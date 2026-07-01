@@ -1,0 +1,55 @@
+# --- Local agent / tooling ---
+CLAUDE.md
+.task/
+
+# --- CMake / C++ build ---
+build/
+cmake-build-*/
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+CTestTestfile.cmake
+compile_commands.json
+*.o
+*.obj
+*.a
+*.so
+*.so.*
+*.dylib
+*.dll
+*.exe
+
+# --- Qt ---
+*.pro.user
+*.qmlc
+*.jsc
+.qmake.stash
+moc_*.cpp
+moc_*.h
+qrc_*.cpp
+ui_*.h
+*.qmake.cache
+*_qmlcache.qrc
+
+# --- whisper.cpp / model files (large; managed at runtime) ---
+models/
+*.gguf
+*.ggml
+*.bin
+
+# --- Out-of-process engines (Python) ---
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+engines/**/.venv/
+
+# --- Vault / runtime artifacts (should live outside the repo, ignored if present) ---
+.transcriber/
+*.partial.jsonl
+*.sentences.json
+
+# --- Editors / OS ---
+.idea/
+*.swp
+.DS_Store

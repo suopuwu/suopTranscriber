@@ -1,0 +1,201 @@
+# suopTranscriber — Design
+
+A cross-platform, GPU-accelerated wrapper for whisper.cpp (and other ASR engines)
+with durable transcriptions, an Obsidian-style vault, and Spotify-lyrics–style
+sentence highlighting synced to audio playback.
+
+Primary target: Linux (CachyOS). Dev GPU: NVIDIA. Cross-vendor (NVIDIA + AMD)
+supported from the start via the engine model below.
+
+## Tech stack
+
+- **UI:** Qt 6 with QML. Chosen for direct C++ linkage to whisper.cpp, native
+  audio with sample-position signals (Qt Multimedia), a near-free tree sidebar
+  (`QFileSystemModel`/`TreeView`), and first-class Linux support.
+- **Default engine:** whisper.cpp, linked **in-process** (see below).
+- **Other engines:** run **out-of-process** as subprocesses behind a uniform
+  protocol.
+- **Audio decode/resample:** ffmpeg (LGPL build). **Playback:** Qt Multimedia
+  with the FFmpeg backend.
+
+## Engine architecture
+
+The abstraction lives at the **`Segment` level, not the transport level**. Every
+engine produces the same normalized `std::vector<Segment>`; only the adapter
+differs. Everything downstream (chunking, offset merge, sidecar writing, resume,
+highlighting) is shared.
+
+```
+TranscriptionEngine (interface → std::vector<Segment>)
+├── WhisperCppEngine   → in-process, calls libwhisper C API directly   (DEFAULT)
+└── SubprocessEngine   → spawns an out-of-process engine, parses JSONL
+```
+
+```cpp
+struct Segment { double t0, t1; std::string text; };   // sentence-level only
+class TranscriptionEngine {
+  virtual std::vector<Segment> transcribe(AudioChunk, ProgressCb) = 0;
+};
+```
+
+### whisper.cpp — first-class, in-process
+
+whisper.cpp is the trusted default and is integrated more deeply than the
+pluggable engines. Being in-process buys:
+
+- **Warm model:** libwhisper stays resident across files (no per-file cold
+  start). This is the main UX win vs. subprocess engines.
+- **Native callbacks:** `whisper_full_params.progress_callback` and
+  `new_segment_callback` drive a smooth progress bar and let segments stream into
+  the UI *as produced*.
+- **No temp WAV:** feed the ffmpeg-decoded PCM buffer straight into
+  `whisper_full`.
+
+Tradeoffs accepted:
+
+- **No crash isolation:** a CUDA OOM here takes down the app. Guard VRAM/model
+  selection. Acceptable for the trusted default.
+- **Threading is ours:** run on a `QThread` worker, never the GUI thread.
+
+### Pluggable engines — out-of-process
+
+Genuinely different engines (faster-whisper, NeMo Parakeet, etc.) are Python/CUDA
+and run as subprocesses. Benefits: async via `QProcess`, crash isolation, and
+**license isolation** (GPL-ish Python deps never link into the Qt binary).
+
+**Engine manifest** — adding an engine = drop a folder, no rebuild:
+
+```jsonc
+// engines/faster-whisper/manifest.json
+{
+  "name": "faster-whisper (large-v3)",
+  "command": ["python", "run.py"],   // relative to manifest dir
+  "capabilities": {
+    "languages": ["*"],
+    "gpu": "cuda",                    // "cuda" | "vulkan" | "cpu" | "any"
+    "vram_gb_min": 6
+  }
+}
+```
+
+**Wire protocol** — JSON Lines over stdout, one object per line:
+
+```jsonc
+// App → engine (audio already normalized to 16k mono):
+//   run.py --audio chunk.wav --offset 120.0 --lang auto
+
+// Engine → app, streamed:
+{"type":"progress","seconds_done":12.4,"seconds_total":60.0}
+{"type":"segment","t0":121.2,"t1":124.8,"text":"So what I mean is this."}
+{"type":"done"}
+{"type":"error","message":"CUDA out of memory","recoverable":false}
+```
+
+Every timestamp an engine emits is **relative to its chunk**; the **app** adds the
+chunk's global `--offset`. This offset merge is written once, in the app, for all
+engines — it is the most common source of bugs in this kind of app.
+
+**Capability detection** at startup: enumerate manifests, check GPU + installed
+model files, gray out engines that can't run on this machine.
+
+## GPU: cross-vendor is not uniform across engines
+
+| Engine            | NVIDIA        | AMD             | Notes |
+|-------------------|---------------|-----------------|-------|
+| **whisper.cpp**   | CUDA or Vulkan| **Vulkan**      | Build Vulkan → one binary runs on both. Universal baseline. |
+| faster-whisper    | CUDA          | ✗               | Best speed/accuracy tradeoff. |
+| NeMo Parakeet     | CUDA          | ✗               | Very accurate English, heavy NVIDIA stack. |
+
+- **whisper.cpp + Vulkan is the cross-vendor floor** that works everywhere; CUDA
+  engines are NVIDIA-only upgrades gated by capability detection.
+- Build whisper.cpp with `-DGGML_VULKAN=1` for the universal binary; optionally a
+  separate `-DGGML_CUDA=1` build for max NVIDIA speed.
+
+## Audio: decode vs. playback are separate concerns
+
+- **Transcription input:** every engine wants **16 kHz mono PCM**. Normalize with
+  ffmpeg — do **not** use Qt to resample:
+  `ffmpeg -i input.ext -ar 16000 -ac 1 -c:a pcm_s16le -f wav chunk.wav`
+- **Playback:** Qt Multimedia on the *original* file. Force the FFmpeg backend on
+  Linux: `QT_MEDIA_BACKEND=ffmpeg` (default in Qt 6.5+, but be explicit) — the
+  gstreamer backend is flaky with arbitrary formats and has worse position
+  accuracy.
+
+## Sentence highlighting (not word-level)
+
+Highlighting is **sentence-level only**, which removes real complexity:
+
+- No DTW / alignment heads in whisper.cpp — segment timestamps come free from
+  `whisper_full_get_segment_t0/t1`.
+- WhisperX (its value was word-level forced alignment) is unnecessary.
+- Protocol carries only `t0`/`t1`/`text` — no `words[]`.
+- **Timing is easy:** sentences are seconds apart, so `positionChanged`
+  (~100–250 ms) is accurate enough. **No interpolated clock needed.** On each
+  position event, **binary-search** the active sentence by time (don't linear
+  scan).
+
+**Note: a whisper "segment" ≠ a "sentence"** — it's a phrase/utterance chunk,
+usually sentence-ish. Start by highlighting native segments as-is. Only if needed
+later, merge/split on `.?!`, keeping the first segment's `t0` and the last's `t1`.
+Do not build that on day one.
+
+## Durable / resumable transcription
+
+Independent of highlighting granularity — this exists for the resume requirement.
+
+- Chunk on **silence via VAD** (Silero VAD), ~2–5 min VAD-aligned windows. Don't
+  chunk at fixed 30s (slices words).
+- Checkpoint after each window: append committed segments to
+  `.name.partial.jsonl` with the last global offset.
+- On restart: if `.md` is missing but a partial exists, resume from that offset.
+- On full completion: write `.md` + the sentence sidecar, delete the partial.
+- Apply the app-side offset merge when stitching windows.
+
+## Vault / file layout (Obsidian-style)
+
+One user-chosen root holds config, audio, and transcriptions:
+
+```
+vault/
+  .transcriber/
+    config.json                 # settings, USB device allowlist, model registry
+    engines/                    # engine manifests + scripts
+    models/                     # downloaded model files (large: 2–4 GB each)
+  interviews/2026-06-30.m4a
+  interviews/2026-06-30.md              # human-readable transcript = "done" (green)
+  interviews/.2026-06-30.sentences.json # flat [{text,t0,t1}] array for highlighting
+  interviews/.2026-06-30.partial.jsonl  # exists only mid-transcription (resume)
+```
+
+- **Transcribed indicator:** sibling `.md` exists → green; missing → yellow.
+  Watch with `QFileSystemWatcher` for live updates.
+- **No retranscription:** presence of `.md` means done.
+- `.md` stays clean prose; all timing lives in the hidden sentence sidecar.
+
+## USB import
+
+- Enumerate removable drives with `QStorageInfo::mountedVolumes()`.
+- User picks device(s); persist their identifiers in `config.json`.
+- On "grab new," diff by filename + hash against the vault and copy only new
+  audio in.
+
+## Model management
+
+- Models are large (whisper large-v3 ≈ 3 GB, Parakeet ≈ 2–4 GB). Provide a
+  download/management UI and a `models/` dir; registry in config.
+- Capability detection checks which model files are present, not just which engine
+  binaries exist.
+
+## Licensing
+
+- whisper.cpp MIT; faster-whisper/CTranslate2 MIT; NeMo Apache-2.0.
+- **Qt: dynamically link** (LGPL) if distributing closed-source.
+- ffmpeg: **LGPL build** (audio-only needs nothing GPL).
+- Out-of-process engines keep any GPL-ish Python deps behind a process boundary,
+  which is also a license boundary.
+
+## Suggested first milestone
+
+Vault open + sidebar tree with green/yellow indicators + play a file with
+`QMediaPlayer`. This exercises the file layout and audio backend before touching
+the engine protocol.
