@@ -8,7 +8,8 @@ set(CMAKE_AUTOMOC ON)
 option(SUOP_ENABLE_VULKAN "Build whisper.cpp with Vulkan backend (cross-vendor GPU baseline)" ON)
 option(SUOP_ENABLE_CUDA "Build whisper.cpp with CUDA backend (NVIDIA fast path)" OFF)
 
-find_package(Qt6 6.5 REQUIRED COMPONENTS Core Gui Qml Quick QuickControls2 Multimedia)
+find_package(Qt6 6.5 REQUIRED COMPONENTS Core Gui Qml Quick QuickControls2 Multimedia Core5Compat)
+find_package(KF6WindowSystem REQUIRED)
 
 qt_standard_project_setup(REQUIRES 6.5)
 
@@ -25,11 +26,22 @@ qt_add_executable(suopTranscriber
     src/main.cpp
 )
 
+# qt_add_qml_module only detects a QML-defined singleton via this source
+# property — it does not scan file contents for `pragma Singleton`.
+set_source_files_properties(qml/AppSettings.qml PROPERTIES QT_QML_SINGLETON_TYPE TRUE)
+
 qt_add_qml_module(suopTranscriber
     URI SuopTranscriber
     VERSION 1.0
     QML_FILES
         qml/Main.qml
+        qml/AppSettings.qml
+        qml/HoverBorder.qml
+        qml/TitleBar.qml
+        qml/Sidebar.qml
+        qml/MainPanel.qml
+        qml/BottomBar.qml
+        qml/SettingsPopup.qml
     SOURCES
         src/core/Segment.h
         src/core/TranscriptionEngine.h
@@ -37,6 +49,8 @@ qt_add_qml_module(suopTranscriber
         src/core/VaultTreeModel.cpp
         src/core/AudioPlayer.h
         src/core/AudioPlayer.cpp
+        src/core/WindowEffects.h
+        src/core/WindowEffects.cpp
 )
 
 target_include_directories(suopTranscriber PRIVATE
@@ -50,6 +64,8 @@ target_link_libraries(suopTranscriber PRIVATE
     Qt6::Quick
     Qt6::QuickControls2
     Qt6::Multimedia
+    Qt6::Core5Compat
+    KF6::WindowSystem
     whisper
 )
 

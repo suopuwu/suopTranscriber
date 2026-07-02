@@ -2,6 +2,7 @@ import QtQuick
 import QtQuick.Controls
 import QtQuick.Layouts
 import QtQuick.Dialogs
+import Qt5Compat.GraphicalEffects
 import SuopTranscriber
 
 ApplicationWindow {
@@ -9,7 +10,9 @@ ApplicationWindow {
     width: 1024
     height: 720
     visible: true
+    color: "transparent"
     title: qsTr("suopTranscriber")
+    flags: AppSettings.useSystemTitlebar ? Qt.Window : (Qt.Window | Qt.FramelessWindowHint)
 
     VaultTreeModel {
         id: vaultModel
@@ -19,168 +22,140 @@ ApplicationWindow {
         id: player
     }
 
-    Component.onCompleted: {
-        if (initialVaultPath.toString() !== "")
-            vaultModel.vaultPath = initialVaultPath
-    }
-
     FolderDialog {
         id: folderDialog
         title: qsTr("Open Vault")
         onAccepted: vaultModel.vaultPath = selectedFolder
     }
 
-    header: ToolBar {
-        RowLayout {
-            anchors.fill: parent
-            anchors.margins: 4
+    TitleBar {
+        id: customTitleBar
+        window: window
+        title: window.title
+        // When assigned to `header:` below, ApplicationWindow controls this
+        // item's position/size; when unassigned (system titlebar mode) it's
+        // still a plain child of contentItem, so hide it explicitly to avoid
+        // it floating over the content at its last header-slot geometry.
+        visible: !AppSettings.useSystemTitlebar
+    }
 
-            ToolButton {
-                text: qsTr("Open Vault")
-                onClicked: folderDialog.open()
-            }
+    header: AppSettings.useSystemTitlebar ? null : customTitleBar
 
-            Label {
-                Layout.fillWidth: true
-                elide: Text.ElideMiddle
-                text: vaultModel.vaultPath.toString() === "" ? qsTr("No vault open") : vaultModel.vaultPath.toString()
-            }
+    SettingsPopup {
+        id: settingsPopup
+        parent: window.contentItem
+        onChangeVaultRequested: folderDialog.open()
+    }
+
+    function updateBlurRegions() {
+        if (!sidebar || !mainPanel || !window.contentItem)
+            return
+        const sidebarRect = sidebar.mapToItem(window.contentItem, 0, 0, sidebar.width, sidebar.height)
+        const mainRect = mainPanel.mapToItem(window.contentItem, 0, 0, mainPanel.width, mainPanel.height)
+        WindowEffects.updateBlur(window,
+            Qt.rect(sidebarRect.x, sidebarRect.y, sidebarRect.width, sidebarRect.height), AppSettings.sidebarBlur,
+            Qt.rect(mainRect.x, mainRect.y, mainRect.width, mainRect.height), AppSettings.mainBlur)
+    }
+
+    Connections {
+        target: AppSettings
+        function onSidebarBlurChanged() { updateBlurRegions() }
+        function onMainBlurChanged() { updateBlurRegions() }
+
+        function onUseSystemTitlebarChanged() {
+            // Wayland doesn't redecorate an already-shown window in place;
+            // force a hide/show cycle so the new frameless/framed flags
+            // actually take effect (window position isn't persisted — x/y
+            // is unreadable/unsettable on Wayland anyway).
+            const w = window.width
+            const h = window.height
+            window.visible = false
+            titlebarNudgeTimer.savedW = w
+            titlebarNudgeTimer.savedH = h
+            titlebarNudgeTimer.start()
         }
     }
 
-    SplitView {
+    Timer {
+        id: titlebarNudgeTimer
+        property int savedW: 0
+        property int savedH: 0
+        interval: 50
+        onTriggered: {
+            window.visible = true
+            window.width = savedW
+            window.height = savedH
+        }
+    }
+
+    onWidthChanged: Qt.callLater(updateBlurRegions)
+    onHeightChanged: Qt.callLater(updateBlurRegions)
+
+    Connections {
+        target: vaultModel
+        function onVaultPathChanged() {
+            AppSettings.lastVaultPath = vaultModel.vaultPath
+        }
+    }
+
+    Component.onCompleted: {
+        if (initialVaultPath.toString() !== "")
+            vaultModel.vaultPath = initialVaultPath
+        else if (AppSettings.lastVaultPath.toString() !== "")
+            vaultModel.vaultPath = AppSettings.lastVaultPath
+        Qt.callLater(updateBlurRegions)
+    }
+
+    Item {
+        id: rootContent
         anchors.fill: parent
-        orientation: Qt.Horizontal
-
-        Rectangle {
-            SplitView.preferredWidth: 320
-            SplitView.minimumWidth: 200
-            color: window.palette.base
-
-            TreeView {
-                id: tree
-                anchors.fill: parent
-                clip: true
-                model: vaultModel
-
-                function expandAll() {
-                    // Descending order: expanding a row only inserts rows
-                    // after it, so earlier (lower) indices stay valid.
-                    for (let r = rows - 1; r >= 0; r--)
-                        expandRecursively(r, -1)
-                }
-
-                // rows isn't populated synchronously with modelReset — the
-                // view's row mapping updates on a later event-loop pass, so
-                // poll briefly until it shows up rather than racing it.
-                Timer {
-                    id: expandRetryTimer
-                    interval: 16
-                    repeat: true
-                    onTriggered: {
-                        if (tree.rows > 0) {
-                            tree.expandAll()
-                            stop()
-                        }
-                    }
-                }
-
-                Connections {
-                    target: vaultModel
-                    function onModelReset() {
-                        expandRetryTimer.start()
-                    }
-                }
-
-                delegate: Item {
-                    id: treeDelegate
-                    implicitWidth: tree.width
-                    implicitHeight: 28
-
-                    required property TreeView treeView
-                    required property int row
-                    required property int depth
-                    required property bool isTreeNode
-                    required property bool expanded
-                    required property bool hasChildren
-                    required property string name
-                    required property string path
-                    required property bool isDir
-                    required property bool isAudio
-                    required property int status
-
-                    TapHandler {
-                        onTapped: {
-                            if (treeDelegate.isDir) {
-                                treeDelegate.treeView.toggleExpanded(treeDelegate.row)
-                            } else if (treeDelegate.isAudio) {
-                                player.source = "file://" + treeDelegate.path
-                                player.play()
-                            }
-                        }
-                    }
-
-                    Row {
-                        anchors.verticalCenter: parent.verticalCenter
-                        x: treeDelegate.depth * 16 + 6
-                        spacing: 6
-
-                        Rectangle {
-                            anchors.verticalCenter: parent.verticalCenter
-                            visible: treeDelegate.isAudio
-                            width: 8
-                            height: 8
-                            radius: 4
-                            color: treeDelegate.status === 2 ? "#2ecc71" : "#f1c40f"
-                        }
-
-                        Text {
-                            anchors.verticalCenter: parent.verticalCenter
-                            text: treeDelegate.name
-                            color: window.palette.text
-                        }
-                    }
-                }
+        layer.enabled: !AppSettings.useSystemTitlebar
+        layer.effect: OpacityMask {
+            maskSource: Rectangle {
+                width: rootContent.width
+                height: rootContent.height
+                radius: AppSettings.borderRadius
             }
         }
 
-        Rectangle {
-            SplitView.fillWidth: true
-            color: window.palette.window
+        ColumnLayout {
+            anchors.fill: parent
+            spacing: 0
 
-            ColumnLayout {
-                anchors.fill: parent
-                anchors.margins: 16
-                spacing: 12
+            SplitView {
+                Layout.fillWidth: true
+                Layout.fillHeight: true
+                orientation: Qt.Horizontal
 
-                Label {
-                    Layout.fillWidth: true
-                    elide: Text.ElideMiddle
-                    text: player.source.toString() === "" ? qsTr("No file selected") : player.source.toString()
-                }
-
-                RowLayout {
-                    spacing: 12
-
-                    Button {
-                        text: player.playing ? qsTr("Pause") : qsTr("Play")
-                        enabled: player.source.toString() !== ""
-                        onClicked: player.togglePlay()
+                Sidebar {
+                    id: sidebar
+                    SplitView.preferredWidth: 320
+                    SplitView.minimumWidth: 200
+                    model: vaultModel
+                    onFileActivated: (path) => {
+                        player.source = "file://" + path
+                        player.play()
                     }
-
-                    Slider {
-                        id: seekSlider
-                        Layout.fillWidth: true
-                        from: 0
-                        to: Math.max(player.duration, 1)
-                        value: player.position
-                        onMoved: player.position = value
-                    }
+                    onSettingsRequested: settingsPopup.open()
+                    onWidthChanged: Qt.callLater(window.updateBlurRegions)
+                    onHeightChanged: Qt.callLater(window.updateBlurRegions)
                 }
 
-                Item {
-                    Layout.fillHeight: true
+                MainPanel {
+                    id: mainPanel
+                    SplitView.fillWidth: true
+                    vaultPath: vaultModel.vaultPath
+                    player: player
+                    onOpenVaultRequested: folderDialog.open()
+                    onWidthChanged: Qt.callLater(window.updateBlurRegions)
+                    onHeightChanged: Qt.callLater(window.updateBlurRegions)
                 }
+            }
+
+            BottomBar {
+                id: bottomBar
+                Layout.fillWidth: true
+                vaultPath: vaultModel.vaultPath
             }
         }
     }
