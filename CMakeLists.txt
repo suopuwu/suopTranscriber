@@ -42,6 +42,7 @@ qt_add_qml_module(suopTranscriber
         qml/MainPanel.qml
         qml/BottomBar.qml
         qml/SettingsPopup.qml
+        qml/VaultFolderDialog.qml
     SOURCES
         src/core/Segment.h
         src/core/TranscriptionEngine.h

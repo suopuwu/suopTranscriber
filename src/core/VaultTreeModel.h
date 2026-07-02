@@ -24,6 +24,7 @@ public:
         IsDirRole,
         IsAudioRole,
         StatusRole,
+        IsOrphanedMdRole,
     };
     Q_ENUM(Roles)
 
@@ -31,6 +32,7 @@ public:
         NoneStatus = 0,
         UntranscribedStatus = 1,
         TranscribedStatus = 2,
+        OrphanedMdStatus = 3,
     };
     Q_ENUM(Status)
 
@@ -47,6 +49,13 @@ public:
     QVariant data(const QModelIndex &index, int role) const override;
     QHash<int, QByteArray> roleNames() const override;
 
+    // Renames the audio file at fileUrl (and its sibling .md, if any) to
+    // newBaseName, preserving each file's extension. Also handles orphaned
+    // .md-only nodes (Feature: Milestone 5 item 19 "forgo labels" mode).
+    // Returns false and sets *errorOut on validation or filesystem failure,
+    // without leaving the audio/.md pair mismatched.
+    Q_INVOKABLE bool renameFile(const QUrl &fileUrl, const QString &newBaseName, QString *errorOut = nullptr);
+
 signals:
     void vaultPathChanged();
 
@@ -56,6 +65,7 @@ private:
         QString path;
         bool isDir = false;
         bool isAudio = false;
+        bool isOrphanedMd = false;
         Status status = NoneStatus;
         Node *parent = nullptr;
         std::vector<std::unique_ptr<Node>> children;

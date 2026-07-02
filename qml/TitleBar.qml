@@ -14,6 +14,11 @@ Item {
     Rectangle {
         anchors.fill: parent
         color: "#1a1a1a"
+        // Only visible when frameless (see Main.qml), so these radii are
+        // always safe to apply — rounds the window's true top corners
+        // natively instead of relying on an outer OpacityMask.
+        topLeftRadius: AppSettings.borderRadius
+        topRightRadius: AppSettings.borderRadius
     }
 
     TapHandler {
@@ -84,12 +89,9 @@ Item {
             }
             Rectangle {
                 anchors.fill: parent
-                color: hover.hovered ? "#3a3a3a" : "transparent"
-            }
-            HoverBorder {
-                anchors.fill: parent
                 anchors.margins: 4
-                active: hover.hovered
+                radius: AppSettings.borderRadius
+                color: hover.hovered ? "#3a3a3a" : "transparent"
             }
             Text {
                 anchors.centerIn: parent

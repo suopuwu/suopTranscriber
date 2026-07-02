@@ -7,10 +7,36 @@
 
 namespace ModelManager {
 
-QString ensureModel(const QUrl &vaultPath, bool speakerDetection, QString *errorOut)
+const std::vector<ModelInfo> &availableModels()
+{
+    static const std::vector<ModelInfo> models = {
+        {"tiny.en", "ggml-tiny.en.bin", "Tiny (English) — ~75 MB, fastest"},
+        {"base.en", "ggml-base.en.bin", "Base (English) — ~148 MB, balanced"},
+        {"small.en", "ggml-small.en.bin", "Small (English) — ~488 MB, more accurate"},
+        {"medium.en", "ggml-medium.en.bin", "Medium (English) — ~1.5 GB, most accurate"},
+    };
+    return models;
+}
+
+namespace {
+
+QString fileNameForModelId(const QString &modelId)
+{
+    for (const ModelInfo &info : availableModels()) {
+        if (info.id == modelId)
+            return info.fileName;
+    }
+    return {};
+}
+
+}
+
+QString ensureModel(const QUrl &vaultPath, const QString &modelId, bool speakerDetection, QString *errorOut)
 {
     const QDir modelsDir(vaultPath.toLocalFile() + "/.transcriber/models");
-    const QString modelName = speakerDetection ? kTdrzModelName : kModelName;
+    QString modelName = speakerDetection ? QString(kTdrzModelName) : fileNameForModelId(modelId);
+    if (modelName.isEmpty())
+        modelName = fileNameForModelId(kDefaultModelId);
     const QString modelPath = modelsDir.filePath(modelName);
 
     if (QFileInfo::exists(modelPath))
