@@ -7,50 +7,18 @@ Rectangle {
 
     property alias model: tree.model
     signal fileActivated(string path)
-    signal settingsRequested()
 
     color: Qt.rgba(AppSettings.sidebarBackgroundColor.r, AppSettings.sidebarBackgroundColor.g,
                     AppSettings.sidebarBackgroundColor.b, AppSettings.sidebarOpacity)
-    radius: AppSettings.borderRadius
-
-    Item {
-        id: sidebarHeader
-        anchors.top: parent.top
-        anchors.left: parent.left
-        anchors.right: parent.right
-        height: 36
-
-        Item {
-            id: settingsButton
-            anchors.right: parent.right
-            anchors.rightMargin: 4
-            anchors.verticalCenter: parent.verticalCenter
-            width: 28
-            height: 28
-
-            HoverHandler {
-                id: settingsHover
-                cursorShape: Qt.PointingHandCursor
-            }
-            TapHandler {
-                onTapped: sidebar.settingsRequested()
-            }
-            HoverBorder {
-                anchors.fill: parent
-                active: settingsHover.hovered
-            }
-            Text {
-                anchors.centerIn: parent
-                text: "⚙"
-                color: "white"
-                font.pixelSize: 16
-            }
-        }
-    }
+    // Only the corners touching the SplitView divider are rounded; the
+    // window-edge corners are left square so the outer window mask (which
+    // already rounds the true window corners) isn't duplicated here.
+    topRightRadius: AppSettings.borderRadius
+    bottomRightRadius: AppSettings.borderRadius
 
     TreeView {
         id: tree
-        anchors.top: sidebarHeader.bottom
+        anchors.top: parent.top
         anchors.left: parent.left
         anchors.right: parent.right
         anchors.bottom: parent.bottom

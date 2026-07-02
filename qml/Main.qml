@@ -11,7 +11,7 @@ ApplicationWindow {
     height: 720
     visible: true
     color: "transparent"
-    title: qsTr("suopTranscriber")
+    title: qsTr("Suop Transcriber")
     flags: AppSettings.useSystemTitlebar ? Qt.Window : (Qt.Window | Qt.FramelessWindowHint)
 
     VaultTreeModel {
@@ -22,24 +22,15 @@ ApplicationWindow {
         id: player
     }
 
+    TranscriptionController {
+        id: transcriptionController
+    }
+
     FolderDialog {
         id: folderDialog
         title: qsTr("Open Vault")
         onAccepted: vaultModel.vaultPath = selectedFolder
     }
-
-    TitleBar {
-        id: customTitleBar
-        window: window
-        title: window.title
-        // When assigned to `header:` below, ApplicationWindow controls this
-        // item's position/size; when unassigned (system titlebar mode) it's
-        // still a plain child of contentItem, so hide it explicitly to avoid
-        // it floating over the content at its last header-slot geometry.
-        visible: !AppSettings.useSystemTitlebar
-    }
-
-    header: AppSettings.useSystemTitlebar ? null : customTitleBar
 
     SettingsPopup {
         id: settingsPopup
@@ -55,12 +46,28 @@ ApplicationWindow {
         WindowEffects.updateBlur(window,
             Qt.rect(sidebarRect.x, sidebarRect.y, sidebarRect.width, sidebarRect.height), AppSettings.sidebarBlur,
             Qt.rect(mainRect.x, mainRect.y, mainRect.width, mainRect.height), AppSettings.mainBlur)
+
+        // Sidebar/MainPanel only round the corners touching the SplitView
+        // divider; those cutouts need a filler behind them (matching the
+        // divider color) or the desktop shows through. Sized/positioned to
+        // exactly the rounded corner itself so it never shows behind the
+        // panels' own (independently opaque/blurred) bodies.
+        const r = AppSettings.borderRadius
+        cornerFillSidebarTR.x = sidebarRect.x + sidebarRect.width - r
+        cornerFillSidebarTR.y = sidebarRect.y
+        cornerFillSidebarBR.x = sidebarRect.x + sidebarRect.width - r
+        cornerFillSidebarBR.y = sidebarRect.y + sidebarRect.height - r
+        cornerFillMainTL.x = mainRect.x
+        cornerFillMainTL.y = mainRect.y
+        cornerFillMainBL.x = mainRect.x
+        cornerFillMainBL.y = mainRect.y + mainRect.height - r
     }
 
     Connections {
         target: AppSettings
         function onSidebarBlurChanged() { updateBlurRegions() }
         function onMainBlurChanged() { updateBlurRegions() }
+        function onBorderRadiusChanged() { Qt.callLater(updateBlurRegions) }
 
         function onUseSystemTitlebarChanged() {
             // Wayland doesn't redecorate an already-shown window in place;
@@ -118,9 +125,48 @@ ApplicationWindow {
             }
         }
 
+        // Sidebar/MainPanel are independently semi-transparent (blur-behind
+        // glass) — these fillers sit only behind their divider-facing rounded
+        // corners (sized/positioned in updateBlurRegions), not full-bleed,
+        // so they don't sit behind the panels' own translucent bodies and
+        // defeat the blur-behind effect.
+        Rectangle {
+            id: cornerFillSidebarTR
+            width: AppSettings.borderRadius
+            height: AppSettings.borderRadius
+            color: window.palette.button
+        }
+        Rectangle {
+            id: cornerFillSidebarBR
+            width: AppSettings.borderRadius
+            height: AppSettings.borderRadius
+            color: window.palette.button
+        }
+        Rectangle {
+            id: cornerFillMainTL
+            width: AppSettings.borderRadius
+            height: AppSettings.borderRadius
+            color: window.palette.button
+        }
+        Rectangle {
+            id: cornerFillMainBL
+            width: AppSettings.borderRadius
+            height: AppSettings.borderRadius
+            color: window.palette.button
+        }
+
         ColumnLayout {
             anchors.fill: parent
             spacing: 0
+
+            TitleBar {
+                id: customTitleBar
+                Layout.fillWidth: true
+                window: window
+                title: window.title
+                visible: !AppSettings.useSystemTitlebar
+                onSettingsRequested: settingsPopup.open()
+            }
 
             SplitView {
                 Layout.fillWidth: true
@@ -134,9 +180,7 @@ ApplicationWindow {
                     model: vaultModel
                     onFileActivated: (path) => {
                         player.source = "file://" + path
-                        player.play()
                     }
-                    onSettingsRequested: settingsPopup.open()
                     onWidthChanged: Qt.callLater(window.updateBlurRegions)
                     onHeightChanged: Qt.callLater(window.updateBlurRegions)
                 }
@@ -145,7 +189,9 @@ ApplicationWindow {
                     id: mainPanel
                     SplitView.fillWidth: true
                     vaultPath: vaultModel.vaultPath
+                    vaultLocalPath: vaultModel.vaultLocalPath
                     player: player
+                    transcriptionController: transcriptionController
                     onOpenVaultRequested: folderDialog.open()
                     onWidthChanged: Qt.callLater(window.updateBlurRegions)
                     onHeightChanged: Qt.callLater(window.updateBlurRegions)
@@ -156,6 +202,9 @@ ApplicationWindow {
                 id: bottomBar
                 Layout.fillWidth: true
                 vaultPath: vaultModel.vaultPath
+                vaultLocalPath: vaultModel.vaultLocalPath
+                transcriptionController: transcriptionController
+                onSettingsRequested: settingsPopup.open()
             }
         }
     }

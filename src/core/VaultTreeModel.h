@@ -15,6 +15,7 @@ class VaultTreeModel : public QAbstractItemModel {
     Q_OBJECT
     QML_ELEMENT
     Q_PROPERTY(QUrl vaultPath READ vaultPath WRITE setVaultPath NOTIFY vaultPathChanged)
+    Q_PROPERTY(QString vaultLocalPath READ vaultLocalPath NOTIFY vaultPathChanged)
 
 public:
     enum Roles {
@@ -37,6 +38,7 @@ public:
 
     QUrl vaultPath() const;
     void setVaultPath(const QUrl &url);
+    QString vaultLocalPath() const;
 
     QModelIndex index(int row, int column, const QModelIndex &parent = {}) const override;
     QModelIndex parent(const QModelIndex &child) const override;

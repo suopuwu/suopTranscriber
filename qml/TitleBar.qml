@@ -7,6 +7,7 @@ Item {
 
     property var window
     property string title: ""
+    signal settingsRequested()
 
     implicitHeight: 36
 
@@ -26,9 +27,36 @@ Item {
         onActiveChanged: if (active) titleBar.window.startSystemMove()
     }
 
-    Text {
+    Item {
+        id: settingsButton
         anchors.left: parent.left
-        anchors.leftMargin: 12
+        anchors.leftMargin: 8
+        anchors.verticalCenter: parent.verticalCenter
+        width: 24
+        height: 24
+
+        HoverHandler {
+            id: settingsHover
+            cursorShape: Qt.PointingHandCursor
+        }
+        TapHandler {
+            onTapped: titleBar.settingsRequested()
+        }
+        HoverBorder {
+            anchors.fill: parent
+            active: settingsHover.hovered
+        }
+        Text {
+            anchors.centerIn: parent
+            text: "⚙"
+            color: "white"
+            font.pixelSize: 14
+        }
+    }
+
+    Text {
+        anchors.left: settingsButton.right
+        anchors.leftMargin: 8
         anchors.verticalCenter: parent.verticalCenter
         text: titleBar.title
         color: "white"

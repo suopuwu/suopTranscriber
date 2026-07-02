@@ -10,12 +10,14 @@ Popup {
     signal changeVaultRequested()
 
     width: 380
-    height: contentColumn.implicitHeight + 32
+    height: Math.min(contentColumn.implicitHeight + 32, maxHeight)
     modal: true
     focus: true
     x: parent ? (parent.width - width) / 2 : 0
     y: parent ? (parent.height - height) / 2 : 0
     closePolicy: Popup.CloseOnEscape | Popup.CloseOnPressOutside
+
+    readonly property real maxHeight: parent ? parent.height * 0.9 : 600
 
     background: Rectangle {
         color: "#242424"
@@ -38,248 +40,252 @@ Popup {
         onAccepted: AppSettings.mainBackgroundColor = selectedColor
     }
 
-    ColumnLayout {
-        id: contentColumn
-        anchors.left: parent.left
-        anchors.right: parent.right
-        anchors.top: parent.top
+    ScrollView {
+        anchors.fill: parent
         anchors.margins: 16
-        spacing: 16
+        clip: true
+        ScrollBar.horizontal.policy: ScrollBar.AlwaysOff
 
-        Label {
-            text: qsTr("Settings")
-            color: "white"
-            font.bold: true
-            font.pixelSize: 16
-        }
+        ColumnLayout {
+            id: contentColumn
+            width: parent.width
+            spacing: 16
 
-        RowLayout {
-            Layout.fillWidth: true
             Label {
-                Layout.fillWidth: true
+                text: qsTr("Settings")
                 color: "white"
-                text: qsTr("Vault")
+                font.bold: true
+                font.pixelSize: 16
             }
-            Button {
-                id: changeVaultButton
-                text: qsTr("Change Vault")
-                hoverEnabled: true
-                onClicked: settingsPopup.changeVaultRequested()
 
-                HoverHandler {
-                    cursorShape: Qt.PointingHandCursor
+            RowLayout {
+                Layout.fillWidth: true
+                Label {
+                    Layout.fillWidth: true
+                    color: "white"
+                    text: qsTr("Vault")
                 }
-                HoverBorder {
-                    anchors.fill: parent
-                    active: changeVaultButton.hovered
+                Button {
+                    id: changeVaultButton
+                    text: qsTr("Change Vault")
+                    hoverEnabled: true
+                    onClicked: settingsPopup.changeVaultRequested()
+
+                    HoverHandler {
+                        cursorShape: Qt.PointingHandCursor
+                    }
+                    HoverBorder {
+                        anchors.fill: parent
+                        active: changeVaultButton.hovered
+                    }
                 }
             }
-        }
 
-        Label {
-            text: qsTr("Appearance")
-            color: "white"
-            font.bold: true
-        }
-
-        RowLayout {
-            Layout.fillWidth: true
             Label {
-                Layout.fillWidth: true
+                text: qsTr("Appearance")
                 color: "white"
-                text: qsTr("Border radius")
+                font.bold: true
             }
-            Slider {
-                id: radiusSlider
-                from: 0
-                to: 24
-                value: AppSettings.borderRadius
-                hoverEnabled: true
-                onMoved: AppSettings.borderRadius = value
 
-                HoverHandler {
-                    cursorShape: Qt.PointingHandCursor
+            RowLayout {
+                Layout.fillWidth: true
+                Label {
+                    Layout.fillWidth: true
+                    color: "white"
+                    text: qsTr("Border radius")
                 }
-                HoverBorder {
-                    anchors.fill: parent
-                    active: radiusSlider.hovered
+                Slider {
+                    id: radiusSlider
+                    from: 0
+                    to: 24
+                    value: AppSettings.borderRadius
+                    hoverEnabled: true
+                    onMoved: AppSettings.borderRadius = value
+
+                    HoverHandler {
+                        cursorShape: Qt.PointingHandCursor
+                    }
+                    HoverBorder {
+                        anchors.fill: parent
+                        active: radiusSlider.hovered
+                    }
                 }
             }
-        }
 
-        RowLayout {
-            Layout.fillWidth: true
+            RowLayout {
+                Layout.fillWidth: true
+                Label {
+                    Layout.fillWidth: true
+                    color: "white"
+                    text: qsTr("Use system titlebar")
+                }
+                Switch {
+                    id: titlebarSwitch
+                    checked: AppSettings.useSystemTitlebar
+                    hoverEnabled: true
+                    onToggled: AppSettings.useSystemTitlebar = checked
+
+                    HoverHandler {
+                        cursorShape: Qt.PointingHandCursor
+                    }
+                    HoverBorder {
+                        anchors.fill: parent
+                        active: titlebarSwitch.hovered
+                    }
+                }
+            }
+
             Label {
-                Layout.fillWidth: true
+                text: qsTr("Sidebar")
                 color: "white"
-                text: qsTr("Use system titlebar")
+                font.bold: true
             }
-            Switch {
-                id: titlebarSwitch
-                checked: AppSettings.useSystemTitlebar
-                hoverEnabled: true
-                onToggled: AppSettings.useSystemTitlebar = checked
 
-                HoverHandler {
-                    cursorShape: Qt.PointingHandCursor
+            RowLayout {
+                Layout.fillWidth: true
+                Label {
+                    Layout.fillWidth: true
+                    color: "white"
+                    text: qsTr("Background color")
                 }
-                HoverBorder {
-                    anchors.fill: parent
-                    active: titlebarSwitch.hovered
+                Button {
+                    id: sidebarColorButton
+                    text: qsTr("Choose…")
+                    hoverEnabled: true
+                    onClicked: sidebarColorDialog.open()
+
+                    HoverHandler {
+                        cursorShape: Qt.PointingHandCursor
+                    }
+                    HoverBorder {
+                        anchors.fill: parent
+                        active: sidebarColorButton.hovered
+                    }
                 }
             }
-        }
 
-        Label {
-            text: qsTr("Sidebar")
-            color: "white"
-            font.bold: true
-        }
+            RowLayout {
+                Layout.fillWidth: true
+                Label {
+                    Layout.fillWidth: true
+                    color: "white"
+                    text: qsTr("Opacity")
+                }
+                Slider {
+                    id: sidebarOpacitySlider
+                    from: 0.1
+                    to: 1
+                    value: AppSettings.sidebarOpacity
+                    hoverEnabled: true
+                    onMoved: AppSettings.sidebarOpacity = value
 
-        RowLayout {
-            Layout.fillWidth: true
+                    HoverHandler {
+                        cursorShape: Qt.PointingHandCursor
+                    }
+                    HoverBorder {
+                        anchors.fill: parent
+                        active: sidebarOpacitySlider.hovered
+                    }
+                }
+            }
+
+            RowLayout {
+                Layout.fillWidth: true
+                Label {
+                    Layout.fillWidth: true
+                    color: "white"
+                    text: qsTr("Blur")
+                }
+                Switch {
+                    id: sidebarBlurSwitch
+                    checked: AppSettings.sidebarBlur
+                    hoverEnabled: true
+                    onToggled: AppSettings.sidebarBlur = checked
+
+                    HoverHandler {
+                        cursorShape: Qt.PointingHandCursor
+                    }
+                    HoverBorder {
+                        anchors.fill: parent
+                        active: sidebarBlurSwitch.hovered
+                    }
+                }
+            }
+
             Label {
-                Layout.fillWidth: true
+                text: qsTr("Main panel")
                 color: "white"
-                text: qsTr("Background color")
+                font.bold: true
             }
-            Button {
-                id: sidebarColorButton
-                text: qsTr("Choose…")
-                hoverEnabled: true
-                onClicked: sidebarColorDialog.open()
 
-                HoverHandler {
-                    cursorShape: Qt.PointingHandCursor
-                }
-                HoverBorder {
-                    anchors.fill: parent
-                    active: sidebarColorButton.hovered
-                }
-            }
-        }
-
-        RowLayout {
-            Layout.fillWidth: true
-            Label {
+            RowLayout {
                 Layout.fillWidth: true
-                color: "white"
-                text: qsTr("Opacity")
-            }
-            Slider {
-                id: sidebarOpacitySlider
-                from: 0.1
-                to: 1
-                value: AppSettings.sidebarOpacity
-                hoverEnabled: true
-                onMoved: AppSettings.sidebarOpacity = value
-
-                HoverHandler {
-                    cursorShape: Qt.PointingHandCursor
+                Label {
+                    Layout.fillWidth: true
+                    color: "white"
+                    text: qsTr("Background color")
                 }
-                HoverBorder {
-                    anchors.fill: parent
-                    active: sidebarOpacitySlider.hovered
+                Button {
+                    id: mainColorButton
+                    text: qsTr("Choose…")
+                    hoverEnabled: true
+                    onClicked: mainColorDialog.open()
+
+                    HoverHandler {
+                        cursorShape: Qt.PointingHandCursor
+                    }
+                    HoverBorder {
+                        anchors.fill: parent
+                        active: mainColorButton.hovered
+                    }
                 }
             }
-        }
 
-        RowLayout {
-            Layout.fillWidth: true
-            Label {
+            RowLayout {
                 Layout.fillWidth: true
-                color: "white"
-                text: qsTr("Blur")
-            }
-            Switch {
-                id: sidebarBlurSwitch
-                checked: AppSettings.sidebarBlur
-                hoverEnabled: true
-                onToggled: AppSettings.sidebarBlur = checked
-
-                HoverHandler {
-                    cursorShape: Qt.PointingHandCursor
+                Label {
+                    Layout.fillWidth: true
+                    color: "white"
+                    text: qsTr("Opacity")
                 }
-                HoverBorder {
-                    anchors.fill: parent
-                    active: sidebarBlurSwitch.hovered
+                Slider {
+                    id: mainOpacitySlider
+                    from: 0.1
+                    to: 1
+                    value: AppSettings.mainOpacity
+                    hoverEnabled: true
+                    onMoved: AppSettings.mainOpacity = value
+
+                    HoverHandler {
+                        cursorShape: Qt.PointingHandCursor
+                    }
+                    HoverBorder {
+                        anchors.fill: parent
+                        active: mainOpacitySlider.hovered
+                    }
                 }
             }
-        }
 
-        Label {
-            text: qsTr("Main panel")
-            color: "white"
-            font.bold: true
-        }
-
-        RowLayout {
-            Layout.fillWidth: true
-            Label {
+            RowLayout {
                 Layout.fillWidth: true
-                color: "white"
-                text: qsTr("Background color")
-            }
-            Button {
-                id: mainColorButton
-                text: qsTr("Choose…")
-                hoverEnabled: true
-                onClicked: mainColorDialog.open()
-
-                HoverHandler {
-                    cursorShape: Qt.PointingHandCursor
+                Label {
+                    Layout.fillWidth: true
+                    color: "white"
+                    text: qsTr("Blur")
                 }
-                HoverBorder {
-                    anchors.fill: parent
-                    active: mainColorButton.hovered
-                }
-            }
-        }
+                Switch {
+                    id: mainBlurSwitch
+                    checked: AppSettings.mainBlur
+                    hoverEnabled: true
+                    onToggled: AppSettings.mainBlur = checked
 
-        RowLayout {
-            Layout.fillWidth: true
-            Label {
-                Layout.fillWidth: true
-                color: "white"
-                text: qsTr("Opacity")
-            }
-            Slider {
-                id: mainOpacitySlider
-                from: 0.1
-                to: 1
-                value: AppSettings.mainOpacity
-                hoverEnabled: true
-                onMoved: AppSettings.mainOpacity = value
-
-                HoverHandler {
-                    cursorShape: Qt.PointingHandCursor
-                }
-                HoverBorder {
-                    anchors.fill: parent
-                    active: mainOpacitySlider.hovered
-                }
-            }
-        }
-
-        RowLayout {
-            Layout.fillWidth: true
-            Label {
-                Layout.fillWidth: true
-                color: "white"
-                text: qsTr("Blur")
-            }
-            Switch {
-                id: mainBlurSwitch
-                checked: AppSettings.mainBlur
-                hoverEnabled: true
-                onToggled: AppSettings.mainBlur = checked
-
-                HoverHandler {
-                    cursorShape: Qt.PointingHandCursor
-                }
-                HoverBorder {
-                    anchors.fill: parent
-                    active: mainBlurSwitch.hovered
+                    HoverHandler {
+                        cursorShape: Qt.PointingHandCursor
+                    }
+                    HoverBorder {
+                        anchors.fill: parent
+                        active: mainBlurSwitch.hovered
+                    }
                 }
             }
         }

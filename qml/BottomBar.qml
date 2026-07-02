@@ -1,16 +1,20 @@
 import QtQuick
 import QtQuick.Controls
 import QtQuick.Layouts
+import SuopTranscriber
 
 Item {
     id: bottomBar
 
     property url vaultPath
-    // Placeholder task-progress state — no transcription engine exists yet.
-    // Real wiring happens when the engine-protocol milestone lands.
-    property real taskProgress: 0
-    property int tasksCompleted: 0
-    property int tasksTotal: 0
+    property string vaultLocalPath: ""
+    property TranscriptionController transcriptionController
+    signal settingsRequested()
+    // Single-shot engine only for now (see DESIGN.md's durable/resumable
+    // milestone) — at most one task is ever in flight, so totals are 0/1.
+    readonly property real taskProgress: transcriptionController ? transcriptionController.progress : 0
+    readonly property int tasksCompleted: 0
+    readonly property int tasksTotal: transcriptionController && transcriptionController.busy ? 1 : 0
 
     implicitHeight: 28
 
@@ -25,12 +29,54 @@ Item {
         anchors.rightMargin: 8
         spacing: 12
 
-        Label {
+        Item {
+            id: settingsButton
+            visible: AppSettings.useSystemTitlebar
+            Layout.preferredWidth: 20
+            Layout.preferredHeight: 20
+
+            HoverHandler {
+                id: settingsHover
+                cursorShape: Qt.PointingHandCursor
+            }
+            TapHandler {
+                onTapped: bottomBar.settingsRequested()
+            }
+            HoverBorder {
+                anchors.fill: parent
+                active: settingsHover.hovered
+            }
+            Text {
+                anchors.centerIn: parent
+                text: "⚙"
+                color: "#aaaaaa"
+                font.pixelSize: 12
+            }
+        }
+
+        Item {
             Layout.fillWidth: true
-            elide: Text.ElideMiddle
-            text: bottomBar.vaultPath.toString() === "" ? qsTr("No vault open") : bottomBar.vaultPath.toString()
-            color: "#aaaaaa"
-            font.pixelSize: 11
+            implicitHeight: vaultPathLabel.implicitHeight
+
+            HoverHandler {
+                id: vaultPathHover
+                cursorShape: Qt.PointingHandCursor
+                enabled: bottomBar.vaultLocalPath !== ""
+            }
+            TapHandler {
+                enabled: bottomBar.vaultLocalPath !== ""
+                onTapped: Qt.openUrlExternally(bottomBar.vaultPath)
+            }
+            Label {
+                id: vaultPathLabel
+                anchors.left: parent.left
+                anchors.right: parent.right
+                elide: Text.ElideMiddle
+                text: bottomBar.vaultLocalPath === "" ? qsTr("No vault open") : bottomBar.vaultLocalPath
+                color: "#aaaaaa"
+                font.pixelSize: 11
+                font.underline: vaultPathHover.hovered
+            }
         }
 
         ProgressBar {

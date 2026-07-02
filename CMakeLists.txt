@@ -8,10 +8,10 @@ set(CMAKE_AUTOMOC ON)
 option(SUOP_ENABLE_VULKAN "Build whisper.cpp with Vulkan backend (cross-vendor GPU baseline)" ON)
 option(SUOP_ENABLE_CUDA "Build whisper.cpp with CUDA backend (NVIDIA fast path)" OFF)
 
-find_package(Qt6 6.5 REQUIRED COMPONENTS Core Gui Qml Quick QuickControls2 Multimedia Core5Compat)
+find_package(Qt6 6.7 REQUIRED COMPONENTS Core Gui Qml Quick QuickControls2 Multimedia Core5Compat)
 find_package(KF6WindowSystem REQUIRED)
 
-qt_standard_project_setup(REQUIRES 6.5)
+qt_standard_project_setup(REQUIRES 6.7)
 
 # whisper.cpp is linked in-process (see DESIGN.md); GGML_VULKAN is the
 # cross-vendor floor, GGML_CUDA is an opt-in NVIDIA fast path.
@@ -51,6 +51,14 @@ qt_add_qml_module(suopTranscriber
         src/core/AudioPlayer.cpp
         src/core/WindowEffects.h
         src/core/WindowEffects.cpp
+        src/core/AudioDecoder.h
+        src/core/AudioDecoder.cpp
+        src/core/WhisperCppEngine.h
+        src/core/WhisperCppEngine.cpp
+        src/core/ModelManager.h
+        src/core/ModelManager.cpp
+        src/core/TranscriptionController.h
+        src/core/TranscriptionController.cpp
 )
 
 target_include_directories(suopTranscriber PRIVATE

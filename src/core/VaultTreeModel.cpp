@@ -34,6 +34,11 @@ QUrl VaultTreeModel::vaultPath() const
     return m_vaultPath;
 }
 
+QString VaultTreeModel::vaultLocalPath() const
+{
+    return m_vaultPath.toLocalFile();
+}
+
 void VaultTreeModel::setVaultPath(const QUrl &url)
 {
     if (url == m_vaultPath)

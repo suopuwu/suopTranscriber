@@ -14,6 +14,10 @@ struct AudioChunk {
 };
 
 using ProgressCallback = std::function<void(double secondsDone, double secondsTotal)>;
+// Called as each segment is produced, so the UI can stream results in (see
+// DESIGN.md "Native callbacks"). Segment.t0/t1 are chunk-relative; the app
+// applies the offset merge, not the engine.
+using SegmentCallback = std::function<void(const Segment &segment)>;
 
 // Abstraction lives at the Segment level, not the transport (see DESIGN.md
 // "Engine architecture"). WhisperCppEngine implements this in-process;
@@ -21,5 +25,6 @@ using ProgressCallback = std::function<void(double secondsDone, double secondsTo
 class TranscriptionEngine {
 public:
     virtual ~TranscriptionEngine() = default;
-    virtual std::vector<Segment> transcribe(const AudioChunk &chunk, const ProgressCallback &onProgress) = 0;
+    virtual std::vector<Segment> transcribe(const AudioChunk &chunk, const ProgressCallback &onProgress,
+                                             const SegmentCallback &onSegment) = 0;
 };
