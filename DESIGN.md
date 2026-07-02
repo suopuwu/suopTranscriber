@@ -194,6 +194,39 @@ vault/
 - Out-of-process engines keep any GPL-ish Python deps behind a process boundary,
   which is also a license boundary.
 
+## Packaging: Flatpak is the production target
+
+Production distribution is Flatpak. This is compatible with the architecture
+above with a few constraints to keep in mind as features are added:
+
+- **Vault folder access goes through the desktop portal**, not raw filesystem
+  access — this is already how `QtQuick.Dialogs`' `FolderDialog` behaves on
+  Linux, so no rework: the sandbox gets scoped access to just the folder the
+  user picks, no `--filesystem=host` needed.
+- **Flatpak builds are Vulkan-only.** CUDA has no standard Flatpak GPU
+  extension (unlike Vulkan/GL, which get `--device=dri` + a matching driver
+  extension). Build Flatpak releases with `GGML_VULKAN=1` / `GGML_CUDA=0` —
+  consistent with Vulkan already being the cross-vendor floor, not a
+  Flatpak-only carve-out.
+- **ffmpeg** is pulled via the shared `org.freedesktop.Platform.ffmpeg-full`
+  extension rather than bundled, per usual Flathub convention.
+- **whisper.cpp is vendored as a pinned `git` source** in the manifest
+  (mirroring the submodule commit) since `flatpak-builder` builds offline by
+  default — no live network fetch during the sandboxed build. The Vulkan
+  shader toolchain (glslc, spirv-headers) is a *build-time-only* sandbox
+  dependency; end users only need the Vulkan loader + driver at runtime.
+- **Known friction to solve when their milestones arrive, not now:**
+  - USB auto-detection (`QStorageInfo::mountedVolumes()`) likely won't see
+    host mounts from inside the sandbox without extra permissions or a
+    udisks2 D-Bus based rewrite.
+  - Downloaded models should resolve via `QStandardPaths::AppDataLocation`
+    rather than a hardcoded path, so they land in the per-app Flatpak data
+    dir automatically.
+
+The actual `flatpak-builder` manifest (runtime, permissions, pinned sources)
+is deferred until there's more app to package — tracked as follow-up work,
+not blocking current feature development.
+
 ## Suggested first milestone
 
 Vault open + sidebar tree with green/yellow indicators + play a file with
