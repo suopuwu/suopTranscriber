@@ -131,6 +131,63 @@ Rectangle {
         return ""
     }
 
+    // Sentence-level highlighting synced to playback (DESIGN.md / CLAUDE.md:
+    // sentence-level only, binary-search the active sentence on
+    // positionChanged). Orphaned-md files have no player/position, so
+    // sentences parse fine but activeSentenceIndex just stays -1 — no
+    // highlight, which is correct (nothing is "playing").
+    readonly property var sentences: {
+        if (!mainPanel.transcriptionController)
+            return []
+        if (mainPanel.orphanedMdPath !== "")
+            return mainPanel.transcriptionController.parseSentences("file://" + mainPanel.orphanedMdPath)
+        if (mainPanel.player && mainPanel.player.source.toString() !== "" && mainPanel.hasStoredMetadata)
+            return mainPanel.transcriptionController.parseSentences(mainPanel.player.source)
+        return []
+    }
+
+    // player.position is milliseconds; segment timestamps are seconds.
+    // This binding re-evaluates automatically on player.positionChanged
+    // (QML property binding dependency tracking) — binary search lives in
+    // C++ (activeSentenceIndex), not linear-scanned here, per DESIGN.md.
+    readonly property int activeSentenceIndex: {
+        if (!mainPanel.transcriptionController || mainPanel.sentences.length === 0)
+            return -1
+        const positionSeconds = (mainPanel.player ? mainPanel.player.position : 0) / 1000.0
+        return mainPanel.transcriptionController.activeSentenceIndex(mainPanel.sentences, positionSeconds)
+    }
+
+    function escapeHtml(text) {
+        return text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+    }
+
+    // Wraps the active sentence's substring (by its exact start/length into
+    // transcriptBody, from parseSentences) in a highlight span. Qt's
+    // cursorPosition/select() operate on the rendered plain-text position
+    // space regardless of textFormat, and HTML-escaping doesn't change that
+    // position count (entities decode back to one character each) — so this
+    // coexists with jumpToNextMatch()'s select()-based search untouched.
+    function highlightedTranscriptHtml() {
+        const body = mainPanel.transcriptBody
+        const idx = mainPanel.activeSentenceIndex
+        let inner
+        if (idx < 0 || idx >= mainPanel.sentences.length) {
+            inner = mainPanel.escapeHtml(body)
+        } else {
+            const active = mainPanel.sentences[idx]
+            const before = body.substring(0, active.start)
+            const highlighted = body.substring(active.start, active.start + active.length)
+            const after = body.substring(active.start + active.length)
+            inner = mainPanel.escapeHtml(before)
+                + "<span style=\"background-color: #3a5a7a;\">" + mainPanel.escapeHtml(highlighted) + "</span>"
+                + mainPanel.escapeHtml(after)
+        }
+        // white-space:pre-wrap so the transcript's literal newlines/spacing
+        // still render as line breaks under RichText — plain HTML would
+        // otherwise collapse them, unlike the plain-text mode this replaces.
+        return "<div style=\"white-space: pre-wrap;\">" + inner + "</div>"
+    }
+
     function jumpToNextMatch() {
         const body = mainPanel.transcriptBody
         if (mainPanel.searchQuery === "" || body === "")
@@ -504,7 +561,8 @@ Rectangle {
                 hoverEnabled: true
                 onClicked: mainPanel.transcriptionController.transcribe(mainPanel.player.source, mainPanel.vaultPath,
                                                                          modelCombo.currentValue,
-                                                                         speakerDetectionToggle.checked)
+                                                                         speakerDetectionToggle.checked,
+                                                                         AppSettings.autoLabelEnabled)
 
                 HoverHandler {
                     cursorShape: Qt.PointingHandCursor
@@ -528,7 +586,8 @@ Rectangle {
                 id: transcriptArea
                 readOnly: true
                 wrapMode: TextArea.Wrap
-                text: mainPanel.transcriptBody
+                textFormat: TextEdit.RichText
+                text: mainPanel.highlightedTranscriptHtml()
                 color: "#dddddd"
                 background: null
             }

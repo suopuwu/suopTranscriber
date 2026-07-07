@@ -74,7 +74,8 @@ Rectangle {
                         const paths = Object.keys(sidebar.untranscribedPaths)
                         if (paths.length === 0)
                             return
-                        sidebar.transcriptionController.transcribeAll(paths, sidebar.vaultPath, AppSettings.lastModel, false)
+                        sidebar.transcriptionController.transcribeAll(paths, sidebar.vaultPath, AppSettings.lastModel,
+                                                                        false, AppSettings.autoLabelEnabled)
                     }
                 }
                 HoverBorder {
@@ -341,7 +342,9 @@ Rectangle {
                 opacity: (rowHover.hovered && treeDelegate.bulkEligible) ? 1 : 0
                 enabled: opacity > 0
                 hoverEnabled: true
-                onClicked: sidebar.transcriptionController.transcribe(treeDelegate.path, sidebar.vaultPath, AppSettings.lastModel, false)
+                onClicked: sidebar.transcriptionController.transcribe(treeDelegate.path, sidebar.vaultPath,
+                                                                       AppSettings.lastModel, false,
+                                                                       AppSettings.autoLabelEnabled)
 
                 Behavior on opacity {
                     NumberAnimation { duration: 120 }

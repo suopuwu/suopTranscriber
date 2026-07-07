@@ -1,0 +1,105 @@
+#include <QtTest>
+
+// Living-spec placeholders for behaviors the documentation commits to but the
+// code does not implement yet. Each slot QSKIPs with the documented behavior
+// as its reason, so every ctest run lists exactly what is still owed. When a
+// feature lands, delete its placeholder here and write real tests for it.
+class TstFutureSpec : public QObject
+{
+    Q_OBJECT
+private slots:
+    // sentenceHighlighting_syncedToPlayback: BUILT. TranscriptionController::
+    // parseSentences()/activeSentenceIndex() (tested in
+    // tst_transcript_format.cpp) + MainPanel.qml's RichText-span highlight
+    // driven by AudioPlayer.positionChanged now implement DESIGN.md's
+    // "Sentence highlighting" section. Visual sync correctness is on the
+    // UI-validation list for manual testing (no click/playback automation in
+    // this environment).
+
+    void vadChunking_silenceAlignedWindows()
+    {
+        QSKIP("DESIGN.md 'Durable / resumable transcription': chunk on silence via Silero VAD in "
+              "~2-5 min windows, not fixed slices. NOT BUILT: the worker feeds the whole file as a "
+              "single AudioChunk with offsetSeconds = 0.0.");
+    }
+
+    void partialJsonl_checkpointAppend()
+    {
+        QSKIP("DESIGN.md / CLAUDE.md: after each window, append committed segments to "
+              "'.name.partial.jsonl' with the last global offset. NOT BUILT (CLAUDE.md marks it "
+              "'future, not yet implemented'). Current durability is coarser: frontmatter at job "
+              "start + per-segment flush of the .md itself.");
+    }
+
+    void partialJsonl_resumeFromOffset()
+    {
+        QSKIP("DESIGN.md: on restart, if the .md is missing but a partial exists, resume "
+              "transcription from the recorded offset. NOT BUILT: a killed job leaves a truncated "
+              ".md and a re-run starts over from scratch.");
+    }
+
+    void partialJsonl_completionDeletesPartial()
+    {
+        QSKIP("DESIGN.md: on full completion, write the .md and delete the partial. NOT BUILT "
+              "(no partial file exists to delete).");
+    }
+
+    void offsetMerge_multiChunkStitching()
+    {
+        QSKIP("DESIGN.md / CLAUDE.md: the app (never the engine) adds each chunk's global offset "
+              "when stitching windows. The single-chunk merge callsite exists and is exercised by "
+              "tst_engine_contract's FakeEngine test; the real multi-chunk stitch is NOT BUILT "
+              "(blocked on VAD chunking).");
+    }
+
+    void subprocessEngines_manifestAndCapabilities()
+    {
+        QSKIP("DESIGN.md 'Pluggable engines': out-of-process engines added by dropping a folder "
+              "with manifest.json {name, command, capabilities{languages, gpu, vram_gb_min}}, "
+              "enumerated at startup with GPU + model-file capability detection (unrunnable "
+              "engines grayed out). NOT BUILT: no SubprocessEngine, no manifest handling. The "
+              "JSONL wire protocol itself is tracked in tst_engine_contract.");
+    }
+
+    void usbImport_grabNewAudio()
+    {
+        QSKIP("DESIGN.md 'USB import': enumerate removable drives via "
+              "QStorageInfo::mountedVolumes(), persist chosen device identifiers, and on 'grab "
+              "new' diff by filename + hash and copy only new audio into the vault. NOT BUILT.");
+    }
+
+    void modelManagement_uiAndRegistry()
+    {
+        QSKIP("DESIGN.md 'Model management': a model download/management UI backed by a registry "
+              "in vault config. PARTIAL: models auto-download to <vault>/.transcriber/models/ and "
+              "a fixed 4-model dropdown exists (covered by tst_modelmanager), but there is no "
+              "registry and no management UI.");
+    }
+
+    void vaultConfigJson_appScopedSettingsDivergence()
+    {
+        QSKIP("DESIGN.md 'Vault / file layout': .transcriber/config.json holds settings, USB "
+              "device allowlist, and the model registry (vault-scoped). DIVERGENCE: settings are "
+              "currently app-scoped QSettings (~/.config/suopTranscriber) via the AppSettings "
+              "singleton; only .transcriber/models/ exists in the vault. Docs and code need "
+              "reconciling before this is testable.");
+    }
+
+    void noRetranscription_mdPresenceMeansDone()
+    {
+        QSKIP("DESIGN.md 'Vault / file layout': presence of the sibling .md means done — no "
+              "retranscription. DIVERGENCE (deliberate, Milestone 3 decision): the Transcribe "
+              "button re-runs and overwrites; only the status dot reflects .md presence. The "
+              "queue does dedup concurrent requests (covered by tst_transcription_queue).");
+    }
+
+    void segmentMergeSplit_onSentencePunctuation()
+    {
+        QSKIP("DESIGN.md 'Sentence highlighting': merge/split native whisper segments on .?! "
+              "keeping the first segment's t0 and the last's t1 — explicitly 'not built day one'. "
+              "NOT BUILT: native segments are used as-is.");
+    }
+};
+
+QTEST_GUILESS_MAIN(TstFutureSpec)
+#include "tst_future_spec.moc"

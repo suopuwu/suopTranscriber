@@ -22,8 +22,8 @@ supported from the start via the engine model below.
 
 The abstraction lives at the **`Segment` level, not the transport level**. Every
 engine produces the same normalized `std::vector<Segment>`; only the adapter
-differs. Everything downstream (chunking, offset merge, sidecar writing, resume,
-highlighting) is shared.
+differs. Everything downstream (chunking, offset merge, transcript writing,
+resume, highlighting) is shared.
 
 ```
 TranscriptionEngine (interface → std::vector<Segment>)
@@ -148,8 +148,12 @@ Independent of highlighting granularity — this exists for the resume requireme
 - Checkpoint after each window: append committed segments to
   `.name.partial.jsonl` with the last global offset.
 - On restart: if `.md` is missing but a partial exists, resume from that offset.
-- On full completion: write `.md` + the sentence sidecar, delete the partial.
+- On full completion: write the `.md` (see "Vault / file layout" — timing lives
+  in the `.md` itself, not a separate sidecar), delete the partial.
 - Apply the app-side offset merge when stitching windows.
+
+Not yet implemented (see "Vault / file layout" below for what durability
+currently looks like without it).
 
 ## Vault / file layout (Obsidian-style)
 
@@ -163,14 +167,30 @@ vault/
     models/                     # downloaded model files (large: 2–4 GB each)
   interviews/2026-06-30.m4a
   interviews/2026-06-30.md              # human-readable transcript = "done" (green)
-  interviews/.2026-06-30.sentences.json # flat [{text,t0,t1}] array for highlighting
   interviews/.2026-06-30.partial.jsonl  # exists only mid-transcription (resume)
 ```
 
 - **Transcribed indicator:** sibling `.md` exists → green; missing → yellow.
   Watch with `QFileSystemWatcher` for live updates.
 - **No retranscription:** presence of `.md` means done.
-- `.md` stays clean prose; all timing lives in the hidden sentence sidecar.
+- **All transcription data lives in the single `.md` — no separate JSON
+  sidecar** (this supersedes an earlier draft of this doc that split timing
+  into a hidden `.sentences.json`; CLAUDE.md's load-bearing constraint is the
+  current decision). Format:
+  - YAML-ish frontmatter: `model` (the ggml file that actually ran),
+    `speakerDetection` (bool), `transcribedAt` (ISO 8601). Frontmatter is
+    written the moment a job starts, before transcription runs, so a
+    killed/stopped job still leaves a file recording what it was run with.
+  - One `[HH:MM:SS.mmm - HH:MM:SS.mmm] text` line per segment, appended and
+    flushed as each segment is produced — not buffered to the end. An
+    optional trailing `[SPEAKER_TURN]` marker marks a tinydiarize speaker change.
+    This is also where sentence-highlight sync will later re-derive timing
+    from, once that milestone lands (see "Sentence highlighting" above).
+  - If the requested model id isn't recognized, `ModelManager` falls back to
+    the default model rather than failing outright (see "Model management"
+    below) — the frontmatter also carries `modelRequested` and
+    `modelFallback: true` in that case, so the file never reads as if the
+    requested model had been honored when it wasn't.
 
 ## USB import
 
@@ -185,6 +205,17 @@ vault/
   download/management UI and a `models/` dir; registry in config.
 - Capability detection checks which model files are present, not just which engine
   binaries exist.
+- **Unrecognized model id → visible fallback, never a silent one.** If a
+  requested model id doesn't match any entry in the catalog (e.g. a stale
+  last-used-model setting after a model tier is removed), `ModelManager`
+  substitutes its default model rather than failing the job outright. That
+  substitution is never silent: it's logged (`qWarning`) *and*, because this
+  app's transcripts are their own source of truth (see "Vault / file
+  layout"), recorded directly in the resulting `.md`'s frontmatter via
+  `modelRequested` + `modelFallback: true` — the file never reads as though
+  the requested model had actually been used. This is orthogonal to the
+  speaker-detection tdrz override above, which is an intentional, always-on
+  substitution rather than a fallback for bad input.
 
 ## Licensing
 

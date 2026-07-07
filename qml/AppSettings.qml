@@ -21,6 +21,12 @@ Settings {
 
     property string lastModel: "base.en"
 
+    // AI auto-labeling (DESIGN.md "Model management"): opt-in second pass
+    // after transcription, populates label/summary/tags via LabelingEngine.
+    // Off by default — it's an extra ~2.5GB model download plus GPU time
+    // per file, not something to silently switch on for everyone.
+    property bool autoLabelEnabled: false
+
     // Thin white translucent edge by default — "liquid glass" look.
     property bool rimEnabled: true
     property real rimWidth: 1
@@ -52,7 +58,8 @@ Settings {
         rimColor: "#99ffffff",
         useLabels: true,
         hideExtensionsSidebar: false,
-        hideExtensionsMainPanel: false
+        hideExtensionsMainPanel: false,
+        autoLabelEnabled: false
     })
 
     function isDefault(name) {

@@ -47,6 +47,7 @@ Popup {
                 || !AppSettings.isDefault("useLabels")
                 || !AppSettings.isDefault("hideExtensionsSidebar")
                 || !AppSettings.isDefault("hideExtensionsMainPanel")
+                || !AppSettings.isDefault("autoLabelEnabled")
     }
 
     background: Rectangle {
@@ -989,6 +990,71 @@ Popup {
                         active: hideExtensionsMainPanelResetButton.enabled && hideExtensionsMainPanelResetButton.hovered
                     }
                 }
+            }
+
+            Label {
+                text: qsTr("AI Auto-Labeling")
+                color: "white"
+                font.bold: true
+            }
+
+            RowLayout {
+                Layout.fillWidth: true
+                Label {
+                    Layout.fillWidth: true
+                    color: "white"
+                    text: qsTr("Auto-generate label, summary, and tags")
+                }
+                Switch {
+                    id: autoLabelEnabledSwitch
+                    checked: AppSettings.autoLabelEnabled
+                    hoverEnabled: true
+                    onToggled: AppSettings.autoLabelEnabled = checked
+
+                    HoverHandler {
+                        cursorShape: Qt.PointingHandCursor
+                    }
+                    HoverBorder {
+                        anchors.fill: parent
+                        active: autoLabelEnabledSwitch.hovered
+                    }
+                }
+                Button {
+                    id: autoLabelEnabledResetButton
+                    text: "↺"
+                    implicitWidth: 22
+                    implicitHeight: 22
+
+                    background: Rectangle {
+                        radius: AppSettings.borderRadius
+                        color: "transparent"
+                        border.width: 1
+                        border.color: "#3a3a3a"
+                    }
+                    enabled: !AppSettings.isDefault("autoLabelEnabled")
+                    opacity: enabled ? 1 : 0.35
+                    hoverEnabled: enabled
+                    onClicked: AppSettings.resetProperty("autoLabelEnabled")
+
+                    HoverHandler {
+                        cursorShape: Qt.PointingHandCursor
+                        enabled: autoLabelEnabledResetButton.enabled
+                    }
+                    HoverBorder {
+                        anchors.fill: parent
+                        active: autoLabelEnabledResetButton.enabled && autoLabelEnabledResetButton.hovered
+                    }
+                }
+            }
+
+            Label {
+                visible: autoLabelEnabledSwitch.checked
+                Layout.fillWidth: true
+                wrapMode: Text.WordWrap
+                text: qsTr("Runs a small local AI model (~2.5 GB download on first use) after each "
+                           + "transcription to generate a display label, summary, and tags.")
+                color: "#888888"
+                font.pixelSize: 11
             }
         }
     }

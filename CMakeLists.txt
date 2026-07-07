@@ -7,6 +7,7 @@ set(CMAKE_AUTOMOC ON)
 
 option(SUOP_ENABLE_VULKAN "Build whisper.cpp with Vulkan backend (cross-vendor GPU baseline)" ON)
 option(SUOP_ENABLE_CUDA "Build whisper.cpp with CUDA backend (NVIDIA fast path)" OFF)
+option(SUOP_ENABLE_LABELING "Build with llama.cpp for AI auto-labeling" ON)
 
 find_package(Qt6 6.7 REQUIRED COMPONENTS Core Gui Qml Quick QuickControls2 Multimedia Core5Compat)
 find_package(KF6WindowSystem REQUIRED)
@@ -21,6 +22,17 @@ set(WHISPER_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
 set(WHISPER_BUILD_TESTS OFF CACHE BOOL "" FORCE)
 set(WHISPER_BUILD_SERVER OFF CACHE BOOL "" FORCE)
 add_subdirectory(third_party/whisper.cpp)
+
+# llama.cpp (AI auto-labeling, see DESIGN.md "Model management"). Vendored
+# after whisper.cpp so its CMakeLists' `if (NOT TARGET ggml)` guard finds the
+# `ggml` target whisper.cpp already defined and reuses it, instead of trying
+# to build a second copy (both projects otherwise vendor their own ggml).
+if(SUOP_ENABLE_LABELING)
+    set(LLAMA_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+    set(LLAMA_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+    set(LLAMA_BUILD_SERVER OFF CACHE BOOL "" FORCE)
+    add_subdirectory(third_party/llama.cpp)
+endif()
 
 qt_add_executable(suopTranscriber
     src/main.cpp
@@ -56,6 +68,8 @@ qt_add_qml_module(suopTranscriber
         src/core/AudioDecoder.cpp
         src/core/WhisperCppEngine.h
         src/core/WhisperCppEngine.cpp
+        src/core/LabelingEngine.h
+        src/core/LabelingEngine.cpp
         src/core/ModelManager.h
         src/core/ModelManager.cpp
         src/core/TranscriptionController.h
@@ -76,7 +90,13 @@ target_link_libraries(suopTranscriber PRIVATE
     Qt6::Core5Compat
     KF6::WindowSystem
     whisper
+    llama
 )
+
+include(CTest)
+if(BUILD_TESTING)
+    add_subdirectory(tests)
+endif()
 
 add_custom_target(run
     COMMAND suopTranscriber
