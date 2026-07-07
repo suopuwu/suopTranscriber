@@ -164,6 +164,12 @@ Item {
                     hoverEnabled: true
                     onClicked: bottomBar.transcriptionController.clearFinished()
 
+                    background: Rectangle {
+                        radius: AppSettings.borderRadius
+                        color: clearButton.hovered ? "#3a3a3a" : "#2a2a2a"
+                        border.width: 1
+                        border.color: "#3a3a3a"
+                    }
                     HoverHandler {
                         cursorShape: Qt.PointingHandCursor
                     }

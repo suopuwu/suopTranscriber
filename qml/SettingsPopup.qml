@@ -9,9 +9,16 @@ Popup {
 
     signal changeVaultRequested()
 
-    width: 480
+    width: 440
     height: Math.min(contentColumn.implicitHeight + 32, maxHeight)
-    modal: true
+    // Non-modal: a modal Popup's input-blocking layer covers the ENTIRE
+    // window via Overlay.overlay, including the window-edge ResizeGrips
+    // (Main.qml) — that silently ate every resize attempt while the popup
+    // was open. `dim` is set explicitly below (not left to follow `modal`),
+    // and closePolicy already closes on an outside press, so the popup still
+    // looks and dismisses the same way; it just no longer blocks the rest of
+    // the window's input.
+    modal: false
     focus: true
     x: parent ? (parent.width - width) / 2 : 0
     y: parent ? (parent.height - height) / 2 : 0
@@ -81,15 +88,43 @@ Popup {
     }
 
     ScrollView {
+        id: scrollArea
         anchors.fill: parent
-        anchors.margins: 16
+        anchors.leftMargin: 16
+        anchors.topMargin: 16
+        anchors.bottomMargin: 16
+        // Reduced by the same 14px contentColumn reserves below for the
+        // scrollbar overlay — keeps the CONTENT symmetric (16px inset on
+        // both sides) by giving the scrollbar its own lane inside the right
+        // margin, instead of 14px of clearance stacking on top of a full
+        // 16px margin and making the popup look lopsided.
+        anchors.rightMargin: 2
         clip: true
         ScrollBar.horizontal.policy: ScrollBar.AlwaysOff
         opacity: settingsPopup.anyPressed ? 0 : 1
 
         ColumnLayout {
             id: contentColumn
-            width: parent.width
+            // NOT parent.width: a QML child declared directly inside
+            // ScrollView sits in its internal Flickable's contentItem, whose
+            // own width is otherwise driven BY this same child's implicit
+            // size when nothing else constrains it — "width: parent.width"
+            // is a binding loop that settles at contentColumn's own
+            // (unclamped) implicitWidth instead of the real viewport width.
+            // Binding to the ScrollView's own id breaks the loop: verified
+            // empirically (offscreen qml repro) that parent.width let a
+            // slider row's content stretch past the popup's actual bounds
+            // even though every individual row fit under naive arithmetic.
+            //
+            // -14: the Basic style's vertical ScrollBar is an OVERLAY —
+            // `parent: control; x: control.width - width` (confirmed in
+            // /usr/lib/qt6/qml/QtQuick/Controls/Basic/ScrollView.qml) — it
+            // reserves no layout space and floats flush against the
+            // ScrollView's right edge, right on top of content that fills
+            // the full width (e.g. the per-row reset buttons). Leaving a
+            // clearance gap here keeps it from covering them.
+            width: scrollArea.width - 14
+            clip: true
             spacing: 10
 
             RowLayout {
@@ -109,6 +144,12 @@ Popup {
                     hoverEnabled: enabled
                     onClicked: AppSettings.resetAll()
 
+                    background: Rectangle {
+                        radius: AppSettings.borderRadius
+                        color: resetAllButton.hovered ? "#3a3a3a" : "#2a2a2a"
+                        border.width: 1
+                        border.color: "#3a3a3a"
+                    }
                     HoverHandler {
                         cursorShape: Qt.PointingHandCursor
                         enabled: resetAllButton.enabled
@@ -133,6 +174,12 @@ Popup {
                     hoverEnabled: true
                     onClicked: settingsPopup.changeVaultRequested()
 
+                    background: Rectangle {
+                        radius: AppSettings.borderRadius
+                        color: changeVaultButton.hovered ? "#3a3a3a" : "#2a2a2a"
+                        border.width: 1
+                        border.color: "#3a3a3a"
+                    }
                     HoverHandler {
                         cursorShape: Qt.PointingHandCursor
                     }
@@ -152,13 +199,14 @@ Popup {
             RowLayout {
                 Layout.fillWidth: true
                 Label {
-                    Layout.fillWidth: true
+                    Layout.preferredWidth: 90
                     color: "white"
                     text: qsTr("Border radius")
                 }
                 Slider {
                     id: radiusSlider
                     Layout.fillWidth: true
+                    Layout.minimumWidth: 80
                     from: 0
                     to: 24
                     value: AppSettings.borderRadius
@@ -297,6 +345,12 @@ Popup {
                     hoverEnabled: true
                     onClicked: sidebarColorDialog.open()
 
+                    background: Rectangle {
+                        radius: AppSettings.borderRadius
+                        color: sidebarColorButton.hovered ? "#3a3a3a" : "#2a2a2a"
+                        border.width: 1
+                        border.color: "#3a3a3a"
+                    }
                     HoverHandler {
                         cursorShape: Qt.PointingHandCursor
                     }
@@ -336,13 +390,14 @@ Popup {
             RowLayout {
                 Layout.fillWidth: true
                 Label {
-                    Layout.fillWidth: true
+                    Layout.preferredWidth: 90
                     color: "white"
                     text: qsTr("Opacity")
                 }
                 Slider {
                     id: sidebarOpacitySlider
                     Layout.fillWidth: true
+                    Layout.minimumWidth: 80
                     from: 0
                     to: 1
                     value: AppSettings.sidebarOpacity
@@ -481,6 +536,12 @@ Popup {
                     hoverEnabled: true
                     onClicked: mainColorDialog.open()
 
+                    background: Rectangle {
+                        radius: AppSettings.borderRadius
+                        color: mainColorButton.hovered ? "#3a3a3a" : "#2a2a2a"
+                        border.width: 1
+                        border.color: "#3a3a3a"
+                    }
                     HoverHandler {
                         cursorShape: Qt.PointingHandCursor
                     }
@@ -520,13 +581,14 @@ Popup {
             RowLayout {
                 Layout.fillWidth: true
                 Label {
-                    Layout.fillWidth: true
+                    Layout.preferredWidth: 90
                     color: "white"
                     text: qsTr("Opacity")
                 }
                 Slider {
                     id: mainOpacitySlider
                     Layout.fillWidth: true
+                    Layout.minimumWidth: 80
                     from: 0
                     to: 1
                     value: AppSettings.mainOpacity
@@ -704,13 +766,14 @@ Popup {
             RowLayout {
                 Layout.fillWidth: true
                 Label {
-                    Layout.fillWidth: true
+                    Layout.preferredWidth: 90
                     color: "white"
                     text: qsTr("Width")
                 }
                 Slider {
                     id: rimWidthSlider
                     Layout.fillWidth: true
+                    Layout.minimumWidth: 80
                     from: 0
                     to: 8
                     value: AppSettings.rimWidth
@@ -794,6 +857,12 @@ Popup {
                     hoverEnabled: true
                     onClicked: rimColorDialog.open()
 
+                    background: Rectangle {
+                        radius: AppSettings.borderRadius
+                        color: rimColorButton.hovered ? "#3a3a3a" : "#2a2a2a"
+                        border.width: 1
+                        border.color: "#3a3a3a"
+                    }
                     HoverHandler {
                         cursorShape: Qt.PointingHandCursor
                     }

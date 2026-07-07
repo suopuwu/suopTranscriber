@@ -122,7 +122,17 @@ Rectangle {
         }
     }
 
+    // Item 10: live-updates as segments are written during an in-progress
+    // transcription of the currently-open file — reading .progress here
+    // (even though the value itself isn't used) makes this binding
+    // re-evaluate on every per-segment progress tick, not just at
+    // completion. Gated on currentFile matching so unrelated jobs' progress
+    // ticks don't cause pointless re-reads.
     readonly property string transcriptBody: {
+        if (mainPanel.transcriptionController && mainPanel.player
+                && mainPanel.transcriptionController.currentFile.toString() === mainPanel.player.source.toString()) {
+            void mainPanel.transcriptionController.progress
+        }
         if (mainPanel.orphanedMdPath !== "" && mainPanel.transcriptionController)
             return mainPanel.transcriptionController.readTranscriptBody("file://" + mainPanel.orphanedMdPath)
         if (mainPanel.player && mainPanel.player.source.toString() !== "" && mainPanel.hasStoredMetadata
@@ -200,8 +210,11 @@ Rectangle {
             idx = lower.indexOf(q, 0) // wrap around
         mainPanel.searchMatchIndex = idx
         if (idx !== -1) {
+            // select() alone still scrolls the match into view and shows
+            // the selection — no need to steal focus from the search field,
+            // which would stop repeated Enter presses from working (each
+            // jumps to the next match without needing to re-click into it).
             transcriptArea.select(idx, idx + q.length)
-            transcriptArea.forceActiveFocus()
         }
     }
 
@@ -214,6 +227,17 @@ Rectangle {
         function onFinished() {
             mainPanel.refreshMetadata()
             mainPanel.refreshOrphanedMetadata()
+        }
+        // Item 10: frontmatter is written at job START (durability, see
+        // TranscriptionController), before any segment lines exist — so
+        // hasStoredMetadata can flip true well before onFinished fires.
+        // Re-checking on every progress tick (for the file currently open)
+        // is what lets transcriptBody's binding start reading a live,
+        // in-progress file instead of waiting for completion.
+        function onProgressChanged() {
+            if (mainPanel.player
+                    && mainPanel.transcriptionController.currentFile.toString() === mainPanel.player.source.toString())
+                mainPanel.refreshMetadata()
         }
     }
     onSearchQueryChanged: mainPanel.searchMatchIndex = -1
@@ -247,6 +271,12 @@ Rectangle {
             hoverEnabled: true
             onClicked: mainPanel.openVaultRequested()
 
+            background: Rectangle {
+                radius: AppSettings.borderRadius
+                color: openVaultButton.hovered ? "#3a3a3a" : "#2a2a2a"
+                border.width: 1
+                border.color: "#3a3a3a"
+            }
             HoverHandler {
                 cursorShape: Qt.PointingHandCursor
             }
@@ -287,12 +317,25 @@ Rectangle {
                     enabled: playPauseButton.enabled
                     onTapped: mainPanel.player.togglePlay()
                 }
+                // Distinct button background (not just the bare panel) —
+                // fixed dark shades so it reads as a button regardless of
+                // the user's configurable panel background color.
+                Rectangle {
+                    anchors.fill: parent
+                    radius: AppSettings.borderRadius
+                    color: playPauseHover.hovered ? "#3a3a3a" : "#2a2a2a"
+                }
                 HoverBorder {
                     anchors.fill: parent
                     active: playPauseButton.enabled && playPauseHover.hovered
                 }
                 Text {
                     anchors.centerIn: parent
+                    // The "▶" glyph's own em-box isn't visually centered on
+                    // its triangle (most fonts pad it left) — nudge right so
+                    // it looks centered in the button; "⏸" is symmetric and
+                    // needs no offset.
+                    anchors.horizontalCenterOffset: text === "▶" ? 1 : 0
                     text: mainPanel.player && mainPanel.player.playing ? "⏸" : "▶"
                     color: playPauseButton.enabled ? "white" : "#666666"
                     font.pixelSize: 16
@@ -323,8 +366,8 @@ Rectangle {
 
                     Rectangle {
                         anchors.centerIn: parent
-                        width: parent.width + 8
-                        height: parent.height + 8
+                        width: parent.width + 2
+                        height: parent.height + 2
                         radius: width / 2
                         color: "transparent"
                         border.width: 1
@@ -383,6 +426,48 @@ Rectangle {
                     onActiveFocusChanged: if (!activeFocus && mainPanel.renamingTitle) mainPanel.commitRename(text)
 
                     Keys.onEscapePressed: mainPanel.renamingTitle = false
+                }
+            }
+
+            // Item 9: regenerate auto-title — re-runs just the AI labeling
+            // pass on the already-transcribed text (no re-transcription).
+            // Visible whenever there's a transcript to label, independent of
+            // AppSettings.autoLabelEnabled (that setting is about running
+            // automatically after each transcription, not gating manual
+            // regeneration).
+            Item {
+                id: regenerateLabelButton
+                Layout.preferredWidth: 22
+                Layout.preferredHeight: 22
+                visible: mainPanel.transcriptionController
+                         && (mainPanel.orphanedMdPath !== "" || mainPanel.hasStoredMetadata)
+                readonly property url targetUrl: mainPanel.orphanedMdPath !== ""
+                    ? ("file://" + mainPanel.orphanedMdPath) : mainPanel.player.source
+                enabled: visible && !mainPanel.transcriptionController.isQueued(regenerateLabelButton.targetUrl)
+
+                ToolTip.visible: regenerateLabelHover.hovered
+                ToolTip.text: qsTr("Regenerate auto-title")
+                ToolTip.delay: 500
+
+                HoverHandler {
+                    id: regenerateLabelHover
+                    cursorShape: Qt.PointingHandCursor
+                    enabled: regenerateLabelButton.enabled
+                }
+                TapHandler {
+                    enabled: regenerateLabelButton.enabled
+                    onTapped: mainPanel.transcriptionController.relabel(regenerateLabelButton.targetUrl,
+                                                                         mainPanel.vaultPath)
+                }
+                HoverBorder {
+                    anchors.fill: parent
+                    active: regenerateLabelButton.enabled && regenerateLabelHover.hovered
+                }
+                Text {
+                    anchors.centerIn: parent
+                    text: "↻"
+                    color: regenerateLabelButton.enabled ? "#dddddd" : "#666666"
+                    font.pixelSize: 14
                 }
             }
 
@@ -564,6 +649,13 @@ Rectangle {
                                                                          speakerDetectionToggle.checked,
                                                                          AppSettings.autoLabelEnabled)
 
+                background: Rectangle {
+                    radius: AppSettings.borderRadius
+                    color: transcribeButton.hovered ? "#3a3a3a" : "#2a2a2a"
+                    opacity: transcribeButton.enabled ? 1 : 0.5
+                    border.width: 1
+                    border.color: "#3a3a3a"
+                }
                 HoverHandler {
                     cursorShape: Qt.PointingHandCursor
                     enabled: transcribeButton.enabled

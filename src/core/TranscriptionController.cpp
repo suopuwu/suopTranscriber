@@ -127,14 +127,16 @@ void appendSegmentLine(QFile &mdFile, const Segment &segment)
 // AI auto-labeling's second pass runs AFTER the primary frontmatter+segments
 // have already been written and mdFile closed (needs the full transcript
 // text, which isn't known until transcription completes) — reopens the same
-// .md and appends label/summary/tags. Unlike setLabel()'s public API this is
-// best-effort: it only ever runs against a frontmatter block THIS SAME job
-// just wrote moments ago (so label/summary/tags can never already be present
-// — append, not splice-or-replace), and failures are logged, not surfaced as
-// job failures (see TranscriptionController::transcribe()'s autoLabel doc).
-// Newlines are stripped from the values since this is a flat line-based
-// format — a raw '\n' inside a JSON string (from a "\n" escape) would
-// otherwise corrupt the frontmatter block.
+// .md and splices in label/summary/tags. Splice-or-append (not append-only):
+// a fresh transcribe job's frontmatter never has these keys yet (so this
+// falls through to append), but "regenerate auto-title" (relabel, see
+// TranscriptionController::relabel()) reruns this against a .md that already
+// has them — must replace in place, not duplicate. Failures are logged, not
+// surfaced as job failures (see TranscriptionController::transcribe()'s
+// autoLabel doc) — labeling is a bonus pass, never a substitute for the
+// transcript itself. Newlines are stripped from the values since this is a
+// flat line-based format — a raw '\n' inside a JSON string (from a "\n"
+// escape) would otherwise corrupt the frontmatter block.
 void writeLabelingFields(const QString &mdPath, const LabelResult &result)
 {
     QFile mdFile(mdPath);
@@ -165,9 +167,19 @@ void writeLabelingFields(const QString &mdPath, const LabelResult &result)
     mdFile.close();
 
     auto sanitize = [](QString s) { return s.replace(QLatin1Char('\n'), QLatin1Char(' ')).replace(QLatin1Char('\r'), QLatin1Char(' ')); };
-    frontmatterLines.append(QStringLiteral("label: ") + sanitize(result.label));
-    frontmatterLines.append(QStringLiteral("summary: ") + sanitize(result.summary));
-    frontmatterLines.append(QStringLiteral("tags: ") + sanitize(result.tags));
+    auto spliceOrAppend = [&frontmatterLines](const QString &key, const QString &value) {
+        for (QString &fmLine : frontmatterLines) {
+            const int colon = fmLine.indexOf(':');
+            if (colon >= 0 && fmLine.left(colon).trimmed() == key) {
+                fmLine = key + QStringLiteral(": ") + value;
+                return;
+            }
+        }
+        frontmatterLines.append(key + QStringLiteral(": ") + value);
+    };
+    spliceOrAppend(QStringLiteral("label"), sanitize(result.label));
+    spliceOrAppend(QStringLiteral("summary"), sanitize(result.summary));
+    spliceOrAppend(QStringLiteral("tags"), sanitize(result.tags));
 
     if (!mdFile.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
         qWarning() << "auto-label: could not reopen" << mdPath << "for writing";
@@ -181,6 +193,23 @@ void writeLabelingFields(const QString &mdPath, const LabelResult &result)
     out << body;
     out.flush();
     mdFile.flush();
+}
+
+// Plain prose for the labeling prompt (see relabel()'s slot below): strips
+// the "[start - end]"/" [SPEAKER_TURN]" formatting back out of an existing
+// transcript body, leaving just the spoken text — same shape as the text
+// TranscriptionWorker::run() accumulates live during a fresh transcription.
+QString plainTextFromTranscriptBody(const QString &body)
+{
+    QStringList pieces;
+    QRegularExpressionMatchIterator it = segmentLinePattern().globalMatch(body);
+    while (it.hasNext()) {
+        const QRegularExpressionMatch m = it.next();
+        const QString text = m.captured(9).trimmed();
+        if (!text.isEmpty())
+            pieces.append(text);
+    }
+    return pieces.join(QLatin1Char(' '));
 }
 
 }
@@ -260,29 +289,51 @@ public slots:
         // AI auto-labeling (opt-in, see DESIGN.md "Model management"): a
         // failure here never fails the job — the primary transcript above is
         // already the thing that matters, this is a bonus pass.
-        if (autoLabel) {
-            QString labelError;
-            const QString labelModelPath = ModelManager::ensureLabelModel(QUrl::fromLocalFile(vaultPath), &labelError);
-            if (labelModelPath.isEmpty()) {
-                qWarning() << "auto-label: model unavailable:" << labelError;
-            } else {
-                if (!m_labelingEngine || !m_labelingEngine->isValid() || m_labelModelPath != labelModelPath) {
-                    m_labelingEngine = std::make_unique<LabelingEngine>(labelModelPath);
-                    m_labelModelPath = labelModelPath;
-                }
-                if (!m_labelingEngine->isValid()) {
-                    qWarning() << "auto-label: failed to load model at" << labelModelPath;
-                } else {
-                    QString genError;
-                    const auto result = m_labelingEngine->label(transcriptText, &genError);
-                    if (result)
-                        writeLabelingFields(mdFile.fileName(), *result);
-                    else
-                        qWarning() << "auto-label: generation failed:" << genError;
-                }
-            }
+        if (autoLabel)
+            runLabelingPass(vaultPath, transcriptText, mdFile.fileName());
+
+        emit finished(true, {});
+    }
+
+    // "Regenerate auto-title" (item 9): re-runs JUST the labeling pass on an
+    // already-transcribed file — no audio decode, no whisper, no frontmatter
+    // reset. Unlike the autoLabel branch above, a failure here IS the job's
+    // result (there's nothing else for this job to accomplish).
+    void relabelJob(const QString &filePath, const QString &vaultPath)
+    {
+        const QString mdPath = sidecarPath(filePath);
+        if (!QFileInfo::exists(mdPath)) {
+            emit finished(false, QStringLiteral("%1 has not been transcribed yet").arg(filePath));
+            return;
         }
 
+        QFile mdFile(mdPath);
+        if (!mdFile.open(QIODevice::ReadOnly | QIODevice::Text)) {
+            emit finished(false, QStringLiteral("could not open %1").arg(mdPath));
+            return;
+        }
+        QTextStream in(&mdFile);
+        if (in.readLine() != QStringLiteral("---")) {
+            emit finished(false, QStringLiteral("%1 has no frontmatter block").arg(mdPath));
+            return;
+        }
+        QString line;
+        while (!(line = in.readLine()).isNull() && line != QStringLiteral("---")) {
+            // skip frontmatter lines
+        }
+        const QString transcriptText = plainTextFromTranscriptBody(in.readAll());
+        mdFile.close();
+
+        if (transcriptText.trimmed().isEmpty()) {
+            emit finished(false, QStringLiteral("%1 has no transcript text to label").arg(mdPath));
+            return;
+        }
+
+        QString error;
+        if (!runLabelingPass(vaultPath, transcriptText, mdPath, &error)) {
+            emit finished(false, error);
+            return;
+        }
         emit finished(true, {});
     }
 
@@ -291,6 +342,49 @@ signals:
     void finished(bool ok, const QString &error);
 
 private:
+    // Shared by the autoLabel branch of run() and relabelJob(): resolve/warm
+    // the label model, generate, and splice the result into mdPath's
+    // frontmatter. Returns false + *errorOut on failure; callers decide
+    // whether that's fatal (relabelJob) or just logged (run()'s bonus pass).
+    bool runLabelingPass(const QString &vaultPath, const QString &transcriptText, const QString &mdPath,
+                         QString *errorOut = nullptr)
+    {
+        QString labelError;
+        const QString labelModelPath = ModelManager::ensureLabelModel(QUrl::fromLocalFile(vaultPath), &labelError);
+        if (labelModelPath.isEmpty()) {
+            const QString msg = QStringLiteral("auto-label model unavailable: %1").arg(labelError);
+            if (errorOut)
+                *errorOut = msg;
+            else
+                qWarning() << msg;
+            return false;
+        }
+        if (!m_labelingEngine || !m_labelingEngine->isValid() || m_labelModelPath != labelModelPath) {
+            m_labelingEngine = std::make_unique<LabelingEngine>(labelModelPath);
+            m_labelModelPath = labelModelPath;
+        }
+        if (!m_labelingEngine->isValid()) {
+            const QString msg = QStringLiteral("failed to load labeling model at %1").arg(labelModelPath);
+            if (errorOut)
+                *errorOut = msg;
+            else
+                qWarning() << msg;
+            return false;
+        }
+        QString genError;
+        const auto result = m_labelingEngine->label(transcriptText, &genError);
+        if (!result) {
+            const QString msg = QStringLiteral("auto-label generation failed: %1").arg(genError);
+            if (errorOut)
+                *errorOut = msg;
+            else
+                qWarning() << msg;
+            return false;
+        }
+        writeLabelingFields(mdPath, *result);
+        return true;
+    }
+
     std::unique_ptr<WhisperCppEngine> m_engine;
     QString m_modelPath;
     std::unique_ptr<LabelingEngine> m_labelingEngine;
@@ -355,6 +449,25 @@ void TranscriptionController::transcribeAll(const QVariantList &fileUrls, const 
         transcribe(v.toUrl(), vaultUrl, modelId, speakerDetection, autoLabel);
 }
 
+void TranscriptionController::relabel(const QUrl &fileUrl, const QUrl &vaultUrl)
+{
+    // Same dedup rule as transcribe(): a Queued/Active entry (whether a full
+    // transcribe or a relabel-only job) blocks a duplicate request.
+    if (isQueued(fileUrl))
+        return;
+
+    Job job;
+    job.fileUrl = fileUrl;
+    job.vaultUrl = vaultUrl;
+    job.relabelOnly = true;
+    job.status = JobStatus::Queued;
+    m_jobs.push_back(job);
+    emit queueChanged();
+
+    if (m_activeIndex < 0)
+        startJob(m_jobs.size() - 1);
+}
+
 void TranscriptionController::startJob(int index)
 {
     m_activeIndex = index;
@@ -370,10 +483,16 @@ void TranscriptionController::startJob(int index)
     emit currentFileChanged();
     emit queueChanged();
 
-    QMetaObject::invokeMethod(m_worker, "run", Qt::QueuedConnection,
-                               Q_ARG(QString, job.fileUrl.toLocalFile()), Q_ARG(QString, job.vaultUrl.toLocalFile()),
-                               Q_ARG(QString, job.modelId), Q_ARG(bool, job.speakerDetection),
-                               Q_ARG(bool, job.autoLabel));
+    if (job.relabelOnly) {
+        QMetaObject::invokeMethod(m_worker, "relabelJob", Qt::QueuedConnection,
+                                   Q_ARG(QString, job.fileUrl.toLocalFile()),
+                                   Q_ARG(QString, job.vaultUrl.toLocalFile()));
+    } else {
+        QMetaObject::invokeMethod(m_worker, "run", Qt::QueuedConnection,
+                                   Q_ARG(QString, job.fileUrl.toLocalFile()),
+                                   Q_ARG(QString, job.vaultUrl.toLocalFile()), Q_ARG(QString, job.modelId),
+                                   Q_ARG(bool, job.speakerDetection), Q_ARG(bool, job.autoLabel));
+    }
 }
 
 void TranscriptionController::onWorkerFinished(bool ok, const QString &error)

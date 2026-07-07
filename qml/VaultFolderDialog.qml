@@ -65,6 +65,13 @@ Popup {
                 hoverEnabled: true
                 onClicked: vaultDialog.currentFolder = folderModel.parentFolder
 
+                background: Rectangle {
+                    radius: AppSettings.borderRadius
+                    color: upButton.hovered ? "#3a3a3a" : "#2a2a2a"
+                    opacity: upButton.enabled ? 1 : 0.5
+                    border.width: 1
+                    border.color: "#3a3a3a"
+                }
                 HoverHandler {
                     cursorShape: Qt.PointingHandCursor
                     enabled: upButton.enabled
@@ -145,6 +152,12 @@ Popup {
                 hoverEnabled: true
                 onClicked: vaultDialog.close()
 
+                background: Rectangle {
+                    radius: AppSettings.borderRadius
+                    color: cancelButton.hovered ? "#3a3a3a" : "#2a2a2a"
+                    border.width: 1
+                    border.color: "#3a3a3a"
+                }
                 HoverHandler {
                     cursorShape: Qt.PointingHandCursor
                 }
@@ -167,6 +180,13 @@ Popup {
                     vaultDialog.close()
                 }
 
+                background: Rectangle {
+                    radius: AppSettings.borderRadius
+                    color: openButton.hovered ? "#3a3a3a" : "#2a2a2a"
+                    opacity: openButton.enabled ? 1 : 0.5
+                    border.width: 1
+                    border.color: "#3a3a3a"
+                }
                 HoverHandler {
                     cursorShape: Qt.PointingHandCursor
                     enabled: openButton.enabled

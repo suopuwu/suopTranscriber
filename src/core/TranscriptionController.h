@@ -74,6 +74,14 @@ public:
     // True if fileUrl currently has a Queued or Active entry.
     Q_INVOKABLE bool isQueued(const QUrl &fileUrl) const;
 
+    // "Regenerate auto-title" (item 9): re-runs just the AI auto-labeling
+    // pass on an already-transcribed file — reads the EXISTING transcript
+    // text, does not re-transcribe audio. Queued through the same job/worker
+    // infrastructure as transcribe() (dedup, persistent job list) since it's
+    // real GPU work; unlike transcribe()'s autoLabel option, a failure here
+    // IS the job's result (there's nothing else for this job to accomplish).
+    Q_INVOKABLE void relabel(const QUrl &fileUrl, const QUrl &vaultUrl);
+
     // Reads the frontmatter (model/speakerDetection/transcribedAt/label/...)
     // out of a file's sibling .md, if one exists yet. Empty map if not
     // transcribed. If the requested model id wasn't recognized and
@@ -141,6 +149,7 @@ private:
         QString modelId;
         bool speakerDetection = false;
         bool autoLabel = false;
+        bool relabelOnly = false;
         JobStatus status = JobStatus::Queued;
         QString error;
     };

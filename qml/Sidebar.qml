@@ -13,7 +13,9 @@ Rectangle {
     signal orphanedMdActivated(string path)
 
     property string searchQuery: ""
-    property bool searchIncludeTranscriptions: false
+    // Transcriptions are searched by default (labels/tags always are); the
+    // checkbox lets the user EXCLUDE them, e.g. for a quick label-only scan.
+    property bool searchIncludeTranscriptions: true
     property bool searchExpanded: false
 
     // path -> true, populated/depopulated by delegates as they realize/
@@ -74,7 +76,12 @@ Rectangle {
                         const paths = Object.keys(sidebar.untranscribedPaths)
                         if (paths.length === 0)
                             return
-                        sidebar.transcriptionController.transcribeAll(paths, sidebar.vaultPath, AppSettings.lastModel,
+                        // Model paths are raw local paths, not file:// URLs
+                        // (see VaultTreeModel's PathRole) — Q_INVOKABLE
+                        // QUrl params need the scheme or QUrl::toLocalFile()
+                        // silently returns empty.
+                        const urls = paths.map((p) => "file://" + p)
+                        sidebar.transcriptionController.transcribeAll(urls, sidebar.vaultPath, AppSettings.lastModel,
                                                                         false, AppSettings.autoLabelEnabled)
                     }
                 }
@@ -148,7 +155,7 @@ Rectangle {
 
             CheckBox {
                 id: includeTranscriptionsBox
-                text: qsTr("+transcriptions")
+                text: qsTr("Search transcriptions")
                 checked: sidebar.searchIncludeTranscriptions
                 onToggled: sidebar.searchIncludeTranscriptions = checked
 
@@ -248,7 +255,7 @@ Rectangle {
             Component.onDestruction: sidebar.setBulkEligible(treeDelegate.path, false)
 
             readonly property var metadata: (treeDelegate.isAudio && sidebar.transcriptionController)
-                ? sidebar.transcriptionController.readMetadata(treeDelegate.path) : ({})
+                ? sidebar.transcriptionController.readMetadata("file://" + treeDelegate.path) : ({})
             readonly property bool matchesSearch: {
                 if (sidebar.searchQuery === "")
                     return true
@@ -262,7 +269,7 @@ Rectangle {
                 if (tags.indexOf(q) !== -1)
                     return true
                 if (sidebar.searchIncludeTranscriptions && treeDelegate.status === 2 && sidebar.transcriptionController) {
-                    const body = sidebar.transcriptionController.readTranscriptBody(treeDelegate.path).toLowerCase()
+                    const body = sidebar.transcriptionController.readTranscriptBody("file://" + treeDelegate.path).toLowerCase()
                     if (body.indexOf(q) !== -1)
                         return true
                 }
@@ -333,30 +340,44 @@ Rectangle {
                 }
             }
 
-            Button {
+            Item {
                 id: rowTranscribeButton
                 anchors.right: parent.right
                 anchors.rightMargin: 8
                 anchors.verticalCenter: parent.verticalCenter
-                text: qsTr("Transcribe")
+                width: 20
+                height: 20
                 opacity: (rowHover.hovered && treeDelegate.bulkEligible) ? 1 : 0
                 enabled: opacity > 0
-                hoverEnabled: true
-                onClicked: sidebar.transcriptionController.transcribe(treeDelegate.path, sidebar.vaultPath,
-                                                                       AppSettings.lastModel, false,
-                                                                       AppSettings.autoLabelEnabled)
 
                 Behavior on opacity {
                     NumberAnimation { duration: 120 }
                 }
 
+                ToolTip.visible: rowTranscribeHover.hovered
+                ToolTip.text: qsTr("Transcribe")
+                ToolTip.delay: 500
+
                 HoverHandler {
+                    id: rowTranscribeHover
                     cursorShape: Qt.PointingHandCursor
                     enabled: rowTranscribeButton.enabled
                 }
+                TapHandler {
+                    enabled: rowTranscribeButton.enabled
+                    onTapped: sidebar.transcriptionController.transcribe(
+                                  "file://" + treeDelegate.path, sidebar.vaultPath, AppSettings.lastModel, false,
+                                  AppSettings.autoLabelEnabled)
+                }
                 HoverBorder {
                     anchors.fill: parent
-                    active: rowTranscribeButton.enabled && rowTranscribeButton.hovered
+                    active: rowTranscribeButton.enabled && rowTranscribeHover.hovered
+                }
+                Text {
+                    anchors.centerIn: parent
+                    text: "⤒"
+                    color: "#dddddd"
+                    font.pixelSize: 13
                 }
             }
         }

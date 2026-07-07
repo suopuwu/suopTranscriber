@@ -448,6 +448,76 @@ private slots:
         QVERIFY2(!meta.value("summary").toString().isEmpty(), "auto-label must populate summary");
         QVERIFY2(!meta.value("tags").toString().isEmpty(), "auto-label must populate tags");
     }
+
+    // Item 9: "regenerate auto-title" — relabel() re-runs ONLY the labeling
+    // pass on an already-transcribed file (no re-transcription) and, unlike
+    // a fresh transcribe's autoLabel pass (which only ever appends, since
+    // those keys can't already exist), must REPLACE existing label/summary/
+    // tags in place rather than duplicating them.
+    void relabel_regeneratesWithoutRetranscribing_andReplacesNotDuplicates()
+    {
+        const QString whisperModelPath = locateRealModel();
+        if (whisperModelPath.isEmpty())
+            QSKIP("no real ggml model available; set SUOP_TEST_MODEL or transcribe once in the app");
+        const QString labelModelPath = locateRealLabelModel();
+        if (labelModelPath.isEmpty())
+            QSKIP("no real label GGUF model available; set SUOP_TEST_LABEL_MODEL to run this test");
+        if (QStandardPaths::findExecutable(QStringLiteral("ffmpeg")).isEmpty())
+            QSKIP("ffmpeg not on PATH — needed to decode the sample (DESIGN.md: ffmpeg decodes, Qt only plays)");
+
+        QTemporaryDir vault;
+        QVERIFY(vault.isValid());
+        const QString modelsDir = vault.path() + "/.transcriber/models";
+        QVERIFY(QDir().mkpath(modelsDir));
+        QVERIFY(QFile::copy(whisperModelPath, modelsDir + "/ggml-base.en.bin"));
+        QVERIFY(QFile::copy(labelModelPath, modelsDir + "/Qwen3-4B-Instruct-2507-Q4_K_M.gguf"));
+
+        const QString samplePath = vault.path() + "/jfk.wav";
+        QVERIFY(QFile::copy(QStringLiteral(SUOP_SAMPLES_DIR "/jfk.wav"), samplePath));
+        const QString mdPath = vault.path() + "/jfk.md";
+
+        TranscriptionController controller;
+        const QUrl audioUrl = QUrl::fromLocalFile(samplePath);
+        const QUrl vaultUrl = QUrl::fromLocalFile(vault.path());
+
+        // Plain transcribe first — NO autoLabel — so label/summary/tags
+        // don't exist yet.
+        {
+            QSignalSpy spy(&controller, &TranscriptionController::finished);
+            controller.transcribe(audioUrl, vaultUrl, QStringLiteral("base.en"), false, /*autoLabel=*/false);
+            QVERIFY(spy.wait(30000));
+            QVERIFY2(spy.at(0).at(1).toBool(), qPrintable(spy.at(0).at(2).toString()));
+        }
+        QVERIFY(controller.readMetadata(audioUrl).value("label").toString().isEmpty());
+
+        // relabel() must not require re-transcription — assert the segment
+        // lines are untouched before/after by comparing the transcript body.
+        const QString bodyBeforeRelabel = controller.readTranscriptBody(audioUrl);
+
+        {
+            QSignalSpy spy(&controller, &TranscriptionController::finished);
+            controller.relabel(audioUrl, vaultUrl);
+            QVERIFY(spy.wait(30000));
+            QVERIFY2(spy.at(0).at(1).toBool(), qPrintable(spy.at(0).at(2).toString()));
+        }
+        QCOMPARE(controller.readTranscriptBody(audioUrl), bodyBeforeRelabel);
+        const QString firstLabel = controller.readMetadata(audioUrl).value("label").toString();
+        QVERIFY2(!firstLabel.isEmpty(), "relabel() must populate label from the existing transcript");
+
+        // Regenerating again must REPLACE, not duplicate, the frontmatter
+        // keys — read the raw file and assert each key appears exactly once.
+        {
+            QSignalSpy spy(&controller, &TranscriptionController::finished);
+            controller.relabel(audioUrl, vaultUrl);
+            QVERIFY(spy.wait(30000));
+            QVERIFY2(spy.at(0).at(1).toBool(), qPrintable(spy.at(0).at(2).toString()));
+        }
+        const QString raw = readAllBytes(mdPath);
+        QCOMPARE(raw.count(QStringLiteral("\nlabel:")), 1);
+        QCOMPARE(raw.count(QStringLiteral("\nsummary:")), 1);
+        QCOMPARE(raw.count(QStringLiteral("\ntags:")), 1);
+        QCOMPARE(controller.readTranscriptBody(audioUrl), bodyBeforeRelabel);
+    }
 };
 
 QTEST_GUILESS_MAIN(TstTranscriptFormat)

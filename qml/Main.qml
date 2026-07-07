@@ -134,33 +134,43 @@ ApplicationWindow {
         // glass) — these fillers sit only behind their divider-facing rounded
         // corners (sized/positioned in updateBlurRegions), not full-bleed,
         // so they don't sit behind the panels' own translucent bodies and
-        // defeat the blur-behind effect. Filled with the app's own dark
-        // chrome color (matching TitleBar/BottomBar) rather than a generic
-        // palette color, which didn't match anything and looked like a
-        // stray colored square poking through (Milestone 4 Task 6).
+        // defeat the blur-behind effect. Milestone 4 filled these with a
+        // fixed dark chrome color ("#1a1a1a") to fix a mismatched-palette-gray
+        // square — but a FIXED opaque color still doesn't match either
+        // panel's own (user-configurable, and possibly translucent) color —
+        // reported again as "squares poking into the panels" whenever
+        // transparency is enabled, since a solid patch next to a blurred
+        // translucent panel always reads as a mismatch. Each filler now uses
+        // the SAME Qt.rgba(color, opacity) formula as the panel it sits next
+        // to, so it blends into the same blurred backdrop instead of
+        // guessing a fixed shade.
         Rectangle {
             id: cornerFillSidebarTR
             width: AppSettings.borderRadius
             height: AppSettings.borderRadius
-            color: "#1a1a1a"
+            color: Qt.rgba(AppSettings.sidebarBackgroundColor.r, AppSettings.sidebarBackgroundColor.g,
+                           AppSettings.sidebarBackgroundColor.b, AppSettings.sidebarOpacity)
         }
         Rectangle {
             id: cornerFillSidebarBR
             width: AppSettings.borderRadius
             height: AppSettings.borderRadius
-            color: "#1a1a1a"
+            color: Qt.rgba(AppSettings.sidebarBackgroundColor.r, AppSettings.sidebarBackgroundColor.g,
+                           AppSettings.sidebarBackgroundColor.b, AppSettings.sidebarOpacity)
         }
         Rectangle {
             id: cornerFillMainTL
             width: AppSettings.borderRadius
             height: AppSettings.borderRadius
-            color: "#1a1a1a"
+            color: Qt.rgba(AppSettings.mainBackgroundColor.r, AppSettings.mainBackgroundColor.g,
+                           AppSettings.mainBackgroundColor.b, AppSettings.mainOpacity)
         }
         Rectangle {
             id: cornerFillMainBL
             width: AppSettings.borderRadius
             height: AppSettings.borderRadius
-            color: "#1a1a1a"
+            color: Qt.rgba(AppSettings.mainBackgroundColor.r, AppSettings.mainBackgroundColor.g,
+                           AppSettings.mainBackgroundColor.b, AppSettings.mainOpacity)
         }
 
         ColumnLayout {
