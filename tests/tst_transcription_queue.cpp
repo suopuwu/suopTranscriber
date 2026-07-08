@@ -286,6 +286,38 @@ private slots:
         QTRY_COMPARE(statusOf(controller, file), QStringLiteral("failed"));
         QCOMPARE(controller.currentFile(), QUrl());
     }
+
+    // 2026-07-07: renameSpeaker() is queued through this SAME job pipeline
+    // (not a side channel invisible to the UI) — it must show up in
+    // tasksTotal/jobs() like any other task, the way the user expects to see
+    // it as a real background task, not just "async and untracked".
+    void renameSpeaker_showsUpAsATaskInTheJobQueue()
+    {
+        VaultFixture vault;
+        const QUrl audioUrl = vault.audioUrl("interview.wav");
+        QFile md(vault.dir.path() + "/interview.md");
+        QVERIFY(md.open(QIODevice::WriteOnly));
+        md.write("---\nmodel: ggml-base.en.bin\nspeakerDetection: true\n---\n\n"
+                 "[0] [Speaker 1] hi\n[3.5] [Speaker 2] hello\n");
+        md.close();
+
+        TranscriptionController controller;
+        QSignalSpy queueChangedSpy(&controller, &TranscriptionController::queueChanged);
+        QSignalSpy renamedSpy(&controller, &TranscriptionController::speakerRenamed);
+
+        controller.renameSpeaker(audioUrl, QStringLiteral("Speaker 1"), QStringLiteral("Alice"));
+
+        // Queued (and started, since nothing else is running) synchronously —
+        // observable in tasksTotal/jobs() immediately, same timing as
+        // transcribe()'s own startJob() call.
+        QCOMPARE(controller.tasksTotal(), 1);
+        QVERIFY(queueChangedSpy.count() >= 1);
+        QCOMPARE(controller.jobs().first().toMap().value("fileUrl").toUrl(), audioUrl);
+
+        QVERIFY(renamedSpy.wait(5000));
+        QTRY_COMPARE(statusOf(controller, audioUrl), QStringLiteral("done"));
+        QCOMPARE(controller.tasksCompleted(), 1);
+    }
 };
 
 QTEST_GUILESS_MAIN(TstTranscriptionQueue)

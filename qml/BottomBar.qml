@@ -24,6 +24,10 @@ Item {
     readonly property real taskProgress: transcriptionController ? transcriptionController.progress : 0
     readonly property int tasksCompleted: transcriptionController ? transcriptionController.tasksCompleted : 0
     readonly property int tasksTotal: transcriptionController ? transcriptionController.tasksTotal : 0
+    // Whether a job is actively running right now — distinct from tasksTotal
+    // (which also counts Done/Failed jobs still sitting in the persistent,
+    // dismissible history list, see TranscriptionController's class doc).
+    readonly property bool busy: transcriptionController ? transcriptionController.busy : false
 
     implicitHeight: 28
 
@@ -130,7 +134,10 @@ Item {
             from: 0
             to: 1
             value: bottomBar.taskProgress
-            visible: bottomBar.tasksTotal > 0
+            // Only while something is ACTIVELY running — tasksTotal alone
+            // would keep this visible (frozen, meaningless) after every job
+            // finishes, since finished jobs stay listed until dismissed.
+            visible: bottomBar.busy
         }
 
         Item {

@@ -89,6 +89,13 @@ Item {
     property color highlightColor: "#3a5a7a"
     property real highlightRadius: 8
 
+    // Transcript gutter's displayed timestamp precision — NOT the stored
+    // data (segment lines always keep full sub-second precision on disk,
+    // see TranscriptionController::formatTimestamp); this only rounds what
+    // MainPanel's gutter shows. 0 (default) hides fractional seconds
+    // entirely ("3", "1:07"); each increment adds one more decimal digit.
+    property int timestampDecimalPlaces: 0
+
     // Single source of truth for every per-setting/global "reset to
     // default" button, AND for loadFromVault()/saveToVault() below (every
     // key here round-trips through the vault's .suopTranscriber file).
@@ -114,7 +121,8 @@ Item {
         restrictTagsToExisting: false,
         tagReuseBias: 0.5,
         highlightColor: "#3a5a7a",
-        highlightRadius: 8
+        highlightRadius: 8,
+        timestampDecimalPlaces: 0
     })
 
     // QML `color` values need to be stringified before crossing into a
@@ -206,5 +214,6 @@ Item {
         function onTagReuseBiasChanged() { appSettings.scheduleSave() }
         function onHighlightColorChanged() { appSettings.scheduleSave() }
         function onHighlightRadiusChanged() { appSettings.scheduleSave() }
+        function onTimestampDecimalPlacesChanged() { appSettings.scheduleSave() }
     }
 }

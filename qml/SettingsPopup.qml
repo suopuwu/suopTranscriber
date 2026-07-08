@@ -37,6 +37,7 @@ Popup {
     property bool anyPressed: radiusSlider.pressed || sidebarOpacitySlider.pressed
                                || mainOpacitySlider.pressed || rimWidthSlider.pressed
                                || highlightRadiusSlider.pressed || tagReuseBiasSlider.pressed
+                               || timestampDecimalPlacesSlider.pressed
 
     dim: !anyPressed
 
@@ -64,6 +65,7 @@ Popup {
                 || !AppSettings.isDefault("autoLabelEnabled")
                 || !AppSettings.isDefault("restrictTagsToExisting")
                 || !AppSettings.isDefault("tagReuseBias")
+                || !AppSettings.isDefault("timestampDecimalPlaces")
     }
 
     background: Rectangle {
@@ -1074,6 +1076,105 @@ Popup {
                 Layout.fillWidth: true
                 wrapMode: Text.WordWrap
                 text: qsTr("Applies to the playback sentence highlight and the Ctrl+F search-match highlight.")
+                color: "#888888"
+                font.pixelSize: 11
+            }
+
+            Label {
+                text: qsTr("Timestamps")
+                color: "white"
+                font.bold: true
+            }
+
+            RowLayout {
+                Layout.fillWidth: true
+                Label {
+                    Layout.preferredWidth: 90
+                    color: "white"
+                    text: qsTr("Decimal places")
+                }
+                Slider {
+                    id: timestampDecimalPlacesSlider
+                    Layout.fillWidth: true
+                    Layout.minimumWidth: 80
+                    from: 0
+                    to: 3
+                    stepSize: 1
+                    snapMode: Slider.SnapAlways
+                    value: AppSettings.timestampDecimalPlaces
+                    hoverEnabled: true
+                    onMoved: AppSettings.timestampDecimalPlaces = value
+
+                    HoverHandler {
+                        cursorShape: Qt.PointingHandCursor
+                    }
+                    HoverBorder {
+                        anchors.fill: parent
+                        active: timestampDecimalPlacesSlider.hovered
+                    }
+                }
+                TextField {
+                    id: timestampDecimalPlacesField
+                    Layout.preferredWidth: 56
+                    horizontalAlignment: TextInput.AlignRight
+                    hoverEnabled: true
+                    validator: IntValidator { bottom: timestampDecimalPlacesSlider.from; top: timestampDecimalPlacesSlider.to }
+                    onEditingFinished: {
+                        const v = parseInt(text, 10)
+                        if (!isNaN(v))
+                            AppSettings.timestampDecimalPlaces = Math.max(timestampDecimalPlacesSlider.from, Math.min(timestampDecimalPlacesSlider.to, v))
+                        text = String(AppSettings.timestampDecimalPlaces)
+                    }
+
+                    background: UnderlineField { focused: timestampDecimalPlacesField.activeFocus }
+
+                    Binding {
+                        target: timestampDecimalPlacesField
+                        property: "text"
+                        value: String(AppSettings.timestampDecimalPlaces)
+                        when: !timestampDecimalPlacesField.activeFocus
+                    }
+
+                    HoverHandler {
+                        cursorShape: Qt.PointingHandCursor
+                    }
+                    HoverBorder {
+                        anchors.fill: parent
+                        active: timestampDecimalPlacesField.hovered
+                    }
+                }
+                Button {
+                    id: timestampDecimalPlacesResetButton
+                    text: "↺"
+                    implicitWidth: 22
+                    implicitHeight: 22
+
+                    background: Rectangle {
+                        radius: AppSettings.borderRadius
+                        color: "transparent"
+                        border.width: 1
+                        border.color: "#3a3a3a"
+                    }
+                    enabled: !AppSettings.isDefault("timestampDecimalPlaces")
+                    opacity: enabled ? 1 : 0.35
+                    hoverEnabled: enabled
+                    onClicked: AppSettings.resetProperty("timestampDecimalPlaces")
+
+                    HoverHandler {
+                        cursorShape: Qt.PointingHandCursor
+                        enabled: timestampDecimalPlacesResetButton.enabled
+                    }
+                    HoverBorder {
+                        anchors.fill: parent
+                        active: timestampDecimalPlacesResetButton.enabled && timestampDecimalPlacesResetButton.hovered
+                    }
+                }
+            }
+
+            Label {
+                Layout.fillWidth: true
+                wrapMode: Text.WordWrap
+                text: qsTr("Rounds the transcript gutter's displayed timestamp only — the underlying data always keeps full precision.")
                 color: "#888888"
                 font.pixelSize: 11
             }

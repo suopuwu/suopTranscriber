@@ -140,32 +140,52 @@ public:
     // read+write, no model/engine involvement.
     Q_INVOKABLE bool setLabel(const QUrl &fileUrl, const QString &label, QString *errorOut = nullptr) const;
 
-    // Item 11 (Wave E): renames a speaker's DISPLAY name, everywhere at
-    // once — segment lines always store the stable id ("Speaker 1", "Speaker
-    // 2", ...; see parseSentences()' "speaker" field), so a rename is purely
-    // a frontmatter edit: splices/replaces one "id=name" pair inside a flat
-    // `speakerNames` key (same comma-separated-no-nesting convention as
-    // `tags`), same splice-or-append shape as setLabel(). speakerId must be
-    // the stable id (e.g. "Speaker 1"), not a previously-set display name.
-    Q_INVOKABLE bool renameSpeaker(const QUrl &fileUrl, const QString &speakerId, const QString &newName,
-                                    QString *errorOut = nullptr) const;
+    // Rewrite (2026-07-07): a speaker's name is now baked directly into
+    // every "[oldName]" segment-line tag in the transcript BODY itself —
+    // there is no more separate frontmatter name-lookup layer, since the
+    // vault's .md file is meant to be human-readable standalone (CLAUDE.md);
+    // a raw file that still showed "[Speaker 1]" everywhere after a rename,
+    // with the real name hidden in YAML frontmatter, wasn't. oldName must be
+    // the speaker's CURRENT literal tag text — the same string
+    // parseSentences()' "speaker" field already returns (e.g. "Speaker 1",
+    // or a previously-set custom name once already renamed once).
+    //
+    // Runs asynchronously, queued through the SAME job pipeline as
+    // transcribe()/relabel() above (a full-body rewrite is real file IO) —
+    // this call itself returns immediately, and the caller is expected to
+    // update its own display optimistically and reconcile once
+    // speakerRenamed() fires (see MainPanel.qml's pendingSpeakerRenames).
+    // Being a real job means it shows up in jobs()/tasksTotal/tasksCompleted
+    // like any other task, queues behind an active job for the SAME file
+    // instead of racing it, and runs concurrently-in-effect with (queued
+    // after, not blocked by) jobs for OTHER files. Rejects (speakerRenamed's
+    // ok=false) if newName (trimmed, case-insensitively) already names a
+    // DIFFERENT speaker present in the file, if oldName isn't actually
+    // present, or if fileUrl already has a Queued/Active job (same dedup
+    // rule as transcribe(), reported back via speakerRenamed instead of
+    // silently dropped, since a caller here is actively waiting for a
+    // definitive result).
+    Q_INVOKABLE void renameSpeaker(const QUrl &fileUrl, const QString &oldName, const QString &newName);
 
     // Everything after the frontmatter's closing "---" line (i.e. the
     // segment text), for main-panel search. Empty string if untranscribed
     // or unreadable.
     Q_INVOKABLE QString readTranscriptBody(const QUrl &fileUrl) const;
 
-    // Parses readTranscriptBody()'s "[HH:MM:SS.mmm] [Speaker N] text" lines
-    // (see appendSegmentLine/formatTimestamp) into a list of
-    // {t0: seconds as double, speaker: int (0 = none), text: QString, start,
-    // length: int}, in file order (which is also time order — segments are
-    // appended as whisper produces them). No "t1": it's never stored (always
-    // identical to the next segment's t0) and nothing consumes it. start/
-    // length are the character range of text within THIS SAME
-    // readTranscriptBody() string, so a caller can span-highlight the active
-    // sentence without re-deriving offsets. For sentence-level highlighting
-    // synced to playback (see DESIGN.md / CLAUDE.md "sentence-level only,
-    // binary-search on positionChanged").
+    // Parses readTranscriptBody()'s "[HH:MM:SS.mmm] [tag] text" lines (see
+    // appendSegmentLine/formatTimestamp) into a list of {t0: seconds as
+    // double, speaker: QString (empty = no speaker detection), text:
+    // QString, start, length: int}, in file order (which is also time order
+    // — segments are appended as whisper produces them). "speaker" is the
+    // literal bracketed tag text as stored in the file — "Speaker N" by
+    // default, or whatever a user has renamed it to (see renameSpeaker()
+    // above), never translated through a separate lookup. No "t1": it's
+    // never stored (always identical to the next segment's t0) and nothing
+    // consumes it. start/length are the character range of text within THIS
+    // SAME readTranscriptBody() string, so a caller can span-highlight the
+    // active sentence without re-deriving offsets. For sentence-level
+    // highlighting synced to playback (see DESIGN.md / CLAUDE.md "sentence-
+    // level only, binary-search on positionChanged").
     Q_INVOKABLE QVariantList parseSentences(const QUrl &fileUrl) const;
 
     // Binary-searches sentences (as returned by parseSentences(), sorted by
@@ -190,6 +210,14 @@ signals:
     void currentFileChanged();
     void queueChanged();
     void finished(const QUrl &fileUrl, bool ok, const QString &error);
+    // Fired when a renameSpeaker() call's background rewrite completes — IN
+    // ADDITION to the generic finished() above (a rename is queued through
+    // the SAME job queue as transcribe/relabel, see renameSpeaker()'s doc
+    // comment, so it participates in busy/progress/tasksTotal/jobs() too).
+    // oldName is echoed back (not just fileUrl) so a caller tracking
+    // multiple speakers/optimistic renames at once (see MainPanel.qml's
+    // pendingSpeakerRenames) knows exactly which one this result belongs to.
+    void speakerRenamed(const QUrl &fileUrl, const QString &oldName, bool ok, const QString &error);
 
 private:
     struct Job {
@@ -199,6 +227,9 @@ private:
         bool speakerDetection = false;
         bool autoLabel = false;
         bool relabelOnly = false;
+        bool renameSpeakerOnly = false;
+        QString oldSpeakerName;
+        QString newSpeakerName;
         bool restrictTagsToExisting = false;
         double tagReuseBias = 0.5;
         JobStatus status = JobStatus::Queued;

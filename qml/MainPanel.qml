@@ -92,69 +92,128 @@ Rectangle {
         return raw.split(",").map(t => t.trim()).filter(t => t.length > 0)
     }
 
-    // Item 11 (Wave E): speakerNames is a flat "id=name, id=name" frontmatter
-    // string (same no-nesting convention as tags) — id is always the STABLE
-    // "Speaker N" form (see TranscriptionController::parseSentences' "speaker"
-    // field), name is the user-chosen display name.
-    function currentSpeakerNames() {
-        const metadata = mainPanel.orphanedMdPath !== "" ? mainPanel.orphanedMdMetadata : mainPanel.storedMetadata
-        const raw = metadata && metadata.speakerNames ? String(metadata.speakerNames) : ""
-        const map = ({})
-        if (raw === "")
-            return map
-        for (const pair of raw.split(",")) {
-            const eq = pair.indexOf("=")
-            if (eq <= 0)
-                continue
-            const id = pair.substring(0, eq).trim()
-            const name = pair.substring(eq + 1).trim()
-            if (id !== "" && name !== "")
-                map[id] = name
-        }
-        return map
-    }
-
-    function displaySpeakerName(id) {
-        const map = mainPanel.currentSpeakerNames()
-        return (id in map) ? map[id] : id
-    }
-
-    // Distinct "Speaker N" ids actually present in THIS transcript, in
-    // first-appearance order — not every id that's ever appeared in the
-    // vault, and not shown at all for a transcript with no speaker
-    // detection data (sentences[i].speaker is 0 in that case).
+    // Distinct speaker tags actually present in THIS transcript's BODY, in
+    // first-appearance order — the tag text itself IS the speaker's name
+    // (see TranscriptionController::parseSentences' "speaker" field; there
+    // is no separate frontmatter name-lookup layer any more, see
+    // renameSpeaker()'s 2026-07-07 rewrite). Not shown at all for a
+    // transcript with no speaker detection data (sentences[i].speaker is ""
+    // in that case). This is always the TRUE on-disk identity, deliberately
+    // NOT overridden by pendingSpeakerRenames below — see
+    // effectiveSpeakerName()'s doc comment for why that matters.
     readonly property var distinctSpeakerIds: {
         const ids = []
         const seen = ({})
         for (const s of mainPanel.sentences) {
-            if (s.speaker && s.speaker > 0) {
-                const id = "Speaker " + s.speaker
-                if (!seen[id]) {
-                    seen[id] = true
-                    ids.push(id)
-                }
+            if (s.speaker !== "" && !seen[s.speaker]) {
+                seen[s.speaker] = true
+                ids.push(s.speaker)
             }
         }
         return ids
     }
+
+    // Optimistic-UI overlay for an in-flight renameSpeaker() call: maps the
+    // speaker's TRUE on-disk name (as commitSpeakerRename() sent it) to the
+    // name the user just typed, so the UI updates instantly while the
+    // background file rewrite is still in progress. Deliberately keyed by
+    // the ORIGINAL on-disk name rather than whatever's currently displayed —
+    // that way distinctSpeakerIds/commitSpeakerRename's "oldName" argument
+    // never has to chase a moving target if the user renames the same
+    // speaker again before the first rewrite confirms; both requests still
+    // resolve against the same real identity. Cleared (per-entry) once
+    // TranscriptionController.speakerRenamed fires for that name, whether it
+    // succeeded (sentencesRevision bump means the real reparse now shows the
+    // new name directly) or failed (falling back to showing the true
+    // on-disk name is the correct revert).
+    property var pendingSpeakerRenames: ({})
+
+    function effectiveSpeakerName(rawName) {
+        return (rawName in mainPanel.pendingSpeakerRenames) ? mainPanel.pendingSpeakerRenames[rawName] : rawName
+    }
+
+    // Bumped whenever background state changes in a way that the `sentences`
+    // binding wouldn't otherwise notice (see its own doc comment for why
+    // storedMetadata/orphanedMdMetadata reference churn alone doesn't
+    // reliably re-trigger it) — a successful speaker rename is exactly that
+    // case, since it rewrites the transcript body sentences reads from.
+    property int sentencesRevision: 0
 
     // Which speaker pill (if any) is currently showing its rename TextField
     // — mirrors renamingTitle's click-to-rename pattern, just keyed by id
     // since there can be several pills.
     property string renamingSpeakerId: ""
 
-    function commitSpeakerRename(speakerId, newValue) {
+    // Surfaced briefly next to the Speakers row (see speakerRenameErrorTimer)
+    // — this app has no toast/notification system, so a small inline red
+    // label is the simplest consistent way to explain a rejected rename.
+    property string speakerRenameError: ""
+
+    Timer {
+        id: speakerRenameErrorTimer
+        interval: 4000
+        onTriggered: mainPanel.speakerRenameError = ""
+    }
+
+    // oldName must be the speaker's TRUE on-disk name (i.e. an entry from
+    // distinctSpeakerIds) — see pendingSpeakerRenames' doc comment above for
+    // why the pill Repeater passes that instead of the currently-DISPLAYED
+    // (possibly already-overridden) name.
+    function commitSpeakerRename(oldName, newValue) {
         const trimmed = newValue.trim()
         mainPanel.renamingSpeakerId = ""
         if (trimmed === "" || !mainPanel.transcriptionController)
             return
+        if (trimmed === mainPanel.effectiveSpeakerName(oldName))
+            return // no-op: unchanged
+
+        // Disallow duplicates client-side (case-insensitive) against every
+        // OTHER speaker's current effective name — fast feedback without
+        // waiting on the background rewrite. The C++ side re-checks against
+        // the actual file too (authoritative; catches the rare case where
+        // the file changed since sentences was last parsed).
+        const trimmedLower = trimmed.toLowerCase()
+        for (const id of mainPanel.distinctSpeakerIds) {
+            if (id !== oldName && mainPanel.effectiveSpeakerName(id).toLowerCase() === trimmedLower) {
+                mainPanel.speakerRenameError = qsTr("A speaker named \"%1\" already exists.").arg(trimmed)
+                speakerRenameErrorTimer.restart()
+                return
+            }
+        }
+        mainPanel.speakerRenameError = ""
+
         const targetUrl = mainPanel.orphanedMdPath !== "" ? ("file://" + mainPanel.orphanedMdPath)
                                                            : mainPanel.player.source
-        mainPanel.transcriptionController.renameSpeaker(targetUrl, speakerId, trimmed)
-        if (mainPanel.orphanedMdPath !== "")
-            mainPanel.refreshOrphanedMetadata()
-        else
-            mainPanel.refreshMetadata()
+        const updated = Object.assign({}, mainPanel.pendingSpeakerRenames)
+        updated[oldName] = trimmed
+        mainPanel.pendingSpeakerRenames = updated
+        mainPanel.transcriptionController.renameSpeaker(targetUrl, oldName, trimmed)
+    }
+
+    // Reconciles a renameSpeaker() call once its background rewrite
+    // completes — see commitSpeakerRename()/pendingSpeakerRenames above.
+    Connections {
+        target: mainPanel.transcriptionController
+        function onSpeakerRenamed(fileUrl, oldName, ok, error) {
+            const currentUrl = mainPanel.orphanedMdPath !== "" ? ("file://" + mainPanel.orphanedMdPath)
+                                                                : (mainPanel.player ? mainPanel.player.source.toString() : "")
+            if (fileUrl.toString() !== currentUrl.toString())
+                return
+            if (ok) {
+                mainPanel.sentencesRevision += 1
+            } else {
+                mainPanel.speakerRenameError = error
+                speakerRenameErrorTimer.restart()
+            }
+            // Either way the optimistic override is no longer needed: on
+            // success the reparse (sentencesRevision above) now shows the
+            // real new name directly; on failure, removing the override
+            // reverts the display back to oldName, the correct on-disk
+            // truth.
+            const updated = Object.assign({}, mainPanel.pendingSpeakerRenames)
+            delete updated[oldName]
+            mainPanel.pendingSpeakerRenames = updated
+        }
     }
 
     function displayTitle() {
@@ -243,6 +302,7 @@ Rectangle {
     // time once frontmatter exists, so its own change notify doesn't fire
     // on every tick).
     readonly property var sentences: {
+        void mainPanel.sentencesRevision
         if (mainPanel.transcriptionController && mainPanel.player
                 && mainPanel.transcriptionController.currentFile.toString() === mainPanel.player.source.toString()) {
             void mainPanel.transcriptionController.progress
@@ -275,8 +335,13 @@ Rectangle {
     // gutters, later ones in the same turn show neither (they're still each
     // their own line/paragraph for accurate sentence-highlight sync, just
     // without repeating the same timestamp+name down the column). Files
-    // with no speaker detection (speaker is always 0) have no "turns" to
+    // with no speaker detection (speaker is always "") have no "turns" to
     // group by, so every sentence counts as its own section there.
+    //
+    // speaker here is the EFFECTIVE (pending-rename-applied) display name —
+    // distinctSpeakerIds/commitSpeakerRename still work off the raw on-disk
+    // sentences[i].speaker directly (see effectiveSpeakerName()'s doc
+    // comment for why the override is deliberately NOT baked in there).
     readonly property var displayData: {
         let text = ""
         const list = []
@@ -291,10 +356,11 @@ Rectangle {
             if (s.text.trim() === "")
                 continue
             const start = text.length
-            const showGutter = (s.speaker === 0) || (previousSpeaker === null) || (s.speaker !== previousSpeaker)
-            list.push({t0: s.t0, speaker: s.speaker, text: s.text, start: start, length: s.text.length,
+            const speaker = s.speaker === "" ? "" : mainPanel.effectiveSpeakerName(s.speaker)
+            const showGutter = (speaker === "") || (previousSpeaker === null) || (speaker !== previousSpeaker)
+            list.push({t0: s.t0, speaker: speaker, text: s.text, start: start, length: s.text.length,
                        showGutter: showGutter})
-            previousSpeaker = s.speaker
+            previousSpeaker = speaker
             text += s.text + "\n"
         }
         if (text.length > 0)
@@ -307,25 +373,64 @@ Rectangle {
     // Gutter column layout (Item: separate gutter areas for timestamp vs.
     // speaker name, kept as named constants so both are easy to re-style/
     // resize independently later).
-    readonly property real timestampGutterWidth: 44
-    readonly property real speakerGutterWidth: 70
+    // Sized to the widest timestamp label actually shown (one per turn, see
+    // showGutter) — same approach as speakerGutterWidth below, so a file
+    // with only short "in-file" timestamps ("3.5") gets a narrow column
+    // instead of always reserving room for "1:23:45.6".
+    readonly property real timestampGutterWidth: {
+        let maxWidth = 0
+        for (const s of mainPanel.displaySentences) {
+            if (!s.showGutter)
+                continue
+            maxWidth = Math.max(maxWidth, timestampGutterFontMetrics.advanceWidth(mainPanel.formatGutterTimestamp(s.t0)))
+        }
+        return maxWidth
+    }
+    // Sized to the widest speaker name actually shown (renamed or not) —
+    // 0 when the transcript has no speaker detection at all, so no gutter
+    // (and no spacing gap) is reserved for a column nothing will use.
+    readonly property real speakerGutterWidth: {
+        if (mainPanel.distinctSpeakerIds.length === 0)
+            return 0
+        let maxWidth = 0
+        for (const id of mainPanel.distinctSpeakerIds)
+            maxWidth = Math.max(maxWidth, speakerGutterFontMetrics.advanceWidth(mainPanel.effectiveSpeakerName(id)))
+        return maxWidth
+    }
     readonly property real gutterSpacing: 8
 
-    // Compact gutter timestamp: 1 decimal place, only the start time (no
-    // range), and leading zero-valued units (hours, then minutes) dropped
-    // entirely rather than shown as "0:"/"00:".
+    FontMetrics {
+        id: timestampGutterFontMetrics
+        font.pixelSize: 10
+    }
+
+    FontMetrics {
+        id: speakerGutterFontMetrics
+        font.pixelSize: 10
+        font.bold: true
+    }
+
+    // Compact gutter timestamp: only the start time (no range), leading
+    // zero-valued units (hours, then minutes) dropped entirely rather than
+    // shown as "0:"/"00:", and fractional-second precision governed by
+    // AppSettings.timestampDecimalPlaces (0 by default — display-only, the
+    // stored data always keeps full precision, see formatTimestamp() in
+    // TranscriptionController.cpp).
     function formatGutterTimestamp(t0) {
-        const totalTenths = Math.round(t0 * 10)
-        const wholeSeconds = Math.floor(totalTenths / 10)
-        const tenth = totalTenths % 10
+        const decimals = AppSettings.timestampDecimalPlaces
+        const scale = Math.pow(10, decimals)
+        const totalUnits = Math.round(t0 * scale)
+        const wholeSeconds = Math.floor(totalUnits / scale)
+        const frac = totalUnits % scale
+        const fracPart = decimals > 0 ? "." + String(frac).padStart(decimals, "0") : ""
         const h = Math.floor(wholeSeconds / 3600)
         const m = Math.floor((wholeSeconds % 3600) / 60)
         const s = wholeSeconds % 60
         if (h > 0)
-            return h + ":" + String(m).padStart(2, "0") + ":" + String(s).padStart(2, "0") + "." + tenth
+            return h + ":" + String(m).padStart(2, "0") + ":" + String(s).padStart(2, "0") + fracPart
         if (m > 0)
-            return m + ":" + String(s).padStart(2, "0") + "." + tenth
-        return s + "." + tenth
+            return m + ":" + String(s).padStart(2, "0") + fracPart
+        return s + fracPart
     }
 
     // player.position is milliseconds; segment timestamps are seconds.
@@ -959,14 +1064,12 @@ Rectangle {
         // Item 11 (Wave E): one pill per distinct speaker id detected in
         // THIS transcript, showing its current display name (default:
         // "Speaker N"). Click-to-rename mirrors the title's own
-        // Label<->TextField swap pattern; renaming updates the shared
-        // speakerNames frontmatter map, so every future read of this
-        // transcript (this pill row, and anywhere else that consults the
-        // same map) shows the new name — the transcript TEXT ITSELF below
-        // still shows the stable "[Speaker N]" tag verbatim (renaming is a
-        // frontmatter-only edit, not a rewrite of the segment lines), since
-        // substituting display names into that text would shift the
-        // character offsets sentence-highlighting/search overlays rely on.
+        // Label<->TextField swap pattern; renaming rewrites every one of
+        // that speaker's "[name]" tags directly in the transcript BODY
+        // itself (see TranscriptionController::renameSpeaker()'s
+        // 2026-07-07 rewrite) — this pill's label updates optimistically
+        // via pendingSpeakerRenames the instant you commit, ahead of the
+        // background file rewrite actually finishing.
         Flow {
             id: speakersRow
             Layout.fillWidth: true
@@ -999,7 +1102,7 @@ Rectangle {
                     TapHandler {
                         enabled: !speakerPillItem.renaming
                         onTapped: {
-                            speakerNameField.text = mainPanel.displaySpeakerName(speakerPillItem.modelData)
+                            speakerNameField.text = mainPanel.effectiveSpeakerName(speakerPillItem.modelData)
                             mainPanel.renamingSpeakerId = speakerPillItem.modelData
                             speakerNameField.forceActiveFocus()
                             speakerNameField.selectAll()
@@ -1009,7 +1112,7 @@ Rectangle {
                         id: speakerPillLabel
                         anchors.centerIn: parent
                         visible: !speakerPillItem.renaming
-                        text: mainPanel.displaySpeakerName(speakerPillItem.modelData)
+                        text: mainPanel.effectiveSpeakerName(speakerPillItem.modelData)
                         color: "#dddddd"
                         font.pixelSize: 11
                     }
@@ -1029,6 +1132,20 @@ Rectangle {
                     }
                 }
             }
+        }
+
+        // Rejected/failed speaker rename feedback (duplicate name, or a
+        // background rewrite failure) — see commitSpeakerRename()/the
+        // speakerRenamed Connections handler. No existing toast system in
+        // this app, so a small auto-clearing inline label is the simplest
+        // consistent way to surface it.
+        Label {
+            Layout.fillWidth: true
+            visible: mainPanel.speakerRenameError !== ""
+            text: mainPanel.speakerRenameError
+            color: "#e07a7a"
+            font.pixelSize: 11
+            wrapMode: Text.WordWrap
         }
 
         Label {
@@ -1179,8 +1296,18 @@ Rectangle {
                 // displayText's doc comment), so a click-drag selection can
                 // never touch them; this is just the visual margin they're
                 // drawn in.
-                leftPadding: mainPanel.timestampGutterWidth + mainPanel.gutterSpacing
-                             + mainPanel.speakerGutterWidth + mainPanel.gutterSpacing
+                leftPadding: (mainPanel.timestampGutterWidth > 0 ? mainPanel.timestampGutterWidth + mainPanel.gutterSpacing : 0)
+                             + mainPanel.speakerGutterWidth
+                             + (mainPanel.speakerGutterWidth > 0 ? mainPanel.gutterSpacing : 0)
+                // Whole-control default; the timestamp gutter's own
+                // MouseArea (below) overrides this to a pointer while
+                // hovering directly over a clickable timestamp. TextArea
+                // (a Control/Item) has no plain "cursorShape" property —
+                // only MouseArea/PointerHandler expose one — hence the
+                // HoverHandler here rather than a direct property set.
+                HoverHandler {
+                    cursorShape: Qt.IBeamCursor
+                }
                 // Regression fix: Item 7 made ALL native selection invisible
                 // (transparent) to avoid double-highlighting jumpToNextMatch's
                 // select() call against searchMatchOverlay below — but that
@@ -1247,11 +1374,21 @@ Rectangle {
                         // text line instead of level with its glyphs.
                         height: lineRect.height
                         width: mainPanel.timestampGutterWidth
-                        horizontalAlignment: Text.AlignRight
+                        horizontalAlignment: Text.AlignLeft
                         verticalAlignment: Text.AlignVCenter
                         text: mainPanel.formatGutterTimestamp(modelData.t0)
                         color: "#777777"
                         font.pixelSize: 10
+                        font.underline: timestampClickArea.containsMouse && mainPanel.player
+
+                        MouseArea {
+                            id: timestampClickArea
+                            anchors.fill: parent
+                            enabled: !!mainPanel.player
+                            hoverEnabled: true
+                            cursorShape: Qt.PointingHandCursor
+                            onClicked: mainPanel.player.position = modelData.t0 * 1000
+                        }
                     }
                 }
 
@@ -1262,16 +1399,20 @@ Rectangle {
                     Text {
                         required property var modelData
                         required property int index
-                        visible: modelData.showGutter && modelData.speaker > 0
+                        visible: modelData.showGutter && modelData.speaker !== ""
                         readonly property rect lineRect: transcriptArea.gutterLineRects[index] || Qt.rect(0, 0, 0, 0)
                         x: mainPanel.timestampGutterWidth + mainPanel.gutterSpacing
                         y: lineRect.y
                         height: lineRect.height
                         width: mainPanel.speakerGutterWidth
                         elide: Text.ElideRight
-                        horizontalAlignment: Text.AlignLeft
+                        // Right-aligned so the name sits right up against
+                        // the transcript text (only gutterSpacing away)
+                        // instead of leaving a ragged gap whenever the name
+                        // is shorter than the column.
+                        horizontalAlignment: Text.AlignRight
                         verticalAlignment: Text.AlignVCenter
-                        text: modelData.speaker > 0 ? mainPanel.displaySpeakerName("Speaker " + modelData.speaker) : ""
+                        text: modelData.speaker
                         color: "#8fa8bf"
                         font.pixelSize: 10
                         font.bold: true

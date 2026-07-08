@@ -11,6 +11,7 @@
 #include <QSet>
 #include <QStringList>
 #include <QTextStream>
+#include <QVector>
 
 #include <algorithm>
 
@@ -85,9 +86,12 @@ double parseCompactTimestamp(const QString &raw)
 //
 // Group map: 1 the whole timestamp expression (parsed via
 // parseCompactTimestamp, not fixed-width digit groups — the compact format's
-// shape varies), 2 speaker number (Item 11, Wave E — optional, only present
-// when speaker detection ran), 3 text, 4 legacy trailing " [SPEAKER_TURN]"
-// marker (older files only). No effort to parse the OLDEST fixed-width
+// shape varies), 2 the speaker tag's literal text (Item 11, Wave E —
+// optional, only present when speaker detection ran; ANY non-"]" text, not
+// just a digit — see renameSpeaker()'s 2026-07-07 rewrite, which bakes a
+// renamed speaker's actual name into this tag directly, so it's no longer
+// always "Speaker N"), 3 text, 4 legacy trailing " [SPEAKER_TURN]" marker
+// (older files only). No effort to parse the OLDEST fixed-width
 // "HH:MM:SS.mmm" format precisely by shape — the flexible `[\d:.]+` capture
 // happens to still parse it correctly (splits into the same 3 colon-parts),
 // so old single-timestamp files keep working for free. An optional, ignored
@@ -99,7 +103,7 @@ const QRegularExpression &segmentLinePattern()
 {
     static const QRegularExpression pattern(
         QStringLiteral("^\\[([\\d:.]+)(?: - [\\d:.]+)?\\]"
-                        "(?: \\[Speaker (\\d+)\\])? (.*?)( \\[SPEAKER_TURN\\])?$"),
+                        "(?: \\[([^\\]]+)\\])? (.*?)( \\[SPEAKER_TURN\\])?$"),
         QRegularExpression::MultilineOption);
     return pattern;
 }
@@ -302,6 +306,126 @@ QStringList collectVaultTags(const QString &vaultLocalPath)
     return sorted;
 }
 
+// Rewrites every "[oldName]" segment-line speaker tag in path's transcript
+// BODY to "[newName]" — the tag text itself IS the speaker's display name
+// (see segmentLinePattern()'s doc comment), so this is the ONLY thing a
+// rename needs to touch; frontmatter is read back out unchanged. Runs on
+// TranscriptionWorker's background thread (see
+// TranscriptionController::renameSpeaker()).
+//
+// Rejects (returns false, *errorOut set) if oldName isn't actually present
+// as a tag anywhere in the file, or if newName (trimmed, case-insensitively)
+// already names a DIFFERENT speaker present in the file — callers must not
+// silently merge two distinct speakers into one by typing an existing name.
+// A no-op rename (newName already equals oldName) succeeds without writing.
+bool renameSpeakerInFile(const QString &path, const QString &oldName, const QString &newName, QString *errorOut)
+{
+    QFile mdFile(path);
+    if (!mdFile.exists()) {
+        if (errorOut)
+            *errorOut = QStringLiteral("%1 has not been transcribed yet").arg(QFileInfo(path).fileName());
+        return false;
+    }
+    if (!mdFile.open(QIODevice::ReadOnly | QIODevice::Text)) {
+        if (errorOut)
+            *errorOut = QStringLiteral("could not open %1 for reading").arg(path);
+        return false;
+    }
+
+    QTextStream in(&mdFile);
+    if (in.readLine() != QStringLiteral("---")) {
+        mdFile.close();
+        if (errorOut)
+            *errorOut = QStringLiteral("%1 has no frontmatter block").arg(mdFile.fileName());
+        return false;
+    }
+    QStringList frontmatterLines;
+    QString line;
+    bool closed = false;
+    while (!(line = in.readLine()).isNull()) {
+        if (line == QStringLiteral("---")) {
+            closed = true;
+            break;
+        }
+        frontmatterLines.append(line);
+    }
+    if (!closed) {
+        mdFile.close();
+        if (errorOut)
+            *errorOut = QStringLiteral("%1 has a malformed frontmatter block").arg(mdFile.fileName());
+        return false;
+    }
+    QString body = in.readAll();
+    mdFile.close();
+
+    // Every distinct speaker tag currently in the body, in first-appearance
+    // order, alongside each match so a hit can be spliced by exact offset
+    // (capturedStart/capturedLength) rather than a blind string-replace,
+    // which could corrupt spoken TEXT that happens to contain the same
+    // characters.
+    QStringList distinctTags;
+    QVector<QRegularExpressionMatch> taggedMatches;
+    QRegularExpressionMatchIterator it = segmentLinePattern().globalMatch(body);
+    while (it.hasNext()) {
+        const QRegularExpressionMatch m = it.next();
+        if (m.capturedLength(2) == 0)
+            continue;
+        const QString tag = m.captured(2);
+        if (!distinctTags.contains(tag))
+            distinctTags.append(tag);
+        if (tag == oldName)
+            taggedMatches.append(m);
+    }
+
+    if (!distinctTags.contains(oldName)) {
+        if (errorOut)
+            *errorOut = QStringLiteral("speaker \"%1\" was not found in this transcript").arg(oldName);
+        return false;
+    }
+
+    QString sanitizedName = newName;
+    sanitizedName.replace(QLatin1Char('\n'), QLatin1Char(' '));
+    sanitizedName.replace(QLatin1Char('['), QLatin1Char(' '));
+    sanitizedName.replace(QLatin1Char(']'), QLatin1Char(' '));
+    sanitizedName = sanitizedName.trimmed();
+    if (sanitizedName.isEmpty()) {
+        if (errorOut)
+            *errorOut = QStringLiteral("speaker name cannot be empty");
+        return false;
+    }
+    if (sanitizedName == oldName)
+        return true; // no-op: already named that
+
+    for (const QString &tag : std::as_const(distinctTags)) {
+        if (tag != oldName && tag.compare(sanitizedName, Qt::CaseInsensitive) == 0) {
+            if (errorOut)
+                *errorOut = QStringLiteral("a speaker named \"%1\" already exists in this transcript").arg(sanitizedName);
+            return false;
+        }
+    }
+
+    // Splice from the END of the body backward so earlier matches' offsets
+    // stay valid as later ones are replaced.
+    for (auto matchIt = taggedMatches.crbegin(); matchIt != taggedMatches.crend(); ++matchIt)
+        body.replace(matchIt->capturedStart(2), matchIt->capturedLength(2), sanitizedName);
+
+    if (!mdFile.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
+        if (errorOut)
+            *errorOut = QStringLiteral("could not open %1 for writing").arg(mdFile.fileName());
+        return false;
+    }
+    QTextStream out(&mdFile);
+    out << "---\n";
+    for (const QString &fmLine : frontmatterLines)
+        out << fmLine << '\n';
+    out << "---\n";
+    out << body;
+    out.flush();
+    mdFile.flush();
+    mdFile.close();
+    return true;
+}
+
 }
 
 // Lives on TranscriptionController's dedicated QThread; never touches the
@@ -439,9 +563,28 @@ public slots:
         emit finished(true, {});
     }
 
+    // Queued through the same job pipeline as run()/relabelJob() above (see
+    // TranscriptionController::renameSpeaker()'s doc comment) — emits BOTH
+    // the generic finished() (so this participates in busy/progress/the
+    // jobs() list exactly like any other task) AND the specific
+    // speakerRenamed() (so the caller learns which speaker's rename this
+    // result belongs to, which finished() alone can't carry).
+    void renameSpeaker(const QString &audioPath, const QString &oldName, const QString &newName)
+    {
+        QString error;
+        const bool ok = renameSpeakerInFile(sidecarPath(audioPath), oldName, newName, &error);
+        // Reported back against audioPath (not the .md sidecar) — matches
+        // finished()'s convention of identifying a file by its ORIGINAL
+        // (audio) fileUrl, which is what QML's Connections target compares
+        // against.
+        emit speakerRenamed(audioPath, oldName, ok, error);
+        emit finished(ok, error);
+    }
+
 signals:
     void progress(double fraction);
     void finished(bool ok, const QString &error);
+    void speakerRenamed(const QString &path, const QString &oldName, bool ok, const QString &error);
 
 private:
     // Shared by the autoLabel branch of run() and relabelJob(): resolve/warm
@@ -511,6 +654,10 @@ TranscriptionController::TranscriptionController(QObject *parent)
         emit progressChanged();
     });
     connect(m_worker, &TranscriptionWorker::finished, this, &TranscriptionController::onWorkerFinished);
+    connect(m_worker, &TranscriptionWorker::speakerRenamed, this,
+            [this](const QString &path, const QString &oldName, bool ok, const QString &error) {
+                emit speakerRenamed(QUrl::fromLocalFile(path), oldName, ok, error);
+            });
     m_thread.start();
 }
 
@@ -640,7 +787,11 @@ void TranscriptionController::startJob(int index)
     emit currentFileChanged();
     emit queueChanged();
 
-    if (job.relabelOnly) {
+    if (job.renameSpeakerOnly) {
+        QMetaObject::invokeMethod(m_worker, "renameSpeaker", Qt::QueuedConnection,
+                                   Q_ARG(QString, job.fileUrl.toLocalFile()), Q_ARG(QString, job.oldSpeakerName),
+                                   Q_ARG(QString, job.newSpeakerName));
+    } else if (job.relabelOnly) {
         QMetaObject::invokeMethod(m_worker, "relabelJob", Qt::QueuedConnection,
                                    Q_ARG(QString, job.fileUrl.toLocalFile()),
                                    Q_ARG(QString, job.vaultUrl.toLocalFile()),
@@ -829,107 +980,29 @@ bool TranscriptionController::setLabel(const QUrl &fileUrl, const QString &label
     return true;
 }
 
-bool TranscriptionController::renameSpeaker(const QUrl &fileUrl, const QString &speakerId, const QString &newName,
-                                             QString *errorOut) const
+void TranscriptionController::renameSpeaker(const QUrl &fileUrl, const QString &oldName, const QString &newName)
 {
-    const QFileInfo fi(fileUrl.toLocalFile());
-    const QString path = fi.absolutePath() + "/" + fi.completeBaseName() + ".md";
-
-    QFile mdFile(path);
-    if (!mdFile.exists()) {
-        if (errorOut)
-            *errorOut = QStringLiteral("%1 has not been transcribed yet").arg(fi.fileName());
-        return false;
-    }
-    if (!mdFile.open(QIODevice::ReadOnly | QIODevice::Text)) {
-        if (errorOut)
-            *errorOut = QStringLiteral("could not open %1 for reading").arg(path);
-        return false;
+    // Same dedup rule as transcribe()/relabel() — but unlike those, a caller
+    // here is actively waiting on speakerRenamed() for a definitive result
+    // (see MainPanel.qml's pendingSpeakerRenames), so silently dropping the
+    // request would leave its optimistic UI stuck forever. Report it instead.
+    if (isQueued(fileUrl)) {
+        emit speakerRenamed(fileUrl, oldName, false,
+                             QStringLiteral("another task is already running for this file"));
+        return;
     }
 
-    QTextStream in(&mdFile);
-    if (in.readLine() != QStringLiteral("---")) {
-        mdFile.close();
-        if (errorOut)
-            *errorOut = QStringLiteral("%1 has no frontmatter block").arg(mdFile.fileName());
-        return false;
-    }
+    Job job;
+    job.fileUrl = fileUrl;
+    job.renameSpeakerOnly = true;
+    job.oldSpeakerName = oldName;
+    job.newSpeakerName = newName;
+    job.status = JobStatus::Queued;
+    m_jobs.push_back(job);
+    emit queueChanged();
 
-    // Same splice-or-append shape as setLabel(), but the value being spliced
-    // is one "id=name" pair inside the flat speakerNames key rather than the
-    // whole key's value — every OTHER speaker's existing mapping must
-    // survive untouched.
-    QStringList frontmatterLines;
-    QString line;
-    bool closed = false;
-    while (!(line = in.readLine()).isNull()) {
-        if (line == QStringLiteral("---")) {
-            closed = true;
-            break;
-        }
-        frontmatterLines.append(line);
-    }
-    if (!closed) {
-        mdFile.close();
-        if (errorOut)
-            *errorOut = QStringLiteral("%1 has a malformed frontmatter block").arg(mdFile.fileName());
-        return false;
-    }
-    const QString body = in.readAll();
-    mdFile.close();
-
-    int speakerNamesLine = -1;
-    QStringList pairs;
-    for (int i = 0; i < frontmatterLines.size(); ++i) {
-        const int colon = frontmatterLines[i].indexOf(':');
-        if (colon >= 0 && frontmatterLines[i].left(colon).trimmed() == QStringLiteral("speakerNames")) {
-            speakerNamesLine = i;
-            pairs = frontmatterLines[i].mid(colon + 1).split(QLatin1Char(','), Qt::SkipEmptyParts);
-            break;
-        }
-    }
-
-    // Sanitize: this is a flat "id=name, id=name" line — a newline, comma,
-    // or "=" inside newName would corrupt the format on read-back.
-    QString sanitizedName = newName;
-    sanitizedName.replace(QLatin1Char('\n'), QLatin1Char(' '));
-    sanitizedName.replace(QLatin1Char(','), QLatin1Char(' '));
-    sanitizedName.replace(QLatin1Char('='), QLatin1Char(' '));
-    sanitizedName = sanitizedName.trimmed();
-
-    bool updated = false;
-    for (QString &pair : pairs) {
-        const int eq = pair.indexOf(QLatin1Char('='));
-        if (eq >= 0 && pair.left(eq).trimmed() == speakerId) {
-            pair = QStringLiteral(" %1=%2").arg(speakerId, sanitizedName);
-            updated = true;
-            break;
-        }
-    }
-    if (!updated)
-        pairs.append(QStringLiteral(" %1=%2").arg(speakerId, sanitizedName));
-
-    const QString newSpeakerNamesLine = QStringLiteral("speakerNames:") + pairs.join(QLatin1Char(','));
-    if (speakerNamesLine >= 0)
-        frontmatterLines[speakerNamesLine] = newSpeakerNamesLine;
-    else
-        frontmatterLines.append(newSpeakerNamesLine);
-
-    if (!mdFile.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
-        if (errorOut)
-            *errorOut = QStringLiteral("could not open %1 for writing").arg(mdFile.fileName());
-        return false;
-    }
-    QTextStream out(&mdFile);
-    out << "---\n";
-    for (const QString &fmLine : frontmatterLines)
-        out << fmLine << '\n';
-    out << "---\n";
-    out << body;
-    out.flush();
-    mdFile.flush();
-    mdFile.close();
-    return true;
+    if (m_activeIndex < 0)
+        startJob(m_jobs.size() - 1);
 }
 
 QString TranscriptionController::readTranscriptBody(const QUrl &fileUrl) const
@@ -965,10 +1038,12 @@ QVariantList TranscriptionController::parseSentences(const QUrl &fileUrl) const
         const QRegularExpressionMatch m = it.next();
         QVariantMap sentence;
         sentence["t0"] = parseCompactTimestamp(m.captured(1));
-        // Item 11 (Wave E): 0 when speaker detection wasn't on for this file
-        // (group 2 didn't participate in the match) — QRegularExpression's
-        // captured() returns an empty string in that case, not a crash.
-        sentence["speaker"] = m.captured(2).isEmpty() ? 0 : m.captured(2).toInt();
+        // Empty when speaker detection wasn't on for this file (group 2
+        // didn't participate in the match) — QRegularExpression's captured()
+        // returns an empty string in that case, not a crash. The literal tag
+        // text itself, never translated through a lookup (see
+        // segmentLinePattern()'s doc comment).
+        sentence["speaker"] = m.captured(2);
         sentence["text"] = m.captured(3);
         sentence["start"] = m.capturedStart(3);
         sentence["length"] = m.capturedLength(3);

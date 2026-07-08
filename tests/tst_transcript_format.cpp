@@ -211,17 +211,19 @@ private slots:
             QCOMPARE(body.mid(start, length), s.value("text").toString());
         }
 
-        // Legacy fixture (no leading "[Speaker N]" tag) parses with speaker=0
-        // for every sentence — old already-transcribed files must not crash
-        // or misparse under the new (Item 11, Wave E) regex.
-        QCOMPARE(s0.value("speaker").toInt(), 0);
-        QCOMPARE(s1.value("speaker").toInt(), 0);
+        // Legacy fixture (no leading "[Speaker N]" tag) parses with an empty
+        // speaker string for every sentence — old already-transcribed files
+        // must not crash or misparse under the new (Item 11, Wave E) regex.
+        QCOMPARE(s0.value("speaker").toString(), QString());
+        QCOMPARE(s1.value("speaker").toString(), QString());
     }
 
     // Item 11 (Wave E): a leading "[Speaker N]" tag (written when speaker
-    // detection is on) is parsed into each sentence's "speaker" field and
-    // stripped from the parsed text, mirroring the legacy trailing
-    // "[SPEAKER_TURN]" marker's text-stripping behavior above.
+    // detection is on) is parsed into each sentence's "speaker" field
+    // verbatim (the literal tag text, not translated through any lookup —
+    // see the 2026-07-07 rewrite) and stripped from the parsed text,
+    // mirroring the legacy trailing "[SPEAKER_TURN]" marker's text-stripping
+    // behavior above.
     void parseSentences_recoversSpeakerNumberFromLeadingTag()
     {
         QTemporaryDir dir;
@@ -237,11 +239,11 @@ private slots:
             controller.parseSentences(QUrl::fromLocalFile(dir.path() + "/interview.wav"));
 
         QCOMPARE(sentences.size(), 3);
-        QCOMPARE(sentences[0].toMap().value("speaker").toInt(), 1);
+        QCOMPARE(sentences[0].toMap().value("speaker").toString(), QStringLiteral("Speaker 1"));
         QCOMPARE(sentences[0].toMap().value("text").toString(), QStringLiteral("Welcome to the show."));
-        QCOMPARE(sentences[1].toMap().value("speaker").toInt(), 2);
+        QCOMPARE(sentences[1].toMap().value("speaker").toString(), QStringLiteral("Speaker 2"));
         QCOMPARE(sentences[1].toMap().value("text").toString(), QStringLiteral("Thanks for having me."));
-        QCOMPARE(sentences[2].toMap().value("speaker").toInt(), 1);
+        QCOMPARE(sentences[2].toMap().value("speaker").toString(), QStringLiteral("Speaker 1"));
 
         // start/length still index the raw body correctly (tag is excluded
         // from the substring, same contract as before).
@@ -271,7 +273,7 @@ private slots:
 
         QCOMPARE(sentences.size(), 2);
         QCOMPARE(sentences[0].toMap().value("t0").toDouble(), 0.0);
-        QCOMPARE(sentences[0].toMap().value("speaker").toInt(), 0);
+        QCOMPARE(sentences[0].toMap().value("speaker").toString(), QString());
         QCOMPARE(sentences[0].toMap().value("text").toString(), QStringLiteral("First point."));
         QCOMPARE(sentences[1].toMap().value("t0").toDouble(), 4.25);
         QCOMPARE(sentences[1].toMap().value("text").toString(), QStringLiteral("Second point."));
@@ -396,49 +398,91 @@ private slots:
         QCOMPARE(readAllBytes(barePath), original);
     }
 
-    // Item 11 (Wave E): renameSpeaker() adds a speakerNames key (first
-    // rename), then updates just that one id=name pair on a second rename to
-    // a DIFFERENT speaker, leaving the first speaker's mapping untouched —
-    // and the value round-trips through readMetadata as a flat string (same
-    // convention as `tags`).
-    void renameSpeaker_addsThenUpdatesOnePair_preservingOthers()
+    // 2026-07-07 rewrite: renameSpeaker() now bakes the new name directly
+    // into every "[oldName]" segment-line tag in the BODY (no more separate
+    // frontmatter name-lookup layer) — runs asynchronously on the
+    // background thread, reporting completion via
+    // speakerRenamed(fileUrl, oldName, ok, error).
+    void renameSpeaker_rewritesEveryBodyTagAsync()
     {
         QTemporaryDir dir;
         QVERIFY(dir.isValid());
         writeFixture(dir.path(), "interview.md",
                      QStringLiteral("---\nmodel: ggml-base.en.bin\n"
                                     "speakerDetection: true\n---\n\n"
-                                    "[00:00:00.000 - 00:00:05.000] [Speaker 1] hi\n"
-                                    "[00:00:05.000 - 00:00:09.000] [Speaker 2] hello\n"));
+                                    "[0] [Speaker 1] hi\n"
+                                    "[3.5] [Speaker 2] hello\n"
+                                    "[7] [Speaker 1] how are you\n"));
         const QUrl audioUrl = QUrl::fromLocalFile(dir.path() + "/interview.wav");
 
         TranscriptionController controller;
-        QString error;
-        QVERIFY2(controller.renameSpeaker(audioUrl, QStringLiteral("Speaker 1"), QStringLiteral("Alice"), &error),
-                  qPrintable(error));
-        QCOMPARE(controller.readMetadata(audioUrl).value("speakerNames").toString(), QStringLiteral("Speaker 1=Alice"));
 
-        // Renaming a SECOND speaker appends its own pair, leaving the first.
-        QVERIFY2(controller.renameSpeaker(audioUrl, QStringLiteral("Speaker 2"), QStringLiteral("Bob"), &error),
-                  qPrintable(error));
-        const QString afterSecond = controller.readMetadata(audioUrl).value("speakerNames").toString();
-        QVERIFY(afterSecond.contains(QStringLiteral("Speaker 1=Alice")));
-        QVERIFY(afterSecond.contains(QStringLiteral("Speaker 2=Bob")));
+        {
+            QSignalSpy spy(&controller, &TranscriptionController::speakerRenamed);
+            controller.renameSpeaker(audioUrl, QStringLiteral("Speaker 1"), QStringLiteral("Alice"));
+            QVERIFY(spy.wait(5000));
+            const QList<QVariant> args = spy.takeFirst();
+            QCOMPARE(args.at(0).toUrl(), audioUrl);
+            QCOMPARE(args.at(1).toString(), QStringLiteral("Speaker 1"));
+            QVERIFY2(args.at(2).toBool(), qPrintable(args.at(3).toString()));
+        }
 
-        // Re-renaming Speaker 1 REPLACES its pair, never duplicates, and
-        // Speaker 2's mapping survives untouched.
-        QVERIFY2(controller.renameSpeaker(audioUrl, QStringLiteral("Speaker 1"), QStringLiteral("Alicia"), &error),
-                  qPrintable(error));
-        const QString afterRename = controller.readMetadata(audioUrl).value("speakerNames").toString();
-        QCOMPARE(afterRename.count(QStringLiteral("Speaker 1=")), 1);
-        QVERIFY(afterRename.contains(QStringLiteral("Speaker 1=Alicia")));
-        QVERIFY(afterRename.contains(QStringLiteral("Speaker 2=Bob")));
-        QVERIFY(!afterRename.contains(QStringLiteral("Alice,")));
+        // EVERY occurrence of the old tag is rewritten, not just the first —
+        // Speaker 1 appears on two separate lines here.
+        const QString bodyAfterFirst = controller.readTranscriptBody(audioUrl);
+        QVERIFY(bodyAfterFirst.contains(QStringLiteral("[Alice] hi")));
+        QVERIFY(bodyAfterFirst.contains(QStringLiteral("[Alice] how are you")));
+        QVERIFY(bodyAfterFirst.contains(QStringLiteral("[Speaker 2] hello")));
+        QVERIFY(!bodyAfterFirst.contains(QStringLiteral("Speaker 1")));
 
-        // The transcript body (segment lines with their stable "[Speaker N]"
-        // tags) is completely untouched by a rename.
-        QVERIFY(controller.readTranscriptBody(audioUrl).contains(QStringLiteral("[Speaker 1] hi")));
-        QVERIFY(controller.readTranscriptBody(audioUrl).contains(QStringLiteral("[Speaker 2] hello")));
+        // Renaming a SECOND, different speaker only touches its own tag.
+        {
+            QSignalSpy spy(&controller, &TranscriptionController::speakerRenamed);
+            controller.renameSpeaker(audioUrl, QStringLiteral("Speaker 2"), QStringLiteral("Bob"));
+            QVERIFY(spy.wait(5000));
+            QVERIFY(spy.takeFirst().at(2).toBool());
+        }
+        const QString bodyAfterSecond = controller.readTranscriptBody(audioUrl);
+        QVERIFY(bodyAfterSecond.contains(QStringLiteral("[Alice] hi")));
+        QVERIFY(bodyAfterSecond.contains(QStringLiteral("[Bob] hello")));
+
+        // Re-renaming (matched by its NOW-current name, "Alice") updates
+        // every one of that speaker's lines again.
+        {
+            QSignalSpy spy(&controller, &TranscriptionController::speakerRenamed);
+            controller.renameSpeaker(audioUrl, QStringLiteral("Alice"), QStringLiteral("Alicia"));
+            QVERIFY(spy.wait(5000));
+            QVERIFY(spy.takeFirst().at(2).toBool());
+        }
+        const QString bodyAfterThird = controller.readTranscriptBody(audioUrl);
+        QVERIFY(bodyAfterThird.contains(QStringLiteral("[Alicia] hi")));
+        QVERIFY(bodyAfterThird.contains(QStringLiteral("[Alicia] how are you")));
+        QVERIFY(bodyAfterThird.contains(QStringLiteral("[Bob] hello")));
+    }
+
+    // Disallows setting two speakers to the same (case-insensitive) name —
+    // the file is left completely untouched on rejection.
+    void renameSpeaker_rejectsDuplicateName()
+    {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        writeFixture(dir.path(), "interview.md",
+                     QStringLiteral("---\nmodel: ggml-base.en.bin\n"
+                                    "speakerDetection: true\n---\n\n"
+                                    "[0] [Speaker 1] hi\n"
+                                    "[3.5] [Speaker 2] hello\n"));
+        const QUrl audioUrl = QUrl::fromLocalFile(dir.path() + "/interview.wav");
+        const QString original = readAllBytes(dir.path() + "/interview.md");
+
+        TranscriptionController controller;
+        QSignalSpy spy(&controller, &TranscriptionController::speakerRenamed);
+        // Case-insensitive match against Speaker 1's own tag.
+        controller.renameSpeaker(audioUrl, QStringLiteral("Speaker 2"), QStringLiteral("speaker 1"));
+        QVERIFY(spy.wait(5000));
+        const QList<QVariant> args = spy.takeFirst();
+        QVERIFY(!args.at(2).toBool());
+        QVERIFY2(args.at(3).toString().contains(QStringLiteral("already exists")), qPrintable(args.at(3).toString()));
+        QCOMPARE(readAllBytes(dir.path() + "/interview.md"), original);
     }
 
     // matchesExistingTranscription() lets "transcribe all" skip files whose
