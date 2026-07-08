@@ -48,6 +48,19 @@ must show both:
   <id>.activeFocus }`. Thin/dim normally, thicker + `AppSettings.highlightColor`
   when focused.
 
+## Warning banners
+
+- Inline, not a popup/toast: a plain `Label`, conditionally visible on a
+  non-empty backing string property (empty = hidden, no separate `visible`
+  flag to keep in sync).
+- Color `#e07a7a` for an error/rejection (e.g. `speakerRenameError`),
+  `#e0a25a` for a softer "didn't fully work" warning (e.g. a requested
+  feature that degraded rather than failed outright).
+- `font.pixelSize: 11`, `wrapMode: Text.WordWrap`, `Layout.fillWidth: true`.
+- No dismiss button — the label disappears once its backing property clears
+  (either automatically, e.g. a timer, or the next time the underlying state
+  it reports on changes).
+
 ## Extending this doc
 
 This file is the place for future UI convention rules (spacing, typography,

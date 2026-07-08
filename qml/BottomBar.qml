@@ -21,6 +21,10 @@ Item {
             ? bottomBar.currentFilePath.slice(prefix.length) : bottomBar.currentFilePath
     }
     signal settingsRequested()
+    // Emitted when a Tasks-popup row is clicked — path is the job's audio
+    // file's LOCAL path (fileUrl minus the "file://" prefix, same convention
+    // Sidebar.qml's fileActivated uses), for the caller to open in MainPanel.
+    signal taskActivated(string path)
     readonly property real taskProgress: transcriptionController ? transcriptionController.progress : 0
     readonly property int tasksCompleted: transcriptionController ? transcriptionController.tasksCompleted : 0
     readonly property int tasksTotal: transcriptionController ? transcriptionController.tasksTotal : 0
@@ -28,6 +32,46 @@ Item {
     // (which also counts Done/Failed jobs still sitting in the persistent,
     // dismissible history list, see TranscriptionController's class doc).
     readonly property bool busy: transcriptionController ? transcriptionController.busy : false
+    // The Active job's kind/file — shown next to the progress bar so it's
+    // clear at a glance WHAT is currently running, not just that something
+    // is. currentFile here is the JOB's file (from TranscriptionController),
+    // not currentFilePath above (whatever MainPanel happens to have open —
+    // usually the same file, but not necessarily, e.g. bulk "transcribe all").
+    readonly property string currentJobKind: transcriptionController ? transcriptionController.currentJobKind : ""
+    readonly property string currentJobFileName: {
+        if (!transcriptionController)
+            return ""
+        const s = transcriptionController.currentFile.toString()
+        return s.substring(s.lastIndexOf("/") + 1)
+    }
+    // See TranscriptionController::currentPhase's doc comment — "loading"
+    // has no real progress number behind it (whisper.cpp has no hook for
+    // model-load time), so the progress bar goes indeterminate for that
+    // phase specifically rather than sitting frozen at 0 looking hung.
+    // "detecting-speakers" and "transcribing" both carry real progress.
+    readonly property string currentPhase: transcriptionController ? transcriptionController.currentPhase : ""
+    readonly property bool progressIsIndeterminate: bottomBar.busy && bottomBar.currentPhase === "loading"
+    // Shared with the Tasks popup's per-row kind badge below — same four
+    // "kind" values (see TranscriptionController::jobs()' doc comment).
+    function kindLabel(kind) {
+        switch (kind) {
+        case "relabel": return qsTr("Label")
+        case "rename": return qsTr("Rename")
+        case "merge": return qsTr("Merge")
+        default: return qsTr("Transcribe")
+        }
+    }
+    // Appended to the kind/filename label so the "huge delay" before
+    // transcription starts on bigger models (or with speaker detection on)
+    // reads as "doing something", not a hang.
+    function phaseLabel(phase) {
+        switch (phase) {
+        case "loading": return qsTr("loading model…")
+        case "detecting-speakers": return qsTr("detecting speakers…")
+        case "transcribing": return qsTr("transcribing…")
+        default: return ""
+        }
+    }
 
     implicitHeight: 28
 
@@ -129,11 +173,38 @@ Item {
             }
         }
 
+        Label {
+            Layout.preferredWidth: 160
+            elide: Text.ElideMiddle
+            visible: bottomBar.busy
+            text: bottomBar.kindLabel(bottomBar.currentJobKind) + ": " + bottomBar.currentJobFileName
+            color: "#aaaaaa"
+            font.pixelSize: 11
+        }
+
+        // Deliberately a SEPARATE, non-eliding Label — this is the one
+        // piece of text telling the user what's actually happening during
+        // the "huge delay" (loading/detecting-speakers/transcribing), so it
+        // must never be the part that gets truncated. Only the filename
+        // above (which can legitimately be long) elides; this one sizes to
+        // its own content instead of sharing a fixed-width elide box with it.
+        Label {
+            visible: bottomBar.busy && bottomBar.phaseLabel(bottomBar.currentPhase) !== ""
+            text: "(" + bottomBar.phaseLabel(bottomBar.currentPhase) + ")"
+            color: "#888888"
+            font.pixelSize: 11
+        }
+
         ProgressBar {
             Layout.preferredWidth: 140
             from: 0
             to: 1
             value: bottomBar.taskProgress
+            // "loading" (model load) has no real progress number behind it
+            // — indeterminate (animated, not frozen) rather than looking
+            // hung. "detecting-speakers"/"transcribing" both have real
+            // progress, same determinate bar as always.
+            indeterminate: bottomBar.progressIsIndeterminate
             // Only while something is ACTIVELY running — tasksTotal alone
             // would keep this visible (frozen, meaningless) after every job
             // finishes, since finished jobs stay listed until dismissed.
@@ -267,6 +338,32 @@ Item {
                             default: return "#f1c40f"
                             }
                         }
+                        // Distinguishes what kind of work this job actually
+                        // is — the same queue/worker thread runs full
+                        // transcriptions, "regenerate label" jobs, and
+                        // speaker renames, which otherwise look identical in
+                        // this list (same fileUrl, same status colors).
+                        readonly property string kindLabel: bottomBar.kindLabel(modelData.kind)
+
+                        HoverHandler {
+                            id: jobRowHover
+                            cursorShape: Qt.PointingHandCursor
+                        }
+                        // Clicking a task jumps straight to its note — same
+                        // "row itself is clickable, inner buttons still work
+                        // independently" pattern as Sidebar.qml's file rows;
+                        // dismissButton's own TapHandler below (a child Item)
+                        // takes priority over this one within its own bounds.
+                        TapHandler {
+                            onTapped: {
+                                bottomBar.taskActivated(jobRow.modelData.fileUrl.toString().replace("file://", ""))
+                                jobListPopup.close()
+                            }
+                        }
+                        HoverBorder {
+                            anchors.fill: parent
+                            active: jobRowHover.hovered
+                        }
 
                         RowLayout {
                             anchors.fill: parent
@@ -277,6 +374,14 @@ Item {
                                 height: 8
                                 radius: 4
                                 color: jobRow.statusColor
+                            }
+                            Label {
+                                Layout.preferredWidth: 70
+                                elide: Text.ElideRight
+                                text: jobRow.kindLabel
+                                color: "#8fa8bf"
+                                font.pixelSize: 10
+                                font.bold: true
                             }
                             Label {
                                 Layout.fillWidth: true

@@ -1,6 +1,8 @@
 #pragma once
 
+#include <QFile>
 #include <QObject>
+#include <QString>
 #include <QThread>
 #include <QUrl>
 #include <QVariantList>
@@ -8,7 +10,76 @@
 #include <QVector>
 #include <qqml.h>
 
+#include "Segment.h"
+
 class TranscriptionWorker;
+
+// Writes segment lines to an open sidecar .md file (see appendSegmentLine's
+// former doc comment / CLAUDE.md "vault layout"), merging a REPEATING CYCLE
+// of consecutive segments (period 1..maxCycleLength — one repeated line, or
+// a repeating block of 2, 3, ... lines) into just ONE copy of the cycle —
+// whisper.cpp occasionally hallucinates the exact same sentence, OR the
+// exact same short alternating pattern (e.g. "[MUSIC PLAYING]" / "[APPLAUSE]"
+// back and forth), across many consecutive segments during a silence
+// stretch, and per the user's request that must be merged IN THE FILE
+// ITSELF, not just hidden by a display-layer dedup. Each line of a merged
+// cycle keeps its own FIRST-occurrence timestamp and gets its own trailing
+// " (×N)" repeat-count marker (see segmentLinePattern() in
+// TranscriptionController.cpp for the parse side) — N is how many times
+// THAT particular line occurred, which for every line in a repeating cycle
+// is the same N (the cycle's repeat count). Two lines with identical text
+// but DIFFERENT speakers are never merged.
+//
+// maxCycleLength bounds the search purely for performance — every new
+// segment does an O(maxCycleLength^2) check against a small trailing
+// window, never a full-file scan, so this stays cheap regardless of
+// transcript length. Configurable (AppSettings.duplicateCycleWindow in QML
+// -> TranscriptionController::transcribe()'s duplicateCycleWindow param),
+// default 3 (checks period 1, 2, AND 3 — not just 3 alone).
+//
+// Durability is preserved despite the merge: each append() call leaves the
+// file in a fully valid, flushed state — a duplicate cycle doesn't append
+// new lines, it seeks back to the start of the EARLIEST line in the
+// matched cycle (valid because writes are always sequential/at EOF, and
+// every LineRecord's fileOffset is kept up to date across rewrites) and
+// rewrites just that one copy in place with incremented counts, so a kill
+// mid-run still leaves a correctly-formatted (if not-yet-fully-repeated)
+// file. Declared here (rather than file-local in the .cpp) so tests can
+// drive it directly with synthetic Segments, without needing a real
+// whisper model.
+class SegmentLineWriter {
+public:
+    explicit SegmentLineWriter(QFile &mdFile, int maxCycleLength = 3);
+
+    // speakerLabel: empty = speaker detection wasn't on (or produced no
+    // label) for this segment — no leading tag written, matching the
+    // legacy no-detection format exactly. Non-empty = the real diarized
+    // speaker label ("Speaker 1", "Speaker 2", ...; see DiarizationEngine).
+    // Segments with empty (whitespace-only) text are silently skipped, same
+    // as the old appendSegmentLine did.
+    void append(const Segment &segment, const QString &speakerLabel);
+
+private:
+    // One physical line currently at the tail of the file, as it stands
+    // right now (fileOffset/repeatCount reflect the CURRENT on-disk state,
+    // which may already have been rewritten by an earlier merge).
+    struct LineRecord {
+        qint64 fileOffset = 0;
+        QString speakerLabel;
+        QString text;
+        double t0 = 0.0;
+        int repeatCount = 1;
+    };
+
+    void writeRecord(const LineRecord &record);
+    void tryMergeCycle();
+
+    QFile &m_mdFile;
+    int m_maxCycleLength;
+    // Bounded to the last 2*maxCycleLength entries (see tryMergeCycle()) —
+    // that's all a period-<=maxCycleLength check can ever need to look at.
+    QVector<LineRecord> m_tail;
+};
 
 // Orchestrates: ffmpeg decode -> WhisperCppEngine -> vault sidecar files.
 // Owns a dedicated QThread; transcription (and its file IO) NEVER runs on
@@ -27,7 +98,28 @@ class TranscriptionController : public QObject {
     QML_ELEMENT
     Q_PROPERTY(bool busy READ isBusy NOTIFY busyChanged)
     Q_PROPERTY(double progress READ progress NOTIFY progressChanged)
+    // "loading" (whisper model load — no native progress hook exists for
+    // this, so progress stays 0 here; QML shows an indeterminate bar),
+    // "detecting-speakers" (diarization pass, REAL progress via
+    // DiarizationEngine's sherpa-onnx-backed callback), "transcribing"
+    // (whisper's own per-segment progress, as before), or empty when idle
+    // or for a relabel/rename job (neither has phases worth naming). When
+    // detection actually runs, "detecting-speakers" and "transcribing"
+    // share ONE continuous 0->1 progress sweep (first half / second half —
+    // see run()) rather than each getting its own 0->1, which would look
+    // like the bar finishes then restarts. Exists because "huge delay
+    // before it starts transcribing" on bigger models was previously
+    // invisible — the progress bar sat frozen at 0 during model load and
+    // (once diarization landed) during the whole
+    // diarization pass too, indistinguishable from a hang.
+    Q_PROPERTY(QString currentPhase READ currentPhase NOTIFY currentPhaseChanged)
     Q_PROPERTY(QUrl currentFile READ currentFile NOTIFY currentFileChanged)
+    // "transcribe"/"relabel"/"rename"/"merge" for whichever job is Active
+    // right now (see jobs()' "kind" key — same four values), empty when
+    // idle. Changes at exactly the same time as currentFile (both set
+    // together in startJob()), so it reuses that signal rather than needing
+    // its own.
+    Q_PROPERTY(QString currentJobKind READ currentJobKind NOTIFY currentFileChanged)
     Q_PROPERTY(int tasksTotal READ tasksTotal NOTIFY queueChanged)
     Q_PROPERTY(int tasksCompleted READ tasksCompleted NOTIFY queueChanged)
     Q_PROPERTY(QVariantList queuedFileUrls READ queuedFileUrls NOTIFY queueChanged)
@@ -42,7 +134,10 @@ public:
 
     bool isBusy() const { return m_busy; }
     double progress() const { return m_progress; }
+    QString currentPhase() const { return m_phase; }
     QUrl currentFile() const { return m_currentFile; }
+    // See the currentJobKind Q_PROPERTY doc comment above.
+    QString currentJobKind() const;
     // Derived from m_jobs: total entry count / Done+Failed count. Both only
     // grow until dismiss()/clearFinished() shrink the list (see class doc).
     int tasksTotal() const;
@@ -51,17 +146,28 @@ public:
     // a "Queued…" state distinct from the currently-Active job.
     QVariantList queuedFileUrls() const;
     // Every job for this session (Queued+Active+Done+Failed), each as
-    // {fileUrl, status ("queued"/"active"/"done"/"failed"), error}.
+    // {fileUrl, status ("queued"/"active"/"done"/"failed"), error,
+    // kind ("transcribe"/"relabel"/"rename"/"merge")} — kind lets the UI
+    // distinguish a full transcription from a "regenerate label" or a
+    // speaker-rename/merge task in the same list (they all share this one
+    // queue/worker thread).
     QVariantList jobs() const;
 
     // No-op if fileUrl already has a Queued or Active entry (no duplicate
     // in-flight-or-pending tasks). A Done/Failed entry for the same fileUrl
     // does NOT block re-queueing — deliberately allows re-transcribing after
     // dismissal or after changing settings. Starts immediately if idle,
-    // otherwise queues. autoLabel opts into the AI auto-labeling second pass
-    // (see LabelingEngine) — a labeling failure never fails the overall job,
-    // since the primary transcript is already the thing that matters; it is
-    // logged and the job still reports success.
+    // otherwise queues. autoLabel opts into AI auto-labeling (see
+    // LabelingEngine) — this does NOT run as a bonus step inside the
+    // transcription job itself: a SEPARATE relabel()-equivalent job (same
+    // "kind": "relabel" as a manual "regenerate label" click) is queued
+    // immediately alongside the transcribe job, right here in this same
+    // call — BOTH show up in the Tasks list together right away, not one
+    // appended later once transcription finishes. It waits its turn behind
+    // the transcribe job (only one job runs at a time) and, if that job
+    // fails, still runs next and fails on its own (nothing to label yet) —
+    // it is never silently skipped just because its upstream job failed, so
+    // the Tasks list always reflects exactly what was requested up front.
     // restrictTagsToExisting (item 14 "auto-categorize" mode): when true,
     // the labeling pass is instructed to only pick tags already used
     // elsewhere in this vault (scanned fresh per job), leaving tags empty
@@ -90,10 +196,6 @@ public:
     // request (transcribe() itself never checks this — a user clicking
     // Transcribe on one file always re-runs it, regardless of whether
     // settings match). False for an untranscribed file (nothing to match).
-    // Accounts for speakerDetection always forcing the tdrz model
-    // regardless of modelId (see ModelManager's documented override), so a
-    // model-id mismatch alone doesn't cause a false "differs" when speaker
-    // detection is what actually determined the model both times.
     Q_INVOKABLE bool matchesExistingTranscription(const QUrl &fileUrl, const QString &modelId,
                                                    bool speakerDetection) const;
 
@@ -101,8 +203,11 @@ public:
     // pass on an already-transcribed file — reads the EXISTING transcript
     // text, does not re-transcribe audio. Queued through the same job/worker
     // infrastructure as transcribe() (dedup, persistent job list) since it's
-    // real GPU work; unlike transcribe()'s autoLabel option, a failure here
-    // IS the job's result (there's nothing else for this job to accomplish).
+    // real GPU work; a failure here IS the job's result (there's nothing
+    // else for this job to accomplish). transcribe()'s autoLabel option
+    // builds this same shape of job directly (see its doc comment) rather
+    // than calling this method — a manual "regenerate label" click and an
+    // automatic post-transcription label pass are the exact same job kind.
     Q_INVOKABLE void relabel(const QUrl &fileUrl, const QUrl &vaultUrl, bool restrictTagsToExisting = false,
                               double tagReuseBias = 0.5);
 
@@ -117,7 +222,11 @@ public:
     // transcribed. If the requested model id wasn't recognized and
     // ModelManager fell back to its default, the map also carries
     // modelFallback (true) and modelRequested (the id that wasn't honored) —
-    // model itself always names the file that actually ran.
+    // model itself always names the file that actually ran. If speaker
+    // detection was requested but the diarization models couldn't be
+    // downloaded/loaded, speakerDetection reads false (the transcription
+    // still ran, ASR-only — see DiarizationEngine) and the map carries
+    // speakerDetectionError (why) — MainPanel surfaces this as a warning.
     Q_INVOKABLE QVariantMap readMetadata(const QUrl &fileUrl) const;
 
     // {id, label} pairs for the model dropdown (see ModelManager).
@@ -167,25 +276,41 @@ public:
     // definitive result).
     Q_INVOKABLE void renameSpeaker(const QUrl &fileUrl, const QString &oldName, const QString &newName);
 
+    // Merges sourceName into targetName: every "[sourceName]" body tag
+    // becomes "[targetName]", and sourceName drops out of distinctSpeakerIds
+    // entirely (unlike renameSpeaker() above, colliding with an existing
+    // name is the whole point here — see mergeSpeakersInFile()'s doc
+    // comment in the .cpp). Queued through the same job pipeline as
+    // renameSpeaker(), with the same async/dedup/optimistic-UI contract:
+    // runs on the background thread, rejects (speakersMerged's ok=false) if
+    // fileUrl already has a Queued/Active job, and the caller is expected to
+    // update its own display optimistically and reconcile once
+    // speakersMerged() fires.
+    Q_INVOKABLE void mergeSpeakers(const QUrl &fileUrl, const QString &sourceName, const QString &targetName);
+
     // Everything after the frontmatter's closing "---" line (i.e. the
     // segment text), for main-panel search. Empty string if untranscribed
     // or unreadable.
     Q_INVOKABLE QString readTranscriptBody(const QUrl &fileUrl) const;
 
     // Parses readTranscriptBody()'s "[HH:MM:SS.mmm] [tag] text" lines (see
-    // appendSegmentLine/formatTimestamp) into a list of {t0: seconds as
+    // SegmentLineWriter/formatTimestamp) into a list of {t0: seconds as
     // double, speaker: QString (empty = no speaker detection), text:
-    // QString, start, length: int}, in file order (which is also time order
-    // — segments are appended as whisper produces them). "speaker" is the
-    // literal bracketed tag text as stored in the file — "Speaker N" by
-    // default, or whatever a user has renamed it to (see renameSpeaker()
-    // above), never translated through a separate lookup. No "t1": it's
-    // never stored (always identical to the next segment's t0) and nothing
-    // consumes it. start/length are the character range of text within THIS
-    // SAME readTranscriptBody() string, so a caller can span-highlight the
-    // active sentence without re-deriving offsets. For sentence-level
-    // highlighting synced to playback (see DESIGN.md / CLAUDE.md "sentence-
-    // level only, binary-search on positionChanged").
+    // QString, start, length: int, repeatCount: int}, in file order (which
+    // is also time order — segments are appended as whisper produces them).
+    // "speaker" is the literal bracketed tag text as stored in the file —
+    // "Speaker N" by default, or whatever a user has renamed it to (see
+    // renameSpeaker() above), never translated through a separate lookup.
+    // No "t1": it's never stored (always identical to the next segment's
+    // t0) and nothing consumes it. start/length are the character range of
+    // text within THIS SAME readTranscriptBody() string, so a caller can
+    // span-highlight the active sentence without re-deriving offsets.
+    // repeatCount is 1 for a normal line, or N when SegmentLineWriter merged
+    // N consecutive identical (same speaker, same text) whisper segments
+    // into this one line with a trailing " (×N)" marker — the merge happens
+    // at write time, in the file itself, not just in this parsed view. For
+    // sentence-level highlighting synced to playback (see DESIGN.md /
+    // CLAUDE.md "sentence-level only, binary-search on positionChanged").
     Q_INVOKABLE QVariantList parseSentences(const QUrl &fileUrl) const;
 
     // Binary-searches sentences (as returned by parseSentences(), sorted by
@@ -207,6 +332,7 @@ public:
 signals:
     void busyChanged();
     void progressChanged();
+    void currentPhaseChanged();
     void currentFileChanged();
     void queueChanged();
     void finished(const QUrl &fileUrl, bool ok, const QString &error);
@@ -218,6 +344,13 @@ signals:
     // multiple speakers/optimistic renames at once (see MainPanel.qml's
     // pendingSpeakerRenames) knows exactly which one this result belongs to.
     void speakerRenamed(const QUrl &fileUrl, const QString &oldName, bool ok, const QString &error);
+    // Fired when a mergeSpeakers() call's background rewrite completes — see
+    // speakerRenamed()'s doc comment above for the shape/rationale, mirrored
+    // here with both names (sourceName is echoed back so a caller tracking
+    // several in-flight merges knows exactly which one this result belongs
+    // to, targetName rounds out the pair for symmetry/debugging).
+    void speakersMerged(const QUrl &fileUrl, const QString &sourceName, const QString &targetName, bool ok,
+                         const QString &error);
 
 private:
     struct Job {
@@ -230,11 +363,19 @@ private:
         bool renameSpeakerOnly = false;
         QString oldSpeakerName;
         QString newSpeakerName;
+        bool mergeSpeakersOnly = false;
+        QString sourceSpeakerName;
+        QString targetSpeakerName;
         bool restrictTagsToExisting = false;
         double tagReuseBias = 0.5;
         JobStatus status = JobStatus::Queued;
         QString error;
     };
+
+    // Shared by jobs()' "kind" key and currentJobKind() — the three flags
+    // above are mutually exclusive by construction (each enqueuing function
+    // only ever sets one).
+    static QString jobKind(const Job &job);
 
     void startJob(int index);
     void onWorkerFinished(bool ok, const QString &error);
@@ -243,6 +384,7 @@ private:
     TranscriptionWorker *m_worker = nullptr;
     bool m_busy = false;
     double m_progress = 0.0;
+    QString m_phase;
     QUrl m_currentFile;
     QVector<Job> m_jobs;
     int m_activeIndex = -1;

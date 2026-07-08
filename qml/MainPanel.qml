@@ -52,7 +52,12 @@ Rectangle {
     function refreshMetadata() {
         storedMetadata = (player && player.source.toString() !== "" && transcriptionController)
             ? transcriptionController.readMetadata(player.source) : ({})
-        speakerDetectionToggle.checked = mainPanel.hasStoredMetadata && storedMetadata.speakerDetection === true
+        // Speaker detection defaults ON for an untranscribed file (see
+        // DESIGN.md "Speaker diarization") — an already-transcribed file
+        // instead honors whatever was actually used last time, same as
+        // every other stored setting here.
+        speakerDetectionToggle.checked =
+            mainPanel.hasStoredMetadata ? storedMetadata.speakerDetection === true : true
     }
 
     function refreshOrphanedMetadata() {
@@ -144,15 +149,29 @@ Rectangle {
     // since there can be several pills.
     property string renamingSpeakerId: ""
 
-    // Surfaced briefly next to the Speakers row (see speakerRenameErrorTimer)
-    // — this app has no toast/notification system, so a small inline red
-    // label is the simplest consistent way to explain a rejected rename.
-    property string speakerRenameError: ""
+    // Surfaced briefly next to the Speakers row (see speakerOpErrorTimer) —
+    // this app has no toast/notification system, so a small inline red
+    // label is the simplest consistent way to explain a rejected rename OR
+    // a failed merge (see commitSpeakerRename()/onSpeakersMerged() below) —
+    // both are speaker-tag rewrites that can fail the same way, so they
+    // share this one banner slot rather than each getting their own.
+    property string speakerOpError: ""
 
     Timer {
-        id: speakerRenameErrorTimer
+        id: speakerOpErrorTimer
         interval: 4000
-        onTriggered: mainPanel.speakerRenameError = ""
+        onTriggered: mainPanel.speakerOpError = ""
+    }
+
+    // The file a speaker rename/merge should be applied to — the orphaned-md
+    // view and the normal audio-player view are mutually exclusive (see
+    // showAudioFile()/showOrphanedMd()), so exactly one of these is ever
+    // live at a time. Player-less/no-file case included so callers can
+    // safely .toString()-compare against a signal's fileUrl without a null
+    // check of their own.
+    function currentFileUrl() {
+        return mainPanel.orphanedMdPath !== "" ? ("file://" + mainPanel.orphanedMdPath)
+                                                : (mainPanel.player ? mainPanel.player.source : "")
     }
 
     // oldName must be the speaker's TRUE on-disk name (i.e. an entry from
@@ -175,19 +194,17 @@ Rectangle {
         const trimmedLower = trimmed.toLowerCase()
         for (const id of mainPanel.distinctSpeakerIds) {
             if (id !== oldName && mainPanel.effectiveSpeakerName(id).toLowerCase() === trimmedLower) {
-                mainPanel.speakerRenameError = qsTr("A speaker named \"%1\" already exists.").arg(trimmed)
-                speakerRenameErrorTimer.restart()
+                mainPanel.speakerOpError = qsTr("A speaker named \"%1\" already exists.").arg(trimmed)
+                speakerOpErrorTimer.restart()
                 return
             }
         }
-        mainPanel.speakerRenameError = ""
+        mainPanel.speakerOpError = ""
 
-        const targetUrl = mainPanel.orphanedMdPath !== "" ? ("file://" + mainPanel.orphanedMdPath)
-                                                           : mainPanel.player.source
         const updated = Object.assign({}, mainPanel.pendingSpeakerRenames)
         updated[oldName] = trimmed
         mainPanel.pendingSpeakerRenames = updated
-        mainPanel.transcriptionController.renameSpeaker(targetUrl, oldName, trimmed)
+        mainPanel.transcriptionController.renameSpeaker(mainPanel.currentFileUrl(), oldName, trimmed)
     }
 
     // Reconciles a renameSpeaker() call once its background rewrite
@@ -195,15 +212,13 @@ Rectangle {
     Connections {
         target: mainPanel.transcriptionController
         function onSpeakerRenamed(fileUrl, oldName, ok, error) {
-            const currentUrl = mainPanel.orphanedMdPath !== "" ? ("file://" + mainPanel.orphanedMdPath)
-                                                                : (mainPanel.player ? mainPanel.player.source.toString() : "")
-            if (fileUrl.toString() !== currentUrl.toString())
+            if (fileUrl.toString() !== mainPanel.currentFileUrl().toString())
                 return
             if (ok) {
                 mainPanel.sentencesRevision += 1
             } else {
-                mainPanel.speakerRenameError = error
-                speakerRenameErrorTimer.restart()
+                mainPanel.speakerOpError = error
+                speakerOpErrorTimer.restart()
             }
             // Either way the optimistic override is no longer needed: on
             // success the reparse (sentencesRevision above) now shows the
@@ -213,6 +228,135 @@ Rectangle {
             const updated = Object.assign({}, mainPanel.pendingSpeakerRenames)
             delete updated[oldName]
             mainPanel.pendingSpeakerRenames = updated
+        }
+    }
+
+    // --- Speaker MERGE (drag one pill onto another) ---
+    //
+    // Optimistic-UI overlay for an in-flight mergeSpeakers() call: raw
+    // on-disk ids currently mid-merge map to true here. Unlike
+    // pendingSpeakerRenames, this only dims/disables the pill (see
+    // speakerPillItem.pendingMerge below) rather than changing its
+    // displayed name — a merge SHRINKS the real distinct-speaker count, and
+    // distinctSpeakerIds is deliberately always the true on-disk set (same
+    // reasoning as pendingSpeakerRenames' own doc comment), so the pill only
+    // actually disappears once the background rewrite completes and
+    // sentencesRevision's reparse reflects it.
+    property var pendingSpeakerMerges: ({})
+
+    // Raw id of the pill currently showing its inline "Merge into X?"
+    // confirmation in place of its normal label, and the raw id it would
+    // merge into if confirmed — set only for the one ambiguous case (see
+    // resolveSpeakerMerge() below): both speakers involved were manually
+    // renamed, so neither name obviously "wins".
+    property string mergeConfirmSourceId: ""
+    property string mergeConfirmTargetId: ""
+
+    // Drag state for the pill row's manual (non-Drag/DropArea) hit-testing
+    // — see speakerPillItem's DragHandler. draggingSpeakerId is the raw id
+    // being dragged ("" when idle); dragHoverSpeakerId is whichever OTHER
+    // pill the pointer is currently over. dragGhostX/Y (mainPanel-space)
+    // position the floating name label near the end of this file that
+    // visually represents the drag — the real pill is deliberately never
+    // moved itself (it lives in a Flow, which doesn't defend a child's x/y
+    // against being fought mid-drag, unlike a manually-positioned ghost).
+    property string draggingSpeakerId: ""
+    property string dragHoverSpeakerId: ""
+    property real dragGhostX: 0
+    property real dragGhostY: 0
+
+    // A speaker's default, never-renamed display name is always exactly
+    // "Speaker N" (see DiarizationEngine/labelForSegment) — used to decide
+    // which side of a merge "wins" the resulting name below.
+    function isDefaultSpeakerName(name) {
+        return /^Speaker \d+$/.test(name)
+    }
+
+    // Resolves a drag of sourceId onto targetId (both raw on-disk ids from
+    // distinctSpeakerIds) into who wins the resulting name: if BOTH were
+    // manually renamed, it's ambiguous — needsConfirm, defaulting to the
+    // drop target's name (the user can re-drag the other direction, or
+    // reject, to keep the source's name instead). Otherwise whichever one
+    // is manually renamed wins outright, even if that's the one just
+    // dragged (so a custom name can never be silently clobbered by dropping
+    // it onto an un-renamed "Speaker N" pill); if NEITHER was renamed, the
+    // drop target wins. Returns null for a no-op self-drop.
+    function resolveSpeakerMerge(sourceId, targetId) {
+        if (sourceId === targetId)
+            return null
+        const sourceNamed = !mainPanel.isDefaultSpeakerName(mainPanel.effectiveSpeakerName(sourceId))
+        const targetNamed = !mainPanel.isDefaultSpeakerName(mainPanel.effectiveSpeakerName(targetId))
+        const winnerIsSource = sourceNamed && !targetNamed
+        return {
+            needsConfirm: sourceNamed && targetNamed,
+            loserId: winnerIsSource ? targetId : sourceId,
+            winnerId: winnerIsSource ? sourceId : targetId
+        }
+    }
+
+    function startSpeakerMerge(loserId, winnerId) {
+        if (!mainPanel.transcriptionController)
+            return
+        const updated = Object.assign({}, mainPanel.pendingSpeakerMerges)
+        updated[loserId] = true
+        mainPanel.pendingSpeakerMerges = updated
+        mainPanel.transcriptionController.mergeSpeakers(mainPanel.currentFileUrl(), loserId, winnerId)
+    }
+
+    // Called when a drag lands on a DIFFERENT pill (see speakerPillItem's
+    // DragHandler.onActiveChanged).
+    function handleSpeakerDrop(sourceId, targetId) {
+        const resolution = mainPanel.resolveSpeakerMerge(sourceId, targetId)
+        if (!resolution)
+            return
+        if (resolution.needsConfirm) {
+            mainPanel.mergeConfirmSourceId = sourceId
+            mainPanel.mergeConfirmTargetId = resolution.winnerId
+        } else {
+            mainPanel.startSpeakerMerge(resolution.loserId, resolution.winnerId)
+        }
+    }
+
+    function confirmSpeakerMerge(confirmed) {
+        const sourceId = mainPanel.mergeConfirmSourceId
+        const targetId = mainPanel.mergeConfirmTargetId
+        mainPanel.mergeConfirmSourceId = ""
+        mainPanel.mergeConfirmTargetId = ""
+        if (confirmed && sourceId !== "")
+            mainPanel.startSpeakerMerge(sourceId, targetId)
+    }
+
+    // Manual hit-test used by the drag handler above — checks every OTHER
+    // pill's bounds (mainPanel-space) for the given point. speakersRow's
+    // Repeater delegates are direct children of speakersRow itself, each
+    // exposing its raw id as .modelData.
+    function speakerIdAtScenePos(sceneX, sceneY, excludeId) {
+        for (const child of speakersRow.children) {
+            if (child.modelData === undefined || child.modelData === excludeId)
+                continue
+            const local = child.mapFromItem(mainPanel, sceneX, sceneY)
+            if (local.x >= 0 && local.x <= child.width && local.y >= 0 && local.y <= child.height)
+                return child.modelData
+        }
+        return ""
+    }
+
+    // Reconciles a mergeSpeakers() call once its background rewrite
+    // completes — mirrors onSpeakerRenamed above.
+    Connections {
+        target: mainPanel.transcriptionController
+        function onSpeakersMerged(fileUrl, sourceName, targetName, ok, error) {
+            if (fileUrl.toString() !== mainPanel.currentFileUrl().toString())
+                return
+            if (ok) {
+                mainPanel.sentencesRevision += 1
+            } else {
+                mainPanel.speakerOpError = error
+                speakerOpErrorTimer.restart()
+            }
+            const updated = Object.assign({}, mainPanel.pendingSpeakerMerges)
+            delete updated[sourceName]
+            mainPanel.pendingSpeakerMerges = updated
         }
     }
 
@@ -885,6 +1029,65 @@ Rectangle {
                 }
             }
 
+            // Item 28: transcribe as an icon button (same 22x22 box as the
+            // regenerate/search icons it now sits beside), replacing the old
+            // full-width text Button that lived down in the scrollable
+            // content below the model combo. Same enable/tooltip logic the
+            // old Button had (Wave F: a manual click always re-runs,
+            // regardless of stored-metadata match) — modelCombo/
+            // speakerDetectionToggle are declared lower in this file but
+            // still resolve fine since ids are scoped to the whole document.
+            Item {
+                id: transcribeIconButton
+                Layout.preferredWidth: 22
+                Layout.preferredHeight: 22
+                visible: mainPanel.orphanedMdPath === "" && mainPanel.player
+                         && mainPanel.player.source.toString() !== ""
+
+                readonly property bool isActive: mainPanel.transcriptionController && mainPanel.player
+                    && mainPanel.transcriptionController.busy
+                    && mainPanel.transcriptionController.currentFile.toString() === mainPanel.player.source.toString()
+                readonly property bool isQueued: mainPanel.transcriptionController && mainPanel.player
+                    && mainPanel.player.source.toString() !== ""
+                    && mainPanel.transcriptionController.queuedFileUrls.some(
+                           u => u.toString() === mainPanel.player.source.toString())
+                enabled: visible && mainPanel.transcriptionController
+                         && !transcribeIconButton.isActive && !transcribeIconButton.isQueued
+
+                ToolTip.visible: transcribeIconHover.hovered
+                ToolTip.text: transcribeIconButton.isActive ? qsTr("Transcribing…")
+                              : transcribeIconButton.isQueued ? qsTr("Queued…")
+                              : (mainPanel.transcriptionController && mainPanel.transcriptionController.busy
+                                 ? qsTr("Add to queue")
+                                 : (mainPanel.hasStoredMetadata ? qsTr("Re-transcribe") : qsTr("Transcribe")))
+                ToolTip.delay: 500
+
+                HoverHandler {
+                    id: transcribeIconHover
+                    cursorShape: Qt.PointingHandCursor
+                    enabled: transcribeIconButton.enabled
+                }
+                TapHandler {
+                    enabled: transcribeIconButton.enabled
+                    onTapped: mainPanel.transcriptionController.transcribe(mainPanel.player.source, mainPanel.vaultPath,
+                                                                             modelCombo.currentValue,
+                                                                             speakerDetectionToggle.checked,
+                                                                             AppSettings.autoLabelEnabled,
+                                                                             AppSettings.restrictTagsToExisting,
+                                                                             AppSettings.tagReuseBias)
+                }
+                HoverBorder {
+                    anchors.fill: parent
+                    active: transcribeIconButton.enabled && transcribeIconHover.hovered
+                }
+                Text {
+                    anchors.centerIn: parent
+                    text: "⤒"
+                    color: transcribeIconButton.enabled ? "#dddddd" : "#666666"
+                    font.pixelSize: 13
+                }
+            }
+
             // Item 9: regenerate auto-title — re-runs just the AI labeling
             // pass on the already-transcribed text (no re-transcription).
             // Visible whenever there's a transcript to label, independent of
@@ -1018,272 +1221,334 @@ Rectangle {
             }
         }
 
-        // Item 13: there was previously no way to see generated tags at all
-        // (auto-labeling wrote them to frontmatter but nothing displayed
-        // them). Small rounded pills, one per comma-separated tag.
-        Flow {
-            id: tagsRow
+        // Item: only the playback progress bar and title/regen/search row
+        // above are "sticky" (fixed, always visible) — everything else
+        // (tags, speaker pills, detection/model controls, the transcribe
+        // button, and the transcript itself) now lives INSIDE
+        // transcriptScrollView's own scrollable content, so it scrolls away
+        // together with the transcript on a long file instead of
+        // permanently eating vertical space above it. This is the SAME
+        // ScrollView/contentItem that middleDragScrollArea and the
+        // live-transcription auto-scroll-to-bottom logic already reference
+        // (see onTranscriptBodyChanged) — moving these rows inside its
+        // single content child doesn't change either of those, since both
+        // already operate on transcriptScrollView.contentItem generically.
+        // transcriptScrollView must have exactly ONE content child for QQC2's
+        // ScrollView to correctly auto-track content size (contentWidth/
+        // contentHeight) — a second child (middleDragScrollArea used to live
+        // here too) leaves that tracking ill-defined and silently breaks
+        // scrolling entirely. So the MouseArea now lives as a sibling
+        // OVERLAY on top of the ScrollView instead, inside this wrapping
+        // Item — anchors.fill still gives it the same full-viewport
+        // coverage for middle-drag panning, it just no longer counts as
+        // flickable content itself.
+        Item {
+            id: transcriptViewportContainer
             Layout.fillWidth: true
-            spacing: 6
-            visible: mainPanel.currentTags().length > 0
-
-            Repeater {
-                model: mainPanel.currentTags()
-
-                Rectangle {
-                    id: tagPill
-                    required property string modelData
-                    radius: AppSettings.borderRadius
-                    color: tagPillHover.hovered ? "#3f3f3f" : "#333333"
-                    border.width: 1
-                    border.color: "#4a4a4a"
-                    implicitWidth: tagLabel.implicitWidth + 12
-                    implicitHeight: tagLabel.implicitHeight + 6
-
-                    // Item 16 (Wave E): clicking a tag filters the sidebar
-                    // tree to files with that tag.
-                    HoverHandler {
-                        id: tagPillHover
-                        cursorShape: Qt.PointingHandCursor
-                    }
-                    TapHandler {
-                        onTapped: mainPanel.tagActivated(tagPill.modelData)
-                    }
-
-                    Label {
-                        id: tagLabel
-                        anchors.centerIn: parent
-                        text: parent.modelData
-                        color: "#cccccc"
-                        font.pixelSize: 11
-                    }
-                }
-            }
-        }
-
-        // Item 11 (Wave E): one pill per distinct speaker id detected in
-        // THIS transcript, showing its current display name (default:
-        // "Speaker N"). Click-to-rename mirrors the title's own
-        // Label<->TextField swap pattern; renaming rewrites every one of
-        // that speaker's "[name]" tags directly in the transcript BODY
-        // itself (see TranscriptionController::renameSpeaker()'s
-        // 2026-07-07 rewrite) — this pill's label updates optimistically
-        // via pendingSpeakerRenames the instant you commit, ahead of the
-        // background file rewrite actually finishing.
-        Flow {
-            id: speakersRow
-            Layout.fillWidth: true
-            spacing: 6
-            visible: mainPanel.distinctSpeakerIds.length > 0
-
-            Repeater {
-                model: mainPanel.distinctSpeakerIds
-
-                Item {
-                    id: speakerPillItem
-                    required property string modelData
-                    readonly property bool renaming: mainPanel.renamingSpeakerId === modelData
-                    implicitWidth: renaming ? speakerNameField.implicitWidth + 12 : speakerPillLabel.implicitWidth + 12
-                    implicitHeight: 22
-
-                    Rectangle {
-                        anchors.fill: parent
-                        radius: AppSettings.borderRadius
-                        color: speakerPillHover.hovered ? "#3f5f7f" : "#2f4f5f"
-                        border.width: 1
-                        border.color: "#4a6a7a"
-                        visible: !speakerPillItem.renaming
-                    }
-                    HoverHandler {
-                        id: speakerPillHover
-                        cursorShape: Qt.PointingHandCursor
-                        enabled: !speakerPillItem.renaming
-                    }
-                    TapHandler {
-                        enabled: !speakerPillItem.renaming
-                        onTapped: {
-                            speakerNameField.text = mainPanel.effectiveSpeakerName(speakerPillItem.modelData)
-                            mainPanel.renamingSpeakerId = speakerPillItem.modelData
-                            speakerNameField.forceActiveFocus()
-                            speakerNameField.selectAll()
-                        }
-                    }
-                    Label {
-                        id: speakerPillLabel
-                        anchors.centerIn: parent
-                        visible: !speakerPillItem.renaming
-                        text: mainPanel.effectiveSpeakerName(speakerPillItem.modelData)
-                        color: "#dddddd"
-                        font.pixelSize: 11
-                    }
-
-                    TextField {
-                        id: speakerNameField
-                        anchors.centerIn: parent
-                        visible: speakerPillItem.renaming
-                        font.pixelSize: 11
-                        onAccepted: mainPanel.commitSpeakerRename(speakerPillItem.modelData, text)
-                        onActiveFocusChanged: if (!activeFocus && speakerPillItem.renaming)
-                                                  mainPanel.commitSpeakerRename(speakerPillItem.modelData, text)
-
-                        background: UnderlineField { focused: speakerNameField.activeFocus }
-
-                        Keys.onEscapePressed: mainPanel.renamingSpeakerId = ""
-                    }
-                }
-            }
-        }
-
-        // Rejected/failed speaker rename feedback (duplicate name, or a
-        // background rewrite failure) — see commitSpeakerRename()/the
-        // speakerRenamed Connections handler. No existing toast system in
-        // this app, so a small auto-clearing inline label is the simplest
-        // consistent way to surface it.
-        Label {
-            Layout.fillWidth: true
-            visible: mainPanel.speakerRenameError !== ""
-            text: mainPanel.speakerRenameError
-            color: "#e07a7a"
-            font.pixelSize: 11
-            wrapMode: Text.WordWrap
-        }
-
-        Label {
-            Layout.fillWidth: true
-            visible: mainPanel.orphanedMdPath === "" && (!mainPanel.player || mainPanel.player.source.toString() === "")
-            text: qsTr("No file selected")
-            color: "white"
-        }
-
-        RowLayout {
-            spacing: 12
-            visible: mainPanel.orphanedMdPath === "" && mainPanel.hasStoredMetadata
-
-            Label {
-                text: qsTr("Previously transcribed — model: %1, speaker detection: %2")
-                      .arg(mainPanel.storedMetadata.model || "?")
-                      .arg(mainPanel.storedMetadata.speakerDetection ? qsTr("on") : qsTr("off"))
-                color: "#aaaaaa"
-                font.pixelSize: 11
-            }
-        }
-
-        RowLayout {
-            spacing: 12
-            visible: mainPanel.orphanedMdPath === ""
-
-            CheckBox {
-                id: speakerDetectionToggle
-                text: qsTr("Speaker detection")
-
-                HoverHandler {
-                    cursorShape: Qt.PointingHandCursor
-                }
-            }
-
-            Label {
-                text: qsTr("Model")
-                color: "#aaaaaa"
-            }
-
-            ComboBox {
-                id: modelCombo
-                Layout.preferredWidth: 240
-                model: mainPanel.transcriptionController ? mainPanel.transcriptionController.availableModels() : []
-                textRole: "label"
-                valueRole: "id"
-                enabled: !speakerDetectionToggle.checked
-                hoverEnabled: true
-
-                Component.onCompleted: currentIndex = mainPanel.indexForModelId(AppSettings.lastModel)
-                onActivated: AppSettings.lastModel = currentValue
-
-                ToolTip.visible: modelCombo.hovered
-                ToolTip.text: modelCombo.currentText
-                ToolTip.delay: 500
-
-                HoverHandler {
-                    cursorShape: Qt.PointingHandCursor
-                    enabled: modelCombo.enabled
-                }
-                HoverBorder {
-                    anchors.fill: parent
-                    active: modelCombo.enabled && modelCombo.hovered
-                }
-            }
-
-            Label {
-                visible: speakerDetectionToggle.checked
-                text: qsTr("(speaker detection requires small.en-tdrz)")
-                color: "#888888"
-                font.pixelSize: 11
-            }
-        }
-
-        RowLayout {
-            spacing: 12
-            visible: mainPanel.orphanedMdPath === ""
-
-            Button {
-                id: transcribeButton
-
-                readonly property bool isActive: mainPanel.transcriptionController && mainPanel.player
-                    && mainPanel.transcriptionController.busy
-                    && mainPanel.transcriptionController.currentFile.toString() === mainPanel.player.source.toString()
-                readonly property bool isQueued: mainPanel.transcriptionController && mainPanel.player
-                    && mainPanel.player.source.toString() !== ""
-                    && mainPanel.transcriptionController.queuedFileUrls.some(
-                           u => u.toString() === mainPanel.player.source.toString())
-
-                text: transcribeButton.isActive ? qsTr("Transcribing…")
-                      : transcribeButton.isQueued ? qsTr("Queued…")
-                      : (mainPanel.transcriptionController && mainPanel.transcriptionController.busy
-                         ? qsTr("Add to queue")
-                         : (mainPanel.hasStoredMetadata ? qsTr("Re-transcribe") : qsTr("Transcribe")))
-                // A manual, explicit click always re-runs — regardless of
-                // whether the current model/speaker-detection selection
-                // matches what's already stored (only "transcribe all"
-                // bulk-skips already-current files; a single deliberate
-                // click here never should).
-                enabled: mainPanel.player && mainPanel.player.source.toString() !== ""
-                         && mainPanel.transcriptionController
-                         && !transcribeButton.isActive && !transcribeButton.isQueued
-                hoverEnabled: true
-                onClicked: mainPanel.transcriptionController.transcribe(mainPanel.player.source, mainPanel.vaultPath,
-                                                                         modelCombo.currentValue,
-                                                                         speakerDetectionToggle.checked,
-                                                                         AppSettings.autoLabelEnabled,
-                                                                         AppSettings.restrictTagsToExisting,
-                                                                         AppSettings.tagReuseBias)
-
-                background: Rectangle {
-                    radius: AppSettings.borderRadius
-                    color: (transcribeButton.hovered && transcribeButton.enabled) ? "#3a3a3a" : "#2a2a2a"
-                    opacity: transcribeButton.enabled ? 1 : 0.5
-                    border.width: 1
-                    border.color: "#3a3a3a"
-                }
-                HoverHandler {
-                    cursorShape: Qt.PointingHandCursor
-                    enabled: transcribeButton.enabled
-                }
-                HoverBorder {
-                    anchors.fill: parent
-                    active: transcribeButton.enabled && transcribeButton.hovered
-                }
-            }
-        }
+            Layout.fillHeight: true
 
         ScrollView {
             id: transcriptScrollView
-            Layout.fillWidth: true
-            Layout.fillHeight: true
+            anchors.fill: parent
             clip: true
-            visible: mainPanel.transcriptBody !== ""
             ScrollBar.horizontal.policy: ScrollBar.AlwaysOff
+
+            ColumnLayout {
+                id: scrollableContent
+                width: transcriptScrollView.availableWidth
+                spacing: 12
+
+                // Item 13: there was previously no way to see generated tags at all
+                // (auto-labeling wrote them to frontmatter but nothing displayed
+                // them). Small rounded pills, one per comma-separated tag.
+                Flow {
+                    id: tagsRow
+                    Layout.fillWidth: true
+                    spacing: 6
+                    visible: mainPanel.currentTags().length > 0
+
+                    Repeater {
+                        model: mainPanel.currentTags()
+
+                        Rectangle {
+                            id: tagPill
+                            required property string modelData
+                            radius: AppSettings.borderRadius
+                            color: tagPillHover.hovered ? "#3f3f3f" : "#333333"
+                            border.width: 1
+                            border.color: "#4a4a4a"
+                            implicitWidth: tagLabel.implicitWidth + 12
+                            implicitHeight: tagLabel.implicitHeight + 6
+
+                            // Item 16 (Wave E): clicking a tag filters the sidebar
+                            // tree to files with that tag.
+                            HoverHandler {
+                                id: tagPillHover
+                                cursorShape: Qt.PointingHandCursor
+                            }
+                            TapHandler {
+                                onTapped: mainPanel.tagActivated(tagPill.modelData)
+                            }
+
+                            Label {
+                                id: tagLabel
+                                anchors.centerIn: parent
+                                text: parent.modelData
+                                color: "#cccccc"
+                                font.pixelSize: 11
+                            }
+                        }
+                    }
+                }
+
+                // Item 11 (Wave E): one pill per distinct speaker id detected in
+                // THIS transcript, showing its current display name (default:
+                // "Speaker N"). Click-to-rename mirrors the title's own
+                // Label<->TextField swap pattern; renaming rewrites every one of
+                // that speaker's "[name]" tags directly in the transcript BODY
+                // itself (see TranscriptionController::renameSpeaker()'s
+                // 2026-07-07 rewrite) — this pill's label updates optimistically
+                // via pendingSpeakerRenames the instant you commit, ahead of the
+                // background file rewrite actually finishing. Drag one pill onto
+                // another to MERGE them (see mainPanel.handleSpeakerDrop() and
+                // TranscriptionController::mergeSpeakers()) — for over-split
+                // diarization, where two pills are really the same person.
+                Flow {
+                    id: speakersRow
+                    Layout.fillWidth: true
+                    spacing: 6
+                    visible: mainPanel.distinctSpeakerIds.length > 0
+
+                    Repeater {
+                        model: mainPanel.distinctSpeakerIds
+
+                        Item {
+                            id: speakerPillItem
+                            required property string modelData
+                            readonly property bool renaming: mainPanel.renamingSpeakerId === modelData
+                            readonly property bool confirmingMerge: mainPanel.mergeConfirmSourceId === modelData
+                            readonly property bool pendingMerge: modelData in mainPanel.pendingSpeakerMerges
+                            readonly property bool isDropTarget: mainPanel.dragHoverSpeakerId === modelData
+                            implicitWidth: (renaming ? speakerNameField.implicitWidth
+                                            : confirmingMerge ? mergeConfirmRow.implicitWidth
+                                            : speakerPillLabel.implicitWidth) + 12
+                            implicitHeight: 22
+                            opacity: pendingMerge ? 0.5 : 1.0
+
+                            Rectangle {
+                                anchors.fill: parent
+                                radius: AppSettings.borderRadius
+                                color: speakerPillItem.isDropTarget ? "#3f7f5f"
+                                       : speakerPillHover.hovered ? "#3f5f7f" : "#2f4f5f"
+                                border.width: speakerPillItem.isDropTarget ? 2 : 1
+                                border.color: speakerPillItem.isDropTarget ? "#6fdf9f" : "#4a6a7a"
+                                visible: !speakerPillItem.renaming
+                            }
+                            HoverHandler {
+                                id: speakerPillHover
+                                cursorShape: Qt.PointingHandCursor
+                                enabled: !speakerPillItem.renaming && !speakerPillItem.confirmingMerge
+                            }
+                            TapHandler {
+                                enabled: !speakerPillItem.renaming && !speakerPillItem.confirmingMerge
+                                         && !speakerPillItem.pendingMerge
+                                onTapped: {
+                                    speakerNameField.text = mainPanel.effectiveSpeakerName(speakerPillItem.modelData)
+                                    mainPanel.renamingSpeakerId = speakerPillItem.modelData
+                                    speakerNameField.forceActiveFocus()
+                                    speakerNameField.selectAll()
+                                }
+                            }
+                            // Drag source AND (via mainPanel.speakerIdAtScenePos())
+                            // the mechanism that finds the drop target — coexists
+                            // with the TapHandler above; Qt's pointer handlers
+                            // already disambiguate a plain tap (rename) from a
+                            // drag past the movement threshold (merge).
+                            DragHandler {
+                                id: speakerPillDrag
+                                enabled: !speakerPillItem.renaming && !speakerPillItem.confirmingMerge
+                                         && !speakerPillItem.pendingMerge
+                                target: null
+                                onActiveChanged: {
+                                    if (active) {
+                                        mainPanel.draggingSpeakerId = speakerPillItem.modelData
+                                        return
+                                    }
+                                    if (mainPanel.draggingSpeakerId !== speakerPillItem.modelData)
+                                        return
+                                    if (mainPanel.dragHoverSpeakerId !== "")
+                                        mainPanel.handleSpeakerDrop(speakerPillItem.modelData, mainPanel.dragHoverSpeakerId)
+                                    mainPanel.draggingSpeakerId = ""
+                                    mainPanel.dragHoverSpeakerId = ""
+                                }
+                                onCentroidChanged: {
+                                    if (!active)
+                                        return
+                                    const scenePos = speakerPillItem.mapToItem(mainPanel, centroid.position.x,
+                                                                                centroid.position.y)
+                                    mainPanel.dragGhostX = scenePos.x
+                                    mainPanel.dragGhostY = scenePos.y
+                                    mainPanel.dragHoverSpeakerId =
+                                        mainPanel.speakerIdAtScenePos(scenePos.x, scenePos.y, speakerPillItem.modelData)
+                                }
+                            }
+                            Label {
+                                id: speakerPillLabel
+                                anchors.centerIn: parent
+                                visible: !speakerPillItem.renaming && !speakerPillItem.confirmingMerge
+                                text: mainPanel.effectiveSpeakerName(speakerPillItem.modelData)
+                                color: "#dddddd"
+                                font.pixelSize: 11
+                            }
+
+                            // Inline "Merge into X?" confirmation — see
+                            // mainPanel.resolveSpeakerMerge()'s doc comment for
+                            // when this shows instead of committing immediately.
+                            // Inline rather than a popup, per StyleGuide.md
+                            // ("Warning banners: inline, not a popup/toast") and
+                            // matching the rename Label<->TextField swap above.
+                            RowLayout {
+                                id: mergeConfirmRow
+                                anchors.centerIn: parent
+                                visible: speakerPillItem.confirmingMerge
+                                spacing: 4
+                                Label {
+                                    text: qsTr("Merge into %1?").arg(mainPanel.effectiveSpeakerName(mainPanel.mergeConfirmTargetId))
+                                    color: "#dddddd"
+                                    font.pixelSize: 11
+                                }
+                                Label {
+                                    text: "✓"
+                                    color: "#8fdf9f"
+                                    font.pixelSize: 12
+                                    font.bold: true
+                                    HoverHandler { cursorShape: Qt.PointingHandCursor }
+                                    TapHandler { onTapped: mainPanel.confirmSpeakerMerge(true) }
+                                }
+                                Label {
+                                    text: "✕"
+                                    color: "#e07a7a"
+                                    font.pixelSize: 12
+                                    font.bold: true
+                                    HoverHandler { cursorShape: Qt.PointingHandCursor }
+                                    TapHandler { onTapped: mainPanel.confirmSpeakerMerge(false) }
+                                }
+                            }
+
+                            TextField {
+                                id: speakerNameField
+                                anchors.centerIn: parent
+                                visible: speakerPillItem.renaming
+                                font.pixelSize: 11
+                                onAccepted: mainPanel.commitSpeakerRename(speakerPillItem.modelData, text)
+                                onActiveFocusChanged: if (!activeFocus && speakerPillItem.renaming)
+                                                          mainPanel.commitSpeakerRename(speakerPillItem.modelData, text)
+
+                                background: UnderlineField { focused: speakerNameField.activeFocus }
+
+                                Keys.onEscapePressed: mainPanel.renamingSpeakerId = ""
+                            }
+                        }
+                    }
+                }
+
+                // Rejected/failed speaker rename OR merge feedback (duplicate
+                // name, or a background rewrite failure) — see
+                // commitSpeakerRename()/onSpeakerRenamed/onSpeakersMerged. No
+                // existing toast system in this app, so a small auto-clearing
+                // inline label is the simplest consistent way to surface it.
+                Label {
+                    Layout.fillWidth: true
+                    visible: mainPanel.speakerOpError !== ""
+                    text: mainPanel.speakerOpError
+                    color: "#e07a7a"
+                    font.pixelSize: 11
+                    wrapMode: Text.WordWrap
+                }
+
+                Label {
+                    Layout.fillWidth: true
+                    visible: mainPanel.orphanedMdPath === "" && (!mainPanel.player || mainPanel.player.source.toString() === "")
+                    text: qsTr("No file selected")
+                    color: "white"
+                }
+
+                RowLayout {
+                    spacing: 12
+                    visible: mainPanel.orphanedMdPath === "" && mainPanel.hasStoredMetadata
+
+                    Label {
+                        text: qsTr("Previously transcribed — model: %1, speaker detection: %2")
+                              .arg(mainPanel.storedMetadata.model || "?")
+                              .arg(mainPanel.storedMetadata.speakerDetection ? qsTr("on") : qsTr("off"))
+                        color: "#aaaaaa"
+                        font.pixelSize: 11
+                    }
+                }
+
+                // Speaker detection was requested but couldn't actually run (models
+                // unavailable/failed to load) — the transcription still completed,
+                // ASR-only, rather than being blocked (see DESIGN.md "Speaker
+                // diarization" graceful-degradation decision). Same inline-warning
+                // shape as speakerOpError above.
+                Label {
+                    Layout.fillWidth: true
+                    visible: mainPanel.orphanedMdPath === "" && mainPanel.hasStoredMetadata
+                             && !!mainPanel.storedMetadata.speakerDetectionError
+                    text: qsTr("Speaker detection was requested but did not run: %1")
+                          .arg(mainPanel.storedMetadata.speakerDetectionError || "")
+                    color: "#e0a25a"
+                    font.pixelSize: 11
+                    wrapMode: Text.WordWrap
+                }
+
+                RowLayout {
+                    spacing: 12
+                    visible: mainPanel.orphanedMdPath === ""
+
+                    CheckBox {
+                        id: speakerDetectionToggle
+                        text: qsTr("Speaker detection")
+
+                        HoverHandler {
+                            cursorShape: Qt.PointingHandCursor
+                        }
+                    }
+
+                    Label {
+                        text: qsTr("Model")
+                        color: "#aaaaaa"
+                    }
+
+                    ComboBox {
+                        id: modelCombo
+                        Layout.preferredWidth: 240
+                        model: mainPanel.transcriptionController ? mainPanel.transcriptionController.availableModels() : []
+                        textRole: "label"
+                        valueRole: "id"
+                        hoverEnabled: true
+
+                        Component.onCompleted: currentIndex = mainPanel.indexForModelId(AppSettings.lastModel)
+                        onActivated: AppSettings.lastModel = currentValue
+
+                        ToolTip.visible: modelCombo.hovered
+                        ToolTip.text: modelCombo.currentText
+                        ToolTip.delay: 500
+
+                        HoverHandler {
+                            cursorShape: Qt.PointingHandCursor
+                        }
+                        HoverBorder {
+                            anchors.fill: parent
+                            active: modelCombo.hovered
+                        }
+                    }
+                }
 
             TextArea {
                 id: transcriptArea
+                Layout.fillWidth: true
+                visible: mainPanel.transcriptBody !== ""
                 readOnly: true
                 wrapMode: TextArea.Wrap
                 text: mainPanel.displayText
@@ -1452,41 +1717,65 @@ Rectangle {
                 }
             }
 
-            // Item 12 (Wave E): Chrome/PDF-viewer-style middle-click-hold-
-            // drag scrolling — content follows the cursor 1:1 while the
-            // middle button is held (grab-and-pan), not a toggled/velocity-
-            // based autoscroll. acceptedButtons is scoped to MiddleButton
-            // only, so left-click text selection and the scrollbar's own
-            // drag are completely unaffected (a non-matching button simply
-            // isn't accepted, falling through to whatever's beneath).
-            MouseArea {
-                id: middleDragScrollArea
-                anchors.fill: parent
-                acceptedButtons: Qt.MiddleButton
-                cursorShape: pressed ? Qt.SizeAllCursor : Qt.ArrowCursor
-                propagateComposedEvents: true
+            } // end scrollableContent ColumnLayout
+        } // end transcriptScrollView
 
-                property real dragStartY: 0
-                property real startContentY: 0
+        // Item 12 (Wave E): Chrome/PDF-viewer-style middle-click-hold-
+        // drag scrolling — content follows the cursor 1:1 while the
+        // middle button is held (grab-and-pan), not a toggled/velocity-
+        // based autoscroll. acceptedButtons is scoped to MiddleButton
+        // only, so left-click text selection and the scrollbar's own
+        // drag are completely unaffected (a non-matching button simply
+        // isn't accepted, falling through to whatever's beneath). Lives as
+        // an overlay sibling of transcriptScrollView (not inside it, see
+        // transcriptViewportContainer's doc comment) so it covers the same
+        // full viewport without being counted as the ScrollView's content.
+        MouseArea {
+            id: middleDragScrollArea
+            anchors.fill: parent
+            acceptedButtons: Qt.MiddleButton
+            cursorShape: pressed ? Qt.SizeAllCursor : Qt.ArrowCursor
+            propagateComposedEvents: true
 
-                onPressed: (mouse) => {
-                    middleDragScrollArea.dragStartY = mouse.y
-                    middleDragScrollArea.startContentY = transcriptScrollView.contentItem.contentY
-                }
-                onPositionChanged: (mouse) => {
-                    if (!pressed)
-                        return
-                    const flick = transcriptScrollView.contentItem
-                    const delta = mouse.y - middleDragScrollArea.dragStartY
-                    const maxY = Math.max(0, flick.contentHeight - flick.height)
-                    flick.contentY = Math.max(0, Math.min(maxY, middleDragScrollArea.startContentY - delta))
-                }
+            property real dragStartY: 0
+            property real startContentY: 0
+
+            onPressed: (mouse) => {
+                middleDragScrollArea.dragStartY = mouse.y
+                middleDragScrollArea.startContentY = transcriptScrollView.contentItem.contentY
+            }
+            onPositionChanged: (mouse) => {
+                if (!pressed)
+                    return
+                const flick = transcriptScrollView.contentItem
+                const delta = mouse.y - middleDragScrollArea.dragStartY
+                const maxY = Math.max(0, flick.contentHeight - flick.height)
+                flick.contentY = Math.max(0, Math.min(maxY, middleDragScrollArea.startContentY - delta))
             }
         }
+        } // end transcriptViewportContainer
+    }
 
-        Item {
-            Layout.fillHeight: true
-            visible: mainPanel.transcriptBody === ""
+    // Floating ghost label that visually represents an in-progress speaker
+    // pill drag (see mainPanel.draggingSpeakerId/dragGhostX/Y) — a direct,
+    // high-z sibling of the whole content layout above rather than a child
+    // of speakersRow itself, since the real pill is deliberately never
+    // moved (see draggingSpeakerId's doc comment).
+    Label {
+        id: speakerDragGhost
+        visible: mainPanel.draggingSpeakerId !== ""
+        z: 1000
+        x: mainPanel.dragGhostX + 12
+        y: mainPanel.dragGhostY + 12
+        text: mainPanel.effectiveSpeakerName(mainPanel.draggingSpeakerId)
+        color: "#dddddd"
+        font.pixelSize: 11
+        padding: 4
+        background: Rectangle {
+            radius: AppSettings.borderRadius
+            color: "#2f4f5f"
+            border.width: 1
+            border.color: "#6fdf9f"
         }
     }
 }

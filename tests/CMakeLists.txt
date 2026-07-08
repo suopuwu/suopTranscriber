@@ -10,7 +10,7 @@ set(SUOP_CORE_DIR ${CMAKE_SOURCE_DIR}/src/core)
 # so the app target stays untouched. QML_ELEMENT headers compile outside the
 # qml module as long as Qt6::Qml is linked.
 function(suop_add_test name)
-    cmake_parse_arguments(ARG "LINK_WHISPER;LINK_LLAMA" "" "SOURCES" ${ARGN})
+    cmake_parse_arguments(ARG "LINK_WHISPER;LINK_LLAMA;LINK_SHERPA_ONNX" "" "SOURCES" ${ARGN})
     set(abs_sources "")
     foreach(src ${ARG_SOURCES})
         list(APPEND abs_sources ${SUOP_CORE_DIR}/${src})
@@ -23,6 +23,13 @@ function(suop_add_test name)
     endif()
     if(ARG_LINK_LLAMA)
         target_link_libraries(${name} PRIVATE llama)
+    endif()
+    if(ARG_LINK_SHERPA_ONNX)
+        target_link_libraries(${name} PRIVATE sherpa-onnx-cxx-api)
+        set_target_properties(${name} PROPERTIES BUILD_RPATH "$ORIGIN")
+        if(SHERPA_ONNX_ENABLE_GPU)
+            add_dependencies(${name} suop_copy_cuda12_compat_libs)
+        endif()
     endif()
     target_compile_definitions(${name} PRIVATE
         SUOP_REPO_DIR="${CMAKE_SOURCE_DIR}"
@@ -37,13 +44,14 @@ suop_add_test(tst_smoke)
 suop_add_test(tst_vaulttreemodel SOURCES VaultTreeModel.cpp)
 suop_add_test(tst_vaultsearchproxymodel SOURCES VaultTreeModel.cpp VaultSearchProxyModel.cpp)
 suop_add_test(tst_modelmanager SOURCES ModelManager.cpp)
-suop_add_test(tst_transcript_format LINK_WHISPER LINK_LLAMA
-    SOURCES TranscriptionController.cpp WhisperCppEngine.cpp ModelManager.cpp AudioDecoder.cpp LabelingEngine.cpp)
-suop_add_test(tst_transcription_queue LINK_WHISPER LINK_LLAMA
-    SOURCES TranscriptionController.cpp WhisperCppEngine.cpp ModelManager.cpp AudioDecoder.cpp LabelingEngine.cpp)
+suop_add_test(tst_transcript_format LINK_WHISPER LINK_LLAMA LINK_SHERPA_ONNX
+    SOURCES TranscriptionController.cpp WhisperCppEngine.cpp ModelManager.cpp AudioDecoder.cpp LabelingEngine.cpp DiarizationEngine.cpp)
+suop_add_test(tst_transcription_queue LINK_WHISPER LINK_LLAMA LINK_SHERPA_ONNX
+    SOURCES TranscriptionController.cpp WhisperCppEngine.cpp ModelManager.cpp AudioDecoder.cpp LabelingEngine.cpp DiarizationEngine.cpp)
 suop_add_test(tst_engine_contract LINK_WHISPER
     SOURCES WhisperCppEngine.cpp AudioDecoder.cpp)
 suop_add_test(tst_audiodecoder SOURCES AudioDecoder.cpp)
 suop_add_test(tst_labelingengine LINK_LLAMA SOURCES LabelingEngine.cpp)
+suop_add_test(tst_diarizationengine LINK_SHERPA_ONNX SOURCES DiarizationEngine.cpp AudioDecoder.cpp)
 suop_add_test(tst_future_spec)
 suop_add_test(tst_styleguide)

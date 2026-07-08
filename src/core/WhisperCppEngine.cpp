@@ -20,7 +20,6 @@ void onNewSegment(struct whisper_context *ctx, struct whisper_state *, int n_new
         segment.t0 = whisper_full_get_segment_t0(ctx, i) / 100.0; // centiseconds -> seconds
         segment.t1 = whisper_full_get_segment_t1(ctx, i) / 100.0;
         segment.text = whisper_full_get_segment_text(ctx, i);
-        segment.speakerTurnNext = whisper_full_get_segment_speaker_turn_next(ctx, i);
         cb->out->push_back(segment);
         if (*cb->onSegment)
             (*cb->onSegment)(segment);
@@ -36,8 +35,7 @@ void onProgressUpdate(struct whisper_context *, struct whisper_state *, int prog
 
 }
 
-WhisperCppEngine::WhisperCppEngine(const QString &modelPath, bool enableSpeakerDetection)
-    : m_speakerDetection(enableSpeakerDetection)
+WhisperCppEngine::WhisperCppEngine(const QString &modelPath)
 {
     whisper_context_params cparams = whisper_context_default_params();
     m_ctx = whisper_init_from_file_with_params(modelPath.toUtf8().constData(), cparams);
@@ -67,7 +65,6 @@ std::vector<Segment> WhisperCppEngine::transcribe(const AudioChunk &chunk, const
     wparams.new_segment_callback_user_data = &cbCtx;
     wparams.progress_callback = onProgressUpdate;
     wparams.progress_callback_user_data = &cbCtx;
-    wparams.tdrz_enable = m_speakerDetection;
 
     whisper_full(m_ctx, wparams, chunk.pcm16kMono.data(), static_cast<int>(chunk.pcm16kMono.size()));
 

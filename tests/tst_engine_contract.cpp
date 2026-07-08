@@ -33,8 +33,6 @@ static_assert(std::is_aggregate_v<Segment>, "Segment is a plain aggregate — en
 static_assert(std::is_same_v<decltype(Segment::t0), double>, "t0 is seconds as double");
 static_assert(std::is_same_v<decltype(Segment::t1), double>, "t1 is seconds as double");
 static_assert(std::is_same_v<decltype(Segment::text), std::string>, "text is std::string (UTF-8)");
-static_assert(std::is_same_v<decltype(Segment::speakerTurnNext), bool>,
-              "speakerTurnNext flags a tinydiarize speaker turn after this segment");
 
 // Spec: AudioChunk is what every engine consumes — 16 kHz mono float PCM
 // (decoded by ffmpeg upstream, see TranscriptionEngine.h) plus the chunk's
@@ -62,8 +60,8 @@ public:
         // Timestamps start at 0.0 regardless of chunk.offsetSeconds — the
         // engine deliberately ignores the offset. That is the contract.
         const std::vector<Segment> segments = {
-            {0.0, 2.5, "First sentence.", false},
-            {2.5, 5.0, "Second sentence.", true},
+            {0.0, 2.5, "First sentence."},
+            {2.5, 5.0, "Second sentence."},
         };
         for (const Segment &s : segments) {
             if (onSegment)
@@ -114,23 +112,21 @@ class TstEngineContract : public QObject
     Q_OBJECT
 
 private slots:
-    // Spec: Segment's fields default to a zeroed, no-speaker-turn state, so a
-    // freshly value-initialized Segment is valid and inert.
+    // Spec: Segment's fields default to a zeroed state, so a freshly
+    // value-initialized Segment is valid and inert.
     void segmentShapeAndDefaults()
     {
         const Segment s;
         QCOMPARE(s.t0, 0.0);
         QCOMPARE(s.t1, 0.0);
         QVERIFY(s.text.empty());
-        QCOMPARE(s.speakerTurnNext, false);
 
         // Designated/positional aggregate init is how engines and tests
         // build Segments — no constructor to keep in sync.
-        const Segment filled{1.0, 2.0, "hello", true};
+        const Segment filled{1.0, 2.0, "hello"};
         QCOMPARE(filled.t0, 1.0);
         QCOMPARE(filled.t1, 2.0);
         QCOMPARE(filled.text, std::string("hello"));
-        QVERIFY(filled.speakerTurnNext);
     }
 
     // Spec: AudioChunk defaults to an empty buffer at the start of the file

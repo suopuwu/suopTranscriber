@@ -256,6 +256,7 @@ ApplicationWindow {
                                     ? mainPanel.player.source.toString().replace("file://", "") : "")
                 transcriptionController: transcriptionController
                 onSettingsRequested: settingsPopup.open()
+                onTaskActivated: (path) => mainPanel.showAudioFile(path)
             }
         }
 

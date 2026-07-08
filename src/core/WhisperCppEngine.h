@@ -9,13 +9,13 @@ struct whisper_context;
 // In-process, warm-model engine (see DESIGN.md "whisper.cpp — first-class,
 // in-process"). One instance keeps the model resident across transcribe()
 // calls. No crash isolation: a CUDA/Vulkan OOM here takes down the app —
-// acceptable tradeoff for the trusted default per DESIGN.md.
+// acceptable tradeoff for the trusted default per DESIGN.md. Speaker
+// diarization is a separate pass over the same PCM (see DiarizationEngine),
+// not a whisper.cpp feature — this engine has no speaker-detection concept
+// of its own.
 class WhisperCppEngine : public TranscriptionEngine {
 public:
-    // enableSpeakerDetection sets whisper.cpp's tdrz_enable — only meaningful
-    // when modelPath points at a "-tdrz" fine-tune (see ModelManager); it's
-    // a no-op on regular models.
-    explicit WhisperCppEngine(const QString &modelPath, bool enableSpeakerDetection = false);
+    explicit WhisperCppEngine(const QString &modelPath);
     ~WhisperCppEngine() override;
 
     bool isValid() const { return m_ctx != nullptr; }
@@ -25,5 +25,4 @@ public:
 
 private:
     whisper_context *m_ctx = nullptr;
-    bool m_speakerDetection = false;
 };

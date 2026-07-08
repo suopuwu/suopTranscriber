@@ -34,6 +34,97 @@ if(SUOP_ENABLE_LABELING)
     add_subdirectory(third_party/llama.cpp)
 endif()
 
+# sherpa-onnx (speaker diarization — pyannote segmentation + CAM++ embedding
+# pipeline, see DESIGN.md "Speaker diarization"). Vendored whole rather than
+# hand-rolled against raw ONNX Runtime: its C++ API already implements the
+# exact segmentation-powerset decode + embedding + agglomerative-clustering
+# pipeline, tested and correct — reimplementing that preprocessing by hand
+# turned out to be a real correctness trap (subtle Fbank/normalization
+# mismatches silently produce garbage embeddings), not worth the smaller
+# build size. Pulls in more than we use (full ASR/VAD/TTS/openfst — no way to
+# scope its CMake down further) but sidesteps that risk entirely. It fetches
+# its own prebuilt ONNX Runtime internally. ONNX Runtime has no Vulkan EP
+# (unlike whisper.cpp's cross-vendor baseline), so GPU here means CUDA only
+# — NVIDIA-only, requires the CUDA toolkit + cuDNN installed system-wide
+# (unlike whisper.cpp's Vulkan path, which just needs the driver). Enabling
+# this also forces sherpa-onnx's own libs to build as SHARED (its own
+# CMakeLists requires BUILD_SHARED_LIBS=ON for the GPU onnxruntime package).
+# DiarizationEngine falls back to CPU automatically if CUDA init fails at
+# runtime (see its own comments) — this option controls whether the CUDA
+# code path exists in the binary at all, not which one actually runs.
+set(SHERPA_ONNX_ENABLE_PYTHON OFF CACHE BOOL "" FORCE)
+set(SHERPA_ONNX_ENABLE_TESTS OFF CACHE BOOL "" FORCE)
+set(SHERPA_ONNX_ENABLE_PORTAUDIO OFF CACHE BOOL "" FORCE)
+set(SHERPA_ONNX_ENABLE_JNI OFF CACHE BOOL "" FORCE)
+set(SHERPA_ONNX_ENABLE_WEBSOCKET OFF CACHE BOOL "" FORCE)
+set(SHERPA_ONNX_ENABLE_GPU ON CACHE BOOL "" FORCE)
+set(SHERPA_ONNX_ENABLE_DIRECTML OFF CACHE BOOL "" FORCE)
+set(SHERPA_ONNX_ENABLE_WASM OFF CACHE BOOL "" FORCE)
+set(SHERPA_ONNX_ENABLE_BINARY OFF CACHE BOOL "" FORCE)
+set(SHERPA_ONNX_BUILD_C_API_EXAMPLES OFF CACHE BOOL "" FORCE)
+set(SHERPA_ONNX_ENABLE_TTS OFF CACHE BOOL "" FORCE)
+set(SHERPA_ONNX_ENABLE_SPEAKER_DIARIZATION ON CACHE BOOL "" FORCE)
+set(SHERPA_ONNX_ENABLE_C_API ON CACHE BOOL "" FORCE)
+add_subdirectory(third_party/sherpa-onnx)
+
+if(SHERPA_ONNX_ENABLE_GPU)
+    # sherpa-onnx's fetched onnxruntime GPU build links against CUDA 12
+    # specifically — confirmed via `ldd` on the actual
+    # libonnxruntime_providers_cuda.so: it needs libcublasLt.so.12,
+    # libcublas.so.12, libcufft.so.11, libcudart.so.12, libnvrtc.so.12 (exact
+    # SONAMEs). A newer system CUDA install (e.g. this machine's CUDA 13, the
+    # current version in Arch/CachyOS's `cuda` package as of this writing)
+    # only provides the .so.13/.so.14 versions of these — NOT drop-in
+    # compatible, so the CUDA execution provider fails to dlopen at runtime
+    # and DiarizationEngine falls back to CPU (silently correct, per its own
+    # comments, but leaves the GPU unused). Rather than requiring a SECOND
+    # full system CUDA 12 toolkit install alongside CUDA 13, fetch just
+    # these 4 redistributable libraries — the same PyPI wheels
+    # PyTorch/TensorFlow bundle to run CUDA code without a system toolkit —
+    # and copy their .so payloads next to sherpa-onnx's other shared libs
+    # (already on suopTranscriber's RPATH). Pinned exact versions/hashes so
+    # this is reproducible from a fresh checkout, not dependent on whatever
+    # happens to be pip-installed on a given machine.
+    include(FetchContent)
+    # A macro, not a function: FetchContent_MakeAvailable() sets ${name}_SOURCE_DIR
+    # in the CURRENT scope, and a function() body is its own scope — the
+    # variable would be discarded on return instead of reaching the
+    # add_custom_target() call below that needs it.
+    macro(suop_fetch_cuda12_wheel name url sha256)
+        FetchContent_Declare(${name}
+            URL ${url}
+            URL_HASH SHA256=${sha256}
+            DOWNLOAD_EXTRACT_TIMESTAMP TRUE
+        )
+        FetchContent_MakeAvailable(${name})
+    endmacro()
+
+    suop_fetch_cuda12_wheel(nvidia_cublas_cu12
+        "https://files.pythonhosted.org/packages/cb/c0/0a517bfe63ccd3b92eb254d264e28fca3c7cab75d07daea315250fb1bf73/nvidia_cublas_cu12-12.9.2.10-py3-none-manylinux_2_27_x86_64.whl"
+        "e4f53a8ca8c5d6e8c492d0d0a3d565ecb59a751b19cfdaa4f6da0ab2104c1702")
+    suop_fetch_cuda12_wheel(nvidia_cuda_runtime_cu12
+        "https://files.pythonhosted.org/packages/bc/46/a92db19b8309581092a3add7e6fceb4c301a3fd233969856a8cbf042cd3c/nvidia_cuda_runtime_cu12-12.9.79-py3-none-manylinux2014_x86_64.manylinux_2_17_x86_64.whl"
+        "25bba2dfb01d48a9b59ca474a1ac43c6ebf7011f1b0b8cc44f54eb6ac48a96c3")
+    suop_fetch_cuda12_wheel(nvidia_cufft_cu12
+        "https://files.pythonhosted.org/packages/95/f4/61e6996dd20481ee834f57a8e9dca28b1869366a135e0d42e2aa8493bdd4/nvidia_cufft_cu12-11.4.1.4-py3-none-manylinux2014_x86_64.manylinux_2_17_x86_64.whl"
+        "c67884f2a7d276b4b80eb56a79322a95df592ae5e765cf1243693365ccab4e28")
+    suop_fetch_cuda12_wheel(nvidia_cuda_nvrtc_cu12
+        "https://files.pythonhosted.org/packages/b8/85/e4af82cc9202023862090bfca4ea827d533329e925c758f0cde964cb54b7/nvidia_cuda_nvrtc_cu12-12.9.86-py3-none-manylinux2010_x86_64.manylinux_2_12_x86_64.whl"
+        "210cf05005a447e29214e9ce50851e83fc5f4358df8b453155d5e1918094dcb4")
+
+    add_custom_target(suop_copy_cuda12_compat_libs ALL
+        COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_BINARY_DIR}/lib"
+        COMMAND ${CMAKE_COMMAND} -E copy
+            "${nvidia_cublas_cu12_SOURCE_DIR}/nvidia/cublas/lib/libcublasLt.so.12"
+            "${nvidia_cublas_cu12_SOURCE_DIR}/nvidia/cublas/lib/libcublas.so.12"
+            "${nvidia_cuda_runtime_cu12_SOURCE_DIR}/nvidia/cuda_runtime/lib/libcudart.so.12"
+            "${nvidia_cufft_cu12_SOURCE_DIR}/nvidia/cufft/lib/libcufft.so.11"
+            "${nvidia_cuda_nvrtc_cu12_SOURCE_DIR}/nvidia/cuda_nvrtc/lib/libnvrtc.so.12"
+            "${CMAKE_BINARY_DIR}/lib/"
+        COMMENT "Copying CUDA 12 compat libraries (cuBLAS/cuFFT/cudart/nvrtc) for onnxruntime's CUDA execution provider"
+    )
+endif()
+
 qt_add_executable(suopTranscriber
     src/main.cpp
 )
@@ -72,6 +163,8 @@ qt_add_qml_module(suopTranscriber
         src/core/WhisperCppEngine.cpp
         src/core/LabelingEngine.h
         src/core/LabelingEngine.cpp
+        src/core/DiarizationEngine.h
+        src/core/DiarizationEngine.cpp
         src/core/ModelManager.h
         src/core/ModelManager.cpp
         src/core/TranscriptionController.h
@@ -93,8 +186,25 @@ target_link_libraries(suopTranscriber PRIVATE
     KF6::WindowSystem
     whisper
     llama
+    sherpa-onnx-cxx-api
 )
 
+set_target_properties(suopTranscriber PROPERTIES
+    BUILD_RPATH "$ORIGIN"
+    INSTALL_RPATH "$ORIGIN"
+)
+
+if(SHERPA_ONNX_ENABLE_GPU)
+    add_dependencies(suopTranscriber suop_copy_cuda12_compat_libs)
+endif()
+
+# sherpa-onnx's own cmake/eigen.cmake force-sets BUILD_TESTING OFF (CACHE
+# ... FORCE) while vendoring Eigen, to keep Eigen's own test suite out of the
+# build — that FORCE wins over anything set before add_subdirectory(
+# third_party/sherpa-onnx) above, so it has to be forced back ON here,
+# AFTER all vendored subdirectories, for this project's own tests/ to be
+# configured by default.
+set(BUILD_TESTING ON CACHE BOOL "" FORCE)
 include(CTest)
 if(BUILD_TESTING)
     add_subdirectory(tests)

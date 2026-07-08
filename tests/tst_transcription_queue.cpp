@@ -297,7 +297,7 @@ private slots:
         const QUrl audioUrl = vault.audioUrl("interview.wav");
         QFile md(vault.dir.path() + "/interview.md");
         QVERIFY(md.open(QIODevice::WriteOnly));
-        md.write("---\nmodel: ggml-base.en.bin\nspeakerDetection: true\n---\n\n"
+        md.write("---\nmodel: ggml-base.en.bin\nspeakerDetection: true\nspeakers: Speaker 1, Speaker 2\n---\n\n"
                  "[0] [Speaker 1] hi\n[3.5] [Speaker 2] hello\n");
         md.close();
 
@@ -317,6 +317,119 @@ private slots:
         QVERIFY(renamedSpy.wait(5000));
         QTRY_COMPARE(statusOf(controller, audioUrl), QStringLiteral("done"));
         QCOMPARE(controller.tasksCompleted(), 1);
+    }
+
+    // mergeSpeakers() mirrors renameSpeaker_showsUpAsATaskInTheJobQueue
+    // immediately above — same job pipeline, same visibility contract.
+    void mergeSpeakers_showsUpAsATaskInTheJobQueue()
+    {
+        VaultFixture vault;
+        const QUrl audioUrl = vault.audioUrl("interview.wav");
+        QFile md(vault.dir.path() + "/interview.md");
+        QVERIFY(md.open(QIODevice::WriteOnly));
+        md.write("---\nmodel: ggml-base.en.bin\nspeakerDetection: true\nspeakers: Speaker 1, Speaker 2\n---\n\n"
+                 "[0] [Speaker 1] hi\n[3.5] [Speaker 2] hello\n");
+        md.close();
+
+        TranscriptionController controller;
+        QSignalSpy queueChangedSpy(&controller, &TranscriptionController::queueChanged);
+        QSignalSpy mergedSpy(&controller, &TranscriptionController::speakersMerged);
+
+        controller.mergeSpeakers(audioUrl, QStringLiteral("Speaker 2"), QStringLiteral("Speaker 1"));
+
+        QCOMPARE(controller.tasksTotal(), 1);
+        QVERIFY(queueChangedSpy.count() >= 1);
+        QCOMPARE(controller.jobs().first().toMap().value("fileUrl").toUrl(), audioUrl);
+        QCOMPARE(controller.jobs().first().toMap().value("kind").toString(), QStringLiteral("merge"));
+
+        QVERIFY(mergedSpy.wait(5000));
+        QTRY_COMPARE(statusOf(controller, audioUrl), QStringLiteral("done"));
+        QCOMPARE(controller.tasksCompleted(), 1);
+    }
+
+    // jobs()' new "kind" key lets the UI tell a full transcription apart
+    // from a "regenerate label" job or a speaker rename — they all share
+    // this one queue/worker thread and otherwise look identical (same
+    // fileUrl/status shape).
+    void jobs_tagEachEntryWithItsKind()
+    {
+        VaultFixture vault;
+
+        const QUrl transcribeFile = vault.audioUrl("a.wav");
+        const QUrl relabelFile = vault.audioUrl("b.wav");
+        QFile relabelMd(vault.dir.path() + "/b.md");
+        QVERIFY(relabelMd.open(QIODevice::WriteOnly));
+        relabelMd.write("---\nmodel: ggml-base.en.bin\n---\n\n[0] hello\n");
+        relabelMd.close();
+        // Fake (empty) label model, same idea as VaultFixture's whisper
+        // model above — makes ModelManager::ensureLabelModel find it
+        // already "downloaded" instead of attempting a real network
+        // fetch; the labeling engine then fails fast on the zero-byte
+        // file, same "deterministic Failed status" strategy as this
+        // whole file's transcribe jobs (see the file-level comment).
+        QFile labelModel(vault.dir.path() + "/.transcriber/models/Qwen3-4B-Instruct-2507-Q4_K_M.gguf");
+        QVERIFY(labelModel.open(QIODevice::WriteOnly));
+        labelModel.close();
+
+        const QUrl renameFile = vault.audioUrl("c.wav");
+        QFile renameMd(vault.dir.path() + "/c.md");
+        QVERIFY(renameMd.open(QIODevice::WriteOnly));
+        renameMd.write("---\nmodel: ggml-base.en.bin\nspeakerDetection: true\nspeakers: Speaker 1\n---\n\n"
+                       "[0] [Speaker 1] hi\n");
+        renameMd.close();
+
+        TranscriptionController controller;
+        // Queued one after another — only the first actually starts
+        // immediately (single worker), the rest wait their turn, but kind
+        // is set at enqueue time regardless of status.
+        controller.transcribe(transcribeFile, vault.vaultUrl, kModelId, false);
+        controller.relabel(relabelFile, vault.vaultUrl);
+        controller.renameSpeaker(renameFile, QStringLiteral("Speaker 1"), QStringLiteral("Alice"));
+
+        QCOMPARE(controller.tasksTotal(), 3);
+        QCOMPARE(controller.jobs().at(0).toMap().value("kind").toString(), QStringLiteral("transcribe"));
+        QCOMPARE(controller.jobs().at(1).toMap().value("kind").toString(), QStringLiteral("relabel"));
+        QCOMPARE(controller.jobs().at(2).toMap().value("kind").toString(), QStringLiteral("rename"));
+
+        // The first job started synchronously (Active) — currentJobKind()
+        // should reflect it immediately, same timing as currentFile().
+        QCOMPARE(controller.currentJobKind(), QStringLiteral("transcribe"));
+
+        QTRY_COMPARE(controller.tasksCompleted(), 3);
+        // Idle again once every job has finished.
+        QCOMPARE(controller.currentJobKind(), QString());
+    }
+
+    // 2026-07-07: transcribe(autoLabel=true) no longer runs labeling as a
+    // silent bonus step inside the SAME job, NOR does it wait for
+    // transcription to finish before even creating a label task — it queues
+    // a SEPARATE "relabel" job immediately, right alongside the transcribe
+    // job, in the SAME transcribe() call (see its doc comment) — both show
+    // up in tasksTotal()/jobs() together right away, the label entry
+    // starting life as "queued" until the transcribe job ahead of it
+    // finishes. It still runs (and, here, fails — nothing to label without a
+    // real model) even when the transcription it followed failed, rather
+    // than being silently dropped.
+    void autoLabel_queuesBothTasksImmediately()
+    {
+        VaultFixture vault;
+        TranscriptionController controller;
+        const QUrl file = vault.audioUrl("a.wav");
+
+        controller.transcribe(file, vault.vaultUrl, kModelId, false, /*autoLabel=*/true);
+
+        // Both present immediately — not one appended later.
+        QCOMPARE(controller.tasksTotal(), 2);
+        QCOMPARE(controller.jobs().at(0).toMap().value("kind").toString(), QStringLiteral("transcribe"));
+        QCOMPARE(controller.jobs().at(0).toMap().value("status").toString(), QStringLiteral("active"));
+        QCOMPARE(controller.jobs().at(1).toMap().value("kind").toString(), QStringLiteral("relabel"));
+        QCOMPARE(controller.jobs().at(1).toMap().value("status").toString(), QStringLiteral("queued"));
+
+        // The fake model fails the transcription fast; the label job then
+        // takes its turn and fails too (no transcript exists to label).
+        QTRY_COMPARE(controller.tasksCompleted(), 2);
+        QCOMPARE(controller.jobs().at(0).toMap().value("status").toString(), QStringLiteral("failed"));
+        QCOMPARE(controller.jobs().at(1).toMap().value("status").toString(), QStringLiteral("failed"));
     }
 };
 
