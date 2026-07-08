@@ -174,10 +174,12 @@ private slots:
     }
 
     // DESIGN.md/CLAUDE.md "Sentence highlighting": parseSentences() turns the
-    // segment lines back into {t0, t1, text} — the structured form the
+    // segment lines back into {t0, text} — the structured form the
     // playback-highlight binary search needs. Timestamps round-trip exactly
     // (parseTimestamp is the literal inverse of formatTimestamp), and the
     // optional " [SPEAKER_TURN]" marker is stripped from the parsed text.
+    // (No "t1": it's never stored — see appendSegmentLine — and this legacy
+    // fixture's end timestamps are simply ignored, not round-tripped.)
     void parseSentences_recoversStructuredTimingFromSegmentLines()
     {
         QTemporaryDir dir;
@@ -190,12 +192,10 @@ private slots:
         QCOMPARE(sentences.size(), 2);
         const QVariantMap s0 = sentences[0].toMap();
         QCOMPARE(s0.value("t0").toDouble(), 0.0);
-        QCOMPARE(s0.value("t1").toDouble(), 11.0);
         QCOMPARE(s0.value("text").toString(), QStringLiteral("hello world"));
 
         const QVariantMap s1 = sentences[1].toMap();
         QCOMPARE(s1.value("t0").toDouble(), 11.0);
-        QCOMPARE(s1.value("t1").toDouble(), 14.5);
         // The [SPEAKER_TURN] marker is metadata about the boundary, not part
         // of the spoken text — stripped from the parsed sentence.
         QCOMPARE(s1.value("text").toString(), QStringLiteral("And another speaker."));
@@ -210,6 +210,71 @@ private slots:
             const int length = s.value("length").toInt();
             QCOMPARE(body.mid(start, length), s.value("text").toString());
         }
+
+        // Legacy fixture (no leading "[Speaker N]" tag) parses with speaker=0
+        // for every sentence — old already-transcribed files must not crash
+        // or misparse under the new (Item 11, Wave E) regex.
+        QCOMPARE(s0.value("speaker").toInt(), 0);
+        QCOMPARE(s1.value("speaker").toInt(), 0);
+    }
+
+    // Item 11 (Wave E): a leading "[Speaker N]" tag (written when speaker
+    // detection is on) is parsed into each sentence's "speaker" field and
+    // stripped from the parsed text, mirroring the legacy trailing
+    // "[SPEAKER_TURN]" marker's text-stripping behavior above.
+    void parseSentences_recoversSpeakerNumberFromLeadingTag()
+    {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        writeFixture(dir.path(), "interview.md",
+                     QStringLiteral("---\nmodel: ggml-base.en.bin\nspeakerDetection: true\n---\n\n"
+                                    "[00:00:00.000 - 00:00:05.000] [Speaker 1] Welcome to the show.\n"
+                                    "[00:00:05.000 - 00:00:09.000] [Speaker 2] Thanks for having me.\n"
+                                    "[00:00:09.000 - 00:00:12.000] [Speaker 1] So, tell us about yourself.\n"));
+
+        TranscriptionController controller;
+        const QVariantList sentences =
+            controller.parseSentences(QUrl::fromLocalFile(dir.path() + "/interview.wav"));
+
+        QCOMPARE(sentences.size(), 3);
+        QCOMPARE(sentences[0].toMap().value("speaker").toInt(), 1);
+        QCOMPARE(sentences[0].toMap().value("text").toString(), QStringLiteral("Welcome to the show."));
+        QCOMPARE(sentences[1].toMap().value("speaker").toInt(), 2);
+        QCOMPARE(sentences[1].toMap().value("text").toString(), QStringLiteral("Thanks for having me."));
+        QCOMPARE(sentences[2].toMap().value("speaker").toInt(), 1);
+
+        // start/length still index the raw body correctly (tag is excluded
+        // from the substring, same contract as before).
+        const QString body = controller.readTranscriptBody(QUrl::fromLocalFile(dir.path() + "/interview.wav"));
+        for (const QVariant &v : sentences) {
+            const QVariantMap s = v.toMap();
+            QCOMPARE(body.mid(s.value("start").toInt(), s.value("length").toInt()), s.value("text").toString());
+        }
+    }
+
+    // The CURRENT (not legacy) write format: a single "[HH:MM:SS.mmm]" start
+    // timestamp only, no "- end" range — appendSegmentLine() no longer
+    // writes the end timestamp at all (it was always identical to the next
+    // segment's start). Confirms parseSentences() handles this format
+    // directly, not just via the backward-compat range-tolerant branch.
+    void parseSentences_recoversTimingFromStartOnlyTimestamp()
+    {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        writeFixture(dir.path(), "notes.md",
+                     QStringLiteral("---\nmodel: ggml-base.en.bin\nspeakerDetection: false\n---\n\n"
+                                    "[00:00:00.000] First point.\n"
+                                    "[00:00:04.250] Second point.\n"));
+
+        TranscriptionController controller;
+        const QVariantList sentences = controller.parseSentences(QUrl::fromLocalFile(dir.path() + "/notes.wav"));
+
+        QCOMPARE(sentences.size(), 2);
+        QCOMPARE(sentences[0].toMap().value("t0").toDouble(), 0.0);
+        QCOMPARE(sentences[0].toMap().value("speaker").toInt(), 0);
+        QCOMPARE(sentences[0].toMap().value("text").toString(), QStringLiteral("First point."));
+        QCOMPARE(sentences[1].toMap().value("t0").toDouble(), 4.25);
+        QCOMPARE(sentences[1].toMap().value("text").toString(), QStringLiteral("Second point."));
     }
 
     // An untranscribed/unreadable file (no sidecar) parses to an empty list,
@@ -331,6 +396,101 @@ private slots:
         QCOMPARE(readAllBytes(barePath), original);
     }
 
+    // Item 11 (Wave E): renameSpeaker() adds a speakerNames key (first
+    // rename), then updates just that one id=name pair on a second rename to
+    // a DIFFERENT speaker, leaving the first speaker's mapping untouched —
+    // and the value round-trips through readMetadata as a flat string (same
+    // convention as `tags`).
+    void renameSpeaker_addsThenUpdatesOnePair_preservingOthers()
+    {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        writeFixture(dir.path(), "interview.md",
+                     QStringLiteral("---\nmodel: ggml-base.en.bin\n"
+                                    "speakerDetection: true\n---\n\n"
+                                    "[00:00:00.000 - 00:00:05.000] [Speaker 1] hi\n"
+                                    "[00:00:05.000 - 00:00:09.000] [Speaker 2] hello\n"));
+        const QUrl audioUrl = QUrl::fromLocalFile(dir.path() + "/interview.wav");
+
+        TranscriptionController controller;
+        QString error;
+        QVERIFY2(controller.renameSpeaker(audioUrl, QStringLiteral("Speaker 1"), QStringLiteral("Alice"), &error),
+                  qPrintable(error));
+        QCOMPARE(controller.readMetadata(audioUrl).value("speakerNames").toString(), QStringLiteral("Speaker 1=Alice"));
+
+        // Renaming a SECOND speaker appends its own pair, leaving the first.
+        QVERIFY2(controller.renameSpeaker(audioUrl, QStringLiteral("Speaker 2"), QStringLiteral("Bob"), &error),
+                  qPrintable(error));
+        const QString afterSecond = controller.readMetadata(audioUrl).value("speakerNames").toString();
+        QVERIFY(afterSecond.contains(QStringLiteral("Speaker 1=Alice")));
+        QVERIFY(afterSecond.contains(QStringLiteral("Speaker 2=Bob")));
+
+        // Re-renaming Speaker 1 REPLACES its pair, never duplicates, and
+        // Speaker 2's mapping survives untouched.
+        QVERIFY2(controller.renameSpeaker(audioUrl, QStringLiteral("Speaker 1"), QStringLiteral("Alicia"), &error),
+                  qPrintable(error));
+        const QString afterRename = controller.readMetadata(audioUrl).value("speakerNames").toString();
+        QCOMPARE(afterRename.count(QStringLiteral("Speaker 1=")), 1);
+        QVERIFY(afterRename.contains(QStringLiteral("Speaker 1=Alicia")));
+        QVERIFY(afterRename.contains(QStringLiteral("Speaker 2=Bob")));
+        QVERIFY(!afterRename.contains(QStringLiteral("Alice,")));
+
+        // The transcript body (segment lines with their stable "[Speaker N]"
+        // tags) is completely untouched by a rename.
+        QVERIFY(controller.readTranscriptBody(audioUrl).contains(QStringLiteral("[Speaker 1] hi")));
+        QVERIFY(controller.readTranscriptBody(audioUrl).contains(QStringLiteral("[Speaker 2] hello")));
+    }
+
+    // matchesExistingTranscription() lets "transcribe all" skip files whose
+    // stored settings already match, while a manual single-file re-run
+    // (transcribe() itself) never consults this — see the Q_INVOKABLE's doc
+    // comment. False for an untranscribed file: nothing to match yet.
+    void matchesExistingTranscription_falseWhenUntranscribed()
+    {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        TranscriptionController controller;
+        QVERIFY(!controller.matchesExistingTranscription(QUrl::fromLocalFile(dir.path() + "/nothing.wav"),
+                                                           QStringLiteral("base.en"), false));
+    }
+
+    // Same modelId (mapped to the same ggml file) and same speakerDetection
+    // (false) as what's stored -> matches; a DIFFERENT modelId -> doesn't.
+    void matchesExistingTranscription_comparesModelAndSpeakerDetection()
+    {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        writeFixture(dir.path(), "meeting.md",
+                     QStringLiteral("---\nmodel: ggml-base.en.bin\nspeakerDetection: false\n---\n\n"
+                                    "[00:00:00.000 - 00:00:01.000] hi\n"));
+        const QUrl audioUrl = QUrl::fromLocalFile(dir.path() + "/meeting.wav");
+        TranscriptionController controller;
+
+        QVERIFY(controller.matchesExistingTranscription(audioUrl, QStringLiteral("base.en"), false));
+        QVERIFY(!controller.matchesExistingTranscription(audioUrl, QStringLiteral("small.en"), false));
+        // Same modelId, but speakerDetection differs from what's stored.
+        QVERIFY(!controller.matchesExistingTranscription(audioUrl, QStringLiteral("base.en"), true));
+    }
+
+    // speakerDetection forces the tdrz model regardless of modelId (see
+    // ModelManager) — a file transcribed with speaker detection matches a
+    // re-request for speaker detection REGARDLESS of which modelId is
+    // currently selected (the id would be ignored either way).
+    void matchesExistingTranscription_speakerDetectionIgnoresModelId()
+    {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        writeFixture(dir.path(), "interview.md",
+                     QStringLiteral("---\nmodel: ggml-small.en-tdrz.bin\nspeakerDetection: true\n---\n\n"
+                                    "[00:00:00.000 - 00:00:01.000] [Speaker 1] hi\n"));
+        const QUrl audioUrl = QUrl::fromLocalFile(dir.path() + "/interview.wav");
+        TranscriptionController controller;
+
+        QVERIFY(controller.matchesExistingTranscription(audioUrl, QStringLiteral("tiny.en"), true));
+        QVERIFY(controller.matchesExistingTranscription(audioUrl, QStringLiteral("medium.en"), true));
+        QVERIFY(!controller.matchesExistingTranscription(audioUrl, QStringLiteral("tiny.en"), false));
+    }
+
     // "no separate JSON sidecar" — the one .md is the entire durable record.
     // After a typical read/label workflow the audio file's directory must
     // contain no *.json / *.jsonl artifacts. (The planned resume state file
@@ -399,6 +559,19 @@ private slots:
                  "an unrecognized modelId must show up as modelFallback: true in the transcript itself, "
                  "not just in a log line");
         QCOMPARE(meta.value("modelRequested").toString(), QStringLiteral("no-such-model-id"));
+
+        // The REAL write path (appendSegmentLine/formatTimestamp) must
+        // produce the compact, zero-trimmed timestamp — not the old
+        // zero-padded "[00:00:00.000]" shape. The very first segment starts
+        // at (or extremely near) 0.0s, so its line should read just "[0]"
+        // or "[0.xxx]", never "[00:00:00...".
+        const QString body = controller.readTranscriptBody(audioUrl);
+        QVERIFY2(!body.isEmpty(), "expected at least one segment line from a real transcription");
+        QVERIFY2(!body.contains(QStringLiteral("[00:")),
+                 qPrintable(QStringLiteral("segment line still zero-padded, expected compact format:\n") + body));
+        const QVariantList sentences = controller.parseSentences(audioUrl);
+        QVERIFY(!sentences.isEmpty());
+        QCOMPARE(sentences.first().toMap().value("t0").toDouble(), 0.0);
     }
 
     // Full auto-labeling wiring, end to end: transcribe(..., autoLabel=true)
@@ -517,6 +690,81 @@ private slots:
         QCOMPARE(raw.count(QStringLiteral("\nsummary:")), 1);
         QCOMPARE(raw.count(QStringLiteral("\ntags:")), 1);
         QCOMPARE(controller.readTranscriptBody(audioUrl), bodyBeforeRelabel);
+    }
+
+    // Item 14 "auto-categorize" mode, full pipeline: with restrictTagsToExisting,
+    // relabel() must scan the REST OF THE VAULT for existing tags (not just
+    // the file being labeled — it has none of its own yet) and constrain
+    // generation to that vocabulary. Exercises the actual vault-scanning
+    // code path (collectVaultTags), not just LabelingEngine's own prompt
+    // handling (already covered directly in tst_labelingengine.cpp).
+    void relabel_restrictTagsToExisting_scansWholeVaultVocabulary()
+    {
+        const QString whisperModelPath = locateRealModel();
+        if (whisperModelPath.isEmpty())
+            QSKIP("no real ggml model available; set SUOP_TEST_MODEL or transcribe once in the app");
+        const QString labelModelPath = locateRealLabelModel();
+        if (labelModelPath.isEmpty())
+            QSKIP("no real label GGUF model available; set SUOP_TEST_LABEL_MODEL to run this test");
+        if (QStandardPaths::findExecutable(QStringLiteral("ffmpeg")).isEmpty())
+            QSKIP("ffmpeg not on PATH — needed to decode the sample (DESIGN.md: ffmpeg decodes, Qt only plays)");
+
+        QTemporaryDir vault;
+        QVERIFY(vault.isValid());
+        const QString modelsDir = vault.path() + "/.transcriber/models";
+        QVERIFY(QDir().mkpath(modelsDir));
+        QVERIFY(QFile::copy(whisperModelPath, modelsDir + "/ggml-base.en.bin"));
+        QVERIFY(QFile::copy(labelModelPath, modelsDir + "/Qwen3-4B-Instruct-2507-Q4_K_M.gguf"));
+
+        const QString samplePath = vault.path() + "/jfk.wav";
+        QVERIFY(QFile::copy(QStringLiteral(SUOP_SAMPLES_DIR "/jfk.wav"), samplePath));
+
+        // A sibling file elsewhere in the vault whose ONLY purpose is to
+        // supply the existing tag vocabulary — jfk.wav itself starts with
+        // no tags of its own. "politics"/"history" are plausible for JFK's
+        // inauguration-speech clip; "cooking" is an implausible decoy, so a
+        // non-empty result confirms the model picked meaningfully rather
+        // than echoing everything it was given.
+        QVERIFY(QDir().mkpath(vault.path() + "/other"));
+        writeFixture(vault.path() + "/other", QStringLiteral("unrelated.md"),
+                     QStringLiteral("---\n"
+                                    "model: ggml-base.en.bin\n"
+                                    "speakerDetection: false\n"
+                                    "transcribedAt: 2026-07-06T10:12:13\n"
+                                    "tags: politics, history, cooking\n"
+                                    "---\n"
+                                    "\n"
+                                    "[00:00:00.000 - 00:00:01.000] unrelated placeholder content\n"));
+
+        TranscriptionController controller;
+        const QUrl audioUrl = QUrl::fromLocalFile(samplePath);
+        const QUrl vaultUrl = QUrl::fromLocalFile(vault.path());
+
+        {
+            QSignalSpy spy(&controller, &TranscriptionController::finished);
+            controller.transcribe(audioUrl, vaultUrl, QStringLiteral("base.en"), false, /*autoLabel=*/false);
+            QVERIFY(spy.wait(30000));
+            QVERIFY2(spy.at(0).at(1).toBool(), qPrintable(spy.at(0).at(2).toString()));
+        }
+
+        {
+            QSignalSpy spy(&controller, &TranscriptionController::finished);
+            controller.relabel(audioUrl, vaultUrl, /*restrictTagsToExisting=*/true);
+            QVERIFY(spy.wait(30000));
+            QVERIFY2(spy.at(0).at(1).toBool(), qPrintable(spy.at(0).at(2).toString()));
+        }
+
+        const QVariantMap meta = controller.readMetadata(audioUrl);
+        QVERIFY2(!meta.value("label").toString().isEmpty(), "relabel must still populate label/summary as usual");
+        const QString tags = meta.value("tags").toString();
+        const QStringList allowed = {QStringLiteral("politics"), QStringLiteral("history"), QStringLiteral("cooking")};
+        for (const QString &tag : tags.split(QStringLiteral(","), Qt::SkipEmptyParts)) {
+            const QString trimmed = tag.trimmed();
+            QVERIFY2(allowed.contains(trimmed, Qt::CaseInsensitive),
+                     qPrintable(QStringLiteral("tag \"%1\" wasn't in the vault-scanned vocabulary "
+                                                "(from other/unrelated.md's tags: politics, history, cooking)")
+                                    .arg(trimmed)));
+        }
     }
 };
 

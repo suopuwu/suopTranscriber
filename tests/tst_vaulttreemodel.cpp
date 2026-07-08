@@ -447,6 +447,143 @@ private slots:
         QCOMPARE(model.data(idx, roleByName(model, "isOrphanedMd")).toBool(), true);
     }
 
+    // --- Search support roles (Item 9: LabelRole/TagsRole/TranscriptBodyRole) --
+
+    // An audio file's frontmatter label/tags are exposed via LabelRole/
+    // TagsRole, read fresh from the sidecar .md rather than cached on Node.
+    void audioWithFrontmatter_exposesLabelAndTagsRoles()
+    {
+        QTemporaryDir vault;
+        QVERIFY(vault.isValid());
+        QVERIFY(touch(vault.filePath("talk.mp3")));
+        QVERIFY(touch(vault.filePath("talk.md"),
+                      "---\nmodel: base\nlabel: Quarterly Talk\ntags: finance, meetings\n---\n\n"
+                      "[00:00:00.000 - 00:00:01.000] hello\n"));
+
+        VaultTreeModel model;
+        model.setVaultPath(QUrl::fromLocalFile(vault.path()));
+
+        const QModelIndex idx = findByName(model, "talk.mp3");
+        QVERIFY(idx.isValid());
+        QCOMPARE(model.data(idx, roleByName(model, "label")).toString(), QStringLiteral("Quarterly Talk"));
+        QCOMPARE(model.data(idx, roleByName(model, "tags")).toString(), QStringLiteral("finance, meetings"));
+    }
+
+    // An untranscribed audio file (no sidecar .md yet) yields empty label/tags
+    // rather than erroring or crashing.
+    void audioWithoutSidecarMd_labelAndTagsRolesAreEmpty()
+    {
+        QTemporaryDir vault;
+        QVERIFY(vault.isValid());
+        QVERIFY(touch(vault.filePath("untouched.mp3")));
+
+        VaultTreeModel model;
+        model.setVaultPath(QUrl::fromLocalFile(vault.path()));
+
+        const QModelIndex idx = findByName(model, "untouched.mp3");
+        QVERIFY(idx.isValid());
+        QVERIFY(model.data(idx, roleByName(model, "label")).toString().isEmpty());
+        QVERIFY(model.data(idx, roleByName(model, "tags")).toString().isEmpty());
+    }
+
+    // TranscriptBodyRole returns the segment text (frontmatter stripped) for a
+    // transcribed audio file, matching TranscriptionController::readTranscriptBody().
+    void transcribedAudio_transcriptBodyRoleReturnsBodyWithoutFrontmatter()
+    {
+        QTemporaryDir vault;
+        QVERIFY(vault.isValid());
+        QVERIFY(touch(vault.filePath("session.wav")));
+        QVERIFY(touch(vault.filePath("session.md"),
+                      "---\nmodel: base\n---\n\n[00:00:00.000 - 00:00:01.000] the quick fox\n"));
+
+        VaultTreeModel model;
+        model.setVaultPath(QUrl::fromLocalFile(vault.path()));
+
+        const QModelIndex idx = findByName(model, "session.wav");
+        QVERIFY(idx.isValid());
+        const QString body = model.data(idx, roleByName(model, "transcriptBody")).toString();
+        QVERIFY(body.contains(QStringLiteral("the quick fox")));
+        QVERIFY(!body.contains(QStringLiteral("model:")));
+    }
+
+    // Item 9's search-transcriptions behavior only ever covered TranscribedStatus
+    // rows (see Sidebar.qml's original matchesSearch: "status === 2"); an
+    // orphaned .md's own content is not exposed via TranscriptBodyRole, since
+    // its status is OrphanedMdStatus, not TranscribedStatus.
+    void orphanedMd_transcriptBodyRoleIsEmpty()
+    {
+        QTemporaryDir vault;
+        QVERIFY(vault.isValid());
+        QVERIFY(touch(vault.filePath("stray.md"), "---\n---\n\nsome stray note content\n"));
+
+        VaultTreeModel model;
+        model.setVaultPath(QUrl::fromLocalFile(vault.path()));
+
+        const QModelIndex idx = findByName(model, "stray.md");
+        QVERIFY(idx.isValid());
+        QVERIFY(model.data(idx, roleByName(model, "transcriptBody")).toString().isEmpty());
+    }
+
+    // --- Vault-scoped settings (Item 9: .suopTranscriber JSON file) --------------
+
+    // writeVaultSettings() then readVaultSettings() round-trips arbitrary
+    // key/value data through a hidden .suopTranscriber JSON file at the
+    // vault root.
+    void vaultSettings_roundTripsThroughHiddenJsonFile()
+    {
+        QTemporaryDir vault;
+        QVERIFY(vault.isValid());
+
+        VaultTreeModel model;
+        model.setVaultPath(QUrl::fromLocalFile(vault.path()));
+
+        QVariantMap settings;
+        settings[QStringLiteral("borderRadius")] = 12.5;
+        settings[QStringLiteral("useSystemTitlebar")] = false;
+        settings[QStringLiteral("sidebarBackgroundColor")] = QStringLiteral("#112233");
+
+        QString error;
+        QVERIFY2(model.writeVaultSettings(settings, &error), qPrintable(error));
+        QVERIFY(QFileInfo::exists(vault.filePath(".suopTranscriber")));
+
+        const QVariantMap readBack = model.readVaultSettings();
+        QCOMPARE(readBack.value(QStringLiteral("borderRadius")).toDouble(), 12.5);
+        QCOMPARE(readBack.value(QStringLiteral("useSystemTitlebar")).toBool(), false);
+        QCOMPARE(readBack.value(QStringLiteral("sidebarBackgroundColor")).toString(), QStringLiteral("#112233"));
+    }
+
+    // The settings dotfile is hidden (QDir's default filters exclude it) and
+    // has no recognized extension, so it never appears as a tree node (not
+    // an orphaned .md, not audio) even though it sits at the vault root
+    // alongside real content.
+    void vaultSettingsFile_neverAppearsAsATreeNode()
+    {
+        QTemporaryDir vault;
+        QVERIFY(vault.isValid());
+        QVERIFY(touch(vault.filePath("song.mp3")));
+
+        VaultTreeModel model;
+        model.setVaultPath(QUrl::fromLocalFile(vault.path()));
+        QVERIFY(model.writeVaultSettings({{QStringLiteral("borderRadius"), 8}}));
+
+        QCOMPARE(model.rowCount(), 1);
+        QVERIFY(findByName(model, "song.mp3").isValid());
+        QVERIFY(!findByName(model, ".suopTranscriber").isValid());
+    }
+
+    // No vault open (empty vaultLocalPath): readVaultSettings() returns an
+    // empty map and writeVaultSettings() fails with an error, rather than
+    // crashing or writing to some unintended location.
+    void vaultSettings_noVaultOpen_isInertNotFatal()
+    {
+        VaultTreeModel model;
+        QVERIFY(model.readVaultSettings().isEmpty());
+
+        QString error;
+        QVERIFY(!model.writeVaultSettings({{QStringLiteral("borderRadius"), 8}}, &error));
+        QVERIFY(!error.isEmpty());
+    }
+
     // --- Model contract ----------------------------------------------------------
 
     // QAbstractItemModelTester validates the full QAbstractItemModel contract

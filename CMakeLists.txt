@@ -49,17 +49,19 @@ qt_add_qml_module(suopTranscriber
         qml/Main.qml
         qml/AppSettings.qml
         qml/HoverBorder.qml
+        qml/UnderlineField.qml
         qml/TitleBar.qml
         qml/Sidebar.qml
         qml/MainPanel.qml
         qml/BottomBar.qml
         qml/SettingsPopup.qml
-        qml/VaultFolderDialog.qml
     SOURCES
         src/core/Segment.h
         src/core/TranscriptionEngine.h
         src/core/VaultTreeModel.h
         src/core/VaultTreeModel.cpp
+        src/core/VaultSearchProxyModel.h
+        src/core/VaultSearchProxyModel.cpp
         src/core/AudioPlayer.h
         src/core/AudioPlayer.cpp
         src/core/WindowEffects.h

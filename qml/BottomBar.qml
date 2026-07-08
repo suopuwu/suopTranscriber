@@ -9,6 +9,17 @@ Item {
     property url vaultPath
     property string vaultLocalPath: ""
     property TranscriptionController transcriptionController
+    property VaultTreeModel vaultTreeModel
+    // Wave D item 2: the currently-open file's raw local path (audio file or
+    // orphaned .md — whatever MainPanel currently shows), empty if none.
+    property string currentFilePath: ""
+    readonly property string currentFileRelativePath: {
+        if (bottomBar.currentFilePath === "" || bottomBar.vaultLocalPath === "")
+            return ""
+        const prefix = bottomBar.vaultLocalPath + "/"
+        return bottomBar.currentFilePath.startsWith(prefix)
+            ? bottomBar.currentFilePath.slice(prefix.length) : bottomBar.currentFilePath
+    }
     signal settingsRequested()
     readonly property real taskProgress: transcriptionController ? transcriptionController.progress : 0
     readonly property int tasksCompleted: transcriptionController ? transcriptionController.tasksCompleted : 0
@@ -59,7 +70,7 @@ Item {
 
         Item {
             Layout.fillWidth: true
-            implicitHeight: vaultPathLabel.implicitHeight
+            implicitHeight: vaultPathRow.implicitHeight
 
             HoverHandler {
                 id: vaultPathHover
@@ -68,17 +79,49 @@ Item {
             }
             TapHandler {
                 enabled: bottomBar.vaultLocalPath !== ""
-                onTapped: Qt.openUrlExternally(bottomBar.vaultPath)
+                onTapped: {
+                    // Reveal the open file (selected) when there is one;
+                    // otherwise just open the vault folder itself.
+                    if (bottomBar.currentFilePath !== "" && bottomBar.vaultTreeModel)
+                        bottomBar.vaultTreeModel.revealInFileManager("file://" + bottomBar.currentFilePath)
+                    else
+                        Qt.openUrlExternally(bottomBar.vaultPath)
+                }
             }
-            Label {
-                id: vaultPathLabel
+            RowLayout {
+                id: vaultPathRow
                 anchors.left: parent.left
                 anchors.right: parent.right
-                elide: Text.ElideMiddle
-                text: bottomBar.vaultLocalPath === "" ? qsTr("No vault open") : bottomBar.vaultLocalPath
-                color: "#aaaaaa"
-                font.pixelSize: 11
-                font.underline: vaultPathHover.hovered
+                spacing: 0
+
+                // Item 4 (Wave E): both parts must read as ONE continuous
+                // left-aligned string. Previously the vault-root Label alone
+                // had Layout.fillWidth, which claimed the whole row and shoved
+                // the subpath Label flush against the right edge instead of
+                // immediately after it. Now the (variable-width, non-elided)
+                // vault-root Label sits at its natural width, and the elided
+                // fillWidth claim moves to the subpath Label after it, so
+                // eliding happens at the far end of the combined string, not
+                // in the middle of the vault path.
+                Label {
+                    Layout.fillWidth: bottomBar.currentFileRelativePath === ""
+                    elide: Text.ElideMiddle
+                    text: bottomBar.vaultLocalPath === "" ? qsTr("No vault open") : bottomBar.vaultLocalPath
+                    color: "#aaaaaa"
+                    font.pixelSize: 11
+                    font.underline: vaultPathHover.hovered
+                }
+                // Wave D item 2: subfolder/filename part of the currently-
+                // open file, dimmer than the vault-root part above.
+                Label {
+                    visible: bottomBar.currentFileRelativePath !== ""
+                    Layout.fillWidth: true
+                    elide: Text.ElideRight
+                    text: "/" + bottomBar.currentFileRelativePath
+                    color: "#666666"
+                    font.pixelSize: 11
+                    font.underline: vaultPathHover.hovered
+                }
             }
         }
 
@@ -166,7 +209,7 @@ Item {
 
                     background: Rectangle {
                         radius: AppSettings.borderRadius
-                        color: clearButton.hovered ? "#3a3a3a" : "#2a2a2a"
+                        color: (clearButton.hovered && clearButton.enabled) ? "#3a3a3a" : "#2a2a2a"
                         border.width: 1
                         border.color: "#3a3a3a"
                     }

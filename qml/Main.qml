@@ -1,5 +1,6 @@
 import QtQuick
 import QtQuick.Controls
+import QtQuick.Dialogs
 import QtQuick.Layouts
 import SuopTranscriber
 
@@ -30,10 +31,17 @@ ApplicationWindow {
         folderDialog.open()
     }
 
-    VaultFolderDialog {
+    // Wave D item 3: reverted to the native/portal dialog (was replaced by
+    // VaultFolderDialog.qml in Milestone 4 because its "Open" button is
+    // greyed out with nothing explicitly selected when browsing into a leaf
+    // folder — confirmed via fresh research this session that there is no
+    // portal/KDE config option to change that; it's KFileWidget's own
+    // OK-button logic, not exposed as a setting. User chose the native
+    // picker back anyway rather than keep the in-app browser as "bloat" —
+    // the leaf-folder limitation is a known, accepted tradeoff.
+    FolderDialog {
         id: folderDialog
-        parent: window.contentItem
-        onAccepted: (folder) => vaultModel.vaultPath = folder
+        onAccepted: vaultModel.vaultPath = folderDialog.selectedFolder
     }
 
     SettingsPopup {
@@ -106,6 +114,12 @@ ApplicationWindow {
         target: vaultModel
         function onVaultPathChanged() {
             AppSettings.lastVaultPath = vaultModel.vaultPath
+            // Item 9 (Wave E): settings are vault-scoped now — load the
+            // newly-opened vault's own .suopTranscriber (falling back to
+            // defaults for a vault that doesn't have one yet) rather than
+            // keep whatever the PREVIOUS vault had in memory.
+            if (vaultModel.vaultPath.toString() !== "")
+                AppSettings.loadFromVault(vaultModel)
         }
     }
 
@@ -200,6 +214,18 @@ ApplicationWindow {
                     vaultPath: vaultModel.vaultPath
                     onFileActivated: (path) => mainPanel.showAudioFile(path)
                     onOrphanedMdActivated: (path) => mainPanel.showOrphanedMd(path)
+                    // Item 2 (Wave E): open the file (or orphaned .md) then
+                    // jump to/highlight the phrase the sidebar snippet
+                    // matched on, in MainPanel's own search mechanism.
+                    onTranscriptMatchActivated: (path, isOrphanedMd, query) => {
+                        if (isOrphanedMd)
+                            mainPanel.showOrphanedMd(path)
+                        else
+                            mainPanel.showAudioFile(path)
+                        mainPanel.searchExpanded = true
+                        mainPanel.searchQuery = query
+                        mainPanel.jumpToNextMatch()
+                    }
                     onWidthChanged: Qt.callLater(window.updateBlurRegions)
                     onHeightChanged: Qt.callLater(window.updateBlurRegions)
                 }
@@ -213,6 +239,7 @@ ApplicationWindow {
                     transcriptionController: transcriptionController
                     vaultTreeModel: vaultModel
                     onOpenVaultRequested: window.openVaultDialog()
+                    onTagActivated: (tag) => sidebar.applyTagFilter(tag)
                     onWidthChanged: Qt.callLater(window.updateBlurRegions)
                     onHeightChanged: Qt.callLater(window.updateBlurRegions)
                 }
@@ -223,9 +250,35 @@ ApplicationWindow {
                 Layout.fillWidth: true
                 vaultPath: vaultModel.vaultPath
                 vaultLocalPath: vaultModel.vaultLocalPath
+                vaultTreeModel: vaultModel
+                currentFilePath: mainPanel.orphanedMdPath !== "" ? mainPanel.orphanedMdPath
+                                 : (mainPanel.player.source.toString() !== ""
+                                    ? mainPanel.player.source.toString().replace("file://", "") : "")
                 transcriptionController: transcriptionController
                 onSettingsRequested: settingsPopup.open()
             }
+        }
+
+        // Item 3 (Wave E): SettingsPopup's own dim already darkens the whole
+        // window (Popup.dim works independent of modal), but with
+        // `modal: false` (needed for the resize grips below, see item 12's
+        // note in SettingsPopup.qml) nothing actually BLOCKS clicks/drags
+        // from reaching Sidebar/MainPanel/BottomBar/TitleBar while it's
+        // open. A real `modal: true` isn't an option: Overlay.overlay's
+        // block plane covers the ENTIRE window uniformly, including these
+        // resize grips, since they're plain siblings below Overlay in
+        // z-order — there's no way to exempt them via Popup's own
+        // modal/Overlay machinery. Instead: a plain input-swallowing
+        // MouseArea declared here, AFTER the main content but BEFORE the
+        // ResizeGrips below, so it visually/input-wise sits on top of the
+        // app's normal content while the grips (declared later, so higher
+        // z) remain on top of IT and stay usable.
+        MouseArea {
+            anchors.fill: parent
+            visible: settingsPopup.visible
+            enabled: settingsPopup.visible
+            hoverEnabled: true
+            onWheel: {}
         }
 
         // Adjustable "rim" — thin translucent-white glass edge by default.

@@ -41,6 +41,13 @@ must show both:
 - Not a single RGBA color picker — keep color and transparency as
   independent controls for any panel-like surface.
 
+## Text fields
+
+- `TextField`s use an underline background (`qml/UnderlineField.qml`), not the
+  default boxed background — `background: UnderlineField { focused:
+  <id>.activeFocus }`. Thin/dim normally, thicker + `AppSettings.highlightColor`
+  when focused.
+
 ## Extending this doc
 
 This file is the place for future UI convention rules (spacing, typography,

@@ -35,6 +35,7 @@ endfunction()
 
 suop_add_test(tst_smoke)
 suop_add_test(tst_vaulttreemodel SOURCES VaultTreeModel.cpp)
+suop_add_test(tst_vaultsearchproxymodel SOURCES VaultTreeModel.cpp VaultSearchProxyModel.cpp)
 suop_add_test(tst_modelmanager SOURCES ModelManager.cpp)
 suop_add_test(tst_transcript_format LINK_WHISPER LINK_LLAMA
     SOURCES TranscriptionController.cpp WhisperCppEngine.cpp ModelManager.cpp AudioDecoder.cpp LabelingEngine.cpp)

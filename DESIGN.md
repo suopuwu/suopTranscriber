@@ -161,14 +161,29 @@ One user-chosen root holds config, audio, and transcriptions:
 
 ```
 vault/
+  .suopTranscriber                # settings (JSON) — see below; user-requested filename
   .transcriber/
-    config.json                 # settings, USB device allowlist, model registry
     engines/                    # engine manifests + scripts
     models/                     # downloaded model files (large: 2–4 GB each)
   interviews/2026-06-30.m4a
   interviews/2026-06-30.md              # human-readable transcript = "done" (green)
   interviews/.2026-06-30.partial.jsonl  # exists only mid-transcription (resume)
 ```
+
+- **Vault-scoped settings (`.suopTranscriber`):** appearance/behavior settings
+  (`AppSettings.qml`'s `defaults` map — colors, opacity, radii, label-display
+  toggles, auto-labeling options, etc.) round-trip through this hidden JSON
+  file at the vault root, via `VaultTreeModel::readVaultSettings()`/
+  `writeVaultSettings()`. A hidden dotfile with no recognized extension, so
+  it's naturally excluded from the sidebar tree (`QDir`'s default entry
+  filters skip hidden files; it also never matches the `.md`/audio-extension
+  checks even if that changed). Loaded on `vaultPath` change
+  (`AppSettings.loadFromVault`), saved (debounced) on any settings change
+  (`AppSettings.saveToVault`). `lastVaultPath`/`lastModel` stay app-scoped
+  (`QtCore.Settings`, `~/.config`) — they're last-used bootstrap state needed
+  BEFORE a vault's own settings file can be read, not a vault-specific
+  preference. USB device allowlist and a model registry (below) are NOT part
+  of this file yet — still not implemented.
 
 - **Transcribed indicator:** sibling `.md` exists → green; missing → yellow.
   Watch with `QFileSystemWatcher` for live updates.

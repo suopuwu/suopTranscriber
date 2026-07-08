@@ -13,11 +13,14 @@ Popup {
     height: Math.min(contentColumn.implicitHeight + 32, maxHeight)
     // Non-modal: a modal Popup's input-blocking layer covers the ENTIRE
     // window via Overlay.overlay, including the window-edge ResizeGrips
-    // (Main.qml) — that silently ate every resize attempt while the popup
-    // was open. `dim` is set explicitly below (not left to follow `modal`),
-    // and closePolicy already closes on an outside press, so the popup still
-    // looks and dismisses the same way; it just no longer blocks the rest of
-    // the window's input.
+    // (Main.qml) — that would silently eat every resize attempt while the
+    // popup was open. `dim` is set explicitly below (not left to follow
+    // `modal`), and closePolicy already closes on an outside press, so the
+    // popup still looks and dismisses the same way. Item 3 (Wave E):
+    // interaction with the rest of the window IS still blocked while this is
+    // open — via a separate input-swallowing MouseArea in Main.qml, declared
+    // below the ResizeGrips in z-order so those alone stay usable, rather
+    // than through this Popup's own modal/Overlay mechanism.
     modal: false
     focus: true
     x: parent ? (parent.width - width) / 2 : 0
@@ -33,6 +36,7 @@ Popup {
     // slider's mouse grab isn't interrupted mid-drag.
     property bool anyPressed: radiusSlider.pressed || sidebarOpacitySlider.pressed
                                || mainOpacitySlider.pressed || rimWidthSlider.pressed
+                               || highlightRadiusSlider.pressed || tagReuseBiasSlider.pressed
 
     dim: !anyPressed
 
@@ -51,10 +55,15 @@ Popup {
                 || !AppSettings.isDefault("rimEnabled")
                 || !AppSettings.isDefault("rimWidth")
                 || !AppSettings.isDefault("rimColor")
-                || !AppSettings.isDefault("useLabels")
+                || !AppSettings.isDefault("highlightColor")
+                || !AppSettings.isDefault("highlightRadius")
+                || !AppSettings.isDefault("useLabelsMainPanel")
+                || !AppSettings.isDefault("useLabelsSidebar")
                 || !AppSettings.isDefault("hideExtensionsSidebar")
                 || !AppSettings.isDefault("hideExtensionsMainPanel")
                 || !AppSettings.isDefault("autoLabelEnabled")
+                || !AppSettings.isDefault("restrictTagsToExisting")
+                || !AppSettings.isDefault("tagReuseBias")
     }
 
     background: Rectangle {
@@ -85,6 +94,13 @@ Popup {
         selectedColor: AppSettings.rimColor
         options: ColorDialog.ShowAlphaChannel
         onAccepted: AppSettings.rimColor = selectedColor
+    }
+
+    ColorDialog {
+        id: highlightColorDialog
+        title: qsTr("Sentence Highlight Color")
+        selectedColor: AppSettings.highlightColor
+        onAccepted: AppSettings.highlightColor = selectedColor
     }
 
     ScrollView {
@@ -146,7 +162,7 @@ Popup {
 
                     background: Rectangle {
                         radius: AppSettings.borderRadius
-                        color: resetAllButton.hovered ? "#3a3a3a" : "#2a2a2a"
+                        color: (resetAllButton.hovered && resetAllButton.enabled) ? "#3a3a3a" : "#2a2a2a"
                         border.width: 1
                         border.color: "#3a3a3a"
                     }
@@ -176,7 +192,7 @@ Popup {
 
                     background: Rectangle {
                         radius: AppSettings.borderRadius
-                        color: changeVaultButton.hovered ? "#3a3a3a" : "#2a2a2a"
+                        color: (changeVaultButton.hovered && changeVaultButton.enabled) ? "#3a3a3a" : "#2a2a2a"
                         border.width: 1
                         border.color: "#3a3a3a"
                     }
@@ -233,6 +249,8 @@ Popup {
                             AppSettings.borderRadius = Math.max(radiusSlider.from, Math.min(radiusSlider.to, v))
                         text = AppSettings.borderRadius.toFixed(1)
                     }
+
+                    background: UnderlineField { focused: radiusField.activeFocus }
 
                     Binding {
                         target: radiusField
@@ -347,7 +365,7 @@ Popup {
 
                     background: Rectangle {
                         radius: AppSettings.borderRadius
-                        color: sidebarColorButton.hovered ? "#3a3a3a" : "#2a2a2a"
+                        color: (sidebarColorButton.hovered && sidebarColorButton.enabled) ? "#3a3a3a" : "#2a2a2a"
                         border.width: 1
                         border.color: "#3a3a3a"
                     }
@@ -424,6 +442,8 @@ Popup {
                             AppSettings.sidebarOpacity = Math.max(sidebarOpacitySlider.from, Math.min(sidebarOpacitySlider.to, v))
                         text = AppSettings.sidebarOpacity.toFixed(2)
                     }
+
+                    background: UnderlineField { focused: sidebarOpacityField.activeFocus }
 
                     Binding {
                         target: sidebarOpacityField
@@ -538,7 +558,7 @@ Popup {
 
                     background: Rectangle {
                         radius: AppSettings.borderRadius
-                        color: mainColorButton.hovered ? "#3a3a3a" : "#2a2a2a"
+                        color: (mainColorButton.hovered && mainColorButton.enabled) ? "#3a3a3a" : "#2a2a2a"
                         border.width: 1
                         border.color: "#3a3a3a"
                     }
@@ -615,6 +635,8 @@ Popup {
                             AppSettings.mainOpacity = Math.max(mainOpacitySlider.from, Math.min(mainOpacitySlider.to, v))
                         text = AppSettings.mainOpacity.toFixed(2)
                     }
+
+                    background: UnderlineField { focused: mainOpacityField.activeFocus }
 
                     Binding {
                         target: mainOpacityField
@@ -801,6 +823,8 @@ Popup {
                         text = AppSettings.rimWidth.toFixed(1)
                     }
 
+                    background: UnderlineField { focused: rimWidthField.activeFocus }
+
                     Binding {
                         target: rimWidthField
                         property: "text"
@@ -859,7 +883,7 @@ Popup {
 
                     background: Rectangle {
                         radius: AppSettings.borderRadius
-                        color: rimColorButton.hovered ? "#3a3a3a" : "#2a2a2a"
+                        color: (rimColorButton.hovered && rimColorButton.enabled) ? "#3a3a3a" : "#2a2a2a"
                         border.width: 1
                         border.color: "#3a3a3a"
                     }
@@ -900,7 +924,7 @@ Popup {
             }
 
             Label {
-                text: qsTr("Files")
+                text: qsTr("Sentence Highlight")
                 color: "white"
                 font.bold: true
             }
@@ -910,24 +934,30 @@ Popup {
                 Label {
                     Layout.fillWidth: true
                     color: "white"
-                    text: qsTr("Show labels instead of filenames")
+                    text: qsTr("Color")
                 }
-                Switch {
-                    id: useLabelsSwitch
-                    checked: AppSettings.useLabels
+                Button {
+                    id: highlightColorButton
+                    text: qsTr("Choose…")
                     hoverEnabled: true
-                    onToggled: AppSettings.useLabels = checked
+                    onClicked: highlightColorDialog.open()
 
+                    background: Rectangle {
+                        radius: AppSettings.borderRadius
+                        color: (highlightColorButton.hovered && highlightColorButton.enabled) ? "#3a3a3a" : "#2a2a2a"
+                        border.width: 1
+                        border.color: "#3a3a3a"
+                    }
                     HoverHandler {
                         cursorShape: Qt.PointingHandCursor
                     }
                     HoverBorder {
                         anchors.fill: parent
-                        active: useLabelsSwitch.hovered
+                        active: highlightColorButton.hovered
                     }
                 }
                 Button {
-                    id: useLabelsResetButton
+                    id: highlightColorResetButton
                     text: "↺"
                     implicitWidth: 22
                     implicitHeight: 22
@@ -938,29 +968,227 @@ Popup {
                         border.width: 1
                         border.color: "#3a3a3a"
                     }
-                    enabled: !AppSettings.isDefault("useLabels")
+                    enabled: !AppSettings.isDefault("highlightColor")
                     opacity: enabled ? 1 : 0.35
                     hoverEnabled: enabled
-                    onClicked: AppSettings.resetProperty("useLabels")
+                    onClicked: AppSettings.resetProperty("highlightColor")
 
                     HoverHandler {
                         cursorShape: Qt.PointingHandCursor
-                        enabled: useLabelsResetButton.enabled
+                        enabled: highlightColorResetButton.enabled
                     }
                     HoverBorder {
                         anchors.fill: parent
-                        active: useLabelsResetButton.enabled && useLabelsResetButton.hovered
+                        active: highlightColorResetButton.enabled && highlightColorResetButton.hovered
+                    }
+                }
+            }
+
+            // Item 7 (Wave E): playback + Ctrl+F search-match highlight radius,
+            // now independently adjustable from the app-wide border radius
+            // above (was previously hardcoded to follow it).
+            RowLayout {
+                Layout.fillWidth: true
+                Label {
+                    Layout.preferredWidth: 90
+                    color: "white"
+                    text: qsTr("Radius")
+                }
+                Slider {
+                    id: highlightRadiusSlider
+                    Layout.fillWidth: true
+                    Layout.minimumWidth: 80
+                    from: 0
+                    to: 24
+                    value: AppSettings.highlightRadius
+                    hoverEnabled: true
+                    onMoved: AppSettings.highlightRadius = value
+
+                    HoverHandler {
+                        cursorShape: Qt.PointingHandCursor
+                    }
+                    HoverBorder {
+                        anchors.fill: parent
+                        active: highlightRadiusSlider.hovered
+                    }
+                }
+                TextField {
+                    id: highlightRadiusField
+                    Layout.preferredWidth: 56
+                    horizontalAlignment: TextInput.AlignRight
+                    hoverEnabled: true
+                    validator: DoubleValidator { bottom: highlightRadiusSlider.from; top: highlightRadiusSlider.to; decimals: 1 }
+                    onEditingFinished: {
+                        const v = parseFloat(text)
+                        if (!isNaN(v))
+                            AppSettings.highlightRadius = Math.max(highlightRadiusSlider.from, Math.min(highlightRadiusSlider.to, v))
+                        text = AppSettings.highlightRadius.toFixed(1)
+                    }
+
+                    background: UnderlineField { focused: highlightRadiusField.activeFocus }
+
+                    Binding {
+                        target: highlightRadiusField
+                        property: "text"
+                        value: AppSettings.highlightRadius.toFixed(1)
+                        when: !highlightRadiusField.activeFocus
+                    }
+
+                    HoverHandler {
+                        cursorShape: Qt.PointingHandCursor
+                    }
+                    HoverBorder {
+                        anchors.fill: parent
+                        active: highlightRadiusField.hovered
+                    }
+                }
+                Button {
+                    id: highlightRadiusResetButton
+                    text: "↺"
+                    implicitWidth: 22
+                    implicitHeight: 22
+
+                    background: Rectangle {
+                        radius: AppSettings.borderRadius
+                        color: "transparent"
+                        border.width: 1
+                        border.color: "#3a3a3a"
+                    }
+                    enabled: !AppSettings.isDefault("highlightRadius")
+                    opacity: enabled ? 1 : 0.35
+                    hoverEnabled: enabled
+                    onClicked: AppSettings.resetProperty("highlightRadius")
+
+                    HoverHandler {
+                        cursorShape: Qt.PointingHandCursor
+                        enabled: highlightRadiusResetButton.enabled
+                    }
+                    HoverBorder {
+                        anchors.fill: parent
+                        active: highlightRadiusResetButton.enabled && highlightRadiusResetButton.hovered
                     }
                 }
             }
 
             Label {
-                visible: !useLabelsSwitch.checked
+                Layout.fillWidth: true
+                wrapMode: Text.WordWrap
+                text: qsTr("Applies to the playback sentence highlight and the Ctrl+F search-match highlight.")
+                color: "#888888"
+                font.pixelSize: 11
+            }
+
+            Label {
+                text: qsTr("Files")
+                color: "white"
+                font.bold: true
+            }
+
+            RowLayout {
+                Layout.fillWidth: true
+                Label {
+                    Layout.fillWidth: true
+                    color: "white"
+                    text: qsTr("Show labels instead of filenames (main panel)")
+                }
+                Switch {
+                    id: useLabelsMainPanelSwitch
+                    checked: AppSettings.useLabelsMainPanel
+                    hoverEnabled: true
+                    onToggled: AppSettings.useLabelsMainPanel = checked
+
+                    HoverHandler {
+                        cursorShape: Qt.PointingHandCursor
+                    }
+                    HoverBorder {
+                        anchors.fill: parent
+                        active: useLabelsMainPanelSwitch.hovered
+                    }
+                }
+                Button {
+                    id: useLabelsMainPanelResetButton
+                    text: "↺"
+                    implicitWidth: 22
+                    implicitHeight: 22
+
+                    background: Rectangle {
+                        radius: AppSettings.borderRadius
+                        color: "transparent"
+                        border.width: 1
+                        border.color: "#3a3a3a"
+                    }
+                    enabled: !AppSettings.isDefault("useLabelsMainPanel")
+                    opacity: enabled ? 1 : 0.35
+                    hoverEnabled: enabled
+                    onClicked: AppSettings.resetProperty("useLabelsMainPanel")
+
+                    HoverHandler {
+                        cursorShape: Qt.PointingHandCursor
+                        enabled: useLabelsMainPanelResetButton.enabled
+                    }
+                    HoverBorder {
+                        anchors.fill: parent
+                        active: useLabelsMainPanelResetButton.enabled && useLabelsMainPanelResetButton.hovered
+                    }
+                }
+            }
+
+            Label {
+                visible: !useLabelsMainPanelSwitch.checked
                 Layout.fillWidth: true
                 wrapMode: Text.WordWrap
                 text: qsTr("Off: renaming a file in the main panel renames the actual audio + transcript files instead of just setting a label.")
                 color: "#888888"
                 font.pixelSize: 11
+            }
+
+            RowLayout {
+                Layout.fillWidth: true
+                Label {
+                    Layout.fillWidth: true
+                    color: "white"
+                    text: qsTr("Show labels instead of filenames (sidebar)")
+                }
+                Switch {
+                    id: useLabelsSidebarSwitch
+                    checked: AppSettings.useLabelsSidebar
+                    hoverEnabled: true
+                    onToggled: AppSettings.useLabelsSidebar = checked
+
+                    HoverHandler {
+                        cursorShape: Qt.PointingHandCursor
+                    }
+                    HoverBorder {
+                        anchors.fill: parent
+                        active: useLabelsSidebarSwitch.hovered
+                    }
+                }
+                Button {
+                    id: useLabelsSidebarResetButton
+                    text: "↺"
+                    implicitWidth: 22
+                    implicitHeight: 22
+
+                    background: Rectangle {
+                        radius: AppSettings.borderRadius
+                        color: "transparent"
+                        border.width: 1
+                        border.color: "#3a3a3a"
+                    }
+                    enabled: !AppSettings.isDefault("useLabelsSidebar")
+                    opacity: enabled ? 1 : 0.35
+                    hoverEnabled: enabled
+                    onClicked: AppSettings.resetProperty("useLabelsSidebar")
+
+                    HoverHandler {
+                        cursorShape: Qt.PointingHandCursor
+                        enabled: useLabelsSidebarResetButton.enabled
+                    }
+                    HoverBorder {
+                        anchors.fill: parent
+                        active: useLabelsSidebarResetButton.enabled && useLabelsSidebarResetButton.hovered
+                    }
+                }
             }
 
             RowLayout {
@@ -1122,6 +1350,135 @@ Popup {
                 wrapMode: Text.WordWrap
                 text: qsTr("Runs a small local AI model (~2.5 GB download on first use) after each "
                            + "transcription to generate a display label, summary, and tags.")
+                color: "#888888"
+                font.pixelSize: 11
+            }
+
+            RowLayout {
+                Layout.fillWidth: true
+                visible: autoLabelEnabledSwitch.checked
+                Label {
+                    Layout.fillWidth: true
+                    color: "white"
+                    text: qsTr("Only use existing tags (auto-categorize)")
+                }
+                Switch {
+                    id: restrictTagsToExistingSwitch
+                    checked: AppSettings.restrictTagsToExisting
+                    hoverEnabled: true
+                    onToggled: AppSettings.restrictTagsToExisting = checked
+
+                    HoverHandler {
+                        cursorShape: Qt.PointingHandCursor
+                    }
+                    HoverBorder {
+                        anchors.fill: parent
+                        active: restrictTagsToExistingSwitch.hovered
+                    }
+                }
+                Button {
+                    id: restrictTagsToExistingResetButton
+                    text: "↺"
+                    implicitWidth: 22
+                    implicitHeight: 22
+
+                    background: Rectangle {
+                        radius: AppSettings.borderRadius
+                        color: "transparent"
+                        border.width: 1
+                        border.color: "#3a3a3a"
+                    }
+                    enabled: !AppSettings.isDefault("restrictTagsToExisting")
+                    opacity: enabled ? 1 : 0.35
+                    hoverEnabled: enabled
+                    onClicked: AppSettings.resetProperty("restrictTagsToExisting")
+
+                    HoverHandler {
+                        cursorShape: Qt.PointingHandCursor
+                        enabled: restrictTagsToExistingResetButton.enabled
+                    }
+                    HoverBorder {
+                        anchors.fill: parent
+                        active: restrictTagsToExistingResetButton.enabled && restrictTagsToExistingResetButton.hovered
+                    }
+                }
+            }
+
+            Label {
+                visible: autoLabelEnabledSwitch.checked && restrictTagsToExistingSwitch.checked
+                Layout.fillWidth: true
+                wrapMode: Text.WordWrap
+                text: qsTr("Off (default): freely invent new tags. On: only pick from tags already used "
+                           + "elsewhere in this vault — leaves a file untagged rather than inventing one "
+                           + "if nothing existing fits.")
+                color: "#888888"
+                font.pixelSize: 11
+            }
+
+            // Item 15 (Wave E): only meaningful when NOT hard-restricted —
+            // restrictTagsToExisting above is already a hard rule, so this
+            // gradient wouldn't have anything to adjust while it's on.
+            RowLayout {
+                Layout.fillWidth: true
+                visible: autoLabelEnabledSwitch.checked && !restrictTagsToExistingSwitch.checked
+                Label {
+                    Layout.preferredWidth: 90
+                    color: "white"
+                    text: qsTr("Tag reuse bias")
+                }
+                Slider {
+                    id: tagReuseBiasSlider
+                    Layout.fillWidth: true
+                    Layout.minimumWidth: 80
+                    from: 0
+                    to: 1
+                    value: AppSettings.tagReuseBias
+                    hoverEnabled: true
+                    onMoved: AppSettings.tagReuseBias = value
+
+                    HoverHandler {
+                        cursorShape: Qt.PointingHandCursor
+                    }
+                    HoverBorder {
+                        anchors.fill: parent
+                        active: tagReuseBiasSlider.hovered
+                    }
+                }
+                Button {
+                    id: tagReuseBiasResetButton
+                    text: "↺"
+                    implicitWidth: 22
+                    implicitHeight: 22
+
+                    background: Rectangle {
+                        radius: AppSettings.borderRadius
+                        color: "transparent"
+                        border.width: 1
+                        border.color: "#3a3a3a"
+                    }
+                    enabled: !AppSettings.isDefault("tagReuseBias")
+                    opacity: enabled ? 1 : 0.35
+                    hoverEnabled: enabled
+                    onClicked: AppSettings.resetProperty("tagReuseBias")
+
+                    HoverHandler {
+                        cursorShape: Qt.PointingHandCursor
+                        enabled: tagReuseBiasResetButton.enabled
+                    }
+                    HoverBorder {
+                        anchors.fill: parent
+                        active: tagReuseBiasResetButton.enabled && tagReuseBiasResetButton.hovered
+                    }
+                }
+            }
+
+            Label {
+                visible: autoLabelEnabledSwitch.checked && !restrictTagsToExistingSwitch.checked
+                Layout.fillWidth: true
+                wrapMode: Text.WordWrap
+                text: qsTr("How much to favor reusing an existing tag over inventing a new one. Low: "
+                           + "prefer a precise new tag. High: stretch and reuse an existing tag even if "
+                           + "it's only a loose fit.")
                 color: "#888888"
                 font.pixelSize: 11
             }

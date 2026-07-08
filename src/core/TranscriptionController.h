@@ -62,17 +62,40 @@ public:
     // (see LabelingEngine) — a labeling failure never fails the overall job,
     // since the primary transcript is already the thing that matters; it is
     // logged and the job still reports success.
+    // restrictTagsToExisting (item 14 "auto-categorize" mode): when true,
+    // the labeling pass is instructed to only pick tags already used
+    // elsewhere in this vault (scanned fresh per job), leaving tags empty
+    // rather than inventing a new one if none fit. Ignored when autoLabel
+    // is false. tagReuseBias (item 15, Wave E): 0.0-1.0 soft nudge between
+    // inventing new tags vs. reusing existing ones — only meaningful when
+    // restrictTagsToExisting is false (that's already a hard constraint).
     Q_INVOKABLE void transcribe(const QUrl &fileUrl, const QUrl &vaultUrl, const QString &modelId,
-                                 bool speakerDetection, bool autoLabel = false);
+                                 bool speakerDetection, bool autoLabel = false, bool restrictTagsToExisting = false,
+                                 double tagReuseBias = 0.5);
 
     // Convenience batch wrapper: calls transcribe() for each url. Dedup is
     // entirely delegated to transcribe(); the caller decides which files are
     // actually untranscribed.
     Q_INVOKABLE void transcribeAll(const QVariantList &fileUrls, const QUrl &vaultUrl, const QString &modelId,
-                                    bool speakerDetection, bool autoLabel = false);
+                                    bool speakerDetection, bool autoLabel = false,
+                                    bool restrictTagsToExisting = false, double tagReuseBias = 0.5);
 
     // True if fileUrl currently has a Queued or Active entry.
     Q_INVOKABLE bool isQueued(const QUrl &fileUrl) const;
+
+    // True if fileUrl's stored transcription (frontmatter) already used
+    // modelId + speakerDetection — i.e. re-running would reproduce the same
+    // result. Used by "transcribe all" (bulk) to skip files that are already
+    // current, WITHOUT blocking an explicit single-file manual re-run
+    // request (transcribe() itself never checks this — a user clicking
+    // Transcribe on one file always re-runs it, regardless of whether
+    // settings match). False for an untranscribed file (nothing to match).
+    // Accounts for speakerDetection always forcing the tdrz model
+    // regardless of modelId (see ModelManager's documented override), so a
+    // model-id mismatch alone doesn't cause a false "differs" when speaker
+    // detection is what actually determined the model both times.
+    Q_INVOKABLE bool matchesExistingTranscription(const QUrl &fileUrl, const QString &modelId,
+                                                   bool speakerDetection) const;
 
     // "Regenerate auto-title" (item 9): re-runs just the AI auto-labeling
     // pass on an already-transcribed file — reads the EXISTING transcript
@@ -80,7 +103,14 @@ public:
     // infrastructure as transcribe() (dedup, persistent job list) since it's
     // real GPU work; unlike transcribe()'s autoLabel option, a failure here
     // IS the job's result (there's nothing else for this job to accomplish).
-    Q_INVOKABLE void relabel(const QUrl &fileUrl, const QUrl &vaultUrl);
+    Q_INVOKABLE void relabel(const QUrl &fileUrl, const QUrl &vaultUrl, bool restrictTagsToExisting = false,
+                              double tagReuseBias = 0.5);
+
+    // Bulk wrapper mirroring transcribeAll(): calls relabel() for each url.
+    // Dedup is delegated to relabel(); the caller (Sidebar's "regenerate all
+    // labels" ribbon icon) decides which files are actually transcribed.
+    Q_INVOKABLE void relabelAll(const QVariantList &fileUrls, const QUrl &vaultUrl,
+                                bool restrictTagsToExisting = false, double tagReuseBias = 0.5);
 
     // Reads the frontmatter (model/speakerDetection/transcribedAt/label/...)
     // out of a file's sibling .md, if one exists yet. Empty map if not
@@ -110,20 +140,32 @@ public:
     // read+write, no model/engine involvement.
     Q_INVOKABLE bool setLabel(const QUrl &fileUrl, const QString &label, QString *errorOut = nullptr) const;
 
+    // Item 11 (Wave E): renames a speaker's DISPLAY name, everywhere at
+    // once — segment lines always store the stable id ("Speaker 1", "Speaker
+    // 2", ...; see parseSentences()' "speaker" field), so a rename is purely
+    // a frontmatter edit: splices/replaces one "id=name" pair inside a flat
+    // `speakerNames` key (same comma-separated-no-nesting convention as
+    // `tags`), same splice-or-append shape as setLabel(). speakerId must be
+    // the stable id (e.g. "Speaker 1"), not a previously-set display name.
+    Q_INVOKABLE bool renameSpeaker(const QUrl &fileUrl, const QString &speakerId, const QString &newName,
+                                    QString *errorOut = nullptr) const;
+
     // Everything after the frontmatter's closing "---" line (i.e. the
     // segment text), for main-panel search. Empty string if untranscribed
     // or unreadable.
     Q_INVOKABLE QString readTranscriptBody(const QUrl &fileUrl) const;
 
-    // Parses readTranscriptBody()'s "[HH:MM:SS.mmm - HH:MM:SS.mmm] text"
-    // lines (see appendSegmentLine/formatTimestamp) into a list of
-    // {t0, t1: seconds as double, text: QString, start, length: int}, in
-    // file order (which is also time order — segments are appended as
-    // whisper produces them). start/length are the character range of text
-    // within THIS SAME readTranscriptBody() string, so a caller can
-    // span-highlight the active sentence without re-deriving offsets. For
-    // sentence-level highlighting synced to playback (see DESIGN.md /
-    // CLAUDE.md "sentence-level only, binary-search on positionChanged").
+    // Parses readTranscriptBody()'s "[HH:MM:SS.mmm] [Speaker N] text" lines
+    // (see appendSegmentLine/formatTimestamp) into a list of
+    // {t0: seconds as double, speaker: int (0 = none), text: QString, start,
+    // length: int}, in file order (which is also time order — segments are
+    // appended as whisper produces them). No "t1": it's never stored (always
+    // identical to the next segment's t0) and nothing consumes it. start/
+    // length are the character range of text within THIS SAME
+    // readTranscriptBody() string, so a caller can span-highlight the active
+    // sentence without re-deriving offsets. For sentence-level highlighting
+    // synced to playback (see DESIGN.md / CLAUDE.md "sentence-level only,
+    // binary-search on positionChanged").
     Q_INVOKABLE QVariantList parseSentences(const QUrl &fileUrl) const;
 
     // Binary-searches sentences (as returned by parseSentences(), sorted by
@@ -134,6 +176,13 @@ public:
     // Returns -1 if positionSeconds is before the first sentence's t0 (or
     // the list is empty).
     Q_INVOKABLE int activeSentenceIndex(const QVariantList &sentences, double positionSeconds) const;
+
+    // Item 17: de-duplicated, sorted list of every tag already used anywhere
+    // in the vault — feeds the sidebar's tag-input autocomplete. Same scan
+    // LabelingEngine's "restrict to existing tags" mode already uses
+    // internally (collectVaultTags, TranscriptionController.cpp); exposed
+    // here so QML doesn't need its own duplicate frontmatter-scanning logic.
+    Q_INVOKABLE QStringList existingVaultTags(const QUrl &vaultUrl) const;
 
 signals:
     void busyChanged();
@@ -150,6 +199,8 @@ private:
         bool speakerDetection = false;
         bool autoLabel = false;
         bool relabelOnly = false;
+        bool restrictTagsToExisting = false;
+        double tagReuseBias = 0.5;
         JobStatus status = JobStatus::Queued;
         QString error;
     };

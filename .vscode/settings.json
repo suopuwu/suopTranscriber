@@ -1,0 +1,20 @@
+{
+    "C_Cpp.files.exclude": {
+        "**/build": true,
+        "**/third_party/whisper.cpp": true,
+        "**/third_party/llama.cpp": true
+    },
+    "files.watcherExclude": {
+        "**/build/**": true,
+        "**/third_party/whisper.cpp/**": true,
+        "**/third_party/llama.cpp/**": true
+    },
+    "search.exclude": {
+        "**/build": true,
+        "**/third_party/whisper.cpp": true,
+        "**/third_party/llama.cpp": true
+    },
+    "files.exclude": {
+        "**/build": true
+    }
+}

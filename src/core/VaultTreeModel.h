@@ -3,6 +3,7 @@
 #include <QAbstractItemModel>
 #include <QFileSystemWatcher>
 #include <QUrl>
+#include <QVariantMap>
 #include <qqml.h>
 
 #include <memory>
@@ -25,6 +26,9 @@ public:
         IsAudioRole,
         StatusRole,
         IsOrphanedMdRole,
+        LabelRole,
+        TagsRole,
+        TranscriptBodyRole,
     };
     Q_ENUM(Roles)
 
@@ -56,6 +60,25 @@ public:
     // without leaving the audio/.md pair mismatched.
     Q_INVOKABLE bool renameFile(const QUrl &fileUrl, const QString &newBaseName, QString *errorOut = nullptr);
 
+    // Reveals fileUrl in the desktop's file manager with it selected (Wave D
+    // item 2 — BottomBar's current-file path is clickable). Uses the
+    // freedesktop.org FileManager1 D-Bus interface's ShowItems method (the
+    // standard cross-DE way to select-and-reveal, vs. Qt.openUrlExternally
+    // which can only open a folder, never select something inside it).
+    // Fire-and-forget: if no file manager implements this interface, this is
+    // silently a no-op rather than an error the user needs to handle.
+    Q_INVOKABLE void revealInFileManager(const QUrl &fileUrl) const;
+
+    // Item 9 (Wave E): vault-scoped settings file (`.suopTranscriber`, JSON)
+    // at the vault root — a hidden dotfile, so it's naturally invisible to
+    // rebuild()/scanDirectory()'s scan (QDir's default filters exclude
+    // hidden entries; a suffix-less dotfile also never matches the ".md"
+    // check even if that changed). Empty map / false+*errorOut if there's no
+    // vault open or the file can't be read/written — callers (AppSettings)
+    // fall back to defaults in that case.
+    Q_INVOKABLE QVariantMap readVaultSettings() const;
+    Q_INVOKABLE bool writeVaultSettings(const QVariantMap &settings, QString *errorOut = nullptr) const;
+
 signals:
     void vaultPathChanged();
 
@@ -74,6 +97,15 @@ private:
     void rebuild();
     std::unique_ptr<Node> scanDirectory(const QString &dirPath, Node *parent) const;
     Node *nodeFromIndex(const QModelIndex &index) const;
+
+    // Backing for LabelRole/TagsRole/TranscriptBodyRole: read fresh from the
+    // sidecar .md on every call rather than cached on Node/at rebuild() time,
+    // since these are only needed on-demand (search sort/highlight, Item 9)
+    // and staying lazy avoids re-parsing every .md file on every directory
+    // change the QFileSystemWatcher reports.
+    static QString sidecarMdPath(const Node *node);
+    static QString frontmatterField(const QString &mdPath, const QString &key);
+    static QString transcriptBody(const QString &mdPath);
 
     QUrl m_vaultPath;
     std::unique_ptr<Node> m_root;

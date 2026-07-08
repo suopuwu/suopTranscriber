@@ -2,10 +2,13 @@
 
 #include <QDateTime>
 #include <QDebug>
+#include <QDir>
+#include <QDirIterator>
 #include <QFile>
 #include <QFileInfo>
 #include <QMetaObject>
 #include <QRegularExpression>
+#include <QSet>
 #include <QStringList>
 #include <QTextStream>
 
@@ -21,8 +24,12 @@
 
 namespace {
 
-// HH:MM:SS.mmm, human-readable and greppable — no separate sidecar needed to
-// recover per-segment timing later (e.g. for sentence-highlight sync).
+// Compact H:MM:SS.fff — leading zero-valued units (hours, then minutes) are
+// dropped entirely rather than shown as "0:"/"00:", and the fractional
+// part's trailing zeros are trimmed (dropped entirely for a whole-second
+// value) — e.g. 7.25 -> "7.25", 67.0 -> "1:07", 3725.25 -> "1:02:05.25".
+// No precision is lost (this only removes redundant characters, unlike the
+// GUTTER display's separate 1-decimal rounding in MainPanel.qml).
 QString formatTimestamp(double seconds)
 {
     const qint64 totalMs = static_cast<qint64>(seconds * 1000.0 + 0.5);
@@ -30,11 +37,22 @@ QString formatTimestamp(double seconds)
     const qint64 m = (totalMs / 60000) % 60;
     const qint64 s = (totalMs / 1000) % 60;
     const qint64 ms = totalMs % 1000;
-    return QStringLiteral("%1:%2:%3.%4")
-        .arg(h, 2, 10, QChar('0'))
-        .arg(m, 2, 10, QChar('0'))
-        .arg(s, 2, 10, QChar('0'))
-        .arg(ms, 3, 10, QChar('0'));
+
+    QString msPart;
+    if (ms > 0) {
+        msPart = QStringLiteral(".") + QString::number(ms).rightJustified(3, QChar('0'));
+        while (msPart.endsWith(QChar('0')))
+            msPart.chop(1);
+    }
+
+    if (h > 0) {
+        return QStringLiteral("%1:%2:%3%4")
+            .arg(h).arg(m, 2, 10, QChar('0')).arg(s, 2, 10, QChar('0')).arg(msPart);
+    }
+    if (m > 0) {
+        return QStringLiteral("%1:%2%3").arg(m).arg(s, 2, 10, QChar('0')).arg(msPart);
+    }
+    return QStringLiteral("%1%2").arg(s).arg(msPart);
 }
 
 QString sidecarPath(const QString &audioFilePath)
@@ -43,23 +61,45 @@ QString sidecarPath(const QString &audioFilePath)
     return fi.absolutePath() + "/" + fi.completeBaseName() + ".md";
 }
 
-// Inverse of formatTimestamp(): "HH:MM:SS.mmm" -> seconds.
-double parseTimestamp(const QString &hh, const QString &mm, const QString &ss, const QString &mmm)
+// Inverse of formatTimestamp(): splits on ':' rather than matching fixed
+// digit widths, since the compact format's unit count/width varies
+// ("7.25", "1:07", "1:02:05.25" are 1/2/3 colon-separated parts
+// respectively) — much simpler than a digit-counting regex per shape.
+double parseCompactTimestamp(const QString &raw)
 {
-    return hh.toDouble() * 3600.0 + mm.toDouble() * 60.0 + ss.toDouble() + mmm.toDouble() / 1000.0;
+    const QStringList parts = raw.split(QLatin1Char(':'));
+    if (parts.size() >= 3)
+        return parts[0].toDouble() * 3600.0 + parts[1].toDouble() * 60.0 + parts[2].toDouble();
+    if (parts.size() == 2)
+        return parts[0].toDouble() * 60.0 + parts[1].toDouble();
+    return parts[0].toDouble();
 }
 
-// Matches appendSegmentLine()'s exact output:
-// "[HH:MM:SS.mmm - HH:MM:SS.mmm] text" with an optional trailing " [SPEAKER_TURN]".
-// MultilineOption lets ^/$ match at each line boundary so globalMatch() can
-// walk every segment line in one pass over the whole (multi-line) body,
-// giving capturedStart(9)/capturedLength(9) as exact offsets into that same
-// body string — what QML needs to span-highlight the right substring.
+// Matches appendSegmentLine()'s exact output: "[H:MM:SS.fff] [Speaker N]
+// text" (compact timestamp — see formatTimestamp) with an optional trailing
+// " [SPEAKER_TURN]". MultilineOption lets ^/$ match at each line boundary so
+// globalMatch() can walk every segment line in one pass over the whole
+// (multi-line) body, giving capturedStart(3)/capturedLength(3) as exact
+// offsets into that same body string — what QML needs to span-highlight the
+// right substring.
+//
+// Group map: 1 the whole timestamp expression (parsed via
+// parseCompactTimestamp, not fixed-width digit groups — the compact format's
+// shape varies), 2 speaker number (Item 11, Wave E — optional, only present
+// when speaker detection ran), 3 text, 4 legacy trailing " [SPEAKER_TURN]"
+// marker (older files only). No effort to parse the OLDEST fixed-width
+// "HH:MM:SS.mmm" format precisely by shape — the flexible `[\d:.]+` capture
+// happens to still parse it correctly (splits into the same 3 colon-parts),
+// so old single-timestamp files keep working for free. An optional, ignored
+// "- <timestamp>" end-range suffix is tolerated too, for the oldest
+// range-format files — full backward compatibility isn't a goal, but there's
+// no reason to gratuitously break already-transcribed files when tolerating
+// them costs almost nothing here.
 const QRegularExpression &segmentLinePattern()
 {
     static const QRegularExpression pattern(
-        QStringLiteral("^\\[(\\d{2}):(\\d{2}):(\\d{2})\\.(\\d{3}) - (\\d{2}):(\\d{2}):(\\d{2})\\.(\\d{3})\\] "
-                        "(.*?)( \\[SPEAKER_TURN\\])?$"),
+        QStringLiteral("^\\[([\\d:.]+)(?: - [\\d:.]+)?\\]"
+                        "(?: \\[Speaker (\\d+)\\])? (.*?)( \\[SPEAKER_TURN\\])?$"),
         QRegularExpression::MultilineOption);
     return pattern;
 }
@@ -110,16 +150,31 @@ void writeFrontmatter(QFile &mdFile, const QString &modelUsed, bool speakerDetec
 // Appended + flushed as each segment is produced (see DESIGN.md's
 // per-segment streaming callback + Task 3's durability goal), rather than
 // buffering the whole transcript and writing it once at the end.
-void appendSegmentLine(QFile &mdFile, const Segment &segment)
+//
+// speakerIndex (Item 11, Wave E): 0 = speaker detection wasn't on for this
+// job (no leading tag written, matching the old/legacy format exactly).
+// >=1 = the CALLER's alternating-speaker counter (see run()'s onSegment
+// lambda) — tinydiarize only detects TURN BOUNDARIES, not identity, so this
+// is a heuristic (naive alternation between 2 speakers), not real
+// diarization; documented as a known limitation, not fixable without a real
+// diarization model. The trailing " [SPEAKER_TURN]" marker is NOT written
+// for new files anymore (the leading tag already conveys the same
+// information, per-segment rather than only at the change point).
+//
+// Only the START timestamp is written (not "[t0 - t1]") — t1 was always
+// identical to the NEXT segment's t0 (whisper.cpp emits contiguous
+// segments), so storing it was pure redundancy, and nothing reads it back
+// (activeSentenceIndex() only ever compares against t0).
+void appendSegmentLine(QFile &mdFile, const Segment &segment, int speakerIndex)
 {
     const QString text = QString::fromStdString(segment.text).trimmed();
     if (text.isEmpty())
         return;
     QTextStream out(&mdFile);
-    out << '[' << formatTimestamp(segment.t0) << " - " << formatTimestamp(segment.t1) << "] " << text;
-    if (segment.speakerTurnNext)
-        out << " [SPEAKER_TURN]";
-    out << '\n';
+    out << '[' << formatTimestamp(segment.t0) << ']';
+    if (speakerIndex > 0)
+        out << " [Speaker " << speakerIndex << ']';
+    out << ' ' << text << '\n';
     out.flush();
     mdFile.flush();
 }
@@ -205,11 +260,46 @@ QString plainTextFromTranscriptBody(const QString &body)
     QRegularExpressionMatchIterator it = segmentLinePattern().globalMatch(body);
     while (it.hasNext()) {
         const QRegularExpressionMatch m = it.next();
-        const QString text = m.captured(9).trimmed();
+        const QString text = m.captured(3).trimmed();
         if (!text.isEmpty())
             pieces.append(text);
     }
     return pieces.join(QLatin1Char(' '));
+}
+
+// Item 14 "auto-categorize" mode: the existing tag vocabulary for a vault,
+// scanned fresh per labeling job (vaults are small; no cache invalidation
+// to get wrong). Reads every .md's `tags:` frontmatter line directly rather
+// than going through readMetadata()'s full parse, since that's all that's
+// needed here. Returns a de-duplicated, sorted list of individual tags.
+QStringList collectVaultTags(const QString &vaultLocalPath)
+{
+    QSet<QString> tags;
+    QDirIterator it(vaultLocalPath, {QStringLiteral("*.md")}, QDir::Files,
+                     QDirIterator::Subdirectories);
+    while (it.hasNext()) {
+        QFile mdFile(it.next());
+        if (!mdFile.open(QIODevice::ReadOnly | QIODevice::Text))
+            continue;
+        QTextStream in(&mdFile);
+        if (in.readLine() != QStringLiteral("---"))
+            continue;
+        QString line;
+        while (!(line = in.readLine()).isNull() && line != QStringLiteral("---")) {
+            const int colon = line.indexOf(':');
+            if (colon < 0 || line.left(colon).trimmed() != QStringLiteral("tags"))
+                continue;
+            const QString value = line.mid(colon + 1).trimmed();
+            for (const QString &tag : value.split(QLatin1Char(','), Qt::SkipEmptyParts)) {
+                const QString trimmed = tag.trimmed();
+                if (!trimmed.isEmpty())
+                    tags.insert(trimmed);
+            }
+        }
+    }
+    QStringList sorted = tags.values();
+    sorted.sort(Qt::CaseInsensitive);
+    return sorted;
 }
 
 }
@@ -225,7 +315,7 @@ public:
 
 public slots:
     void run(const QString &filePath, const QString &vaultPath, const QString &modelId, bool speakerDetection,
-             bool autoLabel)
+             bool autoLabel, bool restrictTagsToExisting, double tagReuseBias)
     {
         QString error;
         bool modelFallback = false;
@@ -270,11 +360,22 @@ public slots:
         // the auto-label pass below — cleaner prompt input than re-reading
         // and re-parsing the formatted .md lines back out.
         QString transcriptText;
-        SegmentCallback onSegment = [&mdFile, &transcriptText](const Segment &segment) {
+        // Item 11 (Wave E): naive alternating speaker heuristic — tinydiarize
+        // only detects TURN BOUNDARIES (segment.speakerTurnNext), not real
+        // speaker identity, so this alternates 1/2 on every detected turn.
+        // Correct for strict 2-party back-and-forth dialogs; degrades for 3+
+        // speakers or a speaker returning after a 3rd party spoke (tdrz
+        // cannot tell those apart from whisper.cpp's output alone — see
+        // LabelingEngine-adjacent research notes in .task/findings.md).
+        int currentSpeaker = 1;
+        SegmentCallback onSegment = [&mdFile, &transcriptText, &currentSpeaker, speakerDetection](
+                                         const Segment &segment) {
             // Chunk offset merge is the app's job (see WhisperCppEngine.cpp);
             // with offsetSeconds always 0 this milestone it's a no-op, kept
             // explicit here as the seam for when chunking lands.
-            appendSegmentLine(mdFile, segment);
+            appendSegmentLine(mdFile, segment, speakerDetection ? currentSpeaker : 0);
+            if (speakerDetection && segment.speakerTurnNext)
+                currentSpeaker = (currentSpeaker == 1) ? 2 : 1;
             const QString text = QString::fromStdString(segment.text).trimmed();
             if (!text.isEmpty()) {
                 if (!transcriptText.isEmpty())
@@ -290,7 +391,7 @@ public slots:
         // failure here never fails the job — the primary transcript above is
         // already the thing that matters, this is a bonus pass.
         if (autoLabel)
-            runLabelingPass(vaultPath, transcriptText, mdFile.fileName());
+            runLabelingPass(vaultPath, transcriptText, mdFile.fileName(), restrictTagsToExisting, tagReuseBias);
 
         emit finished(true, {});
     }
@@ -299,7 +400,8 @@ public slots:
     // already-transcribed file — no audio decode, no whisper, no frontmatter
     // reset. Unlike the autoLabel branch above, a failure here IS the job's
     // result (there's nothing else for this job to accomplish).
-    void relabelJob(const QString &filePath, const QString &vaultPath)
+    void relabelJob(const QString &filePath, const QString &vaultPath, bool restrictTagsToExisting,
+                     double tagReuseBias)
     {
         const QString mdPath = sidecarPath(filePath);
         if (!QFileInfo::exists(mdPath)) {
@@ -330,7 +432,7 @@ public slots:
         }
 
         QString error;
-        if (!runLabelingPass(vaultPath, transcriptText, mdPath, &error)) {
+        if (!runLabelingPass(vaultPath, transcriptText, mdPath, restrictTagsToExisting, tagReuseBias, &error)) {
             emit finished(false, error);
             return;
         }
@@ -347,7 +449,7 @@ private:
     // frontmatter. Returns false + *errorOut on failure; callers decide
     // whether that's fatal (relabelJob) or just logged (run()'s bonus pass).
     bool runLabelingPass(const QString &vaultPath, const QString &transcriptText, const QString &mdPath,
-                         QString *errorOut = nullptr)
+                         bool restrictTagsToExisting, double tagReuseBias, QString *errorOut = nullptr)
     {
         QString labelError;
         const QString labelModelPath = ModelManager::ensureLabelModel(QUrl::fromLocalFile(vaultPath), &labelError);
@@ -371,8 +473,15 @@ private:
                 qWarning() << msg;
             return false;
         }
+        // Item 15 (Wave E): existingTags is now ALWAYS collected (cheap —
+        // vaults are small), not just when restrictTagsToExisting is set —
+        // tagReuseBias needs a vocabulary to bias toward even in
+        // unrestricted mode, whereas before this scan only ran for the hard-
+        // restrict case.
+        const QStringList existingTags = collectVaultTags(vaultPath);
         QString genError;
-        const auto result = m_labelingEngine->label(transcriptText, &genError);
+        const auto result =
+            m_labelingEngine->label(transcriptText, existingTags, restrictTagsToExisting, tagReuseBias, &genError);
         if (!result) {
             const QString msg = QStringLiteral("auto-label generation failed: %1").arg(genError);
             if (errorOut)
@@ -420,8 +529,43 @@ bool TranscriptionController::isQueued(const QUrl &fileUrl) const
     return false;
 }
 
+bool TranscriptionController::matchesExistingTranscription(const QUrl &fileUrl, const QString &modelId,
+                                                            bool speakerDetection) const
+{
+    const QVariantMap meta = readMetadata(fileUrl);
+    if (meta.isEmpty())
+        return false; // not transcribed yet — nothing to match
+
+    if (meta.value(QStringLiteral("speakerDetection")).toBool() != speakerDetection)
+        return false;
+
+    // Same model-resolution logic as ModelManager::ensureModel(), minus the
+    // disk/network side effects — speakerDetection forces the tdrz model
+    // regardless of modelId; otherwise look up modelId's file name, falling
+    // back to the default model's for an unrecognized id (mirroring
+    // ensureModel's own fallback so this comparison never falsely reports
+    // "differs" for the same fallback substitution that actually ran).
+    QString expectedFileName;
+    if (speakerDetection) {
+        expectedFileName = QString::fromUtf8(ModelManager::kTdrzModelName);
+    } else {
+        QString requestedFileName;
+        QString defaultFileName;
+        for (const ModelManager::ModelInfo &info : ModelManager::availableModels()) {
+            if (info.id == modelId)
+                requestedFileName = info.fileName;
+            if (info.id == QString::fromUtf8(ModelManager::kDefaultModelId))
+                defaultFileName = info.fileName;
+        }
+        expectedFileName = requestedFileName.isEmpty() ? defaultFileName : requestedFileName;
+    }
+
+    return meta.value(QStringLiteral("model")).toString() == expectedFileName;
+}
+
 void TranscriptionController::transcribe(const QUrl &fileUrl, const QUrl &vaultUrl, const QString &modelId,
-                                          bool speakerDetection, bool autoLabel)
+                                          bool speakerDetection, bool autoLabel, bool restrictTagsToExisting,
+                                          double tagReuseBias)
 {
     // Done/Failed entries for the same fileUrl deliberately do NOT block
     // re-queueing (see class doc) — only Queued/Active does.
@@ -434,6 +578,8 @@ void TranscriptionController::transcribe(const QUrl &fileUrl, const QUrl &vaultU
     job.modelId = modelId;
     job.speakerDetection = speakerDetection;
     job.autoLabel = autoLabel;
+    job.restrictTagsToExisting = restrictTagsToExisting;
+    job.tagReuseBias = tagReuseBias;
     job.status = JobStatus::Queued;
     m_jobs.push_back(job);
     emit queueChanged();
@@ -443,13 +589,15 @@ void TranscriptionController::transcribe(const QUrl &fileUrl, const QUrl &vaultU
 }
 
 void TranscriptionController::transcribeAll(const QVariantList &fileUrls, const QUrl &vaultUrl,
-                                             const QString &modelId, bool speakerDetection, bool autoLabel)
+                                             const QString &modelId, bool speakerDetection, bool autoLabel,
+                                             bool restrictTagsToExisting, double tagReuseBias)
 {
     for (const QVariant &v : fileUrls)
-        transcribe(v.toUrl(), vaultUrl, modelId, speakerDetection, autoLabel);
+        transcribe(v.toUrl(), vaultUrl, modelId, speakerDetection, autoLabel, restrictTagsToExisting, tagReuseBias);
 }
 
-void TranscriptionController::relabel(const QUrl &fileUrl, const QUrl &vaultUrl)
+void TranscriptionController::relabel(const QUrl &fileUrl, const QUrl &vaultUrl, bool restrictTagsToExisting,
+                                       double tagReuseBias)
 {
     // Same dedup rule as transcribe(): a Queued/Active entry (whether a full
     // transcribe or a relabel-only job) blocks a duplicate request.
@@ -460,12 +608,21 @@ void TranscriptionController::relabel(const QUrl &fileUrl, const QUrl &vaultUrl)
     job.fileUrl = fileUrl;
     job.vaultUrl = vaultUrl;
     job.relabelOnly = true;
+    job.restrictTagsToExisting = restrictTagsToExisting;
+    job.tagReuseBias = tagReuseBias;
     job.status = JobStatus::Queued;
     m_jobs.push_back(job);
     emit queueChanged();
 
     if (m_activeIndex < 0)
         startJob(m_jobs.size() - 1);
+}
+
+void TranscriptionController::relabelAll(const QVariantList &fileUrls, const QUrl &vaultUrl,
+                                          bool restrictTagsToExisting, double tagReuseBias)
+{
+    for (const QVariant &v : fileUrls)
+        relabel(v.toUrl(), vaultUrl, restrictTagsToExisting, tagReuseBias);
 }
 
 void TranscriptionController::startJob(int index)
@@ -486,12 +643,14 @@ void TranscriptionController::startJob(int index)
     if (job.relabelOnly) {
         QMetaObject::invokeMethod(m_worker, "relabelJob", Qt::QueuedConnection,
                                    Q_ARG(QString, job.fileUrl.toLocalFile()),
-                                   Q_ARG(QString, job.vaultUrl.toLocalFile()));
+                                   Q_ARG(QString, job.vaultUrl.toLocalFile()),
+                                   Q_ARG(bool, job.restrictTagsToExisting), Q_ARG(double, job.tagReuseBias));
     } else {
         QMetaObject::invokeMethod(m_worker, "run", Qt::QueuedConnection,
                                    Q_ARG(QString, job.fileUrl.toLocalFile()),
                                    Q_ARG(QString, job.vaultUrl.toLocalFile()), Q_ARG(QString, job.modelId),
-                                   Q_ARG(bool, job.speakerDetection), Q_ARG(bool, job.autoLabel));
+                                   Q_ARG(bool, job.speakerDetection), Q_ARG(bool, job.autoLabel),
+                                   Q_ARG(bool, job.restrictTagsToExisting), Q_ARG(double, job.tagReuseBias));
     }
 }
 
@@ -670,6 +829,109 @@ bool TranscriptionController::setLabel(const QUrl &fileUrl, const QString &label
     return true;
 }
 
+bool TranscriptionController::renameSpeaker(const QUrl &fileUrl, const QString &speakerId, const QString &newName,
+                                             QString *errorOut) const
+{
+    const QFileInfo fi(fileUrl.toLocalFile());
+    const QString path = fi.absolutePath() + "/" + fi.completeBaseName() + ".md";
+
+    QFile mdFile(path);
+    if (!mdFile.exists()) {
+        if (errorOut)
+            *errorOut = QStringLiteral("%1 has not been transcribed yet").arg(fi.fileName());
+        return false;
+    }
+    if (!mdFile.open(QIODevice::ReadOnly | QIODevice::Text)) {
+        if (errorOut)
+            *errorOut = QStringLiteral("could not open %1 for reading").arg(path);
+        return false;
+    }
+
+    QTextStream in(&mdFile);
+    if (in.readLine() != QStringLiteral("---")) {
+        mdFile.close();
+        if (errorOut)
+            *errorOut = QStringLiteral("%1 has no frontmatter block").arg(mdFile.fileName());
+        return false;
+    }
+
+    // Same splice-or-append shape as setLabel(), but the value being spliced
+    // is one "id=name" pair inside the flat speakerNames key rather than the
+    // whole key's value — every OTHER speaker's existing mapping must
+    // survive untouched.
+    QStringList frontmatterLines;
+    QString line;
+    bool closed = false;
+    while (!(line = in.readLine()).isNull()) {
+        if (line == QStringLiteral("---")) {
+            closed = true;
+            break;
+        }
+        frontmatterLines.append(line);
+    }
+    if (!closed) {
+        mdFile.close();
+        if (errorOut)
+            *errorOut = QStringLiteral("%1 has a malformed frontmatter block").arg(mdFile.fileName());
+        return false;
+    }
+    const QString body = in.readAll();
+    mdFile.close();
+
+    int speakerNamesLine = -1;
+    QStringList pairs;
+    for (int i = 0; i < frontmatterLines.size(); ++i) {
+        const int colon = frontmatterLines[i].indexOf(':');
+        if (colon >= 0 && frontmatterLines[i].left(colon).trimmed() == QStringLiteral("speakerNames")) {
+            speakerNamesLine = i;
+            pairs = frontmatterLines[i].mid(colon + 1).split(QLatin1Char(','), Qt::SkipEmptyParts);
+            break;
+        }
+    }
+
+    // Sanitize: this is a flat "id=name, id=name" line — a newline, comma,
+    // or "=" inside newName would corrupt the format on read-back.
+    QString sanitizedName = newName;
+    sanitizedName.replace(QLatin1Char('\n'), QLatin1Char(' '));
+    sanitizedName.replace(QLatin1Char(','), QLatin1Char(' '));
+    sanitizedName.replace(QLatin1Char('='), QLatin1Char(' '));
+    sanitizedName = sanitizedName.trimmed();
+
+    bool updated = false;
+    for (QString &pair : pairs) {
+        const int eq = pair.indexOf(QLatin1Char('='));
+        if (eq >= 0 && pair.left(eq).trimmed() == speakerId) {
+            pair = QStringLiteral(" %1=%2").arg(speakerId, sanitizedName);
+            updated = true;
+            break;
+        }
+    }
+    if (!updated)
+        pairs.append(QStringLiteral(" %1=%2").arg(speakerId, sanitizedName));
+
+    const QString newSpeakerNamesLine = QStringLiteral("speakerNames:") + pairs.join(QLatin1Char(','));
+    if (speakerNamesLine >= 0)
+        frontmatterLines[speakerNamesLine] = newSpeakerNamesLine;
+    else
+        frontmatterLines.append(newSpeakerNamesLine);
+
+    if (!mdFile.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
+        if (errorOut)
+            *errorOut = QStringLiteral("could not open %1 for writing").arg(mdFile.fileName());
+        return false;
+    }
+    QTextStream out(&mdFile);
+    out << "---\n";
+    for (const QString &fmLine : frontmatterLines)
+        out << fmLine << '\n';
+    out << "---\n";
+    out << body;
+    out.flush();
+    mdFile.flush();
+    mdFile.close();
+    return true;
+}
+
 QString TranscriptionController::readTranscriptBody(const QUrl &fileUrl) const
 {
     const QFileInfo fi(fileUrl.toLocalFile());
@@ -693,18 +955,23 @@ QVariantList TranscriptionController::parseSentences(const QUrl &fileUrl) const
     QVariantList sentences;
     const QString body = readTranscriptBody(fileUrl);
     // globalMatch over the whole (multi-line) body, not a per-line split, so
-    // capturedStart(9)/capturedLength(9) are exact offsets into this SAME
+    // capturedStart(3)/capturedLength(3) are exact offsets into this SAME
     // body string — what MainPanel.qml needs to span-highlight the active
-    // sentence's substring without re-deriving offsets itself.
+    // sentence's substring without re-deriving offsets itself. No "t1": it's
+    // no longer stored (see appendSegmentLine's doc comment — it was always
+    // identical to the next segment's t0) and nothing ever consumed it here.
     QRegularExpressionMatchIterator it = segmentLinePattern().globalMatch(body);
     while (it.hasNext()) {
         const QRegularExpressionMatch m = it.next();
         QVariantMap sentence;
-        sentence["t0"] = parseTimestamp(m.captured(1), m.captured(2), m.captured(3), m.captured(4));
-        sentence["t1"] = parseTimestamp(m.captured(5), m.captured(6), m.captured(7), m.captured(8));
-        sentence["text"] = m.captured(9);
-        sentence["start"] = m.capturedStart(9);
-        sentence["length"] = m.capturedLength(9);
+        sentence["t0"] = parseCompactTimestamp(m.captured(1));
+        // Item 11 (Wave E): 0 when speaker detection wasn't on for this file
+        // (group 2 didn't participate in the match) — QRegularExpression's
+        // captured() returns an empty string in that case, not a crash.
+        sentence["speaker"] = m.captured(2).isEmpty() ? 0 : m.captured(2).toInt();
+        sentence["text"] = m.captured(3);
+        sentence["start"] = m.capturedStart(3);
+        sentence["length"] = m.capturedLength(3);
         sentences.append(sentence);
     }
     return sentences;
@@ -723,6 +990,11 @@ int TranscriptionController::activeSentenceIndex(const QVariantList &sentences, 
         [](double pos, const QVariant &sentence) { return pos < sentence.toMap().value("t0").toDouble(); });
     const int index = int(std::distance(sentences.begin(), it)) - 1;
     return index;
+}
+
+QStringList TranscriptionController::existingVaultTags(const QUrl &vaultUrl) const
+{
+    return collectVaultTags(vaultUrl.toLocalFile());
 }
 
 int TranscriptionController::tasksTotal() const

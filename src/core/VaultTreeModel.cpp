@@ -3,7 +3,11 @@
 #include <QDir>
 #include <QFile>
 #include <QFileInfo>
+#include <QJsonDocument>
+#include <QJsonObject>
+#include <QProcess>
 #include <QSet>
+#include <QTextStream>
 
 namespace {
 
@@ -168,6 +172,58 @@ std::unique_ptr<VaultTreeModel::Node> VaultTreeModel::scanDirectory(const QStrin
     return node;
 }
 
+QString VaultTreeModel::sidecarMdPath(const Node *node)
+{
+    if (node->isOrphanedMd)
+        return node->path;
+    if (node->isAudio) {
+        const QFileInfo info(node->path);
+        return info.absolutePath() + '/' + info.completeBaseName() + ".md";
+    }
+    return {};
+}
+
+// Mirrors TranscriptionController::readMetadata()'s frontmatter scan, but
+// reads a single key rather than the whole map, since LabelRole/TagsRole
+// only ever need one field each.
+QString VaultTreeModel::frontmatterField(const QString &mdPath, const QString &key)
+{
+    QFile mdFile(mdPath);
+    if (!mdFile.open(QIODevice::ReadOnly | QIODevice::Text))
+        return {};
+
+    QTextStream in(&mdFile);
+    if (in.readLine() != QStringLiteral("---"))
+        return {};
+
+    QString line;
+    while (!(line = in.readLine()).isNull() && line != QStringLiteral("---")) {
+        const int colon = line.indexOf(':');
+        if (colon < 0 || line.left(colon).trimmed() != key)
+            continue;
+        return line.mid(colon + 1).trimmed();
+    }
+    return {};
+}
+
+// Mirrors TranscriptionController::readTranscriptBody().
+QString VaultTreeModel::transcriptBody(const QString &mdPath)
+{
+    QFile mdFile(mdPath);
+    if (!mdFile.open(QIODevice::ReadOnly | QIODevice::Text))
+        return {};
+
+    QTextStream in(&mdFile);
+    if (in.readLine() != QStringLiteral("---"))
+        return {};
+
+    QString line;
+    while (!(line = in.readLine()).isNull() && line != QStringLiteral("---")) {
+        // skip frontmatter lines
+    }
+    return in.readAll();
+}
+
 VaultTreeModel::Node *VaultTreeModel::nodeFromIndex(const QModelIndex &index) const
 {
     if (!index.isValid())
@@ -242,6 +298,20 @@ QVariant VaultTreeModel::data(const QModelIndex &index, int role) const
         return static_cast<int>(node->status);
     case IsOrphanedMdRole:
         return node->isOrphanedMd;
+    case LabelRole: {
+        const QString mdPath = sidecarMdPath(node);
+        return mdPath.isEmpty() ? QString() : frontmatterField(mdPath, QStringLiteral("label"));
+    }
+    case TagsRole: {
+        const QString mdPath = sidecarMdPath(node);
+        return mdPath.isEmpty() ? QString() : frontmatterField(mdPath, QStringLiteral("tags"));
+    }
+    case TranscriptBodyRole: {
+        if (node->status != TranscribedStatus)
+            return QString();
+        const QString mdPath = sidecarMdPath(node);
+        return mdPath.isEmpty() ? QString() : transcriptBody(mdPath);
+    }
     default:
         return {};
     }
@@ -256,6 +326,9 @@ QHash<int, QByteArray> VaultTreeModel::roleNames() const
         {IsAudioRole, "isAudio"},
         {StatusRole, "status"},
         {IsOrphanedMdRole, "isOrphanedMd"},
+        {LabelRole, "label"},
+        {TagsRole, "tags"},
+        {TranscriptBodyRole, "transcriptBody"},
     };
 }
 
@@ -331,4 +404,55 @@ bool VaultTreeModel::renameFile(const QUrl &fileUrl, const QString &newBaseName,
 
     rebuild();
     return true;
+}
+
+QVariantMap VaultTreeModel::readVaultSettings() const
+{
+    QVariantMap result;
+    const QString localPath = vaultLocalPath();
+    if (localPath.isEmpty())
+        return result;
+
+    QFile file(localPath + QStringLiteral("/.suopTranscriber"));
+    if (!file.open(QIODevice::ReadOnly))
+        return result;
+
+    const QJsonDocument doc = QJsonDocument::fromJson(file.readAll());
+    if (!doc.isObject())
+        return result;
+    return doc.object().toVariantMap();
+}
+
+bool VaultTreeModel::writeVaultSettings(const QVariantMap &settings, QString *errorOut) const
+{
+    const QString localPath = vaultLocalPath();
+    if (localPath.isEmpty()) {
+        if (errorOut)
+            *errorOut = QStringLiteral("no vault open");
+        return false;
+    }
+
+    QFile file(localPath + QStringLiteral("/.suopTranscriber"));
+    if (!file.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
+        if (errorOut)
+            *errorOut = QStringLiteral("could not open %1 for writing").arg(file.fileName());
+        return false;
+    }
+
+    const QJsonDocument doc(QJsonObject::fromVariantMap(settings));
+    file.write(doc.toJson(QJsonDocument::Indented));
+    return true;
+}
+
+void VaultTreeModel::revealInFileManager(const QUrl &fileUrl) const
+{
+    // org.freedesktop.FileManager1.ShowItems(as URIs, s StartupID) — the
+    // standard cross-desktop "select this file in the file manager" call.
+    // Detached: this is a fire-and-forget UI action, not something the app
+    // needs to track the lifetime of or report failure for.
+    QProcess::startDetached(QStringLiteral("dbus-send"),
+                             {QStringLiteral("--session"), QStringLiteral("--dest=org.freedesktop.FileManager1"),
+                              QStringLiteral("--type=method_call"), QStringLiteral("/org/freedesktop/FileManager1"),
+                              QStringLiteral("org.freedesktop.FileManager1.ShowItems"),
+                              QStringLiteral("array:string:%1").arg(fileUrl.toString()), QStringLiteral("string:")});
 }

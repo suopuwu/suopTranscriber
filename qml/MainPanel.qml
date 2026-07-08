@@ -14,6 +14,9 @@ Rectangle {
     property var storedMetadata: ({})
     readonly property bool hasStoredMetadata: Object.keys(mainPanel.storedMetadata).length > 0
     signal openVaultRequested()
+    // Item 16 (Wave E): a tag pill was clicked — Main.qml routes this to
+    // sidebar.applyTagFilter(tag).
+    signal tagActivated(string tag)
 
     // Text-only view for an orphaned .md (no matching audio) — mutually
     // exclusive with player.source; showAudioFile()/showOrphanedMd() below
@@ -26,6 +29,14 @@ Rectangle {
     property string searchQuery: ""
     property bool searchExpanded: false
     property int searchMatchIndex: -1
+    // Item 13: total match count + this match's 1-based ordinal, for the
+    // "a/b" display next to the search field. Item 7: raw start/length of
+    // the CURRENT match (in the same position space as parseSentences'
+    // start/length), feeding searchMatchRect below.
+    property int searchMatchCount: 0
+    property int searchMatchOrdinal: 0
+    property int searchMatchStart: -1
+    property int searchMatchLength: 0
 
     function relativeToVault(fileUrl) {
         const filePath = fileUrl.toString()
@@ -71,17 +82,92 @@ Rectangle {
         return -1
     }
 
+    // Item 13: tags are comma-separated (see TranscriptionController's
+    // frontmatter format — not a YAML list), so split+trim+drop-empties here.
+    function currentTags() {
+        const metadata = mainPanel.orphanedMdPath !== "" ? mainPanel.orphanedMdMetadata : mainPanel.storedMetadata
+        const raw = metadata && metadata.tags ? String(metadata.tags) : ""
+        if (raw === "")
+            return []
+        return raw.split(",").map(t => t.trim()).filter(t => t.length > 0)
+    }
+
+    // Item 11 (Wave E): speakerNames is a flat "id=name, id=name" frontmatter
+    // string (same no-nesting convention as tags) — id is always the STABLE
+    // "Speaker N" form (see TranscriptionController::parseSentences' "speaker"
+    // field), name is the user-chosen display name.
+    function currentSpeakerNames() {
+        const metadata = mainPanel.orphanedMdPath !== "" ? mainPanel.orphanedMdMetadata : mainPanel.storedMetadata
+        const raw = metadata && metadata.speakerNames ? String(metadata.speakerNames) : ""
+        const map = ({})
+        if (raw === "")
+            return map
+        for (const pair of raw.split(",")) {
+            const eq = pair.indexOf("=")
+            if (eq <= 0)
+                continue
+            const id = pair.substring(0, eq).trim()
+            const name = pair.substring(eq + 1).trim()
+            if (id !== "" && name !== "")
+                map[id] = name
+        }
+        return map
+    }
+
+    function displaySpeakerName(id) {
+        const map = mainPanel.currentSpeakerNames()
+        return (id in map) ? map[id] : id
+    }
+
+    // Distinct "Speaker N" ids actually present in THIS transcript, in
+    // first-appearance order — not every id that's ever appeared in the
+    // vault, and not shown at all for a transcript with no speaker
+    // detection data (sentences[i].speaker is 0 in that case).
+    readonly property var distinctSpeakerIds: {
+        const ids = []
+        const seen = ({})
+        for (const s of mainPanel.sentences) {
+            if (s.speaker && s.speaker > 0) {
+                const id = "Speaker " + s.speaker
+                if (!seen[id]) {
+                    seen[id] = true
+                    ids.push(id)
+                }
+            }
+        }
+        return ids
+    }
+
+    // Which speaker pill (if any) is currently showing its rename TextField
+    // — mirrors renamingTitle's click-to-rename pattern, just keyed by id
+    // since there can be several pills.
+    property string renamingSpeakerId: ""
+
+    function commitSpeakerRename(speakerId, newValue) {
+        const trimmed = newValue.trim()
+        mainPanel.renamingSpeakerId = ""
+        if (trimmed === "" || !mainPanel.transcriptionController)
+            return
+        const targetUrl = mainPanel.orphanedMdPath !== "" ? ("file://" + mainPanel.orphanedMdPath)
+                                                           : mainPanel.player.source
+        mainPanel.transcriptionController.renameSpeaker(targetUrl, speakerId, trimmed)
+        if (mainPanel.orphanedMdPath !== "")
+            mainPanel.refreshOrphanedMetadata()
+        else
+            mainPanel.refreshMetadata()
+    }
+
     function displayTitle() {
         if (mainPanel.orphanedMdPath !== "") {
             const label = mainPanel.orphanedMdMetadata.label
-            if (AppSettings.useLabels && label)
+            if (AppSettings.useLabelsMainPanel && label)
                 return label
             const base = mainPanel.orphanedMdPath.substring(mainPanel.orphanedMdPath.lastIndexOf("/") + 1)
             return AppSettings.hideExtensionsMainPanel ? mainPanel.stripExtension(base) : base
         }
         if (!mainPanel.player || mainPanel.player.source.toString() === "")
             return qsTr("No file selected")
-        if (AppSettings.useLabels && mainPanel.storedMetadata.label)
+        if (AppSettings.useLabelsMainPanel && mainPanel.storedMetadata.label)
             return mainPanel.storedMetadata.label
         const rel = mainPanel.relativeToVault(mainPanel.player.source)
         return AppSettings.hideExtensionsMainPanel ? mainPanel.stripExtension(rel) : rel
@@ -94,7 +180,7 @@ Rectangle {
             return
 
         if (mainPanel.orphanedMdPath !== "") {
-            if (AppSettings.useLabels) {
+            if (AppSettings.useLabelsMainPanel) {
                 mainPanel.transcriptionController.setLabel("file://" + mainPanel.orphanedMdPath, trimmed)
                 mainPanel.refreshOrphanedMetadata()
             } else if (mainPanel.vaultTreeModel
@@ -107,7 +193,7 @@ Rectangle {
         }
 
         if (mainPanel.player && mainPanel.player.source.toString() !== "") {
-            if (AppSettings.useLabels) {
+            if (AppSettings.useLabelsMainPanel) {
                 mainPanel.transcriptionController.setLabel(mainPanel.player.source, trimmed)
                 mainPanel.refreshMetadata()
             } else if (mainPanel.vaultTreeModel) {
@@ -146,7 +232,21 @@ Rectangle {
     // positionChanged). Orphaned-md files have no player/position, so
     // sentences parse fine but activeSentenceIndex just stays -1 — no
     // highlight, which is correct (nothing is "playing").
+    //
+    // Same live-update hook as transcriptBody above (read .progress so this
+    // re-evaluates every per-segment tick, not just at completion) — this
+    // was missing here, which is why displayText/the transcript view (both
+    // now built FROM sentences, not from transcriptBody directly) didn't
+    // show new segments live during an in-progress transcription: nothing
+    // else reliably re-triggers this binding mid-job (storedMetadata's
+    // reference changes, but hasStoredMetadata's VALUE stays true the whole
+    // time once frontmatter exists, so its own change notify doesn't fire
+    // on every tick).
     readonly property var sentences: {
+        if (mainPanel.transcriptionController && mainPanel.player
+                && mainPanel.transcriptionController.currentFile.toString() === mainPanel.player.source.toString()) {
+            void mainPanel.transcriptionController.progress
+        }
         if (!mainPanel.transcriptionController)
             return []
         if (mainPanel.orphanedMdPath !== "")
@@ -156,66 +256,268 @@ Rectangle {
         return []
     }
 
+    // User request: selection should skip over timestamps entirely — the
+    // only way to make a contiguous text selection truly SKIP characters
+    // (not just visually de-emphasize them) is to not have them in the
+    // selectable text at all. So transcriptArea's actual text content is
+    // this cleaned, timestamp-AND-speaker-free version (one sentence per
+    // line, spoken words only) — timestamps and speaker names both render
+    // separately, in their OWN gutter columns (see timestampGutterRepeater/
+    // speakerGutterRepeater below), neither of which is part of the
+    // TextArea's text and so can never be selected. start/length here are
+    // offsets into THIS string (recomputed — the raw C++ parseSentences()
+    // start/length index the RAW body, which includes the timestamp/speaker
+    // text this display intentionally omits).
+    //
+    // showGutter: one timestamp+speaker-name pair per SECTION, not per raw
+    // whisper segment — a "section" is a run of consecutive same-speaker
+    // sentences (a turn); only the first sentence of a turn shows the
+    // gutters, later ones in the same turn show neither (they're still each
+    // their own line/paragraph for accurate sentence-highlight sync, just
+    // without repeating the same timestamp+name down the column). Files
+    // with no speaker detection (speaker is always 0) have no "turns" to
+    // group by, so every sentence counts as its own section there.
+    readonly property var displayData: {
+        let text = ""
+        const list = []
+        let previousSpeaker = null
+        for (const s of mainPanel.sentences) {
+            // Skip blank/whitespace-only segments entirely — whisper can
+            // occasionally emit one (e.g. a near-silent stretch), and giving
+            // it its own empty line + gutter timestamp is exactly the "one
+            // timestamp with nothing under it" pattern that reads as a
+            // gutter glitch. A blank segment has no content to show, so it
+            // shouldn't get a line OR a timestamp.
+            if (s.text.trim() === "")
+                continue
+            const start = text.length
+            const showGutter = (s.speaker === 0) || (previousSpeaker === null) || (s.speaker !== previousSpeaker)
+            list.push({t0: s.t0, speaker: s.speaker, text: s.text, start: start, length: s.text.length,
+                       showGutter: showGutter})
+            previousSpeaker = s.speaker
+            text += s.text + "\n"
+        }
+        if (text.length > 0)
+            text = text.slice(0, -1) // drop the final trailing newline
+        return {text: text, sentences: list}
+    }
+    readonly property string displayText: mainPanel.displayData.text
+    readonly property var displaySentences: mainPanel.displayData.sentences
+
+    // Gutter column layout (Item: separate gutter areas for timestamp vs.
+    // speaker name, kept as named constants so both are easy to re-style/
+    // resize independently later).
+    readonly property real timestampGutterWidth: 44
+    readonly property real speakerGutterWidth: 70
+    readonly property real gutterSpacing: 8
+
+    // Compact gutter timestamp: 1 decimal place, only the start time (no
+    // range), and leading zero-valued units (hours, then minutes) dropped
+    // entirely rather than shown as "0:"/"00:".
+    function formatGutterTimestamp(t0) {
+        const totalTenths = Math.round(t0 * 10)
+        const wholeSeconds = Math.floor(totalTenths / 10)
+        const tenth = totalTenths % 10
+        const h = Math.floor(wholeSeconds / 3600)
+        const m = Math.floor((wholeSeconds % 3600) / 60)
+        const s = wholeSeconds % 60
+        if (h > 0)
+            return h + ":" + String(m).padStart(2, "0") + ":" + String(s).padStart(2, "0") + "." + tenth
+        if (m > 0)
+            return m + ":" + String(s).padStart(2, "0") + "." + tenth
+        return s + "." + tenth
+    }
+
     // player.position is milliseconds; segment timestamps are seconds.
     // This binding re-evaluates automatically on player.positionChanged
     // (QML property binding dependency tracking) — binary search lives in
     // C++ (activeSentenceIndex), not linear-scanned here, per DESIGN.md.
     readonly property int activeSentenceIndex: {
-        if (!mainPanel.transcriptionController || mainPanel.sentences.length === 0)
+        // Must index into displaySentences (the FILTERED list — blank
+        // segments dropped, see displayData), not the raw C++ sentences,
+        // since activeSentenceRect below looks up this same index in
+        // displaySentences — using the raw list here would misalign the
+        // index the moment any blank segment got filtered out ahead of the
+        // active one.
+        if (!mainPanel.transcriptionController || mainPanel.displaySentences.length === 0)
             return -1
         const positionSeconds = (mainPanel.player ? mainPanel.player.position : 0) / 1000.0
-        return mainPanel.transcriptionController.activeSentenceIndex(mainPanel.sentences, positionSeconds)
+        return mainPanel.transcriptionController.activeSentenceIndex(mainPanel.displaySentences, positionSeconds)
     }
 
-    function escapeHtml(text) {
-        return text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+    // Sentence highlight is a real overlay Rectangle (see
+    // sentenceHighlightOverlay below), not an HTML <span style="background">
+    // — Qt's rich-text engine silently ignores border-radius on inline
+    // elements (confirmed via a throwaway render check), so a genuinely
+    // rounded highlight needs actual QML geometry, not CSS. That also let
+    // transcriptArea go back to plain TextFormat (simpler, and the HTML
+    // escaping/div-wrapping this used to need is gone entirely).
+    //
+    // Reactive property (not a plain function) so every dependency read
+    // inside — activeSentenceIndex, sentences, and transcriptArea's own
+    // layout (width/text, via positionToRectangle) — is tracked once, and
+    // the 4 geometry bindings below each reuse the SAME computed rect
+    // instead of recomputing it redundantly.
+    // Safe positionToRectangle: same out-of-range hazard as the gutters
+    // (see transcriptArea.gutterLineRects' doc comment) — querying a
+    // position past the document's CURRENT actual length (before layout has
+    // caught up to a just-changed text) logs "position out of range" and
+    // returns a zeroed rect. Explicit dependency on transcriptArea.length
+    // forces correct re-evaluation once layout genuinely settles.
+    function safePositionToRectangle(pos) {
+        return pos <= transcriptArea.length ? transcriptArea.positionToRectangle(pos) : Qt.rect(0, 0, 0, 0)
     }
 
-    // Wraps the active sentence's substring (by its exact start/length into
-    // transcriptBody, from parseSentences) in a highlight span. Qt's
-    // cursorPosition/select() operate on the rendered plain-text position
-    // space regardless of textFormat, and HTML-escaping doesn't change that
-    // position count (entities decode back to one character each) — so this
-    // coexists with jumpToNextMatch()'s select()-based search untouched.
-    function highlightedTranscriptHtml() {
-        const body = mainPanel.transcriptBody
+    readonly property rect activeSentenceRect: {
+        void transcriptArea.length
         const idx = mainPanel.activeSentenceIndex
-        let inner
-        if (idx < 0 || idx >= mainPanel.sentences.length) {
-            inner = mainPanel.escapeHtml(body)
-        } else {
-            const active = mainPanel.sentences[idx]
-            const before = body.substring(0, active.start)
-            const highlighted = body.substring(active.start, active.start + active.length)
-            const after = body.substring(active.start + active.length)
-            inner = mainPanel.escapeHtml(before)
-                + "<span style=\"background-color: #3a5a7a;\">" + mainPanel.escapeHtml(highlighted) + "</span>"
-                + mainPanel.escapeHtml(after)
+        const list = mainPanel.displaySentences
+        if (idx < 0 || idx >= list.length)
+            return Qt.rect(0, 0, 0, 0)
+        const active = list[idx]
+        const startRect = mainPanel.safePositionToRectangle(active.start)
+        const endRect = mainPanel.safePositionToRectangle(active.start + active.length)
+        // Sentences that wrap across multiple visual lines only get an
+        // approximate box (start's row through end's row) — a precise
+        // per-line multi-rect highlight would need walking each wrapped
+        // line individually, not attempted here.
+        const y = startRect.y
+        const height = Math.max((endRect.y + endRect.height) - startRect.y, startRect.height)
+        const x = (endRect.y > startRect.y) ? transcriptArea.leftPadding : startRect.x
+        const width = (endRect.y > startRect.y) ? (transcriptArea.width - transcriptArea.leftPadding)
+                                                  : Math.max(endRect.x - startRect.x, 4)
+        return Qt.rect(x, y, width, height)
+    }
+
+    // Item 7: same shape as activeSentenceRect above, but for the current
+    // Ctrl+F search match instead of the playing sentence.
+    readonly property rect searchMatchRect: {
+        void transcriptArea.length
+        if (mainPanel.searchMatchIndex < 0 || mainPanel.searchMatchStart < 0)
+            return Qt.rect(0, 0, 0, 0)
+        const startRect = mainPanel.safePositionToRectangle(mainPanel.searchMatchStart)
+        const endRect = mainPanel.safePositionToRectangle(mainPanel.searchMatchStart + mainPanel.searchMatchLength)
+        const y = startRect.y
+        const height = Math.max((endRect.y + endRect.height) - startRect.y, startRect.height)
+        const x = (endRect.y > startRect.y) ? transcriptArea.leftPadding : startRect.x
+        const width = (endRect.y > startRect.y) ? (transcriptArea.width - transcriptArea.leftPadding)
+                                                  : Math.max(endRect.x - startRect.x, 4)
+        return Qt.rect(x, y, width, height)
+    }
+
+    // Item 12: search ignores segment-line formatting entirely — built from
+    // mainPanel.displaySentences (already timestamp-free/reactive), joining
+    // just the spoken text with single spaces so a query can start at the
+    // end of one segment and finish at the start of the next. `map` keeps
+    // each sentence's position in BOTH the clean corpus and displayText, so
+    // a match can be translated back to a raw select() range for display.
+    // searchMatchIndex now indexes into this clean corpus, not displayText.
+    function searchCorpus() {
+        let clean = ""
+        const map = []
+        for (const s of mainPanel.displaySentences) {
+            const cleanStart = clean.length
+            clean += s.text
+            map.push({cleanStart: cleanStart, cleanEnd: clean.length, rawStart: s.start, rawLength: s.length})
+            clean += " "
         }
-        // white-space:pre-wrap so the transcript's literal newlines/spacing
-        // still render as line breaks under RichText — plain HTML would
-        // otherwise collapse them, unlike the plain-text mode this replaces.
-        return "<div style=\"white-space: pre-wrap;\">" + inner + "</div>"
+        return {clean: clean, map: map}
+    }
+
+    // Item 13: total non-overlapping occurrences of q in clean — feeds the
+    // "a/b" display alongside jumpToNextMatch's own forward-scan logic.
+    function countMatches(clean, q) {
+        if (q === "")
+            return 0
+        const lower = clean.toLowerCase()
+        let count = 0
+        let pos = 0
+        while (true) {
+            const idx = lower.indexOf(q, pos)
+            if (idx === -1)
+                break
+            count++
+            pos = idx + q.length
+        }
+        return count
+    }
+
+    // 1-based ordinal of the match STARTING at matchIdx, among all matches
+    // in left-to-right order (matches countMatches' same non-overlapping scan).
+    function ordinalOfMatch(clean, q, matchIdx) {
+        const lower = clean.toLowerCase()
+        let count = 0
+        let pos = 0
+        while (true) {
+            const idx = lower.indexOf(q, pos)
+            if (idx === -1)
+                break
+            count++
+            if (idx === matchIdx)
+                break
+            pos = idx + q.length
+        }
+        return count
+    }
+
+    function resetSearchMatch() {
+        mainPanel.searchMatchIndex = -1
+        mainPanel.searchMatchCount = 0
+        mainPanel.searchMatchOrdinal = 0
+        mainPanel.searchMatchStart = -1
+        mainPanel.searchMatchLength = 0
     }
 
     function jumpToNextMatch() {
-        const body = mainPanel.transcriptBody
-        if (mainPanel.searchQuery === "" || body === "")
+        if (mainPanel.searchQuery === "")
+            return
+        const corpus = mainPanel.searchCorpus()
+        if (corpus.clean === "")
             return
         const q = mainPanel.searchQuery.toLowerCase()
-        const lower = body.toLowerCase()
+        const lower = corpus.clean.toLowerCase()
         let start = mainPanel.searchMatchIndex < 0 ? 0 : mainPanel.searchMatchIndex + 1
         let idx = lower.indexOf(q, start)
         if (idx === -1)
             idx = lower.indexOf(q, 0) // wrap around
         mainPanel.searchMatchIndex = idx
-        if (idx !== -1) {
-            // select() alone still scrolls the match into view and shows
-            // the selection — no need to steal focus from the search field,
-            // which would stop repeated Enter presses from working (each
-            // jumps to the next match without needing to re-click into it).
-            transcriptArea.select(idx, idx + q.length)
+        if (idx === -1) {
+            mainPanel.resetSearchMatch()
+            return
         }
+        mainPanel.searchMatchCount = mainPanel.countMatches(corpus.clean, q)
+        mainPanel.searchMatchOrdinal = mainPanel.ordinalOfMatch(corpus.clean, q, idx)
+
+        // Translate [idx, matchEnd) in the clean corpus back to a raw
+        // select() range (into displayText) — spanning every sentence the
+        // match touches, so a match crossing a segment boundary still
+        // highlights correctly (the intervening newline/"[Speaker N]" text
+        // between two sentences ends up included in the raw selection too —
+        // there's no single contiguous range that would exclude it).
+        const matchEnd = idx + q.length
+        let firstEntry = null
+        let lastEntry = null
+        for (const entry of corpus.map) {
+            if (entry.cleanEnd <= idx)
+                continue
+            if (entry.cleanStart >= matchEnd)
+                break
+            if (!firstEntry)
+                firstEntry = entry
+            lastEntry = entry
+        }
+        if (!firstEntry)
+            return
+        const selStart = firstEntry.rawStart + Math.max(0, idx - firstEntry.cleanStart)
+        const selEnd = lastEntry.rawStart + Math.min(lastEntry.rawLength, matchEnd - lastEntry.cleanStart)
+        mainPanel.searchMatchStart = selStart
+        mainPanel.searchMatchLength = selEnd - selStart
+        // select() alone still scrolls the match into view — no need to
+        // steal focus from the search field, which would stop repeated
+        // Enter presses from working (each jumps to the next match without
+        // needing to re-click into it). The visible highlight itself is
+        // searchMatchOverlay (Item 7), not the native selection.
+        transcriptArea.select(selStart, selEnd)
     }
 
     Connections {
@@ -240,7 +542,22 @@ Rectangle {
                 mainPanel.refreshMetadata()
         }
     }
-    onSearchQueryChanged: mainPanel.searchMatchIndex = -1
+    onSearchQueryChanged: mainPanel.resetSearchMatch()
+
+    // Item 8 (Wave D): follow the transcript as it grows during an active
+    // transcription of the currently-open file — only while that job is
+    // actually running, so browsing a finished transcript never gets
+    // yanked to the bottom. Qt.callLater so the TextArea/ScrollView have
+    // re-laid-out with the new text before contentHeight is read.
+    onTranscriptBodyChanged: {
+        if (mainPanel.transcriptionController && mainPanel.player && mainPanel.transcriptionController.busy
+                && mainPanel.transcriptionController.currentFile.toString() === mainPanel.player.source.toString()) {
+            Qt.callLater(function () {
+                const flick = transcriptScrollView.contentItem
+                flick.contentY = Math.max(0, flick.contentHeight - flick.height)
+            })
+        }
+    }
 
     Shortcut {
         sequence: "Ctrl+F"
@@ -273,7 +590,7 @@ Rectangle {
 
             background: Rectangle {
                 radius: AppSettings.borderRadius
-                color: openVaultButton.hovered ? "#3a3a3a" : "#2a2a2a"
+                color: (openVaultButton.hovered && openVaultButton.enabled) ? "#3a3a3a" : "#2a2a2a"
                 border.width: 1
                 border.color: "#3a3a3a"
             }
@@ -323,22 +640,46 @@ Rectangle {
                 Rectangle {
                     anchors.fill: parent
                     radius: AppSettings.borderRadius
-                    color: playPauseHover.hovered ? "#3a3a3a" : "#2a2a2a"
+                    color: (playPauseHover.hovered && playPauseButton.enabled) ? "#3a3a3a" : "#2a2a2a"
                 }
                 HoverBorder {
                     anchors.fill: parent
                     active: playPauseButton.enabled && playPauseHover.hovered
                 }
-                Text {
+                // Drawn, not a font glyph: the "▶" Unicode character's em-box
+                // is never truly centered on its triangle (padding varies by
+                // font/system, so any fixed offset is a guess that breaks
+                // elsewhere) — a Canvas-drawn shape is geometrically centered
+                // by construction, matching pause's two bars exactly the
+                // same way.
+                Canvas {
+                    id: playPauseIcon
                     anchors.centerIn: parent
-                    // The "▶" glyph's own em-box isn't visually centered on
-                    // its triangle (most fonts pad it left) — nudge right so
-                    // it looks centered in the button; "⏸" is symmetric and
-                    // needs no offset.
-                    anchors.horizontalCenterOffset: text === "▶" ? 1 : 0
-                    text: mainPanel.player && mainPanel.player.playing ? "⏸" : "▶"
-                    color: playPauseButton.enabled ? "white" : "#666666"
-                    font.pixelSize: 16
+                    width: 14
+                    height: 14
+
+                    property bool playing: mainPanel.player && mainPanel.player.playing
+                    property color iconColor: playPauseButton.enabled ? "white" : "#666666"
+                    onPlayingChanged: requestPaint()
+                    onIconColorChanged: requestPaint()
+
+                    onPaint: {
+                        const ctx = getContext("2d")
+                        ctx.reset()
+                        ctx.fillStyle = playPauseIcon.iconColor
+                        if (playPauseIcon.playing) {
+                            const barWidth = width * 0.3
+                            ctx.fillRect(0, 0, barWidth, height)
+                            ctx.fillRect(width - barWidth, 0, barWidth, height)
+                        } else {
+                            ctx.beginPath()
+                            ctx.moveTo(0, 0)
+                            ctx.lineTo(width, height / 2)
+                            ctx.lineTo(0, height)
+                            ctx.closePath()
+                            ctx.fill()
+                        }
+                    }
                 }
             }
 
@@ -354,15 +695,16 @@ Rectangle {
                 value: mainPanel.player ? mainPanel.player.position : 0
                 onMoved: mainPanel.player.position = value
 
-                handle: Rectangle {
+                // Item 5 (Wave E): undo Wave D item 4's border-on-hover puck
+                // (reported as not clear enough) — back to a separate
+                // expanding ring around the puck (Wave C item 5's tightened
+                // +2px/1px-gap version), which reads more clearly as a hover
+                // state at a glance.
+                handle: Item {
                     x: seekSlider.leftPadding + seekSlider.visualPosition * (seekSlider.availableWidth - width)
                     y: seekSlider.topPadding + seekSlider.availableHeight / 2 - height / 2
                     implicitWidth: 16
                     implicitHeight: 16
-                    radius: 8
-                    color: seekSlider.pressed ? "#dddddd" : "#ffffff"
-                    border.width: 1
-                    border.color: "#888888"
 
                     Rectangle {
                         anchors.centerIn: parent
@@ -376,6 +718,13 @@ Rectangle {
                         Behavior on opacity {
                             NumberAnimation { duration: 100 }
                         }
+                    }
+                    Rectangle {
+                        anchors.fill: parent
+                        radius: width / 2
+                        color: seekSlider.pressed ? "#dddddd" : "#ffffff"
+                        border.width: 1
+                        border.color: "#888888"
                     }
                 }
             }
@@ -425,6 +774,8 @@ Rectangle {
                     onAccepted: mainPanel.commitRename(text)
                     onActiveFocusChanged: if (!activeFocus && mainPanel.renamingTitle) mainPanel.commitRename(text)
 
+                    background: UnderlineField { focused: titleField.activeFocus }
+
                     Keys.onEscapePressed: mainPanel.renamingTitle = false
                 }
             }
@@ -457,7 +808,9 @@ Rectangle {
                 TapHandler {
                     enabled: regenerateLabelButton.enabled
                     onTapped: mainPanel.transcriptionController.relabel(regenerateLabelButton.targetUrl,
-                                                                         mainPanel.vaultPath)
+                                                                         mainPanel.vaultPath,
+                                                                         AppSettings.restrictTagsToExisting,
+                                                                         AppSettings.tagReuseBias)
                 }
                 HoverBorder {
                     anchors.fill: parent
@@ -512,9 +865,22 @@ Rectangle {
                 onTextChanged: mainPanel.searchQuery = text
                 onAccepted: mainPanel.jumpToNextMatch()
 
+                background: UnderlineField { focused: searchField.activeFocus }
+
                 HoverHandler {
                     cursorShape: Qt.IBeamCursor
                 }
+            }
+
+            // Item 13: "a/b" match position, updating as Enter cycles
+            // through matches (and wraps back to 1 after the last one).
+            Label {
+                visible: mainPanel.searchExpanded && mainPanel.searchQuery !== ""
+                text: mainPanel.searchMatchCount > 0
+                      ? qsTr("%1/%2").arg(mainPanel.searchMatchOrdinal).arg(mainPanel.searchMatchCount)
+                      : qsTr("0/0")
+                color: "#888888"
+                font.pixelSize: 11
             }
 
             Item {
@@ -543,6 +909,124 @@ Rectangle {
                     text: "×"
                     color: "#dddddd"
                     font.pixelSize: 15
+                }
+            }
+        }
+
+        // Item 13: there was previously no way to see generated tags at all
+        // (auto-labeling wrote them to frontmatter but nothing displayed
+        // them). Small rounded pills, one per comma-separated tag.
+        Flow {
+            id: tagsRow
+            Layout.fillWidth: true
+            spacing: 6
+            visible: mainPanel.currentTags().length > 0
+
+            Repeater {
+                model: mainPanel.currentTags()
+
+                Rectangle {
+                    id: tagPill
+                    required property string modelData
+                    radius: AppSettings.borderRadius
+                    color: tagPillHover.hovered ? "#3f3f3f" : "#333333"
+                    border.width: 1
+                    border.color: "#4a4a4a"
+                    implicitWidth: tagLabel.implicitWidth + 12
+                    implicitHeight: tagLabel.implicitHeight + 6
+
+                    // Item 16 (Wave E): clicking a tag filters the sidebar
+                    // tree to files with that tag.
+                    HoverHandler {
+                        id: tagPillHover
+                        cursorShape: Qt.PointingHandCursor
+                    }
+                    TapHandler {
+                        onTapped: mainPanel.tagActivated(tagPill.modelData)
+                    }
+
+                    Label {
+                        id: tagLabel
+                        anchors.centerIn: parent
+                        text: parent.modelData
+                        color: "#cccccc"
+                        font.pixelSize: 11
+                    }
+                }
+            }
+        }
+
+        // Item 11 (Wave E): one pill per distinct speaker id detected in
+        // THIS transcript, showing its current display name (default:
+        // "Speaker N"). Click-to-rename mirrors the title's own
+        // Label<->TextField swap pattern; renaming updates the shared
+        // speakerNames frontmatter map, so every future read of this
+        // transcript (this pill row, and anywhere else that consults the
+        // same map) shows the new name — the transcript TEXT ITSELF below
+        // still shows the stable "[Speaker N]" tag verbatim (renaming is a
+        // frontmatter-only edit, not a rewrite of the segment lines), since
+        // substituting display names into that text would shift the
+        // character offsets sentence-highlighting/search overlays rely on.
+        Flow {
+            id: speakersRow
+            Layout.fillWidth: true
+            spacing: 6
+            visible: mainPanel.distinctSpeakerIds.length > 0
+
+            Repeater {
+                model: mainPanel.distinctSpeakerIds
+
+                Item {
+                    id: speakerPillItem
+                    required property string modelData
+                    readonly property bool renaming: mainPanel.renamingSpeakerId === modelData
+                    implicitWidth: renaming ? speakerNameField.implicitWidth + 12 : speakerPillLabel.implicitWidth + 12
+                    implicitHeight: 22
+
+                    Rectangle {
+                        anchors.fill: parent
+                        radius: AppSettings.borderRadius
+                        color: speakerPillHover.hovered ? "#3f5f7f" : "#2f4f5f"
+                        border.width: 1
+                        border.color: "#4a6a7a"
+                        visible: !speakerPillItem.renaming
+                    }
+                    HoverHandler {
+                        id: speakerPillHover
+                        cursorShape: Qt.PointingHandCursor
+                        enabled: !speakerPillItem.renaming
+                    }
+                    TapHandler {
+                        enabled: !speakerPillItem.renaming
+                        onTapped: {
+                            speakerNameField.text = mainPanel.displaySpeakerName(speakerPillItem.modelData)
+                            mainPanel.renamingSpeakerId = speakerPillItem.modelData
+                            speakerNameField.forceActiveFocus()
+                            speakerNameField.selectAll()
+                        }
+                    }
+                    Label {
+                        id: speakerPillLabel
+                        anchors.centerIn: parent
+                        visible: !speakerPillItem.renaming
+                        text: mainPanel.displaySpeakerName(speakerPillItem.modelData)
+                        color: "#dddddd"
+                        font.pixelSize: 11
+                    }
+
+                    TextField {
+                        id: speakerNameField
+                        anchors.centerIn: parent
+                        visible: speakerPillItem.renaming
+                        font.pixelSize: 11
+                        onAccepted: mainPanel.commitSpeakerRename(speakerPillItem.modelData, text)
+                        onActiveFocusChanged: if (!activeFocus && speakerPillItem.renaming)
+                                                  mainPanel.commitSpeakerRename(speakerPillItem.modelData, text)
+
+                        background: UnderlineField { focused: speakerNameField.activeFocus }
+
+                        Keys.onEscapePressed: mainPanel.renamingSpeakerId = ""
+                    }
                 }
             }
         }
@@ -607,7 +1091,7 @@ Rectangle {
                 }
                 HoverBorder {
                     anchors.fill: parent
-                    active: modelCombo.hovered
+                    active: modelCombo.enabled && modelCombo.hovered
                 }
             }
 
@@ -637,21 +1121,27 @@ Rectangle {
                 text: transcribeButton.isActive ? qsTr("Transcribing…")
                       : transcribeButton.isQueued ? qsTr("Queued…")
                       : (mainPanel.transcriptionController && mainPanel.transcriptionController.busy
-                         ? qsTr("Add to queue") : qsTr("Transcribe"))
+                         ? qsTr("Add to queue")
+                         : (mainPanel.hasStoredMetadata ? qsTr("Re-transcribe") : qsTr("Transcribe")))
+                // A manual, explicit click always re-runs — regardless of
+                // whether the current model/speaker-detection selection
+                // matches what's already stored (only "transcribe all"
+                // bulk-skips already-current files; a single deliberate
+                // click here never should).
                 enabled: mainPanel.player && mainPanel.player.source.toString() !== ""
                          && mainPanel.transcriptionController
                          && !transcribeButton.isActive && !transcribeButton.isQueued
-                         && (!mainPanel.hasStoredMetadata
-                             || speakerDetectionToggle.checked !== (mainPanel.storedMetadata.speakerDetection === true))
                 hoverEnabled: true
                 onClicked: mainPanel.transcriptionController.transcribe(mainPanel.player.source, mainPanel.vaultPath,
                                                                          modelCombo.currentValue,
                                                                          speakerDetectionToggle.checked,
-                                                                         AppSettings.autoLabelEnabled)
+                                                                         AppSettings.autoLabelEnabled,
+                                                                         AppSettings.restrictTagsToExisting,
+                                                                         AppSettings.tagReuseBias)
 
                 background: Rectangle {
                     radius: AppSettings.borderRadius
-                    color: transcribeButton.hovered ? "#3a3a3a" : "#2a2a2a"
+                    color: (transcribeButton.hovered && transcribeButton.enabled) ? "#3a3a3a" : "#2a2a2a"
                     opacity: transcribeButton.enabled ? 1 : 0.5
                     border.width: 1
                     border.color: "#3a3a3a"
@@ -662,12 +1152,13 @@ Rectangle {
                 }
                 HoverBorder {
                     anchors.fill: parent
-                    active: transcribeButton.hovered
+                    active: transcribeButton.enabled && transcribeButton.hovered
                 }
             }
         }
 
         ScrollView {
+            id: transcriptScrollView
             Layout.fillWidth: true
             Layout.fillHeight: true
             clip: true
@@ -678,10 +1169,177 @@ Rectangle {
                 id: transcriptArea
                 readOnly: true
                 wrapMode: TextArea.Wrap
-                textFormat: TextEdit.RichText
-                text: mainPanel.highlightedTranscriptHtml()
+                text: mainPanel.displayText
                 color: "#dddddd"
                 background: null
+                selectByMouse: true
+                selectByKeyboard: true
+                // Reserves space for the timestamp + speaker gutters below
+                // — neither is part of this control's actual text (see
+                // displayText's doc comment), so a click-drag selection can
+                // never touch them; this is just the visual margin they're
+                // drawn in.
+                leftPadding: mainPanel.timestampGutterWidth + mainPanel.gutterSpacing
+                             + mainPanel.speakerGutterWidth + mainPanel.gutterSpacing
+                // Regression fix: Item 7 made ALL native selection invisible
+                // (transparent) to avoid double-highlighting jumpToNextMatch's
+                // select() call against searchMatchOverlay below — but that
+                // also hid genuine user click-drag selection entirely, which
+                // read as "selection stopped working". Only hide the native
+                // highlight when the CURRENT selection is exactly the active
+                // search match (a purely reactive check — the moment the user
+                // drags a different selection, this is false again and the
+                // native highlight reappears on its own).
+                readonly property bool selectionIsSearchMatch: mainPanel.searchMatchIndex >= 0
+                    && transcriptArea.selectionStart === mainPanel.searchMatchStart
+                    && transcriptArea.selectionEnd === mainPanel.searchMatchStart + mainPanel.searchMatchLength
+                selectionColor: transcriptArea.selectionIsSearchMatch ? "transparent" : Qt.rgba(0.35, 0.55, 0.85, 0.5)
+                selectedTextColor: transcriptArea.selectionIsSearchMatch ? transcriptArea.color : "#ffffff"
+
+                // Real bug, found via an offscreen QML reproduction (not
+                // guessed) — see .task/plan.md for the repro transcript.
+                // Querying positionToRectangle() from EACH gutter delegate's
+                // own binding can run BEFORE this control's internal text
+                // layout has caught up to a newly-changed `text` value (Qt
+                // logs "QTextCursor::setPosition: position N out of range"
+                // when this happens); every position past the stale length
+                // silently returns a zeroed rect, collapsing every later
+                // gutter entry onto row 0 — exactly "an end gutter takes the
+                // same position as the start gutter". Computed ONCE here
+                // (shared by both gutter Repeaters below, instead of two
+                // independent — and independently stale — queries per
+                // sentence) with an EXPLICIT dependency on
+                // transcriptArea.length (the actual current document
+                // length), so this genuinely re-evaluates once layout
+                // catches up rather than only reacting to displaySentences
+                // itself changing; the bounds guard means an in-between
+                // stale read never warns/misbehaves, it just recomputes
+                // correctly moments later.
+                readonly property var gutterLineRects: {
+                    const len = transcriptArea.length
+                    return mainPanel.displaySentences.map(
+                        s => s.start <= len ? transcriptArea.positionToRectangle(s.start) : Qt.rect(0, 0, 0, 0))
+                }
+
+                // Two SEPARATE gutter columns (Item: independently stylable
+                // areas, not one combined label) — each aligned to its
+                // sentence's first visual line via gutterLineRects above.
+                // showGutter (see displayData) collapses a run of
+                // same-speaker sentences down to ONE pair of labels at the
+                // start of that turn, rather than repeating the same
+                // timestamp+name on every line — this is what makes "one
+                // timestamp per section" a real, deterministic rule instead
+                // of a defensive guess.
+                Repeater {
+                    id: timestampGutterRepeater
+                    model: mainPanel.displaySentences
+
+                    Text {
+                        required property var modelData
+                        required property int index
+                        visible: modelData.showGutter
+                        readonly property rect lineRect: transcriptArea.gutterLineRects[index] || Qt.rect(0, 0, 0, 0)
+                        x: 0
+                        y: lineRect.y
+                        // Match the corresponding line's own height and
+                        // center within it — the gutter's small font
+                        // otherwise sits near the TOP of the (taller) main
+                        // text line instead of level with its glyphs.
+                        height: lineRect.height
+                        width: mainPanel.timestampGutterWidth
+                        horizontalAlignment: Text.AlignRight
+                        verticalAlignment: Text.AlignVCenter
+                        text: mainPanel.formatGutterTimestamp(modelData.t0)
+                        color: "#777777"
+                        font.pixelSize: 10
+                    }
+                }
+
+                Repeater {
+                    id: speakerGutterRepeater
+                    model: mainPanel.displaySentences
+
+                    Text {
+                        required property var modelData
+                        required property int index
+                        visible: modelData.showGutter && modelData.speaker > 0
+                        readonly property rect lineRect: transcriptArea.gutterLineRects[index] || Qt.rect(0, 0, 0, 0)
+                        x: mainPanel.timestampGutterWidth + mainPanel.gutterSpacing
+                        y: lineRect.y
+                        height: lineRect.height
+                        width: mainPanel.speakerGutterWidth
+                        elide: Text.ElideRight
+                        horizontalAlignment: Text.AlignLeft
+                        verticalAlignment: Text.AlignVCenter
+                        text: modelData.speaker > 0 ? mainPanel.displaySpeakerName("Speaker " + modelData.speaker) : ""
+                        color: "#8fa8bf"
+                        font.pixelSize: 10
+                        font.bold: true
+                    }
+                }
+
+                Rectangle {
+                    id: sentenceHighlightOverlay
+                    visible: mainPanel.activeSentenceIndex >= 0
+                    z: -1
+                    radius: AppSettings.highlightRadius
+                    color: AppSettings.highlightColor
+                    x: mainPanel.activeSentenceRect.x
+                    y: mainPanel.activeSentenceRect.y
+                    width: mainPanel.activeSentenceRect.width
+                    height: mainPanel.activeSentenceRect.height
+                }
+
+                // Item 7 (Wave E): Ctrl+F search match is now a real rounded
+                // overlay too, not just the TextArea's native (unrounded,
+                // system-styled) selection rectangle — transcriptArea's own
+                // selectionColor is only made transparent WHILE the current
+                // selection is exactly this match (see selectionIsSearchMatch
+                // above), so this is the only visible highlight for it;
+                // select() is still called (see jumpToNextMatch) purely for
+                // its scroll-into-view behavior.
+                Rectangle {
+                    id: searchMatchOverlay
+                    visible: mainPanel.searchMatchIndex >= 0
+                    z: -1
+                    radius: AppSettings.highlightRadius
+                    color: AppSettings.highlightColor
+                    x: mainPanel.searchMatchRect.x
+                    y: mainPanel.searchMatchRect.y
+                    width: mainPanel.searchMatchRect.width
+                    height: mainPanel.searchMatchRect.height
+                }
+            }
+
+            // Item 12 (Wave E): Chrome/PDF-viewer-style middle-click-hold-
+            // drag scrolling — content follows the cursor 1:1 while the
+            // middle button is held (grab-and-pan), not a toggled/velocity-
+            // based autoscroll. acceptedButtons is scoped to MiddleButton
+            // only, so left-click text selection and the scrollbar's own
+            // drag are completely unaffected (a non-matching button simply
+            // isn't accepted, falling through to whatever's beneath).
+            MouseArea {
+                id: middleDragScrollArea
+                anchors.fill: parent
+                acceptedButtons: Qt.MiddleButton
+                cursorShape: pressed ? Qt.SizeAllCursor : Qt.ArrowCursor
+                propagateComposedEvents: true
+
+                property real dragStartY: 0
+                property real startContentY: 0
+
+                onPressed: (mouse) => {
+                    middleDragScrollArea.dragStartY = mouse.y
+                    middleDragScrollArea.startContentY = transcriptScrollView.contentItem.contentY
+                }
+                onPositionChanged: (mouse) => {
+                    if (!pressed)
+                        return
+                    const flick = transcriptScrollView.contentItem
+                    const delta = mouse.y - middleDragScrollArea.dragStartY
+                    const maxY = Math.max(0, flick.contentHeight - flick.height)
+                    flick.contentY = Math.max(0, Math.min(maxY, middleDragScrollArea.startContentY - delta))
+                }
             }
         }
 

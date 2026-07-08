@@ -37,6 +37,57 @@ const char *kSystemPrompt =
     "comma-separated list of topical tags. Respond with ONLY the JSON "
     "object, nothing else.";
 
+// Item 14 "auto-categorize" mode: restrict tags to an existing vault-wide
+// vocabulary instead of freely inventing new ones. This is a prompt
+// instruction, not a grammar constraint (see LabelingEngine.h) — the
+// vocabulary is open-ended, so it's appended to the base system prompt
+// rather than baked into the GBNF grammar.
+//
+// Item 15 (Wave E): when NOT hard-restricted, existingTags (if any) is still
+// shown to the model as context, phrased at one of 3 tiers depending on
+// tagReuseBias — a graduated nudge, not a hard rule (that's what
+// restrictToExisting is for).
+QString buildSystemPrompt(const QStringList &existingTags, bool restrictToExisting, double tagReuseBias)
+{
+    QString prompt = QString::fromUtf8(kSystemPrompt);
+    if (existingTags.isEmpty())
+        return prompt;
+
+    const QString tagList = existingTags.join(QStringLiteral(", "));
+    if (restrictToExisting) {
+        prompt += QStringLiteral(
+                       " For tags specifically: choose ONLY from this existing list of tags already used "
+                       "elsewhere in this vault, picking whichever apply: %1. If none of them fit this "
+                       "transcript, return an empty string for tags — do not invent a new tag.")
+                      .arg(tagList);
+        return prompt;
+    }
+
+    // 3-tier phrasing rather than embedding the raw 0.0-1.0 number in the
+    // prompt — a small model follows a clear qualitative instruction more
+    // reliably than it would calibrate against a bare float.
+    if (tagReuseBias >= 0.67) {
+        prompt += QStringLiteral(
+                       " For tags specifically: here are tags already used elsewhere in this vault: %1. "
+                       "STRONGLY prefer reusing one of these even if it's only an approximate fit — only "
+                       "invent a brand new tag if none of the existing ones are remotely relevant.")
+                      .arg(tagList);
+    } else if (tagReuseBias >= 0.34) {
+        prompt += QStringLiteral(
+                       " For tags specifically: here are tags already used elsewhere in this vault: %1. "
+                       "Reuse one of these if it reasonably fits this transcript, otherwise invent a new, "
+                       "precise tag.")
+                      .arg(tagList);
+    } else {
+        prompt += QStringLiteral(
+                       " For tags specifically: here are tags already used elsewhere in this vault: %1. "
+                       "Prefer inventing a new, precise tag for this transcript over reusing one of these "
+                       "unless it's a very close match.")
+                      .arg(tagList);
+    }
+    return prompt;
+}
+
 }
 
 LabelingEngine::LabelingEngine(const QString &modelPath)
@@ -64,7 +115,8 @@ LabelingEngine::~LabelingEngine()
         llama_model_free(m_model);
 }
 
-std::optional<LabelResult> LabelingEngine::label(const QString &transcriptText, QString *errorOut)
+std::optional<LabelResult> LabelingEngine::label(const QString &transcriptText, const QStringList &existingTags,
+                                                  bool restrictToExisting, double tagReuseBias, QString *errorOut)
 {
     if (!isValid()) {
         if (errorOut)
@@ -73,6 +125,7 @@ std::optional<LabelResult> LabelingEngine::label(const QString &transcriptText, 
     }
 
     const QByteArray userUtf8 = transcriptText.left(kMaxInputChars).toUtf8();
+    const QByteArray systemUtf8 = buildSystemPrompt(existingTags, restrictToExisting, tagReuseBias).toUtf8();
     const llama_vocab *vocab = llama_model_get_vocab(m_model);
 
     llama_sampler *grammarSampler = llama_sampler_init_grammar(vocab, kGrammar, "root");
@@ -87,7 +140,7 @@ std::optional<LabelResult> LabelingEngine::label(const QString &transcriptText, 
     llama_sampler_chain_add(chain, llama_sampler_init_dist(LLAMA_DEFAULT_SEED));
 
     std::vector<llama_chat_message> messages = {
-        {"system", kSystemPrompt},
+        {"system", systemUtf8.constData()},
         {"user", userUtf8.constData()},
     };
     const char *tmpl = llama_model_chat_template(m_model, /* name */ nullptr);

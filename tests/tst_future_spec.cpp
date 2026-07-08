@@ -78,11 +78,13 @@ private slots:
 
     void vaultConfigJson_appScopedSettingsDivergence()
     {
-        QSKIP("DESIGN.md 'Vault / file layout': .transcriber/config.json holds settings, USB "
-              "device allowlist, and the model registry (vault-scoped). DIVERGENCE: settings are "
-              "currently app-scoped QSettings (~/.config/suopTranscriber) via the AppSettings "
-              "singleton; only .transcriber/models/ exists in the vault. Docs and code need "
-              "reconciling before this is testable.");
+        QSKIP("DESIGN.md 'Vault / file layout': RESOLVED for settings (Wave E item 9) — "
+              "appearance/behavior settings now round-trip through <vault>/.suopTranscriber "
+              "(JSON), see VaultTreeModel::readVaultSettings/writeVaultSettings and "
+              "AppSettings.qml's loadFromVault/saveToVault (tested: "
+              "tst_vaulttreemodel.cpp's vaultSettings_* cases). STILL DIVERGENT: a USB device "
+              "allowlist and a model registry are not implemented anywhere yet (no code to "
+              "test against) — that part of this placeholder remains accurate.");
     }
 
     void noRetranscription_mdPresenceMeansDone()
