@@ -128,6 +128,17 @@ class TranscriptionController : public QObject {
     Q_PROPERTY(int tasksCompleted READ tasksCompleted NOTIFY queueChanged)
     Q_PROPERTY(QVariantList queuedFileUrls READ queuedFileUrls NOTIFY queueChanged)
     Q_PROPERTY(QVariantList jobs READ jobs NOTIFY queueChanged)
+    // Bumps once for each real new segment line written to the .md sidecar
+    // during an in-progress transcription — throttled (see run()'s
+    // liveUpdateTimer) so a burst of short segments still coalesces into at
+    // most a few ticks per second. QML's "live updates as segments are
+    // written" hooks (MainPanel.qml's transcriptBody/sentences bindings)
+    // must depend on THIS, not progress: progress fires on whisper's every
+    // internal decode-loop iteration (including decode retries/fallbacks),
+    // far more often than real new content actually appears, and each live-
+    // update tick re-reads+re-parses the whole file and rebuilds the whole
+    // transcript view — tying it to progress was clogging the GUI thread.
+    Q_PROPERTY(int liveUpdateTick READ liveUpdateTick NOTIFY liveUpdateTickChanged)
 
 public:
     enum class JobStatus { Queued, Active, Done, Failed };
@@ -140,6 +151,8 @@ public:
     double progress() const { return m_progress; }
     QString currentPhase() const { return m_phase; }
     QUrl currentFile() const { return m_currentFile; }
+    // See the liveUpdateTick Q_PROPERTY doc comment above.
+    int liveUpdateTick() const { return m_liveUpdateTick; }
     // See the currentJobKind Q_PROPERTY doc comment above.
     QString currentJobKind() const;
     // Derived from m_jobs: total entry count / Done+Failed count. Both only
@@ -339,6 +352,7 @@ signals:
     void currentPhaseChanged();
     void currentFileChanged();
     void queueChanged();
+    void liveUpdateTickChanged();
     void finished(const QUrl &fileUrl, bool ok, const QString &error);
     // Fired when a renameSpeaker() call's background rewrite completes — IN
     // ADDITION to the generic finished() above (a rename is queued through
@@ -390,6 +404,7 @@ private:
     double m_progress = 0.0;
     QString m_phase;
     QUrl m_currentFile;
+    int m_liveUpdateTick = 0;
     QVector<Job> m_jobs;
     int m_activeIndex = -1;
 };

@@ -4,6 +4,7 @@
 #include <QDebug>
 #include <QDir>
 #include <QDirIterator>
+#include <QElapsedTimer>
 #include <QFile>
 #include <QFileInfo>
 #include <QMetaObject>
@@ -62,6 +63,14 @@ QString sidecarPath(const QString &audioFilePath)
     const QFileInfo fi(audioFilePath);
     return fi.absolutePath() + "/" + fi.completeBaseName() + ".md";
 }
+
+// Minimum spacing between TranscriptionWorker::segmentWritten() emissions
+// (see run()'s onSegment) — a chatty stretch of audio can produce several
+// whisper segments within milliseconds of each other, and each live-update
+// tick costs QML a full file re-read/re-parse/re-render (see
+// TranscriptionController::liveUpdateTick's doc comment), so bursts are
+// coalesced down to this rate rather than firing one tick per segment.
+constexpr qint64 kLiveUpdateThrottleMs = 200;
 
 // whisper.cpp occasionally hallucinates a bracketed non-speech annotation
 // (e.g. "[APPLAUSE]", "[MUSIC]", "[BLANK_AUDIO]") as a segment's ENTIRE
@@ -787,6 +796,20 @@ public:
 public slots:
     void run(const QString &filePath, const QString &vaultPath, const QString &modelId, bool speakerDetection)
     {
+        // GPU memory hygiene: transcribe and label jobs never run
+        // concurrently (this worker runs at most one job at a time), so
+        // there's no reason to keep the label engine's GPU-resident weights
+        // + KV-cache buffer around while a transcription runs — evicting it
+        // here (unconditionally, not just under memory pressure) keeps this
+        // worker's steady-state GPU footprint to whichever ONE big model
+        // (whisper or label) its most recent job actually needed, instead of
+        // silently accumulating every model ever used this session. Costs a
+        // reload (a few seconds) the next time a labeling job runs, which is
+        // deliberately accepted in exchange for not exhausting VRAM — see
+        // LabelingEngine's CPU-fallback retry for when that reload itself
+        // hits GPU memory pressure.
+        m_labelingEngine.reset();
+
         // "loading": whisper.cpp has no progress hook for model load itself
         // (whisper_init_from_file_with_params is one blocking call) — this
         // phase covers ensureModel()'s (rare, first-run) download plus the
@@ -883,6 +906,15 @@ public slots:
                     diarizeError.isEmpty() ? QStringLiteral("speaker diarization models unavailable") : diarizeError;
             }
         }
+        // Diarization is a one-shot pass at the START of this job (above) —
+        // nothing from here to the end of run() touches it again, so free
+        // its GPU/CPU resources now rather than leaving them resident for no
+        // reason through the whole (often much longer) transcription phase
+        // that follows. Cheap to reload next time (~35MB of small onnx
+        // models), unlike the big whisper/label models above, so this is
+        // evicted unconditionally on every job rather than only on a
+        // model-path change.
+        m_diarizationEngine.reset();
 
         QFile mdFile(sidecarPath(filePath));
         if (!mdFile.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
@@ -916,7 +948,18 @@ public slots:
             const double fraction = total > 0 ? done / total : 0.0;
             emit progress(effectiveSpeakerDetection ? 0.5 + fraction * 0.5 : fraction);
         };
-        SegmentCallback onSegment = [&lineWriter, &diarizedTurns, effectiveSpeakerDetection](const Segment &segment) {
+        // Drives TranscriptionController::liveUpdateTick (see its doc
+        // comment) — throttled independently of whisper's own progress
+        // ticks, which fire on every internal decode-loop iteration
+        // (including retries) rather than on real new content. liveTimer
+        // starts already kLiveUpdateThrottleMs in the past so the FIRST
+        // segment's tick fires immediately instead of waiting out the
+        // throttle window.
+        QElapsedTimer liveTimer;
+        liveTimer.start();
+        qint64 lastLiveTickMs = -kLiveUpdateThrottleMs;
+        SegmentCallback onSegment = [&lineWriter, &diarizedTurns, effectiveSpeakerDetection, &liveTimer,
+                                      &lastLiveTickMs, this](const Segment &segment) {
             // Chunk offset merge is the app's job (see WhisperCppEngine.cpp);
             // with offsetSeconds always 0 this milestone it's a no-op, kept
             // explicit here as the seam for when chunking lands.
@@ -927,6 +970,12 @@ public slots:
             const QString label = (effectiveSpeakerDetection && isSpeech)
                 ? labelForSegment(diarizedTurns, segment.t0, segment.t1) : QString();
             lineWriter.append(segment, label);
+
+            const qint64 nowMs = liveTimer.elapsed();
+            if (nowMs - lastLiveTickMs >= kLiveUpdateThrottleMs) {
+                lastLiveTickMs = nowMs;
+                emit segmentWritten();
+            }
         };
 
         m_engine->transcribe(chunk, onProgress, onSegment);
@@ -955,6 +1004,16 @@ public slots:
     void relabelJob(const QString &filePath, const QString &vaultPath, bool restrictTagsToExisting,
                      double tagReuseBias)
     {
+        // Mirrors run()'s eviction of the label engine (see its doc
+        // comment): this job needs only the label engine, so free whisper's
+        // GPU-resident model now rather than let it sit warm through a
+        // labeling pass that never touches it. m_diarizationEngine is
+        // already evicted at the end of every run() job, so it's never
+        // actually resident here — reset defensively anyway in case that
+        // ever changes.
+        m_engine.reset();
+        m_diarizationEngine.reset();
+
         const QString mdPath = sidecarPath(filePath);
         if (!QFileInfo::exists(mdPath)) {
             emit finished(false, QStringLiteral("%1 has not been transcribed yet").arg(filePath));
@@ -1027,8 +1086,30 @@ public slots:
         emit finished(ok, error);
     }
 
+    // GPU memory hygiene, the idle case: run()/relabelJob() already evict
+    // whichever engine THIS job doesn't need (see their doc comments), but
+    // that leaves whichever engine the MOST RECENT job DID use warm
+    // indefinitely — fine while more jobs are queued (that's the whole
+    // point of staying warm), pointless once the queue is empty and nothing
+    // is going to reuse it. TranscriptionController::onWorkerFinished()
+    // calls this exactly when the job queue has just drained to empty, so
+    // idle GPU footprint goes back to ~0 instead of sitting at whatever the
+    // last job happened to need. Evicting all three unconditionally (rather
+    // than tracking which one is actually still resident) keeps this simple
+    // — resetting an already-null unique_ptr is a no-op.
+    void evictIdle()
+    {
+        m_engine.reset();
+        m_diarizationEngine.reset();
+        m_labelingEngine.reset();
+    }
+
 signals:
     void progress(double fraction);
+    // See TranscriptionController::liveUpdateTick's doc comment — emitted
+    // (throttled, see run()'s liveTimer) each time a real new segment line
+    // is written to the .md sidecar during an in-progress transcription.
+    void segmentWritten();
     // See TranscriptionController::currentPhase's doc comment — emitted at
     // each phase transition within run() (loading/detecting-speakers/
     // transcribing); never emitted by relabelJob()/renameSpeaker()/
@@ -1110,6 +1191,10 @@ TranscriptionController::TranscriptionController(QObject *parent)
     connect(m_worker, &TranscriptionWorker::progress, this, [this](double fraction) {
         m_progress = fraction;
         emit progressChanged();
+    });
+    connect(m_worker, &TranscriptionWorker::segmentWritten, this, [this] {
+        m_liveUpdateTick++;
+        emit liveUpdateTickChanged();
     });
     connect(m_worker, &TranscriptionWorker::phase, this, [this](const QString &phase) {
         m_phase = phase;
@@ -1330,6 +1415,10 @@ void TranscriptionController::onWorkerFinished(bool ok, const QString &error)
         m_currentFile = QUrl();
         emit currentFileChanged();
         emit queueChanged();
+        // See TranscriptionWorker::evictIdle()'s doc comment — nothing left
+        // queued to reuse a warm engine, so release whichever one the job
+        // that just finished was using.
+        QMetaObject::invokeMethod(m_worker, "evictIdle", Qt::QueuedConnection);
     }
 
     emit finished(finishedFile, ok, error);

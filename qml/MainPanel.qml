@@ -412,15 +412,18 @@ Rectangle {
     }
 
     // Item 10: live-updates as segments are written during an in-progress
-    // transcription of the currently-open file — reading .progress here
-    // (even though the value itself isn't used) makes this binding
-    // re-evaluate on every per-segment progress tick, not just at
-    // completion. Gated on currentFile matching so unrelated jobs' progress
-    // ticks don't cause pointless re-reads.
+    // transcription of the currently-open file — reading .liveUpdateTick
+    // here (even though the value itself isn't used) makes this binding
+    // re-evaluate each time a real new segment line lands in the .md file,
+    // not on every one of whisper's internal progress ticks (those fire per
+    // decode-loop iteration, including retries, far more often than real
+    // new content appears — see TranscriptionController::liveUpdateTick's
+    // doc comment). Gated on currentFile matching so unrelated jobs' ticks
+    // don't cause pointless re-reads.
     readonly property string transcriptBody: {
         if (mainPanel.transcriptionController && mainPanel.player
                 && mainPanel.transcriptionController.currentFile.toString() === mainPanel.player.source.toString()) {
-            void mainPanel.transcriptionController.progress
+            void mainPanel.transcriptionController.liveUpdateTick
         }
         if (mainPanel.orphanedMdPath !== "" && mainPanel.transcriptionController)
             return mainPanel.transcriptionController.readTranscriptBody("file://" + mainPanel.orphanedMdPath)
@@ -436,20 +439,20 @@ Rectangle {
     // sentences parse fine but activeSentenceIndex just stays -1 — no
     // highlight, which is correct (nothing is "playing").
     //
-    // Same live-update hook as transcriptBody above (read .progress so this
-    // re-evaluates every per-segment tick, not just at completion) — this
-    // was missing here, which is why displayText/the transcript view (both
-    // now built FROM sentences, not from transcriptBody directly) didn't
-    // show new segments live during an in-progress transcription: nothing
-    // else reliably re-triggers this binding mid-job (storedMetadata's
-    // reference changes, but hasStoredMetadata's VALUE stays true the whole
-    // time once frontmatter exists, so its own change notify doesn't fire
-    // on every tick).
+    // Same live-update hook as transcriptBody above (read .liveUpdateTick so
+    // this re-evaluates each time a real new segment lands, not just at
+    // completion) — this was missing here, which is why displayText/the
+    // transcript view (both now built FROM sentences, not from
+    // transcriptBody directly) didn't show new segments live during an
+    // in-progress transcription: nothing else reliably re-triggers this
+    // binding mid-job (storedMetadata's reference changes, but
+    // hasStoredMetadata's VALUE stays true the whole time once frontmatter
+    // exists, so its own change notify doesn't fire on every tick).
     readonly property var sentences: {
         void mainPanel.sentencesRevision
         if (mainPanel.transcriptionController && mainPanel.player
                 && mainPanel.transcriptionController.currentFile.toString() === mainPanel.player.source.toString()) {
-            void mainPanel.transcriptionController.progress
+            void mainPanel.transcriptionController.liveUpdateTick
         }
         if (!mainPanel.transcriptionController)
             return []

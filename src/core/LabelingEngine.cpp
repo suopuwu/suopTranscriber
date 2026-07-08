@@ -1,5 +1,6 @@
 #include "LabelingEngine.h"
 
+#include <QDebug>
 #include <QJsonDocument>
 #include <QJsonObject>
 
@@ -90,12 +91,13 @@ QString buildSystemPrompt(const QStringList &existingTags, bool restrictToExisti
 
 }
 
-LabelingEngine::LabelingEngine(const QString &modelPath)
+bool LabelingEngine::loadModel(const QString &modelPath, int nGpuLayers)
 {
     llama_model_params mparams = llama_model_default_params();
+    mparams.n_gpu_layers = nGpuLayers;
     m_model = llama_model_load_from_file(modelPath.toUtf8().constData(), mparams);
     if (!m_model)
-        return;
+        return false;
 
     llama_context_params cparams = llama_context_default_params();
     cparams.n_ctx = kContextTokens;
@@ -104,6 +106,18 @@ LabelingEngine::LabelingEngine(const QString &modelPath)
     if (!m_ctx) {
         llama_model_free(m_model);
         m_model = nullptr;
+        return false;
+    }
+    return true;
+}
+
+LabelingEngine::LabelingEngine(const QString &modelPath)
+{
+    if (!loadModel(modelPath, /* nGpuLayers */ -1)) {
+        qWarning() << "labeling model" << modelPath
+                    << "failed to load fully on GPU (likely out of VRAM alongside a resident whisper model) —"
+                       " retrying CPU-only";
+        loadModel(modelPath, /* nGpuLayers */ 0);
     }
 }
 

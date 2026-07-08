@@ -24,6 +24,12 @@ struct LabelResult {
 
 class LabelingEngine {
 public:
+    // Tries GPU offload first (fast path); if that fails — e.g. a resident
+    // whisper.cpp model has already claimed most of the GPU's VRAM, see
+    // ggml-vulkan's grow-only working buffers — retries fully on CPU
+    // (slower, but works under VRAM pressure that would otherwise make
+    // labeling an all-or-nothing failure) before giving up. isValid() is
+    // false only if BOTH attempts failed.
     explicit LabelingEngine(const QString &modelPath);
     ~LabelingEngine();
 
@@ -62,6 +68,12 @@ public:
                                       QString *errorOut = nullptr);
 
 private:
+    // Attempts to load modelPath fully offloaded to GPU (nGpuLayers=-1) or
+    // CPU-only (nGpuLayers=0) — see LabelingEngine()'s doc comment for why
+    // the constructor tries both. Leaves m_model/m_ctx null (and any
+    // partially-created one freed) on failure.
+    bool loadModel(const QString &modelPath, int nGpuLayers);
+
     llama_model *m_model = nullptr;
     llama_context *m_ctx = nullptr;
 };
