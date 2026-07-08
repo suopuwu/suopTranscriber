@@ -55,30 +55,30 @@ sc::OfflineSpeakerDiarizationConfig buildConfig(const QString &segmentationModel
     return config;
 }
 
-// Measured on real audio (2026-07-07, against the CAM++ embedding model —
-// see NOTE below): CUDA is reliably SLOWER than CPU for this specific
-// pipeline, not just occasionally unavailable — 2.35s vs 0.24s on an 11s
-// clip, 45.6s vs 5.8s on a 3:40 clip (scales with length, so it's per-call
-// overhead, not one-time warmup). Root cause: the segmentation model runs as
-// ~1 forward pass per second of audio (90% overlap on a 10s window, baked
-// into the model itself — hundreds of small, sequential calls for a real
-// recording), and GPU kernel-launch/transfer overhead dominates for that
-// shape of work when each call is this small. This is the OPPOSITE of
-// whisper.cpp's GPU win, which is one long streaming pass with large batched
-// matmuls — a genuinely different workload shape, not a contradiction.
-// kTryCuda stays available (tested, working — see the "cuda" branch below)
-// in case a future model/architecture change here benefits from it, but
-// CPU is the correct default given what's actually measured today.
+// SUPERSEDES an earlier (2026-07-07, same day) measurement against the old
+// CAM++ embedding model, which found CUDA reliably SLOWER than CPU (2.35s
+// vs 0.24s on an 11s clip) — root-caused to the segmentation model's shape
+// (~1 forward pass per second of audio, hundreds of small sequential calls,
+// GPU kernel-launch/transfer overhead dominating). That conclusion drove
+// kTryCuda to false, but was never re-verified after the embedding model was
+// swapped to WeSpeaker's ResNet293-LM (~115 MB, a much deeper conv net — see
+// ModelManager::kDiarizationEmbeddingFileName's doc comment) later that same
+// day — the embedding half's own per-call cost grew substantially with that
+// swap, and it turns out that outweighs the segmentation half's GPU penalty
+// well before we cared to look.
 //
-// NOTE (2026-07-07, same day): the embedding model was swapped right after
-// this measurement from CAM++ (~30 MB) to WeSpeaker's ResNet293-LM (~115 MB,
-// a much deeper conv net — see ModelManager::kDiarizationEmbeddingFileName's
-// doc comment) to reduce over-splitting. The SEGMENTATION half of the
-// pipeline (still pyannote, unchanged, and the dominant cost per the root
-// cause above) is why CPU should still win, but the embedding half's own
-// per-call cost just grew substantially and hasn't been re-measured against
-// CUDA with the new model — this conclusion is inherited, not re-verified.
-constexpr bool kTryCuda = false;
+// Re-measured (2026-07-07, later) on real audio against the CURRENT
+// (WeSpeaker) embedding model: CUDA is now reliably FASTER on real-length
+// recordings — 330.1s (CPU, 263 raw turns) vs 148.4s (CUDA, 250 raw turns)
+// on a 24.6-minute real recording, a >2x wall-clock win, on an RTX 5090.
+// Turn counts differ slightly between providers (expected float-precision
+// divergence in the embedding/clustering math, not a correctness issue —
+// both land in the same ballpark and both get the same
+// mergeMinorSpeakersIntoNearestMajor() cleanup below regardless). The old
+// short-clip numbers likely still hold in isolation (CUDA's fixed per-call
+// overhead doesn't disappear), but real recordings are the case that
+// actually matters, and there CUDA wins decisively now.
+constexpr bool kTryCuda = true;
 
 // sherpa-onnx gracefully returns a null handle (Create()'s result has
 // .Get()==nullptr) when a model path doesn't EXIST — confirmed empirically.

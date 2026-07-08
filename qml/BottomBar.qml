@@ -48,7 +48,8 @@ Item {
     // has no real progress number behind it (whisper.cpp has no hook for
     // model-load time), so the progress bar goes indeterminate for that
     // phase specifically rather than sitting frozen at 0 looking hung.
-    // "detecting-speakers" and "transcribing" both carry real progress.
+    // "detecting-speakers-segmenting"/"detecting-speakers-identifying" and
+    // "transcribing" all carry real progress.
     readonly property string currentPhase: transcriptionController ? transcriptionController.currentPhase : ""
     readonly property bool progressIsIndeterminate: bottomBar.busy && bottomBar.currentPhase === "loading"
     // Shared with the Tasks popup's per-row kind badge below — same four
@@ -67,7 +68,8 @@ Item {
     function phaseLabel(phase) {
         switch (phase) {
         case "loading": return qsTr("loading model…")
-        case "detecting-speakers": return qsTr("detecting speakers…")
+        case "detecting-speakers-segmenting": return qsTr("finding speech…")
+        case "detecting-speakers-identifying": return qsTr("identifying speakers…")
         case "transcribing": return qsTr("transcribing…")
         default: return ""
         }
@@ -190,7 +192,15 @@ Item {
         // its own content instead of sharing a fixed-width elide box with it.
         Label {
             visible: bottomBar.busy && bottomBar.phaseLabel(bottomBar.currentPhase) !== ""
-            text: "(" + bottomBar.phaseLabel(bottomBar.currentPhase) + ")"
+            // Percentage omitted during "loading" — progressIsIndeterminate
+            // means taskProgress isn't a real number there (no native hook
+            // for model-load time; see its own doc comment), so showing
+            // "0.0%" the whole time would be actively misleading rather
+            // than just uninformative.
+            text: bottomBar.progressIsIndeterminate
+                ? "(" + bottomBar.phaseLabel(bottomBar.currentPhase) + ")"
+                : "(" + bottomBar.phaseLabel(bottomBar.currentPhase) + " "
+                  + (bottomBar.taskProgress * 100).toFixed(1) + "%)"
             color: "#888888"
             font.pixelSize: 11
         }

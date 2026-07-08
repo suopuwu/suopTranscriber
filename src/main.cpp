@@ -19,23 +19,46 @@ int main(int argc, char *argv[])
     // RPATH/RUNPATH of its own, so its CUDA 12 dependencies (libcublasLt.so.12
     // etc — see CMakeLists.txt's suop_copy_cuda12_compat_libs comment) are
     // only found if LD_LIBRARY_PATH covers them at the time of that LATER
-    // dlopen call. Since glibc's dynamic linker re-reads LD_LIBRARY_PATH per
-    // dlopen (unlike the one-time exec-time resolution of this executable's
-    // own direct NEEDED entries), setting it here — even after this process
-    // has already started — still works for that later, lazy load. Read via
-    // /proc/self/exe (not argv[0], which may be relative or a bare name found
-    // via PATH) so this resolves correctly regardless of how the binary was
-    // invoked; harmless no-op if the directory doesn't exist (e.g. a build
-    // without SHERPA_ONNX_ENABLE_GPU, which never populates it).
-    {
+    // dlopen call.
+    //
+    // glibc's dynamic linker parses LD_LIBRARY_PATH exactly ONCE, during its
+    // own startup (before main() runs) — confirmed the hard way (2026-07-07):
+    // a plain qputenv() here used to "work" in the sense that it never
+    // crashed, but silently never actually put CUDA on sherpa-onnx's search
+    // path either, since that startup parse had already happened before this
+    // line ever runs. dlopen() calls later in the process's life consult
+    // that already-parsed, cached search list — NOT a fresh read of environ
+    // — so a change made after exec() is invisible to them. The only way to
+    // get a runtime-computed LD_LIBRARY_PATH to actually take effect is to
+    // set it and then re-exec this same binary: the new process image's own
+    // ld.so startup parse (which hasn't happened yet at that point) picks up
+    // the corrected environment from the start. SUOP_LD_LIBRARY_PATH_FIXED
+    // is the re-exec guard — set only on the child, so it runs this block
+    // exactly once instead of looping forever.
+    //
+    // Read exePath via /proc/self/exe (not argv[0], which may be relative or
+    // a bare name found via PATH) so this resolves correctly regardless of
+    // how the binary was invoked; harmless no-op if readlink fails, or if
+    // the lib/ directory doesn't exist (e.g. a build without
+    // SHERPA_ONNX_ENABLE_GPU, which never populates it) — diarization still
+    // works CPU-only either way (see DiarizationEngine's own CPU fallback).
+    if (!qEnvironmentVariableIsSet("SUOP_LD_LIBRARY_PATH_FIXED")) {
         char exePath[4096];
         const ssize_t len = readlink("/proc/self/exe", exePath, sizeof(exePath) - 1);
         if (len > 0) {
             exePath[len] = '\0';
             const QString libDir = QFileInfo(QString::fromLocal8Bit(exePath)).absolutePath() + "/lib";
-            const QByteArray existing = qgetenv("LD_LIBRARY_PATH");
-            qputenv("LD_LIBRARY_PATH",
-                    existing.isEmpty() ? libDir.toLocal8Bit() : (libDir.toLocal8Bit() + ":" + existing));
+            if (QFileInfo::exists(libDir)) {
+                const QByteArray existing = qgetenv("LD_LIBRARY_PATH");
+                qputenv("LD_LIBRARY_PATH",
+                        existing.isEmpty() ? libDir.toLocal8Bit() : (libDir.toLocal8Bit() + ":" + existing));
+                qputenv("SUOP_LD_LIBRARY_PATH_FIXED", "1");
+                execv(exePath, argv);
+                // execv() only returns on failure (e.g. ENOENT/EACCES) — fall
+                // through and keep running under the OLD environment rather
+                // than aborting the app outright; CUDA diarization just
+                // won't be found later, same as before this fix existed.
+            }
         }
     }
 

@@ -502,10 +502,18 @@ Rectangle {
             const start = text.length
             const speaker = s.speaker === "" ? "" : mainPanel.effectiveSpeakerName(s.speaker)
             const showGutter = (speaker === "") || (previousSpeaker === null) || (speaker !== previousSpeaker)
-            list.push({t0: s.t0, speaker: speaker, text: s.text, start: start, length: s.text.length,
+            // repeatCount > 1 (SegmentLineWriter merged consecutive identical
+            // whisper segments into one on-disk line, see its doc comment) —
+            // append a "(Nx)" marker so that's still visible here, not just
+            // in the raw .md file. Appended AFTER length is captured from
+            // s.text alone, so the marker itself sits outside the
+            // highlightable/selectable "spoken words" range (same treatment
+            // as gutter timestamps/speaker names — decoration, not content).
+            const displayText = s.repeatCount > 1 ? s.text + " (" + s.repeatCount + "x)" : s.text
+            list.push({t0: s.t0, speaker: speaker, text: displayText, start: start, length: s.text.length,
                        showGutter: showGutter})
             previousSpeaker = speaker
-            text += s.text + "\n"
+            text += displayText + "\n"
         }
         if (text.length > 0)
             text = text.slice(0, -1) // drop the final trailing newline

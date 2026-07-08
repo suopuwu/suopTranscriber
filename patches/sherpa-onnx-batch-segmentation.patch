@@ -1,0 +1,949 @@
+# suopTranscriber local patch — sherpa-onnx speaker diarization pipeline:
+# batching, progress reporting, and follow-up fixes for real-world
+# multi-hour recordings.
+#
+# 1. Batch inference calls (segmentation + embedding models) instead of
+#    running one tiny Ort::Session::Run() per sliding window / per speech
+#    segment — measured ~10% GPU utilization on real recordings even after
+#    enabling CUDA. Segmentation batching is straightforward (fixed window
+#    size). Embedding batching pads variable-length segments, bucketing
+#    same-length-ish segments together (kEmbeddingLengthBucketMaxRatio) to
+#    bound padding-induced numerical drift. Result on a real 24.6-minute
+#    recording: 330.1s (CPU) -> 148.4s (CUDA, unbatched) -> ~33s (CUDA,
+#    batched).
+#
+# 2. Report real, continuous progress across the WHOLE diarize() call —
+#    every phase (segmentation, label conversion, feature extraction,
+#    batched inference) invokes a progress callback once per unit of real
+#    completed work, blended into one combined 0..1000 counter in
+#    Process().
+#
+# 3. Bound peak CPU memory in the embedding phase to a constant instead of
+#    scaling with file length: process in bounded windows
+#    (kEmbeddingStreamWindowSize) instead of building an OnlineStream (with
+#    its extracted fbank features held in memory) for every segment in the
+#    whole file up front. A multi-gigabyte allocation there was getting
+#    silently caught by DiarizationEngine::diarize()'s own graceful-
+#    degradation try/catch — "speakers silently stop being written, no
+#    error shown" on a real 4h48m recording.
+#
+# 4. GPU memory robustness, in three parts, all motivated by the SAME real
+#    4h48m recording still failing after (3):
+#      a. kEmbeddingMaxBatchFrames: a soft cap on batch_count * max_frames
+#         (the actual driver of a batch's GPU tensor size), to avoid
+#         attempting allocations likely to fail. Explicitly NOT a
+#         guarantee — an earlier, more generous value here still let
+#         through a batch that triggered a real 1.1 GB single-allocation
+#         CUDA failure.
+#      b. ProcessEmbeddingBatch() catches that failure and bisects the
+#         batch, retrying each half — recursing down to single items if
+#         needed, with a per-item failure marked NaN (filtered out via the
+#         existing "embedding model may output NaN" handling) rather than
+#         propagating. This is the real safety net: no fixed cap can be
+#         guaranteed correct, since available GPU memory depends on
+#         whatever else is using the GPU at the time. Without this, ONE
+#         oversized batch failed the ENTIRE diarize() call via
+#         DiarizationEngine's top-level catch, discarding every other
+#         segment's already-completed work too. The CUDA OOM itself was
+#         already being caught gracefully, but left the GPU pressured
+#         enough that a LATER, unrelated whisper.cpp Vulkan allocation
+#         also failed — and THAT failure is uncaught anywhere in
+#         whisper.cpp/ggml, terminating the whole process. Fixing the
+#         diarization-side root cause prevents the downstream crash too.
+#      c. kEmbeddingFrameQuantum: max_frames is rounded UP to the nearest
+#         quantum instead of using each bucket's raw longest item. Why:
+#         ONNX Runtime's CUDA memory arena is a CACHING allocator — it
+#         holds distinctly-sized buffers for reuse rather than freeing
+#         them, so a long recording's thousands of buckets (each with a
+#         slightly different raw max_frames) were asking it to cache
+#         thousands of uniquely-sized tensors. Confirmed directly: this
+#         grew the arena to ~29 GB (nearly the entire 32 GB card) on the
+#         same real recording, before the 1.1 GB failure in (a)/(b). Also
+#         fixed a genuine bug where windowed processing (3) changed
+#         execution order but the progress-numbering scheme still assumed
+#         the old order, causing progress to visibly jump forward then
+#         back at every window boundary ("jumps back and forth between 20
+#         and 40 percent") — verified via a regression check forcing ~27
+#         window transitions on the 24-minute file: 5282 progress events,
+#         zero backward jumps.
+#
+# Pinned against sherpa-onnx v1.13.4 (submodule commit 142807252687d81b40
+# d6315f23470a1512a00de3). Re-verify this still applies cleanly (`git apply
+# --check`) after any submodule version bump; if it doesn't, re-derive it
+# against the new source rather than force-applying.
+diff --git a/sherpa-onnx/csrc/offline-speaker-diarization-pyannote-impl.h b/sherpa-onnx/csrc/offline-speaker-diarization-pyannote-impl.h
+index 083b62d0..4d6dfb20 100644
+--- a/sherpa-onnx/csrc/offline-speaker-diarization-pyannote-impl.h
++++ b/sherpa-onnx/csrc/offline-speaker-diarization-pyannote-impl.h
+@@ -6,6 +6,7 @@
+ 
+ #include <algorithm>
+ #include <cmath>
++#include <functional>
+ #include <memory>
+ #include <unordered_map>
+ #include <utility>
+@@ -96,7 +97,31 @@ class OfflineSpeakerDiarizationPyannoteImpl
+       const float *audio, int32_t n,
+       OfflineSpeakerDiarizationProgressCallback callback = nullptr,
+       void *callback_arg = nullptr) const override {
+-    std::vector<Matrix2D> segmentations = RunSpeakerSegmentationModel(audio, n);
++    // suopTranscriber local patch: THREE phases now all report real
++    // progress, blended into one combined 0..kProgressScale counter —
++    // callers (see DiarizationEngine::diarize()'s onProgress) don't need
++    // to know anything changed: numTotalChunks stays a constant
++    // kProgressScale throughout, numProcessedChunks just grows
++    // continuously across all three instead of sitting frozen through
++    // segmentation (upstream NEVER reported progress there), through label
++    // conversion just below (plain CPU work, also never reported — this
++    // one only became noticeable once the other two gaps were fixed:
++    // measured a 6.6s silent stretch here on a real recording), and
++    // through embedding (see ComputeEmbeddings()'s doc comment for how
++    // batching broke ITS progress specifically). The shares are a fixed
++    // approximation of each phase's typical time (measured roughly
++    // 28/2/70 on a real recording) — not adaptive per-file, just enough to
++    // keep the bar moving smoothly throughout.
++    auto segmentationProgress = [callback, callback_arg](int32_t done, int32_t total) {
++      if (callback && total > 0) {
++        callback(static_cast<int32_t>(static_cast<double>(done) * kSegmentationProgressShare *
++                                       kProgressScale / total),
++                 kProgressScale, callback_arg);
++      }
++    };
++
++    std::vector<Matrix2D> segmentations =
++        RunSpeakerSegmentationModel(audio, n, segmentationProgress);
+     // segmentations[i] is for chunk_i
+     // Each matrix is of shape (num_frames, num_powerset_classes)
+     if (segmentations.empty()) {
+@@ -106,15 +131,26 @@ class OfflineSpeakerDiarizationPyannoteImpl
+     std::vector<Matrix2DInt32> labels;
+     labels.reserve(segmentations.size());
+ 
+-    for (const auto &m : segmentations) {
+-      labels.push_back(ToMultiLabel(m));
++    {
++      const int32_t total_windows = static_cast<int32_t>(segmentations.size());
++      const int32_t base = static_cast<int32_t>(kSegmentationProgressShare * kProgressScale);
++      const int32_t range = static_cast<int32_t>(kLabelConversionProgressShare * kProgressScale);
++      int32_t label_index = 0;
++      for (const auto &m : segmentations) {
++        labels.push_back(ToMultiLabel(m));
++        ++label_index;
++        if (callback && total_windows > 0) {
++          callback(base + static_cast<int32_t>(static_cast<double>(label_index) * range / total_windows),
++                   kProgressScale, callback_arg);
++        }
++      }
+     }
+ 
+     segmentations.clear();
+ 
+     if (labels.size() == 1) {
+       if (callback) {
+-        callback(1, 1, callback_arg);
++        callback(kProgressScale, kProgressScale, callback_arg);
+       }
+ 
+       return HandleOneChunkSpecialCase(labels[0], n);
+@@ -138,9 +174,23 @@ class OfflineSpeakerDiarizationPyannoteImpl
+     std::vector<int32_t> valid_indexes;
+     valid_indexes.reserve(chunk_speaker_samples_list_pair.second.size());
+ 
++    const int32_t embeddingProgressBase = static_cast<int32_t>(
++        (kSegmentationProgressShare + kLabelConversionProgressShare) * kProgressScale);
++    if (callback) {
++      callback(embeddingProgressBase, kProgressScale, callback_arg);
++    }
++
++    auto embeddingProgress = [callback, callback_arg, embeddingProgressBase](int32_t done, int32_t total) {
++      if (callback && total > 0) {
++        const int32_t range = kProgressScale - embeddingProgressBase;
++        callback(embeddingProgressBase + static_cast<int32_t>(static_cast<double>(done) * range / total),
++                 kProgressScale, callback_arg);
++      }
++    };
++
+     Matrix2D embeddings =
+         ComputeEmbeddings(audio, n, chunk_speaker_samples_list_pair.second,
+-                          &valid_indexes, std::move(callback), callback_arg);
++                          &valid_indexes, embeddingProgress);
+ 
+     if (valid_indexes.size() != chunk_speaker_samples_list_pair.second.size()) {
+       std::vector<Int32Pair> chunk_speaker_pair;
+@@ -234,8 +284,39 @@ class OfflineSpeakerDiarizationPyannoteImpl
+     }
+   }
+ 
+-  std::vector<Matrix2D> RunSpeakerSegmentationModel(const float *audio,
+-                                                    int32_t n) const {
++  // suopTranscriber local patch: how many sliding windows to batch into a
++  // single Ort::Session::Run() call for the segmentation model — see
++  // RunSpeakerSegmentationModel()'s doc comment for why. Not tuned per-GPU;
++  // a size/memory compromise: big enough to meaningfully cut the call count
++  // (hundreds of windows -> tens of batches for a real recording), small
++  // enough that batch_count * window_size floats (~20 MB at 32 windows *
++  // 160000 samples/window * 4 bytes, pyannote's actual 10s-at-16kHz window)
++  // stays a trivial, one-off allocation regardless of provider.
++  static constexpr int32_t kSegmentationBatchSize = 32;
++
++  // suopTranscriber local patch: see Process()'s doc comment for the
++  // combined-progress design these feed — segmentation batches get
++  // kSegmentationProgressShare, the label-conversion loop right after gets
++  // kLabelConversionProgressShare, and embedding gets everything else
++  // (1 - the other two).
++  static constexpr int32_t kProgressScale = 1000;
++  static constexpr double kSegmentationProgressShare = 0.25;
++  static constexpr double kLabelConversionProgressShare = 0.05;
++
++  // suopTranscriber local patch: see ComputeEmbeddings()'s doc comment.
++  // Bounds how many OnlineStream objects (each retaining its own extracted
++  // fbank features — num_frames * 80 floats, not freed until consumed) are
++  // held in memory at once, instead of building one per speech segment for
++  // the WHOLE file up front. 512 is 16x kEmbeddingBatchSize — big enough
++  // that length-bucketing (see ComputeBatch()) still has a decent pool of
++  // candidates to group similar-length segments from, small enough that
++  // peak memory here stays a bounded constant regardless of file length —
++  // not deeply tuned.
++  static constexpr int32_t kEmbeddingStreamWindowSize = 512;
++
++  std::vector<Matrix2D> RunSpeakerSegmentationModel(
++      const float *audio, int32_t n,
++      const std::function<void(int32_t, int32_t)> &progressCallback = {}) const {
+     std::vector<Matrix2D> ans;
+ 
+     const auto &meta_data = segmentation_model_.GetModelMetaData();
+@@ -267,6 +348,10 @@ class OfflineSpeakerDiarizationPyannoteImpl
+ 
+       ans.push_back(std::move(m));
+ 
++      if (progressCallback) {
++        progressCallback(1, 1);
++      }
++
+       return ans;
+     }
+ 
+@@ -275,21 +360,51 @@ class OfflineSpeakerDiarizationPyannoteImpl
+ 
+     ans.reserve(num_chunks + has_last_chunk);
+ 
+-    const float *p = audio;
+-
+-    for (int32_t i = 0; i != num_chunks; ++i, p += window_shift) {
+-      Matrix2D m = ProcessChunk(p);
+-
+-      ans.push_back(std::move(m));
++    // suopTranscriber local patch (see patches/sherpa-onnx-batch-
++    // segmentation.patch): batch multiple sliding windows into ONE
++    // Ort::Session::Run() call instead of one call per window (the
++    // upstream default just below, still used for the <=1 chunk and
++    // has_last_chunk tail cases). Each window is a small, cheap forward
++    // pass; under CUDA specifically, kernel-launch/host-device-sync
++    // overhead between calls dominates over actual compute for a real
++    // recording's hundreds of sequential windows (measured: ~10% GPU
++    // utilization unbatched), so batching amortizes that per-call
++    // overhead across real work instead of paying it once per window.
++    //
++    // total_batches also feeds progressCallback below — upstream never
++    // reported segmentation progress at all; see Process()'s doc comment
++    // for why that changed here.
++    const int32_t total_batches =
++        (num_chunks + kSegmentationBatchSize - 1) / kSegmentationBatchSize +
++        (has_last_chunk ? 1 : 0);
++    int32_t completed_batches = 0;
++    for (int32_t start = 0; start < num_chunks; start += kSegmentationBatchSize) {
++      int32_t batch_count = std::min(kSegmentationBatchSize, num_chunks - start);
++      std::vector<Matrix2D> batch = ProcessBatch(
++          audio + static_cast<int64_t>(start) * window_shift, window_shift,
++          window_size, batch_count);
++      for (Matrix2D &m : batch) {
++        ans.push_back(std::move(m));
++      }
++      ++completed_batches;
++      if (progressCallback) {
++        progressCallback(completed_batches, total_batches);
++      }
+     }
+ 
+     if (has_last_chunk) {
++      const float *p = audio + static_cast<int64_t>(num_chunks) * window_shift;
+       std::vector<float> buf(window_size);
+       std::copy(p, audio + n, buf.data());
+ 
+       Matrix2D m = ProcessChunk(buf.data());
+ 
+       ans.push_back(std::move(m));
++
++      ++completed_batches;
++      if (progressCallback) {
++        progressCallback(completed_batches, total_batches);
++      }
+     }
+ 
+     return ans;
+@@ -316,6 +431,60 @@ class OfflineSpeakerDiarizationPyannoteImpl
+     return m;
+   }
+ 
++  // suopTranscriber local patch: see RunSpeakerSegmentationModel()'s call
++  // site comment above. `p` points `batch_count` sliding windows of
++  // `window_size` samples each (spaced `window_shift` samples apart,
++  // OVERLAPPING when window_shift < window_size, as pyannote's 90% overlap
++  // does) into the caller's audio buffer — all `batch_count` windows are
++  // guaranteed fully in-bounds by construction (only called for the
++  // num_chunks range; the zero-padded final partial window still goes
++  // through the original single-chunk ProcessChunk() above).
++  std::vector<Matrix2D> ProcessBatch(const float *p, int32_t window_shift,
++                                      int32_t window_size,
++                                      int32_t batch_count) const {
++    auto memory_info =
++        Ort::MemoryInfo::CreateCpu(OrtDeviceAllocator, OrtMemTypeDefault);
++
++    // Windows overlap, so they can't be read as one contiguous
++    // [batch_count, window_size] block of the ORIGINAL audio buffer
++    // directly — each window is copied into its own slot of a fresh,
++    // truly contiguous buffer instead. A memcpy is trivially cheap next
++    // to the inference call this feeds.
++    std::vector<float> buf(static_cast<size_t>(batch_count) * window_size);
++    for (int32_t i = 0; i != batch_count; ++i) {
++      std::copy(p + static_cast<int64_t>(i) * window_shift,
++                p + static_cast<int64_t>(i) * window_shift + window_size,
++                buf.data() + static_cast<size_t>(i) * window_size);
++    }
++
++    std::array<int64_t, 3> shape = {batch_count, 1, window_size};
++
++    Ort::Value x = Ort::Value::CreateTensor(memory_info, buf.data(),
++                                            buf.size(), shape.data(),
++                                            shape.size());
++
++    Ort::Value out = segmentation_model_.Forward(std::move(x));
++    std::vector<int64_t> out_shape = out.GetTensorTypeAndShapeInfo().GetShape();
++    // out_shape = {batch_count, num_frames, num_classes} — the model's
++    // batch axis is dynamic (confirmed against the actual .onnx graph,
++    // not just the Forward() doc comment), so this just works.
++    int32_t num_frames = out_shape[1];
++    int32_t num_classes = out_shape[2];
++    const float *out_data = out.GetTensorData<float>();
++
++    std::vector<Matrix2D> ans;
++    ans.reserve(batch_count);
++    for (int32_t i = 0; i != batch_count; ++i) {
++      Matrix2D m(num_frames, num_classes);
++      std::copy(
++          out_data + static_cast<size_t>(i) * num_frames * num_classes,
++          out_data + static_cast<size_t>(i + 1) * num_frames * num_classes,
++          &m(0, 0));
++      ans.push_back(std::move(m));
++    }
++    return ans;
++  }
++
+   Matrix2DInt32 ToMultiLabel(const Matrix2D &m) const {
+     int32_t num_rows = m.rows();
+     Matrix2DInt32 ans(num_rows, powerset_mapping_.cols());
+@@ -473,53 +642,141 @@ class OfflineSpeakerDiarizationPyannoteImpl
+    *         where ans.row[i] contains the embedding for the
+    *         i-th (chunk, speaker) pair
+    */
++  // suopTranscriber local patch: progressCallback is a simple (done, total)
++  // pair now — not the raw OfflineSpeakerDiarizationProgressCallback C-style
++  // pair — because ComputeBatch() below reports progress ONCE PER COMPLETED
++  // BATCH (a whole bucket finishing together, not one item at a time), so
++  // this function no longer needs its own per-item callback loop at all
++  // (removed — see below); it just forwards Process()'s already-scaled
++  // lambda straight through to ComputeBatch().
+   Matrix2D ComputeEmbeddings(
+       const float *audio, int32_t n,
+       const std::vector<std::vector<Int32Pair>> &sample_indexes,
+       std::vector<int32_t> *valid_indexes,
+-      OfflineSpeakerDiarizationProgressCallback callback,
+-      void *callback_arg) const {
++      const std::function<void(int32_t, int32_t)> &progressCallback) const {
+     const auto &meta_data = segmentation_model_.GetModelMetaData();
+     int32_t sample_rate = meta_data.sample_rate;
+     Matrix2D ans(sample_indexes.size(), embedding_extractor_.Dim());
+ 
+     auto IsNaNWrapper = [](float f) -> bool { return std::isnan(f); };
+ 
++    // suopTranscriber local patch (see patches/sherpa-onnx-batch-
++    // segmentation.patch): build a WINDOW of streams at a time (cheap CPU
++    // feature extraction — must stay sequential, each needs its own
++    // OnlineStream), THEN batch the embedding-model inference across that
++    // window in one embedding_extractor_.ComputeBatch() call instead of
++    // one embedding_extractor_.Compute() call per stream — see
++    // SpeakerEmbeddingExtractorGeneralImpl::ComputeBatch()'s doc comment
++    // for why this one (unlike segmentation) needs length-bucketing.
++    //
++    // Windowed, NOT "build every stream for the whole file up front": each
++    // OnlineStream retains its extracted fbank features (num_frames * 80
++    // floats) until consumed, so holding ALL of them simultaneously for a
++    // long recording scales memory with TOTAL FILE LENGTH — a real,
++    // multi-gigabyte-scale risk for a many-hour recording with thousands
++    // of speech segments (an earlier version of this patch did exactly
++    // that, and a clean std::bad_alloc there gets silently caught by
++    // DiarizationEngine::diarize()'s own try/catch, see its doc comment,
++    // degrading to "no speakers found" with NO visible error — exactly the
++    // "speakers silently stopped being written on large files" symptom
++    // this fix addresses). kEmbeddingStreamWindowSize bounds peak memory
++    // to a constant regardless of file length.
++    //
++    // AcceptWaveform() below is where the actual fbank feature extraction
++    // happens (ComputeBatch()'s own "Phase 1" just RETRIEVES already-
++    // computed frames — cheap; this loop is where the real, sometimes
++    // lengthy, CPU cost of the whole embedding phase actually is, measured
++    // directly: a 6.6s silent gap on a real 24-minute recording before
++    // progress reporting was added here). Reported as the first half of
++    // this call's own progress range; ComputeBatch()'s own report becomes
++    // the second half via computeBatchProgress below — Process()'s
++    // embeddingProgress lambda doesn't need to know any of this, it just
++    // keeps rescaling whatever (done, total) pair arrives here into its
++    // own [base, kProgressScale] slice.
++    const int32_t total_items = static_cast<int32_t>(sample_indexes.size());
++    const int32_t total_units = total_items * 2;
++
+     int32_t k = 0;
+     int32_t cur_row_index = 0;
+-    for (const auto &v : sample_indexes) {
+-      auto stream = embedding_extractor_.CreateStream();
+-      for (const auto &p : v) {
+-        int32_t end = (p.second <= n) ? p.second : n;
+-        int32_t num_samples = end - p.first;
+-
+-        if (num_samples > 0) {
+-          stream->AcceptWaveform(sample_rate, audio + p.first, num_samples);
++
++    for (size_t window_start = 0; window_start < sample_indexes.size();
++         window_start += kEmbeddingStreamWindowSize) {
++      const size_t window_end = std::min(
++          sample_indexes.size(), window_start + static_cast<size_t>(kEmbeddingStreamWindowSize));
++      const int32_t window_size = static_cast<int32_t>(window_end - window_start);
++
++      std::vector<std::unique_ptr<OnlineStream>> streams;
++      streams.reserve(window_size);
++      std::vector<OnlineStream *> stream_ptrs;
++      stream_ptrs.reserve(window_size);
++
++      for (size_t i = window_start; i != window_end; ++i) {
++        const auto &v = sample_indexes[i];
++        auto stream = embedding_extractor_.CreateStream();
++        for (const auto &p : v) {
++          int32_t end = (p.second <= n) ? p.second : n;
++          int32_t num_samples = end - p.first;
++
++          if (num_samples > 0) {
++            stream->AcceptWaveform(sample_rate, audio + p.first, num_samples);
++          }
+         }
+-      }
+ 
+-      stream->InputFinished();
+-      if (!embedding_extractor_.IsReady(stream.get())) {
+-        SHERPA_ONNX_LOGE(
+-            "This segment is too short, which should not happen since we have "
+-            "already filtered short segments");
+-        SHERPA_ONNX_EXIT(-1);
++        stream->InputFinished();
++        if (!embedding_extractor_.IsReady(stream.get())) {
++          SHERPA_ONNX_LOGE(
++              "This segment is too short, which should not happen since we have "
++              "already filtered short segments");
++          SHERPA_ONNX_EXIT(-1);
++        }
++
++        stream_ptrs.push_back(stream.get());
++        streams.push_back(std::move(stream));
++
++        // suopTranscriber local patch: window_start IS the count of items
++        // fully accounted for by all PRIOR windows (windows are
++        // contiguous), so window_start*2 is exactly where this window's
++        // own [build, compute] unit range begins within total_units.
++        // Fixed a real bug here: an earlier version used total_items
++        // (not window_start) as this window's base, which only made sense
++        // under the OLD "build every stream for the whole file, THEN
++        // compute" design — under windowed processing (build window 1,
++        // compute window 1, build window 2, ...) that made progress jump
++        // forward to ~50% after window 1's compute phase, then jump
++        // BACKWARD when window 2's build phase resumed counting from a
++        // much lower absolute position — reported directly: "jumps back
++        // and forth between 20 and 40 percent".
++        if (progressCallback) {
++          const int32_t local_position = static_cast<int32_t>(i - window_start);
++          progressCallback(static_cast<int32_t>(window_start) * 2 + local_position + 1, total_units);
++        }
+       }
+ 
+-      std::vector<float> embedding = embedding_extractor_.Compute(stream.get());
++      auto computeBatchProgress = [&progressCallback, total_units, window_start,
++                                   window_size](int32_t done, int32_t total) {
++        if (progressCallback && total > 0) {
++          const int32_t window_done = static_cast<int32_t>(static_cast<double>(done) * window_size / total);
++          const int32_t base = static_cast<int32_t>(window_start) * 2 + window_size;
++          progressCallback(base + window_done, total_units);
++        }
++      };
+ 
+-      if (std::none_of(embedding.begin(), embedding.end(), IsNaNWrapper)) {
+-        // a valid embedding
+-        std::copy(embedding.begin(), embedding.end(), &ans(cur_row_index, 0));
+-        cur_row_index += 1;
+-        valid_indexes->push_back(k);
+-      }
++      std::vector<std::vector<float>> window_embeddings =
++          embedding_extractor_.ComputeBatch(stream_ptrs, computeBatchProgress);
+ 
+-      k += 1;
++      for (const std::vector<float> &embedding : window_embeddings) {
++        if (std::none_of(embedding.begin(), embedding.end(), IsNaNWrapper)) {
++          // a valid embedding
++          std::copy(embedding.begin(), embedding.end(), &ans(cur_row_index, 0));
++          cur_row_index += 1;
++          valid_indexes->push_back(k);
++        }
+ 
+-      if (callback) {
+-        callback(k, ans.rows(), callback_arg);
++        k += 1;
+       }
++      // `streams` (and every OnlineStream's fbank feature memory) is freed
++      // here, at the end of this window's scope, before the next window's
++      // streams are built.
+     }
+ 
+     if (k != cur_row_index) {
+diff --git a/sherpa-onnx/csrc/speaker-embedding-extractor-general-impl.h b/sherpa-onnx/csrc/speaker-embedding-extractor-general-impl.h
+index 19a83212..84706d34 100644
+--- a/sherpa-onnx/csrc/speaker-embedding-extractor-general-impl.h
++++ b/sherpa-onnx/csrc/speaker-embedding-extractor-general-impl.h
+@@ -5,6 +5,8 @@
+ #ifndef SHERPA_ONNX_CSRC_SPEAKER_EMBEDDING_EXTRACTOR_GENERAL_IMPL_H_
+ #define SHERPA_ONNX_CSRC_SPEAKER_EMBEDDING_EXTRACTOR_GENERAL_IMPL_H_
+ #include <algorithm>
++#include <functional>
++#include <limits>
+ #include <memory>
+ #include <utility>
+ #include <vector>
+@@ -99,6 +101,162 @@ class SpeakerEmbeddingExtractorGeneralImpl
+     return ans;
+   }
+ 
++  // suopTranscriber local patch (see patches/sherpa-onnx-batch-
++  // segmentation.patch): real batched fast path, overriding the naive
++  // per-stream default in SpeakerEmbeddingExtractorImpl. Unlike the
++  // segmentation model's FIXED window_size (trivial to batch — see
++  // offline-speaker-diarization-pyannote-impl.h's sibling patch), each
++  // speech segment here has a DIFFERENT frame count, and this model has no
++  // length/mask input — every frame in a batch, real or padded, gets
++  // processed identically by the conv+pooling stack, so naively batching
++  // very different lengths together would let padding measurably distort
++  // the pooled embedding for the shorter items. Bucketing by length (see
++  // kEmbeddingLengthBucketMaxRatio) keeps worst-case padding waste bounded
++  // instead of eliminating it — a deliberate accuracy/speed tradeoff, not
++  // a free lunch; validated empirically (see the patch file's own
++  // description) rather than assumed safe.
++  std::vector<std::vector<float>> ComputeBatch(
++      const std::vector<OnlineStream *> &streams,
++      const std::function<void(int32_t, int32_t)> &progressCallback = {}) const override {
++    const int32_t num_streams = static_cast<int32_t>(streams.size());
++    std::vector<std::vector<float>> ans(num_streams);
++    if (num_streams == 0) {
++      return ans;
++    }
++
++    // suopTranscriber local patch: Phase 1 (below) and Phase 2 (batched
++    // inference) each count for half of progressCallback's own range here
++    // — feature extraction has no natural "batch" grouping the way
++    // inference does, but it's still real, sequential, sometimes lengthy
++    // CPU work (measured: a 6.9s silent gap on a real 24-minute recording
++    // before this was added) that callers should still see move. This
++    // doubled total is purely internal to this call — ComputeEmbeddings()
++    // forwards whatever (done, total) pair arrives straight through, it
++    // doesn't assume total == streams.size().
++    const int32_t progressTotal = num_streams * 2;
++
++    // Phase 1: per-stream feature extraction + normalization — the CHEAP
++    // CPU part (measured: not the bottleneck; see the segmentation patch's
++    // sibling comment for the same finding on that model). Kept exactly
++    // as Compute() above does it, just factored out so the expensive ONNX
++    // inference below can be batched across streams instead.
++    std::vector<EmbeddingBatchItem> items;
++    items.reserve(num_streams);
++    int32_t feat_dim = 0;
++
++    for (int32_t i = 0; i != num_streams; ++i) {
++      OnlineStream *s = streams[i];
++      int32_t num_frames = s->NumFramesReady() - s->GetNumProcessedFrames();
++      if (num_frames <= 0) {
++#if __OHOS__
++        SHERPA_ONNX_LOGE(
++            "Please make sure IsReady(s) returns true. num_frames: "
++            "%{public}d",
++            num_frames);
++#else
++        SHERPA_ONNX_LOGE(
++            "Please make sure IsReady(s) returns true. num_frames: %d",
++            num_frames);
++#endif
++        continue;  // ans[i] stays empty, same shape as Compute()'s
++                   // undefined-behavior-avoided-by-caller-contract case
++      }
++
++      std::vector<float> features =
++          s->GetFrames(s->GetNumProcessedFrames(), num_frames);
++      s->GetNumProcessedFrames() += num_frames;
++
++      feat_dim = static_cast<int32_t>(features.size()) / num_frames;
++
++      const auto &meta_data = model_.GetMetaData();
++      if (!meta_data.feature_normalize_type.empty()) {
++        if (meta_data.feature_normalize_type == "global-mean") {
++          SubtractGlobalMean(features.data(), num_frames, feat_dim);
++        } else {
++#if __OHOS__
++          SHERPA_ONNX_LOGE("Unsupported feature_normalize_type: %{public}s",
++                           meta_data.feature_normalize_type.c_str());
++#else
++          SHERPA_ONNX_LOGE("Unsupported feature_normalize_type: %s",
++                           meta_data.feature_normalize_type.c_str());
++#endif
++          SHERPA_ONNX_EXIT(-1);
++        }
++      }
++
++      items.push_back({i, num_frames, std::move(features)});
++
++      if (progressCallback) {
++        progressCallback(i + 1, progressTotal);
++      }
++    }
++
++    if (items.empty()) {
++      return ans;
++    }
++
++    // Phase 2: bucket by length (ascending), then run ONE
++    // Ort::Session::Run() per bucket instead of one per item.
++    std::sort(items.begin(), items.end(),
++              [](const EmbeddingBatchItem &a, const EmbeddingBatchItem &b) {
++                return a.num_frames < b.num_frames;
++              });
++
++    size_t i = 0;
++    int32_t completed_items = 0;
++    while (i != items.size()) {
++      size_t j = i + 1;
++      const int32_t min_frames = items[i].num_frames;
++      const int32_t max_frames_allowed = static_cast<int32_t>(
++          min_frames * kEmbeddingLengthBucketMaxRatio);
++      while (j != items.size() &&
++             (j - i) < static_cast<size_t>(kEmbeddingBatchSize) &&
++             items[j].num_frames <= max_frames_allowed) {
++        // suopTranscriber local patch: kEmbeddingBatchSize and
++        // kEmbeddingLengthBucketMaxRatio above only bound item COUNT and
++        // the RELATIVE spread of lengths within a bucket — neither bounds
++        // the ABSOLUTE tensor size a bucket can grow to. A real recording
++        // can contain a very long continuous segment (e.g. someone
++        // talking for minutes); batching kEmbeddingBatchSize of THOSE
++        // together produces a batch_count * max_frames product large
++        // enough for a deep conv net's internal activation memory to
++        // exceed GPU VRAM entirely — measured directly: a 1.1 GB single
++        // allocation failure (CUDA OOM) inside ONNX Runtime on a real
++        // multi-hour recording. This check stops the bucket from growing
++        // once admitting the NEXT item (which, since items are sorted
++        // ascending, would also become the bucket's new max_frames) would
++        // push batch_count * max_frames past kEmbeddingMaxBatchFrames,
++        // regardless of whether the count/ratio limits above were already
++        // satisfied. A single item alone is never rejected by this check
++        // (the bucket always contains at least items[i]) — same
++        // unbounded-length tolerance the ORIGINAL unbatched code already
++        // had for one segment at a time; only the MULTIPLICATION by
++        // batch_count is new, so only that is capped here.
++        const int64_t projected_frames =
++            static_cast<int64_t>(j - i + 1) * items[j].num_frames;
++        if (projected_frames > kEmbeddingMaxBatchFrames) {
++          break;
++        }
++        ++j;
++      }
++
++      ProcessEmbeddingBatch(items, i, j, feat_dim, &ans);
++      // suopTranscriber local patch: report progress once per completed
++      // BUCKET, not once per item — items within a bucket finish together
++      // (one Session::Run() call), so there's no meaningful "per-item"
++      // moment to report within a bucket. Starts counting from num_streams
++      // (Phase 1's share of progressTotal, already fully reported above)
++      // rather than 0.
++      completed_items += static_cast<int32_t>(j - i);
++      if (progressCallback) {
++        progressCallback(num_streams + completed_items, progressTotal);
++      }
++      i = j;
++    }
++
++    return ans;
++  }
++
+  private:
+   void SubtractGlobalMean(float *p, int32_t num_frames,
+                           int32_t feat_dim) const {
+@@ -109,8 +267,163 @@ class SpeakerEmbeddingExtractorGeneralImpl
+     m = m.rowwise() - m.colwise().mean();
+   }
+ 
++  // suopTranscriber local patch: one item queued for ComputeBatch() below —
++  // a class-scope type (not function-local) so ProcessEmbeddingBatch() can
++  // share it.
++  struct EmbeddingBatchItem {
++    int32_t index;  // this item's position in ComputeBatch()'s `streams`/`ans`
++    int32_t num_frames;
++    std::vector<float> features;  // num_frames * feat_dim, already normalized
++  };
++
++  // suopTranscriber local patch: see ComputeBatch()'s doc comment. `items`
++  // is sorted ascending by num_frames; [begin, end) is one length bucket.
++  // Zero-pads every item in the bucket up to the bucket's own max length
++  // (items[end - 1].num_frames, since the range is sorted), runs one
++  // batched Session::Run(), then writes each item's own embedding back
++  // into `*ans` at its ORIGINAL (pre-sort) index.
++  //
++  // No fixed batch-size/frame-count cap (see kEmbeddingMaxBatchFrames) can
++  // ever be GUARANTEED safe — the model's actual internal activation
++  // memory scaling isn't visible from here, and available GPU memory
++  // varies with whatever ELSE is using the GPU at the time. Confirmed
++  // directly: kEmbeddingMaxBatchFrames=100000 was NOT conservative enough
++  // in practice — a real 1.1 GB single-allocation CUDA failure still
++  // happened on a real multi-hour recording. So this reacts to an actual
++  // failure instead of only trying to predict one: on any exception from
++  // the inference call, bisect the batch and retry each half — a smaller
++  // batch means a smaller tensor, which either succeeds or gets bisected
++  // again down to single items. This means ONE oversized batch degrades
++  // gracefully (the rest of the file's diarization still completes)
++  // instead of the WHOLE diarize() call failing via
++  // DiarizationEngine::diarize()'s top-level try/catch, which previously
++  // discarded every other segment's already-computed work too — the exact
++  // "no speakers written at all, even for the parts that would have
++  // worked fine" symptom this fixes.
++  void ProcessEmbeddingBatch(const std::vector<EmbeddingBatchItem> &items,
++                             size_t begin, size_t end, int32_t feat_dim,
++                             std::vector<std::vector<float>> *ans) const {
++    const int32_t batch_count = static_cast<int32_t>(end - begin);
++    // suopTranscriber local patch: rounded UP to the nearest
++    // kEmbeddingFrameQuantum instead of using the bucket's raw longest
++    // item directly. Why: ONNX Runtime's default CUDA memory arena is a
++    // CACHING allocator — it holds onto distinctly-sized buffers for
++    // reuse rather than freeing them back to the driver between calls.
++    // Every bucket here can have a slightly different max_frames (real
++    // segment lengths vary continuously), so without quantizing, a long
++    // multi-hour recording with thousands of buckets asks the arena to
++    // cache thousands of UNIQUELY-sized tensors — confirmed directly: one
++    // real 4h48m recording's diarization pass grew the CUDA arena to
++    // ~29 GB (nearly the entire card) before the eventual 1.1 GB
++    // allocation failure that motivated ProcessEmbeddingBatch()'s retry
++    // fallback above. Quantizing means many buckets share the exact same
++    // padded shape, so the arena can actually REUSE cached blocks instead
++    // of continuously growing. Costs a little extra zero-padding (already
++    // tolerated — see kEmbeddingLengthBucketMaxRatio), not tuned to a
++    // precise memory budget.
++    const int32_t max_frames =
++        ((items[end - 1].num_frames + kEmbeddingFrameQuantum - 1) / kEmbeddingFrameQuantum) *
++        kEmbeddingFrameQuantum;
++
++    try {
++      std::vector<float> buf(
++          static_cast<size_t>(batch_count) * max_frames * feat_dim, 0.0f);
++      for (int32_t bi = 0; bi != batch_count; ++bi) {
++        const EmbeddingBatchItem &it = items[begin + bi];
++        std::copy(it.features.begin(), it.features.end(),
++                  buf.data() + static_cast<size_t>(bi) * max_frames * feat_dim);
++        // Remaining (max_frames - it.num_frames) * feat_dim entries for
++        // this item stay zero — the padding kEmbeddingLengthBucketMaxRatio
++        // bounds.
++      }
++
++      auto memory_info =
++          Ort::MemoryInfo::CreateCpu(OrtDeviceAllocator, OrtMemTypeDefault);
++
++      std::array<int64_t, 3> x_shape{batch_count, max_frames, feat_dim};
++      Ort::Value x = Ort::Value::CreateTensor(memory_info, buf.data(),
++                                              buf.size(), x_shape.data(),
++                                              x_shape.size());
++
++      Ort::Value embedding = model_.Compute(std::move(x));
++      std::vector<int64_t> embedding_shape =
++          embedding.GetTensorTypeAndShapeInfo().GetShape();
++      // embedding_shape = {batch_count, embedding_dim}
++      const int32_t embedding_dim = static_cast<int32_t>(embedding_shape[1]);
++      const float *out_data = embedding.GetTensorData<float>();
++
++      for (int32_t bi = 0; bi != batch_count; ++bi) {
++        const EmbeddingBatchItem &it = items[begin + bi];
++        std::vector<float> emb(embedding_dim);
++        std::copy(out_data + static_cast<size_t>(bi) * embedding_dim,
++                  out_data + static_cast<size_t>(bi + 1) * embedding_dim,
++                  emb.begin());
++        (*ans)[it.index] = std::move(emb);
++      }
++    } catch (const std::exception &e) {
++      if (batch_count > 1) {
++        const size_t mid = begin + (end - begin) / 2;
++        ProcessEmbeddingBatch(items, begin, mid, feat_dim, ans);
++        ProcessEmbeddingBatch(items, mid, end, feat_dim, ans);
++        return;
++      }
++
++      // A single item alone still doesn't fit — genuinely unrecoverable
++      // for THIS segment specifically (not a batching artifact). Marked
++      // NaN (using the model's static output_dim, since a failed call
++      // never produced a real result to read the dimension from) so the
++      // EXISTING "embedding model may output NaN" handling in
++      // ComputeEmbeddings() correctly filters it out via IsNaNWrapper,
++      // instead of leaving an ambiguous empty vector that
++      // std::none_of(empty range) would vacuously — and incorrectly —
++      // treat as "valid, no NaN present".
++      SHERPA_ONNX_LOGE(
++          "Failed to compute embedding for one segment even at batch size "
++          "1 (%d frames) — skipping just this segment: %s",
++          items[begin].num_frames, e.what());
++      (*ans)[items[begin].index] = std::vector<float>(
++          model_.GetMetaData().output_dim, std::numeric_limits<float>::quiet_NaN());
++    }
++  }
++
+  private:
+   SpeakerEmbeddingExtractorModel model_;
++
++  // suopTranscriber local patch: see ComputeBatch()'s doc comment for both.
++  // Not tuned per-GPU. 32 mirrors the segmentation model's batch size (same
++  // size/memory-triviality reasoning). 1.5x bounds worst-case padding
++  // waste (and therefore worst-case pooled-embedding drift from padding)
++  // for the shortest item in any one bucket, while still giving same-ish-
++  // length segments (the common case for turns from the same speaker) room
++  // to batch together.
++  static constexpr int32_t kEmbeddingBatchSize = 32;
++  static constexpr float kEmbeddingLengthBucketMaxRatio = 1.5f;
++
++  // suopTranscriber local patch: see the bucketing loop's doc comment
++  // above. A SOFT, best-effort cap on batch_count * max_frames — the
++  // actual driver of a batch's GPU tensor size — meant to avoid the cost
++  // of an allocation attempt we can predict is probably too large, NOT a
++  // guarantee of safety. It can't be one: confirmed directly, an earlier
++  // value of 100,000 here (raw input tensor ~32 MB) still let through a
++  // batch whose real GPU memory need (internal activation memory for this
++  // model, an unknown multiple of input size we have no visibility into
++  // from here) hit a 1.1 GB single-allocation CUDA failure. The REAL
++  // safety net is ProcessEmbeddingBatch()'s own catch-and-bisect fallback
++  // — this constant only shifts how OFTEN that fallback has to run.
++  // Lowered 5x (to 20,000, ~6.4 MB raw input tensor) after that failure,
++  // still not derived from a measured safe maximum.
++  static constexpr int64_t kEmbeddingMaxBatchFrames = 20000;
++
++  // suopTranscriber local patch: see ProcessEmbeddingBatch()'s doc comment
++  // on max_frames. 100 frames (~1s at the typical 100fps fbank rate) is a
++  // coarse-but-not-wasteful rounding granularity — small enough that the
++  // extra zero-padding it adds is minor next to what
++  // kEmbeddingLengthBucketMaxRatio already tolerates, coarse enough to
++  // meaningfully cut down how many DISTINCT tensor shapes a long
++  // recording's many buckets collectively need, which is what actually
++  // determines how large the CUDA memory arena grows to. Not tuned to a
++  // measured optimum.
++  static constexpr int32_t kEmbeddingFrameQuantum = 100;
+ };
+ 
+ }  // namespace sherpa_onnx
+diff --git a/sherpa-onnx/csrc/speaker-embedding-extractor-impl.h b/sherpa-onnx/csrc/speaker-embedding-extractor-impl.h
+index 6299dce4..d47c3aa6 100644
+--- a/sherpa-onnx/csrc/speaker-embedding-extractor-impl.h
++++ b/sherpa-onnx/csrc/speaker-embedding-extractor-impl.h
+@@ -5,6 +5,7 @@
+ #ifndef SHERPA_ONNX_CSRC_SPEAKER_EMBEDDING_EXTRACTOR_IMPL_H_
+ #define SHERPA_ONNX_CSRC_SPEAKER_EMBEDDING_EXTRACTOR_IMPL_H_
+ 
++#include <functional>
+ #include <memory>
+ #include <string>
+ #include <vector>
+@@ -31,6 +32,38 @@ class SpeakerEmbeddingExtractorImpl {
+   virtual bool IsReady(OnlineStream *s) const = 0;
+ 
+   virtual std::vector<float> Compute(OnlineStream *s) const = 0;
++
++  // suopTranscriber local patch (see patches/sherpa-onnx-batch-
++  // segmentation.patch — same patch file covers both the segmentation and
++  // embedding batching changes): batched form of Compute() above.
++  // progressCallback (optional), if given, is invoked with (numProcessed,
++  // numTotal) — the granularity is "once per completed batch/bucket" for
++  // real batched impls, or once per item for this naive default (called
++  // right after each Compute(), same cadence the OLD non-batched call site
++  // used to report at) — so callers get roughly the same progress
++  // responsiveness they always did, regardless of whether the underlying
++  // impl actually batches. Default implementation is a naive per-stream
++  // loop — numerically IDENTICAL to calling Compute() on each stream
++  // individually, so any impl that doesn't override this (e.g. NeMo) keeps
++  // today's exact behavior for free. Overridden in
++  // SpeakerEmbeddingExtractorGeneralImpl (the impl WeSpeaker/CAM++ etc.
++  // actually use) with a real batched fast path.
++  virtual std::vector<std::vector<float>> ComputeBatch(
++      const std::vector<OnlineStream *> &streams,
++      const std::function<void(int32_t, int32_t)> &progressCallback = {}) const {
++    std::vector<std::vector<float>> ans;
++    ans.reserve(streams.size());
++    const int32_t total = static_cast<int32_t>(streams.size());
++    int32_t done = 0;
++    for (OnlineStream *s : streams) {
++      ans.push_back(Compute(s));
++      ++done;
++      if (progressCallback) {
++        progressCallback(done, total);
++      }
++    }
++    return ans;
++  }
+ };
+ 
+ }  // namespace sherpa_onnx
+diff --git a/sherpa-onnx/csrc/speaker-embedding-extractor.cc b/sherpa-onnx/csrc/speaker-embedding-extractor.cc
+index 237678b1..a52966a0 100644
+--- a/sherpa-onnx/csrc/speaker-embedding-extractor.cc
++++ b/sherpa-onnx/csrc/speaker-embedding-extractor.cc
+@@ -87,6 +87,12 @@ std::vector<float> SpeakerEmbeddingExtractor::Compute(OnlineStream *s) const {
+   return impl_->Compute(s);
+ }
+ 
++std::vector<std::vector<float>> SpeakerEmbeddingExtractor::ComputeBatch(
++    const std::vector<OnlineStream *> &streams,
++    const std::function<void(int32_t, int32_t)> &progressCallback) const {
++  return impl_->ComputeBatch(streams, progressCallback);
++}
++
+ #if __ANDROID_API__ >= 9
+ template SpeakerEmbeddingExtractor::SpeakerEmbeddingExtractor(
+     AAssetManager *mgr, const SpeakerEmbeddingExtractorConfig &config);
+diff --git a/sherpa-onnx/csrc/speaker-embedding-extractor.h b/sherpa-onnx/csrc/speaker-embedding-extractor.h
+index 068e6b8d..c249676c 100644
+--- a/sherpa-onnx/csrc/speaker-embedding-extractor.h
++++ b/sherpa-onnx/csrc/speaker-embedding-extractor.h
+@@ -5,6 +5,7 @@
+ #ifndef SHERPA_ONNX_CSRC_SPEAKER_EMBEDDING_EXTRACTOR_H_
+ #define SHERPA_ONNX_CSRC_SPEAKER_EMBEDDING_EXTRACTOR_H_
+ 
++#include <functional>
+ #include <memory>
+ #include <string>
+ #include <vector>
+@@ -62,6 +63,14 @@ class SpeakerEmbeddingExtractor {
+   // You have to ensure IsReady(s) returns true before you call this method.
+   std::vector<float> Compute(OnlineStream *s) const;
+ 
++  // suopTranscriber local patch: batched form of Compute() above — see
++  // SpeakerEmbeddingExtractorImpl::ComputeBatch()'s doc comment (including
++  // for progressCallback's semantics). Every stream must satisfy
++  // IsReady(s) already, same precondition as Compute().
++  std::vector<std::vector<float>> ComputeBatch(
++      const std::vector<OnlineStream *> &streams,
++      const std::function<void(int32_t, int32_t)> &progressCallback = {}) const;
++
+  private:
+   std::unique_ptr<SpeakerEmbeddingExtractorImpl> impl_;
+ };

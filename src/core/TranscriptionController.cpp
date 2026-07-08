@@ -853,8 +853,27 @@ public slots:
                     // restarts from empty) — detection is the first half,
                     // transcription is the second (see the "transcribing"
                     // phase below, which picks up at 0.5 to match).
-                    diarizedTurns = m_diarizationEngine->diarize(
-                        *pcm, [this](double fraction) { emit progress(fraction * 0.5); });
+                    //
+                    // Sub-phase text: DiarizationEngine's fraction blends
+                    // sherpa-onnx's own internal segmentation/label-
+                    // conversion/embedding split (see the vendored patch's
+                    // kSegmentationProgressShare + kLabelConversionProgressShare
+                    // = 0.30 boundary) into one 0->1 number — 0.30 here is
+                    // that exact same boundary, not an approximation, so
+                    // the label switches right when the real work actually
+                    // moves from "found where speech is" to "whose voice is
+                    // it". Only emitted on an actual sub-phase change (not
+                    // every callback tick) to avoid redundant phase signals.
+                    QString detectingSubPhase;
+                    diarizedTurns = m_diarizationEngine->diarize(*pcm, [this, &detectingSubPhase](double fraction) {
+                        const QString subPhase = fraction < 0.30 ? QStringLiteral("detecting-speakers-segmenting")
+                                                                  : QStringLiteral("detecting-speakers-identifying");
+                        if (subPhase != detectingSubPhase) {
+                            detectingSubPhase = subPhase;
+                            emit phase(subPhase);
+                        }
+                        emit progress(fraction * 0.5);
+                    });
                     effectiveSpeakerDetection = true;
                 } else {
                     speakerDetectionError = QStringLiteral("failed to load speaker diarization models");

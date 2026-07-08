@@ -100,18 +100,22 @@ class TranscriptionController : public QObject {
     Q_PROPERTY(double progress READ progress NOTIFY progressChanged)
     // "loading" (whisper model load — no native progress hook exists for
     // this, so progress stays 0 here; QML shows an indeterminate bar),
-    // "detecting-speakers" (diarization pass, REAL progress via
-    // DiarizationEngine's sherpa-onnx-backed callback), "transcribing"
-    // (whisper's own per-segment progress, as before), or empty when idle
-    // or for a relabel/rename job (neither has phases worth naming). When
-    // detection actually runs, "detecting-speakers" and "transcribing"
-    // share ONE continuous 0->1 progress sweep (first half / second half —
-    // see run()) rather than each getting its own 0->1, which would look
-    // like the bar finishes then restarts. Exists because "huge delay
-    // before it starts transcribing" on bigger models was previously
-    // invisible — the progress bar sat frozen at 0 during model load and
-    // (once diarization landed) during the whole
-    // diarization pass too, indistinguishable from a hang.
+    // "detecting-speakers-segmenting" / "detecting-speakers-identifying"
+    // (diarization pass, REAL progress via DiarizationEngine's sherpa-onnx-
+    // backed callback — split into two sub-phases at fraction==0.30, the
+    // exact boundary where sherpa-onnx's own internal work moves from
+    // finding WHERE speech is to figuring out WHOSE voice it is, so the
+    // label switches right when the real work does, not on a guess),
+    // "transcribing" (whisper's own per-segment progress, as before), or
+    // empty when idle or for a relabel/rename job (neither has phases
+    // worth naming). When detection actually runs, the detecting-speakers-*
+    // sub-phases and "transcribing" share ONE continuous 0->1 progress
+    // sweep (first half / second half — see run()) rather than each
+    // getting its own 0->1, which would look like the bar finishes then
+    // restarts. Exists because "huge delay before it starts transcribing"
+    // on bigger models was previously invisible — the progress bar sat
+    // frozen at 0 during model load and (once diarization landed) during
+    // the whole diarization pass too, indistinguishable from a hang.
     Q_PROPERTY(QString currentPhase READ currentPhase NOTIFY currentPhaseChanged)
     Q_PROPERTY(QUrl currentFile READ currentFile NOTIFY currentFileChanged)
     // "transcribe"/"relabel"/"rename"/"merge" for whichever job is Active
