@@ -1760,38 +1760,108 @@ Rectangle {
             } // end scrollableContent ColumnLayout
         } // end transcriptScrollView
 
-        // Item 12 (Wave E): Chrome/PDF-viewer-style middle-click-hold-
-        // drag scrolling — content follows the cursor 1:1 while the
-        // middle button is held (grab-and-pan), not a toggled/velocity-
-        // based autoscroll. acceptedButtons is scoped to MiddleButton
-        // only, so left-click text selection and the scrollbar's own
-        // drag are completely unaffected (a non-matching button simply
-        // isn't accepted, falling through to whatever's beneath). Lives as
+        // Item 12 (Wave E, rewritten): Chrome/Firefox-style middle-click
+        // autoscroll — two gestures, both ending in the SAME free-scroll
+        // state: (1) a quick click (press+release, no real drag) arms
+        // autoscroll that then free-scrolls just from moving the mouse,
+        // no button held, until another click (any button) or Escape
+        // disarms it; (2) press-hold-drag past a small threshold then
+        // release disarms immediately, no second click needed.
+        // draggedWhileHeld tells the two apart: it only flips true once
+        // real movement exceeds the threshold WHILE the button is down,
+        // so a plain click that never moved leaves release a no-op
+        // (armed stays true) — that's what preserves gesture 1.
+        // acceptedButtons only widens to Left/Right while armed (so any
+        // button click cancels, matching Chrome) — while idle only
+        // MiddleButton is accepted, so left-click text selection and the
+        // scrollbar's own drag pass straight through untouched. Lives as
         // an overlay sibling of transcriptScrollView (not inside it, see
         // transcriptViewportContainer's doc comment) so it covers the same
         // full viewport without being counted as the ScrollView's content.
         MouseArea {
             id: middleDragScrollArea
             anchors.fill: parent
-            acceptedButtons: Qt.MiddleButton
-            cursorShape: pressed ? Qt.SizeAllCursor : Qt.ArrowCursor
-            propagateComposedEvents: true
+            acceptedButtons: middleDragScrollArea.armed
+                             ? (Qt.LeftButton | Qt.MiddleButton | Qt.RightButton)
+                             : Qt.MiddleButton
+            hoverEnabled: true
 
-            property real dragStartY: 0
-            property real startContentY: 0
+            property bool armed: false
+            property real originY: 0
+            property real currentY: 0
+            property bool buttonHeld: false
+            property bool draggedWhileHeld: false
+            readonly property int deadzone: 8
+
+            cursorShape: {
+                if (!middleDragScrollArea.armed)
+                    return Qt.ArrowCursor
+                const dy = Math.abs(middleDragScrollArea.currentY - middleDragScrollArea.originY)
+                return dy <= middleDragScrollArea.deadzone ? Qt.SizeAllCursor : Qt.SizeVerCursor
+            }
 
             onPressed: (mouse) => {
-                middleDragScrollArea.dragStartY = mouse.y
-                middleDragScrollArea.startContentY = transcriptScrollView.contentItem.contentY
+                // Any click while already armed cancels it (Chrome
+                // convention) instead of performing that button's normal
+                // action — acceptedButtons above ensures this branch is
+                // the only one reachable for non-middle buttons.
+                if (middleDragScrollArea.armed) {
+                    middleDragScrollArea.armed = false
+                    return
+                }
+                middleDragScrollArea.buttonHeld = true
+                middleDragScrollArea.draggedWhileHeld = false
+                middleDragScrollArea.armed = true
+                const p = middleDragScrollArea.mapToItem(transcriptScrollView, mouse.x, mouse.y)
+                middleDragScrollArea.originY = p.y
+                middleDragScrollArea.currentY = p.y
             }
             onPositionChanged: (mouse) => {
-                if (!pressed)
-                    return
-                const flick = transcriptScrollView.contentItem
-                const delta = mouse.y - middleDragScrollArea.dragStartY
-                const maxY = Math.max(0, flick.contentHeight - flick.height)
-                flick.contentY = Math.max(0, Math.min(maxY, middleDragScrollArea.startContentY - delta))
+                const p = middleDragScrollArea.mapToItem(transcriptScrollView, mouse.x, mouse.y)
+                middleDragScrollArea.currentY = p.y
+                if (middleDragScrollArea.buttonHeld && !middleDragScrollArea.draggedWhileHeld
+                        && Math.abs(middleDragScrollArea.currentY - middleDragScrollArea.originY) > middleDragScrollArea.deadzone) {
+                    middleDragScrollArea.draggedWhileHeld = true
+                }
             }
+            onReleased: (mouse) => {
+                if (mouse.button !== Qt.MiddleButton)
+                    return
+                middleDragScrollArea.buttonHeld = false
+                if (middleDragScrollArea.draggedWhileHeld)
+                    middleDragScrollArea.armed = false
+                // else: real click, no drag — gesture 1 keeps running.
+            }
+
+            // Repeating timer (never runs while idle — gated by `armed`,
+            // the same category as a Flickable's own flick-deceleration
+            // animation) drives the actual scroll from the live
+            // originY/currentY gap. Quadratic and uncapped: dragging
+            // farther from the origin keeps accelerating rather than
+            // plateauing — the Flickable's own content-size clamp below
+            // is what actually stops it.
+            Timer {
+                interval: 16
+                repeat: true
+                running: middleDragScrollArea.armed
+                onTriggered: {
+                    const flick = transcriptScrollView.contentItem
+                    const dy = middleDragScrollArea.currentY - middleDragScrollArea.originY
+                    const deadzone = middleDragScrollArea.deadzone
+                    if (Math.abs(dy) <= deadzone)
+                        return
+                    const beyond = dy - Math.sign(dy) * deadzone
+                    const speed = Math.sign(beyond) * beyond * beyond * 0.002
+                    const maxY = Math.max(0, flick.contentHeight - flick.height)
+                    flick.contentY = Math.max(0, Math.min(maxY, flick.contentY + speed))
+                }
+            }
+        }
+
+        Shortcut {
+            sequence: "Escape"
+            enabled: middleDragScrollArea.armed
+            onActivated: middleDragScrollArea.armed = false
         }
         } // end transcriptViewportContainer
     }
