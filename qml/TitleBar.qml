@@ -8,6 +8,13 @@ Item {
     property var window
     property string title: ""
     signal settingsRequested()
+    signal forceRetranscribeAllRequested()
+
+    // Inline confirm state for the "Force retranscribe all" menu row (see
+    // MainPanel.qml's speaker-merge confirm row for the same swap-in-place
+    // pattern) — reset whenever the menu closes so it never reopens
+    // mid-confirm.
+    property bool forceRetranscribeConfirming: false
 
     implicitHeight: 36
 
@@ -59,8 +66,127 @@ Item {
         }
     }
 
-    Text {
+    // Infrequently used actions (currently just "force retranscribe all")
+    // that don't warrant a spot in Settings — kept out of the way next to
+    // the gear rather than cluttering the per-row/bulk sidebar controls.
+    Item {
+        id: moreActionsButton
         anchors.left: settingsButton.right
+        anchors.leftMargin: 4
+        anchors.verticalCenter: parent.verticalCenter
+        width: 24
+        height: 24
+
+        HoverHandler {
+            id: moreActionsHover
+            cursorShape: Qt.PointingHandCursor
+        }
+        TapHandler {
+            onTapped: moreActionsMenu.visible ? moreActionsMenu.close() : moreActionsMenu.open()
+        }
+        HoverBorder {
+            anchors.fill: parent
+            active: moreActionsHover.hovered
+        }
+        Text {
+            anchors.centerIn: parent
+            text: "⋯"
+            color: "white"
+            font.pixelSize: 14
+        }
+    }
+
+    Popup {
+        id: moreActionsMenu
+        x: moreActionsButton.x
+        y: titleBar.height + 4
+        width: 220
+        padding: 4
+        modal: false
+        focus: false
+        closePolicy: Popup.CloseOnPressOutside | Popup.CloseOnEscape
+        onClosed: titleBar.forceRetranscribeConfirming = false
+
+        background: Rectangle {
+            color: "#242424"
+            radius: AppSettings.borderRadius
+            border.width: 1
+            border.color: "#3a3a3a"
+        }
+
+        Item {
+            id: forceRetranscribeRow
+            width: moreActionsMenu.width - moreActionsMenu.padding * 2
+            height: 28
+
+            HoverHandler {
+                id: forceRetranscribeHover
+                cursorShape: Qt.PointingHandCursor
+                enabled: !titleBar.forceRetranscribeConfirming
+            }
+            TapHandler {
+                enabled: !titleBar.forceRetranscribeConfirming
+                onTapped: titleBar.forceRetranscribeConfirming = true
+            }
+            Rectangle {
+                anchors.fill: parent
+                radius: AppSettings.borderRadius
+                color: forceRetranscribeHover.hovered ? "#3a3a3a" : "transparent"
+            }
+            Text {
+                anchors.left: parent.left
+                anchors.leftMargin: 8
+                anchors.verticalCenter: parent.verticalCenter
+                visible: !titleBar.forceRetranscribeConfirming
+                text: qsTr("Force retranscribe all")
+                color: "white"
+                font.pixelSize: 12
+            }
+
+            // Inline confirm, matching the speaker-merge pill swap in
+            // MainPanel.qml — this queues a job for every audio file in the
+            // vault (even already-transcribed ones), so a stray click
+            // shouldn't fire it outright.
+            Row {
+                anchors.centerIn: parent
+                visible: titleBar.forceRetranscribeConfirming
+                spacing: 6
+                Text {
+                    anchors.verticalCenter: parent.verticalCenter
+                    text: qsTr("Retranscribe entire vault?")
+                    color: "#dddddd"
+                    font.pixelSize: 11
+                }
+                Text {
+                    anchors.verticalCenter: parent.verticalCenter
+                    text: "✓"
+                    color: "#8fdf9f"
+                    font.pixelSize: 12
+                    font.bold: true
+                    HoverHandler { cursorShape: Qt.PointingHandCursor }
+                    TapHandler {
+                        onTapped: {
+                            titleBar.forceRetranscribeConfirming = false
+                            moreActionsMenu.close()
+                            titleBar.forceRetranscribeAllRequested()
+                        }
+                    }
+                }
+                Text {
+                    anchors.verticalCenter: parent.verticalCenter
+                    text: "✕"
+                    color: "#e07a7a"
+                    font.pixelSize: 12
+                    font.bold: true
+                    HoverHandler { cursorShape: Qt.PointingHandCursor }
+                    TapHandler { onTapped: titleBar.forceRetranscribeConfirming = false }
+                }
+            }
+        }
+    }
+
+    Text {
+        anchors.left: moreActionsButton.right
         anchors.leftMargin: 8
         anchors.verticalCenter: parent.verticalCenter
         text: titleBar.title

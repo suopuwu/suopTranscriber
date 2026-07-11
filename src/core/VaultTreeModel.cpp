@@ -444,6 +444,21 @@ bool VaultTreeModel::writeVaultSettings(const QVariantMap &settings, QString *er
     return true;
 }
 
+QStringList VaultTreeModel::allAudioPaths() const
+{
+    QStringList out;
+    collectAudioPaths(m_root.get(), out);
+    return out;
+}
+
+void VaultTreeModel::collectAudioPaths(const Node *node, QStringList &out)
+{
+    if (node->isAudio)
+        out << node->path;
+    for (const auto &child : node->children)
+        collectAudioPaths(child.get(), out);
+}
+
 void VaultTreeModel::revealInFileManager(const QUrl &fileUrl) const
 {
     // org.freedesktop.FileManager1.ShowItems(as URIs, s StartupID) — the

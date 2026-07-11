@@ -149,6 +149,25 @@ Rectangle {
             delete sidebar.transcribedPaths[path]
     }
 
+    // TitleBar's "⋯" menu action: unlike transcribeAllButton (which only
+    // targets untranscribedPaths/bulkEligible files realized in the current
+    // TreeView viewport), this queues every audio file in the vault,
+    // including already-transcribed ones — VaultTreeModel.allAudioPaths()
+    // walks the full tree directly rather than relying on realized
+    // delegates. transcribe()'s only in-flight gate is isQueued(), so this
+    // unconditionally re-runs each file (see TranscriptionController.h).
+    function forceRetranscribeAll() {
+        if (!sidebar.transcriptionController || sidebar.vaultPath.toString() === "")
+            return
+        const paths = sidebar.model.allAudioPaths()
+        if (paths.length === 0)
+            return
+        const urls = paths.map((p) => "file://" + p)
+        sidebar.transcriptionController.transcribeAll(urls, sidebar.vaultPath, AppSettings.lastModel, false,
+                                                        AppSettings.autoLabelEnabled, AppSettings.restrictTagsToExisting,
+                                                        AppSettings.tagReuseBias)
+    }
+
     color: Qt.rgba(AppSettings.sidebarBackgroundColor.r, AppSettings.sidebarBackgroundColor.g,
                     AppSettings.sidebarBackgroundColor.b, AppSettings.sidebarOpacity)
     // Only the corners touching the SplitView divider are rounded; the

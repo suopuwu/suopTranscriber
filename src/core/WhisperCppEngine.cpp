@@ -33,6 +33,17 @@ void onProgressUpdate(struct whisper_context *, struct whisper_state *, int prog
         (*cb->onProgress)(cb->totalSeconds * progress / 100.0, cb->totalSeconds);
 }
 
+// whisper.cpp checks this deep inside its encode/decode loops (many times
+// per second of audio, see whisper.cpp:2455/2977's
+// "!(abort_callback && abort_callback(...))" guards) — frequent enough that
+// blocking here for a pause is effectively instant, and returning true
+// cancels the whole whisper_full() call immediately.
+bool onAbortCheck(void *userData)
+{
+    const auto *onAbort = static_cast<const AbortCallback *>(userData);
+    return *onAbort && (*onAbort)();
+}
+
 }
 
 WhisperCppEngine::WhisperCppEngine(const QString &modelPath)
@@ -48,7 +59,7 @@ WhisperCppEngine::~WhisperCppEngine()
 }
 
 std::vector<Segment> WhisperCppEngine::transcribe(const AudioChunk &chunk, const ProgressCallback &onProgress,
-                                                    const SegmentCallback &onSegment)
+                                                    const SegmentCallback &onSegment, const AbortCallback &onAbort)
 {
     std::vector<Segment> segments;
     if (!m_ctx)
@@ -65,6 +76,10 @@ std::vector<Segment> WhisperCppEngine::transcribe(const AudioChunk &chunk, const
     wparams.new_segment_callback_user_data = &cbCtx;
     wparams.progress_callback = onProgressUpdate;
     wparams.progress_callback_user_data = &cbCtx;
+    if (onAbort) {
+        wparams.abort_callback = onAbortCheck;
+        wparams.abort_callback_user_data = const_cast<AbortCallback *>(&onAbort);
+    }
 
     whisper_full(m_ctx, wparams, chunk.pcm16kMono.data(), static_cast<int>(chunk.pcm16kMono.size()));
 

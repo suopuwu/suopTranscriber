@@ -25,6 +25,19 @@ ApplicationWindow {
         id: transcriptionController
     }
 
+    // Bug report (2026-07-09): closing the window must never leave a
+    // transcription silently running in the background — see
+    // TranscriptionController::terminateApplicationImmediately()'s doc
+    // comment for why this is a hard process exit rather than the normal
+    // Qt::quitOnLastWindowClosed path (that still graceful-waits on the
+    // same slow-to-interrupt native diarization code this is specifically
+    // avoiding). Covers every way the window can close — the custom
+    // titlebar's × button, Alt+F4, the native decoration's close button
+    // when useSystemTitlebar is on, a window-manager close request — since
+    // they all funnel through this ONE signal, not just TitleBar.qml's
+    // button.
+    onClosing: transcriptionController.terminateApplicationImmediately()
+
     function openVaultDialog() {
         if (vaultModel.vaultPath.toString() !== "")
             folderDialog.currentFolder = vaultModel.vaultPath
@@ -120,6 +133,13 @@ ApplicationWindow {
             // keep whatever the PREVIOUS vault had in memory.
             if (vaultModel.vaultPath.toString() !== "")
                 AppSettings.loadFromVault(vaultModel)
+            // Wave N (task system, item 1): re-queues whatever was still
+            // Queued/Active in this vault's tasks.json when the app last
+            // closed — see TranscriptionController::loadPersistedQueue()'s
+            // doc comment for exactly what "resume" means here (the queue
+            // survives a restart; no true mid-file resume exists yet).
+            if (vaultModel.vaultPath.toString() !== "")
+                transcriptionController.loadPersistedQueue(vaultModel.vaultPath)
         }
     }
 
@@ -198,6 +218,7 @@ ApplicationWindow {
                 title: window.title
                 visible: !AppSettings.useSystemTitlebar
                 onSettingsRequested: settingsPopup.open()
+                onForceRetranscribeAllRequested: sidebar.forceRetranscribeAll()
             }
 
             SplitView {

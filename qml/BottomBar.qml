@@ -25,7 +25,14 @@ Item {
     // file's LOCAL path (fileUrl minus the "file://" prefix, same convention
     // Sidebar.qml's fileActivated uses), for the caller to open in MainPanel.
     signal taskActivated(string path)
+    // Percentage TEXT (item 6): this phase's own 0..1 (see
+    // TranscriptionController::progress's doc comment for why it's phase-
+    // relative, not blended across the whole job).
     readonly property real taskProgress: transcriptionController ? transcriptionController.progress : 0
+    // Item 6 (user correction): the PROGRESS BAR's fill instead sweeps
+    // smoothly across the job's WHOLE lifetime — see
+    // TranscriptionController::overallProgress's doc comment.
+    readonly property real taskOverallProgress: transcriptionController ? transcriptionController.overallProgress : 0
     readonly property int tasksCompleted: transcriptionController ? transcriptionController.tasksCompleted : 0
     readonly property int tasksTotal: transcriptionController ? transcriptionController.tasksTotal : 0
     // Whether a job is actively running right now — distinct from tasksTotal
@@ -44,21 +51,172 @@ Item {
         const s = transcriptionController.currentFile.toString()
         return s.substring(s.lastIndexOf("/") + 1)
     }
+    // User correction (2026-07-09): restored (persisted) jobs no longer
+    // auto-start — they just sit Queued until the user resumes them. While
+    // idle, the bottom bar still shows the front-most Queued job (most
+    // commonly the one that was Active when the app last closed) so there's
+    // something to look at and a play button to resume it, instead of the
+    // bar going blank just because nothing happens to be running yet. A
+    // Paused job (see TranscriptionController::JobStatus::Paused's doc
+    // comment — a pause during "loading" that had to restart rather than
+    // truly suspend) takes priority, matching startNext()'s own priority —
+    // there's at most one at a time.
+    readonly property var frontQueuedJob: {
+        if (bottomBar.busy || !bottomBar.transcriptionController)
+            return null
+        const jobs = bottomBar.transcriptionController.jobs
+        for (let i = 0; i < jobs.length; i++) {
+            if (jobs[i].status === "paused")
+                return jobs[i]
+        }
+        for (let i = 0; i < jobs.length; i++) {
+            if (jobs[i].status === "queued")
+                return jobs[i]
+        }
+        return null
+    }
+    readonly property bool hasDisplayJob: bottomBar.busy || bottomBar.frontQueuedJob !== null
+    readonly property string displayJobKind: bottomBar.busy ? bottomBar.currentJobKind
+        : (bottomBar.frontQueuedJob ? bottomBar.frontQueuedJob.kind : "")
+    readonly property string displayJobFileName: {
+        if (bottomBar.busy)
+            return bottomBar.currentJobFileName
+        if (bottomBar.frontQueuedJob) {
+            const s = bottomBar.frontQueuedJob.fileUrl ? bottomBar.frontQueuedJob.fileUrl.toString() : ""
+            return s.substring(s.lastIndexOf("/") + 1)
+        }
+        return ""
+    }
     // See TranscriptionController::currentPhase's doc comment — "loading"
-    // has no real progress number behind it (whisper.cpp has no hook for
-    // model-load time), so the progress bar goes indeterminate for that
-    // phase specifically rather than sitting frozen at 0 looking hung.
-    // "detecting-speakers-segmenting"/"detecting-speakers-identifying" and
-    // "transcribing" all carry real progress.
+    // and "decoding" have no real progress number behind them (whisper.cpp/
+    // ffmpeg have no hook for model-load/decode time), so taskProgress is a
+    // SYNTHESIZED fraction there (elapsed-vs-rolling-average — see
+    // TranscriptionController::phaseRelativeSyntheticProgress()), not
+    // indeterminate — 2026-07-10: every phase now occupies its own
+    // historically-weighted slice of the bar (see overallProgress's doc
+    // comment), which only reads correctly if every phase actually shows
+    // real (if approximate) motion instead of a spinner with no width.
     readonly property string currentPhase: transcriptionController ? transcriptionController.currentPhase : ""
-    readonly property bool progressIsIndeterminate: bottomBar.busy && bottomBar.currentPhase === "loading"
-    // Shared with the Tasks popup's per-row kind badge below — same four
+    // Wave N (task system): true while the Active job is paused (only
+    // "transcribe"/"download" kinds are truly pausable — see
+    // TranscriptionController::pauseActive()'s doc comment).
+    readonly property bool activePaused: transcriptionController ? transcriptionController.activePaused : false
+    // True between clicking pause during "loading" and that soft-cancel
+    // actually resolving (see TranscriptionController::
+    // activeStopping's doc comment) — the pause button disables itself
+    // meanwhile so a second click can't land, and the phase label says so
+    // instead of silently continuing to show the stale phase, which is what
+    // made the first click look like it did nothing (user report,
+    // 2026-07-10).
+    readonly property bool activeStopping: transcriptionController ? transcriptionController.activeStopping : false
+    function canPause(kind) { return kind === "transcribe" || kind === "download" }
+    // Shared by the bottom bar's and the popup header's pause/play button —
+    // kept in one place so the glyph and the tap behavior (see both
+    // TapHandlers) can never drift out of sync with each other.
+    // User correction (2026-07-09): a distinct "stop" glyph during
+    // "loading" (the click actually calls cancelActive() there — see the
+    // TapHandlers below — since real pause has no interruption point to
+    // pause AT) was rejected: cancelling doesn't remove the job from the
+    // queue/history any differently than a normal cancel does, so showing
+    // a visually distinct "stop" affordance overstated what the click
+    // actually does. Always shows the ordinary pause/play glyph now,
+    // regardless of phase.
+    function playPauseGlyph() {
+        if (!bottomBar.busy)
+            return "▶"
+        return bottomBar.activePaused ? "▶" : "⏸"
+    }
+    // activeElapsedMs/estimatedRemainingMs are plain invokables (no NOTIFY
+    // signal — see TranscriptionController::activeElapsedMs()'s doc
+    // comment), so they need to be actively POLLED rather than bound —
+    // deliberately push-based (Timer writes into a plain property) rather
+    // than the more common "read a dummy property inside a binding to
+    // fake a dependency" trick: that trick does NOT survive this project's
+    // AOT QML compilation (qmlcachegen) — confirmed empirically (a real
+    // launch showed the dummy-dependency version frozen at its initial
+    // value forever, while directly calling the same invokable elsewhere
+    // in the same file worked fine every tick) — presumably because the
+    // compiler sees the dummy read's result is unused and drops it,
+    // dropping the dependency registration along with it. A plain
+    // imperative assignment has no such ambiguity: writing to a property
+    // always fires ITS OWN notify signal.
+    property int activeElapsedMs: 0
+    property int estimatedRemainingMs: -1
+    function refreshActiveElapsed() {
+        bottomBar.activeElapsedMs = bottomBar.transcriptionController ? bottomBar.transcriptionController.activeElapsedMs() : 0
+        bottomBar.estimatedRemainingMs = bottomBar.transcriptionController ? bottomBar.transcriptionController.estimatedRemainingMs() : -1
+    }
+    Timer {
+        interval: 500
+        repeat: true
+        running: bottomBar.busy
+        // Refresh immediately when a job starts (running flips true) rather
+        // than leaving stale/zeroed values on screen for the first 500ms.
+        onRunningChanged: if (running) bottomBar.refreshActiveElapsed()
+        onTriggered: bottomBar.refreshActiveElapsed()
+    }
+    // "1:23" / "45s" — durationMs < 0 (unknown/not-yet-finished) -> "".
+    function formatDuration(durationMs) {
+        if (durationMs < 0)
+            return ""
+        const totalSeconds = Math.floor(durationMs / 1000)
+        const h = Math.floor(totalSeconds / 3600)
+        const m = Math.floor((totalSeconds % 3600) / 60)
+        const s = totalSeconds % 60
+        if (h > 0)
+            return h + ":" + String(m).padStart(2, "0") + ":" + String(s).padStart(2, "0")
+        if (m > 0)
+            return m + ":" + String(s).padStart(2, "0")
+        return s + "s"
+    }
+    // Item 4/7: "elapsed / ~ETA left" while the ETA is knowable (see
+    // TranscriptionController::estimatedRemainingMs()'s doc comment for when
+    // it isn't — e.g. the "loading" phase), otherwise just elapsed.
+    readonly property string elapsedEtaText: {
+        if (!bottomBar.busy)
+            return ""
+        const elapsed = bottomBar.formatDuration(bottomBar.activeElapsedMs)
+        return bottomBar.estimatedRemainingMs >= 0
+            ? (elapsed + " / ~" + bottomBar.formatDuration(bottomBar.estimatedRemainingMs) + " left")
+            : elapsed
+    }
+    // Item 3 (reorder): position of jobId among Queued-only entries (the
+    // ordering TranscriptionController::moveQueuedJob()'s newIndex counts
+    // within) — -1 if jobId isn't currently Queued. Used by the popup's
+    // per-row up/down buttons to compute the target index and to disable
+    // the button at either end of the queued sublist.
+    function queuedPositionOf(jobId) {
+        if (!bottomBar.transcriptionController)
+            return -1
+        const jobs = bottomBar.transcriptionController.jobs
+        let pos = 0
+        for (let i = 0; i < jobs.length; i++) {
+            if (jobs[i].id === jobId)
+                return jobs[i].status === "queued" ? pos : -1
+            if (jobs[i].status === "queued")
+                pos++
+        }
+        return -1
+    }
+    function queuedCount() {
+        if (!bottomBar.transcriptionController)
+            return 0
+        const jobs = bottomBar.transcriptionController.jobs
+        let count = 0
+        for (let i = 0; i < jobs.length; i++) {
+            if (jobs[i].status === "queued")
+                count++
+        }
+        return count
+    }
+    // Shared with the Tasks popup's per-row kind badge below — same five
     // "kind" values (see TranscriptionController::jobs()' doc comment).
     function kindLabel(kind) {
         switch (kind) {
         case "relabel": return qsTr("Label")
         case "rename": return qsTr("Rename")
         case "merge": return qsTr("Merge")
+        case "download": return qsTr("Download")
         default: return qsTr("Transcribe")
         }
     }
@@ -68,9 +226,11 @@ Item {
     function phaseLabel(phase) {
         switch (phase) {
         case "loading": return qsTr("loading model…")
+        case "decoding": return qsTr("decoding audio…")
         case "detecting-speakers-segmenting": return qsTr("finding speech…")
         case "detecting-speakers-identifying": return qsTr("identifying speakers…")
         case "transcribing": return qsTr("transcribing…")
+        case "downloading": return qsTr("downloading…")
         default: return ""
         }
     }
@@ -178,8 +338,8 @@ Item {
         Label {
             Layout.preferredWidth: 160
             elide: Text.ElideMiddle
-            visible: bottomBar.busy
-            text: bottomBar.kindLabel(bottomBar.currentJobKind) + ": " + bottomBar.currentJobFileName
+            visible: bottomBar.hasDisplayJob
+            text: bottomBar.kindLabel(bottomBar.displayJobKind) + ": " + bottomBar.displayJobFileName
             color: "#aaaaaa"
             font.pixelSize: 11
         }
@@ -192,29 +352,96 @@ Item {
         // its own content instead of sharing a fixed-width elide box with it.
         Label {
             visible: bottomBar.busy && bottomBar.phaseLabel(bottomBar.currentPhase) !== ""
-            // Percentage omitted during "loading" — progressIsIndeterminate
-            // means taskProgress isn't a real number there (no native hook
-            // for model-load time; see its own doc comment), so showing
-            // "0.0%" the whole time would be actively misleading rather
-            // than just uninformative.
-            text: bottomBar.progressIsIndeterminate
-                ? "(" + bottomBar.phaseLabel(bottomBar.currentPhase) + ")"
+            // 2026-07-10: taskProgress is now a real (if synthesized, for
+            // "loading"/"decoding" — see currentPhase's doc comment) number
+            // in every phase, so the percentage always shows instead of
+            // being omitted for two of them.
+            text: bottomBar.activeStopping
+                ? qsTr("(stopping…)")
                 : "(" + bottomBar.phaseLabel(bottomBar.currentPhase) + " "
                   + (bottomBar.taskProgress * 100).toFixed(1) + "%)"
             color: "#888888"
             font.pixelSize: 11
         }
 
+        // Item 4/7: elapsed/ETA for whatever's currently running.
+        Label {
+            visible: bottomBar.busy && bottomBar.elapsedEtaText !== ""
+            text: bottomBar.elapsedEtaText
+            color: "#888888"
+            font.pixelSize: 11
+        }
+
+        // Item 2: pause/resume the Active job — only meaningful for
+        // "transcribe"/"download" kinds (see canPause()'s doc comment);
+        // hidden entirely rather than shown-but-inert for the others, so a
+        // click never silently does nothing. Doubles as the "resume a
+        // saved-but-not-yet-started queue" play button (user correction,
+        // 2026-07-09) whenever nothing is Active but a Queued job is
+        // waiting — that case is never kind-gated (any restored job kind
+        // can be started, only ACTIVE jobs are pause-gated by kind).
+        Item {
+            id: pauseButton
+            visible: (bottomBar.busy && bottomBar.canPause(bottomBar.currentJobKind))
+                || (!bottomBar.busy && bottomBar.frontQueuedJob !== null)
+            // Disabled (not just visually dimmed) while a soft-cancel from
+            // an earlier click is still resolving — see activeStopping's
+            // doc comment for the state corruption a second click causes
+            // otherwise.
+            enabled: !bottomBar.activeStopping
+            opacity: enabled ? 1 : 0.4
+            Layout.preferredWidth: 16
+            Layout.preferredHeight: 16
+
+            HoverHandler {
+                id: pauseHover
+                cursorShape: Qt.PointingHandCursor
+            }
+            TapHandler {
+                // Default gesturePolicy (DragThreshold) cancels the tap if
+                // the pointer moves at all between press and release —
+                // easy to trigger by accident on a small (16px) target,
+                // where aiming precisely enough to land the click often
+                // means a last-instant micro-adjustment. ReleaseWithinBounds
+                // only cares that the release lands back inside the item,
+                // regardless of what the pointer did in between (user
+                // report, 2026-07-09: hover reliably highlighted this
+                // button, but clicking it did nothing — consistent with taps
+                // being silently cancelled here).
+                gesturePolicy: TapHandler.ReleaseWithinBounds
+                // See TranscriptionController::togglePauseActive()'s doc
+                // comment — the pause-vs-cancel decision now lives entirely
+                // in C++, off its own authoritative phase/pause state, so a
+                // click can't race a phase transition QML hasn't heard
+                // about yet.
+                onTapped: bottomBar.transcriptionController.togglePauseActive()
+            }
+            HoverBorder {
+                anchors.fill: parent
+                active: pauseHover.hovered
+            }
+            Text {
+                anchors.centerIn: parent
+                text: bottomBar.playPauseGlyph()
+                color: "#dddddd"
+                font.pixelSize: 11
+            }
+        }
+
         ProgressBar {
             Layout.preferredWidth: 140
             from: 0
             to: 1
-            value: bottomBar.taskProgress
-            // "loading" (model load) has no real progress number behind it
-            // — indeterminate (animated, not frozen) rather than looking
-            // hung. "detecting-speakers"/"transcribing" both have real
-            // progress, same determinate bar as always.
-            indeterminate: bottomBar.progressIsIndeterminate
+            value: bottomBar.taskOverallProgress
+            // Always determinate now (2026-07-10) — every phase, including
+            // "loading"/"decoding" which have no real progress hook, gets a
+            // real (synthesized for those two) taskOverallProgress number
+            // and a historically-weighted slice of the bar (see
+            // TranscriptionController::overallProgress's doc comment). A
+            // paused job simply stops advancing rather than needing a
+            // separate suppression (user report, 2026-07-10, about the old
+            // indeterminate style looping regardless of pause state — moot
+            // now that this bar is never indeterminate).
             // Only while something is ACTIVELY running — tasksTotal alone
             // would keep this visible (frozen, meaningless) after every job
             // finishes, since finished jobs stay listed until dismissed.
@@ -260,8 +487,12 @@ Item {
         // directly put the popup mostly off the right edge of the window.
         // Anchor to bottomBar's own right edge instead.
         x: bottomBar.width - width - 8
-        width: 320
-        height: jobColumn.implicitHeight + 16
+        width: 360
+        // A larger floor than the content-derived height alone — with only
+        // one or two rows, the popup previously sized down tight enough
+        // that a row's hover/hightlight hover border could visually poke
+        // past the popup's own rounded bottom edge.
+        height: Math.max(jobColumn.implicitHeight + 16, 160)
         modal: false
         focus: false
         closePolicy: Popup.CloseOnPressOutside | Popup.CloseOnEscape
@@ -288,6 +519,78 @@ Item {
                     text: qsTr("Tasks")
                     color: "white"
                     font.bold: true
+                }
+                // Item 2: pause/resume the Active job — only one job is
+                // ever Active at a time, so a single header-level button
+                // (rather than a per-row one) covers it; only meaningful for
+                // "transcribe"/"download" kinds (see canPause()'s doc
+                // comment) — hidden entirely otherwise, same as the bottom
+                // bar's own pause button. Also doubles as the "resume a
+                // saved queue" play button — see the bottom bar's own
+                // pauseButton doc comment for the full rationale.
+                Item {
+                    id: popupPauseButton
+                    visible: (bottomBar.busy && bottomBar.canPause(bottomBar.currentJobKind))
+                        || (!bottomBar.busy && bottomBar.frontQueuedJob !== null)
+                    // See the bottom bar's own pauseButton for why this is
+                    // disabled (not just dimmed) while activeStopping.
+                    enabled: !bottomBar.activeStopping
+                    opacity: enabled ? 1 : 0.4
+                    Layout.preferredWidth: 20
+                    Layout.preferredHeight: 20
+
+                    HoverHandler {
+                        id: popupPauseHover
+                        cursorShape: Qt.PointingHandCursor
+                    }
+                    TapHandler {
+                        // See the bottom bar's own pauseButton TapHandler
+                        // for why this is needed on a small icon target.
+                        gesturePolicy: TapHandler.ReleaseWithinBounds
+                        // See TranscriptionController::togglePauseActive()'s
+                        // doc comment — deciding pause-vs-cancel here in QML
+                        // (reading this file's own currentPhase copy) used to
+                        // race the backend's real phase and could fire an
+                        // accidental cancel right at the loading->diarizing
+                        // boundary. The controller now makes this call itself
+                        // off its own authoritative state.
+                        onTapped: bottomBar.transcriptionController.togglePauseActive()
+                    }
+                    HoverBorder {
+                        anchors.fill: parent
+                        active: popupPauseHover.hovered
+                    }
+                    Text {
+                        anchors.centerIn: parent
+                        text: bottomBar.playPauseGlyph()
+                        color: "#dddddd"
+                        font.pixelSize: 12
+                    }
+                }
+                // Item 3: cancels every Queued job, then the Active one too
+                // (same immediate-vs-next-checkpoint caveat as the per-row
+                // cancel button below — see
+                // TranscriptionController::cancelAll()'s doc comment).
+                Button {
+                    id: cancelAllButton
+                    text: qsTr("Cancel all")
+                    hoverEnabled: true
+                    visible: bottomBar.tasksTotal > bottomBar.tasksCompleted
+                    onClicked: bottomBar.transcriptionController.cancelAll()
+
+                    background: Rectangle {
+                        radius: AppSettings.borderRadius
+                        color: (cancelAllButton.hovered && cancelAllButton.enabled) ? "#3a3a3a" : "#2a2a2a"
+                        border.width: 1
+                        border.color: "#3a3a3a"
+                    }
+                    HoverHandler {
+                        cursorShape: Qt.PointingHandCursor
+                    }
+                    HoverBorder {
+                        anchors.fill: parent
+                        active: cancelAllButton.hovered
+                    }
                 }
                 Button {
                     id: clearButton
@@ -336,7 +639,19 @@ Item {
                         width: jobListView.width
                         height: 24
 
+                        readonly property bool isDownload: modelData.kind === "download"
                         readonly property string fileName: {
+                            if (jobRow.isDownload) {
+                                // Downloads have no fileUrl (nothing to
+                                // open) — name the row after WHAT is being
+                                // downloaded instead.
+                                switch (modelData.downloadTarget) {
+                                case "model": return modelData.modelId
+                                case "label": return qsTr("auto-label model")
+                                case "diarization": return qsTr("speaker detection models")
+                                default: return ""
+                                }
+                            }
                             const s = modelData.fileUrl ? modelData.fileUrl.toString() : ""
                             return s.substring(s.lastIndexOf("/") + 1)
                         }
@@ -345,26 +660,46 @@ Item {
                             case "done": return "#2ecc71"
                             case "failed": return "#e74c3c"
                             case "active": return "#3498db"
+                            case "paused": return "#e67e22"
                             default: return "#f1c40f"
                             }
                         }
                         // Distinguishes what kind of work this job actually
                         // is — the same queue/worker thread runs full
-                        // transcriptions, "regenerate label" jobs, and
-                        // speaker renames, which otherwise look identical in
-                        // this list (same fileUrl, same status colors).
+                        // transcriptions, "regenerate label" jobs, speaker
+                        // renames, and (Wave N) model downloads, which
+                        // otherwise look identical in this list (same
+                        // status colors).
                         readonly property string kindLabel: bottomBar.kindLabel(modelData.kind)
+                        // Item 4/7: elapsed/ETA while this IS the active
+                        // row (there's only ever one, so bottomBar's own
+                        // elapsedEtaText is unambiguously about THIS row
+                        // whenever status is "active"); final duration once
+                        // Done/Failed; nothing yet while Queued.
+                        readonly property string detailText: {
+                            if (modelData.status === "active")
+                                return bottomBar.elapsedEtaText
+                            if (modelData.status === "done" || modelData.status === "failed")
+                                return bottomBar.formatDuration(modelData.durationMs)
+                            return ""
+                        }
+                        // Item 3: up/down only make sense among Queued rows
+                        // — see queuedPositionOf()'s doc comment.
+                        readonly property int queuedPosition: bottomBar.queuedPositionOf(modelData.id)
 
                         HoverHandler {
                             id: jobRowHover
                             cursorShape: Qt.PointingHandCursor
+                            enabled: !jobRow.isDownload
                         }
                         // Clicking a task jumps straight to its note — same
                         // "row itself is clickable, inner buttons still work
                         // independently" pattern as Sidebar.qml's file rows;
-                        // dismissButton's own TapHandler below (a child Item)
-                        // takes priority over this one within its own bounds.
+                        // the buttons' own TapHandlers below (child Items)
+                        // take priority over this one within their bounds.
+                        // Disabled for download rows (no file to open).
                         TapHandler {
+                            enabled: !jobRow.isDownload
                             onTapped: {
                                 bottomBar.taskActivated(jobRow.modelData.fileUrl.toString().replace("file://", ""))
                                 jobListPopup.close()
@@ -372,64 +707,140 @@ Item {
                         }
                         HoverBorder {
                             anchors.fill: parent
-                            active: jobRowHover.hovered
+                            active: jobRowHover.hovered && !jobRow.isDownload
                         }
 
-                        RowLayout {
-                            anchors.fill: parent
-                            spacing: 6
+                            RowLayout {
+                                anchors.fill: parent
+                                spacing: 6
 
-                            Rectangle {
-                                width: 8
-                                height: 8
-                                radius: 4
-                                color: jobRow.statusColor
-                            }
-                            Label {
-                                Layout.preferredWidth: 70
-                                elide: Text.ElideRight
-                                text: jobRow.kindLabel
-                                color: "#8fa8bf"
-                                font.pixelSize: 10
-                                font.bold: true
-                            }
-                            Label {
-                                Layout.fillWidth: true
-                                elide: Text.ElideMiddle
-                                text: jobRow.fileName
-                                color: "white"
-                                font.pixelSize: 11
-                            }
-                            Label {
-                                text: modelData.status
-                                color: "#888888"
-                                font.pixelSize: 10
-                            }
-                            Item {
-                                id: dismissButton
-                                visible: modelData.status === "done" || modelData.status === "failed"
-                                Layout.preferredWidth: 16
-                                Layout.preferredHeight: 16
+                                Rectangle {
+                                    width: 8
+                                    height: 8
+                                    radius: 4
+                                    color: jobRow.statusColor
+                                }
+                                Label {
+                                    Layout.preferredWidth: 62
+                                    elide: Text.ElideRight
+                                    text: jobRow.kindLabel
+                                    color: "#8fa8bf"
+                                    font.pixelSize: 10
+                                    font.bold: true
+                                }
+                                Label {
+                                    Layout.fillWidth: true
+                                    elide: Text.ElideMiddle
+                                    text: jobRow.fileName
+                                    color: "white"
+                                    font.pixelSize: 11
+                                }
+                                Label {
+                                    Layout.preferredWidth: 96
+                                    elide: Text.ElideRight
+                                    horizontalAlignment: Text.AlignRight
+                                    text: modelData.status + (jobRow.detailText !== "" ? " (" + jobRow.detailText + ")" : "")
+                                    color: "#888888"
+                                    font.pixelSize: 9
+                                }
 
-                                HoverHandler {
-                                    id: dismissHover
-                                    cursorShape: Qt.PointingHandCursor
+
+                                // Item 3: reorder — Queued rows only.
+                                Item {
+                                    id: moveUpButton
+                                    visible: modelData.status === "queued" && jobRow.queuedPosition > 0
+                                    Layout.preferredWidth: 14
+                                    Layout.preferredHeight: 14
+
+                                    HoverHandler {
+                                        id: moveUpHover
+                                        cursorShape: Qt.PointingHandCursor
+                                    }
+                                    TapHandler {
+                                        // See BottomBar.qml's main pauseButton
+                                        // TapHandler for why this is needed on
+                                        // a small icon target.
+                                        gesturePolicy: TapHandler.ReleaseWithinBounds
+                                        onTapped: bottomBar.transcriptionController.moveQueuedJob(
+                                            modelData.id, jobRow.queuedPosition - 1)
+                                    }
+                                    HoverBorder {
+                                        anchors.fill: parent
+                                        active: moveUpHover.hovered
+                                    }
+                                    Text {
+                                        anchors.centerIn: parent
+                                        text: "▲"
+                                        color: "#dddddd"
+                                        font.pixelSize: 9
+                                    }
                                 }
-                                TapHandler {
-                                    onTapped: bottomBar.transcriptionController.dismiss(jobRow.modelData.fileUrl)
+                                Item {
+                                    id: moveDownButton
+                                    visible: modelData.status === "queued"
+                                        && jobRow.queuedPosition >= 0 && jobRow.queuedPosition < bottomBar.queuedCount() - 1
+                                    Layout.preferredWidth: 14
+                                    Layout.preferredHeight: 14
+
+                                    HoverHandler {
+                                        id: moveDownHover
+                                        cursorShape: Qt.PointingHandCursor
+                                    }
+                                    TapHandler {
+                                        gesturePolicy: TapHandler.ReleaseWithinBounds
+                                        onTapped: bottomBar.transcriptionController.moveQueuedJob(
+                                            modelData.id, jobRow.queuedPosition + 1)
+                                    }
+                                    HoverBorder {
+                                        anchors.fill: parent
+                                        active: moveDownHover.hovered
+                                    }
+                                    Text {
+                                        anchors.centerIn: parent
+                                        text: "▼"
+                                        color: "#dddddd"
+                                        font.pixelSize: 9
+                                    }
                                 }
-                                HoverBorder {
-                                    anchors.fill: parent
-                                    active: dismissHover.hovered
-                                }
-                                Text {
-                                    anchors.centerIn: parent
-                                    text: "×"
-                                    color: "#dddddd"
-                                    font.pixelSize: 13
+
+                                // Item 3: one button for both "cancel"
+                                // (Queued/Active — stops it, see
+                                // TranscriptionController::cancelJob()'s doc
+                                // comment for the immediate-vs-next-
+                                // checkpoint caveat) and "dismiss"
+                                // (Done/Failed — just removes the row);
+                                // never both at once since they're keyed off
+                                // mutually exclusive status values.
+                                Item {
+                                    id: closeButton
+                                    Layout.preferredWidth: 16
+                                    Layout.preferredHeight: 16
+
+                                    HoverHandler {
+                                        id: closeHover
+                                        cursorShape: Qt.PointingHandCursor
+                                    }
+                                    TapHandler {
+                                        gesturePolicy: TapHandler.ReleaseWithinBounds
+                                        onTapped: {
+                                            if (modelData.status === "done" || modelData.status === "failed")
+                                                bottomBar.transcriptionController.dismiss(modelData.fileUrl)
+                                            else
+                                                bottomBar.transcriptionController.cancelJob(modelData.id)
+                                        }
+                                    }
+                                    HoverBorder {
+                                        anchors.fill: parent
+                                        active: closeHover.hovered
+                                    }
+                                    Text {
+                                        anchors.centerIn: parent
+                                        text: "×"
+                                        color: "#dddddd"
+                                        font.pixelSize: 13
+                                    }
                                 }
                             }
-                        }
                     }
                 }
             }

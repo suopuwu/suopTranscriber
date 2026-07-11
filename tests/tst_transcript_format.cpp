@@ -110,6 +110,11 @@ class TstTranscriptFormat : public QObject
     Q_OBJECT
 
 private slots:
+    // See tst_transcription_queue.cpp's initTestCase() — same reasoning:
+    // TranscriptionController now persists rolling-average phase timing via
+    // QSettings, which must never touch the real ~/.config/suopTranscriber.
+    void initTestCase() { QStandardPaths::setTestModeEnabled(true); }
+
     // Frontmatter carries exactly the documented keys: model,
     // speakerDetection, transcribedAt. Booleans come back as real bools
     // (readMetadata maps the literal strings "true"/"false"), everything

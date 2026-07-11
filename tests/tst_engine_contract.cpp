@@ -12,6 +12,7 @@
 #include <QtTest>
 
 #include <QDir>
+#include <QElapsedTimer>
 #include <QFileInfo>
 #include <QStandardPaths>
 
@@ -54,8 +55,9 @@ namespace {
 class FakeEngine : public TranscriptionEngine {
 public:
     std::vector<Segment> transcribe(const AudioChunk &chunk, const ProgressCallback &onProgress,
-                                     const SegmentCallback &onSegment) override
+                                     const SegmentCallback &onSegment, const AbortCallback &onAbort = {}) override
     {
+        Q_UNUSED(onAbort);
         const double totalSeconds = static_cast<double>(chunk.pcm16kMono.size()) / 16000.0;
         // Timestamps start at 0.0 regardless of chunk.offsetSeconds — the
         // engine deliberately ignores the offset. That is the contract.

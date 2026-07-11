@@ -184,6 +184,7 @@ qt_add_qml_module(suopTranscriber
         qml/SettingsPopup.qml
     SOURCES
         src/core/Segment.h
+        src/core/RollingAverage.h
         src/core/TranscriptionEngine.h
         src/core/VaultTreeModel.h
         src/core/VaultTreeModel.cpp

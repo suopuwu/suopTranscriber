@@ -2,6 +2,7 @@
 
 #include <QAbstractItemModel>
 #include <QFileSystemWatcher>
+#include <QStringList>
 #include <QUrl>
 #include <QVariantMap>
 #include <qqml.h>
@@ -79,6 +80,12 @@ public:
     Q_INVOKABLE QVariantMap readVaultSettings() const;
     Q_INVOKABLE bool writeVaultSettings(const QVariantMap &settings, QString *errorOut = nullptr) const;
 
+    // Every audio file's absolute path in the vault, transcribed or not —
+    // walks the full tree rather than relying on which TreeView rows happen
+    // to be realized (Sidebar's untranscribedPaths/transcribedPaths only
+    // cover the current viewport). Used by "force retranscribe all".
+    Q_INVOKABLE QStringList allAudioPaths() const;
+
 signals:
     void vaultPathChanged();
 
@@ -97,6 +104,7 @@ private:
     void rebuild();
     std::unique_ptr<Node> scanDirectory(const QString &dirPath, Node *parent) const;
     Node *nodeFromIndex(const QModelIndex &index) const;
+    static void collectAudioPaths(const Node *node, QStringList &out);
 
     // Backing for LabelRole/TagsRole/TranscriptBodyRole: read fresh from the
     // sidecar .md on every call rather than cached on Node/at rebuild() time,

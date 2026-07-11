@@ -27,6 +27,11 @@
 // test tears down cleanly and ctest never hangs; each test still QTRY-waits
 // for its jobs to settle before returning.
 
+#include <QCoreApplication>
+#include <QElapsedTimer>
+#include <QProcess>
+#include <QSettings>
+#include <QStandardPaths>
 #include <QtTest>
 
 #include "TranscriptionController.h"
@@ -53,6 +58,31 @@ struct VaultFixture {
     QUrl audioUrl(const QString &name) const { return QUrl::fromLocalFile(dir.path() + "/" + name); }
 };
 
+// Same detection strategy as tst_transcript_format's locateRealModel(): env
+// override first, else the user's real vault, preferring a plain (non-tdrz)
+// .en model — needed for the one test in this file that requires a model
+// that actually LOADS (VaultFixture's zero-byte fake fails too fast/on the
+// wrong step to test a checkpoint that only exists AFTER a real load).
+QString locateRealModel()
+{
+    const QString envModel = qEnvironmentVariable("SUOP_TEST_MODEL");
+    if (!envModel.isEmpty() && QFileInfo::exists(envModel))
+        return envModel;
+
+    QDir vaultModels(QStringLiteral("/home/user/recordings/.transcriber/models"));
+    const QStringList bins = vaultModels.entryList({QStringLiteral("*.bin")}, QDir::Files, QDir::Name);
+    QString fallback;
+    for (const QString &bin : bins) {
+        if (bin.contains(QStringLiteral("tdrz")))
+            continue;
+        if (bin.contains(QStringLiteral(".en")))
+            return vaultModels.filePath(bin);
+        if (fallback.isEmpty())
+            fallback = vaultModels.filePath(bin);
+    }
+    return fallback;
+}
+
 QString statusOf(const TranscriptionController &c, const QUrl &fileUrl)
 {
     const QVariantList jobs = c.jobs();
@@ -73,6 +103,14 @@ class TstTranscriptionQueue : public QObject
     Q_OBJECT
 
 private slots:
+    // TranscriptionController persists rolling-average phase timing via a
+    // plain QSettings() (see RollingAverage.h / loadPhaseTimings()) — CLAUDE.md
+    // "Never let testing touch the user's real vault or app config" applies
+    // here just as much as to lastVaultPath: setTestModeEnabled() redirects every
+    // QSettings/QStandardPaths lookup for the rest of this process into an
+    // isolated "qttest" sandbox instead of the real ~/.config/suopTranscriber.
+    void initTestCase() { QStandardPaths::setTestModeEnabled(true); }
+
     // A job that can't run (here: unloadable model; a missing audio file
     // fails the same way one step later) ends as status "failed", and
     // finished(fileUrl, ok=false, error) fires with a non-empty error — the
@@ -413,6 +451,15 @@ private slots:
     void autoLabel_queuesBothTasksImmediately()
     {
         VaultFixture vault;
+        // Fake (empty) label model already "downloaded" — same idea as
+        // VaultFixture's whisper model — so this test's transcribe(autoLabel)
+        // call queues exactly the transcribe+relabel pair it's actually
+        // testing, without ALSO queuing a Wave N "download" job ahead of the
+        // relabel job (that's its own concern, covered separately).
+        QFile labelModel(vault.dir.path() + "/.transcriber/models/Qwen3-4B-Instruct-2507-Q4_K_M.gguf");
+        QVERIFY(labelModel.open(QIODevice::WriteOnly));
+        labelModel.close();
+
         TranscriptionController controller;
         const QUrl file = vault.audioUrl("a.wav");
 
@@ -430,6 +477,631 @@ private slots:
         QTRY_COMPARE(controller.tasksCompleted(), 2);
         QCOMPARE(controller.jobs().at(0).toMap().value("status").toString(), QStringLiteral("failed"));
         QCOMPARE(controller.jobs().at(1).toMap().value("status").toString(), QStringLiteral("failed"));
+    }
+
+    // Wave N (task system, item 5): transcribe() queues a "download" job
+    // ahead of the transcribe job when the whisper model isn't on disk yet
+    // — VaultFixture deliberately does NOT plant a model file here (unlike
+    // every other test in this file), so this is the one case where that's
+    // exactly what's being tested.
+    void transcribe_queuesDownloadJobWhenModelMissing()
+    {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        const QUrl vaultUrl = QUrl::fromLocalFile(dir.path());
+        const QUrl file = QUrl::fromLocalFile(dir.path() + "/a.wav");
+
+        TranscriptionController controller;
+        controller.transcribe(file, vaultUrl, kModelId, false);
+
+        QCOMPARE(controller.tasksTotal(), 2);
+        QCOMPARE(controller.jobs().at(0).toMap().value("kind").toString(), QStringLiteral("download"));
+        QCOMPARE(controller.jobs().at(0).toMap().value("status").toString(), QStringLiteral("active"));
+        QCOMPARE(controller.jobs().at(1).toMap().value("kind").toString(), QStringLiteral("transcribe"));
+        QCOMPARE(controller.jobs().at(1).toMap().value("status").toString(), QStringLiteral("queued"));
+
+        // Deliberately does NOT wait for the download job to actually
+        // finish (it's a real curl process hitting the network — slow/
+        // flaky/environment-dependent) — the enqueue-time queue SHAPE
+        // above is this test's whole point. Cancel it before the
+        // controller is torn down so its destructor's QThread::wait()
+        // doesn't block on a real network timeout.
+        controller.cancelJob(controller.jobs().at(0).toMap().value("id").toInt());
+    }
+
+    // Item 3: cancelling a Queued job removes it outright (nothing had
+    // started, nothing to interrupt); cancelling the Active job lets it run
+    // to a Failed/"Cancelled" completion rather than vanishing instantly
+    // (see TranscriptionController::cancelJob()'s doc comment).
+    void cancelJob_removesQueuedEntry()
+    {
+        VaultFixture vault;
+        TranscriptionController controller;
+        const QUrl activeFile = vault.audioUrl("a.wav");
+        const QUrl queuedFile = vault.audioUrl("b.wav");
+
+        controller.transcribe(activeFile, vault.vaultUrl, kModelId, false);
+        controller.transcribe(queuedFile, vault.vaultUrl, kModelId, false);
+        QCOMPARE(controller.tasksTotal(), 2);
+
+        // Nothing has started for the Queued entry — cancelling it is a
+        // plain removal, no interruption needed.
+        const int queuedId = controller.jobs().at(1).toMap().value("id").toInt();
+        controller.cancelJob(queuedId);
+        QCOMPARE(controller.tasksTotal(), 1);
+        QCOMPARE(controller.jobs().at(0).toMap().value("status").toString(), QStringLiteral("active"));
+
+        QTRY_COMPARE(controller.tasksCompleted(), 1); // let the fake (fails-fast) model job settle before teardown
+    }
+
+    // Item 3: cancelling the ACTIVE job takes effect (Failed/"Cancelled")
+    // rather than leaving it running to completion. Uses a "download" job
+    // as the Active job under test — see maybeQueueDownloadJob()'s doc
+    // comment for why VaultFixture's normal fake model would fail on its
+    // own (bad magic) before ever reaching an interruption point, which
+    // would make this test race against that unrelated failure instead of
+    // actually exercising cancellation.
+    void cancelJob_stopsActiveJob()
+    {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        const QUrl vaultUrl = QUrl::fromLocalFile(dir.path());
+        const QUrl file = QUrl::fromLocalFile(dir.path() + "/a.wav");
+
+        TranscriptionController controller;
+        controller.transcribe(file, vaultUrl, kModelId, false);
+        QCOMPARE(controller.jobs().at(0).toMap().value("kind").toString(), QStringLiteral("download"));
+        QCOMPARE(controller.jobs().at(0).toMap().value("status").toString(), QStringLiteral("active"));
+
+        const int downloadId = controller.jobs().at(0).toMap().value("id").toInt();
+        controller.cancelJob(downloadId);
+        QTRY_COMPARE(controller.jobs().at(0).toMap().value("status").toString(), QStringLiteral("failed"));
+        QCOMPARE(controller.jobs().at(0).toMap().value("error").toString(), QStringLiteral("Cancelled"));
+    }
+
+    // User correction (2026-07-09): "loading" (model load) has no
+    // interruption point at all (whisper_init_from_file_with_params is one
+    // blocking call, no callback hook) — pauseActive() must no-op there
+    // rather than queue a pause that only takes effect much later.
+    void pauseActive_noopsDuringLoadingPhase()
+    {
+        VaultFixture vault;
+        TranscriptionController controller;
+        controller.transcribe(vault.audioUrl("a.wav"), vault.vaultUrl, kModelId, false);
+        QTRY_COMPARE(controller.currentPhase(), QStringLiteral("loading"));
+
+        controller.pauseActive();
+        QVERIFY(!controller.isActivePaused());
+
+        QTRY_COMPARE(controller.tasksCompleted(), 1); // let the fake model's fast failure settle
+    }
+
+    // Regression (2026-07-09 bug report — "cancel all doesn't cancel active
+    // transcriptions"): a cancel requested during "loading" was previously
+    // only caught AFTER the full audio decode (and diarization, if
+    // requested) — for a long recording, that could look exactly like
+    // "cancel does nothing" for a real user (the checkpoint existed, but
+    // only far later than the phase they clicked cancel during). Gated on
+    // a real model since VaultFixture's zero-byte fake fails at the
+    // model-load step itself, before ever reaching this checkpoint.
+    void cancelDuringLoading_caughtRightAfterModelLoad_notAfterFullDecode()
+    {
+        const QString modelPath = locateRealModel();
+        if (modelPath.isEmpty())
+            QSKIP("no real ggml model available; set SUOP_TEST_MODEL or transcribe once in the app");
+        if (QStandardPaths::findExecutable(QStringLiteral("ffmpeg")).isEmpty())
+            QSKIP("ffmpeg not on PATH — needed to decode the sample");
+
+        QTemporaryDir vault;
+        QVERIFY(vault.isValid());
+        const QString modelsDir = vault.path() + "/.transcriber/models";
+        QVERIFY(QDir().mkpath(modelsDir));
+        QVERIFY(QFile::copy(modelPath, modelsDir + "/ggml-base.en.bin"));
+        const QString samplePath = vault.path() + "/jfk.wav";
+        QVERIFY(QFile::copy(QStringLiteral(SUOP_SAMPLES_DIR "/jfk.wav"), samplePath));
+
+        TranscriptionController controller;
+        QSignalSpy finishedSpy(&controller, &TranscriptionController::finished);
+        controller.transcribe(QUrl::fromLocalFile(samplePath), QUrl::fromLocalFile(vault.path()), kModelId, false);
+        // Called the instant the job starts — mirrors clicking "Cancel all"
+        // while the bottom bar still reads "loading model…".
+        controller.cancelAll();
+
+        QVERIFY(finishedSpy.wait(10000));
+        QCOMPARE(finishedSpy.at(0).at(1).toBool(), false);
+        QCOMPARE(finishedSpy.at(0).at(2).toString(), QStringLiteral("Cancelled"));
+    }
+
+    // Bug report (2026-07-09): "the pause button doesn't work for the rest
+    // of the session" after cancelling a job during its "loading" phase.
+    // Reproduces the exact user sequence: cancel job #1 while it's loading,
+    // then queue job #2 and try to pause IT during real transcribing.
+    void pauseActive_stillWorksOnNextJob_afterCancelDuringPreviousLoading()
+    {
+        const QString modelPath = locateRealModel();
+        if (modelPath.isEmpty())
+            QSKIP("no real ggml model available; set SUOP_TEST_MODEL or transcribe once in the app");
+        if (QStandardPaths::findExecutable(QStringLiteral("ffmpeg")).isEmpty())
+            QSKIP("ffmpeg not on PATH — needed to decode the sample");
+
+        QTemporaryDir vault;
+        QVERIFY(vault.isValid());
+        const QString modelsDir = vault.path() + "/.transcriber/models";
+        QVERIFY(QDir().mkpath(modelsDir));
+        QVERIFY(QFile::copy(modelPath, modelsDir + "/ggml-base.en.bin"));
+        const QString sampleA = vault.path() + "/a.wav";
+        const QString sampleB = vault.path() + "/b.wav";
+        QVERIFY(QFile::copy(QStringLiteral(SUOP_SAMPLES_DIR "/jfk.wav"), sampleA));
+        QVERIFY(QFile::copy(QStringLiteral(SUOP_SAMPLES_DIR "/jfk.wav"), sampleB));
+
+        TranscriptionController controller;
+        QSignalSpy finishedSpy(&controller, &TranscriptionController::finished);
+
+        // Job #1: cancel it while still "loading" (mirrors the bottom bar's
+        // pause button, which maps to cancelActive() during this phase).
+        controller.transcribe(QUrl::fromLocalFile(sampleA), QUrl::fromLocalFile(vault.path()), kModelId, false);
+        controller.cancelActive();
+        QVERIFY(finishedSpy.wait(10000));
+        QCOMPARE(finishedSpy.at(0).at(1).toBool(), false);
+        QCOMPARE(finishedSpy.at(0).at(2).toString(), QStringLiteral("Cancelled"));
+
+        // Job #2: a fresh job for a different file. Model is already loaded
+        // (cached m_engine from job #1), so this should reach "transcribing"
+        // quickly, real decode work in flight.
+        controller.transcribe(QUrl::fromLocalFile(sampleB), QUrl::fromLocalFile(vault.path()), kModelId, false);
+        QTRY_VERIFY_WITH_TIMEOUT(controller.currentPhase() == QStringLiteral("transcribing"), 10000);
+
+        controller.pauseActive();
+        QTRY_VERIFY_WITH_TIMEOUT(controller.isActivePaused(), 5000);
+
+        controller.resumeActive();
+        QVERIFY(finishedSpy.wait(10000));
+        QCOMPARE(finishedSpy.at(1).at(1).toBool(), true);
+    }
+
+    // User correction (2026-07-09, follow-up round): clicking pause during
+    // "loading"/"decoding" (no cooperative checkpoint to truly suspend at —
+    // see JobStatus::Paused's doc comment) must not present as a failure.
+    // It should read as Paused, with no error, resumable with one more
+    // click of the same button — unlike cancelActive()/cancelJob(), which
+    // are a real, intentional cancel and still end Failed.
+    void togglePauseActive_duringLoading_pausesNotFails_andIsResumable()
+    {
+        const QString modelPath = locateRealModel();
+        if (modelPath.isEmpty())
+            QSKIP("no real ggml model available; set SUOP_TEST_MODEL or transcribe once in the app");
+        if (QStandardPaths::findExecutable(QStringLiteral("ffmpeg")).isEmpty())
+            QSKIP("ffmpeg not on PATH — needed to decode the sample");
+
+        QTemporaryDir vault;
+        QVERIFY(vault.isValid());
+        const QString modelsDir = vault.path() + "/.transcriber/models";
+        QVERIFY(QDir().mkpath(modelsDir));
+        QVERIFY(QFile::copy(modelPath, modelsDir + "/ggml-base.en.bin"));
+        const QString samplePath = vault.path() + "/a.wav";
+        QVERIFY(QFile::copy(QStringLiteral(SUOP_SAMPLES_DIR "/jfk.wav"), samplePath));
+
+        TranscriptionController controller;
+        QSignalSpy finishedSpy(&controller, &TranscriptionController::finished);
+
+        controller.transcribe(QUrl::fromLocalFile(samplePath), QUrl::fromLocalFile(vault.path()), kModelId, false);
+        QTRY_COMPARE(controller.currentPhase(), QStringLiteral("loading"));
+
+        controller.togglePauseActive();
+        QVERIFY(finishedSpy.wait(10000));
+        QCOMPARE(finishedSpy.at(0).at(1).toBool(), false);
+        QCOMPARE(finishedSpy.at(0).at(2).toString(), QStringLiteral("Cancelled"));
+        QVERIFY(!controller.isBusy());
+        QCOMPARE(controller.jobs().at(0).toMap().value("status").toString(), QStringLiteral("paused"));
+        QVERIFY(controller.jobs().at(0).toMap().value("error").toString().isEmpty());
+
+        // One more click of the same button (idle -> startNext()) resumes
+        // it — a full restart under the hood, but the job's identity/
+        // position is preserved, not a new entry.
+        controller.togglePauseActive();
+        QTRY_VERIFY(controller.isBusy());
+        QCOMPARE(controller.jobs().at(0).toMap().value("status").toString(), QStringLiteral("active"));
+
+        QVERIFY(finishedSpy.wait(10000));
+        QCOMPARE(finishedSpy.at(1).at(1).toBool(), true);
+        QCOMPARE(controller.jobs().at(0).toMap().value("status").toString(), QStringLiteral("done"));
+    }
+
+    // Bug report (2026-07-10): after pausing during "decoding", the user saw
+    // nothing happen for a while (expected — no checkpoint exists mid-decode,
+    // see JobStatus::Paused's doc comment), then found pause permanently
+    // broken once the job reached "finding speech" (the diarization phase).
+    // Root cause: nothing told the user the first click had registered, so a
+    // second click landed while the soft-cancel from the first was still
+    // unresolved — pauseActive()'s real requestPause() stacked on top of the
+    // still-pending cancel flag, and waitWhilePausedOrCancelled()'s wait loop
+    // never runs while cancelled, so the pause silently went inert. Fixed via
+    // activeStopping (pauseActive() now no-ops while it's true). Reproduces
+    // the race directly rather than via real timing: both calls happen
+    // back-to-back on the test thread, before the worker can possibly have
+    // observed the first cancel yet — deterministic, not a sleep-and-hope.
+    void pauseActive_duringStopWindow_isNoop_pauseStillWorksAfterResume()
+    {
+        const QString modelPath = locateRealModel();
+        if (modelPath.isEmpty())
+            QSKIP("no real ggml model available; set SUOP_TEST_MODEL or transcribe once in the app");
+        if (QStandardPaths::findExecutable(QStringLiteral("ffmpeg")).isEmpty())
+            QSKIP("ffmpeg not on PATH — needed to decode the sample");
+
+        QTemporaryDir vault;
+        QVERIFY(vault.isValid());
+        const QString modelsDir = vault.path() + "/.transcriber/models";
+        QVERIFY(QDir().mkpath(modelsDir));
+        QVERIFY(QFile::copy(modelPath, modelsDir + "/ggml-base.en.bin"));
+        const QString samplePath = vault.path() + "/a.wav";
+        QVERIFY(QFile::copy(QStringLiteral(SUOP_SAMPLES_DIR "/jfk.wav"), samplePath));
+
+        TranscriptionController controller;
+        QSignalSpy finishedSpy(&controller, &TranscriptionController::finished);
+
+        controller.transcribe(QUrl::fromLocalFile(samplePath), QUrl::fromLocalFile(vault.path()), kModelId, false);
+        QTRY_COMPARE(controller.currentPhase(), QStringLiteral("loading"));
+
+        // First click: initiates the soft-cancel.
+        controller.togglePauseActive();
+        QVERIFY(controller.isActiveStopping());
+        // Stray second click, landing before the first has resolved — must
+        // be a no-op, not a real pause request stacked on the pending cancel.
+        controller.pauseActive();
+        QVERIFY(!controller.isActivePaused());
+
+        QVERIFY(finishedSpy.wait(10000));
+        QCOMPARE(controller.jobs().at(0).toMap().value("status").toString(), QStringLiteral("paused"));
+        QVERIFY(!controller.isActiveStopping());
+
+        // Resume, then confirm a NORMAL pause during a real phase still
+        // works — this is the actual regression: it used to go permanently
+        // inert after the sequence above.
+        controller.togglePauseActive();
+        QTRY_VERIFY_WITH_TIMEOUT(controller.currentPhase() == QStringLiteral("transcribing"), 10000);
+        controller.pauseActive();
+        QTRY_VERIFY_WITH_TIMEOUT(controller.isActivePaused(), 5000);
+        controller.resumeActive();
+        QVERIFY(finishedSpy.wait(10000));
+        QCOMPARE(finishedSpy.at(1).at(1).toBool(), true);
+    }
+
+    // User follow-up (2026-07-10): "why can we not do something similar [to
+    // instant window-close] for the pause button" during decode. Answer:
+    // for decode specifically, we can — ffmpeg runs as a real subprocess
+    // (see AudioDecoder.h), unlike whisper.cpp's in-process model load.
+    // Pausing during "decoding" is now a REAL cooperative pause (isActivePaused
+    // becomes true, job stays Active — not the restart-based JobStatus::Paused
+    // "loading" still needs). Uses a synthetic tone long enough that decode
+    // takes a real, observable amount of time — jfk.wav decodes in well
+    // under one polling tick, giving no realistic window to catch "decoding"
+    // via QTRY at all.
+    void pauseActive_duringDecoding_reallyPauses_notRestart()
+    {
+        const QString modelPath = locateRealModel();
+        if (modelPath.isEmpty())
+            QSKIP("no real ggml model available; set SUOP_TEST_MODEL or transcribe once in the app");
+        if (QStandardPaths::findExecutable(QStringLiteral("ffmpeg")).isEmpty())
+            QSKIP("ffmpeg not on PATH — needed to decode the sample");
+
+        QTemporaryDir vault;
+        QVERIFY(vault.isValid());
+        const QString modelsDir = vault.path() + "/.transcriber/models";
+        QVERIFY(QDir().mkpath(modelsDir));
+        QVERIFY(QFile::copy(modelPath, modelsDir + "/ggml-base.en.bin"));
+
+        const QString samplePath = vault.path() + "/a.wav";
+        QProcess gen;
+        gen.start("ffmpeg", {"-y", "-f", "lavfi", "-i", QStringLiteral("sine=frequency=440:duration=300"),
+                              samplePath});
+        if (!gen.waitForFinished(30000) || gen.exitCode() != 0 || !QFileInfo::exists(samplePath))
+            QSKIP("could not generate synthetic test audio via ffmpeg");
+
+        TranscriptionController controller;
+        QSignalSpy finishedSpy(&controller, &TranscriptionController::finished);
+        controller.transcribe(QUrl::fromLocalFile(samplePath), QUrl::fromLocalFile(vault.path()), kModelId, false);
+        QTRY_COMPARE(controller.currentPhase(), QStringLiteral("decoding"));
+
+        controller.pauseActive();
+        QTRY_VERIFY_WITH_TIMEOUT(controller.isActivePaused(), 5000);
+        // Still Active/"decoding" — NOT the restart-based Paused status.
+        QCOMPARE(controller.jobs().at(0).toMap().value("status").toString(), QStringLiteral("active"));
+        QCOMPARE(controller.currentPhase(), QStringLiteral("decoding"));
+
+        controller.resumeActive();
+        QVERIFY(finishedSpy.wait(20000));
+        QCOMPARE(finishedSpy.at(0).at(1).toBool(), true);
+        QCOMPARE(controller.jobs().at(0).toMap().value("status").toString(), QStringLiteral("done"));
+    }
+
+    // User correction (2026-07-09): cancelActive() is a real, intentional
+    // cancel of whichever job is Active (always ends Failed/"Cancelled") —
+    // convenience over cancelJob() so QML doesn't need to look up the
+    // Active job's id itself. togglePauseActive() also uses it as a
+    // building block for the "loading" soft-pause path (see
+    // togglePauseActive_duringLoading_pausesNotFails_andIsResumable), but a
+    // DIRECT cancelActive() call — as here — is unconditionally a real
+    // cancel. Uses a "download" job as the Active job under test, same
+    // reasoning as cancelJob_stopsActiveJob (a real transcribe job's fake
+    // model fails too fast to reliably race against).
+    void cancelActive_cancelsWhicheverJobIsActive()
+    {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        const QUrl vaultUrl = QUrl::fromLocalFile(dir.path());
+        const QUrl file = QUrl::fromLocalFile(dir.path() + "/a.wav");
+
+        TranscriptionController controller;
+        controller.transcribe(file, vaultUrl, kModelId, false);
+        QCOMPARE(controller.jobs().at(0).toMap().value("status").toString(), QStringLiteral("active"));
+
+        controller.cancelActive();
+        QTRY_COMPARE(controller.jobs().at(0).toMap().value("status").toString(), QStringLiteral("failed"));
+        QCOMPARE(controller.jobs().at(0).toMap().value("error").toString(), QStringLiteral("Cancelled"));
+    }
+
+    // Regression (2026-07-09 bug report — "transcription was still running
+    // after closing the GUI... it should never run in the background"):
+    // ~TranscriptionController() used to just call m_thread.quit() +
+    // m_thread.wait() with nothing ever telling an Active job to stop —
+    // wait() blocks until the worker's CURRENT call returns naturally, so
+    // destroying the controller mid-job could hang (or keep transcribing)
+    // for as long as that job's underlying call took. Uses a "download" job
+    // as the Active job under test — see cancelJob_stopsActiveJob's doc
+    // comment for why (real, blocking-but-interruptible poll loop, no
+    // model/network dependency needed). Threshold picked empirically: in
+    // this sandbox (no network), curl's own DNS failure takes ~3.6s with
+    // the fix REVERTED (nothing ever cancels it, so the destructor just
+    // waits that out) vs. ~0.6s with the fix present (cancelled almost
+    // immediately) — 2000ms cleanly separates the two without being so
+    // tight that ordinary system jitter could flake it. On a machine WITH
+    // network access the "unfixed" duration would be even longer (a real
+    // download attempt, not just a fast DNS failure), so this bound stays
+    // valid there too.
+    void destructor_cancelsActiveJob_doesNotHangWaitingForItToFinishNaturally()
+    {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        const QUrl vaultUrl = QUrl::fromLocalFile(dir.path());
+        const QUrl file = QUrl::fromLocalFile(dir.path() + "/a.wav");
+
+        QElapsedTimer timer;
+        {
+            TranscriptionController controller;
+            controller.transcribe(file, vaultUrl, kModelId, false);
+            QCOMPARE(controller.jobs().at(0).toMap().value("status").toString(), QStringLiteral("active"));
+            timer.start();
+            // Controller destructs at end of scope — must not hang waiting
+            // for the download to fail/finish on its own.
+        }
+        QVERIFY2(timer.elapsed() < 2000,
+                 "destructor took too long -- did it wait for the job to finish naturally instead of cancelling it?");
+    }
+
+    // Item 3: moveQueuedJob() reorders WITHIN the queued sublist only,
+    // leaving the Active row's position alone.
+    void moveQueuedJob_reordersQueuedEntriesOnly()
+    {
+        VaultFixture vault;
+        TranscriptionController controller;
+        const QUrl activeFile = vault.audioUrl("a.wav");
+        const QUrl queuedFile1 = vault.audioUrl("b.wav");
+        const QUrl queuedFile2 = vault.audioUrl("c.wav");
+
+        controller.transcribe(activeFile, vault.vaultUrl, kModelId, false);
+        controller.transcribe(queuedFile1, vault.vaultUrl, kModelId, false);
+        controller.transcribe(queuedFile2, vault.vaultUrl, kModelId, false);
+
+        const int secondId = controller.jobs().at(2).toMap().value("id").toInt();
+        controller.moveQueuedJob(secondId, 0); // move c.wav to the front of the queued sublist
+
+        const QVariantList jobs = controller.jobs();
+        QCOMPARE(jobs.at(0).toMap().value("fileUrl").toUrl(), activeFile); // Active row untouched
+        QCOMPARE(jobs.at(1).toMap().value("fileUrl").toUrl(), queuedFile2); // moved to front
+        QCOMPARE(jobs.at(2).toMap().value("fileUrl").toUrl(), queuedFile1);
+    }
+
+    // Item 1: a Queued job persists to <vault>/.transcriber/tasks.json and
+    // loadPersistedQueue() re-enqueues it on a FRESH controller — same
+    // contract a new app launch relies on.
+    void persistedQueue_survivesAcrossControllerInstances()
+    {
+        VaultFixture vault;
+        const QUrl queuedFile = vault.audioUrl("b.wav");
+        {
+            TranscriptionController controller;
+            // Persistence only starts once a vault has been "opened" (see
+            // TranscriptionController::persistQueue()'s doc comment — it's
+            // a no-op until loadPersistedQueue() has recorded a vault to
+            // save back to). Real app usage always calls this on vault
+            // open (Main.qml's onVaultPathChanged) before anything gets
+            // queued; mirror that here rather than calling transcribe()
+            // "cold".
+            controller.loadPersistedQueue(vault.vaultUrl); // no tasks.json yet — just records the vault
+            controller.transcribe(vault.audioUrl("a.wav"), vault.vaultUrl, kModelId, false);
+            controller.transcribe(queuedFile, vault.vaultUrl, kModelId, false);
+            QVERIFY(QFileInfo::exists(vault.dir.path() + "/.transcriber/tasks.json"));
+        }
+
+        TranscriptionController fresh;
+        fresh.loadPersistedQueue(vault.vaultUrl);
+        // The first controller's Active job (a.wav) was persisted AS Queued
+        // (no true mid-file resume — see loadPersistedQueue()'s doc
+        // comment), so both files should be back in the queue.
+        QTRY_COMPARE(fresh.tasksTotal(), 2);
+        QVERIFY(fresh.isQueued(queuedFile));
+        // User correction (2026-07-09): restored jobs are saved, not
+        // auto-resumed — they sit Queued until startNext() is called.
+        QVERIFY(!fresh.isBusy());
+        QCOMPARE(fresh.jobs().at(0).toMap().value("status").toString(), QStringLiteral("queued"));
+    }
+
+    // User correction (2026-07-09): loadPersistedQueue() restores the queue
+    // but does NOT start anything — the QML "play" button calls startNext()
+    // explicitly once the user chooses to resume.
+    void loadPersistedQueue_restoresWithoutAutoStarting_startNextResumesIt()
+    {
+        VaultFixture vault;
+        const QUrl file = vault.audioUrl("a.wav");
+        {
+            TranscriptionController controller;
+            controller.loadPersistedQueue(vault.vaultUrl);
+            controller.transcribe(file, vault.vaultUrl, kModelId, false);
+            QVERIFY(controller.isBusy()); // a live transcribe() call still auto-starts as before
+        }
+
+        TranscriptionController fresh;
+        fresh.loadPersistedQueue(vault.vaultUrl);
+        QCOMPARE(fresh.tasksTotal(), 1);
+        QVERIFY(!fresh.isBusy());
+        QCOMPARE(fresh.jobs().at(0).toMap().value("status").toString(), QStringLiteral("queued"));
+
+        fresh.startNext();
+        QVERIFY(fresh.isBusy());
+        QCOMPARE(fresh.jobs().at(0).toMap().value("status").toString(), QStringLiteral("active"));
+
+        // A second startNext() while already busy is a no-op (still just
+        // the one job, still Active — not restarted/duplicated).
+        fresh.startNext();
+        QCOMPARE(fresh.tasksTotal(), 1);
+        QTRY_COMPARE(fresh.tasksCompleted(), 1); // let the fake model's fast failure settle before teardown
+    }
+
+    // Regression (2026-07-09 bug report): a transcribe(autoLabel=true) call
+    // persists BOTH a "transcribe" and a "relabel" entry for the SAME
+    // fileUrl (see autoLabel_queuesBothTasksImmediately). Replaying them on
+    // restart previously called relabel() directly, whose own isQueued()
+    // dedup guard saw the just-replayed transcribe entry already Queued/
+    // Active for that fileUrl and silently dropped the relabel entry — the
+    // label job never came back after a restart. enqueueReplayedJob() now
+    // bypasses that guard for replay (every persisted entry already passed
+    // dedup once, when it was first queued live).
+    void persistedQueue_autoLabelPairForSameFile_bothSurviveRestart()
+    {
+        VaultFixture vault;
+        // Fake (empty) label model already "downloaded" — same idea as
+        // VaultFixture's whisper model — so replaying the "relabel" entry
+        // doesn't ALSO queue a download job, keeping this test focused on
+        // the dedup-during-replay bug specifically.
+        QFile labelModel(vault.dir.path() + "/.transcriber/models/Qwen3-4B-Instruct-2507-Q4_K_M.gguf");
+        QVERIFY(labelModel.open(QIODevice::WriteOnly));
+        labelModel.close();
+
+        const QUrl file = vault.audioUrl("a.wav");
+        {
+            TranscriptionController controller;
+            controller.loadPersistedQueue(vault.vaultUrl);
+            controller.transcribe(file, vault.vaultUrl, kModelId, false, /*autoLabel=*/true);
+            QCOMPARE(controller.tasksTotal(), 2);
+        }
+
+        TranscriptionController fresh;
+        fresh.loadPersistedQueue(vault.vaultUrl);
+        QTRY_COMPARE(fresh.tasksTotal(), 2);
+        QCOMPARE(fresh.jobs().at(0).toMap().value("kind").toString(), QStringLiteral("transcribe"));
+        QCOMPARE(fresh.jobs().at(1).toMap().value("kind").toString(), QStringLiteral("relabel"));
+    }
+
+    // Bug report (2026-07-10): "my first run seems to have the whole bar
+    // filled at all times". Root cause: phaseRelativeSyntheticProgress()
+    // divides elapsed-time-in-phase by defaultPhaseDurationMs() for
+    // "loading"/"decoding" (phases with no real progress callback) whenever
+    // a phase has recorded zero samples yet — the ORIGINAL fallback
+    // (kDefaultPhaseWeightMs = 1.0, meant only as a WEIGHT for
+    // recomputeOverallProgress()'s normalization, never as a plausible
+    // DURATION) meant that division hit its 0.95 clamp within about a
+    // millisecond of a phase starting, on literally every fresh install's
+    // very first job.
+    //
+    // This asserts against defaultPhaseDurationMs() directly rather than
+    // trying to reproduce the SYMPTOM end-to-end with a real job + wall-clock
+    // waits: an earlier version of this test did exactly that and turned out
+    // unreliable on fast hardware (a real model's "loading" phase can
+    // complete in well under m_indeterminatePhaseTimer's 200ms tick interval
+    // — e.g. a small model already warm in the OS page cache on a fast GPU —
+    // so the elapsed-time-based bug never even got a chance to manifest
+    // before the phase moved on, regardless of whether it was fixed). A
+    // direct, deterministic check of the fallback value itself has no such
+    // race.
+    void defaultPhaseDurationMs_isAPlausibleDuration_notAnArbitraryWeight()
+    {
+        for (const QString &phase : TranscriptionController::kTimedPhases) {
+            const double ms = TranscriptionController::defaultPhaseDurationMs(phase);
+            QVERIFY2(ms >= 500.0,
+                     qPrintable(QStringLiteral("defaultPhaseDurationMs(\"%1\") == %2 — too small to be a "
+                                                "plausible duration; phaseRelativeSyntheticProgress() divides "
+                                                "elapsed-ms by this, so anything this small saturates to ~full "
+                                                "almost instantly")
+                                    .arg(phase)
+                                    .arg(ms)));
+        }
+        // The specific default this bug report asked for: "detecting-
+        // speakers" and "transcribing" split 50/50 (equal default weight)
+        // absent any real history, matching the fixed split this rolling-
+        // average feature replaced.
+        QCOMPARE(TranscriptionController::defaultPhaseDurationMs(QStringLiteral("detecting-speakers")),
+                  TranscriptionController::defaultPhaseDurationMs(QStringLiteral("transcribing")));
+    }
+
+    // 2026-07-10: rolling-average phase weighting (RollingAverage,
+    // TranscriptionController::recomputeOverallProgress()). Two things this
+    // feature promises: (1) overallProgress sweeps the WHOLE job, ending at
+    // (or extremely near) 1.0 once every active phase — including "loading"/
+    // "decoding", which have no real progress callback of their own and now
+    // rely on phaseRelativeSyntheticProgress() — has been accounted for; (2)
+    // each phase's actual duration gets persisted (QSettings "phaseTimings"
+    // group) so the NEXT job's bar proportions reflect real timing data
+    // instead of the fixed 50/50 default fallback every phase starts with.
+    void rollingAveragePhaseWeighting_advancesOverallProgressToCompletion_andPersistsDurations()
+    {
+        const QString modelPath = locateRealModel();
+        if (modelPath.isEmpty())
+            QSKIP("no real ggml model available; set SUOP_TEST_MODEL or transcribe once in the app");
+        if (QStandardPaths::findExecutable(QStringLiteral("ffmpeg")).isEmpty())
+            QSKIP("ffmpeg not on PATH — needed to decode the sample");
+
+        QTemporaryDir vault;
+        QVERIFY(vault.isValid());
+        const QString modelsDir = vault.path() + "/.transcriber/models";
+        QVERIFY(QDir().mkpath(modelsDir));
+        QVERIFY(QFile::copy(modelPath, modelsDir + "/ggml-base.en.bin"));
+        const QString samplePath = vault.path() + "/jfk.wav";
+        QVERIFY(QFile::copy(QStringLiteral(SUOP_SAMPLES_DIR "/jfk.wav"), samplePath));
+
+        // Isolated org/app identity (on top of initTestCase()'s
+        // setTestModeEnabled()) so this test's assertions on QSettings' exact
+        // contents can't collide with any OTHER test in this same run that
+        // also happens to record phase timings.
+        QCoreApplication::setOrganizationName(QStringLiteral("suopTranscriber-tests"));
+        QCoreApplication::setApplicationName(
+            QStringLiteral("tst_transcription_queue-rollingAveragePhaseWeighting"));
+
+        TranscriptionController controller;
+        QSignalSpy finishedSpy(&controller, &TranscriptionController::finished);
+        controller.transcribe(QUrl::fromLocalFile(samplePath), QUrl::fromLocalFile(vault.path()), kModelId, false);
+
+        QVERIFY(finishedSpy.wait(30000));
+        QVERIFY2(finishedSpy.at(0).at(1).toBool(), qPrintable(finishedSpy.at(0).at(2).toString()));
+
+        // The last progress() tick before finished() should have swept
+        // overallProgress all the way to (essentially) 1.0 — not stalled
+        // partway because "loading"/"decoding" never got counted, and not
+        // overshot past 1.0 either.
+        QVERIFY2(controller.overallProgress() > 0.98,
+                 qPrintable(QStringLiteral("expected overallProgress near 1.0 at completion, got %1")
+                                .arg(controller.overallProgress())));
+
+        // speakerDetection was false, so only these two phases ran — both
+        // must have a persisted sample now.
+        QSettings settings;
+        settings.beginGroup(QStringLiteral("phaseTimings"));
+        QVERIFY2(!settings.value(QStringLiteral("loading")).toList().isEmpty(),
+                 "expected a persisted duration sample for the \"loading\" phase");
+        QVERIFY2(!settings.value(QStringLiteral("transcribing")).toList().isEmpty(),
+                 "expected a persisted duration sample for the \"transcribing\" phase");
+        // Never requested this job, so no sample should exist for it.
+        QVERIFY(settings.value(QStringLiteral("detecting-speakers")).toList().isEmpty());
+        settings.endGroup();
     }
 };
 

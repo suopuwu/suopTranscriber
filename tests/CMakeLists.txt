@@ -41,6 +41,7 @@ function(suop_add_test name)
 endfunction()
 
 suop_add_test(tst_smoke)
+suop_add_test(tst_rollingaverage)
 suop_add_test(tst_vaulttreemodel SOURCES VaultTreeModel.cpp)
 suop_add_test(tst_vaultsearchproxymodel SOURCES VaultTreeModel.cpp VaultSearchProxyModel.cpp)
 suop_add_test(tst_modelmanager SOURCES ModelManager.cpp)

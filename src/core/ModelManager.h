@@ -3,6 +3,7 @@
 #include <QString>
 #include <QUrl>
 
+#include <functional>
 #include <vector>
 
 // Ensures a whisper.cpp ggml model is present at <vault>/.transcriber/models/,
@@ -31,11 +32,53 @@ const std::vector<ModelInfo> &availableModels();
 
 constexpr auto kDefaultModelId = "base.en";
 
+// Wave N (task system, item 5): resolves modelId to its ggml file name
+// without touching disk/network — lets a caller check "is this already
+// downloaded" (see isModelDownloaded()) before deciding whether a separate
+// download job is needed. Empty if modelId isn't recognized (mirrors
+// ensureModel()'s fallback logic being the CALLER's job to apply, not this
+// function's — this one never substitutes kDefaultModelId).
+QString modelFileName(const QString &modelId);
+
+// True if modelFileName(modelId)'s file already exists at
+// <vault>/.transcriber/models/ — never downloads. False (not a fallback
+// check) for an unrecognized modelId, same as modelFileName()'s empty
+// result.
+bool isModelDownloaded(const QUrl &vaultPath, const QString &modelId);
+// Mirrors isModelDownloaded() for the AI-auto-labeling model (kLabelModelFileName).
+bool isLabelModelDownloaded(const QUrl &vaultPath);
+// Mirrors isModelDownloaded() for BOTH speaker-diarization models — true
+// only if both are present, matching ensureDiarizationModels()'s
+// never-partially-succeeds contract.
+bool areDiarizationModelsDownloaded(const QUrl &vaultPath);
+
+// Progress callback for the download functions below: bytesDone/bytesTotal
+// from polling the growing .part file's size against a Content-Length
+// probed once up front — bytesTotal is 0 if the server didn't report a
+// length (progress is then unknown, caller should show indeterminate).
+using DownloadProgressCallback = std::function<void(qint64 bytesDone, qint64 bytesTotal)>;
+// Cooperative pause/cancel for an in-progress download (Wave N task
+// system) — paused()/cancelled() are polled periodically (see
+// downloadToModelsDir()'s doc comment in the .cpp) rather than delivered as
+// an interrupt. Default-constructed (both null) means "never pause or
+// cancel", same optional-callback convention as TranscriptionEngine's
+// AbortCallback.
+struct DownloadControl {
+    std::function<bool()> paused;
+    std::function<bool()> cancelled;
+};
+
 // Returns the local model path, or empty on failure (errorOut set if given).
 // usedFallback, if given, is set to true/false depending on whether an
 // unrecognized modelId forced a default substitution (see class comment).
+// onProgress/control (Wave N): optional real-time byte progress + cooperative
+// pause/cancel for the download itself — a no-op to pass when the model is
+// already downloaded (the common case once item 5's separate download job
+// has already run), since this function returns immediately without
+// touching either callback when the file already exists.
 QString ensureModel(const QUrl &vaultPath, const QString &modelId, QString *errorOut = nullptr,
-                     bool *usedFallback = nullptr);
+                     bool *usedFallback = nullptr, const DownloadProgressCallback &onProgress = {},
+                     const DownloadControl &control = {});
 
 // The GGUF model used for AI auto-labeling (see DESIGN.md "Model management" —
 // LabelingEngine's second pass after transcription). One hardcoded model for
@@ -45,8 +88,10 @@ constexpr auto kLabelModelFileName = "Qwen3-4B-Instruct-2507-Q4_K_M.gguf";
 
 // Returns the local label-model path, or empty on failure (errorOut set if
 // given). Downloads on first use (~2.5 GB); Q_INVOKABLE callers must run this
-// off the GUI thread, same as ensureModel().
-QString ensureLabelModel(const QUrl &vaultPath, QString *errorOut = nullptr);
+// off the GUI thread, same as ensureModel(). onProgress/control: see
+// ensureModel()'s doc comment.
+QString ensureLabelModel(const QUrl &vaultPath, QString *errorOut = nullptr,
+                          const DownloadProgressCallback &onProgress = {}, const DownloadControl &control = {});
 
 // Speaker diarization (see DESIGN.md "Speaker diarization" / DiarizationEngine):
 // pyannote-segmentation-3.0, int8-quantized (local speaker-activity
@@ -94,7 +139,13 @@ constexpr auto kDiarizationEmbeddingFileName = "wespeaker-resnet293-lm.onnx";
 // were downloaded successfully; false (errorOut set) if either fails. Never
 // partially succeeds without reporting it — either both paths are valid or
 // neither is (callers shouldn't have to handle a "half available" state).
+// onProgress/control: see ensureModel()'s doc comment — spans BOTH files
+// when both need downloading (bytesDone/bytesTotal cover whichever one is
+// currently transferring, resetting between them; a caller wanting one
+// smooth 0..1 across both must track that itself, same as any multi-file
+// download).
 bool ensureDiarizationModels(const QUrl &vaultPath, QString *segmentationPathOut, QString *embeddingPathOut,
-                              QString *errorOut = nullptr);
+                              QString *errorOut = nullptr, const DownloadProgressCallback &onProgress = {},
+                              const DownloadControl &control = {});
 
 }

@@ -584,6 +584,49 @@ private slots:
         QVERIFY(!error.isEmpty());
     }
 
+    // --- allAudioPaths() (TitleBar "force retranscribe all") ---------------------
+
+    // Every audio file's absolute path is returned regardless of transcribed
+    // status, nested directory depth, or orphaned .md/non-audio noise — this
+    // is what "force retranscribe all" enumerates over, unlike the sidebar's
+    // viewport-realized-delegate tracking, so it must reflect the full vault
+    // even for rows that were never scrolled into view.
+    void allAudioPaths_listsEveryAudioFile_transcribedOrNot_atAnyDepth()
+    {
+        QTemporaryDir vault;
+        QVERIFY(vault.isValid());
+        QVERIFY(touch(vault.filePath("untranscribed.mp3")));
+        QVERIFY(touch(vault.filePath("transcribed.mp3")));
+        QVERIFY(touch(vault.filePath("transcribed.md")));
+        QVERIFY(touch(vault.filePath("orphaned.md")));
+        QVERIFY(touch(vault.filePath("notes.txt")));
+        QVERIFY(touch(vault.filePath("nested/deep/buried.wav")));
+
+        VaultTreeModel model;
+        model.setVaultPath(QUrl::fromLocalFile(vault.path()));
+
+        QStringList paths = model.allAudioPaths();
+        paths.sort();
+
+        QStringList expected;
+        expected << vault.filePath("nested/deep/buried.wav") << vault.filePath("transcribed.mp3")
+                 << vault.filePath("untranscribed.mp3");
+        expected.sort();
+
+        QCOMPARE(paths, expected);
+    }
+
+    void allAudioPaths_emptyVault_returnsEmptyList()
+    {
+        QTemporaryDir vault;
+        QVERIFY(vault.isValid());
+
+        VaultTreeModel model;
+        model.setVaultPath(QUrl::fromLocalFile(vault.path()));
+
+        QVERIFY(model.allAudioPaths().isEmpty());
+    }
+
     // --- Model contract ----------------------------------------------------------
 
     // QAbstractItemModelTester validates the full QAbstractItemModel contract

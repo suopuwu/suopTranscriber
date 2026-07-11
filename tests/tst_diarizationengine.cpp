@@ -119,6 +119,7 @@ private slots:
             prevStart = turn.start;
         }
     }
+
 };
 
 QTEST_GUILESS_MAIN(TstDiarizationEngine)

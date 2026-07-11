@@ -21,7 +21,8 @@ public:
     bool isValid() const { return m_ctx != nullptr; }
 
     std::vector<Segment> transcribe(const AudioChunk &chunk, const ProgressCallback &onProgress,
-                                     const SegmentCallback &onSegment) override;
+                                     const SegmentCallback &onSegment,
+                                     const AbortCallback &onAbort = {}) override;
 
 private:
     whisper_context *m_ctx = nullptr;

@@ -1517,12 +1517,41 @@ Rectangle {
                     spacing: 12
                     visible: mainPanel.orphanedMdPath === ""
 
-                    CheckBox {
+                    // Minimal pill toggle, matching Sidebar.qml's
+                    // "Transcriptions" search-scope toggle (item 1, Wave E)
+                    // rather than a QQC2 CheckBox — same on/off read via
+                    // background+outline (green when on) as every other
+                    // toggle-shaped control in this app.
+                    Item {
                         id: speakerDetectionToggle
-                        text: qsTr("Speaker detection")
+                        property bool checked: false
+                        Layout.preferredWidth: speakerDetectionLabel.implicitWidth + 16
+                        Layout.preferredHeight: 24
 
                         HoverHandler {
+                            id: speakerDetectionHover
                             cursorShape: Qt.PointingHandCursor
+                        }
+                        TapHandler {
+                            onTapped: speakerDetectionToggle.checked = !speakerDetectionToggle.checked
+                        }
+                        Rectangle {
+                            anchors.fill: parent
+                            radius: AppSettings.borderRadius
+                            color: speakerDetectionToggle.checked
+                                   ? (speakerDetectionHover.hovered ? "#2ecc71" : "#25a25a")
+                                   : (speakerDetectionHover.hovered ? "#3a3a3a" : "#2a2a2a")
+                            border.width: 1
+                            border.color: speakerDetectionToggle.checked ? "#2ecc71" : "#4a4a4a"
+
+                            Behavior on color { ColorAnimation { duration: 100 } }
+                        }
+                        Label {
+                            id: speakerDetectionLabel
+                            anchors.centerIn: parent
+                            text: qsTr("Speaker detection")
+                            color: speakerDetectionToggle.checked ? "white" : "#aaaaaa"
+                            font.pixelSize: 11
                         }
                     }
 

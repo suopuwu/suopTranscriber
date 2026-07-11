@@ -3,9 +3,14 @@
 #include <QProcess>
 #include <cstring>
 
+#include <csignal>
+#include <sys/types.h>
+#include <unistd.h>
+
 namespace AudioDecoder {
 
-std::optional<std::vector<float>> decodeTo16kMono(const QString &filePath, QString *errorOut)
+std::optional<std::vector<float>> decodeTo16kMono(const QString &filePath, QString *errorOut,
+                                                    const DecodeControl &control)
 {
     QProcess ffmpeg;
     ffmpeg.start("ffmpeg", {
@@ -25,12 +30,41 @@ std::optional<std::vector<float>> decodeTo16kMono(const QString &filePath, QStri
 
     ffmpeg.closeWriteChannel();
 
+    // 100ms poll (vs. a plain blocking drain) so control.paused/cancelled
+    // are checked often enough to feel instant — same cadence as
+    // ModelManager::downloadToModelsDir()'s curl loop. Draining stdout every
+    // iteration regardless of pause state is required, not optional: ffmpeg
+    // writes raw PCM to a pipe with a finite OS buffer (typically 64KB) —
+    // falling behind stalls ffmpeg on write() rather than actually pausing
+    // it cleanly via SIGSTOP.
     QByteArray raw;
+    bool wasPaused = false;
+    bool cancelled = false;
     while (ffmpeg.state() != QProcess::NotRunning) {
-        ffmpeg.waitForReadyRead(1000);
+        if (control.cancelled && control.cancelled()) {
+            cancelled = true;
+            ffmpeg.kill();
+            ffmpeg.waitForFinished(2000);
+            break;
+        }
+        const bool shouldPause = control.paused && control.paused();
+        if (shouldPause && !wasPaused) {
+            ::kill(static_cast<pid_t>(ffmpeg.processId()), SIGSTOP);
+            wasPaused = true;
+        } else if (!shouldPause && wasPaused) {
+            ::kill(static_cast<pid_t>(ffmpeg.processId()), SIGCONT);
+            wasPaused = false;
+        }
+        ffmpeg.waitForReadyRead(100);
         raw += ffmpeg.readAllStandardOutput();
     }
     raw += ffmpeg.readAllStandardOutput();
+
+    if (cancelled) {
+        if (errorOut)
+            *errorOut = QStringLiteral("Cancelled");
+        return std::nullopt;
+    }
 
     if (ffmpeg.exitStatus() != QProcess::NormalExit || ffmpeg.exitCode() != 0) {
         if (errorOut)

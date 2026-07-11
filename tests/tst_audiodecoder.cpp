@@ -10,7 +10,10 @@
 #include <QtTest>
 
 #include <QDir>
+#include <QElapsedTimer>
 #include <QFile>
+#include <QFileInfo>
+#include <QProcess>
 #include <QStandardPaths>
 #include <QTemporaryDir>
 
@@ -26,6 +29,23 @@ const QString kJfkMp3 = QStringLiteral(SUOP_SAMPLES_DIR "/jfk.mp3"); // same aud
 bool ffmpegOnPath()
 {
     return !QStandardPaths::findExecutable(QStringLiteral("ffmpeg")).isEmpty();
+}
+
+// DecodeControl's pause/cancel is polled once per ~100ms loop iteration (see
+// decodeTo16kMono()'s doc comment) — jfk.wav decodes in well under that on
+// any reasonable machine, giving the control callbacks no realistic chance
+// to fire more than once. A synthetic tone long enough to guarantee several
+// poll iterations is the only reliable way to exercise mid-decode
+// pause/cancel, hence generating one on the fly rather than shipping a
+// multi-minute fixture.
+QString makeLongSyntheticWav(const QString &path, int seconds = 180)
+{
+    QProcess gen;
+    gen.start("ffmpeg", {"-y", "-f", "lavfi", "-i", QStringLiteral("sine=frequency=440:duration=%1").arg(seconds),
+                          path});
+    if (!gen.waitForFinished(30000) || gen.exitCode() != 0)
+        return QString();
+    return QFileInfo::exists(path) ? path : QString();
 }
 
 // Snapshot a directory's file names — used to prove decoding leaves no
@@ -161,6 +181,70 @@ private slots:
         const auto pcm2 = AudioDecoder::decodeTo16kMono(kJfkWav, &error);
         QVERIFY2(pcm2.has_value(), qPrintable(error));
         QCOMPARE(dirEntries(QStringLiteral(SUOP_SAMPLES_DIR)), samplesBefore);
+    }
+
+    // Spec (2026-07-10 user report — pausing during "decoding" appeared to
+    // do nothing): ffmpeg runs as a real subprocess here, not an in-process
+    // library call, so — unlike whisper.cpp's model load — a cancel request
+    // can kill it almost immediately rather than waiting for the whole
+    // decode to finish naturally. Cancels on the 3rd poll (~200-300ms in);
+    // the synthetic source is 180s, so a multi-second wait would mean the
+    // cancel was ignored.
+    void cancelledDuringDecode_stopsPromptlyWithCancelledError()
+    {
+        REQUIRE_FFMPEG();
+
+        QTemporaryDir tempDir;
+        QVERIFY(tempDir.isValid());
+        const QString longWav = makeLongSyntheticWav(tempDir.filePath(QStringLiteral("long.wav")));
+        if (longWav.isEmpty())
+            QSKIP("could not generate synthetic test audio via ffmpeg");
+
+        AudioDecoder::DecodeControl control;
+        int calls = 0;
+        control.cancelled = [&calls] { return ++calls > 2; };
+
+        QElapsedTimer timer;
+        timer.start();
+        QString error;
+        const auto pcm = AudioDecoder::decodeTo16kMono(longWav, &error, control);
+        QVERIFY(!pcm.has_value());
+        QCOMPARE(error, QStringLiteral("Cancelled"));
+        QVERIFY2(timer.elapsed() < 3000,
+                 qPrintable(QStringLiteral("cancel took %1ms — should be near-instant, not wait out the decode")
+                                .arg(timer.elapsed())));
+    }
+
+    // Spec: pause genuinely suspends the ffmpeg subprocess (SIGSTOP) rather
+    // than just refusing to read from it — proven by control.paused()
+    // getting polled repeatedly (the loop keeps ticking every ~100ms while
+    // stopped) before it returns false and decode completes normally.
+    void pausedDuringDecode_blocksUntilUnpaused_thenCompletesNormally()
+    {
+        REQUIRE_FFMPEG();
+
+        QTemporaryDir tempDir;
+        QVERIFY(tempDir.isValid());
+        const QString longWav = makeLongSyntheticWav(tempDir.filePath(QStringLiteral("long.wav")));
+        if (longWav.isEmpty())
+            QSKIP("could not generate synthetic test audio via ffmpeg");
+
+        AudioDecoder::DecodeControl control;
+        int pauseChecks = 0;
+        bool stillPaused = true;
+        control.paused = [&pauseChecks, &stillPaused] {
+            ++pauseChecks;
+            if (pauseChecks > 5)
+                stillPaused = false;
+            return stillPaused;
+        };
+
+        QString error;
+        const auto pcm = AudioDecoder::decodeTo16kMono(longWav, &error, control);
+        QVERIFY2(pcm.has_value(), qPrintable(error));
+        QVERIFY2(pauseChecks > 5,
+                 qPrintable(QStringLiteral("only %1 pause checks — pause didn't actually block the loop")
+                                .arg(pauseChecks)));
     }
 };
 

@@ -2,9 +2,14 @@
 
 #include <QDebug>
 #include <QDir>
+#include <QElapsedTimer>
 #include <QFile>
 #include <QFileInfo>
 #include <QProcess>
+#include <QThread>
+
+#include <csignal>
+#include <unistd.h>
 
 namespace ModelManager {
 
@@ -19,9 +24,7 @@ const std::vector<ModelInfo> &availableModels()
     return models;
 }
 
-namespace {
-
-QString fileNameForModelId(const QString &modelId)
+QString modelFileName(const QString &modelId)
 {
     for (const ModelInfo &info : availableModels()) {
         if (info.id == modelId)
@@ -30,18 +33,115 @@ QString fileNameForModelId(const QString &modelId)
     return {};
 }
 
+namespace {
+
+QDir modelsDirFor(const QUrl &vaultPath)
+{
+    return QDir(vaultPath.toLocalFile() + "/.transcriber/models");
+}
+
+}
+
+bool isModelDownloaded(const QUrl &vaultPath, const QString &modelId)
+{
+    const QString fileName = modelFileName(modelId);
+    return !fileName.isEmpty() && QFileInfo::exists(modelsDirFor(vaultPath).filePath(fileName));
+}
+
+bool isLabelModelDownloaded(const QUrl &vaultPath)
+{
+    return QFileInfo::exists(modelsDirFor(vaultPath).filePath(QString(kLabelModelFileName)));
+}
+
+bool areDiarizationModelsDownloaded(const QUrl &vaultPath)
+{
+    const QDir dir = modelsDirFor(vaultPath);
+    return QFileInfo::exists(dir.filePath(QString(kDiarizationSegmentationFileName)))
+        && QFileInfo::exists(dir.filePath(QString(kDiarizationEmbeddingFileName)));
+}
+
+namespace {
+
+// Probes Content-Length via a HEAD request, without downloading anything —
+// best-effort only: 0 if the server doesn't report a length or the probe
+// fails (caller then shows indeterminate progress instead of a percentage).
+qint64 probeContentLength(const QString &url)
+{
+    QProcess curl;
+    curl.start("curl", {"-sIL", url});
+    if (!curl.waitForFinished(10000))
+        return 0;
+    const QString headers = QString::fromUtf8(curl.readAllStandardOutput());
+    qint64 lastLength = 0;
+    for (const QString &line : headers.split(QStringLiteral("\r\n"), Qt::SkipEmptyParts)) {
+        if (line.startsWith(QStringLiteral("content-length:"), Qt::CaseInsensitive)) {
+            bool ok = false;
+            const qint64 value = line.mid(line.indexOf(':') + 1).trimmed().toLongLong(&ok);
+            if (ok)
+                lastLength = value; // a redirect chain reports several — the LAST one is the real download's
+        }
+    }
+    return lastLength;
+}
+
 // Shared by ensureModel()/ensureLabelModel(): download url to
 // <vault>/.transcriber/models/<fileName> via curl to a .part file, then
 // rename into place. Returns the final path, or empty on failure (errorOut
 // set if given). Assumes modelsDir already exists.
-QString downloadToModelsDir(const QDir &modelsDir, const QString &fileName, const QString &url, QString *errorOut)
+//
+// Wave N (task system): event-driven rather than one blocking
+// waitForFinished(-1) — polls every 100ms instead, which both reports real
+// byte progress (against an upfront HEAD probe of Content-Length) and gives
+// a cooperative checkpoint for pause (SIGSTOP the curl process, SIGCONT to
+// resume — Linux-only, per CLAUDE.md's "Linux (CachyOS) primary") and cancel
+// (kill the process, remove the partial file). Still fully synchronous from
+// the CALLER's point of view (this runs on TranscriptionWorker's own
+// dedicated thread, never the GUI thread — blocking there is fine, same as
+// every other job).
+QString downloadToModelsDir(const QDir &modelsDir, const QString &fileName, const QString &url, QString *errorOut,
+                             const DownloadProgressCallback &onProgress = {}, const DownloadControl &control = {})
 {
     const QString modelPath = modelsDir.filePath(fileName);
     const QString tmpPath = modelPath + ".part";
+    QFile::remove(tmpPath); // stale partial from a previously cancelled attempt
+
+    const qint64 totalBytes = probeContentLength(url);
 
     QProcess curl;
     curl.start("curl", {"-L", "--fail", "-o", tmpPath, url});
-    curl.waitForFinished(-1);
+    if (!curl.waitForStarted(10000)) {
+        if (errorOut)
+            *errorOut = QStringLiteral("could not start curl");
+        return {};
+    }
+
+    bool wasPaused = false;
+    bool cancelled = false;
+    while (!curl.waitForFinished(100)) {
+        if (control.cancelled && control.cancelled()) {
+            cancelled = true;
+            curl.kill();
+            curl.waitForFinished(2000);
+            break;
+        }
+        const bool shouldPause = control.paused && control.paused();
+        if (shouldPause && !wasPaused) {
+            ::kill(static_cast<pid_t>(curl.processId()), SIGSTOP);
+            wasPaused = true;
+        } else if (!shouldPause && wasPaused) {
+            ::kill(static_cast<pid_t>(curl.processId()), SIGCONT);
+            wasPaused = false;
+        }
+        if (onProgress && !wasPaused)
+            onProgress(QFileInfo(tmpPath).size(), totalBytes);
+    }
+
+    if (cancelled) {
+        if (errorOut)
+            *errorOut = QStringLiteral("Cancelled");
+        QFile::remove(tmpPath);
+        return {};
+    }
 
     if (curl.exitStatus() != QProcess::NormalExit || curl.exitCode() != 0) {
         if (errorOut)
@@ -50,6 +150,10 @@ QString downloadToModelsDir(const QDir &modelsDir, const QString &fileName, cons
         return {};
     }
 
+    if (onProgress) {
+        const qint64 finalSize = QFileInfo(tmpPath).size();
+        onProgress(finalSize, totalBytes > 0 ? totalBytes : finalSize);
+    }
     QFile::rename(tmpPath, modelPath);
     return modelPath;
 }
@@ -65,10 +169,13 @@ QString downloadToModelsDir(const QDir &modelsDir, const QString &fileName, cons
 // file is extracted straight into modelsDir under our own local name, and
 // the archive plus its siblings are discarded.
 QString downloadAndExtractFromTarBz2(const QDir &modelsDir, const QString &localFileName, const QString &archiveUrl,
-                                      const QString &pathInsideArchive, QString *errorOut)
+                                      const QString &pathInsideArchive, QString *errorOut,
+                                      const DownloadProgressCallback &onProgress = {},
+                                      const DownloadControl &control = {})
 {
     const QString archiveFileName = QStringLiteral("%1.tar.bz2").arg(localFileName);
-    const QString archivePath = downloadToModelsDir(modelsDir, archiveFileName, archiveUrl, errorOut);
+    const QString archivePath =
+        downloadToModelsDir(modelsDir, archiveFileName, archiveUrl, errorOut, onProgress, control);
     if (archivePath.isEmpty())
         return {};
 
@@ -91,19 +198,20 @@ QString downloadAndExtractFromTarBz2(const QDir &modelsDir, const QString &local
 
 }
 
-QString ensureModel(const QUrl &vaultPath, const QString &modelId, QString *errorOut, bool *usedFallback)
+QString ensureModel(const QUrl &vaultPath, const QString &modelId, QString *errorOut, bool *usedFallback,
+                     const DownloadProgressCallback &onProgress, const DownloadControl &control)
 {
     if (usedFallback)
         *usedFallback = false;
 
-    const QDir modelsDir(vaultPath.toLocalFile() + "/.transcriber/models");
-    QString modelName = fileNameForModelId(modelId);
+    const QDir modelsDir = modelsDirFor(vaultPath);
+    QString modelName = modelFileName(modelId);
     if (modelName.isEmpty()) {
         // modelId isn't in availableModels() — never silently pretend the
         // requested model was used; the caller must be told.
         qWarning() << "ModelManager: unrecognized model id" << modelId << "— falling back to"
                    << kDefaultModelId;
-        modelName = fileNameForModelId(kDefaultModelId);
+        modelName = modelFileName(QString::fromUtf8(kDefaultModelId));
         if (usedFallback)
             *usedFallback = true;
     }
@@ -119,12 +227,13 @@ QString ensureModel(const QUrl &vaultPath, const QString &modelId, QString *erro
     }
 
     const QString repoUrl = QStringLiteral("https://huggingface.co/ggerganov/whisper.cpp/resolve/main/%1");
-    return downloadToModelsDir(modelsDir, modelName, repoUrl.arg(modelName), errorOut);
+    return downloadToModelsDir(modelsDir, modelName, repoUrl.arg(modelName), errorOut, onProgress, control);
 }
 
-QString ensureLabelModel(const QUrl &vaultPath, QString *errorOut)
+QString ensureLabelModel(const QUrl &vaultPath, QString *errorOut, const DownloadProgressCallback &onProgress,
+                          const DownloadControl &control)
 {
-    const QDir modelsDir(vaultPath.toLocalFile() + "/.transcriber/models");
+    const QDir modelsDir = modelsDirFor(vaultPath);
     const QString modelPath = modelsDir.filePath(QString(kLabelModelFileName));
 
     if (QFileInfo::exists(modelPath))
@@ -138,13 +247,14 @@ QString ensureLabelModel(const QUrl &vaultPath, QString *errorOut)
 
     const QString url = QStringLiteral("https://huggingface.co/unsloth/Qwen3-4B-Instruct-2507-GGUF/resolve/main/%1")
                              .arg(kLabelModelFileName);
-    return downloadToModelsDir(modelsDir, QString(kLabelModelFileName), url, errorOut);
+    return downloadToModelsDir(modelsDir, QString(kLabelModelFileName), url, errorOut, onProgress, control);
 }
 
 bool ensureDiarizationModels(const QUrl &vaultPath, QString *segmentationPathOut, QString *embeddingPathOut,
-                              QString *errorOut)
+                              QString *errorOut, const DownloadProgressCallback &onProgress,
+                              const DownloadControl &control)
 {
-    const QDir modelsDir(vaultPath.toLocalFile() + "/.transcriber/models");
+    const QDir modelsDir = modelsDirFor(vaultPath);
 
     const QString segmentationPath = modelsDir.filePath(QString(kDiarizationSegmentationFileName));
     const QString embeddingPath = modelsDir.filePath(QString(kDiarizationEmbeddingFileName));
@@ -174,7 +284,7 @@ bool ensureDiarizationModels(const QUrl &vaultPath, QString *segmentationPathOut
         // for why this is the int8-quantized export, not model.onnx.
         if (downloadAndExtractFromTarBz2(modelsDir, QString(kDiarizationSegmentationFileName), archiveUrl,
                                           QStringLiteral("sherpa-onnx-pyannote-segmentation-3-0/model.int8.onnx"),
-                                          errorOut)
+                                          errorOut, onProgress, control)
                 .isEmpty())
             return false;
     }
@@ -184,7 +294,8 @@ bool ensureDiarizationModels(const QUrl &vaultPath, QString *segmentationPathOut
         const QString url = QStringLiteral(
             "https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-recongition-models/"
             "wespeaker_en_voxceleb_resnet293_LM.onnx");
-        if (downloadToModelsDir(modelsDir, QString(kDiarizationEmbeddingFileName), url, errorOut).isEmpty())
+        if (downloadToModelsDir(modelsDir, QString(kDiarizationEmbeddingFileName), url, errorOut, onProgress, control)
+                .isEmpty())
             return false;
     }
 

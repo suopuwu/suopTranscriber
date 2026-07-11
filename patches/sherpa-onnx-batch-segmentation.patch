@@ -67,6 +67,22 @@
 #         window transitions on the 24-minute file: 5282 progress events,
 #         zero backward jumps.
 #
+# 5. arena_extend_strategy = kSameAsRequested (1) for the CUDA execution
+#    provider (session.cc), instead of onnxruntime's own default (0 =
+#    kNextPowerOfTwo). Motivated by a real log line: "Failed to allocate
+#    memory for requested buffer of size 917504000" (~875 MB) inside a
+#    Conv node's BFCArena allocation, still occurring after (4) — the
+#    default strategy rounds each arena extension up to a power-of-two-
+#    sized chunk, so a moderate request can trigger a cudaMalloc for far
+#    more than what's actually needed. That's especially costly here
+#    because this process ALSO runs whisper.cpp's own independent CUDA
+#    allocator concurrently (diarization runs while a warm whisper.cpp
+#    model sits GPU-resident) — two allocators fragmenting one device's
+#    address space means an oversized request can fail even when
+#    aggregate free VRAM is plentiful. kSameAsRequested allocates exactly
+#    the requested size instead; this is onnxruntime's own documented
+#    mitigation for this exact error.
+#
 # Pinned against sherpa-onnx v1.13.4 (submodule commit 142807252687d81b40
 # d6315f23470a1512a00de3). Re-verify this still applies cleanly (`git apply
 # --check`) after any submodule version bump; if it doesn't, re-derive it
@@ -947,3 +963,28 @@ index 068e6b8d..c249676c 100644
   private:
    std::unique_ptr<SpeakerEmbeddingExtractorImpl> impl_;
  };
+diff --git a/sherpa-onnx/csrc/session.cc b/sherpa-onnx/csrc/session.cc
+index d9cdec1a..cce07e3e 100755
+--- a/sherpa-onnx/csrc/session.cc
++++ b/sherpa-onnx/csrc/session.cc
+@@ -306,6 +306,20 @@ Ort::SessionOptions GetSessionOptionsImpl(
+         // The CUDA provider is available, proceed with setting the options
+         OrtCUDAProviderOptions options;
+ 
++        // suopTranscriber local patch (see patches/sherpa-onnx-batch-
++        // segmentation.patch): default arena_extend_strategy (0 =
++        // kNextPowerOfTwo) grows the BFC arena by rounding each extension
++        // up to a power-of-two-sized chunk, so a single ~875 MB Conv
++        // workspace request can trigger a cudaMalloc for something much
++        // larger than what's actually needed — far more likely to fail on
++        // a fragmented device address space (this process also runs
++        // whisper.cpp's own independent CUDA allocator concurrently) even
++        // when aggregate free VRAM is plentiful. 1 = kSameAsRequested
++        // allocates exactly the requested size instead, which is
++        // onnxruntime's own documented mitigation for this exact
++        // "Failed to allocate memory for requested buffer" BFCArena error.
++        options.arena_extend_strategy = 1;
++
+         if (provider_config != nullptr) {
+           options.device_id = provider_config->device;
+           options.cudnn_conv_algo_search = OrtCudnnConvAlgoSearch(
