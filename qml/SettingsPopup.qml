@@ -9,6 +9,12 @@ Popup {
 
     signal changeVaultRequested()
 
+    // Combine-rule "test this rule" preview: detectCombineGroups() lives on
+    // the controller, the vault's current file listing on the tree model —
+    // neither of which this popup otherwise touches.
+    property var transcriptionController: null
+    property var vaultTreeModel: null
+
     width: 440
     height: Math.min(contentColumn.implicitHeight + 32, maxHeight)
     // Modal: Overlay.overlay's automatic block-plane now genuinely blocks
@@ -75,6 +81,45 @@ Popup {
                 || !AppSettings.isDefault("progressGlowColor")
                 || !AppSettings.isDefault("progressGlowWidth")
                 || !AppSettings.isDefault("progressGlowRadius")
+                || !AppSettings.isDefault("deleteOriginalsAfterCombine")
+    }
+
+    // Rule mutation helpers: AppSettings.combineRules is a plain JS array
+    // (see its own doc comment in AppSettings.qml — no per-value reset
+    // semantics fit it), so every edit rebuilds and reassigns the whole
+    // array to trigger combineRulesChanged.
+    function updateRule(index, key, value) {
+        const rules = AppSettings.combineRules.slice()
+        rules[index] = Object.assign({}, rules[index], {[key]: value})
+        AppSettings.combineRules = rules
+    }
+    function addRule() {
+        AppSettings.combineRules = AppSettings.combineRules.concat(
+                    [{name: qsTr("New rule"), pattern: "", enabled: true}])
+    }
+    function removeRule(index) {
+        const rules = AppSettings.combineRules.slice()
+        rules.splice(index, 1)
+        AppSettings.combineRules = rules
+    }
+
+    // Not a full syntax highlighter — just enough to make regex
+    // metacharacters visually pop out of the literal filename text while
+    // typing, so it's obvious at a glance which part of the pattern is a
+    // literal match vs. a wildcard/anchor/capture.
+    function escapeRegexPreviewHtml(s) {
+        return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+    }
+    function highlightPattern(pattern) {
+        const meta = ".^$*+?()[]{}|\\"
+        let out = ""
+        for (let i = 0; i < pattern.length; i++) {
+            const c = pattern[i]
+            out += meta.indexOf(c) >= 0
+                    ? "<span style=\"color:#e8a33d; font-weight:bold;\">" + escapeRegexPreviewHtml(c) + "</span>"
+                    : escapeRegexPreviewHtml(c)
+        }
+        return out
     }
 
     background: Rectangle {
@@ -2077,6 +2122,344 @@ Popup {
                            + "descriptive.")
                 color: "#888888"
                 font.pixelSize: 11
+            }
+
+            Label {
+                text: qsTr("Combine split recordings")
+                color: "white"
+                font.bold: true
+            }
+
+            Label {
+                Layout.fillWidth: true
+                wrapMode: Text.WordWrap
+                text: qsTr("Some recorders split one continuous recording into several files (e.g. a "
+                           + "size or time limit). Rules below auto-detect and merge those parts into "
+                           + "one file — losslessly, before transcription — the instant a new part "
+                           + "shows up in the vault.")
+                color: "#888888"
+                font.pixelSize: 11
+            }
+
+            RowLayout {
+                Layout.fillWidth: true
+                Label {
+                    Layout.fillWidth: true
+                    wrapMode: Text.WordWrap
+                    color: "white"
+                    text: qsTr("Delete original parts after combining (instead of moving them to .combined)")
+                }
+                Switch {
+                    id: deleteOriginalsAfterCombineSwitch
+                    checked: AppSettings.deleteOriginalsAfterCombine
+                    hoverEnabled: true
+                    onToggled: AppSettings.deleteOriginalsAfterCombine = checked
+
+                    HoverHandler {
+                        cursorShape: Qt.PointingHandCursor
+                    }
+                    HoverBorder {
+                        anchors.fill: parent
+                        active: deleteOriginalsAfterCombineSwitch.hovered
+                    }
+                }
+                Button {
+                    id: deleteOriginalsAfterCombineResetButton
+                    text: "↺"
+                    implicitWidth: 22
+                    implicitHeight: 22
+
+                    background: Rectangle {
+                        radius: AppSettings.borderRadius
+                        color: "transparent"
+                        border.width: 1
+                        border.color: "#3a3a3a"
+                    }
+                    enabled: !AppSettings.isDefault("deleteOriginalsAfterCombine")
+                    opacity: enabled ? 1 : 0.35
+                    hoverEnabled: enabled
+                    onClicked: AppSettings.resetProperty("deleteOriginalsAfterCombine")
+
+                    HoverHandler {
+                        cursorShape: Qt.PointingHandCursor
+                        enabled: deleteOriginalsAfterCombineResetButton.enabled
+                    }
+                    HoverBorder {
+                        anchors.fill: parent
+                        active: deleteOriginalsAfterCombineResetButton.enabled && deleteOriginalsAfterCombineResetButton.hovered
+                    }
+                }
+            }
+
+            Popup {
+                id: regexHelpPopup
+                width: 340
+                modal: false
+                focus: false
+                closePolicy: Popup.CloseOnEscape | Popup.CloseOnPressOutside
+
+                background: Rectangle {
+                    color: "#2a2a2a"
+                    radius: AppSettings.borderRadius
+                    border.width: 1
+                    border.color: "#3a3a3a"
+                }
+
+                contentItem: ColumnLayout {
+                    spacing: 4
+                    Label { text: qsTr("Regex quick reference"); color: "white"; font.bold: true }
+                    Label { text: qsTr(".  any single character"); color: "#cccccc"; font.pixelSize: 11 }
+                    Label { text: qsTr("*  +  ?  repeat: 0-or-more, 1-or-more, 0-or-1 times"); color: "#cccccc"; font.pixelSize: 11 }
+                    Label { text: qsTr("^  $  start / end of the filename"); color: "#cccccc"; font.pixelSize: 11 }
+                    Label { text: qsTr("\\d  \\w  \\s  a digit / word / space character"); color: "#cccccc"; font.pixelSize: 11 }
+                    Label { text: qsTr("{n}  {n,m}  exactly n, or between n and m, repeats"); color: "#cccccc"; font.pixelSize: 11 }
+                    Label { text: qsTr("[...]  any one of these characters"); color: "#cccccc"; font.pixelSize: 11 }
+                    Label {
+                        Layout.maximumWidth: 300
+                        wrapMode: Text.WordWrap
+                        color: "#cccccc"
+                        font.pixelSize: 11
+                        text: qsTr("(...)  capture group — text captured here must be IDENTICAL "
+                                   + "across files for them to be combined. Everything else (literal "
+                                   + "text, or an uncaptured wildcard) may vary freely between parts.")
+                    }
+                    Label {
+                        Layout.maximumWidth: 300
+                        wrapMode: Text.WordWrap
+                        color: "#888888"
+                        font.pixelSize: 11
+                        text: qsTr("Example: ^(TX\\d{2})_MIC\\d{3}_\\d{8}_\\d{6}_orig\\.wav$ groups "
+                                   + "files sharing the same TXnn id, even though the mic number and "
+                                   + "timestamp differ between parts.")
+                    }
+                }
+            }
+
+            ColumnLayout {
+                Layout.fillWidth: true
+                spacing: 8
+
+                Repeater {
+                    model: AppSettings.combineRules
+
+                    delegate: ColumnLayout {
+                        id: ruleCard
+                        required property var modelData
+                        required property int index
+
+                        property var previewGroups: []
+                        property bool previewRun: false
+
+                        Layout.fillWidth: true
+                        spacing: 4
+
+                        Rectangle {
+                            Layout.fillWidth: true
+                            Layout.preferredHeight: 1
+                            color: "#3a3a3a"
+                        }
+
+                        RowLayout {
+                            Layout.fillWidth: true
+                            TextField {
+                                id: ruleNameField
+                                Layout.preferredWidth: 130
+                                text: ruleCard.modelData.name
+                                placeholderText: qsTr("Rule name")
+                                hoverEnabled: true
+                                background: UnderlineField { focused: ruleNameField.activeFocus }
+                                onEditingFinished: settingsPopup.updateRule(ruleCard.index, "name", text)
+                            }
+                            Item { Layout.fillWidth: true }
+                            Switch {
+                                id: ruleEnabledSwitch
+                                checked: ruleCard.modelData.enabled
+                                hoverEnabled: true
+                                onToggled: settingsPopup.updateRule(ruleCard.index, "enabled", checked)
+                                HoverHandler { cursorShape: Qt.PointingHandCursor }
+                                HoverBorder { anchors.fill: parent; active: ruleEnabledSwitch.hovered }
+                            }
+                            Button {
+                                id: removeRuleButton
+                                text: qsTr("Remove")
+                                implicitHeight: 22
+                                background: Rectangle {
+                                    radius: AppSettings.borderRadius
+                                    color: "transparent"
+                                    border.width: 1
+                                    border.color: "#3a3a3a"
+                                }
+                                hoverEnabled: true
+                                onClicked: settingsPopup.removeRule(ruleCard.index)
+                                HoverHandler { cursorShape: Qt.PointingHandCursor }
+                                HoverBorder { anchors.fill: parent; active: removeRuleButton.hovered }
+                            }
+                        }
+
+                        RowLayout {
+                            Layout.fillWidth: true
+                            TextField {
+                                id: rulePatternField
+                                Layout.fillWidth: true
+                                text: ruleCard.modelData.pattern
+                                placeholderText: qsTr("^(TX\\d{2})_MIC\\d{3}_.*_orig\\.wav$")
+                                font.family: "monospace"
+                                hoverEnabled: true
+                                background: UnderlineField { focused: rulePatternField.activeFocus }
+                                onEditingFinished: settingsPopup.updateRule(ruleCard.index, "pattern", text)
+                            }
+                            Button {
+                                id: regexInfoButton
+                                text: "ⓘ"
+                                implicitWidth: 22
+                                implicitHeight: 22
+                                background: Rectangle {
+                                    radius: AppSettings.borderRadius
+                                    color: "transparent"
+                                    border.width: 1
+                                    border.color: "#3a3a3a"
+                                }
+                                hoverEnabled: true
+                                onClicked: {
+                                    regexHelpPopup.parent = regexInfoButton
+                                    regexHelpPopup.x = -regexHelpPopup.width + regexInfoButton.width
+                                    regexHelpPopup.y = regexInfoButton.height + 4
+                                    regexHelpPopup.open()
+                                }
+                                HoverHandler { cursorShape: Qt.PointingHandCursor }
+                                HoverBorder { anchors.fill: parent; active: regexInfoButton.hovered }
+                            }
+                        }
+
+                        // Live syntax-highlight readout — reflects every
+                        // keystroke in rulePatternField directly (not the
+                        // committed modelData.pattern), same "see it as you
+                        // type" intent as the regex info popup above.
+                        Text {
+                            Layout.fillWidth: true
+                            textFormat: Text.RichText
+                            wrapMode: Text.Wrap
+                            font.family: "monospace"
+                            font.pixelSize: 11
+                            text: settingsPopup.highlightPattern(rulePatternField.text)
+                            visible: rulePatternField.text.length > 0
+                        }
+
+                        RowLayout {
+                            Layout.fillWidth: true
+                            Button {
+                                id: testRuleButton
+                                text: qsTr("Test this rule")
+                                implicitHeight: 22
+                                enabled: rulePatternField.text.length > 0 && settingsPopup.vaultTreeModel
+                                         && settingsPopup.transcriptionController
+                                background: Rectangle {
+                                    radius: AppSettings.borderRadius
+                                    color: "transparent"
+                                    border.width: 1
+                                    border.color: "#3a3a3a"
+                                }
+                                opacity: enabled ? 1 : 0.35
+                                hoverEnabled: enabled
+                                onClicked: {
+                                    const testRule = {name: ruleCard.modelData.name || qsTr("(unnamed)"),
+                                                       pattern: rulePatternField.text, enabled: true}
+                                    ruleCard.previewGroups = settingsPopup.transcriptionController.detectCombineGroups(
+                                                [testRule], settingsPopup.vaultTreeModel.allAudioPaths())
+                                    ruleCard.previewRun = true
+                                }
+                                HoverHandler { cursorShape: Qt.PointingHandCursor; enabled: testRuleButton.enabled }
+                                HoverBorder { anchors.fill: parent; active: testRuleButton.enabled && testRuleButton.hovered }
+                            }
+                            Label {
+                                visible: ruleCard.previewRun && ruleCard.previewGroups.length === 0
+                                text: qsTr("No files in this vault match.")
+                                color: "#888888"
+                                font.pixelSize: 11
+                            }
+                        }
+
+                        // Preview cards: one per detected group, showing the
+                        // combine order and what would happen — this is the
+                        // SAME detectCombineGroups() the automatic scan and
+                        // the per-job safety-net redirect both use, so
+                        // what's shown here is exactly what would really
+                        // happen, not a separate simulation.
+                        Repeater {
+                            model: ruleCard.previewRun ? ruleCard.previewGroups : []
+                            delegate: Rectangle {
+                                id: previewCard
+                                required property var modelData
+                                Layout.fillWidth: true
+                                Layout.preferredHeight: previewCardColumn.implicitHeight + 12
+                                radius: AppSettings.borderRadius
+                                color: "#1e1e1e"
+                                border.width: 1
+                                border.color: "#3a3a3a"
+
+                                ColumnLayout {
+                                    id: previewCardColumn
+                                    anchors.fill: parent
+                                    anchors.margins: 6
+                                    spacing: 2
+                                    Label {
+                                        Layout.fillWidth: true
+                                        wrapMode: Text.WordWrap
+                                        color: "#dddddd"
+                                        font.pixelSize: 11
+                                        text: {
+                                            switch (previewCard.modelData.status) {
+                                            case "ready": return qsTr("Ready to combine (%1 parts):").arg(previewCard.modelData.files.length)
+                                            case "singleton": return qsTr("Only one matching file — nothing to combine yet.")
+                                            case "alreadyTranscribed": return qsTr("Skipped — one of these parts is already transcribed.")
+                                            case "alreadyCombined": return qsTr("Already combined into %1.").arg(previewCard.modelData.outputPath)
+                                            case "pending": return qsTr("Waiting — the most recent part was modified very recently.")
+                                            default: return previewCard.modelData.status
+                                            }
+                                        }
+                                    }
+                                    Label {
+                                        Layout.fillWidth: true
+                                        wrapMode: Text.WordWrap
+                                        visible: previewCard.modelData.files.length > 0
+                                        color: "#888888"
+                                        font.pixelSize: 10
+                                        text: previewCard.modelData.files.map(function (f, i) {
+                                            return (i + 1) + ". " + f.substring(f.lastIndexOf("/") + 1)
+                                        }).join(" → ")
+                                    }
+                                    Label {
+                                        Layout.fillWidth: true
+                                        wrapMode: Text.WordWrap
+                                        visible: previewCard.modelData.status === "ready"
+                                        color: "#888888"
+                                        font.pixelSize: 10
+                                        text: qsTr("Output: %1").arg(
+                                                  previewCard.modelData.outputPath.substring(
+                                                      previewCard.modelData.outputPath.lastIndexOf("/") + 1))
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                Button {
+                    id: addRuleButton
+                    text: qsTr("+ Add rule")
+                    Layout.alignment: Qt.AlignLeft
+                    implicitHeight: 24
+                    background: Rectangle {
+                        radius: AppSettings.borderRadius
+                        color: (addRuleButton.hovered ? "#3a3a3a" : "#2a2a2a")
+                        border.width: 1
+                        border.color: "#3a3a3a"
+                    }
+                    hoverEnabled: true
+                    onClicked: settingsPopup.addRule()
+                    HoverHandler { cursorShape: Qt.PointingHandCursor }
+                    HoverBorder { anchors.fill: parent; active: addRuleButton.hovered }
+                }
             }
         }
     }

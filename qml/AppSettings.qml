@@ -126,6 +126,25 @@ Item {
     property real progressGlowWidth: 2
     property real progressGlowRadius: 8
 
+    // Split-recording auto-combine (see TranscriptionController::
+    // findCombineGroups()'s doc comment): what happens to a group's original
+    // files once ffmpeg has merged them. false (default) moves them into a
+    // sibling ".combined" folder instead of deleting — safer default until
+    // the user's trusted their rules, matching this app's general "keep
+    // until confident" bias around anything that touches source recordings.
+    property bool deleteOriginalsAfterCombine: false
+
+    // Split-recording combine rules — a list of {name, pattern, enabled}
+    // maps, each a QRegularExpression matched against a filename (see
+    // findCombineGroups()'s doc comment for the capture-group-as-identity
+    // semantics). Deliberately NOT part of `defaults`/isDefault()/
+    // resetProperty() below: that machinery is single-value reset-to-default
+    // semantics, which doesn't fit a user-authored list (no sensible
+    // "default" rule set, and the Settings UI manages entries directly via
+    // add/remove rather than a reset button) — see loadFromVault()/
+    // saveToVault() for its own explicit (de)serialization instead.
+    property var combineRules: []
+
     // Single source of truth for every per-setting/global "reset to
     // default" button, AND for loadFromVault()/saveToVault() below (every
     // key here round-trips through the vault's .suopTranscriber file).
@@ -161,7 +180,8 @@ Item {
         progressGlowEnabled: false,
         progressGlowColor: "#ffffff",
         progressGlowWidth: 2,
-        progressGlowRadius: 8
+        progressGlowRadius: 8,
+        deleteOriginalsAfterCombine: false
     })
 
     // QML `color` values need to be stringified before crossing into a
@@ -202,6 +222,9 @@ Item {
         const loaded = vaultModel ? vaultModel.readVaultSettings() : {}
         for (const key in appSettings.defaults)
             appSettings[key] = (key in loaded) ? loaded[key] : appSettings.defaults[key]
+        // combineRules isn't in `defaults` (see its own doc comment above) —
+        // loaded explicitly here instead.
+        appSettings.combineRules = loaded.combineRules || []
         appSettings.suppressSave = false
     }
 
@@ -213,6 +236,7 @@ Item {
             const value = appSettings[key]
             data[key] = isColorValue(value) ? String(value) : value
         }
+        data.combineRules = appSettings.combineRules
         appSettings.activeVaultModel.writeVaultSettings(data)
     }
 
@@ -262,5 +286,10 @@ Item {
         function onProgressGlowColorChanged() { appSettings.scheduleSave() }
         function onProgressGlowWidthChanged() { appSettings.scheduleSave() }
         function onProgressGlowRadiusChanged() { appSettings.scheduleSave() }
+        function onDeleteOriginalsAfterCombineChanged() { appSettings.scheduleSave() }
+        // combineRules isn't in `defaults` (see its own doc comment) but
+        // still needs the same debounced-save-on-change wiring as every
+        // other persisted key.
+        function onCombineRulesChanged() { appSettings.scheduleSave() }
     }
 }

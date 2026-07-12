@@ -11,20 +11,25 @@
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QMetaObject>
+#include <QProcess>
 #include <QRegularExpression>
 #include <QSet>
 #include <QSettings>
 #include <QStringList>
+#include <QTemporaryFile>
 #include <QTextStream>
 #include <QTimer>
 #include <QVector>
 
+#include <csignal>
+#include <sys/types.h>
 #include <unistd.h>
 
 #include <algorithm>
 #include <atomic>
 #include <limits>
 #include <memory>
+#include <optional>
 
 #include "AudioDecoder.h"
 #include "DiarizationEngine.h"
@@ -72,7 +77,12 @@ QString formatTimestamp(double seconds)
 // "meeting.mp3") must get distinct sidecars ("meeting.wav.md" /
 // "meeting.mp3.md"), never collide on one "meeting.md". Every sidecar-path
 // call site in this file and in VaultTreeModel.cpp (sidecarMdPath()) must
-// stay consistent with this same convention.
+// stay consistent with this same convention. Deliberate, confirmed
+// trade-off (2026-07-11): this DOES orphan a pre-existing vault's sidecars
+// that were written under the old completeBaseName()-based convention
+// before this change — accepted by the user as a one-time rename they'll
+// do themselves, in exchange for the stem-collision safety this buys going
+// forward. Do not revert without checking with the user first.
 QString sidecarPath(const QString &audioFilePath)
 {
     const QFileInfo fi(audioFilePath);
@@ -903,6 +913,70 @@ void syncSpeakersFrontmatterToBody(const QString &path)
         qWarning() << "syncSpeakersFrontmatterToBody: failed to write" << path << ":" << error;
 }
 
+// findCombineGroups()'s outputPath is built from (ruleName, capturedKey), not
+// a filename component that's guaranteed filesystem-safe (a regex capture
+// group can pull out literally anything) — collapse everything except
+// alphanumerics/-/_ to '-' so the derived name is always a valid single path
+// segment on every filesystem this app targets.
+QString sanitizeForFilename(const QString &raw)
+{
+    QString out = raw;
+    static const QRegularExpression unsafe(QStringLiteral("[^A-Za-z0-9_-]+"));
+    out.replace(unsafe, QStringLiteral("-"));
+    while (out.startsWith(QChar('-')))
+        out.remove(0, 1);
+    while (out.endsWith(QChar('-')))
+        out.chop(1);
+    return out.isEmpty() ? QStringLiteral("combined") : out;
+}
+
+// findCombineGroups()'s "pending" status: a group is otherwise "ready" but
+// its newest member was modified more recently than this many seconds ago —
+// the recorder may still be actively writing that file, and concatenating a
+// growing/not-yet-closed file risks truncation or a corrupt merge.
+constexpr qint64 kCombineStabilityWindowSecs = 5;
+
+// One rule ({name, pattern, enabled} map) matched against a single filename
+// (not a full path — QFileInfo::fileName()), search semantics
+// (QRegularExpression, unanchored unless the pattern itself has ^/$). On a
+// match, returns the "real string" key: capture groups 1..N concatenated in
+// order (empty if the pattern has none) — see
+// TranscriptionController::findCombineGroups()'s doc comment for the full
+// semantics. Shared by findCombineGroups() (which tries every rule against
+// every candidate path) and maybeRedirectForCombine() (which only needs to
+// try every rule against ONE already-known filename).
+std::optional<QString> matchRuleCapturedKey(const QVariantMap &rule, const QString &fileName)
+{
+    if (!rule.value(QStringLiteral("enabled"), true).toBool())
+        return std::nullopt;
+    const QString pattern = rule.value(QStringLiteral("pattern")).toString();
+    if (pattern.isEmpty())
+        return std::nullopt;
+    const QRegularExpression re(pattern);
+    if (!re.isValid())
+        return std::nullopt;
+    const QRegularExpressionMatch m = re.match(fileName);
+    if (!m.hasMatch())
+        return std::nullopt;
+    QString key;
+    for (int i = 1; i <= m.lastCapturedIndex(); ++i)
+        key += m.captured(i);
+    return key;
+}
+
+// Deterministic merged-output filename for a (ruleName, capturedKey) pair,
+// resolved against a directory + extension — see
+// TranscriptionController::findCombineGroups()'s outputPath doc comment for
+// why it's derived from the rule+key rather than any single member's
+// filename.
+QString combineOutputPathFor(const QString &ruleName, const QString &key, const QString &dir, const QString &ext)
+{
+    QString name = sanitizeForFilename(ruleName);
+    if (!key.isEmpty())
+        name += QStringLiteral("-") + sanitizeForFilename(key);
+    return dir + QStringLiteral("/") + name + QStringLiteral(".combined.") + ext;
+}
+
 }
 
 SegmentLineWriter::SegmentLineWriter(QFile &mdFile, int maxCycleLength)
@@ -1707,6 +1781,115 @@ public slots:
         emit finished(ok, error);
     }
 
+    // Split-recording combine (see
+    // TranscriptionController::findCombineGroups()'s doc comment):
+    // concatenates sourcePaths (already mtime-ordered by the caller) into
+    // outputPath via ffmpeg's concat demuxer with stream copy (lossless,
+    // fast — these are same-format parts from the same recorder), then
+    // moves (or deletes, per deleteOriginals) each source into a sibling
+    // .combined/ dir so the next vault scan doesn't re-detect the same
+    // group. Never touches m_engine/m_diarizationEngine/m_labelingEngine —
+    // unlike run()/download(), this job doesn't use any of them, so there's
+    // nothing to evict/reload here.
+    void combineJob(const QStringList &sourcePaths, const QString &outputPath, bool deleteOriginals)
+    {
+        emit phase(QStringLiteral("combining"));
+
+        QTemporaryFile listFile;
+        if (!listFile.open()) {
+            emit finished(false, QStringLiteral("could not create ffmpeg concat list"));
+            return;
+        }
+        qint64 totalInputBytes = 0;
+        for (const QString &path : sourcePaths) {
+            // ffmpeg concat demuxer syntax: single-quoted paths, any literal
+            // single quote escaped as '\''.
+            QString escaped = path;
+            escaped.replace(QStringLiteral("'"), QStringLiteral("'\\''"));
+            listFile.write(QStringLiteral("file '%1'\n").arg(escaped).toUtf8());
+            totalInputBytes += QFileInfo(path).size();
+        }
+        listFile.close();
+
+        QProcess ffmpeg;
+        ffmpeg.start(QStringLiteral("ffmpeg"),
+                      {QStringLiteral("-f"), QStringLiteral("concat"), QStringLiteral("-safe"), QStringLiteral("0"),
+                       QStringLiteral("-i"), listFile.fileName(), QStringLiteral("-c"), QStringLiteral("copy"),
+                       QStringLiteral("-y"), QStringLiteral("-hide_banner"), QStringLiteral("-loglevel"),
+                       QStringLiteral("error"), outputPath});
+        if (!ffmpeg.waitForStarted()) {
+            emit finished(false, QStringLiteral("failed to start ffmpeg"));
+            return;
+        }
+
+        // Same 100ms poll/pause/cancel shape as AudioDecoder::decodeTo16kMono
+        // — SIGSTOP/SIGCONT for pause, kill for cancel. Progress is
+        // approximate (output file size vs. summed input size — stream-copy
+        // throughput tracks output size closely for PCM/WAV), matching this
+        // app's existing "poll a size on disk" precedent (ModelManager's
+        // curl downloads) rather than adding a second, ffmpeg-`-progress`-
+        // based progress-parsing mechanism just for this one job kind.
+        bool wasPaused = false;
+        bool cancelled = false;
+        while (ffmpeg.state() != QProcess::NotRunning) {
+            if (isCancelRequested()) {
+                cancelled = true;
+                ffmpeg.kill();
+                ffmpeg.waitForFinished(2000);
+                break;
+            }
+            const bool shouldPause = m_pauseRequested.load();
+            if (shouldPause && !wasPaused) {
+                ::kill(static_cast<pid_t>(ffmpeg.processId()), SIGSTOP);
+                wasPaused = true;
+                emit paused(true);
+            } else if (!shouldPause && wasPaused) {
+                ::kill(static_cast<pid_t>(ffmpeg.processId()), SIGCONT);
+                wasPaused = false;
+                emit paused(false);
+            }
+            ffmpeg.waitForReadyRead(100);
+            if (totalInputBytes > 0) {
+                const qint64 outBytes = QFileInfo(outputPath).size();
+                emit progress(std::clamp(static_cast<double>(outBytes) / static_cast<double>(totalInputBytes), 0.0, 1.0));
+            }
+        }
+
+        if (cancelled) {
+            QFile::remove(outputPath);
+            emit finished(false, QStringLiteral("Cancelled"));
+            return;
+        }
+
+        if (ffmpeg.exitStatus() != QProcess::NormalExit || ffmpeg.exitCode() != 0) {
+            const QString err = QString::fromUtf8(ffmpeg.readAllStandardError());
+            QFile::remove(outputPath);
+            emit finished(false, err.isEmpty() ? QStringLiteral("ffmpeg concat failed") : err);
+            return;
+        }
+
+        emit progress(1.0);
+
+        // Move (or delete) every source now that the merge succeeded — a
+        // sibling .combined/ dir next to each one (hidden dotfolder, same
+        // convention as .transcriber/ — naturally invisible to
+        // VaultTreeModel::rebuild()'s scan, which never passes QDir::Hidden)
+        // so the next scan doesn't re-detect this exact group.
+        for (const QString &path : sourcePaths) {
+            if (deleteOriginals) {
+                QFile::remove(path);
+                continue;
+            }
+            const QFileInfo info(path);
+            QDir combinedDir(info.absolutePath() + QStringLiteral("/.combined"));
+            if (!combinedDir.exists())
+                combinedDir.mkpath(QStringLiteral("."));
+            QFile::rename(path, combinedDir.absoluteFilePath(info.fileName()));
+        }
+
+        emit finished(true, QString());
+    }
+
     // GPU memory hygiene, the idle case: run()/relabelJob() already evict
     // whichever engine THIS job doesn't need (see their doc comments), but
     // that leaves whichever engine the MOST RECENT job DID use warm
@@ -1895,7 +2078,18 @@ TranscriptionController::TranscriptionController(QObject *parent)
     connect(m_worker, &TranscriptionWorker::progress, this, [this](double fraction) {
         m_progress = fraction;
         emit progressChanged();
-        recomputeOverallProgress();
+        // A combine job's "combining" phase isn't one of
+        // recomputeOverallProgress()'s fixed transcribe-job phase buckets
+        // (loading/decoding/[detecting-speakers]/transcribing) — mirrors
+        // the downloadProgress connection below's direct assignment, since
+        // ffmpeg concat progress is likewise a single real fraction with no
+        // sub-phases to blend.
+        if (m_phase == QStringLiteral("combining")) {
+            m_overallProgress = fraction;
+            emit overallProgressChanged();
+        } else {
+            recomputeOverallProgress();
+        }
     });
     // 2026-07-10 (rolling-average phase weighting): feeds this phase's
     // just-finished duration into its RollingAverage — see
@@ -2118,10 +2312,11 @@ double TranscriptionController::phaseRelativeSyntheticProgress() const
 
 void TranscriptionController::recomputeOverallProgress()
 {
-    // Empty (idle/relabel/rename/merge) or "downloading" (its own direct
-    // m_overallProgress assignment — see the downloadProgress connection in
-    // the constructor) aren't covered by this phase-weighting scheme.
-    if (m_phase.isEmpty() || m_phase == QStringLiteral("downloading"))
+    // Empty (idle/relabel/rename/merge) or "downloading"/"combining" (both
+    // get their own direct m_overallProgress assignment — see the
+    // downloadProgress and progress() connections in the constructor)
+    // aren't covered by this phase-weighting scheme.
+    if (m_phase.isEmpty() || m_phase == QStringLiteral("downloading") || m_phase == QStringLiteral("combining"))
         return;
 
     QStringList active = {QStringLiteral("loading"), QStringLiteral("decoding")};
@@ -2377,6 +2572,13 @@ void TranscriptionController::generateChaptersAll(const QVariantList &fileUrls, 
 
 void TranscriptionController::startJob(int index)
 {
+    // Safety-net re-check, before any state mutation below — see
+    // maybeRedirectForCombine()'s doc comment. A true return means it
+    // already recursed onto whatever should run instead (a newly-inserted
+    // combine job); this call contributes nothing further.
+    if (maybeRedirectForCombine(index))
+        return;
+
     m_activeIndex = index;
     Job &job = m_jobs[index];
     job.status = JobStatus::Active;
@@ -2432,6 +2634,11 @@ void TranscriptionController::startJob(int index)
         QMetaObject::invokeMethod(m_worker, "generateChaptersJob", Qt::QueuedConnection,
                                    Q_ARG(QString, job.fileUrl.toLocalFile()),
                                    Q_ARG(QString, job.vaultUrl.toLocalFile()));
+    } else if (job.combineOnly) {
+        QMetaObject::invokeMethod(m_worker, "combineJob", Qt::QueuedConnection,
+                                   Q_ARG(QStringList, job.combineSourcePaths),
+                                   Q_ARG(QString, job.fileUrl.toLocalFile()),
+                                   Q_ARG(bool, job.deleteOriginalsAfterCombine));
     } else if (job.downloadTarget != DownloadTarget::None) {
         QString target;
         switch (job.downloadTarget) {
@@ -2587,17 +2794,22 @@ void TranscriptionController::pauseActive()
 {
     if (m_activeIndex < 0 || m_activeIndex >= m_jobs.size())
         return;
-    // See this method's header doc comment — only these two kinds have a
-    // real interruption point.
+    // See this method's header doc comment — only these kinds have a real
+    // interruption point. "combine" is the same real, killable/SIGSTOP-able
+    // ffmpeg subprocess as "transcribe"'s "decoding" phase (see
+    // TranscriptionWorker::combineJob()), just as its ENTIRE job rather than
+    // one phase of it.
     const QString kind = jobKind(m_jobs[m_activeIndex]);
-    if (kind != QStringLiteral("transcribe") && kind != QStringLiteral("download"))
+    if (kind != QStringLiteral("transcribe") && kind != QStringLiteral("download")
+        && kind != QStringLiteral("combine"))
         return;
     // See this method's header doc comment — "loading" is whisper.cpp's
     // in-process, unhookable model-load call (no interruption point at all),
     // unlike "decoding" (a real, killable/SIGSTOP-able ffmpeg subprocess —
     // see AudioDecoder.h) or transcribing/diarization (their own cooperative
     // checkpoints) — queuing a pause during "loading" would only take effect
-    // much later, confusingly.
+    // much later, confusingly. Irrelevant to "combine" (never emits a
+    // "loading" phase at all).
     if (m_phase == QStringLiteral("loading"))
         return;
     // A soft-pause-as-restart from an earlier "loading" click on THIS SAME
@@ -2817,6 +3029,206 @@ int TranscriptionController::frontOfQueueInsertIndex() const
     return m_jobs.size();
 }
 
+// See this method's header doc comment for the full matching/grouping/status
+// semantics.
+QList<TranscriptionController::CombineGroup>
+TranscriptionController::findCombineGroups(const QVariantList &rules, const QStringList &audioPaths)
+{
+    struct Candidate {
+        QString path;
+        QString ruleName;
+        QString key;
+        QDateTime mtime;
+    };
+
+    QList<Candidate> candidates;
+    for (const QVariant &ruleVar : rules) {
+        const QVariantMap rule = ruleVar.toMap();
+        const QString ruleName = rule.value(QStringLiteral("name")).toString();
+        for (const QString &path : audioPaths) {
+            const QFileInfo info(path);
+            if (const auto key = matchRuleCapturedKey(rule, info.fileName()))
+                candidates.append(Candidate{path, ruleName, *key, info.lastModified()});
+        }
+    }
+
+    QMap<QPair<QString, QString>, QList<Candidate>> buckets;
+    for (const Candidate &c : candidates)
+        buckets[qMakePair(c.ruleName, c.key)].append(c);
+
+    const QDateTime now = QDateTime::currentDateTime();
+    QList<CombineGroup> groups;
+    for (auto it = buckets.constBegin(); it != buckets.constEnd(); ++it) {
+        QList<Candidate> members = it.value();
+        std::sort(members.begin(), members.end(),
+                  [](const Candidate &a, const Candidate &b) { return a.mtime < b.mtime; });
+
+        CombineGroup group;
+        group.ruleName = it.key().first;
+        group.key = it.key().second;
+        for (const Candidate &c : members)
+            group.files << c.path;
+
+        const QFileInfo firstInfo(members.first().path);
+        group.outputPath =
+            combineOutputPathFor(group.ruleName, group.key, firstInfo.absolutePath(), firstInfo.suffix());
+
+        if (members.size() < 2) {
+            group.status = QStringLiteral("singleton");
+        } else if (QFileInfo::exists(group.outputPath)) {
+            group.status = QStringLiteral("alreadyCombined");
+        } else {
+            bool anyTranscribed = false;
+            for (const Candidate &c : members) {
+                if (QFileInfo::exists(c.path + QStringLiteral(".md"))) {
+                    anyTranscribed = true;
+                    break;
+                }
+            }
+            if (anyTranscribed)
+                group.status = QStringLiteral("alreadyTranscribed");
+            else if (members.last().mtime.secsTo(now) < kCombineStabilityWindowSecs)
+                group.status = QStringLiteral("pending");
+            else
+                group.status = QStringLiteral("ready");
+        }
+        groups.append(group);
+    }
+
+    // Deterministic ordering — callers (tests, the Settings preview) don't
+    // have to guess QMap's iteration order.
+    std::sort(groups.begin(), groups.end(), [](const CombineGroup &a, const CombineGroup &b) {
+        if (a.ruleName != b.ruleName)
+            return a.ruleName < b.ruleName;
+        return a.key < b.key;
+    });
+    return groups;
+}
+
+QVariantList TranscriptionController::detectCombineGroups(const QVariantList &rules,
+                                                            const QStringList &audioPaths) const
+{
+    QVariantList result;
+    for (const CombineGroup &group : findCombineGroups(rules, audioPaths)) {
+        QVariantMap entry;
+        entry[QStringLiteral("ruleName")] = group.ruleName;
+        entry[QStringLiteral("key")] = group.key;
+        entry[QStringLiteral("files")] = group.files;
+        entry[QStringLiteral("outputPath")] = group.outputPath;
+        entry[QStringLiteral("status")] = group.status;
+        result << entry;
+    }
+    return result;
+}
+
+bool TranscriptionController::isCombineQueued(const QString &outputPath) const
+{
+    const QUrl outputUrl = QUrl::fromLocalFile(outputPath);
+    for (const Job &job : m_jobs) {
+        if (job.combineOnly && job.fileUrl == outputUrl
+            && (job.status == JobStatus::Queued || job.status == JobStatus::Active))
+            return true;
+    }
+    return false;
+}
+
+void TranscriptionController::enqueueCombineJob(const CombineGroup &group, const QUrl &vaultUrl,
+                                                 bool deleteOriginals, int insertIndex)
+{
+    Job job;
+    job.id = m_nextJobId++;
+    job.fileUrl = QUrl::fromLocalFile(group.outputPath);
+    job.vaultUrl = vaultUrl;
+    job.combineOnly = true;
+    job.combineSourcePaths = group.files;
+    job.deleteOriginalsAfterCombine = deleteOriginals;
+    job.status = JobStatus::Queued;
+    const int at = (insertIndex < 0) ? frontOfQueueInsertIndex() : insertIndex;
+    m_jobs.insert(std::clamp(at, 0, static_cast<int>(m_jobs.size())), job);
+}
+
+// See this method's header doc comment.
+bool TranscriptionController::maybeRedirectForCombine(int index)
+{
+    Job &job = m_jobs[index];
+    if (job.combineOnly || job.relabelOnly || job.generateChaptersOnly || job.renameSpeakerOnly
+        || job.mergeSpeakersOnly || job.downloadTarget != DownloadTarget::None || job.fileUrl.isEmpty())
+        return false;
+
+    const QFileInfo info(job.fileUrl.toLocalFile());
+
+    // Outcome 1: a passive autoCombine() scan may already have merged this
+    // exact file's group (and moved the original fragment into .combined/)
+    // since this job was queued. The merged output's path is recomputable
+    // from this filename alone (see findCombineGroups()'s outputPath doc
+    // comment), so check for it directly.
+    for (const QVariant &ruleVar : m_combineRules) {
+        const QVariantMap rule = ruleVar.toMap();
+        const auto key = matchRuleCapturedKey(rule, info.fileName());
+        if (!key)
+            continue;
+        const QString outputPath = combineOutputPathFor(rule.value(QStringLiteral("name")).toString(), *key,
+                                                          info.absolutePath(), info.suffix());
+        if (QFileInfo::exists(outputPath))
+            job.fileUrl = QUrl::fromLocalFile(outputPath);
+        break; // only the first matching rule is used, mirroring findCombineGroups()
+    }
+
+    // Outcome 2: this file is a member of a currently-"ready" group per the
+    // last autoCombine() scan that hasn't been merged yet — insert the
+    // combine job ahead of this one and redirect, same insert-ahead shape
+    // maybeQueueDownloadJob() already uses for model downloads.
+    const QString filePath = job.fileUrl.toLocalFile();
+    for (const CombineGroup &group : findCombineGroups(m_combineRules, m_combineAudioPaths)) {
+        if (group.status != QStringLiteral("ready") || !group.files.contains(filePath))
+            continue;
+        job.fileUrl = QUrl::fromLocalFile(group.outputPath);
+        if (!isCombineQueued(group.outputPath))
+            enqueueCombineJob(group, job.vaultUrl, m_combineDeleteOriginals, index);
+        emit queueChanged();
+        // Recurses onto the freshly-inserted combine job at this same index
+        // (safe — see this method's header doc comment). If a combine job
+        // for this group was somehow already queued elsewhere (defensive
+        // only: this app dispatches one job at a time via front-to-back
+        // scans, and a front-inserted combine job is always reached before
+        // a transcribe job queued behind it — see enqueueCombineJob()'s
+        // insertIndex), nothing was inserted at `index` here, so this
+        // recurses onto the SAME transcribe job; its redirected fileUrl
+        // still won't exist yet and it fails cleanly via the normal
+        // "file not found"-shaped decode error rather than looping.
+        startJob(index);
+        return true;
+    }
+    return false;
+}
+
+void TranscriptionController::autoCombine(const QVariantList &rules, const QStringList &audioPaths,
+                                           const QUrl &vaultUrl, bool deleteOriginals)
+{
+    // Cached for maybeRedirectForCombine()'s per-job safety check — see its
+    // doc comment and the m_combineRules/m_combineAudioPaths field comments.
+    m_combineRules = rules;
+    m_combineAudioPaths = audioPaths;
+    m_combineDeleteOriginals = deleteOriginals;
+
+    bool inserted = false;
+    for (const CombineGroup &group : findCombineGroups(rules, audioPaths)) {
+        if (group.status != QStringLiteral("ready") || isCombineQueued(group.outputPath))
+            continue;
+        enqueueCombineJob(group, vaultUrl, deleteOriginals);
+        inserted = true;
+    }
+    if (!inserted)
+        return;
+    emit queueChanged();
+    // Live trigger (like transcribe()), not a persisted-queue replay — auto-
+    // starting when idle matches transcribe()'s own behavior, unlike
+    // loadPersistedQueue()'s deliberately-not-auto-started restored jobs
+    // (see startNext()'s doc comment).
+    if (m_activeIndex < 0)
+        startNext();
+}
+
 QString TranscriptionController::tasksJsonPath(const QUrl &vaultUrl)
 {
     return vaultUrl.toLocalFile() + QStringLiteral("/.transcriber/tasks.json");
@@ -2850,6 +3262,8 @@ void TranscriptionController::persistQueue() const
         obj["newSpeakerName"] = job.newSpeakerName;
         obj["sourceSpeakerName"] = job.sourceSpeakerName;
         obj["targetSpeakerName"] = job.targetSpeakerName;
+        obj["combineSourcePaths"] = QJsonArray::fromStringList(job.combineSourcePaths);
+        obj["deleteOriginalsAfterCombine"] = job.deleteOriginalsAfterCombine;
         switch (job.downloadTarget) {
         case DownloadTarget::WhisperModel: obj["downloadTarget"] = QStringLiteral("model"); break;
         case DownloadTarget::LabelModel: obj["downloadTarget"] = QStringLiteral("label"); break;
@@ -2926,7 +3340,8 @@ void TranscriptionController::enqueueReplayedJob(const QString &kind, const QJso
         // Chapters use the same label model as relabel — see
         // LabelingEngine::generateChapters()'s doc comment.
         maybeQueueDownloadJob(DownloadTarget::LabelModel, jobVaultUrl, QString());
-    } else if (kind != QStringLiteral("rename") && kind != QStringLiteral("merge")) {
+    } else if (kind != QStringLiteral("rename") && kind != QStringLiteral("merge")
+               && kind != QStringLiteral("combine")) {
         // "transcribe"
         const QString modelId = obj.value("modelId").toString();
         maybeQueueDownloadJob(DownloadTarget::WhisperModel, jobVaultUrl, modelId);
@@ -2953,6 +3368,11 @@ void TranscriptionController::enqueueReplayedJob(const QString &kind, const QJso
         job.targetSpeakerName = obj.value("targetSpeakerName").toString();
     } else if (kind == QStringLiteral("chapters")) {
         job.generateChaptersOnly = true;
+    } else if (kind == QStringLiteral("combine")) {
+        job.combineOnly = true;
+        for (const QJsonValue &v : obj.value("combineSourcePaths").toArray())
+            job.combineSourcePaths << v.toString();
+        job.deleteOriginalsAfterCombine = obj.value("deleteOriginalsAfterCombine").toBool();
     } else {
         job.modelId = obj.value("modelId").toString();
         job.speakerDetection = obj.value("speakerDetection").toBool();
@@ -2997,6 +3417,10 @@ void TranscriptionController::terminateApplicationImmediately() const
 
 QVariantMap TranscriptionController::readMetadata(const QUrl &fileUrl) const
 {
+    // Item P23: see m_transcriptCacheMutex's doc comment — this function is
+    // now also called from loadTranscriptAsync()'s background thread.
+    QMutexLocker locker(&m_transcriptCacheMutex);
+
     const QString mdPath = sidecarPath(fileUrl.toLocalFile());
     const QFileInfo fi(mdPath);
     if (!fi.exists())
@@ -3370,6 +3794,9 @@ void TranscriptionController::mergeSpeakers(const QUrl &fileUrl, const QString &
 
 QString TranscriptionController::readTranscriptBody(const QUrl &fileUrl) const
 {
+    // Item P23: see m_transcriptCacheMutex's doc comment.
+    QMutexLocker locker(&m_transcriptCacheMutex);
+
     const QString mdPath = sidecarPath(fileUrl.toLocalFile());
     const QFileInfo fi(mdPath);
     if (!fi.exists())
@@ -3411,6 +3838,10 @@ QString TranscriptionController::readTranscriptBody(const QUrl &fileUrl) const
 
 QVariantList TranscriptionController::parseSentences(const QUrl &fileUrl) const
 {
+    // Item P23: see m_transcriptCacheMutex's doc comment — RECURSIVE lock,
+    // since readTranscriptBody()/readMetadata() below each lock it again.
+    QMutexLocker locker(&m_transcriptCacheMutex);
+
     const QString mdPath = sidecarPath(fileUrl.toLocalFile());
     // stripPreludeIfPresent first: the prelude is prose ABOUT the transcript,
     // not a segment, and (per stripPreludeIfPresent's doc comment) could
@@ -3499,6 +3930,33 @@ QVariantList TranscriptionController::parseSentences(const QUrl &fileUrl) const
     return sentences;
 }
 
+void TranscriptionController::loadTranscriptAsync(const QUrl &fileUrl)
+{
+    // See this function's own doc comment in the header. QThread::create()
+    // (Qt::Core, no extra module needed) rather than QtConcurrent — this
+    // app has no other use for the Concurrent module, and a plain
+    // fire-and-forget QThread per call is simpler than introducing it for
+    // one call site. The thread deletes itself (deleteLater on its own
+    // finished() signal) once the lambda below returns.
+    QThread *thread = QThread::create([this, fileUrl]() {
+        // Both calls are cached + mutex-guarded (see
+        // m_transcriptCacheMutex's doc comment) — safe to run here
+        // concurrently with the GUI thread's own synchronous calls to the
+        // same two functions.
+        const QString body = readTranscriptBody(fileUrl);
+        const QVariantList sentences = parseSentences(fileUrl);
+        // Marshal back to the GUI thread — `this` (TranscriptionController)
+        // lives there, so Qt::QueuedConnection posts this lambda onto its
+        // event loop rather than running it inline on this background
+        // thread.
+        QMetaObject::invokeMethod(
+            this, [this, fileUrl, body, sentences]() { emit transcriptLoaded(fileUrl, body, sentences); },
+            Qt::QueuedConnection);
+    });
+    connect(thread, &QThread::finished, thread, &QObject::deleteLater);
+    thread->start();
+}
+
 int TranscriptionController::activeSentenceIndex(const QVariantList &sentences, double positionSeconds) const
 {
     if (sentences.isEmpty())
@@ -3556,6 +4014,8 @@ QString TranscriptionController::jobKind(const Job &job)
         return QStringLiteral("relabel");
     if (job.generateChaptersOnly)
         return QStringLiteral("chapters");
+    if (job.combineOnly)
+        return QStringLiteral("combine");
     return QStringLiteral("transcribe");
 }
 

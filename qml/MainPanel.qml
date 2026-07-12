@@ -68,25 +68,41 @@ Rectangle {
     function refreshMetadata() {
         storedMetadata = (player && player.source.toString() !== "" && transcriptionController)
             ? transcriptionController.readMetadata(player.source) : ({})
-        // The prelude lives in the BODY, not frontmatter, so it can't
-        // piggyback on storedMetadata above (readMetadata()'s frontmatter
-        // cache has no reason to invalidate when only the body changes) —
-        // needs its own read call. Folded in here rather than a separate
-        // refreshPrelude(), so every existing refreshMetadata() call site
-        // (onSourceChanged/onFinished/onProgressChanged) picks it up for free.
-        mainPanel.prelude = (player && player.source.toString() !== "" && transcriptionController)
-            ? transcriptionController.readPrelude(player.source) : ""
-        // Same reasoning as prelude above — chapters live in the BODY as
-        // "## [timestamp] title" marker lines, not frontmatter, so they need
-        // their own read call here too.
-        mainPanel.chapters = (player && player.source.toString() !== "" && transcriptionController)
-            ? transcriptionController.readChapters(player.source) : []
         // Speaker detection defaults ON for an untranscribed file (see
         // DESIGN.md "Speaker diarization") — an already-transcribed file
         // instead honors whatever was actually used last time, same as
         // every other stored setting here.
         speakerDetectionToggle.checked =
             mainPanel.hasStoredMetadata ? storedMetadata.speakerDetection === true : true
+    }
+
+    // Item P23: split out of refreshMetadata() above — prelude/chapters live
+    // in the transcript BODY (not frontmatter), so populating them calls
+    // readPrelude()/readChapters(), which themselves call the SAME
+    // readTranscriptBody() transcriptBody/sentences now load asynchronously
+    // on a cold file-open (see beginTranscriptLoad()'s doc comment) — if
+    // this stayed inside refreshMetadata() and refreshMetadata() were still
+    // called synchronously from onSourceChanged, a large file would still
+    // block the GUI thread right here, defeating that fix entirely. So this
+    // is called EXPLICITLY (not nested inside refreshMetadata()) from each
+    // of its safe call sites, each with a different (all cheap) cache state:
+    //  - commitRename()/commitPrelude(): editing an already-open file the
+    //    user is actively looking at — body's already warm.
+    //  - onFinished/onProgressChanged: the file just finished/is actively
+    //    transcribing — already warm from live-tick reads.
+    //  - the transcriptLoaded Connections handler below, AFTER a cold
+    //    open's background load completes: also cheap by then, since that
+    //    same background pass already populated TranscriptionController's
+    //    body cache for this exact file.
+    // It is deliberately NEVER called from onSourceChanged directly (unlike
+    // storedMetadata above, which is a cheap frontmatter-only read either
+    // way) — see beginTranscriptLoad()'s doc comment for why that path
+    // defers to the async completion instead.
+    function refreshPreludeAndChapters() {
+        mainPanel.prelude = (player && player.source.toString() !== "" && transcriptionController)
+            ? transcriptionController.readPrelude(player.source) : ""
+        mainPanel.chapters = (player && player.source.toString() !== "" && transcriptionController)
+            ? transcriptionController.readChapters(player.source) : []
     }
 
     function refreshOrphanedMetadata() {
@@ -491,6 +507,7 @@ Rectangle {
                     mainPanel.pushUndo({type: "label", fileUrl: mainPanel.player.source, oldValue: oldLabel})
                 mainPanel.transcriptionController.setLabel(mainPanel.player.source, trimmed)
                 mainPanel.refreshMetadata()
+                mainPanel.refreshPreludeAndChapters()
             } else if (mainPanel.vaultTreeModel) {
                 const oldPath = mainPanel.player.source.toString().replace("file://", "")
                 if (mainPanel.vaultTreeModel.renameFile(mainPanel.player.source, trimmed)) {
@@ -518,6 +535,7 @@ Rectangle {
             mainPanel.pushUndo({type: "prelude", fileUrl: mainPanel.player.source, oldValue: mainPanel.prelude})
         mainPanel.transcriptionController.setPrelude(mainPanel.player.source, newValue)
         mainPanel.refreshMetadata()
+        mainPanel.refreshPreludeAndChapters()
     }
 
     // Item P15/P20: adds/removes one tag from the current file's list and
@@ -545,56 +563,106 @@ Rectangle {
         mainPanel.transcriptionController.setTags(mainPanel.currentFileUrl(), current.filter(t => t !== tag))
     }
 
-    // Item 10: live-updates as segments are written during an in-progress
-    // transcription of the currently-open file — reading .liveUpdateTick
-    // here (even though the value itself isn't used) makes this binding
-    // re-evaluate each time a real new segment line lands in the .md file,
-    // not on every one of whisper's internal progress ticks (those fire per
-    // decode-loop iteration, including retries, far more often than real
-    // new content appears — see TranscriptionController::liveUpdateTick's
-    // doc comment). Gated on currentFile matching so unrelated jobs' ticks
-    // don't cause pointless re-reads.
-    readonly property string transcriptBody: {
-        if (mainPanel.transcriptionController && mainPanel.player
-                && mainPanel.transcriptionController.currentFile.toString() === mainPanel.player.source.toString()) {
-            void mainPanel.transcriptionController.liveUpdateTick
+    // Item P23: transcriptBody/sentences used to be readonly computed
+    // properties that called readTranscriptBody()/parseSentences()
+    // DIRECTLY inside their binding — on a large already-transcribed file,
+    // that meant a full synchronous regex-parse-the-whole-file pass ran on
+    // the GUI thread the instant the file was opened (the binding
+    // re-evaluates the moment player.source/orphanedMdPath changes),
+    // blocking the UI for however long that took. Now plain stored
+    // properties, populated three different ways depending on WHY they're
+    // changing — a cold file-open goes through the async path (large-file
+    // case, must not block); a live-tick/small-edit refresh stays
+    // synchronous (already cheap via the existing prefix-diff/stat caches,
+    // see TranscriptionController's m_bodyCache/m_sentenceCache doc
+    // comments — no benefit to making these async too):
+    //   1. beginTranscriptLoad() — called on file switch (see
+    //      onSourceChanged/onOrphanedMdPathChanged below). Clears both to
+    //      empty immediately (so the panel doesn't show the PREVIOUS file's
+    //      content while the new one loads) and kicks off
+    //      transcriptionController.loadTranscriptAsync() in the background,
+    //      UNLESS the file has no stored metadata yet (nothing to load —
+    //      matches the original binding's instant "" / [] for an
+    //      untranscribed file).
+    //   2. The transcriptLoaded Connections handler below applies the
+    //      result — but only if fileUrl still matches the file that's
+    //      CURRENTLY open (mainPanel.transcriptLoadingFor), in case the user
+    //      switched files again before the background pass finished.
+    //   3. refreshTranscriptSync() — called on liveUpdateTick (gated on
+    //      currentFile matching, same condition the original binding used),
+    //      on sentencesRevision bumps, and on hasStoredMetadata flipping
+    //      true (frontmatter now exists — matches the moment the original
+    //      binding's dependency on hasStoredMetadata would have started
+    //      returning real content instead of ""/[]). All three are either
+    //      small edits to an already-open file or an early/small live
+    //      transcript — cheap synchronous calls, exactly as before.
+    property string transcriptBody: ""
+    property var sentences: []
+    // Which fileUrl (string form) the most recent beginTranscriptLoad() is
+    // waiting on — "" when nothing is in flight (untranscribed file, no
+    // transcriptionController, etc.).
+    property string transcriptLoadingFor: ""
+
+    function beginTranscriptLoad() {
+        mainPanel.transcriptBody = ""
+        mainPanel.sentences = []
+        mainPanel.transcriptLoadingFor = ""
+        if (!mainPanel.transcriptionController)
+            return
+        if (mainPanel.orphanedMdPath !== "") {
+            const key = "file://" + mainPanel.orphanedMdPath
+            mainPanel.transcriptLoadingFor = key
+            mainPanel.transcriptionController.loadTranscriptAsync(key)
+        } else if (mainPanel.player && mainPanel.player.source.toString() !== "" && mainPanel.hasStoredMetadata) {
+            const key = mainPanel.player.source.toString()
+            mainPanel.transcriptLoadingFor = key
+            mainPanel.transcriptionController.loadTranscriptAsync(key)
         }
-        if (mainPanel.orphanedMdPath !== "" && mainPanel.transcriptionController)
-            return mainPanel.transcriptionController.readTranscriptBody("file://" + mainPanel.orphanedMdPath)
-        if (mainPanel.player && mainPanel.player.source.toString() !== "" && mainPanel.hasStoredMetadata
-                && mainPanel.transcriptionController)
-            return mainPanel.transcriptionController.readTranscriptBody(mainPanel.player.source)
-        return ""
+        // else: no file, or an untranscribed file with nothing to load yet
+        // — stays cleared until hasStoredMetadata flips true (see
+        // onHasStoredMetadataChanged below).
     }
 
-    // Sentence-level highlighting synced to playback (DESIGN.md / CLAUDE.md:
-    // sentence-level only, binary-search the active sentence on
-    // positionChanged). Orphaned-md files have no player/position, so
-    // sentences parse fine but activeSentenceIndex just stays -1 — no
-    // highlight, which is correct (nothing is "playing").
-    //
-    // Same live-update hook as transcriptBody above (read .liveUpdateTick so
-    // this re-evaluates each time a real new segment lands, not just at
-    // completion) — this was missing here, which is why displayText/the
-    // transcript view (both now built FROM sentences, not from
-    // transcriptBody directly) didn't show new segments live during an
-    // in-progress transcription: nothing else reliably re-triggers this
-    // binding mid-job (storedMetadata's reference changes, but
-    // hasStoredMetadata's VALUE stays true the whole time once frontmatter
-    // exists, so its own change notify doesn't fire on every tick).
-    readonly property var sentences: {
-        void mainPanel.sentencesRevision
-        if (mainPanel.transcriptionController && mainPanel.player
-                && mainPanel.transcriptionController.currentFile.toString() === mainPanel.player.source.toString()) {
-            void mainPanel.transcriptionController.liveUpdateTick
+    function refreshTranscriptSync() {
+        if (!mainPanel.transcriptionController) {
+            mainPanel.transcriptBody = ""
+            mainPanel.sentences = []
+            return
         }
-        if (!mainPanel.transcriptionController)
-            return []
+        let key = ""
         if (mainPanel.orphanedMdPath !== "")
-            return mainPanel.transcriptionController.parseSentences("file://" + mainPanel.orphanedMdPath)
-        if (mainPanel.player && mainPanel.player.source.toString() !== "" && mainPanel.hasStoredMetadata)
-            return mainPanel.transcriptionController.parseSentences(mainPanel.player.source)
-        return []
+            key = "file://" + mainPanel.orphanedMdPath
+        else if (mainPanel.player && mainPanel.player.source.toString() !== "" && mainPanel.hasStoredMetadata)
+            key = mainPanel.player.source.toString()
+        if (key === "") {
+            mainPanel.transcriptBody = ""
+            mainPanel.sentences = []
+            return
+        }
+        mainPanel.transcriptBody = mainPanel.transcriptionController.readTranscriptBody(key)
+        mainPanel.sentences = mainPanel.transcriptionController.parseSentences(key)
+    }
+
+    onSentencesRevisionChanged: mainPanel.refreshTranscriptSync()
+    onHasStoredMetadataChanged: mainPanel.refreshTranscriptSync()
+
+    Connections {
+        target: mainPanel.transcriptionController
+        function onTranscriptLoaded(fileUrl, body, loadedSentences) {
+            if (fileUrl.toString() !== mainPanel.transcriptLoadingFor)
+                return // superseded by a later file switch — discard
+            mainPanel.transcriptBody = body
+            mainPanel.sentences = loadedSentences
+        }
+        // Item 10/P23: same live-update gating the old computed bindings
+        // used (currentFile matching the open file) — a synchronous
+        // refresh here is cheap (small incremental parse via the existing
+        // prefix-diff cache), unlike the cold-open case above.
+        function onLiveUpdateTickChanged() {
+            if (mainPanel.player
+                    && mainPanel.transcriptionController.currentFile.toString() === mainPanel.player.source.toString())
+                mainPanel.refreshTranscriptSync()
+        }
     }
 
     // User request: selection should skip over timestamps entirely — the
@@ -1025,6 +1093,9 @@ Rectangle {
         // reach across a file switch into a different note's edits.
         function onSourceChanged() {
             mainPanel.refreshMetadata()
+            // Item P23: NOT refreshPreludeAndChapters() here — this is the
+            // cold-open case, see beginTranscriptLoad()'s doc comment.
+            mainPanel.beginTranscriptLoad()
             transcriptRepaintNudgeTimer.restart()
             mainPanel.undoStack = []
         }
@@ -1035,6 +1106,7 @@ Rectangle {
     // itself) — this is the other half of "a different file was just
     // opened", covering the orphaned-md view.
     onOrphanedMdPathChanged: {
+        mainPanel.beginTranscriptLoad()
         transcriptRepaintNudgeTimer.restart()
         mainPanel.undoStack = []
     }
@@ -1042,6 +1114,7 @@ Rectangle {
         target: mainPanel.transcriptionController
         function onFinished() {
             mainPanel.refreshMetadata()
+            mainPanel.refreshPreludeAndChapters()
             mainPanel.refreshOrphanedMetadata()
         }
         // Item 10: frontmatter is written at job START (durability, see
@@ -1052,8 +1125,10 @@ Rectangle {
         // in-progress file instead of waiting for completion.
         function onProgressChanged() {
             if (mainPanel.player
-                    && mainPanel.transcriptionController.currentFile.toString() === mainPanel.player.source.toString())
+                    && mainPanel.transcriptionController.currentFile.toString() === mainPanel.player.source.toString()) {
                 mainPanel.refreshMetadata()
+                mainPanel.refreshPreludeAndChapters()
+            }
         }
     }
     // Item O10: typing now searches immediately (not just on Enter) —

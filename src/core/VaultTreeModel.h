@@ -4,6 +4,7 @@
 #include <QFileSystemWatcher>
 #include <QStringList>
 #include <QUrl>
+#include <QVariantList>
 #include <QVariantMap>
 #include <qqml.h>
 
@@ -96,6 +97,35 @@ public:
     // cover the current viewport). Used by "force retranscribe all".
     Q_INVOKABLE QStringList allAudioPaths() const;
 
+    // Search UI rearchitecture: flat, already-computed search results for
+    // Sidebar.qml's separate results ListView (shown instead of the normal
+    // TreeView while a text search query is active) — as opposed to
+    // VaultSearchProxyModel, which stays exactly as-is and still does
+    // in-tree dim+sort for this same query AND genuine row-hiding for the
+    // separate tagFilter feature (unrelated; not touched here).
+    //
+    // Recursively walks the whole tree (mirrors allAudioPaths()'s traversal
+    // shape) and returns one QVariantMap per matching leaf node (audio file
+    // or orphaned .md — directories are never results, they're not
+    // clickable-to-open), sorted alphabetically by name. A leaf matches if
+    // query (case-insensitive) is found in its filename, stored label, or
+    // stored tags — or, only when includeTranscriptions is true and the
+    // file is transcribed, in its transcript body.
+    //
+    // Deliberately returns RAW transcriptBody rather than a pre-built
+    // snippet string: Sidebar.qml already has cleanTranscript()/
+    // transcriptSnippet()/highlightMatch() for exactly this (used today by
+    // the in-tree snippet row), and re-implementing that text-shaping logic
+    // here in C++ would just duplicate it. QML calls those existing helpers
+    // on each result's transcriptBody the same way the tree delegate already
+    // does on its own TranscriptBodyRole value.
+    //
+    // Each entry's keys: path (absolute), name (filename), label (stored
+    // label, or "" if none/untranscribed), status (VaultTreeModel::Status
+    // int), isAudio, isOrphanedMd, transcriptBody (raw body, or "" if
+    // includeTranscriptions is false or the file isn't transcribed).
+    Q_INVOKABLE QVariantList searchResults(const QString &query, bool includeTranscriptions) const;
+
 signals:
     void vaultPathChanged();
 
@@ -115,6 +145,10 @@ private:
     std::unique_ptr<Node> scanDirectory(const QString &dirPath, Node *parent) const;
     Node *nodeFromIndex(const QModelIndex &index) const;
     static void collectAudioPaths(const Node *node, QStringList &out);
+    // Backs searchResults() — not static (unlike collectAudioPaths above)
+    // because it needs transcriptBody(), which consults m_transcriptBodyCache.
+    void collectSearchResults(const Node *node, const QString &queryLower, bool includeTranscriptions,
+                               QVariantList &out) const;
 
     // Backing for LabelRole/TagsRole/TranscriptBodyRole: read fresh from the
     // sidecar .md on every call rather than cached on Node/at rebuild() time,

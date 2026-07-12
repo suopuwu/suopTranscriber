@@ -9,6 +9,8 @@
 #include <QSet>
 #include <QTextStream>
 
+#include <algorithm>
+
 namespace {
 
 const QSet<QString> &audioExtensions()
@@ -516,6 +518,61 @@ void VaultTreeModel::collectAudioPaths(const Node *node, QStringList &out)
         out << node->path;
     for (const auto &child : node->children)
         collectAudioPaths(child.get(), out);
+}
+
+QVariantList VaultTreeModel::searchResults(const QString &query, bool includeTranscriptions) const
+{
+    QVariantList out;
+    const QString queryLower = query.trimmed().toLower();
+    if (queryLower.isEmpty())
+        return out;
+
+    collectSearchResults(m_root.get(), queryLower, includeTranscriptions, out);
+
+    std::sort(out.begin(), out.end(), [](const QVariant &a, const QVariant &b) {
+        return a.toMap().value(QStringLiteral("name")).toString().compare(
+                   b.toMap().value(QStringLiteral("name")).toString(), Qt::CaseInsensitive)
+            < 0;
+    });
+    return out;
+}
+
+// Only audio files and orphaned .md leaves are ever results (mirrors
+// collectAudioPaths()'s traversal shape, but doesn't prune directories —
+// they're walked purely to reach their children, never emitted themselves).
+void VaultTreeModel::collectSearchResults(const Node *node, const QString &queryLower, bool includeTranscriptions,
+                                           QVariantList &out) const
+{
+    if (node->isAudio || node->isOrphanedMd) {
+        const QString mdPath = sidecarMdPath(node);
+        const QString label = mdPath.isEmpty() ? QString() : frontmatterField(mdPath, QStringLiteral("label"));
+        const QString tags = mdPath.isEmpty() ? QString() : frontmatterField(mdPath, QStringLiteral("tags"));
+
+        // Only read the (possibly large) transcript body when the caller
+        // asked for body matching AND the file is actually transcribed —
+        // same gating TranscriptBodyRole itself uses in data() above.
+        QString body;
+        if (includeTranscriptions && node->status == TranscribedStatus && !mdPath.isEmpty())
+            body = transcriptBody(mdPath);
+
+        const bool matched = node->name.toLower().contains(queryLower) || label.toLower().contains(queryLower)
+            || tags.toLower().contains(queryLower) || body.toLower().contains(queryLower);
+
+        if (matched) {
+            QVariantMap entry;
+            entry[QStringLiteral("path")] = node->path;
+            entry[QStringLiteral("name")] = node->name;
+            entry[QStringLiteral("label")] = label;
+            entry[QStringLiteral("status")] = static_cast<int>(node->status);
+            entry[QStringLiteral("isAudio")] = node->isAudio;
+            entry[QStringLiteral("isOrphanedMd")] = node->isOrphanedMd;
+            entry[QStringLiteral("transcriptBody")] = body;
+            out.append(entry);
+        }
+    }
+
+    for (const auto &child : node->children)
+        collectSearchResults(child.get(), queryLower, includeTranscriptions, out);
 }
 
 void VaultTreeModel::revealInFileManager(const QUrl &fileUrl) const

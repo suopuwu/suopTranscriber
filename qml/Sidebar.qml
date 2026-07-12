@@ -130,9 +130,68 @@ Rectangle {
 
     VaultSearchProxyModel {
         id: searchProxy
-        searchQuery: sidebar.searchQuery
-        includeTranscriptions: sidebar.searchIncludeTranscriptions
+        // Bug fix: searchQuery/includeTranscriptions are deliberately NOT
+        // bound to sidebar.searchQuery/searchIncludeTranscriptions anymore.
+        // Since the search-UI rearchitecture, text search is rendered
+        // entirely by searchResultsView below (via
+        // vaultTreeModel.searchResults()) — the TreeView bound to this proxy
+        // is fully hidden whenever a text search is active
+        // (treeView.visible: sidebar.searchQuery === ""). Feeding a live
+        // search query into this proxy while the TreeView was hidden still
+        // triggered its sort/dim re-evaluation and the model-reset/
+        // expandAll relayout machinery below — invisibly, off-screen — and
+        // left the TreeView's cached row positions in a stale/inconsistent
+        // state by the time it became visible again after the search
+        // cleared (observed live: large gaps and overlapping rows,
+        // hover-highlight geometry correct because it's computed fresh on
+        // hover, static text left at stale positions). searchQuery staying
+        // permanently "" here is exactly equivalent to the old
+        // bound-but-only-relevant-when-""-anyway behavior from the
+        // TreeView's own point of view, since the TreeView is never visible
+        // while sidebar.searchQuery is non-"" in the first place.
         tagFilter: sidebar.activeTagFilters
+    }
+
+    // Search UI rearchitecture: while a text search query is active, the
+    // normal TreeView is hidden and this flat, pre-computed results list
+    // (from VaultTreeModel::searchResults(), NOT the in-tree
+    // VaultSearchProxyModel dim+sort above — that stays exactly as-is,
+    // still driving tag-filter row-hiding) is shown instead. A plain
+    // property + explicit refresh function, not a reactive binding that
+    // reads metadataRevision/etc. as a dependency trick — this codebase has
+    // already been bitten once by qmlcachegen (AOT) silently dropping an
+    // unused dummy-property read meant only to force binding
+    // re-evaluation (see treeDelegate.metadata's own comment above), so
+    // every other "recompute on X" case in this file uses an explicit push
+    // instead, and this follows the same idiom.
+    //
+    // Edge case (tag filter + text search both active at once): the two are
+    // separate, orthogonal features, and this flat list intentionally does
+    // NOT also apply activeTagFilters — text search simply takes precedence
+    // for what's visible while its query is non-empty. Simplest coherent
+    // behavior per the plan; revisit only if that combination turns out to
+    // matter in practice.
+    property var searchResultsList: []
+    function refreshSearchResults() {
+        sidebar.searchResultsList = (sidebar.searchQuery !== "" && sidebar.model)
+            ? sidebar.model.searchResults(sidebar.searchQuery, sidebar.searchIncludeTranscriptions)
+            : []
+    }
+    onSearchQueryChanged: sidebar.refreshSearchResults()
+    onSearchIncludeTranscriptionsChanged: sidebar.refreshSearchResults()
+    Connections {
+        target: sidebar
+        function onMetadataRevisionChanged() { sidebar.refreshSearchResults() }
+    }
+    Connections {
+        // Vault contents changed (file added/removed/renamed) — re-run the
+        // search against the fresh tree. sidebar.model is itself the
+        // VaultTreeModel (searchProxy.sourceModel via the alias), and
+        // QAbstractItemModel::modelReset is a plain Qt signal any
+        // Connections can bind to, same as searchProxy's own onModelReset
+        // above.
+        target: sidebar.model
+        function onModelReset() { sidebar.refreshSearchResults() }
     }
 
     // O9: bumped on every transcribe/relabel completion so each realized
@@ -631,6 +690,15 @@ Rectangle {
     TreeView {
         id: tree
         model: searchProxy
+        // Search UI rearchitecture: a non-empty text search query now shows
+        // searchResultsView (below) instead — the old in-tree dimming/
+        // snippet code beneath is left in place (unreachable, not deleted;
+        // see that code's own comments) rather than risk removing something
+        // this app has no automated way to re-verify. Tag filtering is a
+        // separate, orthogonal feature and keeps hiding rows through this
+        // same TreeView regardless of search state — only text search hides
+        // the tree itself.
+        visible: sidebar.searchQuery === ""
         anchors.top: ribbon.bottom
         anchors.left: parent.left
         anchors.right: parent.right
@@ -869,10 +937,15 @@ Rectangle {
             }
 
             Column {
+                id: treeColumn
                 x: treeDelegate.depth * 16 + 6
-                anchors.verticalCenter: treeDelegate.showSnippet ? undefined : parent.verticalCenter
-                anchors.top: treeDelegate.showSnippet ? parent.top : undefined
-                anchors.topMargin: treeDelegate.showSnippet ? 4 : 0
+                // See the identical fix + explanation on searchResultsView's
+                // resultColumn in this same file — conditionally toggling
+                // between anchors.top and anchors.verticalCenter via
+                // ternary+undefined is fragile and was observed live to get
+                // stuck at the wrong position; a plain "y" binding avoids
+                // the whole class of bug.
+                y: treeDelegate.showSnippet ? 4 : (treeDelegate.height - treeColumn.implicitHeight) / 2
                 spacing: 2
 
                 Row {
@@ -1084,6 +1157,165 @@ Rectangle {
         }
     }
 
+    // Search UI rearchitecture: a flat, separate results list shown INSTEAD
+    // of tree above while a text search query is active — genuinely its own
+    // ListView/delegate rather than another dimming/restyling mode bolted
+    // onto treeDelegate, which is what caused the row-height/relayout races
+    // relayoutForSearchStateChange/expandRetryTimer above were fixed for.
+    // Bound to VaultTreeModel::searchResults() via sidebar.searchResultsList
+    // (see that property's own comment for why it's an explicit push, not a
+    // reactive binding).
+    ListView {
+        id: searchResultsView
+        visible: sidebar.searchQuery !== ""
+        anchors.top: ribbon.bottom
+        anchors.left: parent.left
+        anchors.right: parent.right
+        anchors.bottom: parent.bottom
+        clip: true
+        model: sidebar.searchResultsList
+
+        ScrollBar.vertical: ScrollBar { policy: ScrollBar.AlwaysOn }
+
+        delegate: Item {
+            id: resultDelegate
+            required property var modelData
+            width: searchResultsView.width
+
+            readonly property string resultPath: resultDelegate.modelData.path
+            readonly property string resultName: resultDelegate.modelData.name
+            readonly property string resultLabel: resultDelegate.modelData.label
+            readonly property int resultStatus: resultDelegate.modelData.status
+            readonly property bool resultIsAudio: resultDelegate.modelData.isAudio
+            readonly property bool resultIsOrphanedMd: resultDelegate.modelData.isOrphanedMd
+            readonly property string resultTranscriptBody: resultDelegate.modelData.transcriptBody
+
+            // Same snippet-building idiom as treeDelegate above (item 9),
+            // just fed from this result's own transcriptBody instead of a
+            // tree row's TranscriptBodyRole — reuses the exact same
+            // sidebar.cleanTranscript()/transcriptSnippet() helpers so the
+            // two never drift.
+            readonly property string cleanedBody: (sidebar.searchIncludeTranscriptions
+                                                     && resultDelegate.resultTranscriptBody)
+                ? sidebar.cleanTranscript(resultDelegate.resultTranscriptBody) : ""
+            readonly property string snippetText: (sidebar.searchQuery !== "" && resultDelegate.cleanedBody !== "")
+                ? sidebar.transcriptSnippet(resultDelegate.cleanedBody, sidebar.searchQuery, 40) : ""
+            readonly property bool showSnippet: resultDelegate.snippetText !== ""
+
+            readonly property string displayName: {
+                if (AppSettings.useLabelsSidebar && resultDelegate.resultLabel)
+                    return resultDelegate.resultLabel
+                if (!AppSettings.hideExtensionsSidebar)
+                    return resultDelegate.resultName
+                const dot = resultDelegate.resultName.lastIndexOf(".")
+                return dot > 0 ? resultDelegate.resultName.substring(0, dot) : resultDelegate.resultName
+            }
+
+            implicitHeight: resultDelegate.showSnippet ? (28 + resultSnippetText.implicitHeight + 4) : 28
+
+            HoverHandler {
+                id: resultHover
+                cursorShape: Qt.PointingHandCursor
+            }
+            TapHandler {
+                onTapped: {
+                    // Mirrors treeDelegate's TapHandler exactly (minus the
+                    // isDir/toggleExpanded branch — results are always
+                    // leaves, never directories).
+                    if (resultDelegate.resultIsAudio)
+                        sidebar.fileActivated(resultDelegate.resultPath)
+                    else if (resultDelegate.resultIsOrphanedMd)
+                        sidebar.orphanedMdActivated(resultDelegate.resultPath)
+                }
+            }
+            HoverBorder {
+                anchors.fill: parent
+                anchors.margins: 1
+                active: resultHover.hovered
+            }
+
+            // O7: same persistent "currently open" highlight as treeDelegate.
+            Rectangle {
+                anchors.fill: parent
+                anchors.margins: 1
+                visible: resultDelegate.resultPath === sidebar.currentPath
+                color: AppSettings.sidebarSelectionColor
+                radius: AppSettings.borderRadius
+                border.width: 1
+                border.color: AppSettings.sidebarSelectionBorderColor
+            }
+
+            Column {
+                id: resultColumn
+                x: 6
+                // Bug fix: conditionally toggling BETWEEN anchors.top and
+                // anchors.verticalCenter via ternary+undefined is fragile —
+                // Qt Quick's anchoring engine doesn't reliably clear/re-apply
+                // anchor lines when both are driven by the same changing
+                // condition (observed live: refining a search from a
+                // body-match to a title-only match, which flips showSnippet
+                // true->false, left this Column visually stuck at its old
+                // top-anchored position instead of re-centering, overlapping
+                // the row's top border). A plain "y" binding sidesteps the
+                // anchor system entirely — this is an ordinary property
+                // re-evaluation, not an anchor reconfiguration, so there's no
+                // conflicting-anchor-lines class of bug possible.
+                y: resultDelegate.showSnippet ? 4 : (resultDelegate.height - resultColumn.implicitHeight) / 2
+                spacing: 2
+
+                Row {
+                    spacing: 6
+
+                    Rectangle {
+                        anchors.verticalCenter: parent.verticalCenter
+                        width: 8
+                        height: 8
+                        radius: 4
+                        // Same color logic as treeDelegate's status dot
+                        // (TranscribedStatus green, orphaned-.md blue,
+                        // otherwise untranscribed yellow).
+                        color: resultDelegate.resultStatus === 2 ? "#2ecc71"
+                               : (resultDelegate.resultIsOrphanedMd ? "#3498db" : "#f1c40f")
+                    }
+
+                    Text {
+                        anchors.verticalCenter: parent.verticalCenter
+                        textFormat: Text.StyledText
+                        text: sidebar.highlightMatch(resultDelegate.displayName, sidebar.searchQuery)
+                        color: "white"
+                    }
+                }
+
+                Text {
+                    id: resultSnippetText
+                    visible: resultDelegate.showSnippet
+                    x: 14
+                    width: Math.max(10, searchResultsView.width - x - 16)
+                    textFormat: Text.StyledText
+                    text: resultDelegate.snippetText
+                    color: "#999999"
+                    font.pixelSize: 11
+                    wrapMode: Text.WordWrap
+
+                    HoverHandler {
+                        id: resultSnippetHover
+                        cursorShape: Qt.PointingHandCursor
+                    }
+                    TapHandler {
+                        onTapped: sidebar.transcriptMatchActivated(resultDelegate.resultPath,
+                                                                    resultDelegate.resultIsOrphanedMd,
+                                                                    sidebar.searchQuery)
+                    }
+                    HoverBorder {
+                        anchors.fill: parent
+                        anchors.margins: -2
+                        active: resultSnippetHover.hovered
+                    }
+                }
+            }
+        }
+    }
+
     // Chrome/Firefox-style middle-click autoscroll for the file tree —
     // same two-gesture pattern (quick click arms free-scroll; press-drag-
     // release disarms on release) as MainPanel's transcript-view
@@ -1114,6 +1346,13 @@ Rectangle {
     // priority over row clicks, per Chrome's own convention.
     MouseArea {
         id: middleDragScrollArea
+        // Search UI rearchitecture: this autoscroll is wired specifically
+        // to tree's own Flickable geometry (contentY/contentHeight below) —
+        // while search results are showing, tree is invisible and this would
+        // just scroll a hidden view for no visible effect, so it's disabled
+        // rather than adapted to also drive searchResultsView (which already
+        // gets ordinary wheel/flick scrolling for free from ListView).
+        enabled: sidebar.searchQuery === ""
         anchors.top: ribbon.bottom
         anchors.left: parent.left
         anchors.right: parent.right

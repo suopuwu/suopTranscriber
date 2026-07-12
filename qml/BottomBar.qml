@@ -113,7 +113,7 @@ Item {
     // made the first click look like it did nothing (user report,
     // 2026-07-10).
     readonly property bool activeStopping: transcriptionController ? transcriptionController.activeStopping : false
-    function canPause(kind) { return kind === "transcribe" || kind === "download" }
+    function canPause(kind) { return kind === "transcribe" || kind === "download" || kind === "combine" }
     // Shared by the bottom bar's and the popup header's pause/play button —
     // kept in one place so the glyph and the tap behavior (see both
     // TapHandlers) can never drift out of sync with each other.
@@ -230,6 +230,7 @@ Item {
         case "merge": return qsTr("Merge")
         case "download": return qsTr("Download")
         case "chapters": return qsTr("Generate chapters")
+        case "combine": return qsTr("Combine")
         default: return qsTr("Transcribe")
         }
     }
@@ -244,6 +245,7 @@ Item {
         case "detecting-speakers-identifying": return qsTr("identifying speakers…")
         case "transcribing": return qsTr("transcribing…")
         case "downloading": return qsTr("downloading…")
+        case "combining": return qsTr("combining…")
         default: return ""
         }
     }

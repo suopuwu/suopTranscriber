@@ -13,6 +13,7 @@
 #include <QVariantList>
 #include <QVariantMap>
 #include <QMap>
+#include <QMutex>
 #include <QVector>
 #include <qqml.h>
 
@@ -664,6 +665,21 @@ public:
     // instead of re-parsing the whole (ever-growing) body from scratch.
     Q_INVOKABLE QVariantList parseSentences(const QUrl &fileUrl) const;
 
+    // Item P23: cold-opening a large already-transcribed file used to block
+    // the GUI thread for the entire readTranscriptBody()+parseSentences()
+    // pass (a single regex sweep over the whole body, cost scaling with
+    // file size) — this runs that SAME pair of (cached) calls on a
+    // throwaway background QThread instead, and emits transcriptLoaded()
+    // with the result once done. Thread-safe with respect to the GUI
+    // thread's own synchronous calls to readTranscriptBody()/parseSentences()
+    // (e.g. the existing liveUpdateTick-driven polling of whatever file is
+    // ACTIVELY transcribing) via m_transcriptCacheMutex — see its doc
+    // comment. Fire-and-forget: callers (QML) are expected to track which
+    // fileUrl they're waiting on themselves and ignore a transcriptLoaded()
+    // whose fileUrl no longer matches the file currently open (the user may
+    // have switched files again before this one's background pass finished).
+    Q_INVOKABLE void loadTranscriptAsync(const QUrl &fileUrl);
+
     // Binary-searches sentences (as returned by parseSentences(), sorted by
     // t0) for the one active at positionSeconds. Returns the index of the
     // last sentence whose t0 <= positionSeconds — i.e. "sticky": a position
@@ -737,6 +753,29 @@ public:
     // here so QML doesn't need its own duplicate frontmatter-scanning logic.
     Q_INVOKABLE QStringList existingVaultTags(const QUrl &vaultUrl) const;
 
+    // Split-recording auto-combine: matches vault audio filenames against
+    // user-authored regex rules (AppSettings.combineRules) to find groups of
+    // files that are really one recording split by the recorder — see
+    // findCombineGroups() in the .cpp for the full matching/grouping
+    // semantics. Pure over its inputs (only touches disk via QFileInfo stats
+    // on the paths passed in), so this same entry point backs both the
+    // Settings "test this rule" preview AND autoCombine()'s real enqueue
+    // decisions below. Each rule map: {name, pattern, enabled}. Returns one
+    // entry per detected group: {ruleName, key, files (QStringList,
+    // mtime-ascending), outputPath, status
+    // ("ready"/"singleton"/"alreadyTranscribed"/"alreadyCombined"/"pending")}.
+    Q_INVOKABLE QVariantList detectCombineGroups(const QVariantList &rules, const QStringList &audioPaths) const;
+
+    // Runs detectCombineGroups() and enqueues a "combine" job (Job::combineOnly)
+    // for every "ready" group not already queued (isCombineQueued()) — never
+    // also queues a transcribe job; the merged file just becomes a normal
+    // untranscribed vault entry the user transcribes like any other. Called
+    // from Main.qml on every VaultTreeModel rebuild (startup + every
+    // filesystem change), so newly-arrived recorder parts get combined
+    // without the user doing anything.
+    Q_INVOKABLE void autoCombine(const QVariantList &rules, const QStringList &audioPaths, const QUrl &vaultUrl,
+                                  bool deleteOriginals);
+
 signals:
     void busyChanged();
     void progressChanged();
@@ -751,6 +790,11 @@ signals:
     // jobStatusForPath() for their own path, without depending on the
     // (unrelated-to-them) full jobs() list shape.
     void jobStatusesChanged();
+    // Item P23: see loadTranscriptAsync()'s doc comment. Always emitted on
+    // the GUI thread (the background QThread marshals back via
+    // QMetaObject::invokeMethod/Qt::QueuedConnection) — safe for QML to
+    // react to directly, no cross-thread concerns for the receiver.
+    void transcriptLoaded(const QUrl &fileUrl, const QString &body, const QVariantList &sentences);
     void liveUpdateTickChanged();
     void activePausedChanged();
     void activeStoppingChanged();
@@ -814,6 +858,14 @@ private:
         // comment. Needs only fileUrl/vaultUrl (same as relabelOnly) — no
         // extra fields of its own.
         bool generateChaptersOnly = false;
+        // Split-recording combine (see findCombineGroups()'s doc comment):
+        // fileUrl doubles as the combine job's OUTPUT path for this kind,
+        // same "reuse fileUrl for whatever this kind's one file is" pattern
+        // the other *Only kinds already use. combineSourcePaths is the
+        // ordered (mtime-ascending) list of parts to concatenate.
+        bool combineOnly = false;
+        QStringList combineSourcePaths;
+        bool deleteOriginalsAfterCombine = false;
         bool restrictTagsToExisting = false;
         double tagReuseBias = 0.5;
         double wordiness = 0.5;
@@ -826,10 +878,76 @@ private:
         qint64 durationMs = -1;
     };
 
-    // Shared by jobs()' "kind" key and currentJobKind() — the four flags
-    // above (plus downloadTarget != None) are mutually exclusive by
-    // construction (each enqueuing function only ever sets one).
+    // Shared by jobs()' "kind" key and currentJobKind() — the flags above
+    // (plus downloadTarget != None) are mutually exclusive by construction
+    // (each enqueuing function only ever sets one).
     static QString jobKind(const Job &job);
+
+    // One detected group of split-recording parts — see findCombineGroups()'s
+    // doc comment for the matching/grouping/status semantics. Mirrors
+    // detectCombineGroups()'s QVariantMap shape one-to-one; kept as a real
+    // struct internally so startJob()'s per-job safety check and
+    // autoCombine() don't have to round-trip through QVariant.
+    struct CombineGroup {
+        QString ruleName;
+        QString key;
+        QStringList files; // mtime-ascending
+        QString outputPath;
+        QString status; // "ready"/"singleton"/"alreadyTranscribed"/"alreadyCombined"/"pending"
+    };
+
+    // Matches every path in audioPaths against every enabled rule in `rules`
+    // ({name, pattern, enabled} maps) using QRegularExpression SEARCH
+    // semantics (not anchored unless the pattern itself has ^/$) against the
+    // full filename (name+ext). A match's capture groups (captured(1..N),
+    // concatenated) are the group-identity "key" — an uncaptured wildcard
+    // span (bare `.`, `\d{3}`, `.*`, ...) varies freely between members
+    // without affecting grouping, matching the user's stated model of
+    // "the rule gets the real string with the wildcard replaced; same real
+    // string = combine". A rule with zero capture groups therefore groups
+    // EVERY file it matches into one bucket (expected regex behavior, not a
+    // special case). Members are sorted by mtime ascending within each
+    // group. outputPath is derived from (sanitized ruleName, sanitized key)
+    // rather than any single member's filename, so it's re-derivable from
+    // just one surviving filename even after the rest have been moved into
+    // .combined/ — see startJob()'s safety-net re-check, which relies on
+    // exactly that. status: "singleton" (only one match), "alreadyTranscribed"
+    // (skip — some member already has a sibling .md, never silently discard
+    // existing work), "alreadyCombined" (outputPath already exists on disk),
+    // "pending" (would be ready, but the newest member's mtime is inside
+    // kCombineStabilityWindowSecs of "now" — the recorder may still be
+    // writing it), else "ready".
+    static QList<CombineGroup> findCombineGroups(const QVariantList &rules, const QStringList &audioPaths);
+    // True if a Queued/Active "combine" job already targets this exact
+    // outputPath — autoCombine()'s dedup check, mirrors isDownloadQueued().
+    bool isCombineQueued(const QString &outputPath) const;
+    // Builds and inserts a Queued Job for `group` at frontOfQueueInsertIndex()
+    // (or the given insertIndex, for callers that already computed a
+    // specific slot — see startJob()'s safety-net re-check). Shared by
+    // autoCombine() and startJob() so both enqueue combine jobs identically.
+    void enqueueCombineJob(const CombineGroup &group, const QUrl &vaultUrl, bool deleteOriginals,
+                            int insertIndex = -1);
+    // Safety-net re-check, called from the very top of startJob() before any
+    // state mutation — "double check the file being transcribed for parts
+    // before or after, whenever it is being transcribed" (a passive
+    // autoCombine() scan alone can miss a sibling part that appeared while
+    // this job sat Queued). Only acts on a plain transcribe-kind job (no
+    // other *Only flag/downloadTarget set) with a non-empty fileUrl; returns
+    // false immediately for anything else. Two outcomes when it does act:
+    // (1) the merged output for this exact fileUrl's filename already
+    // exists (recomputed from the filename alone, not group membership —
+    // see findCombineGroups()'s outputPath doc comment) -> redirects
+    // job.fileUrl in place and returns false, so startJob() falls through to
+    // its normal dispatch against the now-merged file; (2) fileUrl is a
+    // member of a currently-"ready" group per the last autoCombine() scan
+    // (m_combineRules/m_combineAudioPaths) -> inserts a combine Job ahead of
+    // this one (same insert-ahead-of-transcribe shape as
+    // maybeQueueDownloadJob), redirects job.fileUrl to the pending output,
+    // and recurses via startJob(index) onto the freshly-inserted combine job
+    // (safe: combine jobs are never "transcribe kind", so this check is a
+    // no-op on that recursive call) — returns true, telling startJob() NOT
+    // to also run its normal dispatch for this call.
+    bool maybeRedirectForCombine(int index);
 
     // Item P6: rebuilds m_jobStatusByPath from scratch off the current
     // m_jobs, emitting jobStatusesChanged() iff the resolved per-path status
@@ -1013,6 +1131,15 @@ private:
     // Set by loadPersistedQueue() (once per vault open) — where persistQueue()
     // writes back to. Empty (no persistence) until then.
     QUrl m_vaultUrl;
+    // Cached from the most recent autoCombine() call (Main.qml calls it on
+    // every VaultTreeModel rebuild — startup and every filesystem change) so
+    // maybeRedirectForCombine()'s per-job safety check has something to
+    // consult without TranscriptionController needing its own
+    // VaultTreeModel/AppSettings reference. May be briefly stale between
+    // rebuilds — acceptable, see maybeRedirectForCombine()'s doc comment.
+    QVariantList m_combineRules;
+    QStringList m_combineAudioPaths;
+    bool m_combineDeleteOriginals = false;
     // See isActivePaused()'s doc comment.
     bool m_activePaused = false;
     // Set right before killing the Active job specifically to soft-pause it
@@ -1071,4 +1198,18 @@ private:
         bool valid = false;
     };
     mutable SentenceCache m_sentenceCache;
+    // Item P23: readMetadata()/readTranscriptBody()/parseSentences() are now
+    // also invoked from a background QThread by loadTranscriptAsync() (see
+    // its doc comment), concurrently with the GUI thread's own synchronous
+    // calls to the same three functions (the existing liveUpdateTick-driven
+    // polling above) — this single mutex serializes all access to the three
+    // caches above so neither thread ever observes/writes a torn cache
+    // entry. One coarse lock (not per-cache) is deliberate: these functions
+    // are cheap and this is not a contended hot path (the async path only
+    // runs once per file-open, not per-tick), so the simplicity of locking
+    // each function's entire body outweighs any benefit from finer-grained
+    // locking. RECURSIVE: parseSentences() locks this itself and then calls
+    // readTranscriptBody()/readMetadata(), which each lock it again on the
+    // SAME thread — a plain QMutex would deadlock there.
+    mutable QRecursiveMutex m_transcriptCacheMutex;
 };
