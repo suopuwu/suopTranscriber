@@ -12,6 +12,10 @@ Rectangle {
     property alias model: searchProxy.sourceModel
     property TranscriptionController transcriptionController
     property url vaultPath
+    // O7: whatever MainPanel currently has open (audio file or orphaned .md,
+    // raw local path either way) — fed back down from Main.qml so the tree
+    // delegate below can render a persistent "currently open" highlight.
+    property string currentPath: ""
     signal fileActivated(string path)
     signal orphanedMdActivated(string path)
     // Item 2 (Wave E): clicking a search-result transcript snippet opens
@@ -32,12 +36,15 @@ Rectangle {
         .map(t => t.trim()).filter(t => t.length > 0)
 
     // Item 16: MainPanel's tag pill onClicked calls this (Main.qml wires
-    // sidebar as a direct id, no signal roundtrip needed) — replaces any
-    // existing filter with just this one tag and opens the search area so
-    // the active filter is visible.
+    // sidebar as a direct id, no signal roundtrip needed) — appends this tag
+    // to any existing filter (skipping a case-insensitive duplicate) and
+    // opens the search area so the active filter is visible.
     function applyTagFilter(tag) {
         sidebar.searchExpanded = true
-        sidebar.tagFilterText = tag
+        const existing = sidebar.tagFilterText.split(",").map(t => t.trim()).filter(t => t.length > 0)
+        if (!existing.some(t => t.toLowerCase() === tag.toLowerCase()))
+            existing.push(tag)
+        sidebar.tagFilterText = existing.join(", ")
     }
 
     // Item 17: suggestions for the tag fragment currently being typed (text
@@ -128,6 +135,24 @@ Rectangle {
         tagFilter: sidebar.activeTagFilters
     }
 
+    // O9: bumped on every transcribe/relabel completion so each realized
+    // delegate's metadata (label/tags/etc., read fresh off disk) can push
+    // itself up to date instead of staying frozen at delegate-creation time
+    // — see treeDelegate.refreshMetadata()/metadata below for why this is a
+    // push (explicit assignment) rather than a binding-dependency trick.
+    property int metadataRevision: 0
+    // P6: same push idiom as metadataRevision above, but for job-status
+    // (queued/active/paused/etc.) — jobStatusForPath() is a plain
+    // Q_INVOKABLE lookup, not a reactive property, so delegates need an
+    // explicit nudge (via jobStatusRevision below) whenever the controller
+    // says some path's resolved status may have changed.
+    property int jobStatusRevision: 0
+    Connections {
+        target: sidebar.transcriptionController
+        function onFinished(fileUrl, ok, error) { sidebar.metadataRevision += 1 }
+        function onJobStatusesChanged() { sidebar.jobStatusRevision += 1 }
+    }
+
     // path -> true, populated/depopulated by delegates as they realize/
     // destroy — used on-demand by "transcribe all" (item 15) to avoid
     // needing raw numeric model roles from QML for a manual tree walk.
@@ -149,6 +174,20 @@ Rectangle {
             delete sidebar.transcribedPaths[path]
     }
 
+    // P6: path -> JobStatus int (Queued/Active/Paused only — see setJobStatus),
+    // same keyed-hash idiom as untranscribedPaths/transcribedPaths above,
+    // populated by each realized delegate's own jobStatus property.
+    property var jobStatuses: ({})
+    function setJobStatus(path, status) {
+        // Only Queued(0)/Active(1)/Paused(2) are "in progress" — None(-1),
+        // Done(3) and Failed(4) aren't interesting for this indicator (see
+        // treeDelegate's existing transcribed/untranscribed status dot).
+        if (status === 0 || status === 1 || status === 2)
+            sidebar.jobStatuses[path] = status
+        else
+            delete sidebar.jobStatuses[path]
+    }
+
     // TitleBar's "⋯" menu action: unlike transcribeAllButton (which only
     // targets untranscribedPaths/bulkEligible files realized in the current
     // TreeView viewport), this queues every audio file in the vault,
@@ -163,9 +202,9 @@ Rectangle {
         if (paths.length === 0)
             return
         const urls = paths.map((p) => "file://" + p)
-        sidebar.transcriptionController.transcribeAll(urls, sidebar.vaultPath, AppSettings.lastModel, false,
+        sidebar.transcriptionController.transcribeAll(urls, sidebar.vaultPath, AppSettings.defaultModel, false,
                                                         AppSettings.autoLabelEnabled, AppSettings.restrictTagsToExisting,
-                                                        AppSettings.tagReuseBias)
+                                                        AppSettings.tagReuseBias, AppSettings.wordiness)
     }
 
     color: Qt.rgba(AppSettings.sidebarBackgroundColor.r, AppSettings.sidebarBackgroundColor.g,
@@ -192,7 +231,9 @@ Rectangle {
         anchors.right: parent.right
         // Item 17 (Wave E): a 2nd row (tag filter input) appears below the
         // search row while expanded, so this needs to grow to fit both.
-        height: sidebar.searchExpanded ? 64 : 32
+        // O12: a 3rd, variable-height row (wrapping tag-filter chips) grows
+        // this further still, only while at least one tag filter is active.
+        height: sidebar.searchExpanded ? (64 + (tagChipsFlow.visible ? tagChipsFlow.height + 4 : 0)) : 32
 
         RowLayout {
             anchors.fill: parent
@@ -222,10 +263,10 @@ Rectangle {
                         // QUrl params need the scheme or QUrl::toLocalFile()
                         // silently returns empty.
                         const urls = paths.map((p) => "file://" + p)
-                        sidebar.transcriptionController.transcribeAll(urls, sidebar.vaultPath, AppSettings.lastModel,
+                        sidebar.transcriptionController.transcribeAll(urls, sidebar.vaultPath, AppSettings.defaultModel,
                                                                         false, AppSettings.autoLabelEnabled,
                                                                         AppSettings.restrictTagsToExisting,
-                                                                        AppSettings.tagReuseBias)
+                                                                        AppSettings.tagReuseBias, AppSettings.wordiness)
                     }
                 }
                 HoverBorder {
@@ -265,7 +306,7 @@ Rectangle {
                         const urls = paths.map((p) => "file://" + p)
                         sidebar.transcriptionController.relabelAll(urls, sidebar.vaultPath,
                                                                      AppSettings.restrictTagsToExisting,
-                                                                     AppSettings.tagReuseBias)
+                                                                     AppSettings.tagReuseBias, AppSettings.wordiness)
                     }
                 }
                 HoverBorder {
@@ -458,6 +499,75 @@ Rectangle {
                 }
             }
         }
+
+        // O12: per-tag removable chips for the active tag filter, below the
+        // raw comma-separated TextField (which stays as-is for typing/
+        // autocompleting new tags, see tagSuggestionsPopup) — visual style
+        // matches MainPanel's own tagPill (a note's OWN tags, a separate
+        // feature) for consistency rather than inventing a new look.
+        Flow {
+            id: tagChipsFlow
+            width: parent.width
+            visible: sidebar.activeTagFilters.length > 0
+            spacing: 4
+
+            Repeater {
+                model: sidebar.activeTagFilters
+
+                Rectangle {
+                    id: tagChip
+                    required property string modelData
+                    required property int index
+                    radius: AppSettings.borderRadius
+                    color: tagChipHover.hovered ? "#3f3f3f" : "#333333"
+                    border.width: 1
+                    border.color: "#4a4a4a"
+                    implicitWidth: tagChipRow.implicitWidth + 10
+                    implicitHeight: tagChipRow.implicitHeight + 6
+
+                    HoverHandler {
+                        id: tagChipHover
+                    }
+
+                    Row {
+                        id: tagChipRow
+                        anchors.centerIn: parent
+                        spacing: 4
+
+                        Label {
+                            anchors.verticalCenter: parent.verticalCenter
+                            text: tagChip.modelData
+                            color: "#cccccc"
+                            font.pixelSize: 11
+                        }
+
+                        Item {
+                            id: tagChipRemove
+                            anchors.verticalCenter: parent.verticalCenter
+                            width: 12
+                            height: 12
+
+                            HoverHandler {
+                                id: tagChipRemoveHover
+                                cursorShape: Qt.PointingHandCursor
+                            }
+                            TapHandler {
+                                onTapped: {
+                                    const remaining = sidebar.activeTagFilters.filter((t, i) => i !== tagChip.index)
+                                    sidebar.tagFilterText = remaining.join(", ")
+                                }
+                            }
+                            Text {
+                                anchors.centerIn: parent
+                                text: "×"
+                                color: tagChipRemoveHover.hovered ? "white" : "#999999"
+                                font.pixelSize: 12
+                            }
+                        }
+                    }
+                }
+            }
+        }
         }
 
         // Item 17: autofill suggestions for the tag currently being typed
@@ -472,6 +582,7 @@ Rectangle {
             padding: 4
             visible: sidebar.searchExpanded && tagFilterField.activeFocus && tagSuggestionsList.model.length > 0
             focus: false
+            modal: true
             closePolicy: Popup.NoAutoClose
 
             background: Rectangle {
@@ -526,6 +637,15 @@ Rectangle {
         anchors.bottom: parent.bottom
         clip: true
 
+        // AlwaysOn (not the Basic style's default AsNeeded-but-invisible-
+        // until-active overlay): the ask was a genuinely visible scrollbar
+        // affordance, not just scroll functionality — TreeView already
+        // scrolls via wheel/drag without this. AlwaysOn keeps the Basic
+        // style's ScrollBar in its "active" opacity state permanently
+        // (see ScrollBar.qml's `state` condition), rather than only
+        // flashing in while a scroll is in progress.
+        ScrollBar.vertical: ScrollBar { policy: ScrollBar.AlwaysOn }
+
         function expandAll() {
             // Descending order: expanding a row only inserts rows
             // after it, so earlier (lower) indices stay valid.
@@ -543,6 +663,14 @@ Rectangle {
             onTriggered: {
                 if (tree.rows > 0) {
                     tree.expandAll()
+                    // P13(a): expandAll() re-inserts every previously-expanded
+                    // directory's children synchronously, but the ALREADY
+                    // pending Qt.callLater(forceLayout) from
+                    // relayoutForSearchStateChange() (triggered by the same
+                    // model reset) can fire before this point, caching stale/
+                    // partial row positions with nothing to re-trigger a
+                    // layout afterward — force one now, after expansion is done.
+                    tree.forceLayout()
                     stop()
                 }
             }
@@ -572,6 +700,16 @@ Rectangle {
             target: sidebar
             function onSearchQueryChanged() { tree.relayoutForSearchStateChange() }
             function onSearchIncludeTranscriptionsChanged() { tree.relayoutForSearchStateChange() }
+            // P13(b): searchCloseButton flips searchExpanded=false in the
+            // SAME tick it clears searchQuery — that synchronously collapses
+            // the ribbon (64->32) this TreeView is anchored directly below,
+            // while the query-changed relayout above is deferred a full
+            // event-loop turn via Qt.callLater. For at least one frame, rows
+            // would lay out against the new header geometry with stale
+            // cached heights. Call forceLayout() directly (not deferred) so
+            // this specific transition lands in the same frame as the
+            // header collapse/expand.
+            function onSearchExpandedChanged() { tree.forceLayout() }
         }
 
         delegate: Item {
@@ -608,11 +746,11 @@ Rectangle {
             // stored model/speakerDetection differs) — but this does NOT
             // gate the per-row manual Transcribe icon below, which is always
             // available so a single file can always be explicitly re-run.
-            // Bulk always requests AppSettings.lastModel with
+            // Bulk always requests AppSettings.defaultModel with
             // speakerDetection=false (see transcribeAllButton's TapHandler).
             readonly property bool bulkEligible: treeDelegate.isAudio && sidebar.transcriptionController
                 && !sidebar.transcriptionController.matchesExistingTranscription(
-                       "file://" + treeDelegate.path, AppSettings.lastModel, false)
+                       "file://" + treeDelegate.path, AppSettings.defaultModel, false)
             onBulkEligibleChanged: sidebar.setBulkEligible(treeDelegate.path, treeDelegate.bulkEligible)
 
             // Wave D item 7: inverse of bulkEligible — already-transcribed
@@ -620,21 +758,60 @@ Rectangle {
             readonly property bool relabelEligible: treeDelegate.isAudio && treeDelegate.status === 2
             onRelabelEligibleChanged: sidebar.setRelabelEligible(treeDelegate.path, treeDelegate.relabelEligible)
 
+            // P6: JobStatus int for this row's file (None/Queued/Active/
+            // Paused/Done/Failed, see TranscriptionController::JobStatus) —
+            // unlike bulkEligible/relabelEligible above this can't be a
+            // readonly binding (jobStatusForPath() is a plain Q_INVOKABLE
+            // call, not a bound property), so it's explicitly refreshed —
+            // same push idiom as refreshMetadata() below — on completion and
+            // whenever sidebar.jobStatusRevision bumps.
+            property int jobStatus: -1
+            function refreshJobStatus() {
+                treeDelegate.jobStatus = (treeDelegate.isAudio && sidebar.transcriptionController)
+                    ? sidebar.transcriptionController.jobStatusForPath(treeDelegate.path) : -1
+            }
+            onJobStatusChanged: sidebar.setJobStatus(treeDelegate.path, treeDelegate.jobStatus)
+            Connections {
+                target: sidebar
+                function onJobStatusRevisionChanged() { treeDelegate.refreshJobStatus() }
+            }
+
             Component.onCompleted: {
                 sidebar.setBulkEligible(treeDelegate.path, treeDelegate.bulkEligible)
                 sidebar.setRelabelEligible(treeDelegate.path, treeDelegate.relabelEligible)
+                treeDelegate.refreshMetadata()
+                treeDelegate.refreshJobStatus()
             }
             Component.onDestruction: {
                 sidebar.setBulkEligible(treeDelegate.path, false)
                 sidebar.setRelabelEligible(treeDelegate.path, false)
+                sidebar.setJobStatus(treeDelegate.path, -1)
             }
 
+            // O9: was a pure readonly binding (isAudio/isOrphanedMd/
+            // transcriptionController only) — none of those change on
+            // relabel/transcribe completion, so it froze at delegate
+            // creation and only "caught up" whenever an unrelated vault
+            // event forced VaultTreeModel::rebuild() (recreating every
+            // delegate from scratch). A dummy-property read inside this
+            // binding to force re-evaluation on completion would risk being
+            // silently dropped by AOT (qmlcachegen) if the read result is
+            // otherwise unused — see a prior bug in this exact codebase.
+            // Instead this is now a plain property, explicitly (re)assigned
+            // by refreshMetadata() — a genuine push, not a binding trick.
             // readMetadata() resolves <completeBaseName>.md regardless of
             // whether the given path is the audio file or the .md itself
             // (self-referential for an orphaned .md), so this covers both.
-            readonly property var metadata: ((treeDelegate.isAudio || treeDelegate.isOrphanedMd)
-                                              && sidebar.transcriptionController)
-                ? sidebar.transcriptionController.readMetadata("file://" + treeDelegate.path) : ({})
+            property var metadata: ({})
+            function refreshMetadata() {
+                treeDelegate.metadata = ((treeDelegate.isAudio || treeDelegate.isOrphanedMd)
+                                          && sidebar.transcriptionController)
+                    ? sidebar.transcriptionController.readMetadata("file://" + treeDelegate.path) : ({})
+            }
+            Connections {
+                target: sidebar
+                function onMetadataRevisionChanged() { treeDelegate.refreshMetadata() }
+            }
 
             // Item 9: ellipsis-bounded transcript snippet around the first
             // match, shown only when there's an active query, transcript
@@ -645,6 +822,13 @@ Rectangle {
             readonly property string snippetText: (sidebar.searchQuery !== "" && treeDelegate.cleanedBody !== "")
                 ? sidebar.transcriptSnippet(treeDelegate.cleanedBody, sidebar.searchQuery, 40) : ""
             readonly property bool showSnippet: treeDelegate.snippetText !== ""
+            // Item 8 fix: showSnippet can also flip because transcriptBody
+            // changed independently of sidebar.searchQuery/
+            // searchIncludeTranscriptions (e.g. a transcript streaming in
+            // live while search is already active) — neither of tree's two
+            // Connections handlers above fire for that, leaving this row's
+            // cached TableView Y stale. Trigger the same relayout directly.
+            onShowSnippetChanged: tree.relayoutForSearchStateChange()
 
             opacity: treeDelegate.matchesSearch ? 1 : 0.3
 
@@ -669,6 +853,19 @@ Rectangle {
                 anchors.fill: parent
                 anchors.margins: 1
                 active: rowHover.hovered
+            }
+
+            // O7: persistent highlight for whatever MainPanel currently has
+            // open, distinct from HoverBorder above (which is hover-only and
+            // white) so both can be visible at once without being confused.
+            Rectangle {
+                anchors.fill: parent
+                anchors.margins: 1
+                visible: treeDelegate.path === sidebar.currentPath
+                color: AppSettings.sidebarSelectionColor
+                radius: AppSettings.borderRadius
+                border.width: 1
+                border.color: AppSettings.sidebarSelectionBorderColor
             }
 
             Column {
@@ -701,6 +898,32 @@ Rectangle {
                         height: 8
                         radius: 4
                         color: treeDelegate.status === 2 ? "#2ecc71" : (treeDelegate.isOrphanedMd ? "#3498db" : "#f1c40f")
+                    }
+
+                    // P6: separate small dot for an in-progress transcription
+                    // job (Queued/Active/Paused) — deliberately distinct from
+                    // the transcribed/untranscribed dot above rather than
+                    // overloading it, since a Done/Failed job alongside an
+                    // already-transcribed file would be redundant to show and
+                    // this dot only ever appears for the 3 "in progress"
+                    // statuses (see sidebar.setJobStatus's gating).
+                    Rectangle {
+                        id: jobStatusDot
+                        anchors.verticalCenter: parent.verticalCenter
+                        visible: treeDelegate.isAudio && treeDelegate.jobStatus >= 0 && treeDelegate.jobStatus <= 2
+                        width: 6
+                        height: 6
+                        radius: 3
+                        color: treeDelegate.jobStatus === 1 ? "#3498db"
+                               : (treeDelegate.jobStatus === 0 ? "#f39c12" : "#95a5a6")
+
+                        HoverHandler {
+                            id: jobStatusDotHover
+                        }
+                        ToolTip.visible: jobStatusDotHover.hovered
+                        ToolTip.text: treeDelegate.jobStatus === 1 ? qsTr("Transcribing…")
+                                      : (treeDelegate.jobStatus === 0 ? qsTr("Queued") : qsTr("Paused"))
+                        ToolTip.delay: 500
                     }
 
                     Text {
@@ -797,9 +1020,9 @@ Rectangle {
                 TapHandler {
                     enabled: rowTranscribeButton.enabled
                     onTapped: sidebar.transcriptionController.transcribe(
-                                  "file://" + treeDelegate.path, sidebar.vaultPath, AppSettings.lastModel, false,
+                                  "file://" + treeDelegate.path, sidebar.vaultPath, AppSettings.defaultModel, false,
                                   AppSettings.autoLabelEnabled, AppSettings.restrictTagsToExisting,
-                                  AppSettings.tagReuseBias)
+                                  AppSettings.tagReuseBias, AppSettings.wordiness)
                 }
                 HoverBorder {
                     anchors.fill: parent
@@ -845,7 +1068,7 @@ Rectangle {
                     enabled: rowRelabelButton.enabled
                     onTapped: sidebar.transcriptionController.relabel("file://" + treeDelegate.path, sidebar.vaultPath,
                                                                        AppSettings.restrictTagsToExisting,
-                                                                       AppSettings.tagReuseBias)
+                                                                       AppSettings.tagReuseBias, AppSettings.wordiness)
                 }
                 HoverBorder {
                     anchors.fill: parent
@@ -859,5 +1082,119 @@ Rectangle {
                 }
             }
         }
+    }
+
+    // Chrome/Firefox-style middle-click autoscroll for the file tree —
+    // same two-gesture pattern (quick click arms free-scroll; press-drag-
+    // release disarms on release) as MainPanel's transcript-view
+    // middleDragScrollArea, adapted to TreeView (itself the Flickable, so
+    // no .contentItem indirection is needed the way ScrollView requires).
+    //
+    // z is the whole story here, confirmed empirically (an offscreen
+    // QTest::mouseMove repro against Qt 6.11's actual cursor resolution,
+    // since this was wrong twice from reasoning alone): Qt Quick's cursor
+    // resolution is a pure top-down PAINT-ORDER scan for "whichever item is
+    // topmost at this point" — NOT gated by hoverEnabled, acceptedButtons,
+    // or even whether that topmost item has an explicit cursorShape at all.
+    // An idle item sitting above a row, even fully inert (hoverEnabled:
+    // false, no cursorShape bound), still wins and shows the plain arrow
+    // instead of falling through to the row's HoverHandler cursor — and
+    // separately, an idle item with hoverEnabled: true also blocks hover
+    // EVENT delivery itself to the row below (a different mechanism; that
+    // part broke this area's HoverBorder highlight too, until an earlier
+    // fix made hoverEnabled conditional).
+    //
+    // So this item now stays BELOW tree (z negative) while idle — proven by
+    // the same repro that a below-tree MouseArea still receives the
+    // qualifying middle-button press (TreeView's delegates only claim
+    // LeftButton via TapHandler, so MiddleButton falls through to whatever
+    // is underneath, no special fallthrough trick needed) — and only rises
+    // above tree (z positive) once actually armed, which is exactly when it
+    // SHOULD own both the cursor (SizeAll/SizeVer) and click-to-cancel
+    // priority over row clicks, per Chrome's own convention.
+    MouseArea {
+        id: middleDragScrollArea
+        anchors.top: ribbon.bottom
+        anchors.left: parent.left
+        anchors.right: parent.right
+        anchors.bottom: parent.bottom
+        z: middleDragScrollArea.armed ? 1 : -1
+        acceptedButtons: middleDragScrollArea.armed
+                         ? (Qt.LeftButton | Qt.MiddleButton | Qt.RightButton)
+                         : Qt.MiddleButton
+        // hoverEnabled only while armed: idle doesn't need it (arming only
+        // needs onPressed, which fires regardless of hoverEnabled), and
+        // leaving it true while idle would still shadow the row's own hover
+        // EVENT delivery (see comment above) even though z now keeps the
+        // CURSOR correct either way. Gesture 2's held-button drag still
+        // delivers onPositionChanged with hoverEnabled false (an active
+        // press grab guarantees that); gesture 1's free-scroll-without-
+        // holding is the one case that needs hover tracking, and that only
+        // ever runs once armed, when this binding has already flipped true.
+        hoverEnabled: middleDragScrollArea.armed
+        cursorShape: {
+            if (!middleDragScrollArea.armed)
+                return Qt.ArrowCursor
+            const dy = Math.abs(middleDragScrollArea.currentY - middleDragScrollArea.originY)
+            return dy <= middleDragScrollArea.deadzone ? Qt.SizeAllCursor : Qt.SizeVerCursor
+        }
+
+        property bool armed: false
+        property real originY: 0
+        property real currentY: 0
+        property bool buttonHeld: false
+        property bool draggedWhileHeld: false
+        readonly property int deadzone: 8
+
+        onPressed: (mouse) => {
+            if (middleDragScrollArea.armed) {
+                middleDragScrollArea.armed = false
+                return
+            }
+            middleDragScrollArea.buttonHeld = true
+            middleDragScrollArea.draggedWhileHeld = false
+            middleDragScrollArea.armed = true
+            const p = middleDragScrollArea.mapToItem(tree, mouse.x, mouse.y)
+            middleDragScrollArea.originY = p.y
+            middleDragScrollArea.currentY = p.y
+        }
+        onPositionChanged: (mouse) => {
+            const p = middleDragScrollArea.mapToItem(tree, mouse.x, mouse.y)
+            middleDragScrollArea.currentY = p.y
+            if (middleDragScrollArea.buttonHeld && !middleDragScrollArea.draggedWhileHeld
+                    && Math.abs(middleDragScrollArea.currentY - middleDragScrollArea.originY) > middleDragScrollArea.deadzone) {
+                middleDragScrollArea.draggedWhileHeld = true
+            }
+        }
+        onReleased: (mouse) => {
+            if (mouse.button !== Qt.MiddleButton)
+                return
+            middleDragScrollArea.buttonHeld = false
+            if (middleDragScrollArea.draggedWhileHeld)
+                middleDragScrollArea.armed = false
+            // else: real click, no drag — gesture 1 keeps running.
+        }
+
+        Timer {
+            interval: 16
+            repeat: true
+            running: middleDragScrollArea.armed
+            onTriggered: {
+                const dy = middleDragScrollArea.currentY - middleDragScrollArea.originY
+                const deadzone = middleDragScrollArea.deadzone
+                if (Math.abs(dy) <= deadzone)
+                    return
+                const beyond = dy - Math.sign(dy) * deadzone
+                const speed = Math.sign(beyond) * beyond * beyond * 0.002
+                const maxY = Math.max(0, tree.contentHeight - tree.height)
+                tree.contentY = Math.max(0, Math.min(maxY, tree.contentY + speed))
+            }
+        }
+    }
+
+    Shortcut {
+        sequence: "Escape"
+        enabled: middleDragScrollArea.armed
+        onActivated: middleDragScrollArea.armed = false
     }
 }

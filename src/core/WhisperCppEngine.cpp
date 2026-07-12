@@ -1,8 +1,52 @@
 #include "WhisperCppEngine.h"
 
+#include <QRegularExpression>
+
+#include <cstdio>
+
 #include <whisper.h>
 
 namespace {
+
+// See WhisperCppEngine::activeBackendName()'s doc comment for why this is
+// process-wide storage rather than an instance member.
+QString &activeBackendNameStorage()
+{
+    static QString name;
+    return name;
+}
+
+// Registered via whisper_log_set() before every model load (see the
+// constructor below) — whisper.cpp logs the backend it picked as
+// "<func>: using <DeviceName><index> backend\n" (see
+// whisper_backend_init_gpu() in third_party/whisper.cpp/src/whisper.cpp),
+// where <DeviceName> is ggml_backend_dev_name()'s own naming ("CUDA0",
+// "Vulkan0", ...) — the trailing device-index digit is stripped since this
+// app only ever cares which BACKEND was picked, not which device ordinal.
+// Every other log line (there are many, at every log level) simply doesn't
+// match and is left alone.
+//
+// Also replicates whisper_log_callback_default()'s own behavior (fputs to
+// stderr, skipping DEBUG-level lines) — registering a custom callback via
+// whisper_log_set() REPLACES that default outright, and this app's existing
+// tests/dev workflow already rely on whisper.cpp's load/backend noise
+// reaching stderr (see tst_engine_contract.cpp's "expected noise" comments)
+// — this callback must not silently swallow it.
+void onWhisperLog(ggml_log_level level, const char *text, void *userData)
+{
+    Q_UNUSED(userData);
+    if (!text)
+        return;
+    static const QRegularExpression pattern(QStringLiteral("using ([A-Za-z]+)\\d* backend"));
+    const QRegularExpressionMatch m = pattern.match(QString::fromUtf8(text));
+    if (m.hasMatch())
+        activeBackendNameStorage() = m.captured(1);
+
+    if (level != GGML_LOG_LEVEL_DEBUG) {
+        std::fputs(text, stderr);
+        std::fflush(stderr);
+    }
+}
 
 struct CallbackContext {
     const ProgressCallback *onProgress;
@@ -48,8 +92,24 @@ bool onAbortCheck(void *userData)
 
 WhisperCppEngine::WhisperCppEngine(const QString &modelPath)
 {
+    // Must be set BEFORE whisper_init_from_file_with_params() — that's the
+    // one call that logs the "using X backend" line this engine parses (see
+    // onWhisperLog's doc comment).
+    whisper_log_set(onWhisperLog, nullptr);
     whisper_context_params cparams = whisper_context_default_params();
     m_ctx = whisper_init_from_file_with_params(modelPath.toUtf8().constData(), cparams);
+}
+
+QString WhisperCppEngine::activeBackendName() const
+{
+    if (!m_ctx)
+        return QString(); // no model has loaded yet — unknown, not "CPU"
+    const QString parsed = activeBackendNameStorage();
+    // No GPU line ever fired for a successfully loaded model — whisper.cpp
+    // only logs "using X backend" for the GPU/ACCEL path (see
+    // whisper_backend_init_gpu()); the CPU backend it always falls back to
+    // is added silently, with no equivalent log line of its own.
+    return parsed.isEmpty() ? QStringLiteral("CPU") : parsed;
 }
 
 WhisperCppEngine::~WhisperCppEngine()

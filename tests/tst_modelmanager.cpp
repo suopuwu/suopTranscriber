@@ -55,13 +55,14 @@ class TstModelManager : public QObject
 private slots:
     // --- Model catalog -----------------------------------------------------
 
-    // The dropdown offers exactly the four documented English models, ordered
-    // fastest/smallest to slowest/most-accurate, with the documented ggml file
-    // names (which double as the on-disk names under .transcriber/models/).
-    void availableModels_areExactlyTheFourDocumentedEnglishModels_inSpeedOrder()
+    // The dropdown offers exactly the four documented English models plus
+    // the one multilingual large-v3 tier (item O31), ordered fastest/
+    // smallest to slowest/most-accurate, with the documented ggml file names
+    // (which double as the on-disk names under .transcriber/models/).
+    void availableModels_areExactlyTheFiveDocumentedModels_inSpeedOrder()
     {
         const auto &models = ModelManager::availableModels();
-        QCOMPARE(models.size(), size_t(4));
+        QCOMPARE(models.size(), size_t(5));
 
         QCOMPARE(models[0].id, QStringLiteral("tiny.en"));
         QCOMPARE(models[0].fileName, QStringLiteral("ggml-tiny.en.bin"));
@@ -71,10 +72,17 @@ private slots:
         QCOMPARE(models[2].fileName, QStringLiteral("ggml-small.en.bin"));
         QCOMPARE(models[3].id, QStringLiteral("medium.en"));
         QCOMPARE(models[3].fileName, QStringLiteral("ggml-medium.en.bin"));
+        QCOMPARE(models[4].id, QStringLiteral("large-v3"));
+        QCOMPARE(models[4].fileName, QStringLiteral("ggml-large-v3.bin"));
 
         // Every entry has a human-readable label for the model dropdown.
         for (const ModelManager::ModelInfo &info : models)
             QVERIFY2(!info.label.isEmpty(), qPrintable(info.id + " has no label"));
+
+        // No English-only "large" ggml model exists upstream (see
+        // ModelManager.cpp) — large-v3 must not claim "(English)" the way
+        // the other four tiers do.
+        QVERIFY(!models[4].label.contains(QStringLiteral("(English)")));
     }
 
     // The documented default model is base.en ("balanced"), and it is one of

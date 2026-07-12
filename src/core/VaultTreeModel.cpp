@@ -71,13 +71,17 @@ void VaultTreeModel::rebuild()
         QDir dir(rootPath);
         const QFileInfoList entries = dir.entryInfoList(QDir::AllEntries | QDir::NoDotAndDotDot, QDir::DirsFirst | QDir::Name);
 
-        // First pass: collect audio base names so the second pass can tell
-        // whether a .md file is orphaned (no matching audio sibling) without
-        // re-scanning the directory.
+        // First pass: collect audio FULL filenames (extension included) so
+        // the second pass can tell whether a .md file is orphaned (no
+        // matching audio sibling) without re-scanning the directory. Item P7:
+        // the sidecar convention is <fileName>.md (the full filename, not
+        // just the stripped stem) — otherwise two audio files sharing a stem
+        // with different extensions (e.g. "meeting.wav" + "meeting.mp3")
+        // would collide on one "meeting.md".
         QSet<QString> audioBaseNames;
         for (const QFileInfo &entry : entries) {
             if (!entry.isDir() && isAudioFile(entry))
-                audioBaseNames.insert(entry.completeBaseName());
+                audioBaseNames.insert(entry.fileName());
         }
 
         for (const QFileInfo &entry : entries) {
@@ -91,7 +95,7 @@ void VaultTreeModel::rebuild()
                 leaf->name = entry.fileName();
                 leaf->path = entry.absoluteFilePath();
                 leaf->isAudio = true;
-                const QString mdPath = entry.absolutePath() + '/' + entry.completeBaseName() + ".md";
+                const QString mdPath = entry.absolutePath() + '/' + entry.fileName() + ".md";
                 leaf->status = QFileInfo::exists(mdPath) ? TranscribedStatus : UntranscribedStatus;
                 leaf->parent = m_root.get();
                 m_root->children.push_back(std::move(leaf));
@@ -129,13 +133,13 @@ std::unique_ptr<VaultTreeModel::Node> VaultTreeModel::scanDirectory(const QStrin
     QDir dir(dirPath);
     const QFileInfoList entries = dir.entryInfoList(QDir::AllEntries | QDir::NoDotAndDotDot, QDir::DirsFirst | QDir::Name);
 
-    // First pass: collect audio base names so the second pass can tell
-    // whether a .md file is orphaned (no matching audio sibling) without
-    // re-scanning the directory.
+    // First pass: collect audio FULL filenames (extension included) — see
+    // rebuild()'s identical first pass for why (Item P7: sidecar convention
+    // is <fileName>.md, not <completeBaseName>.md).
     QSet<QString> audioBaseNames;
     for (const QFileInfo &entry : entries) {
         if (!entry.isDir() && isAudioFile(entry))
-            audioBaseNames.insert(entry.completeBaseName());
+            audioBaseNames.insert(entry.fileName());
     }
 
     for (const QFileInfo &entry : entries) {
@@ -149,7 +153,7 @@ std::unique_ptr<VaultTreeModel::Node> VaultTreeModel::scanDirectory(const QStrin
             leaf->name = entry.fileName();
             leaf->path = entry.absoluteFilePath();
             leaf->isAudio = true;
-            const QString mdPath = entry.absolutePath() + '/' + entry.completeBaseName() + ".md";
+            const QString mdPath = entry.absolutePath() + '/' + entry.fileName() + ".md";
             leaf->status = QFileInfo::exists(mdPath) ? TranscribedStatus : UntranscribedStatus;
             leaf->parent = node.get();
             node->children.push_back(std::move(leaf));
@@ -177,8 +181,11 @@ QString VaultTreeModel::sidecarMdPath(const Node *node)
     if (node->isOrphanedMd)
         return node->path;
     if (node->isAudio) {
+        // Item P7: derived from the FULL filename (extension included), not
+        // just the stripped stem — otherwise two audio files sharing a stem
+        // with different extensions would collide on one sidecar .md.
         const QFileInfo info(node->path);
-        return info.absolutePath() + '/' + info.completeBaseName() + ".md";
+        return info.absolutePath() + '/' + info.fileName() + ".md";
     }
     return {};
 }
@@ -206,9 +213,19 @@ QString VaultTreeModel::frontmatterField(const QString &mdPath, const QString &k
     return {};
 }
 
-// Mirrors TranscriptionController::readTranscriptBody().
-QString VaultTreeModel::transcriptBody(const QString &mdPath)
+// Mirrors TranscriptionController::readTranscriptBody(). Item P12: cached
+// per mdPath, invalidated purely by mtime+size (see m_transcriptBodyCache's
+// doc comment) rather than by any file-change signal.
+QString VaultTreeModel::transcriptBody(const QString &mdPath) const
 {
+    const QFileInfo info(mdPath);
+    const qint64 mtimeMs = info.lastModified().toMSecsSinceEpoch();
+    const qint64 size = info.size();
+
+    const auto cached = m_transcriptBodyCache.constFind(mdPath);
+    if (cached != m_transcriptBodyCache.constEnd() && cached->mtimeMs == mtimeMs && cached->size == size)
+        return cached->body;
+
     QFile mdFile(mdPath);
     if (!mdFile.open(QIODevice::ReadOnly | QIODevice::Text))
         return {};
@@ -221,7 +238,9 @@ QString VaultTreeModel::transcriptBody(const QString &mdPath)
     while (!(line = in.readLine()).isNull() && line != QStringLiteral("---")) {
         // skip frontmatter lines
     }
-    return in.readAll();
+    const QString body = in.readAll();
+    m_transcriptBodyCache[mdPath] = CachedBody{mtimeMs, size, body};
+    return body;
 }
 
 VaultTreeModel::Node *VaultTreeModel::nodeFromIndex(const QModelIndex &index) const
@@ -359,7 +378,6 @@ bool VaultTreeModel::renameFile(const QUrl &fileUrl, const QString &newBaseName,
         return fail(QStringLiteral("File does not exist."));
 
     const QString dirPath = info.absolutePath();
-    const QString baseName = info.completeBaseName();
 
     // Determine which file(s) participate in the rename: an audio file (and
     // its sibling .md, if present) or a standalone orphaned .md file.
@@ -370,7 +388,9 @@ bool VaultTreeModel::renameFile(const QUrl &fileUrl, const QString &newBaseName,
     if (isAudioFile(info)) {
         audioOldPath = info.absoluteFilePath();
         audioExt = info.suffix();
-        const QString candidateMd = dirPath + '/' + baseName + ".md";
+        // Item P7: the sidecar's name is the FULL audio filename + ".md",
+        // not just the stripped stem — see sidecarMdPath()'s doc comment.
+        const QString candidateMd = dirPath + '/' + info.fileName() + ".md";
         if (QFileInfo::exists(candidateMd))
             mdOldPath = candidateMd;
     } else if (info.suffix().toLower() == "md") {
@@ -380,7 +400,16 @@ bool VaultTreeModel::renameFile(const QUrl &fileUrl, const QString &newBaseName,
     }
 
     const QString newAudioPath = audioOldPath.isEmpty() ? QString() : dirPath + '/' + trimmed + '.' + audioExt;
-    const QString newMdPath = mdOldPath.isEmpty() ? QString() : dirPath + '/' + trimmed + ".md";
+    // When renaming an audio file with an existing sidecar, the new sidecar
+    // name must track the new FULL audio filename (stem+ext+".md"), matching
+    // the fileName()+".md" convention above — NOT just trimmed+".md", which
+    // would silently revert to the old (collision-prone) stripped-stem
+    // naming. A standalone orphaned .md being renamed directly (no audio
+    // file involved) keeps the simple trimmed+".md" form, since there's no
+    // audio extension to fold in.
+    const QString newMdPath = mdOldPath.isEmpty()
+        ? QString()
+        : (audioOldPath.isEmpty() ? dirPath + '/' + trimmed + ".md" : newAudioPath + ".md");
 
     if ((!newAudioPath.isEmpty() && QFileInfo::exists(newAudioPath))
         || (!newMdPath.isEmpty() && QFileInfo::exists(newMdPath))) {
@@ -401,6 +430,36 @@ bool VaultTreeModel::renameFile(const QUrl &fileUrl, const QString &newBaseName,
             return fail(QStringLiteral("Failed to rename markdown file; changes rolled back."));
         }
     }
+
+    rebuild();
+    return true;
+}
+
+bool VaultTreeModel::importFile(const QUrl &fileUrl, QString *errorOut)
+{
+    auto fail = [&](const QString &msg) {
+        if (errorOut)
+            *errorOut = msg;
+        return false;
+    };
+
+    const QString localPath = vaultLocalPath();
+    if (localPath.isEmpty())
+        return fail(QStringLiteral("No vault is open."));
+
+    const QString sourcePath = fileUrl.toLocalFile();
+    const QFileInfo sourceInfo(sourcePath);
+    if (!sourceInfo.exists() || !sourceInfo.isFile())
+        return fail(QStringLiteral("Not a file: %1").arg(sourceInfo.fileName()));
+    if (!isAudioFile(sourceInfo))
+        return fail(QStringLiteral("Not a recognized audio file: %1").arg(sourceInfo.fileName()));
+
+    const QString destPath = localPath + '/' + sourceInfo.fileName();
+    if (QFileInfo::exists(destPath))
+        return fail(QStringLiteral("\"%1\" already exists in the vault.").arg(sourceInfo.fileName()));
+
+    if (!QFile::copy(sourcePath, destPath))
+        return fail(QStringLiteral("Failed to copy \"%1\" into the vault.").arg(sourceInfo.fileName()));
 
     rebuild();
     return true;

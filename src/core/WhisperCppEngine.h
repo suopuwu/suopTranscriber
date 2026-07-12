@@ -24,6 +24,20 @@ public:
                                      const SegmentCallback &onSegment,
                                      const AbortCallback &onAbort = {}) override;
 
+    // Item O35: "CUDA"/"Vulkan"/"CPU", parsed out of whisper.cpp's own
+    // "using %s backend" log line (see the .cpp's whisper_log_set()
+    // capture) — empty until the first model load. Backed by process-wide
+    // storage rather than a plain instance member: whisper_log_set()
+    // registers a GLOBAL ggml log callback (ggml_log_set), shared with
+    // llama.cpp's LabelingEngine (both link the same vendored ggml target —
+    // see CMakeLists.txt), so binding the callback to THIS instance's own
+    // member address would leave a dangling callback pointer the moment
+    // this engine is destroyed while that global registration is still
+    // live — this app resets/recreates its engines constantly (see
+    // TranscriptionWorker's GPU-memory-hygiene evictions), and any later
+    // ggml/llama.cpp log call would then write through freed memory.
+    QString activeBackendName() const override;
+
 private:
     whisper_context *m_ctx = nullptr;
 };

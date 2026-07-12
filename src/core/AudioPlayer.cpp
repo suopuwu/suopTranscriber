@@ -1,5 +1,7 @@
 #include "AudioPlayer.h"
 
+#include <QAudioDevice>
+
 AudioPlayer::AudioPlayer(QObject *parent)
     : QObject(parent)
 {
@@ -9,6 +11,12 @@ AudioPlayer::AudioPlayer(QObject *parent)
     connect(&m_player, &QMediaPlayer::positionChanged, this, &AudioPlayer::positionChanged);
     connect(&m_player, &QMediaPlayer::durationChanged, this, &AudioPlayer::durationChanged);
     connect(&m_player, &QMediaPlayer::playbackStateChanged, this, &AudioPlayer::playingChanged);
+
+    // Follow the system default output device live (e.g. unplugging headphones
+    // mid-playback) rather than only picking it up at the next play() call.
+    connect(&m_devices, &QMediaDevices::audioOutputsChanged, this, [this] {
+        m_audioOutput.setDevice(QMediaDevices::defaultAudioOutput());
+    });
 }
 
 QUrl AudioPlayer::source() const

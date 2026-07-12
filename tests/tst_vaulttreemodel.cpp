@@ -79,14 +79,15 @@ class TstVaultTreeModel : public QObject
 private slots:
     // --- Sibling .md convention (CLAUDE.md: "sibling .md = transcribed") ----
 
-    // CLAUDE.md: an audio file with a sibling <completeBaseName>.md has been
-    // transcribed — shown with the green indicator (TranscribedStatus = 2).
+    // CLAUDE.md: an audio file with a sibling <fileName>.md (the FULL
+    // filename, extension included) has been transcribed — shown with the
+    // green indicator (TranscribedStatus = 2).
     void audioWithSiblingMd_isTranscribed_green()
     {
         QTemporaryDir vault;
         QVERIFY(vault.isValid());
         QVERIFY(touch(vault.filePath("meeting.mp3")));
-        QVERIFY(touch(vault.filePath("meeting.md")));
+        QVERIFY(touch(vault.filePath("meeting.mp3.md")));
 
         VaultTreeModel model;
         model.setVaultPath(QUrl::fromLocalFile(vault.path()));
@@ -116,9 +117,10 @@ private slots:
                  int(VaultTreeModel::UntranscribedStatus));
     }
 
-    // The sibling match is on completeBaseName: "a.b.mp3" pairs with "a.b.md",
-    // not "a.md".
-    void siblingMatch_usesCompleteBaseName()
+    // The sibling match is on the FULL filename (fileName(), extension
+    // included): "interview.part1.mp3" pairs with "interview.part1.mp3.md",
+    // not "interview.part1.md" or "interview.md".
+    void siblingMatch_usesFullFileName()
     {
         QTemporaryDir vault;
         QVERIFY(vault.isValid());
@@ -132,10 +134,32 @@ private slots:
         QVERIFY(audio.isValid());
         QCOMPARE(model.data(audio, roleByName(model, "status")).toInt(),
                  int(VaultTreeModel::UntranscribedStatus));
-        // interview.md matches no audio base name, so it is an orphan node.
+        // interview.md matches no audio's full filename, so it is an orphan node.
         const QModelIndex md = findByName(model, "interview.md");
         QVERIFY(md.isValid());
         QCOMPARE(model.data(md, roleByName(model, "isOrphanedMd")).toBool(), true);
+    }
+
+    // Item P7 regression: two audio files sharing the same stem but
+    // different extensions must NOT collide on one sidecar .md — each gets
+    // its own sidecar named from its FULL filename (stem+ext+".md"), so
+    // "meeting.wav" and "meeting.mp3" resolve to distinct "meeting.wav.md" /
+    // "meeting.mp3.md" instead of both reading/writing the same "meeting.md".
+    void sameStemDifferentExtension_getDistinctSidecars_noCollision()
+    {
+        QTemporaryDir vault;
+        QVERIFY(vault.isValid());
+        QVERIFY(touch(vault.filePath("meeting.wav")));
+        QVERIFY(touch(vault.filePath("meeting.wav.md"))); // only the .wav file is transcribed
+        QVERIFY(touch(vault.filePath("meeting.mp3"))); // same stem, untranscribed
+
+        VaultTreeModel model;
+        model.setVaultPath(QUrl::fromLocalFile(vault.path()));
+
+        QCOMPARE(statusOf(model, "meeting.wav"), int(VaultTreeModel::TranscribedStatus));
+        QCOMPARE(statusOf(model, "meeting.mp3"), int(VaultTreeModel::UntranscribedStatus));
+        // meeting.wav.md is the wav's sidecar, not a standalone orphaned node.
+        QVERIFY(!findByName(model, "meeting.wav.md").isValid());
     }
 
     // --- Audio file recognition ---------------------------------------------
@@ -224,14 +248,14 @@ private slots:
         QTemporaryDir vault;
         QVERIFY(vault.isValid());
         QVERIFY(touch(vault.filePath("lecture.wav")));
-        QVERIFY(touch(vault.filePath("lecture.md")));
+        QVERIFY(touch(vault.filePath("lecture.wav.md")));
 
         VaultTreeModel model;
         model.setVaultPath(QUrl::fromLocalFile(vault.path()));
 
         QCOMPARE(model.rowCount(), 1); // only the audio node
         QVERIFY(findByName(model, "lecture.wav").isValid());
-        QVERIFY(!findByName(model, "lecture.md").isValid());
+        QVERIFY(!findByName(model, "lecture.wav.md").isValid());
     }
 
     // --- Directory pruning (DESIGN.md: dirs with no relevant content are hidden)
@@ -315,7 +339,7 @@ private slots:
         QCOMPARE(statusOf(model, "session.opus"), int(VaultTreeModel::UntranscribedStatus));
 
         // Simulate a finished transcription: the sibling .md appears on disk.
-        QVERIFY(touch(vault.filePath("session.md"), "[00:00 - 00:01] hello\n"));
+        QVERIFY(touch(vault.filePath("session.opus.md"), "[00:00 - 00:01] hello\n"));
 
         QTRY_COMPARE_WITH_TIMEOUT(statusOf(model, "session.opus"),
                                   int(VaultTreeModel::TranscribedStatus), 10000);
@@ -330,7 +354,7 @@ private slots:
         QTemporaryDir vault;
         QVERIFY(vault.isValid());
         QVERIFY(touch(vault.filePath("old name.m4a")));
-        QVERIFY(touch(vault.filePath("old name.md"), "transcript"));
+        QVERIFY(touch(vault.filePath("old name.m4a.md"), "transcript"));
 
         VaultTreeModel model;
         model.setVaultPath(QUrl::fromLocalFile(vault.path()));
@@ -341,9 +365,9 @@ private slots:
         QVERIFY2(error.isEmpty(), qPrintable(error));
 
         QVERIFY(QFileInfo::exists(vault.filePath("new name.m4a")));
-        QVERIFY(QFileInfo::exists(vault.filePath("new name.md")));
+        QVERIFY(QFileInfo::exists(vault.filePath("new name.m4a.md")));
         QVERIFY(!QFileInfo::exists(vault.filePath("old name.m4a")));
-        QVERIFY(!QFileInfo::exists(vault.filePath("old name.md")));
+        QVERIFY(!QFileInfo::exists(vault.filePath("old name.m4a.md")));
 
         // The model rebuilds after a rename, so the tree reflects the new pair.
         QCOMPARE(statusOf(model, "new name.m4a"), int(VaultTreeModel::TranscribedStatus));
@@ -401,9 +425,9 @@ private slots:
         QTemporaryDir vault;
         QVERIFY(vault.isValid());
         QVERIFY(touch(vault.filePath("a.mp3")));
-        QVERIFY(touch(vault.filePath("a.md"), "a transcript"));
+        QVERIFY(touch(vault.filePath("a.mp3.md"), "a transcript"));
         QVERIFY(touch(vault.filePath("b.mp3")));
-        QVERIFY(touch(vault.filePath("c.md"), "c transcript"));
+        QVERIFY(touch(vault.filePath("c.mp3.md"), "c transcript"));
 
         VaultTreeModel model;
         model.setVaultPath(QUrl::fromLocalFile(vault.path()));
@@ -413,14 +437,14 @@ private slots:
         QVERIFY(!model.renameFile(QUrl::fromLocalFile(vault.filePath("a.mp3")), "b", &error));
         QVERIFY(!error.isEmpty());
 
-        // Markdown target collision: a -> c; c.mp3 is free but c.md exists.
+        // Markdown target collision: a -> c; c.mp3 is free but c.mp3.md exists.
         error.clear();
         QVERIFY(!model.renameFile(QUrl::fromLocalFile(vault.filePath("a.mp3")), "c", &error));
         QVERIFY(!error.isEmpty());
 
         // Nothing changed on disk in either failed attempt.
         QVERIFY(QFileInfo::exists(vault.filePath("a.mp3")));
-        QVERIFY(QFileInfo::exists(vault.filePath("a.md")));
+        QVERIFY(QFileInfo::exists(vault.filePath("a.mp3.md")));
         QVERIFY(!QFileInfo::exists(vault.filePath("c.mp3")));
     }
 
@@ -447,6 +471,92 @@ private slots:
         QCOMPARE(model.data(idx, roleByName(model, "isOrphanedMd")).toBool(), true);
     }
 
+    // --- importFile (drag-and-drop import into the vault root) -----------------
+
+    // Dropping a recognized audio file copies it into the vault root and the
+    // tree picks it up (via the explicit rebuild(), not just the watcher) —
+    // and the ORIGINAL file is left in place, since this is a copy, not a
+    // move (DESIGN.md's "USB import" precedent: "copy only new audio in").
+    void importFile_copiesRecognizedAudioIntoVaultRoot_leavingSourceIntact()
+    {
+        QTemporaryDir vault;
+        QVERIFY(vault.isValid());
+        QTemporaryDir source;
+        QVERIFY(source.isValid());
+        QVERIFY(touch(source.filePath("dropped.mp3"), "audio bytes"));
+
+        VaultTreeModel model;
+        model.setVaultPath(QUrl::fromLocalFile(vault.path()));
+
+        QString error;
+        QVERIFY2(model.importFile(QUrl::fromLocalFile(source.filePath("dropped.mp3")), &error),
+                 qPrintable(error));
+        QVERIFY(error.isEmpty());
+
+        QVERIFY(QFileInfo::exists(vault.filePath("dropped.mp3")));
+        QVERIFY(QFileInfo::exists(source.filePath("dropped.mp3"))); // source untouched
+        const QModelIndex idx = findByName(model, "dropped.mp3");
+        QVERIFY(idx.isValid());
+        QCOMPARE(model.data(idx, roleByName(model, "status")).toInt(),
+                 int(VaultTreeModel::UntranscribedStatus));
+    }
+
+    // A file with an unrecognized extension is refused, not silently copied
+    // in as vault clutter.
+    void importFile_rejectsNonAudioExtension()
+    {
+        QTemporaryDir vault;
+        QVERIFY(vault.isValid());
+        QTemporaryDir source;
+        QVERIFY(source.isValid());
+        QVERIFY(touch(source.filePath("notes.txt")));
+
+        VaultTreeModel model;
+        model.setVaultPath(QUrl::fromLocalFile(vault.path()));
+
+        QString error;
+        QVERIFY(!model.importFile(QUrl::fromLocalFile(source.filePath("notes.txt")), &error));
+        QVERIFY(!error.isEmpty());
+        QVERIFY(!QFileInfo::exists(vault.filePath("notes.txt")));
+    }
+
+    // A same-named file already at the vault root is never silently
+    // overwritten or auto-renamed — the import is refused outright.
+    void importFile_rejectsCollisionWithExistingFile()
+    {
+        QTemporaryDir vault;
+        QVERIFY(vault.isValid());
+        QVERIFY(touch(vault.filePath("song.mp3"), "original"));
+        QTemporaryDir source;
+        QVERIFY(source.isValid());
+        QVERIFY(touch(source.filePath("song.mp3"), "different bytes"));
+
+        VaultTreeModel model;
+        model.setVaultPath(QUrl::fromLocalFile(vault.path()));
+
+        QString error;
+        QVERIFY(!model.importFile(QUrl::fromLocalFile(source.filePath("song.mp3")), &error));
+        QVERIFY(!error.isEmpty());
+
+        QFile original(vault.filePath("song.mp3"));
+        QVERIFY(original.open(QIODevice::ReadOnly));
+        QCOMPARE(original.readAll(), QByteArray("original")); // untouched
+    }
+
+    // No vault open (empty vaultLocalPath): importFile() fails with an error
+    // rather than crashing or writing to some unintended location.
+    void importFile_noVaultOpen_isInertNotFatal()
+    {
+        QTemporaryDir source;
+        QVERIFY(source.isValid());
+        QVERIFY(touch(source.filePath("clip.mp3")));
+
+        VaultTreeModel model;
+        QString error;
+        QVERIFY(!model.importFile(QUrl::fromLocalFile(source.filePath("clip.mp3")), &error));
+        QVERIFY(!error.isEmpty());
+    }
+
     // --- Search support roles (Item 9: LabelRole/TagsRole/TranscriptBodyRole) --
 
     // An audio file's frontmatter label/tags are exposed via LabelRole/
@@ -456,7 +566,7 @@ private slots:
         QTemporaryDir vault;
         QVERIFY(vault.isValid());
         QVERIFY(touch(vault.filePath("talk.mp3")));
-        QVERIFY(touch(vault.filePath("talk.md"),
+        QVERIFY(touch(vault.filePath("talk.mp3.md"),
                       "---\nmodel: base\nlabel: Quarterly Talk\ntags: finance, meetings\n---\n\n"
                       "[00:00:00.000 - 00:00:01.000] hello\n"));
 
@@ -493,7 +603,7 @@ private slots:
         QTemporaryDir vault;
         QVERIFY(vault.isValid());
         QVERIFY(touch(vault.filePath("session.wav")));
-        QVERIFY(touch(vault.filePath("session.md"),
+        QVERIFY(touch(vault.filePath("session.wav.md"),
                       "---\nmodel: base\n---\n\n[00:00:00.000 - 00:00:01.000] the quick fox\n"));
 
         VaultTreeModel model;
@@ -597,7 +707,7 @@ private slots:
         QVERIFY(vault.isValid());
         QVERIFY(touch(vault.filePath("untranscribed.mp3")));
         QVERIFY(touch(vault.filePath("transcribed.mp3")));
-        QVERIFY(touch(vault.filePath("transcribed.md")));
+        QVERIFY(touch(vault.filePath("transcribed.mp3.md")));
         QVERIFY(touch(vault.filePath("orphaned.md")));
         QVERIFY(touch(vault.filePath("notes.txt")));
         QVERIFY(touch(vault.filePath("nested/deep/buried.wav")));
@@ -637,7 +747,7 @@ private slots:
         QTemporaryDir vault;
         QVERIFY(vault.isValid());
         QVERIFY(touch(vault.filePath("root.mp3")));
-        QVERIFY(touch(vault.filePath("root.md")));
+        QVERIFY(touch(vault.filePath("root.mp3.md")));
         QVERIFY(touch(vault.filePath("orphan.md")));
         QVERIFY(touch(vault.filePath("sub/nested.wav")));
         QVERIFY(touch(vault.filePath("sub/deeper/leaf.ogg")));

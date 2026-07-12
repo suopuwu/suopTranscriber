@@ -1,8 +1,11 @@
 #pragma once
 
+#include <QDateTime>
 #include <QElapsedTimer>
 #include <QFile>
+#include <QHash>
 #include <QJsonObject>
+#include <QList>
 #include <QObject>
 #include <QString>
 #include <QThread>
@@ -86,6 +89,44 @@ private:
     QVector<LineRecord> m_tail;
 };
 
+// Feature 3a ("generate chapters"): one resolved chapter boundary, ready to
+// splice into a transcript body — t0 already resolved from whatever segment
+// index the LLM proposed (see LabelingEngine::generateChapters()'s doc
+// comment for why the raw index is never trusted as a timestamp directly;
+// that resolution happens in TranscriptionController.cpp's
+// TranscriptionWorker::generateChaptersJob(), against its own freshly-parsed
+// segment list, before this struct is ever built).
+struct ResolvedChapter {
+    double t0 = 0.0;
+    QString title;
+};
+
+// Strips every existing "## [timestamp] title" chapter marker line out of
+// `body` (regeneration must replace the old marker set wholesale, never
+// accumulate duplicates across repeated "generate chapters" runs — same
+// unconditional-overwrite policy as Feature 2's prelude), then inserts each
+// of `chapters`' marker lines immediately before the segment line whose own
+// leading "[timestamp]" exactly matches that chapter's t0 (formatted via the
+// same formatTimestamp() every segment line already uses, so the match is
+// exact by construction whenever t0 came from parsing this same file — see
+// formatSegmentLine() in the .cpp). A chapter whose t0 doesn't match any
+// segment line is silently skipped rather than corrupting the body.
+//
+// Collision-free with segmentLinePattern() by construction (not just lower
+// risk, unlike the prelude's numbered-list false-positive — see
+// stripPreludeIfPresent()'s doc comment): that pattern is anchored on a
+// literal "^\[", and a line starting with "## " can never match it.
+//
+// Chapters are inserted internally in DESCENDING offset order (the
+// last-in-the-file chapter first) — inserting by ascending string offset
+// would invalidate every not-yet-inserted chapter's offset as each earlier
+// insertion shifts the string. Callers don't need to pre-sort `chapters`.
+//
+// Declared here (rather than file-local in the .cpp, mirroring
+// SegmentLineWriter above) so tests can drive the splicing logic directly
+// with synthetic values, without needing a real label model.
+QString spliceBodyChapters(const QString &body, const QList<ResolvedChapter> &chapters);
+
 // Orchestrates: ffmpeg decode -> WhisperCppEngine -> vault sidecar files.
 // Owns a dedicated QThread; transcription (and its file IO) NEVER runs on
 // the GUI thread (see CLAUDE.md). Whole-file transcription only for now —
@@ -144,8 +185,8 @@ class TranscriptionController : public QObject {
     // a hang.
     Q_PROPERTY(QString currentPhase READ currentPhase NOTIFY currentPhaseChanged)
     Q_PROPERTY(QUrl currentFile READ currentFile NOTIFY currentFileChanged)
-    // "transcribe"/"relabel"/"rename"/"merge" for whichever job is Active
-    // right now (see jobs()' "kind" key — same four values), empty when
+    // "transcribe"/"relabel"/"rename"/"merge"/"chapters" for whichever job is
+    // Active right now (see jobs()' "kind" key — same values), empty when
     // idle. Changes at exactly the same time as currentFile (both set
     // together in startJob()), so it reuses that signal rather than needing
     // its own.
@@ -179,6 +220,13 @@ class TranscriptionController : public QObject {
     // permanently breaks pause for that job (see togglePauseActive()'s doc
     // comment for why).
     Q_PROPERTY(bool activeStopping READ isActiveStopping NOTIFY activeStoppingChanged)
+    // Item O35: "CUDA"/"Vulkan"/"CPU" — whichever backend whisper.cpp picked
+    // at the most recent model load (see WhisperCppEngine::activeBackendName()'s
+    // doc comment). Empty until the first model finishes loading this
+    // session; QML is expected to hide its indicator until then rather than
+    // show a blank/placeholder value. Never populated for a relabel/rename/
+    // merge/download job — none of those touch WhisperCppEngine.
+    Q_PROPERTY(QString activeBackendName READ activeBackendName NOTIFY activeBackendNameChanged)
 
 public:
     // Paused: only reached from Active during "loading" — whisper.cpp's
@@ -188,7 +236,13 @@ public:
     // subprocess — see AudioDecoder.h — so it gets a genuine pause instead).
     // Presented to the user as paused, not failed; resuming
     // restarts the job from scratch rather than continuing mid-flight.
-    enum class JobStatus { Queued, Active, Paused, Done, Failed };
+    //
+    // None (item P6): a pure sentinel, never actually assigned to a real
+    // Job::status — it's what jobStatusForPath() returns for a path with no
+    // job at all, so QML can compare against a named value instead of a
+    // magic -1. Explicit -1 underlying value so it can never collide with a
+    // real status if ever compared as a raw int.
+    enum class JobStatus { None = -1, Queued, Active, Paused, Done, Failed };
     Q_ENUM(JobStatus)
 
     // Fallback "average duration" (ms) a phase with zero recorded samples
@@ -240,6 +294,8 @@ public:
     bool isActivePaused() const { return m_activePaused; }
     // See the activeStopping Q_PROPERTY doc comment above.
     bool isActiveStopping() const { return m_pausingActiveAsRestart; }
+    // See the activeBackendName Q_PROPERTY doc comment above.
+    QString activeBackendName() const { return m_activeBackendName; }
     // Wall-clock time the Active job has spent actually RUNNING, excluding
     // any time spent paused — this is what elapsed/duration display in the
     // UI, not finishedAt-startedAt (see pauseActive()'s doc comment for why
@@ -270,11 +326,22 @@ public:
     QVariantList queuedFileUrls() const;
     // Every job for this session (Queued+Active+Done+Failed), each as
     // {fileUrl, status ("queued"/"active"/"done"/"failed"), error,
-    // kind ("transcribe"/"relabel"/"rename"/"merge")} — kind lets the UI
-    // distinguish a full transcription from a "regenerate label" or a
+    // kind ("transcribe"/"relabel"/"rename"/"merge"/"chapters")} — kind lets
+    // the UI distinguish a full transcription from a "regenerate label" or a
     // speaker-rename/merge task in the same list (they all share this one
     // queue/worker thread).
     QVariantList jobs() const;
+
+    // Item P6: lets the sidebar's file tree query a single path's job status
+    // directly, without walking the whole jobs() list itself. path must be an
+    // absolute local file path (QUrl::toLocalFile()), matching what m_jobs'
+    // Job::fileUrl resolves to — same convention every other path-keyed
+    // lookup in this class uses. Returns JobStatus::None (-1) if path has no
+    // Queued/Active/Paused/Done/Failed entry at all. When multiple jobs exist
+    // for the same path (e.g. a Done history entry plus a freshly re-queued
+    // run), the more "in progress" one wins — see rebuildJobStatusIndex()'s
+    // doc comment for the exact priority order.
+    Q_INVOKABLE int jobStatusForPath(const QString &path) const;
 
     // No-op if fileUrl already has a Queued or Active entry (no duplicate
     // in-flight-or-pending tasks). A Done/Failed entry for the same fileUrl
@@ -298,16 +365,19 @@ public:
     // is false. tagReuseBias (item 15, Wave E): 0.0-1.0 soft nudge between
     // inventing new tags vs. reusing existing ones — only meaningful when
     // restrictTagsToExisting is false (that's already a hard constraint).
+    // wordiness (Feature 1): 0.0-1.0 soft nudge on how verbose the generated
+    // label and prelude are, independent of the tag settings above.
     Q_INVOKABLE void transcribe(const QUrl &fileUrl, const QUrl &vaultUrl, const QString &modelId,
                                  bool speakerDetection, bool autoLabel = false, bool restrictTagsToExisting = false,
-                                 double tagReuseBias = 0.5);
+                                 double tagReuseBias = 0.5, double wordiness = 0.5);
 
     // Convenience batch wrapper: calls transcribe() for each url. Dedup is
     // entirely delegated to transcribe(); the caller decides which files are
     // actually untranscribed.
     Q_INVOKABLE void transcribeAll(const QVariantList &fileUrls, const QUrl &vaultUrl, const QString &modelId,
                                     bool speakerDetection, bool autoLabel = false,
-                                    bool restrictTagsToExisting = false, double tagReuseBias = 0.5);
+                                    bool restrictTagsToExisting = false, double tagReuseBias = 0.5,
+                                    double wordiness = 0.5);
 
     // True if fileUrl currently has a Queued or Active entry.
     Q_INVOKABLE bool isQueued(const QUrl &fileUrl) const;
@@ -332,13 +402,34 @@ public:
     // than calling this method — a manual "regenerate label" click and an
     // automatic post-transcription label pass are the exact same job kind.
     Q_INVOKABLE void relabel(const QUrl &fileUrl, const QUrl &vaultUrl, bool restrictTagsToExisting = false,
-                              double tagReuseBias = 0.5);
+                              double tagReuseBias = 0.5, double wordiness = 0.5);
 
     // Bulk wrapper mirroring transcribeAll(): calls relabel() for each url.
     // Dedup is delegated to relabel(); the caller (Sidebar's "regenerate all
     // labels" ribbon icon) decides which files are actually transcribed.
     Q_INVOKABLE void relabelAll(const QVariantList &fileUrls, const QUrl &vaultUrl,
-                                bool restrictTagsToExisting = false, double tagReuseBias = 0.5);
+                                bool restrictTagsToExisting = false, double tagReuseBias = 0.5,
+                                double wordiness = 0.5);
+
+    // Feature 3a ("generate chapters"): a second, SEPARATE LLM pass from
+    // relabel() above — sharing the same resident label model/context (see
+    // LabelingEngine::generateChapters()'s doc comment), but a deliberately
+    // separate, explicit action rather than bundled into relabel(): this is
+    // a materially heavier/slower call and shouldn't silently ride along on
+    // every "regenerate label" click. Reads the file's ALREADY-parsed
+    // segments, proposes chapter boundaries+titles, and splices them into
+    // the body as "## [timestamp] title" marker lines (see
+    // spliceBodyChapters()'s doc comment) immediately before the segment
+    // line each chapter starts at. Queued through the same job pipeline as
+    // relabel() — identical dedup-if-already-queued behavior (see its doc
+    // comment) and job-list visibility. Regenerating (calling this again on
+    // an already-chaptered file) strips the old marker set first — never
+    // accumulates duplicates across repeated runs.
+    Q_INVOKABLE void generateChapters(const QUrl &fileUrl, const QUrl &vaultUrl);
+
+    // Bulk wrapper mirroring relabelAll(): calls generateChapters() for each
+    // url. Dedup is entirely delegated to generateChapters().
+    Q_INVOKABLE void generateChaptersAll(const QVariantList &fileUrls, const QUrl &vaultUrl);
 
     // Reads the frontmatter (model/speakerDetection/transcribedAt/label/...)
     // out of a file's sibling .md, if one exists yet. Empty map if not
@@ -350,6 +441,15 @@ public:
     // downloaded/loaded, speakerDetection reads false (the transcription
     // still ran, ASR-only — see DiarizationEngine) and the map carries
     // speakerDetectionError (why) — MainPanel surfaces this as a warning.
+    // Parses every "key: value" frontmatter line generically (not just a
+    // fixed allowlist) — any key LabelingEngine or a future writer adds
+    // (e.g. "tags") is automatically present here with no extra code.
+    // Note: the prelude (Feature 2) lives in the BODY, not frontmatter (it
+    // needs real newlines) — use readPrelude() for that, not this map.
+    // Item O19: cached (see m_frontmatterCache) behind a cheap
+    // file-size+mtime check, since this is called on every liveUpdateTick
+    // (transitively, via parseSentences()) while a transcription is
+    // actively running on the currently-open file.
     Q_INVOKABLE QVariantMap readMetadata(const QUrl &fileUrl) const;
 
     // {id, label} pairs for the model dropdown (see ModelManager).
@@ -459,6 +559,42 @@ public:
     // read+write, no model/engine involvement.
     Q_INVOKABLE bool setLabel(const QUrl &fileUrl, const QString &label, QString *errorOut = nullptr) const;
 
+    // Item P15: sets/replaces the `tags:` frontmatter key, same reopen/
+    // rewrite shape as setLabel() above. tags is joined with ", " to match
+    // the exact comma-separated format collectVaultTags()/readMetadata()
+    // already parse (auto-label writes this same shape via
+    // writeLabelingFields()'s spliceOrAppend) — individual tags must not
+    // themselves contain commas.
+    Q_INVOKABLE bool setTags(const QUrl &fileUrl, const QStringList &tags, QString *errorOut = nullptr) const;
+
+    // Feature 2: the multi-paragraph, editable "prelude" (upgrades the old
+    // read-only single-line "summary") — stored in the .md BODY immediately
+    // after frontmatter, terminated by the "<!-- prelude end -->" sentinel
+    // (see spliceBodyPrelude()'s doc comment in the .cpp for why an explicit
+    // marker rather than implicit boundary detection). Returns everything
+    // before that marker, trimmed, or an empty string if the marker isn't
+    // present (untranscribed file, or one predating this feature).
+    Q_INVOKABLE QString readPrelude(const QUrl &fileUrl) const;
+
+    // Manual-edit counterpart to setLabel() above, same reopen/rewrite shape
+    // (frontmatter preserved byte-for-byte) — replaces just the prelude
+    // region of the body via the same splice helper writeLabelingFields()
+    // uses for auto-regeneration, so a later relabel() and a manual edit
+    // here produce identically-formatted output. Per Feature 2's
+    // regeneration semantics, a later auto-relabel unconditionally
+    // overwrites whatever was set here — same precedent as a manual title
+    // rename (setLabel()) already being clobbered by relabel() today.
+    Q_INVOKABLE bool setPrelude(const QUrl &fileUrl, const QString &prelude, QString *errorOut = nullptr) const;
+
+    // Feature 3a: the read-side counterpart to generateChapters() above —
+    // scans the body for "## [timestamp] title" marker lines (see
+    // spliceBodyChapters()'s doc comment) and returns them as
+    // {t0: seconds as double, title: QString} maps, in file order (== time
+    // order, since a chapter marker is always inserted immediately before
+    // the segment line it introduces). Empty list if the file has no
+    // chapters yet (untranscribed, or generateChapters() never run).
+    Q_INVOKABLE QVariantList readChapters(const QUrl &fileUrl) const;
+
     // Rewrite (2026-07-07): a speaker's name is now baked directly into
     // every "[oldName]" segment-line tag in the transcript BODY itself —
     // there is no more separate frontmatter name-lookup layer, since the
@@ -500,7 +636,9 @@ public:
 
     // Everything after the frontmatter's closing "---" line (i.e. the
     // segment text), for main-panel search. Empty string if untranscribed
-    // or unreadable.
+    // or unreadable. Item O19: cached (see m_bodyCache) behind a cheap
+    // file-size+mtime check, since this is called on every liveUpdateTick
+    // while a transcription is actively running on the currently-open file.
     Q_INVOKABLE QString readTranscriptBody(const QUrl &fileUrl) const;
 
     // Parses readTranscriptBody()'s "[HH:MM:SS.mmm] [tag] text" lines (see
@@ -521,6 +659,9 @@ public:
     // at write time, in the file itself, not just in this parsed view. For
     // sentence-level highlighting synced to playback (see DESIGN.md /
     // CLAUDE.md "sentence-level only, binary-search on positionChanged").
+    // Item O19: cached (see m_sentenceCache) — an append-only live
+    // transcription only regex-parses its NEW trailing bytes per call
+    // instead of re-parsing the whole (ever-growing) body from scratch.
     Q_INVOKABLE QVariantList parseSentences(const QUrl &fileUrl) const;
 
     // Binary-searches sentences (as returned by parseSentences(), sorted by
@@ -603,10 +744,24 @@ signals:
     void currentPhaseChanged();
     void currentFileChanged();
     void queueChanged();
+    // Item P6: fired whenever the path->JobStatus index (m_jobStatusByPath)
+    // actually changes — i.e. on every queueChanged() that changes at least
+    // one path's resolved status, see rebuildJobStatusIndex(). QML's file
+    // tree delegates connect to this to know when to re-poll
+    // jobStatusForPath() for their own path, without depending on the
+    // (unrelated-to-them) full jobs() list shape.
+    void jobStatusesChanged();
     void liveUpdateTickChanged();
     void activePausedChanged();
     void activeStoppingChanged();
-    void finished(const QUrl &fileUrl, bool ok, const QString &error);
+    void activeBackendNameChanged();
+    // const: also emitted from setLabel()/setPrelude()/setTags() (item P19),
+    // which are themselves const (pure file-rewrite helpers, no member state
+    // touched) — Qt signals may be declared const, and doing so here lets
+    // those synchronous, non-queued edit paths notify the sidebar the same
+    // way the queued-job paths (relabel()/generateChapters()/etc, all
+    // non-const) already do via onWorkerFinished().
+    void finished(const QUrl &fileUrl, bool ok, const QString &error) const;
     // Fired when a renameSpeaker() call's background rewrite completes — IN
     // ADDITION to the generic finished() above (a rename is queued through
     // the SAME job queue as transcribe/relabel, see renameSpeaker()'s doc
@@ -642,14 +797,26 @@ private:
         bool speakerDetection = false;
         bool autoLabel = false;
         bool relabelOnly = false;
+        // Item P21: true only for the automatic follow-up label pass
+        // transcribe(autoLabel=true) queues alongside its transcribe job —
+        // never set on the manual "Regenerate label and prelude" job
+        // (relabel()), which must always force-regenerate regardless of
+        // existing content. See relabelJob()'s doc comment for what this
+        // does at execution time.
+        bool skipIfAlreadyLabeled = false;
         bool renameSpeakerOnly = false;
         QString oldSpeakerName;
         QString newSpeakerName;
         bool mergeSpeakersOnly = false;
         QString sourceSpeakerName;
         QString targetSpeakerName;
+        // Feature 3a: see TranscriptionController::generateChapters()'s doc
+        // comment. Needs only fileUrl/vaultUrl (same as relabelOnly) — no
+        // extra fields of its own.
+        bool generateChaptersOnly = false;
         bool restrictTagsToExisting = false;
         double tagReuseBias = 0.5;
+        double wordiness = 0.5;
         DownloadTarget downloadTarget = DownloadTarget::None;
         JobStatus status = JobStatus::Queued;
         QString error;
@@ -664,6 +831,24 @@ private:
     // construction (each enqueuing function only ever sets one).
     static QString jobKind(const Job &job);
 
+    // Item P6: rebuilds m_jobStatusByPath from scratch off the current
+    // m_jobs, emitting jobStatusesChanged() iff the resolved per-path status
+    // actually changed. Connected to queueChanged() in the constructor
+    // (alongside persistQueue()) rather than called individually from every
+    // m_jobs-mutating site — every mutation (enqueue, startJob(),
+    // onWorkerFinished(), cancelJob()/cancelAll(), dismiss()/clearFinished(),
+    // moveQueuedJob(), the replay path) already emits queueChanged(), so this
+    // one connection keeps the index current everywhere a targeted per-call-
+    // site update would otherwise be needed. When more than one job shares a
+    // path (a Done/Failed history entry plus a freshly re-queued run), the
+    // more "in progress" one wins: Active > Paused > Queued > Failed > Done —
+    // i.e. show whatever's most relevant to "is something happening to this
+    // file right now", falling back to Failed over Done among purely
+    // historical entries since a failure is the more actionable one to
+    // surface. A download job (empty fileUrl) contributes nothing to this
+    // index — it names no single vault file.
+    void rebuildJobStatusIndex();
+
     void startJob(int index);
     void onWorkerFinished(bool ok, const QString &error);
     // Wave N (task system, item 5): pushes a Queued "download" job for
@@ -673,7 +858,25 @@ private:
     // Called right before transcribe()/relabel() queues its own job, so the
     // download (if needed) lands just ahead of it in m_jobs and therefore
     // runs first. Returns the new job's id, or -1 if no download was needed.
-    int maybeQueueDownloadJob(DownloadTarget target, const QUrl &vaultUrl, const QString &modelId);
+    //
+    // insertIndex (item O15): where to insert the download job, if one is
+    // queued — -1 (default) appends to the end of m_jobs, which is what
+    // queue-REPLAY callers (enqueueReplayedJob()/loadPersistedQueue()) want,
+    // since restoring a persisted session must reproduce its exact saved
+    // order rather than jump anything. transcribe()/relabel() instead pass
+    // frontOfQueueInsertIndex()'s cursor, so a live "start this now" request
+    // jumps ahead of whatever's already Queued (see their own doc comments).
+    int maybeQueueDownloadJob(DownloadTarget target, const QUrl &vaultUrl, const QString &modelId,
+                               int insertIndex = -1);
+    // Item O15: where a freshly requested job should land in m_jobs so it
+    // runs NEXT once whatever's currently running finishes, ahead of
+    // anything already Queued — right after the Active job if one exists
+    // (never ahead of it: this must not preempt work already in flight), or
+    // otherwise right before the first currently-Queued entry (never before
+    // a Paused job, which startNext() already treats as higher priority
+    // than Queued — see its doc comment; and never before Done/Failed
+    // history, which is append-only by design — see the class doc comment).
+    int frontOfQueueInsertIndex() const;
     // True if ANY Queued/Active job already targets this exact download
     // (same vaultUrl + target + modelId) — maybeQueueDownloadJob()'s dedup
     // check.
@@ -707,7 +910,18 @@ private:
     // it, then recomputes m_overallProgress so the CURRENT phase's own slice
     // reflects the freshly-updated average right away rather than waiting
     // for the next tick. Connected to TranscriptionWorker::phaseDurationMs.
+    // Item P3: m_phaseTimings is now keyed per-CONFIGURATION (phase + modelId
+    // + speakerDetection, see canonicalPhaseKey() in the .cpp), not just
+    // phase name — modelId/speakerDetection are read from the Active job
+    // (activeModelIdForTiming()/m_activeSpeakerDetection) right here rather
+    // than threaded through the phaseDurationMs signal itself, since both are
+    // already available on the controller side whenever this runs.
     void recordPhaseDuration(const QString &phase, qint64 durationMs);
+    // modelId of whichever job is currently Active, or empty if none/not
+    // applicable — see recordPhaseDuration()'s doc comment above for why this
+    // reads m_jobs/m_activeIndex directly instead of needing a parameter
+    // threaded in from the worker's signal.
+    QString activeModelIdForTiming() const;
     // Rebuilds m_overallProgress from scratch: m_phase's active-phase set
     // (loading/decoding/[detecting-speakers]/transcribing — detecting-
     // speakers only counted when m_activeSpeakerDetection is set), each
@@ -731,18 +945,21 @@ private:
     // average run never LOOKS finished before the real phase transition
     // actually happens.
     double phaseRelativeSyntheticProgress() const;
-    // Populates m_phaseTimings from QSettings' "phaseTimings" group (one key
-    // per kTimedPhases entry, a QVariantList of up to RollingAverage::kCapacity
-    // raw millisecond samples) — called once from the constructor. App-scoped
+    // Populates m_phaseTimings from QSettings' "phaseTimings" group — one key
+    // per (phase, modelId, speakerDetection) combination ever recorded (see
+    // canonicalPhaseKey() in the .cpp), each a QVariantList of up to
+    // RollingAverage::kCapacity raw millisecond samples — called once from
+    // the constructor. Item P3: since the composite key embeds an
+    // open-ended modelId, this enumerates whatever keys are actually
+    // persisted (QSettings::childKeys()) rather than a fixed list. App-scoped
     // (not per-vault): how long a phase takes is a property of this machine
-    // + whichever model was last used, not something that should differ by
-    // vault.
+    // + whichever model was used, not something that should differ by vault.
     void loadPhaseTimings();
-    // Writes JUST `phase`'s current sample list back to QSettings — called
-    // right after recordPhaseDuration() adds a new sample. Per-phase (not a
-    // single bulk save) since jobs typically complete one phase at a time,
-    // not all four at once.
-    void savePhaseTiming(const QString &phase);
+    // Writes JUST `key`'s (the composite canonicalPhaseKey() string) current
+    // sample list back to QSettings — called right after recordPhaseDuration()
+    // adds a new sample. Per-key (not a single bulk save) since jobs
+    // typically complete one phase at a time, not all four at once.
+    void savePhaseTiming(const QString &key);
 
     QThread m_thread;
     TranscriptionWorker *m_worker = nullptr;
@@ -757,12 +974,17 @@ private:
     // job (see the downloadProgress connection in the constructor).
     double m_overallProgress = 0.0;
     // Rolling (last RollingAverage::kCapacity samples) average duration of
-    // each named phase, keyed by the same strings TranscriptionWorker::phase
-    // emits ("loading"/"decoding"/"detecting-speakers"/"transcribing") — see
-    // recomputeOverallProgress()'s doc comment for how these become the
-    // progress bar's per-phase widths. Loaded once in the constructor
-    // (loadPhaseTimings()), updated+persisted per-phase as jobs complete each
-    // phase (recordPhaseDuration()/savePhaseTiming()).
+    // each named phase, keyed by a COMPOSITE string — phase bucket + modelId
+    // + speakerDetection (see canonicalPhaseKey() in the .cpp), not just the
+    // phase name TranscriptionWorker::phase emits
+    // ("loading"/"decoding"/"detecting-speakers"/"transcribing"). Item P3: a
+    // large model's phases take materially longer than a tiny one's, and
+    // diarization adds real overhead, so different configurations must not
+    // share one rolling average — see recomputeOverallProgress()'s doc
+    // comment for how these become the progress bar's per-phase widths.
+    // Loaded once in the constructor (loadPhaseTimings()), updated+persisted
+    // per-key as jobs complete each phase (recordPhaseDuration()/
+    // savePhaseTiming()).
     QMap<QString, RollingAverage> m_phaseTimings;
     // Whether the Active job requested speaker detection — set in startJob()
     // from job.speakerDetection so recomputeOverallProgress() knows whether
@@ -781,6 +1003,11 @@ private:
     QUrl m_currentFile;
     int m_liveUpdateTick = 0;
     QVector<Job> m_jobs;
+    // Item P6: rebuilt from m_jobs by rebuildJobStatusIndex() (see its own
+    // doc comment) — keyed by absolute local file path, mirrors jobs()'
+    // per-path status but as an O(1) lookup for jobStatusForPath() instead of
+    // a linear jobs() scan.
+    QHash<QString, JobStatus> m_jobStatusByPath;
     int m_activeIndex = -1;
     int m_nextJobId = 1;
     // Set by loadPersistedQueue() (once per vault open) — where persistQueue()
@@ -801,4 +1028,47 @@ private:
     // m_activeAccumulatedMs holds everything before that.
     QElapsedTimer m_activeSegmentTimer;
     qint64 m_activeAccumulatedMs = 0;
+    // See activeBackendName Q_PROPERTY's doc comment.
+    QString m_activeBackendName;
+
+    // Item O19: readMetadata()/readTranscriptBody()/parseSentences() are all
+    // Q_INVOKABLE and called synchronously from QML bindings on every
+    // liveUpdateTick (~5x/sec, see its own doc comment) while a
+    // transcription is actively running on the currently-open file — each
+    // one used to unconditionally re-open, re-read, and (for parseSentences)
+    // re-run a regex over the ENTIRE file from scratch, every tick, on the
+    // GUI thread, with cost growing with transcript length. These three
+    // single-slot (not per-path map — only the currently open file is ever
+    // polled this often; switching files just misses the cache once, no
+    // separate eviction step needed) caches back the mitigation: a cheap
+    // QFileInfo stat (size+mtime) guards the common "nothing changed since
+    // last call" case entirely, and parseSentences() additionally reuses an
+    // exact-prefix check to regex-parse only the NEW trailing bytes of an
+    // append-only live transcript instead of the whole body (falling back to
+    // a full reparse whenever that prefix check fails — e.g.
+    // SegmentLineWriter rewrote the tail in place merging a repeat cycle —
+    // never trading correctness for speed).
+    struct FrontmatterCache {
+        QString mdPath;
+        qint64 size = -1;
+        QDateTime mtime;
+        QVariantMap data;
+        bool valid = false;
+    };
+    mutable FrontmatterCache m_frontmatterCache;
+    struct TranscriptBodyCache {
+        QString mdPath;
+        qint64 size = -1;
+        QDateTime mtime;
+        QString body;
+        bool valid = false;
+    };
+    mutable TranscriptBodyCache m_bodyCache;
+    struct SentenceCache {
+        QString mdPath;
+        QString body; // the exact body string `sentences` was parsed from
+        QVariantList sentences;
+        bool valid = false;
+    };
+    mutable SentenceCache m_sentenceCache;
 };

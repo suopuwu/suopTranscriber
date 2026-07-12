@@ -20,6 +20,10 @@ const std::vector<ModelInfo> &availableModels()
         {"base.en", "ggml-base.en.bin", "Base (English) — ~148 MB, balanced"},
         {"small.en", "ggml-small.en.bin", "Small (English) — ~488 MB, more accurate"},
         {"medium.en", "ggml-medium.en.bin", "Medium (English) — ~1.5 GB, most accurate"},
+        // No English-only "large" ggml model exists upstream — large-v3 is
+        // multilingual-only, so (unlike the four entries above) this one
+        // must not claim "(English)".
+        {"large-v3", "ggml-large-v3.bin", "Large (multilingual, most accurate) — ~3.1 GB"},
     };
     return models;
 }

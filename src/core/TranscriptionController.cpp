@@ -66,10 +66,17 @@ QString formatTimestamp(double seconds)
     return QStringLiteral("%1%2").arg(s).arg(msPart);
 }
 
+// Item P7: derived from the audio file's FULL name (fi.fileName(), extension
+// included), not just its stripped stem (fi.completeBaseName()) — two audio
+// files sharing a stem with different extensions (e.g. "meeting.wav" +
+// "meeting.mp3") must get distinct sidecars ("meeting.wav.md" /
+// "meeting.mp3.md"), never collide on one "meeting.md". Every sidecar-path
+// call site in this file and in VaultTreeModel.cpp (sidecarMdPath()) must
+// stay consistent with this same convention.
 QString sidecarPath(const QString &audioFilePath)
 {
     const QFileInfo fi(audioFilePath);
-    return fi.absolutePath() + "/" + fi.completeBaseName() + ".md";
+    return fi.absolutePath() + "/" + fi.fileName() + ".md";
 }
 
 // Minimum spacing between TranscriptionWorker::segmentWritten() emissions
@@ -142,11 +149,27 @@ int distinctSpeakerCount(const std::vector<DiarizedTurn> &turns)
 double parseCompactTimestamp(const QString &raw)
 {
     const QStringList parts = raw.split(QLatin1Char(':'));
-    if (parts.size() >= 3)
-        return parts[0].toDouble() * 3600.0 + parts[1].toDouble() * 60.0 + parts[2].toDouble();
-    if (parts.size() == 2)
-        return parts[0].toDouble() * 60.0 + parts[1].toDouble();
-    return parts[0].toDouble();
+    bool ok = true;
+    double result = 0.0;
+    if (parts.size() >= 3) {
+        bool okH = false, okM = false, okS = false;
+        result = parts[0].toDouble(&okH) * 3600.0 + parts[1].toDouble(&okM) * 60.0 + parts[2].toDouble(&okS);
+        ok = okH && okM && okS;
+    } else if (parts.size() == 2) {
+        bool okM = false, okS = false;
+        result = parts[0].toDouble(&okM) * 60.0 + parts[1].toDouble(&okS);
+        ok = okM && okS;
+    } else {
+        result = parts[0].toDouble(&ok);
+    }
+    // Item O32: a malformed/non-numeric timestamp used to silently fall back
+    // to 0.0 with no diagnostic — a corrupted .md file's mis-sorted/
+    // mis-highlighted segment was otherwise undiagnosable. The 0.0 fallback
+    // itself is unchanged (graceful degradation is still correct here), this
+    // just stops it from being silent.
+    if (!ok)
+        qWarning() << "parseCompactTimestamp: could not parse timestamp" << raw;
+    return result;
 }
 
 // Splits a frontmatter "speakers: A, B, C" value into trimmed, non-empty
@@ -228,6 +251,8 @@ QRegularExpression segmentLinePattern(const QStringList &knownSpeakers)
 QString jobStatusToString(TranscriptionController::JobStatus status)
 {
     switch (status) {
+    case TranscriptionController::JobStatus::None:
+        return QString();
     case TranscriptionController::JobStatus::Queued:
         return QStringLiteral("queued");
     case TranscriptionController::JobStatus::Active:
@@ -240,6 +265,30 @@ QString jobStatusToString(TranscriptionController::JobStatus status)
         return QStringLiteral("failed");
     }
     return QString();
+}
+
+// Item P6: priority order rebuildJobStatusIndex() uses to pick ONE status
+// when multiple m_jobs entries share a path (e.g. a Done history entry plus
+// a freshly re-queued run) — "in progress" beats "finished", and among
+// finished entries Failed beats Done since a failure is the more actionable
+// one for the file tree to surface.
+int jobStatusPriority(TranscriptionController::JobStatus status)
+{
+    switch (status) {
+    case TranscriptionController::JobStatus::Active:
+        return 5;
+    case TranscriptionController::JobStatus::Paused:
+        return 4;
+    case TranscriptionController::JobStatus::Queued:
+        return 3;
+    case TranscriptionController::JobStatus::Failed:
+        return 2;
+    case TranscriptionController::JobStatus::Done:
+        return 1;
+    case TranscriptionController::JobStatus::None:
+        return 0;
+    }
+    return 0;
 }
 
 // Written immediately when a job starts, before whisper_full runs, so a
@@ -308,25 +357,82 @@ QString formatSegmentLine(double t0, const QString &speakerLabel, const QString 
     return line;
 }
 
+// Fixed sentinel marking the end of the prelude region at the very start of
+// a transcript's BODY — frontmatter can't hold real newlines, so the
+// multi-paragraph, editable prelude (Feature 2, upgrading the old read-only
+// single-line "summary") lives in the body instead, immediately after
+// frontmatter's closing "---". An EXPLICIT marker, not implicit "first line
+// matching segmentLinePattern()" detection: that pattern's timestamp group
+// ([\d:.]+) is loose enough that a hand-typed numbered list in the prelude
+// (e.g. "[1] First point") would otherwise collide and get misdetected as a
+// real segment.
+const QString kPreludeEndMarker = QStringLiteral("<!-- prelude end -->");
+
+// Everything from `body`'s start through kPreludeEndMarker (and its
+// immediately-following blank line, if present) is the prelude region —
+// strip it, leaving just the segment-line content. `body` unchanged if the
+// marker isn't present (a fresh or pre-Feature-2 file has nothing to strip).
+// Shared by every consumer that scans for segment lines
+// (segmentLinePattern().globalMatch()) — without this, a prelude paragraph
+// that happens to start a line with bracket-shaped text (e.g. a hand-typed
+// "[1] First point") risks being misdetected as a real segment, since
+// nothing else marks where the prelude ends from that scan's point of view.
+QString stripPreludeIfPresent(const QString &body)
+{
+    const int markerIdx = body.indexOf(kPreludeEndMarker);
+    if (markerIdx < 0)
+        return body;
+    int afterMarker = markerIdx + kPreludeEndMarker.size();
+    if (afterMarker < body.size() && body.at(afterMarker) == QLatin1Char('\n'))
+        ++afterMarker; // end of the marker's own line
+    if (afterMarker < body.size() && body.at(afterMarker) == QLatin1Char('\n'))
+        ++afterMarker; // its immediately-following blank line, if present
+    return body.mid(afterMarker);
+}
+
+// Replaces whatever prelude currently precedes kPreludeEndMarker in `body`
+// (or, if the marker isn't present yet — a fresh or pre-Feature-2 file —
+// the whole of `body`) with newPrelude, re-inserting the marker. Shared by
+// writeLabelingFields() (auto regeneration) and
+// TranscriptionController::setPrelude() (manual edit) — identical splice
+// shape either way. Idempotent by construction: splicing the SAME
+// newPrelude into this function's own prior output reproduces byte-identical
+// spacing, so repeated regeneration with unchanged text never accumulates
+// blank lines. An empty newPrelude still gets the marker written (rather
+// than omitting the whole block) — that way readPrelude() always reliably
+// reads back "" instead of having to distinguish "empty prelude" from "no
+// marker written yet, treat the whole body as unmarked content".
+QString spliceBodyPrelude(const QString &body, const QString &newPrelude)
+{
+    const QString remaining = stripPreludeIfPresent(body);
+    const QString trimmed = newPrelude.trimmed();
+    if (trimmed.isEmpty())
+        return kPreludeEndMarker + QStringLiteral("\n\n") + remaining;
+    return trimmed + QStringLiteral("\n\n") + kPreludeEndMarker + QStringLiteral("\n\n") + remaining;
+}
+
 // AI auto-labeling's second pass runs AFTER the primary frontmatter+segments
 // have already been written and mdFile closed (needs the full transcript
 // text, which isn't known until transcription completes) — reopens the same
-// .md and splices in label/summary/tags. Splice-or-append (not append-only):
-// a fresh transcribe job's frontmatter never has these keys yet (so this
-// falls through to append), but "regenerate auto-title" (relabel, see
-// TranscriptionController::relabel()) reruns this against a .md that already
-// has them — must replace in place, not duplicate. A failure here IS
-// surfaced as its own job's failure (see TranscriptionController::relabel())
-// — auto-labeling now always runs as a separate, visible follow-up task (see
-// transcribe()'s autoLabel doc), not a silent bonus pass baked into the
-// transcription job itself. Newlines are stripped from the values since this
-// is a flat line-based format — a raw '\n' inside a JSON string (from a "\n"
-// escape) would otherwise corrupt the frontmatter block.
+// .md and splices in label/prelude/tags: label/tags into frontmatter,
+// prelude into the body via spliceBodyPrelude() above. Splice-or-append (not
+// append-only) for the frontmatter keys: a fresh transcribe job's
+// frontmatter never has these keys yet (so this falls through to append),
+// but "regenerate auto-title" (relabel, see TranscriptionController::
+// relabel()) reruns this against a .md that already has them — must replace
+// in place, not duplicate. A failure here IS surfaced as its own job's
+// failure (see TranscriptionController::relabel()) — auto-labeling now
+// always runs as a separate, visible follow-up task (see transcribe()'s
+// autoLabel doc), not a silent bonus pass baked into the transcription job
+// itself. Newlines are stripped from label/tags (not prelude) since those
+// are a flat line-based format — a raw '\n' inside a JSON string (from a
+// "\n" escape) would otherwise corrupt the frontmatter block; the prelude's
+// real newlines are exactly the point of moving it to the body.
 void writeLabelingFields(const QString &mdPath, const LabelResult &result)
 {
     QFile mdFile(mdPath);
     if (!mdFile.open(QIODevice::ReadOnly | QIODevice::Text)) {
-        qWarning() << "auto-label: could not reopen" << mdPath << "to write label/summary/tags";
+        qWarning() << "auto-label: could not reopen" << mdPath << "to write label/prelude/tags";
         return;
     }
     QTextStream in(&mdFile);
@@ -363,8 +469,8 @@ void writeLabelingFields(const QString &mdPath, const LabelResult &result)
         frontmatterLines.append(key + QStringLiteral(": ") + value);
     };
     spliceOrAppend(QStringLiteral("label"), sanitize(result.label));
-    spliceOrAppend(QStringLiteral("summary"), sanitize(result.summary));
     spliceOrAppend(QStringLiteral("tags"), sanitize(result.tags));
+    const QString newBody = spliceBodyPrelude(body, result.prelude);
 
     if (!mdFile.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
         qWarning() << "auto-label: could not reopen" << mdPath << "for writing";
@@ -375,7 +481,7 @@ void writeLabelingFields(const QString &mdPath, const LabelResult &result)
     for (const QString &fmLine : frontmatterLines)
         out << fmLine << '\n';
     out << "---\n";
-    out << body;
+    out << newBody;
     out.flush();
     mdFile.flush();
 }
@@ -386,11 +492,14 @@ void writeLabelingFields(const QString &mdPath, const LabelResult &result)
 // TranscriptionWorker::run() accumulates live during a fresh transcription.
 // knownSpeakers is the file's own frontmatter "speakers:" allowlist (see
 // segmentLinePattern()'s doc comment) — the caller reads it alongside the
-// body since both come from the same frontmatter block.
+// body since both come from the same frontmatter block. stripPreludeIfPresent
+// first: the prelude is prose ABOUT the transcript, not spoken content, and
+// feeding a stale one back into the labeling prompt would bias the very
+// regeneration meant to replace it.
 QString plainTextFromTranscriptBody(const QString &body, const QStringList &knownSpeakers)
 {
     QStringList pieces;
-    QRegularExpressionMatchIterator it = segmentLinePattern(knownSpeakers).globalMatch(body);
+    QRegularExpressionMatchIterator it = segmentLinePattern(knownSpeakers).globalMatch(stripPreludeIfPresent(body));
     while (it.hasNext()) {
         const QRegularExpressionMatch m = it.next();
         const QString text = m.captured(3).trimmed();
@@ -398,6 +507,51 @@ QString plainTextFromTranscriptBody(const QString &body, const QStringList &know
             pieces.append(text);
     }
     return pieces.join(QLatin1Char(' '));
+}
+
+// Feature 3a ("generate chapters"): one segment's parsed identity from a
+// transcript body — this struct's position in the QList returned by
+// parsedSegmentsFromTranscriptBody() below IS its index (the same indexing
+// LabelingEngine::generateChapters() expects and returns "afterSegment"
+// against).
+struct ParsedSegment {
+    double t0 = 0.0;
+    QString text;
+};
+
+// A lightweight sibling to plainTextFromTranscriptBody() above — walks the
+// same segmentLinePattern().globalMatch() but keeps each segment's t0
+// alongside its text instead of discarding everything but the joined
+// string. Chapter generation needs both: text is what's actually shown to
+// the model (indexed), t0 is what a chapter's LLM-returned index gets
+// resolved to before anything touches disk (this app never trusts the LLM
+// to echo a timestamp back directly — see
+// LabelingEngine::generateChapters()'s doc comment).
+QList<ParsedSegment> parsedSegmentsFromTranscriptBody(const QString &body, const QStringList &knownSpeakers)
+{
+    QList<ParsedSegment> segments;
+    QRegularExpressionMatchIterator it = segmentLinePattern(knownSpeakers).globalMatch(stripPreludeIfPresent(body));
+    while (it.hasNext()) {
+        const QRegularExpressionMatch m = it.next();
+        const QString text = m.captured(3).trimmed();
+        if (text.isEmpty())
+            continue;
+        ParsedSegment segment;
+        segment.t0 = parseCompactTimestamp(m.captured(1));
+        segment.text = text;
+        segments.append(segment);
+    }
+    return segments;
+}
+
+// Feature 3a: "## [timestamp] title" marker line format — see
+// spliceBodyChapters()'s doc comment (TranscriptionController.h) for why
+// this is collision-free with segmentLinePattern() by construction. Group 1:
+// the timestamp text (parsed via parseCompactTimestamp, same helper/format
+// every other timestamp in this file uses); group 2: the title text.
+QRegularExpression chapterMarkerPattern()
+{
+    return QRegularExpression(QStringLiteral("^## \\[([\\d:.]+)\\] (.*)$"), QRegularExpression::MultilineOption);
 }
 
 // Item 14 "auto-categorize" mode: the existing tag vocabulary for a vault,
@@ -530,6 +684,49 @@ bool writeFrontmatterBlock(const QString &path, const QStringList &frontmatterLi
     mdFile.flush();
     mdFile.close();
     return true;
+}
+
+// Feature 3a: reopens mdPath, leaves frontmatter completely untouched
+// (chapters live purely in the body — no frontmatter key involved, unlike
+// label/tags), and splices `chapters` into the body via spliceBodyChapters()
+// — which itself strips any existing marker set first, so regeneration
+// (a later "generate chapters" call on the same file) replaces the old set
+// wholesale rather than accumulating duplicates, same policy as Feature 2's
+// prelude. A failure here IS surfaced as the job's own failure (see
+// TranscriptionWorker::generateChaptersJob()).
+bool writeChaptersField(const QString &mdPath, const QList<ResolvedChapter> &chapters, QString *errorOut)
+{
+    QFile mdFile(mdPath);
+    if (!mdFile.open(QIODevice::ReadOnly | QIODevice::Text)) {
+        if (errorOut)
+            *errorOut = QStringLiteral("could not reopen %1 to write chapters").arg(mdPath);
+        return false;
+    }
+    QTextStream in(&mdFile);
+    if (in.readLine() != QStringLiteral("---")) {
+        if (errorOut)
+            *errorOut = QStringLiteral("%1 has no frontmatter block").arg(mdPath);
+        return false;
+    }
+    QStringList frontmatterLines;
+    QString line;
+    bool closed = false;
+    while (!(line = in.readLine()).isNull()) {
+        if (line == QStringLiteral("---")) {
+            closed = true;
+            break;
+        }
+        frontmatterLines.append(line);
+    }
+    if (!closed) {
+        if (errorOut)
+            *errorOut = QStringLiteral("%1 has a malformed frontmatter block").arg(mdPath);
+        return false;
+    }
+    const QString body = in.readAll();
+    mdFile.close();
+
+    return writeFrontmatterBlock(mdPath, frontmatterLines, spliceBodyChapters(body, chapters), errorOut);
 }
 
 // Rewrites every "[oldName]" segment-line speaker tag in path's transcript
@@ -794,6 +991,56 @@ void SegmentLineWriter::tryMergeCycle()
     }
 }
 
+// See this function's doc comment in TranscriptionController.h.
+QString spliceBodyChapters(const QString &body, const QList<ResolvedChapter> &chapters)
+{
+    QString result = body;
+
+    // Strip every existing marker line first — offsets computed below are
+    // against this already-stripped string, so a chapter's target segment
+    // line is found at its TRUE (post-strip) position, not shifted by
+    // whatever marker set a previous "generate chapters" run left behind.
+    QVector<QRegularExpressionMatch> existingMarkers;
+    QRegularExpressionMatchIterator stripIt = chapterMarkerPattern().globalMatch(result);
+    while (stripIt.hasNext())
+        existingMarkers.append(stripIt.next());
+    for (auto matchIt = existingMarkers.crbegin(); matchIt != existingMarkers.crend(); ++matchIt) {
+        int start = matchIt->capturedStart(0);
+        int length = matchIt->capturedLength(0);
+        if (start + length < result.size() && result.at(start + length) == QLatin1Char('\n'))
+            ++length; // swallow the marker's own trailing newline too
+        result.remove(start, length);
+    }
+
+    // Locate every target offset UP FRONT, against the one unmodified
+    // (post-strip) string — only then sort descending and insert, so each
+    // insertion never invalidates an offset already computed for another
+    // chapter still pending (see this function's doc comment in the header).
+    struct PendingInsert {
+        int offset;
+        QString marker;
+    };
+    QList<PendingInsert> pending;
+    pending.reserve(chapters.size());
+    for (const ResolvedChapter &chapter : chapters) {
+        const QString anchor = QStringLiteral("[") + formatTimestamp(chapter.t0) + QStringLiteral("]");
+        const QRegularExpression lineStart(QStringLiteral("^") + QRegularExpression::escape(anchor),
+                                            QRegularExpression::MultilineOption);
+        const QRegularExpressionMatch m = lineStart.match(result);
+        if (!m.hasMatch())
+            continue; // target segment not found — defensive, shouldn't happen for a caller-resolved t0
+        pending.append({static_cast<int>(m.capturedStart(0)),
+                         QStringLiteral("## [") + formatTimestamp(chapter.t0) + QStringLiteral("] ") + chapter.title
+                             + QLatin1Char('\n')});
+    }
+    std::sort(pending.begin(), pending.end(),
+              [](const PendingInsert &a, const PendingInsert &b) { return a.offset > b.offset; });
+    for (const PendingInsert &p : std::as_const(pending))
+        result.insert(p.offset, p.marker);
+
+    return result;
+}
+
 // Lives on TranscriptionController's dedicated QThread; never touches the
 // GUI thread. Owns the warm WhisperCppEngine so the model stays resident
 // across transcribe() calls.
@@ -875,6 +1122,11 @@ public slots:
             emit finished(false, QStringLiteral("failed to load model at %1").arg(modelPath));
             return;
         }
+        // Item O35: whichever backend whisper.cpp just picked for this load
+        // (see WhisperCppEngine::activeBackendName()'s doc comment) — fired
+        // here rather than after the later diarization-eviction reload below
+        // since QML only needs to know once per job, not on every reload.
+        emit backendNameChanged(m_engine->activeBackendName());
 
         // A cancel (or pause, which resolves to cancel — see
         // TranscriptionController::pauseActive()'s doc comment) requested
@@ -1146,8 +1398,18 @@ public slots:
     // already-transcribed file — no audio decode, no whisper, no frontmatter
     // reset. Unlike the autoLabel branch above, a failure here IS the job's
     // result (there's nothing else for this job to accomplish).
+    //
+    // skipIfAlreadyLabeled (item P21): only ever true for the automatic
+    // follow-up pass transcribe(autoLabel=true) queues right after its own
+    // transcribe job (see Job::skipIfAlreadyLabeled's doc comment) — false
+    // for the user's explicit "Regenerate label and prelude" button
+    // (relabel()), which must always force-regenerate. When true, an
+    // existing non-empty label/tags/prelude means this file was already
+    // labeled by a previous run (or a manual edit) and re-transcribing
+    // shouldn't clobber it — reports success with no LLM call rather than
+    // failure, since "nothing to do" isn't an error.
     void relabelJob(const QString &filePath, const QString &vaultPath, bool restrictTagsToExisting,
-                     double tagReuseBias)
+                     double tagReuseBias, double wordiness, bool skipIfAlreadyLabeled = false)
     {
         // Mirrors run()'s eviction of the label engine (see its doc
         // comment): this job needs only the label engine, so free whisper's
@@ -1175,19 +1437,38 @@ public slots:
             emit finished(false, QStringLiteral("%1 has no frontmatter block").arg(mdPath));
             return;
         }
-        // Pull out "speakers:" while skipping the rest of the frontmatter —
-        // plainTextFromTranscriptBody() needs the file's own known-speaker
-        // allowlist (see segmentLinePattern()'s doc comment) to correctly
-        // strip ONLY real speaker tags, not hallucinated bracketed text.
+        // Pull out "speakers:"/"label:"/"tags:" while skipping the rest of
+        // the frontmatter — speakers feeds plainTextFromTranscriptBody()'s
+        // known-speaker allowlist (see segmentLinePattern()'s doc comment);
+        // label/tags feed the skipIfAlreadyLabeled check below (item P21).
         QStringList knownSpeakers;
+        QString existingLabel;
+        QString existingTags;
         QString line;
         while (!(line = in.readLine()).isNull() && line != QStringLiteral("---")) {
             const int colon = line.indexOf(':');
-            if (colon >= 0 && line.left(colon).trimmed() == QStringLiteral("speakers"))
+            if (colon < 0)
+                continue;
+            const QString key = line.left(colon).trimmed();
+            if (key == QStringLiteral("speakers"))
                 knownSpeakers = parseSpeakersList(line.mid(colon + 1));
+            else if (key == QStringLiteral("label"))
+                existingLabel = line.mid(colon + 1).trimmed();
+            else if (key == QStringLiteral("tags"))
+                existingTags = line.mid(colon + 1).trimmed();
         }
-        const QString transcriptText = plainTextFromTranscriptBody(in.readAll(), knownSpeakers);
+        const QString rawBody = in.readAll();
+        const QString transcriptText = plainTextFromTranscriptBody(rawBody, knownSpeakers);
         mdFile.close();
+
+        // Item P21: this is the automatic post-transcribe follow-up, not an
+        // explicit user request — don't clobber label/tags/prelude a
+        // previous run (or a manual edit) already produced.
+        if (skipIfAlreadyLabeled
+            && (!existingLabel.isEmpty() || !existingTags.isEmpty() || rawBody.contains(kPreludeEndMarker))) {
+            emit finished(true, {});
+            return;
+        }
 
         if (transcriptText.trimmed().isEmpty()) {
             emit finished(false, QStringLiteral("%1 has no transcript text to label").arg(mdPath));
@@ -1195,8 +1476,173 @@ public slots:
         }
 
         QString error;
-        if (!runLabelingPass(vaultPath, transcriptText, mdPath, restrictTagsToExisting, tagReuseBias, &error)) {
+        if (!runLabelingPass(vaultPath, transcriptText, mdPath, restrictTagsToExisting, tagReuseBias, wordiness,
+                              &error)) {
             emit finished(false, error);
+            return;
+        }
+        emit finished(true, {});
+    }
+
+    // Feature 3a ("generate chapters"): a second, separate LLM pass sharing
+    // the SAME resident label engine as relabelJob()/runLabelingPass() above
+    // (see LabelingEngine::generateChapters()'s doc comment) — never a
+    // second LabelingEngine instance. Mirrors relabelJob()'s shape closely:
+    // same eviction, same "reopen the .md, read frontmatter+body, no audio
+    // decode" approach, same "a failure here IS the job's result" contract.
+    void generateChaptersJob(const QString &filePath, const QString &vaultPath)
+    {
+        m_engine.reset();
+        m_diarizationEngine.reset();
+
+        const QString mdPath = sidecarPath(filePath);
+        if (!QFileInfo::exists(mdPath)) {
+            emit finished(false, QStringLiteral("%1 has not been transcribed yet").arg(filePath));
+            return;
+        }
+
+        QFile mdFile(mdPath);
+        if (!mdFile.open(QIODevice::ReadOnly | QIODevice::Text)) {
+            emit finished(false, QStringLiteral("could not open %1").arg(mdPath));
+            return;
+        }
+        QTextStream in(&mdFile);
+        if (in.readLine() != QStringLiteral("---")) {
+            emit finished(false, QStringLiteral("%1 has no frontmatter block").arg(mdPath));
+            return;
+        }
+        QStringList knownSpeakers;
+        QString line;
+        while (!(line = in.readLine()).isNull() && line != QStringLiteral("---")) {
+            const int colon = line.indexOf(':');
+            if (colon >= 0 && line.left(colon).trimmed() == QStringLiteral("speakers"))
+                knownSpeakers = parseSpeakersList(line.mid(colon + 1));
+        }
+        const QString body = in.readAll();
+        mdFile.close();
+
+        // Fresh parse of THIS job's own read of the file — the exact (index,
+        // t0, text) tuples chapter generation needs (see
+        // parsedSegmentsFromTranscriptBody()'s doc comment): index i's
+        // position in this list IS the index LabelingEngine::
+        // generateChapters() expects and returns "afterSegment" against.
+        const QList<ParsedSegment> segments = parsedSegmentsFromTranscriptBody(body, knownSpeakers);
+        if (segments.isEmpty()) {
+            emit finished(false, QStringLiteral("%1 has no transcript text to generate chapters from").arg(mdPath));
+            return;
+        }
+
+        QString labelError;
+        const QString labelModelPath = ModelManager::ensureLabelModel(QUrl::fromLocalFile(vaultPath), &labelError);
+        if (labelModelPath.isEmpty()) {
+            emit finished(false, QStringLiteral("auto-label model unavailable: %1").arg(labelError));
+            return;
+        }
+        if (!m_labelingEngine || !m_labelingEngine->isValid() || m_labelModelPath != labelModelPath) {
+            m_labelingEngine = std::make_unique<LabelingEngine>(labelModelPath);
+            m_labelModelPath = labelModelPath;
+        }
+        if (!m_labelingEngine->isValid()) {
+            emit finished(false, QStringLiteral("failed to load labeling model at %1").arg(labelModelPath));
+            return;
+        }
+
+        QStringList segmentTexts;
+        segmentTexts.reserve(segments.size());
+        for (const ParsedSegment &segment : segments)
+            segmentTexts.append(segment.text);
+
+        // Item P34: generateChapters() silently truncates (with a qWarning)
+        // any single call whose formatted "INDEX: text\n" input exceeds
+        // LabelingEngine::kMaxChapterInputChars — for a long file, one call
+        // over the whole transcript meant everything past ~20 minutes of
+        // speech never got proposed at all. Fix: split into multiple
+        // windows, each kept under that budget, call generateChapters()
+        // once per window, and offset each window's returned
+        // afterSegmentIndex (0-relative to THAT window's own segmentTexts
+        // slice) by the window's starting index in the full segments list
+        // before merging. A window's cost estimate mirrors generateChapters(
+        // )'s own "index: text\n" formatting exactly (digit count of i, ": ",
+        // text, '\n') so the window boundary lands at the same place the
+        // single-call truncation would have.
+        QList<int> windowStarts; // segment index each window begins at
+        {
+            int windowStart = 0;
+            qsizetype windowChars = 0;
+            for (int i = 0; i < segmentTexts.size(); ++i) {
+                const qsizetype segChars =
+                    QString::number(i - windowStart).size() + 2 + segmentTexts.at(i).size() + 1;
+                if (i > windowStart && windowChars + segChars > LabelingEngine::kMaxChapterInputChars) {
+                    windowStarts.append(windowStart);
+                    windowStart = i;
+                    windowChars = 0;
+                }
+                windowChars += segChars;
+            }
+            windowStarts.append(windowStart);
+        }
+        // Don't let a pathologically small trailing window (e.g. one
+        // segment left over) waste a whole extra LLM call on almost nothing
+        // — fold it into the previous window if it's under a quarter of the
+        // full transcript's average window size. Only meaningful once
+        // there's more than one window.
+        if (windowStarts.size() > 1) {
+            const qsizetype lastWindowSegCount = segmentTexts.size() - windowStarts.last();
+            const qsizetype avgWindowSegCount = segmentTexts.size() / windowStarts.size();
+            if (lastWindowSegCount < avgWindowSegCount / 4)
+                windowStarts.removeLast();
+        }
+
+        QList<Chapter> chapters;
+        for (int w = 0; w < windowStarts.size(); ++w) {
+            const int startIdx = windowStarts.at(w);
+            const int endIdx = (w + 1 < windowStarts.size()) ? windowStarts.at(w + 1) : segmentTexts.size();
+            const QStringList windowTexts = segmentTexts.mid(startIdx, endIdx - startIdx);
+
+            QString genError;
+            const auto windowChapters = m_labelingEngine->generateChapters(windowTexts, &genError);
+            if (!windowChapters) {
+                emit finished(false, QStringLiteral("chapter generation failed: %1").arg(genError));
+                return;
+            }
+            // afterSegmentIndex is 0-relative to THIS window's own
+            // windowTexts slice (see generateChapters()'s doc comment) —
+            // offset by startIdx so it's relative to the full file's
+            // segments list instead, exactly as if one single call had
+            // produced it (startIdx is 0 for the first window, a no-op
+            // offset there). The existing bounds/dedup/empty-title check
+            // below (against the full `segments` list) still applies
+            // uniformly across every window's contributions.
+            for (const Chapter &chapter : *windowChapters)
+                chapters.append({chapter.afterSegmentIndex + startIdx, chapter.title});
+        }
+
+        // See LabelingEngine::generateChapters()'s doc comment: the LLM only
+        // ever returns which SEGMENT INDEX a chapter starts after — never
+        // trusted as a timestamp directly. Resolved here, against this
+        // job's own freshly-parsed `segments` (exact t0 values), before
+        // anything touches disk. Out-of-range or duplicate target indices
+        // (and an empty title, which would otherwise render as a bare
+        // "## [t] " marker line) are silently dropped, not treated as a job
+        // failure — the grammar only constrains JSON shape, never the
+        // semantic validity of the integer (a small model can still propose
+        // e.g. afterSegment=99999 on a 50-segment transcript).
+        QList<ResolvedChapter> resolved;
+        QSet<int> seenTargets;
+        for (const Chapter &chapter : chapters) {
+            const int targetIndex = chapter.afterSegmentIndex + 1;
+            const QString title = chapter.title.trimmed();
+            if (targetIndex < 0 || targetIndex >= segments.size() || title.isEmpty())
+                continue;
+            if (seenTargets.contains(targetIndex))
+                continue;
+            seenTargets.insert(targetIndex);
+            resolved.append({segments.at(targetIndex).t0, title});
+        }
+
+        QString writeError;
+        if (!writeChaptersField(mdPath, resolved, &writeError)) {
+            emit finished(false, writeError);
             return;
         }
         emit finished(true, {});
@@ -1301,6 +1747,12 @@ signals:
     // transcribing); never emitted by relabelJob()/renameSpeaker()/
     // mergeSpeakers() (none of these have phases worth naming).
     void phase(const QString &phase);
+    // Item O35: fired once right after a model successfully (re)loads in
+    // run() — see WhisperCppEngine::activeBackendName()'s doc comment for
+    // where the value itself comes from. Never emitted by relabelJob()/
+    // renameSpeaker()/mergeSpeakers()/download() (none of them touch
+    // WhisperCppEngine).
+    void backendNameChanged(const QString &name);
     // Wave N (task system): fired on a real pause/resume transition (never
     // on every poll — see waitWhilePausedOrCancelled()'s "only on change"
     // discipline).
@@ -1324,7 +1776,8 @@ private:
     // Resolves/warms the label model, generates, and splices the result into
     // mdPath's frontmatter. Returns false + *errorOut on failure.
     bool runLabelingPass(const QString &vaultPath, const QString &transcriptText, const QString &mdPath,
-                         bool restrictTagsToExisting, double tagReuseBias, QString *errorOut = nullptr)
+                         bool restrictTagsToExisting, double tagReuseBias, double wordiness,
+                         QString *errorOut = nullptr)
     {
         QString labelError;
         const QString labelModelPath = ModelManager::ensureLabelModel(QUrl::fromLocalFile(vaultPath), &labelError);
@@ -1354,9 +1807,24 @@ private:
         // unrestricted mode, whereas before this scan only ran for the hard-
         // restrict case.
         const QStringList existingTags = collectVaultTags(vaultPath);
+        // Item P29: a short transcript shouldn't get a disproportionately
+        // long prelude just because the user's global wordiness slider is
+        // set high — cap the EFFECTIVE wordiness by transcript length (word
+        // count is a cheap, good-enough proxy for "how much is there to
+        // summarize"). Thresholds are deliberately coarse steps, not a
+        // precise formula — this only needs to stop the "3-sentence
+        // transcript, 5-paragraph prelude" case, not fine-tune prose length.
+        const int wordCount = transcriptText.split(QRegularExpression(QStringLiteral("\\s+")),
+                                                     Qt::SkipEmptyParts)
+                                   .size();
+        double effectiveWordiness = wordiness;
+        if (wordCount < 50)
+            effectiveWordiness = std::min(wordiness, 0.15);
+        else if (wordCount < 150)
+            effectiveWordiness = std::min(wordiness, 0.35);
         QString genError;
-        const auto result =
-            m_labelingEngine->label(transcriptText, existingTags, restrictTagsToExisting, tagReuseBias, &genError);
+        const auto result = m_labelingEngine->label(transcriptText, existingTags, restrictTagsToExisting,
+                                                     tagReuseBias, effectiveWordiness, &genError);
         if (!result) {
             const QString msg = QStringLiteral("auto-label generation failed: %1").arg(genError);
             if (errorOut)
@@ -1464,6 +1932,7 @@ TranscriptionController::TranscriptionController(QObject *parent)
         emit activePausedChanged();
     });
     connect(this, &TranscriptionController::queueChanged, this, &TranscriptionController::persistQueue);
+    connect(this, &TranscriptionController::queueChanged, this, &TranscriptionController::rebuildJobStatusIndex);
     connect(m_worker, &TranscriptionWorker::segmentWritten, this, [this] {
         m_liveUpdateTick++;
         emit liveUpdateTickChanged();
@@ -1482,6 +1951,12 @@ TranscriptionController::TranscriptionController(QObject *parent)
         else
             m_indeterminatePhaseTimer->stop();
         recomputeOverallProgress();
+    });
+    connect(m_worker, &TranscriptionWorker::backendNameChanged, this, [this](const QString &name) {
+        if (m_activeBackendName != name) {
+            m_activeBackendName = name;
+            emit activeBackendNameChanged();
+        }
     });
     connect(m_worker, &TranscriptionWorker::finished, this, &TranscriptionController::onWorkerFinished);
     connect(m_worker, &TranscriptionWorker::speakerRenamed, this,
@@ -1534,45 +2009,82 @@ const QStringList TranscriptionController::kTimedPhases = {
 // "detecting-speakers-segmenting"/"detecting-speakers-identifying" (see
 // run()'s doc comment on the 0.30 sub-phase boundary) — both belong to the
 // single "detecting-speakers" bucket for timing/weighting purposes. Every
-// other phase name is already its own bucket.
-static QString canonicalPhaseKey(const QString &phase)
+// other phase name is already its own bucket. This is the BUCKET identity
+// only (used to compare against recomputeOverallProgress()'s `active` list
+// and to look up defaultPhaseDurationMs()) — NOT the m_phaseTimings storage
+// key, see canonicalPhaseKey() below for that.
+static QString phaseBucket(const QString &phase)
 {
     if (phase.startsWith(QStringLiteral("detecting-speakers")))
         return QStringLiteral("detecting-speakers");
     return phase;
 }
 
+// 2026-07-10 (item P3): m_phaseTimings' actual storage key — folds modelId
+// (and, only when relevant, an explicit "diar" marker for speakerDetection)
+// onto the phase bucket name. A large model's "loading"/"transcribing" takes
+// materially longer than a tiny one, and diarization adds real per-job
+// overhead — sharing one rolling average across every model/config produced
+// meaningless bar proportions and ETAs the instant a user switched models.
+// modelId is deliberately part of the key for EVERY phase (not just
+// "loading"/"transcribing" where it obviously matters) — keeping one
+// consistent key shape is simpler than special-casing which phases care.
+static QString canonicalPhaseKey(const QString &phase, const QString &modelId, bool speakerDetection)
+{
+    QString key = phaseBucket(phase) + QLatin1Char('|') + modelId;
+    if (speakerDetection)
+        key += QStringLiteral("|diar");
+    return key;
+}
+
+// modelId of whichever job is currently Active, or empty if none — the
+// per-config timing key (canonicalPhaseKey()) needs this at each of the three
+// points below; job.modelId (set in transcribe()) and m_activeSpeakerDetection
+// (set in startJob()) are both already available here since m_activeIndex
+// only clears in onWorkerFinished(), which runs strictly after every
+// phase()/phaseDurationMs() signal for that job.
+QString TranscriptionController::activeModelIdForTiming() const
+{
+    if (m_activeIndex >= 0 && m_activeIndex < m_jobs.size())
+        return m_jobs[m_activeIndex].modelId;
+    return QString();
+}
+
 void TranscriptionController::loadPhaseTimings()
 {
+    // 2026-07-10 (item P3): keys are now composite (phase|modelId[|diar]),
+    // so there's no fixed upfront list to load by name — enumerate whatever
+    // keys are actually persisted instead. childKeys() naturally covers every
+    // model/config combination ever recorded on this machine.
     QSettings settings;
     settings.beginGroup(QStringLiteral("phaseTimings"));
-    for (const QString &phaseName : kTimedPhases) {
-        const QVariantList stored = settings.value(phaseName).toList();
+    for (const QString &key : settings.childKeys()) {
+        const QVariantList stored = settings.value(key).toList();
         QVector<double> samples;
         samples.reserve(stored.size());
         for (const QVariant &v : stored)
             samples.append(v.toDouble());
         RollingAverage avg;
         avg.setSamples(samples);
-        m_phaseTimings.insert(phaseName, avg);
+        m_phaseTimings.insert(key, avg);
     }
     settings.endGroup();
 }
 
-void TranscriptionController::savePhaseTiming(const QString &phase)
+void TranscriptionController::savePhaseTiming(const QString &key)
 {
     QSettings settings;
     settings.beginGroup(QStringLiteral("phaseTimings"));
     QVariantList list;
-    for (double v : m_phaseTimings.value(phase).samples())
+    for (double v : m_phaseTimings.value(key).samples())
         list.append(v);
-    settings.setValue(phase, list);
+    settings.setValue(key, list);
     settings.endGroup();
 }
 
 void TranscriptionController::recordPhaseDuration(const QString &phase, qint64 durationMs)
 {
-    const QString key = canonicalPhaseKey(phase);
+    const QString key = canonicalPhaseKey(phase, activeModelIdForTiming(), m_activeSpeakerDetection);
     m_phaseTimings[key].addSample(static_cast<double>(durationMs));
     savePhaseTiming(key);
     recomputeOverallProgress();
@@ -1596,7 +2108,8 @@ double TranscriptionController::phaseRelativeSyntheticProgress() const
 {
     if (m_phase != QStringLiteral("loading") && m_phase != QStringLiteral("decoding"))
         return m_progress;
-    const double avg = m_phaseTimings.value(m_phase).average(defaultPhaseDurationMs(m_phase));
+    const QString key = canonicalPhaseKey(m_phase, activeModelIdForTiming(), m_activeSpeakerDetection);
+    const double avg = m_phaseTimings.value(key).average(defaultPhaseDurationMs(m_phase));
     if (avg <= 0.0)
         return 0.0;
     const qint64 elapsedInPhase = activeElapsedMs() - m_phaseStartMs;
@@ -1616,21 +2129,24 @@ void TranscriptionController::recomputeOverallProgress()
         active.append(QStringLiteral("detecting-speakers"));
     active.append(QStringLiteral("transcribing"));
 
+    const QString modelId = activeModelIdForTiming();
+
     double totalWeight = 0.0;
     QMap<QString, double> weight;
     for (const QString &p : std::as_const(active)) {
-        const double w = m_phaseTimings.value(p).average(defaultPhaseDurationMs(p));
+        const double w = m_phaseTimings.value(canonicalPhaseKey(p, modelId, m_activeSpeakerDetection))
+                              .average(defaultPhaseDurationMs(p));
         weight[p] = w;
         totalWeight += w;
     }
     if (totalWeight <= 0.0)
         totalWeight = 1.0;
 
-    const QString currentKey = canonicalPhaseKey(m_phase);
+    const QString currentBucket = phaseBucket(m_phase);
     double offset = 0.0;
     for (const QString &p : std::as_const(active)) {
         const double share = weight[p] / totalWeight;
-        if (p == currentKey) {
+        if (p == currentBucket) {
             m_overallProgress = offset + phaseRelativeSyntheticProgress() * share;
             emit overallProgressChanged();
             return;
@@ -1648,6 +2164,29 @@ bool TranscriptionController::isQueued(const QUrl &fileUrl) const
             return true;
     }
     return false;
+}
+
+void TranscriptionController::rebuildJobStatusIndex()
+{
+    QHash<QString, JobStatus> rebuilt;
+    for (const Job &job : m_jobs) {
+        if (job.fileUrl.isEmpty())
+            continue; // download job — names no single vault file
+        const QString path = job.fileUrl.toLocalFile();
+        const auto it = rebuilt.constFind(path);
+        if (it == rebuilt.constEnd() || jobStatusPriority(job.status) > jobStatusPriority(it.value()))
+            rebuilt[path] = job.status;
+    }
+    if (rebuilt != m_jobStatusByPath) {
+        m_jobStatusByPath = rebuilt;
+        emit jobStatusesChanged();
+    }
+}
+
+int TranscriptionController::jobStatusForPath(const QString &path) const
+{
+    const auto it = m_jobStatusByPath.constFind(path);
+    return it == m_jobStatusByPath.constEnd() ? static_cast<int>(JobStatus::None) : static_cast<int>(it.value());
 }
 
 bool TranscriptionController::matchesExistingTranscription(const QUrl &fileUrl, const QString &modelId,
@@ -1682,23 +2221,33 @@ bool TranscriptionController::matchesExistingTranscription(const QUrl &fileUrl, 
 
 void TranscriptionController::transcribe(const QUrl &fileUrl, const QUrl &vaultUrl, const QString &modelId,
                                           bool speakerDetection, bool autoLabel, bool restrictTagsToExisting,
-                                          double tagReuseBias)
+                                          double tagReuseBias, double wordiness)
 {
     // Done/Failed entries for the same fileUrl deliberately do NOT block
     // re-queueing (see class doc) — only Queued/Active does.
     if (isQueued(fileUrl))
         return;
 
+    // Item O15: a freshly requested job jumps ahead of whatever's already
+    // Queued — see frontOfQueueInsertIndex()'s doc comment. startIndex
+    // remembers where the FIRST newly-added entry (a download job, if one
+    // was queued, otherwise this transcribe job itself) landed, so
+    // autostart-if-idle below starts the right one; insertAt then walks
+    // forward as each subsequent entry (download(s), the transcribe job
+    // itself, autoLabel's follow-up relabel job) is inserted right after the
+    // previous one, keeping this whole cluster contiguous at the front of
+    // the queue rather than scattered.
+    int insertAt = frontOfQueueInsertIndex();
+    const int startIndex = insertAt;
+
     // Item 5 (Wave N): the model(s) this job needs, queued as their OWN
     // job(s) ahead of it if not already on disk — see
-    // maybeQueueDownloadJob()'s doc comment. startIndex remembers where the
-    // FIRST newly-added entry (a download job, if one was queued, otherwise
-    // this transcribe job itself) landed, so autostart-if-idle below starts
-    // the right one.
-    const int startIndex = m_jobs.size();
-    maybeQueueDownloadJob(DownloadTarget::WhisperModel, vaultUrl, modelId);
-    if (speakerDetection)
-        maybeQueueDownloadJob(DownloadTarget::DiarizationModels, vaultUrl, QString());
+    // maybeQueueDownloadJob()'s doc comment.
+    if (maybeQueueDownloadJob(DownloadTarget::WhisperModel, vaultUrl, modelId, insertAt) >= 0)
+        ++insertAt;
+    if (speakerDetection
+        && maybeQueueDownloadJob(DownloadTarget::DiarizationModels, vaultUrl, QString(), insertAt) >= 0)
+        ++insertAt;
 
     Job job;
     job.id = m_nextJobId++;
@@ -1709,8 +2258,10 @@ void TranscriptionController::transcribe(const QUrl &fileUrl, const QUrl &vaultU
     job.autoLabel = autoLabel;
     job.restrictTagsToExisting = restrictTagsToExisting;
     job.tagReuseBias = tagReuseBias;
+    job.wordiness = wordiness;
     job.status = JobStatus::Queued;
-    m_jobs.push_back(job);
+    m_jobs.insert(insertAt, job);
+    ++insertAt;
 
     // autoLabel's follow-up label pass is queued as its OWN job right NOW —
     // both entries show up in the Tasks list together immediately, rather
@@ -1722,16 +2273,19 @@ void TranscriptionController::transcribe(const QUrl &fileUrl, const QUrl &vaultU
     // it is NOT silently skipped just because its upstream job failed, so
     // the Tasks list always reflects exactly what was requested.
     if (autoLabel) {
-        maybeQueueDownloadJob(DownloadTarget::LabelModel, vaultUrl, QString());
+        if (maybeQueueDownloadJob(DownloadTarget::LabelModel, vaultUrl, QString(), insertAt) >= 0)
+            ++insertAt;
         Job labelJob;
         labelJob.id = m_nextJobId++;
         labelJob.fileUrl = fileUrl;
         labelJob.vaultUrl = vaultUrl;
         labelJob.relabelOnly = true;
+        labelJob.skipIfAlreadyLabeled = true;
         labelJob.restrictTagsToExisting = restrictTagsToExisting;
         labelJob.tagReuseBias = tagReuseBias;
+        labelJob.wordiness = wordiness;
         labelJob.status = JobStatus::Queued;
-        m_jobs.push_back(labelJob);
+        m_jobs.insert(insertAt, labelJob);
     }
 
     emit queueChanged();
@@ -1742,22 +2296,27 @@ void TranscriptionController::transcribe(const QUrl &fileUrl, const QUrl &vaultU
 
 void TranscriptionController::transcribeAll(const QVariantList &fileUrls, const QUrl &vaultUrl,
                                              const QString &modelId, bool speakerDetection, bool autoLabel,
-                                             bool restrictTagsToExisting, double tagReuseBias)
+                                             bool restrictTagsToExisting, double tagReuseBias, double wordiness)
 {
     for (const QVariant &v : fileUrls)
-        transcribe(v.toUrl(), vaultUrl, modelId, speakerDetection, autoLabel, restrictTagsToExisting, tagReuseBias);
+        transcribe(v.toUrl(), vaultUrl, modelId, speakerDetection, autoLabel, restrictTagsToExisting, tagReuseBias,
+                   wordiness);
 }
 
 void TranscriptionController::relabel(const QUrl &fileUrl, const QUrl &vaultUrl, bool restrictTagsToExisting,
-                                       double tagReuseBias)
+                                       double tagReuseBias, double wordiness)
 {
     // Same dedup rule as transcribe(): a Queued/Active entry (whether a full
     // transcribe or a relabel-only job) blocks a duplicate request.
     if (isQueued(fileUrl))
         return;
 
-    const int startIndex = m_jobs.size();
-    maybeQueueDownloadJob(DownloadTarget::LabelModel, vaultUrl, QString());
+    // Item O15: see transcribe()'s identical use of frontOfQueueInsertIndex()
+    // for why this jumps ahead of whatever's already Queued.
+    int insertAt = frontOfQueueInsertIndex();
+    const int startIndex = insertAt;
+    if (maybeQueueDownloadJob(DownloadTarget::LabelModel, vaultUrl, QString(), insertAt) >= 0)
+        ++insertAt;
 
     Job job;
     job.id = m_nextJobId++;
@@ -1766,8 +2325,9 @@ void TranscriptionController::relabel(const QUrl &fileUrl, const QUrl &vaultUrl,
     job.relabelOnly = true;
     job.restrictTagsToExisting = restrictTagsToExisting;
     job.tagReuseBias = tagReuseBias;
+    job.wordiness = wordiness;
     job.status = JobStatus::Queued;
-    m_jobs.push_back(job);
+    m_jobs.insert(insertAt, job);
     emit queueChanged();
 
     if (m_activeIndex < 0)
@@ -1775,10 +2335,44 @@ void TranscriptionController::relabel(const QUrl &fileUrl, const QUrl &vaultUrl,
 }
 
 void TranscriptionController::relabelAll(const QVariantList &fileUrls, const QUrl &vaultUrl,
-                                          bool restrictTagsToExisting, double tagReuseBias)
+                                          bool restrictTagsToExisting, double tagReuseBias, double wordiness)
 {
     for (const QVariant &v : fileUrls)
-        relabel(v.toUrl(), vaultUrl, restrictTagsToExisting, tagReuseBias);
+        relabel(v.toUrl(), vaultUrl, restrictTagsToExisting, tagReuseBias, wordiness);
+}
+
+void TranscriptionController::generateChapters(const QUrl &fileUrl, const QUrl &vaultUrl)
+{
+    // Same dedup rule as relabel() — see its doc comment.
+    if (isQueued(fileUrl))
+        return;
+
+    // Item O15: see transcribe()'s identical use of frontOfQueueInsertIndex()
+    // for why this jumps ahead of whatever's already Queued.
+    int insertAt = frontOfQueueInsertIndex();
+    const int startIndex = insertAt;
+    // Chapters use the same label model as relabel() — see
+    // LabelingEngine::generateChapters()'s doc comment.
+    if (maybeQueueDownloadJob(DownloadTarget::LabelModel, vaultUrl, QString(), insertAt) >= 0)
+        ++insertAt;
+
+    Job job;
+    job.id = m_nextJobId++;
+    job.fileUrl = fileUrl;
+    job.vaultUrl = vaultUrl;
+    job.generateChaptersOnly = true;
+    job.status = JobStatus::Queued;
+    m_jobs.insert(insertAt, job);
+    emit queueChanged();
+
+    if (m_activeIndex < 0)
+        startJob(startIndex);
+}
+
+void TranscriptionController::generateChaptersAll(const QVariantList &fileUrls, const QUrl &vaultUrl)
+{
+    for (const QVariant &v : fileUrls)
+        generateChapters(v.toUrl(), vaultUrl);
 }
 
 void TranscriptionController::startJob(int index)
@@ -1832,7 +2426,12 @@ void TranscriptionController::startJob(int index)
         QMetaObject::invokeMethod(m_worker, "relabelJob", Qt::QueuedConnection,
                                    Q_ARG(QString, job.fileUrl.toLocalFile()),
                                    Q_ARG(QString, job.vaultUrl.toLocalFile()),
-                                   Q_ARG(bool, job.restrictTagsToExisting), Q_ARG(double, job.tagReuseBias));
+                                   Q_ARG(bool, job.restrictTagsToExisting), Q_ARG(double, job.tagReuseBias),
+                                   Q_ARG(double, job.wordiness), Q_ARG(bool, job.skipIfAlreadyLabeled));
+    } else if (job.generateChaptersOnly) {
+        QMetaObject::invokeMethod(m_worker, "generateChaptersJob", Qt::QueuedConnection,
+                                   Q_ARG(QString, job.fileUrl.toLocalFile()),
+                                   Q_ARG(QString, job.vaultUrl.toLocalFile()));
     } else if (job.downloadTarget != DownloadTarget::None) {
         QString target;
         switch (job.downloadTarget) {
@@ -2167,7 +2766,7 @@ bool TranscriptionController::isDownloadQueued(DownloadTarget target, const QUrl
 }
 
 int TranscriptionController::maybeQueueDownloadJob(DownloadTarget target, const QUrl &vaultUrl,
-                                                    const QString &modelId)
+                                                    const QString &modelId, int insertIndex)
 {
     bool alreadyOnDisk = false;
     switch (target) {
@@ -2201,8 +2800,21 @@ int TranscriptionController::maybeQueueDownloadJob(DownloadTarget target, const 
     job.modelId = modelId; // only meaningful for WhisperModel
     job.downloadTarget = target;
     job.status = JobStatus::Queued;
-    m_jobs.push_back(job);
+    const int at = (insertIndex < 0) ? m_jobs.size() : std::clamp(insertIndex, 0, static_cast<int>(m_jobs.size()));
+    m_jobs.insert(at, job);
     return job.id;
+}
+
+// See this method's header doc comment.
+int TranscriptionController::frontOfQueueInsertIndex() const
+{
+    if (m_activeIndex >= 0)
+        return m_activeIndex + 1;
+    for (int i = 0; i < m_jobs.size(); ++i) {
+        if (m_jobs[i].status == JobStatus::Queued)
+            return i;
+    }
+    return m_jobs.size();
 }
 
 QString TranscriptionController::tasksJsonPath(const QUrl &vaultUrl)
@@ -2233,6 +2845,7 @@ void TranscriptionController::persistQueue() const
         obj["speakerDetection"] = job.speakerDetection;
         obj["restrictTagsToExisting"] = job.restrictTagsToExisting;
         obj["tagReuseBias"] = job.tagReuseBias;
+        obj["wordiness"] = job.wordiness;
         obj["oldSpeakerName"] = job.oldSpeakerName;
         obj["newSpeakerName"] = job.newSpeakerName;
         obj["sourceSpeakerName"] = job.sourceSpeakerName;
@@ -2309,7 +2922,9 @@ void TranscriptionController::enqueueReplayedJob(const QString &kind, const QJso
     const QUrl fileUrl(obj.value("fileUrl").toString());
     const QUrl jobVaultUrl(obj.value("vaultUrl").toString());
 
-    if (kind == QStringLiteral("relabel")) {
+    if (kind == QStringLiteral("relabel") || kind == QStringLiteral("chapters")) {
+        // Chapters use the same label model as relabel — see
+        // LabelingEngine::generateChapters()'s doc comment.
         maybeQueueDownloadJob(DownloadTarget::LabelModel, jobVaultUrl, QString());
     } else if (kind != QStringLiteral("rename") && kind != QStringLiteral("merge")) {
         // "transcribe"
@@ -2327,6 +2942,7 @@ void TranscriptionController::enqueueReplayedJob(const QString &kind, const QJso
         job.relabelOnly = true;
         job.restrictTagsToExisting = obj.value("restrictTagsToExisting").toBool();
         job.tagReuseBias = obj.value("tagReuseBias").toDouble(0.5);
+        job.wordiness = obj.value("wordiness").toDouble(0.5);
     } else if (kind == QStringLiteral("rename")) {
         job.renameSpeakerOnly = true;
         job.oldSpeakerName = obj.value("oldSpeakerName").toString();
@@ -2335,6 +2951,8 @@ void TranscriptionController::enqueueReplayedJob(const QString &kind, const QJso
         job.mergeSpeakersOnly = true;
         job.sourceSpeakerName = obj.value("sourceSpeakerName").toString();
         job.targetSpeakerName = obj.value("targetSpeakerName").toString();
+    } else if (kind == QStringLiteral("chapters")) {
+        job.generateChaptersOnly = true;
     } else {
         job.modelId = obj.value("modelId").toString();
         job.speakerDetection = obj.value("speakerDetection").toBool();
@@ -2379,10 +2997,24 @@ void TranscriptionController::terminateApplicationImmediately() const
 
 QVariantMap TranscriptionController::readMetadata(const QUrl &fileUrl) const
 {
-    QVariantMap result;
+    const QString mdPath = sidecarPath(fileUrl.toLocalFile());
+    const QFileInfo fi(mdPath);
+    if (!fi.exists())
+        return QVariantMap();
 
-    const QFileInfo fi(fileUrl.toLocalFile());
-    QFile mdFile(fi.absolutePath() + "/" + fi.completeBaseName() + ".md");
+    // Item O19: a cheap stat guard — frontmatter is written once up front
+    // and only touched again at a job's very end (see
+    // syncSpeakersFrontmatterToBody()/writeLabelingFields()), so on the
+    // common "nothing changed since last call" tick this skips the file
+    // open/read/parse entirely. See m_frontmatterCache's doc comment.
+    const qint64 size = fi.size();
+    const QDateTime mtime = fi.lastModified();
+    if (m_frontmatterCache.valid && m_frontmatterCache.mdPath == mdPath && m_frontmatterCache.size == size
+        && m_frontmatterCache.mtime == mtime)
+        return m_frontmatterCache.data;
+
+    QVariantMap result;
+    QFile mdFile(mdPath);
     if (!mdFile.open(QIODevice::ReadOnly | QIODevice::Text))
         return result;
 
@@ -2404,13 +3036,19 @@ QVariantMap TranscriptionController::readMetadata(const QUrl &fileUrl) const
         else
             result[key] = value;
     }
+
+    m_frontmatterCache.mdPath = mdPath;
+    m_frontmatterCache.size = size;
+    m_frontmatterCache.mtime = mtime;
+    m_frontmatterCache.data = result;
+    m_frontmatterCache.valid = true;
     return result;
 }
 
 bool TranscriptionController::setLabel(const QUrl &fileUrl, const QString &label, QString *errorOut) const
 {
     const QFileInfo fi(fileUrl.toLocalFile());
-    const QString path = fi.absolutePath() + "/" + fi.completeBaseName() + ".md";
+    const QString path = sidecarPath(fileUrl.toLocalFile());
 
     QFile mdFile(path);
     if (!mdFile.exists()) {
@@ -2485,7 +3123,199 @@ bool TranscriptionController::setLabel(const QUrl &fileUrl, const QString &label
     out.flush();
     mdFile.flush();
     mdFile.close();
+    // Item P19: this manual (non-queued) rewrite otherwise leaves the
+    // sidebar's cached per-row metadata stale until an unrelated job
+    // finishes or a full VaultTreeModel rebuild happens — see finished()'s
+    // doc comment.
+    emit finished(fileUrl, true, QString());
     return true;
+}
+
+bool TranscriptionController::setTags(const QUrl &fileUrl, const QStringList &tags, QString *errorOut) const
+{
+    const QFileInfo fi(fileUrl.toLocalFile());
+    const QString path = sidecarPath(fileUrl.toLocalFile());
+
+    QFile mdFile(path);
+    if (!mdFile.exists()) {
+        if (errorOut)
+            *errorOut = QStringLiteral("%1 has not been transcribed yet").arg(fi.fileName());
+        return false;
+    }
+
+    if (!mdFile.open(QIODevice::ReadOnly | QIODevice::Text)) {
+        if (errorOut)
+            *errorOut = QStringLiteral("could not open %1 for reading").arg(path);
+        return false;
+    }
+
+    QTextStream in(&mdFile);
+    if (in.readLine() != QStringLiteral("---")) {
+        mdFile.close();
+        if (errorOut)
+            *errorOut = QStringLiteral("%1 has no frontmatter block").arg(mdFile.fileName());
+        return false;
+    }
+
+    // Mirror setLabel()'s frontmatter-scanning shape.
+    QStringList frontmatterLines;
+    QString line;
+    bool closed = false;
+    while (!(line = in.readLine()).isNull()) {
+        if (line == QStringLiteral("---")) {
+            closed = true;
+            break;
+        }
+        frontmatterLines.append(line);
+    }
+    if (!closed) {
+        mdFile.close();
+        if (errorOut)
+            *errorOut = QStringLiteral("%1 has a malformed frontmatter block").arg(mdFile.fileName());
+        return false;
+    }
+
+    const QString body = in.readAll();
+    mdFile.close();
+
+    const QString joined = tags.join(QStringLiteral(", "));
+    bool replaced = false;
+    for (QString &fmLine : frontmatterLines) {
+        const int colon = fmLine.indexOf(':');
+        if (colon >= 0 && fmLine.left(colon).trimmed() == QStringLiteral("tags")) {
+            fmLine = QStringLiteral("tags: ") + joined;
+            replaced = true;
+            break;
+        }
+    }
+    if (!replaced)
+        frontmatterLines.append(QStringLiteral("tags: ") + joined);
+
+    if (!mdFile.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
+        if (errorOut)
+            *errorOut = QStringLiteral("could not open %1 for writing").arg(mdFile.fileName());
+        return false;
+    }
+    QTextStream out(&mdFile);
+    out << "---\n";
+    for (const QString &fmLine : frontmatterLines)
+        out << fmLine << '\n';
+    out << "---\n";
+    out << body;
+    out.flush();
+    mdFile.flush();
+    mdFile.close();
+    // Item P19-style notification: sidebar's tag-derived display (if any)
+    // should refresh the same way a label edit does.
+    emit finished(fileUrl, true, QString());
+    return true;
+}
+
+QString TranscriptionController::readPrelude(const QUrl &fileUrl) const
+{
+    // Builds on readTranscriptBody() rather than re-skipping frontmatter by
+    // hand — that call is already cached behind a size+mtime check (see its
+    // own doc comment), so this stays cheap on repeated calls, and correctly
+    // invalidates when only the body (not frontmatter) changes, which is
+    // exactly the case a manual prelude edit or a relabel produces.
+    const QString body = readTranscriptBody(fileUrl);
+    const int markerIdx = body.indexOf(kPreludeEndMarker);
+    if (markerIdx < 0)
+        return QString();
+    return body.left(markerIdx).trimmed();
+}
+
+bool TranscriptionController::setPrelude(const QUrl &fileUrl, const QString &prelude, QString *errorOut) const
+{
+    const QFileInfo fi(fileUrl.toLocalFile());
+    const QString path = sidecarPath(fileUrl.toLocalFile());
+
+    QFile mdFile(path);
+    if (!mdFile.exists()) {
+        if (errorOut)
+            *errorOut = QStringLiteral("%1 has not been transcribed yet").arg(fi.fileName());
+        return false;
+    }
+
+    if (!mdFile.open(QIODevice::ReadOnly | QIODevice::Text)) {
+        if (errorOut)
+            *errorOut = QStringLiteral("could not open %1 for reading").arg(path);
+        return false;
+    }
+
+    QTextStream in(&mdFile);
+    if (in.readLine() != QStringLiteral("---")) {
+        mdFile.close();
+        if (errorOut)
+            *errorOut = QStringLiteral("%1 has no frontmatter block").arg(mdFile.fileName());
+        return false;
+    }
+
+    // Mirror setLabel()'s frontmatter-scanning shape, but this method never
+    // touches a frontmatter key — the raw lines are only carried through
+    // untouched to the rewrite below.
+    QStringList frontmatterLines;
+    QString line;
+    bool closed = false;
+    while (!(line = in.readLine()).isNull()) {
+        if (line == QStringLiteral("---")) {
+            closed = true;
+            break;
+        }
+        frontmatterLines.append(line);
+    }
+    if (!closed) {
+        mdFile.close();
+        if (errorOut)
+            *errorOut = QStringLiteral("%1 has a malformed frontmatter block").arg(mdFile.fileName());
+        return false;
+    }
+
+    const QString body = in.readAll();
+    mdFile.close();
+
+    const QString newBody = spliceBodyPrelude(body, prelude);
+
+    if (!mdFile.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
+        if (errorOut)
+            *errorOut = QStringLiteral("could not open %1 for writing").arg(mdFile.fileName());
+        return false;
+    }
+    QTextStream out(&mdFile);
+    out << "---\n";
+    for (const QString &fmLine : frontmatterLines)
+        out << fmLine << '\n';
+    out << "---\n";
+    out << newBody;
+    out.flush();
+    mdFile.flush();
+    mdFile.close();
+    // Item P19: see setLabel()'s matching emit for why.
+    emit finished(fileUrl, true, QString());
+    return true;
+}
+
+QVariantList TranscriptionController::readChapters(const QUrl &fileUrl) const
+{
+    // stripPreludeIfPresent isn't load-bearing here — "## " can never
+    // collide with the prelude's own kPreludeEndMarker sentinel or with
+    // segmentLinePattern()'s "^\[" anchor, unlike the prelude's own
+    // numbered-list false-positive risk (see stripPreludeIfPresent()'s doc
+    // comment). Kept anyway purely for consistency with every other body
+    // scanner in this file (parseSentences(), plainTextFromTranscriptBody())
+    // — belt-and-suspenders, not correctness-required.
+    const QString body = stripPreludeIfPresent(readTranscriptBody(fileUrl));
+
+    QVariantList chapters;
+    QRegularExpressionMatchIterator it = chapterMarkerPattern().globalMatch(body);
+    while (it.hasNext()) {
+        const QRegularExpressionMatch m = it.next();
+        QVariantMap chapter;
+        chapter["t0"] = parseCompactTimestamp(m.captured(1));
+        chapter["title"] = m.captured(2);
+        chapters.append(chapter);
+    }
+    return chapters;
 }
 
 void TranscriptionController::renameSpeaker(const QUrl &fileUrl, const QString &oldName, const QString &newName)
@@ -2540,8 +3370,24 @@ void TranscriptionController::mergeSpeakers(const QUrl &fileUrl, const QString &
 
 QString TranscriptionController::readTranscriptBody(const QUrl &fileUrl) const
 {
-    const QFileInfo fi(fileUrl.toLocalFile());
-    QFile mdFile(fi.absolutePath() + "/" + fi.completeBaseName() + ".md");
+    const QString mdPath = sidecarPath(fileUrl.toLocalFile());
+    const QFileInfo fi(mdPath);
+    if (!fi.exists())
+        return QString();
+
+    // Item O19: see m_bodyCache's doc comment — during an ACTIVE
+    // transcription this is invoked on every live-update tick while the
+    // file is constantly growing, so this stat-based guard alone rarely
+    // skips work THEN, but it does for every other caller polling a file
+    // that isn't currently changing (e.g. browsing while nothing is
+    // transcribing) — a real full-read-avoided win, not just a
+    // theoretical one.
+    const qint64 size = fi.size();
+    const QDateTime mtime = fi.lastModified();
+    if (m_bodyCache.valid && m_bodyCache.mdPath == mdPath && m_bodyCache.size == size && m_bodyCache.mtime == mtime)
+        return m_bodyCache.body;
+
+    QFile mdFile(mdPath);
     if (!mdFile.open(QIODevice::ReadOnly | QIODevice::Text))
         return QString();
 
@@ -2553,26 +3399,78 @@ QString TranscriptionController::readTranscriptBody(const QUrl &fileUrl) const
     while (!(line = in.readLine()).isNull() && line != QStringLiteral("---")) {
         // skip frontmatter lines
     }
-    return in.readAll();
+    const QString body = in.readAll();
+
+    m_bodyCache.mdPath = mdPath;
+    m_bodyCache.size = size;
+    m_bodyCache.mtime = mtime;
+    m_bodyCache.body = body;
+    m_bodyCache.valid = true;
+    return body;
 }
 
 QVariantList TranscriptionController::parseSentences(const QUrl &fileUrl) const
 {
-    QVariantList sentences;
-    const QString body = readTranscriptBody(fileUrl);
+    const QString mdPath = sidecarPath(fileUrl.toLocalFile());
+    // stripPreludeIfPresent first: the prelude is prose ABOUT the transcript,
+    // not a segment, and (per stripPreludeIfPresent's doc comment) could
+    // otherwise be misdetected as one if it happens to start a line with
+    // bracket-shaped text.
+    const QString body = stripPreludeIfPresent(readTranscriptBody(fileUrl)); // itself cached — see its doc comment
     // The file's own known-speaker allowlist (see writeFrontmatter()'s and
     // segmentLinePattern()'s doc comments) — read via readMetadata() rather
     // than re-scanning frontmatter lines by hand, since that already parses
     // arbitrary "key: value" frontmatter lines generically (vaults are
-    // small, a second open+read costs nothing worth avoiding here).
+    // small, a second open+read costs nothing worth avoiding here) and is
+    // itself cached (see readMetadata()'s doc comment).
     const QStringList knownSpeakers =
         parseSpeakersList(readMetadata(fileUrl).value(QStringLiteral("speakers")).toString());
-    // globalMatch over the whole (multi-line) body, not a per-line split, so
-    // capturedStart(3)/capturedLength(3) are exact offsets into this SAME
-    // body string — what MainPanel.qml needs to span-highlight the active
-    // sentence's substring without re-deriving offsets itself. No "t1": it's
-    // no longer stored (see SegmentLineWriter's doc comment — it was always
-    // identical to the next segment's t0) and nothing ever consumed it here.
+
+    // Item O19: segments are only ever APPENDED to a live-running
+    // transcript (SegmentLineWriter's repeat-cycle merge is the one
+    // exception — it rewrites the last couple of lines IN PLACE rather than
+    // appending, see its own doc comment) — so once `body`'s first
+    // m_sentenceCache.body.size() characters are confirmed to still equal
+    // the cached body byte-for-byte, only the NEW trailing slice needs a
+    // regex pass; the already-parsed prefix's sentences are reused as-is.
+    // Falls back to a full reparse whenever that prefix check fails (a
+    // different file, first call, or a merge having rewritten the tail) —
+    // this only ever trades a slightly-too-eager full reparse for
+    // correctness, never the other way around.
+    if (m_sentenceCache.valid && m_sentenceCache.mdPath == mdPath) {
+        if (m_sentenceCache.body == body)
+            return m_sentenceCache.sentences;
+        if (body.startsWith(m_sentenceCache.body)) {
+            const qsizetype prefixLen = m_sentenceCache.body.size();
+            QVariantList sentences = m_sentenceCache.sentences;
+            const QStringView suffix = QStringView(body).mid(prefixLen);
+            QRegularExpressionMatchIterator it = segmentLinePattern(knownSpeakers).globalMatchView(suffix);
+            while (it.hasNext()) {
+                const QRegularExpressionMatch m = it.next();
+                QVariantMap sentence;
+                sentence["t0"] = parseCompactTimestamp(m.captured(1));
+                sentence["speaker"] = m.captured(2);
+                sentence["text"] = m.captured(3);
+                sentence["start"] = static_cast<int>(prefixLen + m.capturedStart(3));
+                sentence["length"] = m.capturedLength(3);
+                sentence["repeatCount"] = m.capturedLength(4) == 0 ? 1 : m.captured(4).toInt();
+                sentences.append(sentence);
+            }
+            m_sentenceCache.body = body;
+            m_sentenceCache.sentences = sentences;
+            return sentences;
+        }
+    }
+
+    // Full (re)parse: no cache yet, a different file, or the cached prefix
+    // no longer matches. globalMatch over the whole (multi-line) body, not a
+    // per-line split, so capturedStart(3)/capturedLength(3) are exact
+    // offsets into this SAME body string — what MainPanel.qml needs to
+    // span-highlight the active sentence's substring without re-deriving
+    // offsets itself. No "t1": it's no longer stored (see
+    // SegmentLineWriter's doc comment — it was always identical to the next
+    // segment's t0) and nothing ever consumed it here.
+    QVariantList sentences;
     QRegularExpressionMatchIterator it = segmentLinePattern(knownSpeakers).globalMatch(body);
     while (it.hasNext()) {
         const QRegularExpressionMatch m = it.next();
@@ -2593,6 +3491,11 @@ QVariantList TranscriptionController::parseSentences(const QUrl &fileUrl) const
         sentence["repeatCount"] = m.capturedLength(4) == 0 ? 1 : m.captured(4).toInt();
         sentences.append(sentence);
     }
+
+    m_sentenceCache.mdPath = mdPath;
+    m_sentenceCache.body = body;
+    m_sentenceCache.sentences = sentences;
+    m_sentenceCache.valid = true;
     return sentences;
 }
 
@@ -2651,6 +3554,8 @@ QString TranscriptionController::jobKind(const Job &job)
         return QStringLiteral("merge");
     if (job.relabelOnly)
         return QStringLiteral("relabel");
+    if (job.generateChaptersOnly)
+        return QStringLiteral("chapters");
     return QStringLiteral("transcribe");
 }
 
@@ -2698,6 +3603,12 @@ QVariantList TranscriptionController::availableModels() const
         QVariantMap entry;
         entry["id"] = info.id;
         entry["label"] = info.label;
+        // Item O31: whether this tier's .bin is already on disk for the
+        // CURRENTLY open vault (m_vaultUrl — set once per vault open by
+        // loadPersistedQueue(), empty/false for every entry until then) —
+        // lets the model dropdown show which tiers would need a fresh
+        // download vs. start immediately.
+        entry["downloaded"] = ModelManager::isModelDownloaded(m_vaultUrl, info.id);
         list.append(entry);
     }
     return list;

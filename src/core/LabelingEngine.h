@@ -1,5 +1,6 @@
 #pragma once
 
+#include <QList>
 #include <QString>
 #include <QStringList>
 
@@ -18,8 +19,21 @@ struct llama_context;
 // read-back.
 struct LabelResult {
     QString label;
-    QString summary;
+    QString prelude;
     QString tags;
+};
+
+// Feature 3a ("generate chapters"): one proposed chapter boundary from
+// generateChapters() below. afterSegmentIndex is the index (into the
+// caller's own segmentTexts list — see generateChapters()'s doc comment) of
+// the segment the new chapter starts right AFTER, i.e. this chapter's
+// content begins at segment afterSegmentIndex + 1. Deliberately NOT a
+// timestamp: this app never trusts the LLM to echo one back accurately (see
+// generateChapters()'s doc comment) — the caller resolves this index to the
+// segment's own precisely-known t0 itself, before anything touches disk.
+struct Chapter {
+    int afterSegmentIndex = -1;
+    QString title;
 };
 
 class LabelingEngine {
@@ -39,7 +53,7 @@ public:
     bool isValid() const { return m_model != nullptr && m_ctx != nullptr; }
 
     // Single GBNF-grammar-constrained generation pass producing
-    // {label, summary, tags} from transcriptText, using the model's own
+    // {label, prelude, tags} from transcriptText, using the model's own
     // embedded chat template. Returns std::nullopt on failure (errorOut set
     // if given — grammar/tokenize/decode error, context overflow, or invalid
     // engine). transcriptText longer than kMaxInputChars (see .cpp) is
@@ -63,9 +77,54 @@ public:
     // (near 1.0) — a graduated preference, not a hard rule. Ignored when
     // existingTags is empty (nothing to bias toward) or restrictToExisting
     // is true (that's already a hard constraint, not a bias).
+    //
+    // wordiness (Feature 1): 0.0-1.0 slider controlling how verbose the
+    // generated label and prelude are, independent of the tag-related
+    // options above. Low (<0.34): a very short label, a single concise
+    // prelude sentence. Mid (default, 0.34-0.67): a short label (a few
+    // words), a one-paragraph prelude. High (>=0.67): a descriptive label
+    // (up to a short phrase), a detailed multi-sentence prelude.
     std::optional<LabelResult> label(const QString &transcriptText, const QStringList &existingTags = {},
                                       bool restrictToExisting = false, double tagReuseBias = 0.5,
-                                      QString *errorOut = nullptr);
+                                      double wordiness = 0.5, QString *errorOut = nullptr);
+
+    // Feature 3a ("generate chapters"): a SEPARATE grammar-constrained pass
+    // sharing this SAME resident model/context as label() above — never a
+    // second LabelingEngine instance (would double-load a ~2.5GB GGUF
+    // alongside whisper.cpp's own resident model, a hard VRAM/RAM
+    // constraint, not a style preference).
+    //
+    // Robustness: this app never trusts the LLM to echo back accurate raw
+    // timestamps. segmentTexts[i] must be segment i's text (cheap for the
+    // caller to build from its own already-parsed segment list — see
+    // TranscriptionController's parsedSegmentsFromTranscriptBody()); the
+    // model only ever sees text, indexed by position ("0: ...", "1: ...",
+    // built internally from segmentTexts), and returns which index each
+    // proposed chapter starts after. The caller is responsible for
+    // resolving that index back to the segment's own precisely-known t0 —
+    // and for bound-checking/deduping the returned indices against
+    // segmentTexts.size() — before anything touches disk; this method
+    // returns whatever the model produced, unvalidated against
+    // segmentTexts.size(), the same way label() never validates its own
+    // JSON's semantic content either (the grammar only constrains shape).
+    //
+    // segmentTexts longer than kMaxChapterInputChars (see .cpp) is
+    // truncated before prompting — same truncate-and-document approach
+    // label() uses for kMaxInputChars, but (unlike label()'s silent
+    // truncation) this logs a qWarning when truncation actually happens: a
+    // multi-hour file silently only getting chapters for its first stretch
+    // would read as a bug, not a documented limit.
+    //
+    // Returns std::nullopt on failure (errorOut set if given).
+    std::optional<QList<Chapter>> generateChapters(const QStringList &segmentTexts, QString *errorOut = nullptr);
+
+    // Item P34: the same limit generateChapters() truncates to internally
+    // (see its doc comment above and the .cpp definition site), exposed so
+    // TranscriptionController::generateChaptersJob() can split a long
+    // transcript into multiple windows — each within this budget — and call
+    // generateChapters() once per window instead of silently losing
+    // everything past this many characters in a single truncated pass.
+    static constexpr int kMaxChapterInputChars = 16000;
 
 private:
     // Attempts to load modelPath fully offloaded to GPU (nGpuLayers=-1) or
@@ -73,6 +132,18 @@ private:
     // the constructor tries both. Leaves m_model/m_ctx null (and any
     // partially-created one freed) on failure.
     bool loadModel(const QString &modelPath, int nGpuLayers);
+
+    // Shared grammar-constrained single-shot generation core for label() and
+    // generateChapters() above — builds the chat-templated prompt from
+    // systemPrompt+userText, decodes under grammar's constraint up to
+    // maxOutputTokens, and returns the raw generated text (unparsed). Both
+    // callers parse the JSON shape themselves (an object for label(), an
+    // array for generateChapters()) since that's the one thing that
+    // actually differs between them — everything else (chat template,
+    // grammar sampler wiring, context-overflow/decode-failure handling) is
+    // identical and was previously duplicated between the two.
+    std::optional<QString> runGrammarConstrained(const QString &systemPrompt, const QString &userText,
+                                                  const char *grammar, int maxOutputTokens, QString *errorOut);
 
     llama_model *m_model = nullptr;
     llama_context *m_ctx = nullptr;

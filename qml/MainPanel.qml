@@ -26,6 +26,22 @@ Rectangle {
 
     property bool renamingTitle: false
 
+    // Feature 2: multi-paragraph, editable prelude (upgrades O26's old
+    // read-only single-line summary) — lives in the .md BODY, not
+    // storedMetadata/frontmatter (see TranscriptionController::readPrelude()),
+    // so it needs its own property, populated alongside storedMetadata in
+    // refreshMetadata() below.
+    property string prelude: ""
+    property bool editingPrelude: false
+
+    // Feature 3b/3c: chapter markers (see
+    // TranscriptionController::readChapters()) — shared by the seek-bar tick
+    // marks (3b) and the chapter list (3c), populated once alongside
+    // prelude/storedMetadata in refreshMetadata() below rather than each
+    // calling readChapters() separately.
+    property var chapters: []
+    property bool chaptersExpanded: true
+
     property string searchQuery: ""
     property bool searchExpanded: false
     property int searchMatchIndex: -1
@@ -52,6 +68,19 @@ Rectangle {
     function refreshMetadata() {
         storedMetadata = (player && player.source.toString() !== "" && transcriptionController)
             ? transcriptionController.readMetadata(player.source) : ({})
+        // The prelude lives in the BODY, not frontmatter, so it can't
+        // piggyback on storedMetadata above (readMetadata()'s frontmatter
+        // cache has no reason to invalidate when only the body changes) —
+        // needs its own read call. Folded in here rather than a separate
+        // refreshPrelude(), so every existing refreshMetadata() call site
+        // (onSourceChanged/onFinished/onProgressChanged) picks it up for free.
+        mainPanel.prelude = (player && player.source.toString() !== "" && transcriptionController)
+            ? transcriptionController.readPrelude(player.source) : ""
+        // Same reasoning as prelude above — chapters live in the BODY as
+        // "## [timestamp] title" marker lines, not frontmatter, so they need
+        // their own read call here too.
+        mainPanel.chapters = (player && player.source.toString() !== "" && transcriptionController)
+            ? transcriptionController.readChapters(player.source) : []
         // Speaker detection defaults ON for an untranscribed file (see
         // DESIGN.md "Speaker diarization") — an already-transcribed file
         // instead honors whatever was actually used last time, same as
@@ -200,6 +229,12 @@ Rectangle {
             }
         }
         mainPanel.speakerOpError = ""
+
+        // Item P16: reverse of this op is renaming trimmed back to oldName
+        // — stored ready-to-replay (not just "oldName") so undoLast() can
+        // invoke renameSpeaker() directly without re-deriving anything.
+        mainPanel.pushUndo({type: "speakerRename", fileUrl: mainPanel.currentFileUrl(),
+                            reverseOld: trimmed, reverseNew: oldName})
 
         const updated = Object.assign({}, mainPanel.pendingSpeakerRenames)
         updated[oldName] = trimmed
@@ -360,6 +395,57 @@ Rectangle {
         }
     }
 
+    // Item P16: minimal flat undo (no redo) for the four kinds of small
+    // manual edits this panel can make directly (label, prelude, tags,
+    // speaker rename) — a plain JS stack of {type, ...} entries, each
+    // recording enough to reverse itself, pushed BEFORE the mutation it
+    // guards. Reset whenever the open file changes (see onSourceChanged/
+    // onOrphanedMdPathChanged below) so Ctrl+Z never reaches across a file
+    // switch into a different note's history. Speaker MERGE is
+    // deliberately NOT undoable here — unlike a rename, a merge collapses
+    // two distinct speaker identities into one (which sentences originally
+    // belonged to the losing speaker is no longer recoverable from the
+    // rewritten transcript alone), so there is no simple reverse operation
+    // to record.
+    property var undoStack: []
+
+    // Reassigns (rather than push()/pop() in place) so undoStackChanged()
+    // actually fires — a plain JS array mutated in place doesn't notify any
+    // binding that reads mainPanel.undoStack.length (e.g. the Ctrl+Z
+    // Shortcut's `enabled` below), since QML's dependency tracking only
+    // hooks the property's own notify signal, not the array contents.
+    function pushUndo(entry) {
+        mainPanel.undoStack = mainPanel.undoStack.concat([entry])
+    }
+
+    function undoLast() {
+        if (mainPanel.undoStack.length === 0 || !mainPanel.transcriptionController)
+            return
+        const entry = mainPanel.undoStack[mainPanel.undoStack.length - 1]
+        mainPanel.undoStack = mainPanel.undoStack.slice(0, -1)
+        switch (entry.type) {
+        case "label":
+            mainPanel.transcriptionController.setLabel(entry.fileUrl, entry.oldValue)
+            break
+        case "prelude":
+            mainPanel.transcriptionController.setPrelude(entry.fileUrl, entry.oldValue)
+            break
+        case "tags":
+            mainPanel.transcriptionController.setTags(entry.fileUrl, entry.oldValue)
+            break
+        case "speakerRename": {
+            // Mirrors commitSpeakerRename()'s own optimistic overlay so the
+            // pill updates instantly here too, not just via the eventual
+            // background rewrite + sentencesRevision bump.
+            const updated = Object.assign({}, mainPanel.pendingSpeakerRenames)
+            updated[entry.reverseOld] = entry.reverseNew
+            mainPanel.pendingSpeakerRenames = updated
+            mainPanel.transcriptionController.renameSpeaker(entry.fileUrl, entry.reverseOld, entry.reverseNew)
+            break
+        }
+        }
+    }
+
     function displayTitle() {
         if (mainPanel.orphanedMdPath !== "") {
             const label = mainPanel.orphanedMdMetadata.label
@@ -384,6 +470,9 @@ Rectangle {
 
         if (mainPanel.orphanedMdPath !== "") {
             if (AppSettings.useLabelsMainPanel) {
+                const oldLabel = mainPanel.orphanedMdMetadata.label || ""
+                if (trimmed !== oldLabel)
+                    mainPanel.pushUndo({type: "label", fileUrl: "file://" + mainPanel.orphanedMdPath, oldValue: oldLabel})
                 mainPanel.transcriptionController.setLabel("file://" + mainPanel.orphanedMdPath, trimmed)
                 mainPanel.refreshOrphanedMetadata()
             } else if (mainPanel.vaultTreeModel
@@ -397,6 +486,9 @@ Rectangle {
 
         if (mainPanel.player && mainPanel.player.source.toString() !== "") {
             if (AppSettings.useLabelsMainPanel) {
+                const oldLabel = mainPanel.storedMetadata.label || ""
+                if (trimmed !== oldLabel)
+                    mainPanel.pushUndo({type: "label", fileUrl: mainPanel.player.source, oldValue: oldLabel})
                 mainPanel.transcriptionController.setLabel(mainPanel.player.source, trimmed)
                 mainPanel.refreshMetadata()
             } else if (mainPanel.vaultTreeModel) {
@@ -409,6 +501,48 @@ Rectangle {
                 }
             }
         }
+    }
+
+    // Feature 2: Save action for the prelude editor below. Explicit
+    // Save/Cancel rather than commit-on-Enter (titleField's pattern) since
+    // the prelude is multi-line — plain Enter has to insert a newline
+    // instead. Orphaned-md files never show the prelude editor (see its
+    // visible: condition below), so unlike commitRename() this only needs
+    // the player.source path. setLabel()'s failures are already silently
+    // ignored by commitRename() above; matched here for consistency.
+    function commitPrelude(newValue) {
+        mainPanel.editingPrelude = false
+        if (!mainPanel.transcriptionController || !mainPanel.player || mainPanel.player.source.toString() === "")
+            return
+        if (newValue !== mainPanel.prelude)
+            mainPanel.pushUndo({type: "prelude", fileUrl: mainPanel.player.source, oldValue: mainPanel.prelude})
+        mainPanel.transcriptionController.setPrelude(mainPanel.player.source, newValue)
+        mainPanel.refreshMetadata()
+    }
+
+    // Item P15/P20: adds/removes one tag from the current file's list and
+    // rewrites the whole list via setTags() (there is no single-tag add/
+    // remove call — TranscriptionController always writes the full,
+    // comma-joined set). Works for both the orphaned-md and player-backed
+    // views via currentFileUrl(), same as the speaker rename/merge helpers
+    // above.
+    function addTag(raw) {
+        const trimmed = raw.trim()
+        if (!mainPanel.transcriptionController || trimmed === "")
+            return
+        const current = mainPanel.currentTags()
+        if (current.some(t => t.toLowerCase() === trimmed.toLowerCase()))
+            return // no-op: duplicate (case-insensitive)
+        mainPanel.pushUndo({type: "tags", fileUrl: mainPanel.currentFileUrl(), oldValue: current})
+        mainPanel.transcriptionController.setTags(mainPanel.currentFileUrl(), current.concat([trimmed]))
+    }
+
+    function removeTag(tag) {
+        if (!mainPanel.transcriptionController)
+            return
+        const current = mainPanel.currentTags()
+        mainPanel.pushUndo({type: "tags", fileUrl: mainPanel.currentFileUrl(), oldValue: current})
+        mainPanel.transcriptionController.setTags(mainPanel.currentFileUrl(), current.filter(t => t !== tag))
     }
 
     // Item 10: live-updates as segments are written during an in-progress
@@ -489,10 +623,43 @@ Rectangle {
     // distinctSpeakerIds/commitSpeakerRename still work off the raw on-disk
     // sentences[i].speaker directly (see effectiveSpeakerName()'s doc
     // comment for why the override is deliberately NOT baked in there).
+    // Item P32: chapter headings (mainPanel.chapters, each {t0, title}) are
+    // interleaved into this SAME list in time order, as zero-length pseudo-
+    // "sentence" entries (isChapterHeading: true) that reserve one real
+    // blank line in `text` for themselves — a genuine document line, not
+    // just an overlay, is what gives the heading its own row of vertical
+    // space in the flowing transcriptArea (the same reason gutter
+    // timestamps/speaker names DON'T get their own line: those are pure
+    // decoration with nothing to reserve space for; a chapter heading is a
+    // real structural break, so it needs the opposite treatment here).
+    // Being zero-length (text:"", length:0) means it contributes nothing to
+    // searchCorpus() or transcriptArea's selectable content — it only ever
+    // shows up via chapterHeadingRepeater below, keyed off the same
+    // displaySentences index as the gutter Repeaters.
+    //
+    // A heading's t0 is clamped to never exceed the sentence it precedes,
+    // so ties always resolve in the REAL sentence's favor: C++'s
+    // activeSentenceIndex() is a plain std::upper_bound over t0 (see its
+    // own doc comment) — for two list entries sharing the same t0, that
+    // resolves to the LATER one once playback reaches it, so a heading can
+    // only ever be "active" during genuine silence before its own
+    // chapter's first real sentence, never stealing an already-playing
+    // sentence's highlight.
     readonly property var displayData: {
         let text = ""
         const list = []
         let previousSpeaker = null
+        const chapterList = mainPanel.chapters
+        let chapterIdx = 0
+
+        function pushHeading(chapter) {
+            const headingStart = text.length
+            list.push({t0: chapter.t0, speaker: "", text: "", start: headingStart, length: 0,
+                       showGutter: false, isChapterHeading: true, chapterTitle: chapter.title})
+            text += "\n"
+            previousSpeaker = null // next real sentence's gutter shows fresh after a section break
+        }
+
         for (const s of mainPanel.sentences) {
             // Skip blank/whitespace-only segments entirely — whisper can
             // occasionally emit one (e.g. a near-silent stretch), and giving
@@ -502,6 +669,10 @@ Rectangle {
             // shouldn't get a line OR a timestamp.
             if (s.text.trim() === "")
                 continue
+            while (chapterIdx < chapterList.length && chapterList[chapterIdx].t0 <= s.t0) {
+                pushHeading({t0: Math.min(chapterList[chapterIdx].t0, s.t0), title: chapterList[chapterIdx].title})
+                chapterIdx++
+            }
             const start = text.length
             const speaker = s.speaker === "" ? "" : mainPanel.effectiveSpeakerName(s.speaker)
             const showGutter = (speaker === "") || (previousSpeaker === null) || (speaker !== previousSpeaker)
@@ -514,9 +685,16 @@ Rectangle {
             // as gutter timestamps/speaker names — decoration, not content).
             const displayText = s.repeatCount > 1 ? s.text + " (" + s.repeatCount + "x)" : s.text
             list.push({t0: s.t0, speaker: speaker, text: displayText, start: start, length: s.text.length,
-                       showGutter: showGutter})
+                       showGutter: showGutter, isChapterHeading: false, chapterTitle: ""})
             previousSpeaker = speaker
             text += displayText + "\n"
+        }
+        // Any chapter at/after the last real sentence (e.g. a trailing
+        // marker with no further speech) still gets a heading rather than
+        // being silently dropped.
+        while (chapterIdx < chapterList.length) {
+            pushHeading(chapterList[chapterIdx])
+            chapterIdx++
         }
         if (text.length > 0)
             text = text.slice(0, -1) // drop the final trailing newline
@@ -625,11 +803,23 @@ Rectangle {
     // returns a zeroed rect. Explicit dependency on transcriptArea.length
     // forces correct re-evaluation once layout genuinely settles.
     function safePositionToRectangle(pos) {
+        // positionToRectangle()'s C++ result depends on width/padding/font,
+        // but those aren't QML property reads from ITS perspective, so they
+        // never register as dependencies of whichever binding called this —
+        // reading them here (even unconditionally, unlike the ternaries
+        // below that only read leftPadding/width on some branches) makes
+        // that dependency real for every caller, propagating up the JS call
+        // stack to activeSentenceRect/searchMatchRect's own evaluation.
+        void transcriptArea.width
+        void transcriptArea.leftPadding
+        void transcriptArea.topPadding
+        void transcriptArea.font
         return pos <= transcriptArea.length ? transcriptArea.positionToRectangle(pos) : Qt.rect(0, 0, 0, 0)
     }
 
     readonly property rect activeSentenceRect: {
         void transcriptArea.length
+        void transcriptArea.width
         const idx = mainPanel.activeSentenceIndex
         const list = mainPanel.displaySentences
         if (idx < 0 || idx >= list.length)
@@ -653,6 +843,7 @@ Rectangle {
     // Ctrl+F search match instead of the playing sentence.
     readonly property rect searchMatchRect: {
         void transcriptArea.length
+        void transcriptArea.width
         if (mainPanel.searchMatchIndex < 0 || mainPanel.searchMatchStart < 0)
             return Qt.rect(0, 0, 0, 0)
         const startRect = mainPanel.safePositionToRectangle(mainPanel.searchMatchStart)
@@ -728,7 +919,14 @@ Rectangle {
         mainPanel.searchMatchLength = 0
     }
 
-    function jumpToNextMatch() {
+    // Shared match-finding core for both "jump to next" (Enter, searches
+    // from just after the current match) and "search as you type"
+    // (searchQuery changing, searches from the very start) — locates the
+    // first occurrence of searchQuery at or after fromIndex in the search
+    // corpus, wrapping around to the start if none is found from there,
+    // then updates all the match-state properties and select()s the raw
+    // range.
+    function locateMatch(fromIndex) {
         if (mainPanel.searchQuery === "")
             return
         const corpus = mainPanel.searchCorpus()
@@ -736,8 +934,7 @@ Rectangle {
             return
         const q = mainPanel.searchQuery.toLowerCase()
         const lower = corpus.clean.toLowerCase()
-        let start = mainPanel.searchMatchIndex < 0 ? 0 : mainPanel.searchMatchIndex + 1
-        let idx = lower.indexOf(q, start)
+        let idx = lower.indexOf(q, Math.max(0, fromIndex))
         if (idx === -1)
             idx = lower.indexOf(q, 0) // wrap around
         mainPanel.searchMatchIndex = idx
@@ -768,8 +965,14 @@ Rectangle {
         }
         if (!firstEntry)
             return
-        const selStart = firstEntry.rawStart + Math.max(0, idx - firstEntry.cleanStart)
-        const selEnd = lastEntry.rawStart + Math.min(lastEntry.rawLength, matchEnd - lastEntry.cleanStart)
+        // Clamped to transcriptArea.length, same guard used everywhere else
+        // in this file that feeds a raw position into Qt's cursor API
+        // (safePositionToRectangle/gutterLineRects) — the corpus can
+        // momentarily be built from a still-stale displaySentences a frame
+        // before transcriptArea's text has caught up, and select() has no
+        // bounds guard of its own.
+        const selStart = Math.min(firstEntry.rawStart + Math.max(0, idx - firstEntry.cleanStart), transcriptArea.length)
+        const selEnd = Math.min(lastEntry.rawStart + Math.min(lastEntry.rawLength, matchEnd - lastEntry.cleanStart), transcriptArea.length)
         mainPanel.searchMatchStart = selStart
         mainPanel.searchMatchLength = selEnd - selStart
         // select() alone still scrolls the match into view — no need to
@@ -778,11 +981,62 @@ Rectangle {
         // needing to re-click into it). The visible highlight itself is
         // searchMatchOverlay (Item 7), not the native selection.
         transcriptArea.select(selStart, selEnd)
+        Qt.callLater(mainPanel.scrollMatchIntoView)
+    }
+
+    // Item P10: select() alone does NOT scroll the match into view here —
+    // transcriptArea is readOnly and never takes focus in locateMatch()
+    // (deliberately, so repeated Enter keeps working from the search
+    // field), and QQC2's automatic cursor-follow scrolling only engages for
+    // a focused, editable control. searchMatchRect (computed above from the
+    // same searchMatchStart/Length this function just set) gives the
+    // match's rect in transcriptArea's own local coordinates; mapping that
+    // into transcriptScrollView's Flickable frame (same contentItem used by
+    // the live-transcription auto-scroll in onTranscriptBodyChanged, and by
+    // middleDragScrollArea) gives its on-screen position relative to the
+    // current viewport, which is then minimally clamped into view — no
+    // centering, just enough scroll to reveal it, same as a browser's
+    // "scroll into view".
+    function scrollMatchIntoView() {
+        const rect = mainPanel.searchMatchRect
+        if (rect.width === 0 && rect.height === 0)
+            return
+        const flick = transcriptScrollView.contentItem
+        const viewportPos = transcriptArea.mapToItem(flick, rect.x, rect.y)
+        const maxContentY = Math.max(0, flick.contentHeight - flick.height)
+        if (viewportPos.y < 0)
+            flick.contentY = Math.max(0, flick.contentY + viewportPos.y)
+        else if (viewportPos.y + rect.height > flick.height)
+            flick.contentY = Math.min(maxContentY, flick.contentY + (viewportPos.y + rect.height - flick.height))
+    }
+
+    function jumpToNextMatch() {
+        mainPanel.locateMatch(mainPanel.searchMatchIndex < 0 ? 0 : mainPanel.searchMatchIndex + 1)
     }
 
     Connections {
         target: mainPanel.player
-        function onSourceChanged() { mainPanel.refreshMetadata() }
+        // Item P8: restart the repaint nudge on EVERY file open, not just
+        // the empty->populated transition (see transcriptRepaintNudgeTimer's
+        // own doc comment below) — switching directly between two
+        // already-transcribed files never passes through an empty state, so
+        // onTranscriptBodyChanged's own trigger alone would miss it.
+        // Item P16: also reset per-file undo history so Ctrl+Z can never
+        // reach across a file switch into a different note's edits.
+        function onSourceChanged() {
+            mainPanel.refreshMetadata()
+            transcriptRepaintNudgeTimer.restart()
+            mainPanel.undoStack = []
+        }
+    }
+    // Item P8/P16: showOrphanedMd() switches files by setting orphanedMdPath
+    // directly (player.source is cleared to "" first, which fires
+    // onSourceChanged above for the "no file" state, not the orphaned file
+    // itself) — this is the other half of "a different file was just
+    // opened", covering the orphaned-md view.
+    onOrphanedMdPathChanged: {
+        transcriptRepaintNudgeTimer.restart()
+        mainPanel.undoStack = []
     }
     Connections {
         target: mainPanel.transcriptionController
@@ -802,20 +1056,63 @@ Rectangle {
                 mainPanel.refreshMetadata()
         }
     }
-    onSearchQueryChanged: mainPanel.resetSearchMatch()
+    // Item O10: typing now searches immediately (not just on Enter) —
+    // reset first (clears the stale match's highlight/count instantly) then
+    // locate the FIRST match from the very start of the corpus. Enter
+    // (searchField.onAccepted -> jumpToNextMatch) still advances from the
+    // current match, unchanged.
+    onSearchQueryChanged: {
+        mainPanel.resetSearchMatch()
+        mainPanel.locateMatch(0)
+    }
+
+    // O1: on first open of an already-transcribed file, transcriptArea can
+    // transiently compute a wrong (oversized) width for one frame right as
+    // `visible` flips true and `text` is set in the same tick, leaving the
+    // text invisible (while the highlight overlay, a separate Rectangle,
+    // still renders) until something forces a repaint — empirically,
+    // selecting text in the TextArea is known to make it reappear, so
+    // selectAll()+deselect() (invokable regardless of focus, no visible
+    // side effect since nothing stays selected) reproduces that same nudge
+    // programmatically. Timer delay (rather than Qt.callLater, which only
+    // defers one event-loop turn) gives the width self-correction observed
+    // ~100ms after the flip time to actually happen first.
+    property bool transcriptWasEmpty: true
+    Timer {
+        id: transcriptRepaintNudgeTimer
+        interval: 120
+        onTriggered: {
+            transcriptArea.selectAll()
+            transcriptArea.deselect()
+        }
+    }
 
     // Item 8 (Wave D): follow the transcript as it grows during an active
     // transcription of the currently-open file — only while that job is
     // actually running, so browsing a finished transcript never gets
     // yanked to the bottom. Qt.callLater so the TextArea/ScrollView have
     // re-laid-out with the new text before contentHeight is read.
+    //
+    // O6: only if the user was ALREADY scrolled at/near the bottom before
+    // this change — otherwise a user who scrolled up to re-read earlier
+    // text would get yanked back down on every new segment. Checked here,
+    // BEFORE Qt.callLater/new layout, against the current (pre-growth)
+    // contentY/contentHeight.
     onTranscriptBodyChanged: {
+        if (mainPanel.transcriptWasEmpty && mainPanel.transcriptBody !== "")
+            transcriptRepaintNudgeTimer.restart()
+        mainPanel.transcriptWasEmpty = mainPanel.transcriptBody === ""
+
         if (mainPanel.transcriptionController && mainPanel.player && mainPanel.transcriptionController.busy
                 && mainPanel.transcriptionController.currentFile.toString() === mainPanel.player.source.toString()) {
-            Qt.callLater(function () {
-                const flick = transcriptScrollView.contentItem
-                flick.contentY = Math.max(0, flick.contentHeight - flick.height)
-            })
+            const flick = transcriptScrollView.contentItem
+            const nearBottomThreshold = 40
+            const wasAtBottom = flick.contentY >= flick.contentHeight - flick.height - nearBottomThreshold
+            if (wasAtBottom) {
+                Qt.callLater(function () {
+                    flick.contentY = Math.max(0, flick.contentHeight - flick.height)
+                })
+            }
         }
     }
 
@@ -827,6 +1124,14 @@ Rectangle {
             mainPanel.searchExpanded = true
             searchField.forceActiveFocus()
         }
+    }
+
+    // Item P16: undoes the last label/prelude/tag/speaker-rename edit made
+    // through this panel — see undoStack's own doc comment above.
+    Shortcut {
+        sequence: "Ctrl+Z"
+        enabled: mainPanel.activeFocus && mainPanel.undoStack.length > 0
+        onActivated: mainPanel.undoLast()
     }
 
     color: Qt.rgba(AppSettings.mainBackgroundColor.r, AppSettings.mainBackgroundColor.g,
@@ -909,9 +1214,12 @@ Rectangle {
                 // Drawn, not a font glyph: the "▶" Unicode character's em-box
                 // is never truly centered on its triangle (padding varies by
                 // font/system, so any fixed offset is a guess that breaks
-                // elsewhere) — a Canvas-drawn shape is geometrically centered
-                // by construction, matching pause's two bars exactly the
-                // same way.
+                // elsewhere) — a Canvas-drawn shape lets us control centering
+                // directly. Pause's two bars are bbox-symmetric so centerIn
+                // alone centers them correctly; play's triangle is not — its
+                // visual centroid (average of its 3 vertices) sits left of
+                // its bounding-box center, so it's drawn shifted right by a
+                // fixed offset to visually balance against the pause glyph.
                 Canvas {
                     id: playPauseIcon
                     anchors.centerIn: parent
@@ -932,10 +1240,19 @@ Rectangle {
                             ctx.fillRect(0, 0, barWidth, height)
                             ctx.fillRect(width - barWidth, 0, barWidth, height)
                         } else {
+                            // Item P24: the tip used to sit at width+xOffset,
+                            // 2px past this 14x14 canvas's own raster — it
+                            // got silently clipped, reading as a blunt/cut
+                            // triangle. Capping the tip at `width` instead
+                            // (the offset now only shifts the LEFT edge in,
+                            // shrinking the triangle's span rather than
+                            // pushing it past the canvas bounds) keeps the
+                            // whole shape on-canvas.
+                            const xOffset = 2
                             ctx.beginPath()
-                            ctx.moveTo(0, 0)
+                            ctx.moveTo(xOffset, 0)
                             ctx.lineTo(width, height / 2)
-                            ctx.lineTo(0, height)
+                            ctx.lineTo(xOffset, height)
                             ctx.closePath()
                             ctx.fill()
                         }
@@ -987,6 +1304,46 @@ Rectangle {
                         border.color: "#888888"
                     }
                 }
+
+                // Feature 3b: one tick mark per chapter (see
+                // mainPanel.chapters/readChapters()), positioned with the
+                // EXACT SAME leftPadding/availableWidth math as the handle
+                // above (:1071) — visualPosition there is
+                // (value - from) / (to - from) with value/to in player
+                // position milliseconds, so a chapter's t0 (seconds) is
+                // scaled to milliseconds here to land in the same space.
+                // Gated on a real duration so a not-yet-loaded player (to
+                // falls back to 1, see seekSlider.to above) never produces
+                // broken 0/0-style math.
+                Repeater {
+                    model: (mainPanel.player && mainPanel.player.duration > 0) ? mainPanel.chapters : []
+
+                    Rectangle {
+                        id: chapterTick
+                        required property var modelData
+                        x: seekSlider.leftPadding
+                           + (chapterTick.modelData.t0 * 1000 / mainPanel.player.duration) * (seekSlider.availableWidth - width)
+                        y: seekSlider.topPadding + seekSlider.availableHeight / 2 - height / 2
+                        width: 2
+                        height: 10
+                        radius: 1
+                        color: "#ffffff"
+                        opacity: chapterTickArea.containsMouse ? 0.9 : 0.55
+
+                        ToolTip.visible: chapterTickArea.containsMouse
+                        ToolTip.text: chapterTick.modelData.title
+                        ToolTip.delay: 500
+
+                        MouseArea {
+                            id: chapterTickArea
+                            anchors.fill: parent
+                            anchors.margins: -3
+                            hoverEnabled: true
+                            cursorShape: Qt.PointingHandCursor
+                            onClicked: mainPanel.player.position = chapterTick.modelData.t0 * 1000
+                        }
+                    }
+                }
             }
         }
 
@@ -998,45 +1355,82 @@ Rectangle {
             Item {
                 id: titleContainer
                 Layout.fillWidth: true
-                implicitHeight: Math.max(titleLabel.implicitHeight, titleField.implicitHeight)
+                implicitHeight: titleColumn.implicitHeight
 
-                Label {
-                    id: titleLabel
-                    anchors.fill: parent
-                    visible: !mainPanel.renamingTitle
-                    elide: Text.ElideMiddle
-                    text: mainPanel.displayTitle()
-                    color: "white"
-                    font.pixelSize: 14
+                ColumnLayout {
+                    id: titleColumn
+                    anchors.left: parent.left
+                    anchors.right: parent.right
+                    spacing: 1
 
-                    HoverHandler {
-                        id: titleHover
-                        cursorShape: Qt.PointingHandCursor
-                    }
-                    TapHandler {
-                        onTapped: {
-                            titleField.text = mainPanel.displayTitle()
-                            mainPanel.renamingTitle = true
-                            titleField.forceActiveFocus()
-                            titleField.selectAll()
+                    Item {
+                        id: titleRow
+                        Layout.fillWidth: true
+                        implicitHeight: Math.max(titleLabel.implicitHeight, titleField.implicitHeight)
+
+                        Label {
+                            id: titleLabel
+                            anchors.fill: parent
+                            visible: !mainPanel.renamingTitle
+                            elide: Text.ElideMiddle
+                            text: mainPanel.displayTitle()
+                            color: "white"
+                            font.pixelSize: 14
+
+                            HoverHandler {
+                                id: titleHover
+                                cursorShape: Qt.PointingHandCursor
+                            }
+                            TapHandler {
+                                onTapped: {
+                                    titleField.text = mainPanel.displayTitle()
+                                    mainPanel.renamingTitle = true
+                                    titleField.forceActiveFocus()
+                                    titleField.selectAll()
+                                }
+                            }
+                            HoverBorder {
+                                anchors.fill: parent
+                                active: titleHover.hovered
+                            }
+                        }
+
+                        TextField {
+                            id: titleField
+                            anchors.fill: parent
+                            visible: mainPanel.renamingTitle
+                            onAccepted: mainPanel.commitRename(text)
+                            onActiveFocusChanged: if (!activeFocus && mainPanel.renamingTitle) mainPanel.commitRename(text)
+
+                            background: UnderlineField { focused: titleField.activeFocus }
+
+                            Keys.onEscapePressed: mainPanel.renamingTitle = false
                         }
                     }
-                    HoverBorder {
-                        anchors.fill: parent
-                        active: titleHover.hovered
+
+                    // Item P5: when "labels" mode is showing an AI-generated
+                    // label instead of the real filename (see
+                    // AppSettings.useLabelsMainPanel/displayTitle()), the
+                    // actual on-disk file is no longer visible anywhere —
+                    // this small secondary line restores that, reusing
+                    // displayTitle()'s own relativeToVault() helper rather
+                    // than re-deriving the path. Only for the player-backed
+                    // view (orphaned .md has no player.source to relativize)
+                    // and only once this file actually HAS a label (an
+                    // untranscribed file with labels-mode on still just
+                    // shows its filename as the title itself, so a
+                    // filename-under-filename subtitle would be redundant).
+                    Label {
+                        id: filenameSubtitle
+                        Layout.fillWidth: true
+                        visible: !mainPanel.renamingTitle && AppSettings.useLabelsMainPanel
+                                 && mainPanel.orphanedMdPath === "" && !!mainPanel.storedMetadata.label
+                        elide: Text.ElideMiddle
+                        text: (mainPanel.player && mainPanel.player.source.toString() !== "")
+                              ? mainPanel.relativeToVault(mainPanel.player.source) : ""
+                        color: "#777777"
+                        font.pixelSize: 10
                     }
-                }
-
-                TextField {
-                    id: titleField
-                    anchors.fill: parent
-                    visible: mainPanel.renamingTitle
-                    onAccepted: mainPanel.commitRename(text)
-                    onActiveFocusChanged: if (!activeFocus && mainPanel.renamingTitle) mainPanel.commitRename(text)
-
-                    background: UnderlineField { focused: titleField.activeFocus }
-
-                    Keys.onEscapePressed: mainPanel.renamingTitle = false
                 }
             }
 
@@ -1085,7 +1479,8 @@ Rectangle {
                                                                              speakerDetectionToggle.checked,
                                                                              AppSettings.autoLabelEnabled,
                                                                              AppSettings.restrictTagsToExisting,
-                                                                             AppSettings.tagReuseBias)
+                                                                             AppSettings.tagReuseBias,
+                                                                             AppSettings.wordiness)
                 }
                 HoverBorder {
                     anchors.fill: parent
@@ -1116,7 +1511,7 @@ Rectangle {
                 enabled: visible && !mainPanel.transcriptionController.isQueued(regenerateLabelButton.targetUrl)
 
                 ToolTip.visible: regenerateLabelHover.hovered
-                ToolTip.text: qsTr("Regenerate auto-title")
+                ToolTip.text: qsTr("Regenerate label and prelude")
                 ToolTip.delay: 500
 
                 HoverHandler {
@@ -1129,7 +1524,8 @@ Rectangle {
                     onTapped: mainPanel.transcriptionController.relabel(regenerateLabelButton.targetUrl,
                                                                          mainPanel.vaultPath,
                                                                          AppSettings.restrictTagsToExisting,
-                                                                         AppSettings.tagReuseBias)
+                                                                         AppSettings.tagReuseBias,
+                                                                         AppSettings.wordiness)
                 }
                 HoverBorder {
                     anchors.fill: parent
@@ -1140,6 +1536,49 @@ Rectangle {
                     text: "↻"
                     color: regenerateLabelButton.enabled ? "#dddddd" : "#666666"
                     font.pixelSize: 14
+                }
+            }
+
+            // Feature 3c: "Generate chapters" — mirrors regenerateLabelButton
+            // above exactly (same enable/tooltip/hover shape), but scoped to
+            // player-backed files only (not orphaned .md), matching the
+            // prelude editor's same restriction just below (chapters, like
+            // the prelude, are only ever read via refreshMetadata(), not
+            // refreshOrphanedMetadata()) — placed here in the icon-button
+            // cluster rather than inside the chapter list's own header row
+            // so it's still reachable to generate a FIRST set of chapters
+            // when mainPanel.chapters is still empty (the list itself only
+            // renders once chapters.length > 0).
+            Item {
+                id: generateChaptersButton
+                Layout.preferredWidth: 22
+                Layout.preferredHeight: 22
+                visible: mainPanel.transcriptionController
+                         && mainPanel.orphanedMdPath === "" && mainPanel.hasStoredMetadata
+                enabled: visible && !mainPanel.transcriptionController.isQueued(mainPanel.player.source)
+
+                ToolTip.visible: generateChaptersHover.hovered
+                ToolTip.text: qsTr("Generate chapters")
+                ToolTip.delay: 500
+
+                HoverHandler {
+                    id: generateChaptersHover
+                    cursorShape: Qt.PointingHandCursor
+                    enabled: generateChaptersButton.enabled
+                }
+                TapHandler {
+                    enabled: generateChaptersButton.enabled
+                    onTapped: mainPanel.transcriptionController.generateChapters(mainPanel.player.source, mainPanel.vaultPath)
+                }
+                HoverBorder {
+                    anchors.fill: parent
+                    active: generateChaptersButton.enabled && generateChaptersHover.hovered
+                }
+                Text {
+                    anchors.centerIn: parent
+                    text: "≡"
+                    color: generateChaptersButton.enabled ? "#dddddd" : "#666666"
+                    font.pixelSize: 15
                 }
             }
 
@@ -1276,7 +1715,13 @@ Rectangle {
                     id: tagsRow
                     Layout.fillWidth: true
                     spacing: 6
-                    visible: mainPanel.currentTags().length > 0
+                    // Item P15/P20: the add-tag affordance needs to be
+                    // reachable even before this file has any tags at all —
+                    // visible whenever there's an actual note to attach tags
+                    // to (mirrors preludeContainer/chapterListColumn's own
+                    // gating), not just once currentTags() is non-empty.
+                    visible: mainPanel.currentTags().length > 0 || mainPanel.orphanedMdPath !== ""
+                             || mainPanel.hasStoredMetadata
 
                     Repeater {
                         model: mainPanel.currentTags()
@@ -1288,11 +1733,16 @@ Rectangle {
                             color: tagPillHover.hovered ? "#3f3f3f" : "#333333"
                             border.width: 1
                             border.color: "#4a4a4a"
-                            implicitWidth: tagLabel.implicitWidth + 12
-                            implicitHeight: tagLabel.implicitHeight + 6
+                            implicitWidth: tagPillRow.implicitWidth + 12
+                            implicitHeight: tagPillRow.implicitHeight + 6
 
-                            // Item 16 (Wave E): clicking a tag filters the sidebar
-                            // tree to files with that tag.
+                            // Item 16 (Wave E): clicking the pill body (NOT
+                            // the "x" below) filters the sidebar tree to
+                            // files with that tag — the "x" TapHandler grabs
+                            // the point first when the tap lands inside it
+                            // (same exclusive-grab pattern already used by
+                            // speakerPillItem's rename tap vs. its merge-
+                            // confirm ✓/✕ labels), so the two never both fire.
                             HoverHandler {
                                 id: tagPillHover
                                 cursorShape: Qt.PointingHandCursor
@@ -1301,13 +1751,102 @@ Rectangle {
                                 onTapped: mainPanel.tagActivated(tagPill.modelData)
                             }
 
-                            Label {
-                                id: tagLabel
+                            RowLayout {
+                                id: tagPillRow
                                 anchors.centerIn: parent
-                                text: parent.modelData
-                                color: "#cccccc"
-                                font.pixelSize: 11
+                                spacing: 4
+
+                                Label {
+                                    id: tagLabel
+                                    text: tagPill.modelData
+                                    color: "#cccccc"
+                                    font.pixelSize: 11
+                                }
+
+                                // Item P20: per-pill delete — always visible
+                                // (not hover-only) so its hit target is
+                                // predictable/discoverable, same treatment
+                                // as searchCloseButton's "x" elsewhere in
+                                // this file.
+                                Text {
+                                    id: tagRemoveIcon
+                                    text: "×"
+                                    color: tagRemoveHover.hovered ? "#e07a7a" : "#888888"
+                                    font.pixelSize: 12
+
+                                    HoverHandler {
+                                        id: tagRemoveHover
+                                        cursorShape: Qt.PointingHandCursor
+                                    }
+                                    TapHandler {
+                                        onTapped: mainPanel.removeTag(tagPill.modelData)
+                                    }
+                                }
                             }
+                        }
+                    }
+
+                    // Item P15: inline "+ tag" affordance — a small icon
+                    // that swaps to a compact TextField on click (mirrors
+                    // the title/prelude/speaker-pill click-to-edit idiom
+                    // already used throughout this file), committing on
+                    // Enter or on losing focus.
+                    Item {
+                        id: tagAddButton
+                        visible: !tagAddField.editing
+                        implicitWidth: tagAddLabel.implicitWidth + 12
+                        implicitHeight: tagAddLabel.implicitHeight + 6
+
+                        HoverHandler {
+                            id: tagAddHover
+                            cursorShape: Qt.PointingHandCursor
+                        }
+                        TapHandler {
+                            onTapped: {
+                                tagAddField.editing = true
+                                tagAddField.forceActiveFocus()
+                            }
+                        }
+                        Rectangle {
+                            anchors.fill: parent
+                            radius: AppSettings.borderRadius
+                            color: tagAddHover.hovered ? "#3f3f3f" : "transparent"
+                            border.width: 1
+                            border.color: "#4a4a4a"
+                        }
+                        Label {
+                            id: tagAddLabel
+                            anchors.centerIn: parent
+                            text: "+ " + qsTr("tag")
+                            color: "#999999"
+                            font.pixelSize: 11
+                        }
+                    }
+
+                    TextField {
+                        id: tagAddField
+                        property bool editing: false
+                        visible: editing
+                        implicitWidth: 100
+                        font.pixelSize: 11
+                        placeholderText: qsTr("New tag…")
+
+                        background: UnderlineField { focused: tagAddField.activeFocus }
+
+                        onAccepted: {
+                            mainPanel.addTag(text)
+                            text = ""
+                            tagAddField.editing = false
+                        }
+                        onActiveFocusChanged: {
+                            if (!activeFocus) {
+                                tagAddField.editing = false
+                                tagAddField.text = ""
+                            }
+                        }
+                        Keys.onEscapePressed: {
+                            tagAddField.editing = false
+                            tagAddField.text = ""
                         }
                     }
                 }
@@ -1410,6 +1949,21 @@ Rectangle {
                                 text: mainPanel.effectiveSpeakerName(speakerPillItem.modelData)
                                 color: "#dddddd"
                                 font.pixelSize: 11
+
+                                // Item P27: cursor-shape-only treatment — the
+                                // pill's TapHandler (rename) and DragHandler
+                                // (merge, both declared on the parent
+                                // speakerPillItem above) grab on press, so
+                                // giving this label real click-drag text
+                                // selection (a TextEdit/MouseArea, which
+                                // would need its own grab) would compete
+                                // with — and likely break — the existing
+                                // drag-to-merge gesture. HoverHandler alone
+                                // never grabs, so it can show the I-beam
+                                // hint without taking over the pointer.
+                                HoverHandler {
+                                    cursorShape: Qt.IBeamCursor
+                                }
                             }
 
                             // Inline "Merge into X?" confirmation — see
@@ -1489,11 +2043,233 @@ Rectangle {
                     visible: mainPanel.orphanedMdPath === "" && mainPanel.hasStoredMetadata
 
                     Label {
+                        Layout.fillWidth: true
+                        wrapMode: Text.WordWrap
                         text: qsTr("Previously transcribed — model: %1, speaker detection: %2")
                               .arg(mainPanel.storedMetadata.model || "?")
                               .arg(mainPanel.storedMetadata.speakerDetection ? qsTr("on") : qsTr("off"))
                         color: "#aaaaaa"
                         font.pixelSize: 11
+                    }
+                }
+
+                // Feature 2 (upgrades O26's old read-only single-line
+                // summary): a click-to-edit, multi-paragraph prelude —
+                // same muted secondary-text treatment as the "Previously
+                // transcribed" label above (color/pixelSize) when not being
+                // edited, just larger and unbolded so it reads as
+                // descriptive prose rather than a status line. Same
+                // click-to-edit idiom as titleLabel/titleField above, but a
+                // TextArea (multi-line) with explicit Save/Cancel instead of
+                // commit-on-Enter — plain Enter must insert a newline here.
+                // Visibility mirrors O26's own gating exactly (never shown
+                // for an orphaned .md, only once the file has been
+                // transcribed at all).
+                Item {
+                    id: preludeContainer
+                    Layout.fillWidth: true
+                    visible: mainPanel.orphanedMdPath === "" && mainPanel.hasStoredMetadata
+                    implicitHeight: mainPanel.editingPrelude
+                        ? preludeEditColumn.implicitHeight : preludeLabel.implicitHeight
+
+                    // Item P27: read-mode prelude is now a real selectable
+                    // TextEdit (I-beam cursor, click-drag select/copy) —
+                    // it can no longer double as the click-to-edit target
+                    // (a plain click there now positions the text cursor/
+                    // starts a selection instead), so preludeEditIcon below
+                    // is the new, narrower trigger into edit mode.
+                    Item {
+                        id: preludeLabel
+                        anchors.left: parent.left
+                        anchors.right: parent.right
+                        visible: !mainPanel.editingPrelude
+                        implicitHeight: preludeText.implicitHeight
+
+                        TextEdit {
+                            id: preludeText
+                            anchors.left: parent.left
+                            anchors.right: parent.right
+                            anchors.rightMargin: preludeEditIcon.implicitWidth + 6
+                            readOnly: true
+                            selectByMouse: true
+                            selectByKeyboard: true
+                            persistentSelection: true
+                            activeFocusOnPress: false
+                            text: mainPanel.prelude || qsTr("Click to add a prelude…")
+                            wrapMode: TextEdit.WordWrap
+                            color: mainPanel.prelude ? "#aaaaaa" : "#666666"
+                            font.pixelSize: 12
+                            font.italic: !mainPanel.prelude
+
+                            HoverHandler {
+                                cursorShape: Qt.IBeamCursor
+                            }
+                        }
+
+                        Text {
+                            id: preludeEditIcon
+                            anchors.right: parent.right
+                            anchors.top: parent.top
+                            text: "✎"
+                            color: preludeIconHover.hovered ? "#dddddd" : "#888888"
+                            font.pixelSize: 11
+
+                            HoverHandler {
+                                id: preludeIconHover
+                                cursorShape: Qt.PointingHandCursor
+                            }
+                            TapHandler {
+                                onTapped: {
+                                    preludeArea.text = mainPanel.prelude
+                                    mainPanel.editingPrelude = true
+                                    preludeArea.forceActiveFocus()
+                                }
+                            }
+                            HoverBorder {
+                                anchors.fill: parent
+                                anchors.margins: -3
+                                active: preludeIconHover.hovered
+                            }
+                        }
+                    }
+
+                    ColumnLayout {
+                        id: preludeEditColumn
+                        anchors.left: parent.left
+                        anchors.right: parent.right
+                        visible: mainPanel.editingPrelude
+                        spacing: 4
+
+                        TextArea {
+                            id: preludeArea
+                            Layout.fillWidth: true
+                            wrapMode: TextArea.Wrap
+                            color: "#dddddd"
+                            font.pixelSize: 12
+                            selectByMouse: true
+                            selectByKeyboard: true
+                            background: Rectangle {
+                                color: "transparent"
+                                radius: AppSettings.borderRadius
+                                border.width: 1
+                                border.color: "#5a5a5a"
+                            }
+                            Keys.onEscapePressed: mainPanel.editingPrelude = false
+                        }
+
+                        RowLayout {
+                            Layout.alignment: Qt.AlignRight
+                            spacing: 12
+
+                            Label {
+                                text: qsTr("Cancel")
+                                color: "#e07a7a"
+                                font.pixelSize: 11
+                                HoverHandler { cursorShape: Qt.PointingHandCursor }
+                                TapHandler { onTapped: mainPanel.editingPrelude = false }
+                            }
+                            Label {
+                                text: qsTr("Save")
+                                color: "#8fdf9f"
+                                font.pixelSize: 11
+                                font.bold: true
+                                HoverHandler { cursorShape: Qt.PointingHandCursor }
+                                TapHandler { onTapped: mainPanel.commitPrelude(preludeArea.text) }
+                            }
+                        }
+                    }
+                }
+
+                // Feature 3c: collapsible chapter list — same tap-to-seek
+                // idiom as the seek-bar tick marks (3b) and
+                // timestampClickArea further below. Only ever visible once
+                // mainPanel.chapters is non-empty (never for an orphaned
+                // .md, same restriction as the prelude editor above — see
+                // its own comment). Collapse toggle uses the same "+"/"−"
+                // disclosure glyph Sidebar.qml already uses for its tree
+                // rows, rather than introducing a new ▶/▼ convention;
+                // defaults EXPANDED since most files will only have a
+                // handful of chapters and hiding useful navigation by
+                // default would be the wrong default — the toggle exists as
+                // an escape hatch for the rare long list, not a resting
+                // state.
+                ColumnLayout {
+                    id: chapterListColumn
+                    Layout.fillWidth: true
+                    visible: mainPanel.orphanedMdPath === "" && mainPanel.chapters.length > 0
+                    spacing: 4
+
+                    RowLayout {
+                        Layout.fillWidth: true
+                        spacing: 6
+
+                        Text {
+                            text: mainPanel.chaptersExpanded ? "−" : "+"
+                            color: "#aaaaaa"
+                            font.pixelSize: 11
+
+                            HoverHandler { cursorShape: Qt.PointingHandCursor }
+                            TapHandler { onTapped: mainPanel.chaptersExpanded = !mainPanel.chaptersExpanded }
+                        }
+
+                        Label {
+                            Layout.fillWidth: true
+                            text: qsTr("Chapters (%1)").arg(mainPanel.chapters.length)
+                            color: "#aaaaaa"
+                            font.pixelSize: 11
+                            font.bold: true
+
+                            HoverHandler { cursorShape: Qt.PointingHandCursor }
+                            TapHandler { onTapped: mainPanel.chaptersExpanded = !mainPanel.chaptersExpanded }
+                        }
+                    }
+
+                    ColumnLayout {
+                        Layout.fillWidth: true
+                        Layout.leftMargin: 20
+                        spacing: 2
+                        visible: mainPanel.chaptersExpanded
+
+                        Repeater {
+                            model: mainPanel.chapters
+
+                            RowLayout {
+                                id: chapterRow
+                                required property var modelData
+                                Layout.fillWidth: true
+                                spacing: 8
+
+                                // Item P33: pointer cursor + click-to-seek
+                                // scoped to JUST the timestamp now (used to
+                                // span the whole row, covering the title
+                                // too) — the title below gets its own
+                                // independent I-beam/selectable treatment
+                                // instead of inheriting this one.
+                                Label {
+                                    id: chapterTimestampLabel
+                                    text: mainPanel.formatGutterTimestamp(chapterRow.modelData.t0)
+                                    color: "#777777"
+                                    font.pixelSize: 10
+
+                                    HoverHandler { cursorShape: Qt.PointingHandCursor }
+                                    TapHandler { onTapped: mainPanel.player.position = chapterRow.modelData.t0 * 1000 }
+                                }
+                                TextEdit {
+                                    Layout.fillWidth: true
+                                    clip: true
+                                    readOnly: true
+                                    selectByMouse: true
+                                    selectByKeyboard: true
+                                    persistentSelection: true
+                                    activeFocusOnPress: false
+                                    text: chapterRow.modelData.title
+                                    color: "#cccccc"
+                                    font.pixelSize: 11
+
+                                    HoverHandler { cursorShape: Qt.IBeamCursor }
+                                }
+                            }
+                        }
                     }
                 }
 
@@ -1533,7 +2309,13 @@ Rectangle {
                             cursorShape: Qt.PointingHandCursor
                         }
                         TapHandler {
-                            onTapped: speakerDetectionToggle.checked = !speakerDetectionToggle.checked
+                            onTapped: {
+                                speakerDetectionToggle.checked = !speakerDetectionToggle.checked
+                                // Mirrors modelCombo's onActivated below —
+                                // a manual toggle is remembered as the new
+                                // vault-wide default going forward.
+                                AppSettings.defaultSpeakerDetection = speakerDetectionToggle.checked
+                            }
                         }
                         Rectangle {
                             anchors.fill: parent
@@ -1560,16 +2342,40 @@ Rectangle {
                         color: "#aaaaaa"
                     }
 
+                    // Item P2: measures every model's label once (not
+                    // per-delegate — a single throwaway FontMetrics reused
+                    // across the whole list) so a long label (e.g. a
+                    // multilingual "large-v3" entry) gets a box wide enough
+                    // to show it in full, both closed and in the dropdown,
+                    // instead of relying on elide to silently hide the tail.
+                    FontMetrics {
+                        id: modelLabelFontMetrics
+                    }
+
                     ComboBox {
                         id: modelCombo
-                        Layout.preferredWidth: 240
+                        // 240 stays the floor for short label sets; the +64
+                        // padding covers the dropdown row's own dot+spacing
+                        // (8+6) plus the control's indicator/content
+                        // padding, so the widest label never gets clipped
+                        // in either the closed box or a delegate row (both
+                        // are sized to modelCombo.width).
+                        property real cachedMaxLabelWidth: 0
+                        Layout.preferredWidth: Math.max(240, modelCombo.cachedMaxLabelWidth + 64)
                         model: mainPanel.transcriptionController ? mainPanel.transcriptionController.availableModels() : []
                         textRole: "label"
                         valueRole: "id"
                         hoverEnabled: true
 
-                        Component.onCompleted: currentIndex = mainPanel.indexForModelId(AppSettings.lastModel)
-                        onActivated: AppSettings.lastModel = currentValue
+                        Component.onCompleted: {
+                            currentIndex = mainPanel.indexForModelId(AppSettings.defaultModel)
+                            let maxWidth = 0
+                            const models = mainPanel.transcriptionController ? mainPanel.transcriptionController.availableModels() : []
+                            for (const m of models)
+                                maxWidth = Math.max(maxWidth, modelLabelFontMetrics.advanceWidth(m.label))
+                            modelCombo.cachedMaxLabelWidth = maxWidth
+                        }
+                        onActivated: AppSettings.defaultModel = currentValue
 
                         ToolTip.visible: modelCombo.hovered
                         ToolTip.text: modelCombo.currentText
@@ -1582,6 +2388,77 @@ Rectangle {
                             anchors.fill: parent
                             active: modelCombo.hovered
                         }
+
+                        // O29: small dot per entry — green if that model's
+                        // weights are already on disk, gray if picking it
+                        // will first queue a download job.
+                        delegate: ItemDelegate {
+                            id: modelDelegate
+                            required property var modelData
+                            required property int index
+                            width: modelCombo.width
+                            highlighted: modelCombo.highlightedIndex === index
+
+                            contentItem: RowLayout {
+                                spacing: 6
+                                Label {
+                                    text: modelDelegate.modelData.label
+                                    color: "white"
+                                    Layout.fillWidth: true
+                                    elide: Text.ElideRight
+                                }
+                                Rectangle {
+                                    width: 8
+                                    height: 8
+                                    radius: 4
+                                    color: modelDelegate.modelData.downloaded ? "#2ecc71" : "#555555"
+                                    Layout.alignment: Qt.AlignVCenter
+                                }
+                            }
+                        }
+
+                        // Item P2: custom popup so its background can use
+                        // the app's own corner radius (matches
+                        // SettingsPopup.qml's own Popup background exactly)
+                        // instead of QQC2's default square-cornered popup.
+                        // The ListView here still drives itself off
+                        // modelCombo.delegateModel (built from the
+                        // top-level `model:`/`delegate:` above) — this is
+                        // exactly how QQC2's OWN default ComboBox popup
+                        // composes delegate+background internally, just
+                        // with our own background/padding instead of the
+                        // style's.
+                        popup: Popup {
+                            y: modelCombo.height
+                            width: modelCombo.width
+                            implicitHeight: Math.min(contentItem.implicitHeight, 320)
+                            padding: 1
+
+                            contentItem: ListView {
+                                clip: true
+                                implicitHeight: contentHeight
+                                model: modelCombo.popup.visible ? modelCombo.delegateModel : null
+                                currentIndex: modelCombo.highlightedIndex
+                                ScrollIndicator.vertical: ScrollIndicator {}
+                            }
+
+                            background: Rectangle {
+                                color: "#242424"
+                                radius: AppSettings.borderRadius
+                                border.width: 1
+                                border.color: "#3a3a3a"
+                            }
+                        }
+                    }
+
+                    // O35: which backend actually loaded the active model
+                    // ("Vulkan"/"CUDA"/"CPU"/…) — empty (and hidden) until
+                    // the first model load completes in this session.
+                    Label {
+                        text: mainPanel.transcriptionController ? mainPanel.transcriptionController.activeBackendName : ""
+                        visible: text !== ""
+                        color: "#888888"
+                        font.pixelSize: 11
                     }
                 }
 
@@ -1649,6 +2526,14 @@ Rectangle {
                 // correctly moments later.
                 readonly property var gutterLineRects: {
                     const len = transcriptArea.length
+                    // Same width/padding/font dependency gap as
+                    // safePositionToRectangle above — positionToRectangle()
+                    // is called directly here (not through that helper), so
+                    // it needs its own explicit reads.
+                    void transcriptArea.width
+                    void transcriptArea.leftPadding
+                    void transcriptArea.topPadding
+                    void transcriptArea.font
                     return mainPanel.displaySentences.map(
                         s => s.start <= len ? transcriptArea.positionToRectangle(s.start) : Qt.rect(0, 0, 0, 0))
                 }
@@ -1697,11 +2582,22 @@ Rectangle {
                     }
                 }
 
+                // Item P27: TextEdit (not plain Text) so a speaker name in
+                // the gutter is independently selectable/copyable with its
+                // own I-beam cursor — this is a distinct Item from
+                // transcriptArea (a sibling child positioned on top of it,
+                // same as before), so its selection is naturally scoped to
+                // just this one name and can never merge into the
+                // transcript's own selection. TextEdit has no `elide`
+                // (unlike the plain Text this replaces), but
+                // speakerGutterWidth is already sized to the widest name
+                // actually shown, so truncation was never really exercised
+                // in practice.
                 Repeater {
                     id: speakerGutterRepeater
                     model: mainPanel.displaySentences
 
-                    Text {
+                    TextEdit {
                         required property var modelData
                         required property int index
                         visible: modelData.showGutter && modelData.speaker !== ""
@@ -1710,17 +2606,73 @@ Rectangle {
                         y: lineRect.y
                         height: lineRect.height
                         width: mainPanel.speakerGutterWidth
-                        elide: Text.ElideRight
+                        readOnly: true
+                        selectByMouse: true
+                        selectByKeyboard: true
+                        persistentSelection: true
+                        activeFocusOnPress: false
                         // Right-aligned so the name sits right up against
                         // the transcript text (only gutterSpacing away)
                         // instead of leaving a ragged gap whenever the name
                         // is shorter than the column.
-                        horizontalAlignment: Text.AlignRight
-                        verticalAlignment: Text.AlignVCenter
+                        horizontalAlignment: TextEdit.AlignRight
+                        verticalAlignment: TextEdit.AlignVCenter
                         text: modelData.speaker
                         color: "#8fa8bf"
                         font.pixelSize: 10
                         font.bold: true
+
+                        HoverHandler {
+                            cursorShape: Qt.IBeamCursor
+                        }
+                    }
+                }
+
+                // Item P32: one heading row per chapter marker, interleaved
+                // into displaySentences by displayData above (see its own
+                // doc comment) — each heading pseudo-entry reserved a real
+                // blank line in transcriptArea's own text, so
+                // gutterLineRects[index] (same lookup the two gutter
+                // Repeaters above use) gives it a genuine row of its own to
+                // render into, rather than overlapping an adjacent
+                // sentence's line. Spans the full transcript width
+                // (including the gutter columns) since a chapter break
+                // applies to the whole turn, not one speaker's column.
+                Repeater {
+                    id: chapterHeadingRepeater
+                    model: mainPanel.displaySentences
+
+                    RowLayout {
+                        id: chapterHeadingRow
+                        required property var modelData
+                        required property int index
+                        visible: chapterHeadingRow.modelData.isChapterHeading
+                        readonly property rect lineRect: transcriptArea.gutterLineRects[index] || Qt.rect(0, 0, 0, 0)
+                        x: 0
+                        y: lineRect.y
+                        width: transcriptArea.width
+                        height: lineRect.height
+                        spacing: 8
+
+                        Rectangle {
+                            Layout.preferredWidth: 16
+                            Layout.preferredHeight: 1
+                            Layout.alignment: Qt.AlignVCenter
+                            color: "#3a3a3a"
+                        }
+                        Label {
+                            Layout.alignment: Qt.AlignVCenter
+                            text: chapterHeadingRow.modelData.chapterTitle
+                            color: "#8fdf9f"
+                            font.pixelSize: 12
+                            font.bold: true
+                        }
+                        Rectangle {
+                            Layout.fillWidth: true
+                            Layout.preferredHeight: 1
+                            Layout.alignment: Qt.AlignVCenter
+                            color: "#3a3a3a"
+                        }
                     }
                 }
 

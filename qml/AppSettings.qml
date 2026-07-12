@@ -5,10 +5,10 @@ import QtCore
 // Item 9 (Wave E): appearance/behavior settings now live in the VAULT
 // (<vault>/.suopTranscriber, JSON — VaultTreeModel::readVaultSettings/
 // writeVaultSettings), not an app-scoped QSettings .conf file — different
-// vaults can have different look/behavior preferences. lastVaultPath/
-// lastModel stay app-scoped (small nested Settings below): they're
-// last-used STATE needed to bootstrap which vault to open in the first
-// place, not a vault-specific preference.
+// vaults can have different look/behavior preferences. lastVaultPath stays
+// app-scoped (small nested Settings below): it's last-used STATE needed to
+// bootstrap which vault to open in the first place, not a vault-specific
+// preference.
 Item {
     id: appSettings
 
@@ -25,10 +25,8 @@ Item {
         id: appLevelSettings
         category: "app"
         property url lastVaultPath
-        property string lastModel: "base.en"
     }
     property alias lastVaultPath: appLevelSettings.lastVaultPath
-    property alias lastModel: appLevelSettings.lastModel
 
     property real borderRadius: 8
     property bool useSystemTitlebar: true
@@ -42,7 +40,7 @@ Item {
     property bool mainBlur: false
 
     // AI auto-labeling (DESIGN.md "Model management"): opt-in second pass
-    // after transcription, populates label/summary/tags via LabelingEngine.
+    // after transcription, populates label/prelude/tags via LabelingEngine.
     // Off by default — it's an extra ~2.5GB model download plus GPU time
     // per file, not something to silently switch on for everyone.
     property bool autoLabelEnabled: false
@@ -60,6 +58,11 @@ Item {
     // Higher = more willing to reuse an existing tag even if it's only a
     // loose/"stretched" fit, rather than invent a precise new one.
     property real tagReuseBias: 0.5
+
+    // Feature 1: how verbose the AI-generated label and prelude are, 0.0
+    // (terse) to 1.0 (descriptive). Same vault-scoped/debounced-save/reset
+    // mechanism as tagReuseBias above.
+    property real wordiness: 0.5
 
     // Thin white translucent edge by default — "liquid glass" look.
     property bool rimEnabled: true
@@ -89,6 +92,13 @@ Item {
     property color highlightColor: "#3a5a7a"
     property real highlightRadius: 8
 
+    // Sidebar file-tree selected-row highlight (Sidebar.qml) — was
+    // hardcoded translucent green (#2ecc7126 fill / #2ecc71 border); now a
+    // configurable translucent-white fill + border, same shape as rimColor
+    // above (color picker with alpha channel).
+    property color sidebarSelectionColor: "#33ffffff"
+    property color sidebarSelectionBorderColor: "#ffffff"
+
     // Transcript gutter's displayed timestamp precision — NOT the stored
     // data (segment lines always keep full sub-second precision on disk,
     // see TranscriptionController::formatTimestamp); this only rounds what
@@ -96,11 +106,31 @@ Item {
     // entirely ("3", "1:07"); each increment adds one more decimal digit.
     property int timestampDecimalPlaces: 0
 
+    // Default whisper model for new transcriptions — vault-scoped (a vault
+    // of interview recordings may want a different default model than one
+    // of podcast episodes). Matches ModelManager::kDefaultModelId.
+    property string defaultModel: "base.en"
+
+    // Default state of the speaker-detection toggle for new transcriptions.
+    // Matches the previous hardcoded fallback in MainPanel.qml.
+    property bool defaultSpeakerDetection: true
+
+    // BottomBar's opt-in alternative to the default ProgressBar: a thin
+    // glowing line across the top edge of the bottom info bar. Off by
+    // default (same "opt-in alternative style" reasoning as autoLabelEnabled
+    // above) — same shape as the rimEnabled/rimWidth/rimColor triple, plus
+    // one extra numeric (progressGlowRadius) for how far the glow blur
+    // extends, since a glow needs both a thickness and a blur spread.
+    property bool progressGlowEnabled: false
+    property color progressGlowColor: "#ffffff"
+    property real progressGlowWidth: 2
+    property real progressGlowRadius: 8
+
     // Single source of truth for every per-setting/global "reset to
     // default" button, AND for loadFromVault()/saveToVault() below (every
     // key here round-trips through the vault's .suopTranscriber file).
-    // lastVaultPath/lastModel are intentionally excluded: they track
-    // last-used state, not a vault-specific appearance/behavior setting.
+    // lastVaultPath is intentionally excluded: it tracks last-used state,
+    // not a vault-specific appearance/behavior setting.
     readonly property var defaults: ({
         borderRadius: 8,
         useSystemTitlebar: true,
@@ -120,9 +150,18 @@ Item {
         autoLabelEnabled: false,
         restrictTagsToExisting: false,
         tagReuseBias: 0.5,
+        wordiness: 0.5,
         highlightColor: "#3a5a7a",
         highlightRadius: 8,
-        timestampDecimalPlaces: 0
+        sidebarSelectionColor: "#33ffffff",
+        sidebarSelectionBorderColor: "#ffffff",
+        timestampDecimalPlaces: 0,
+        defaultModel: "base.en",
+        defaultSpeakerDetection: true,
+        progressGlowEnabled: false,
+        progressGlowColor: "#ffffff",
+        progressGlowWidth: 2,
+        progressGlowRadius: 8
     })
 
     // QML `color` values need to be stringified before crossing into a
@@ -214,6 +253,14 @@ Item {
         function onTagReuseBiasChanged() { appSettings.scheduleSave() }
         function onHighlightColorChanged() { appSettings.scheduleSave() }
         function onHighlightRadiusChanged() { appSettings.scheduleSave() }
+        function onSidebarSelectionColorChanged() { appSettings.scheduleSave() }
+        function onSidebarSelectionBorderColorChanged() { appSettings.scheduleSave() }
         function onTimestampDecimalPlacesChanged() { appSettings.scheduleSave() }
+        function onDefaultModelChanged() { appSettings.scheduleSave() }
+        function onDefaultSpeakerDetectionChanged() { appSettings.scheduleSave() }
+        function onProgressGlowEnabledChanged() { appSettings.scheduleSave() }
+        function onProgressGlowColorChanged() { appSettings.scheduleSave() }
+        function onProgressGlowWidthChanged() { appSettings.scheduleSave() }
+        function onProgressGlowRadiusChanged() { appSettings.scheduleSave() }
     }
 }

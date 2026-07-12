@@ -44,6 +44,38 @@ ApplicationWindow {
         folderDialog.open()
     }
 
+    // Drag-and-drop import: dropping audio file(s) anywhere on the window
+    // copies them into the vault ROOT (never a subfolder, regardless of
+    // where over the window the drop lands — see fileDropArea below) via
+    // VaultTreeModel::importFile(). Failures (wrong file type, name
+    // collision, no vault open) aren't fatal to the whole drop — every
+    // dropped file is attempted independently, and any that failed are
+    // named in a small auto-clearing banner (this app's established
+    // no-toast-system convention, see MainPanel's speakerOpError).
+    property string importError: ""
+    function importDroppedUrls(urls) {
+        if (vaultModel.vaultPath.toString() === "") {
+            window.importError = qsTr("Open a vault before dropping in audio files.")
+            importErrorClearTimer.restart()
+            return
+        }
+        const failed = []
+        for (const url of urls) {
+            if (!vaultModel.importFile(url))
+                failed.push(url.toString().split("/").pop())
+        }
+        if (failed.length > 0) {
+            window.importError = qsTr("Couldn't import: %1").arg(failed.join(", "))
+            importErrorClearTimer.restart()
+        }
+    }
+
+    Timer {
+        id: importErrorClearTimer
+        interval: 4000
+        onTriggered: window.importError = ""
+    }
+
     // Wave D item 3: reverted to the native/portal dialog (was replaced by
     // VaultFolderDialog.qml in Milestone 4 because its "Open" button is
     // greyed out with nothing explicitly selected when browsing into a leaf
@@ -164,6 +196,31 @@ ApplicationWindow {
         id: rootContent
         anchors.fill: parent
 
+        // Item: drag-and-drop import — dropping OS file(s) anywhere over the
+        // window imports them into the vault root (see importDroppedUrls()
+        // above). Covers the whole window rather than just Sidebar, matching
+        // "anywhere on screen" — the destination is always the vault root
+        // regardless of drop position, so there's no benefit to scoping this
+        // to a smaller target. z above the panels (but below the resize
+        // grips' 1000) purely so its hover highlight paints on top of
+        // whichever panel the cursor happens to be over.
+        DropArea {
+            id: fileDropArea
+            anchors.fill: parent
+            z: 500
+            onEntered: (drag) => { if (!drag.hasUrls) drag.accepted = false }
+            onDropped: (drop) => window.importDroppedUrls(drop.urls)
+
+            Rectangle {
+                anchors.fill: parent
+                visible: fileDropArea.containsDrag
+                color: "transparent"
+                radius: AppSettings.borderRadius
+                border.width: 2
+                border.color: "#2ecc71"
+            }
+        }
+
         // Sidebar/MainPanel are independently semi-transparent (blur-behind
         // glass) — these fillers sit only behind their divider-facing rounded
         // corners (sized/positioned in updateBlurRegions), not full-bleed,
@@ -233,6 +290,14 @@ ApplicationWindow {
                     model: vaultModel
                     transcriptionController: transcriptionController
                     vaultPath: vaultModel.vaultPath
+                    // O7: mirrors BottomBar's currentFilePath binding below —
+                    // orphaned .md and normal audio-player views are
+                    // mutually exclusive (see MainPanel's showAudioFile()/
+                    // showOrphanedMd()), so exactly one of these is ever the
+                    // "currently open" path.
+                    currentPath: mainPanel.orphanedMdPath !== "" ? mainPanel.orphanedMdPath
+                                 : (mainPanel.player && mainPanel.player.source.toString() !== ""
+                                    ? mainPanel.player.source.toString().replace("file://", "") : "")
                     onFileActivated: (path) => mainPanel.showAudioFile(path)
                     onOrphanedMdActivated: (path) => mainPanel.showOrphanedMd(path)
                     // Item 2 (Wave E): open the file (or orphaned .md) then
@@ -276,31 +341,13 @@ ApplicationWindow {
                                  : (mainPanel.player.source.toString() !== ""
                                     ? mainPanel.player.source.toString().replace("file://", "") : "")
                 transcriptionController: transcriptionController
+                // Item 4/P28: same AudioPlayer instance MainPanel already
+                // plays through — only used for a read-only position/
+                // duration readout in the bottom bar.
+                player: player
                 onSettingsRequested: settingsPopup.open()
                 onTaskActivated: (path) => mainPanel.showAudioFile(path)
             }
-        }
-
-        // Item 3 (Wave E): SettingsPopup's own dim already darkens the whole
-        // window (Popup.dim works independent of modal), but with
-        // `modal: false` (needed for the resize grips below, see item 12's
-        // note in SettingsPopup.qml) nothing actually BLOCKS clicks/drags
-        // from reaching Sidebar/MainPanel/BottomBar/TitleBar while it's
-        // open. A real `modal: true` isn't an option: Overlay.overlay's
-        // block plane covers the ENTIRE window uniformly, including these
-        // resize grips, since they're plain siblings below Overlay in
-        // z-order — there's no way to exempt them via Popup's own
-        // modal/Overlay machinery. Instead: a plain input-swallowing
-        // MouseArea declared here, AFTER the main content but BEFORE the
-        // ResizeGrips below, so it visually/input-wise sits on top of the
-        // app's normal content while the grips (declared later, so higher
-        // z) remain on top of IT and stay usable.
-        MouseArea {
-            anchors.fill: parent
-            visible: settingsPopup.visible
-            enabled: settingsPopup.visible
-            hoverEnabled: true
-            onWheel: {}
         }
 
         // Adjustable "rim" — thin translucent-white glass edge by default.
@@ -321,15 +368,19 @@ ApplicationWindow {
         // user resize the window (Qt::FramelessWindowHint removes it and
         // nothing replaced it) — these thin edge/corner grips call the same
         // startSystemResize() the compositor would normally drive, mirroring
-        // TitleBar's existing startSystemMove() pattern. Declared last so
-        // they paint/receive input on top of TitleBar/Sidebar/MainPanel/
-        // BottomBar's own outermost pixels (e.g. the top strip overlaps
-        // TitleBar's drag-to-move area — a resize takes priority right at
-        // the true window edge). System-titlebar mode already gets OS resize
-        // borders for free, so these are frameless-only.
+        // TitleBar's existing startSystemMove() pattern. Reparented onto
+        // Overlay.overlay (same coordinate space as rootContent, since
+        // Overlay.overlay fills the ApplicationWindow's contentItem) with an
+        // explicit z above SettingsPopup's own block-plane/content, so they
+        // keep painting/receiving input above it while settingsPopup's
+        // `modal: true` blocks everything else in the window. System-
+        // titlebar mode already gets OS resize borders for free, so these
+        // are frameless-only.
         component ResizeGrip: Item {
             id: grip
             required property int edges
+            parent: Overlay.overlay
+            z: 1000
             visible: !AppSettings.useSystemTitlebar
             enabled: visible
 
@@ -395,6 +446,27 @@ ApplicationWindow {
             edges: Qt.BottomEdge | Qt.RightEdge
             anchors.bottom: parent.bottom; anchors.right: parent.right
             width: 8; height: 8
+        }
+
+        // Drag-and-drop import failure feedback — same reparent-onto-
+        // Overlay.overlay + high-z treatment as ResizeGrip above, so it
+        // floats above every panel regardless of where the drop happened.
+        // Auto-clears via importErrorClearTimer; success needs no banner
+        // since the imported file simply appears in the sidebar tree.
+        Label {
+            parent: Overlay.overlay
+            z: 1001
+            anchors.top: parent.top
+            anchors.horizontalCenter: parent.horizontalCenter
+            anchors.topMargin: 12
+            visible: window.importError !== ""
+            text: window.importError
+            color: "white"
+            padding: 8
+            background: Rectangle {
+                color: "#c0392b"
+                radius: AppSettings.borderRadius
+            }
         }
     }
 }

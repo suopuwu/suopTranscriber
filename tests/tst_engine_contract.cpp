@@ -242,6 +242,13 @@ private slots:
         WhisperCppEngine engine(modelPath);
         QVERIFY2(engine.isValid(), qPrintable(QStringLiteral("failed to load model: ") + modelPath));
 
+        // Item O35: a real load must always resolve to SOME backend name —
+        // "CPU" when no GPU line fired, or whatever whisper.cpp's own log
+        // line named (see WhisperCppEngine::activeBackendName()'s doc
+        // comment) — never empty once a model has actually loaded.
+        QVERIFY2(!engine.activeBackendName().isEmpty(),
+                 "activeBackendName() must be populated after a real model load");
+
         AudioChunk chunk;
         chunk.pcm16kMono = *pcm;
         const double chunkSeconds = static_cast<double>(chunk.pcm16kMono.size()) / 16000.0;

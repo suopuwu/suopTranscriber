@@ -1,6 +1,7 @@
 #include "LabelingEngine.h"
 
 #include <QDebug>
+#include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
 
@@ -20,23 +21,84 @@ constexpr int kContextTokens = 8192;
 // kContextTokens for the system prompt, chat-template overhead, and the
 // generation budget below.
 constexpr int kMaxInputChars = 24000;
-constexpr int kMaxOutputTokens = 400;
+constexpr int kMaxOutputTokens = 700;
+
+// Feature 3a ("generate chapters"): a SEPARATE pair of limits from label()'s
+// above — the output shape scales with however many chapters the model
+// proposes (up to ~20, see kChapterSystemPrompt) rather than one small fixed
+// JSON object, so kMaxOutputTokens itself would be far too small. Both
+// constants are sized to fit comfortably within kContextTokens together
+// (kMaxChapterInputChars is ~4000 tokens at the same ~4 chars/token estimate
+// used above, kMaxChapterOutputTokens leaves ~4000 tokens of headroom for
+// that plus the system prompt/chat-template overhead) — unlike label(),
+// where the tiny fixed output budget makes this non-issue moot.
+// kMaxChapterInputChars itself now lives on the class (LabelingEngine.h) —
+// item P34 needs TranscriptionController to see it too, to window a long
+// transcript across multiple calls instead of relying on the truncation
+// below to silently drop everything past one window.
+constexpr int kMaxChapterOutputTokens = 3072;
 
 // Fixed key order, not a generic JSON-object grammar — a narrow, schema-exact
 // grammar is far more reliable for a small model to satisfy every time than
 // a fully generic one. The `string` rule is llama.cpp's own proven one from
 // grammars/json.gbnf (third_party/llama.cpp), reused verbatim.
 constexpr auto kGrammar = R"GBNF(
-root   ::= "{" ws "\"label\"" ws ":" ws string "," ws "\"summary\"" ws ":" ws string "," ws "\"tags\"" ws ":" ws string ws "}"
+root   ::= "{" ws "\"label\"" ws ":" ws string "," ws "\"prelude\"" ws ":" ws string "," ws "\"tags\"" ws ":" ws string ws "}"
 string ::= "\"" ( [^"\\\x7F\x00-\x1F] | "\\" (["\\bfnrt] | "u" [0-9a-fA-F]{4}) )* "\""
 ws     ::= [ \t\n]*
 )GBNF";
 
-const char *kSystemPrompt =
-    "You produce a JSON object describing an audio transcript: a short "
-    "display label (a few words), a one-paragraph summary, and a "
-    "comma-separated list of topical tags. Respond with ONLY the JSON "
-    "object, nothing else.";
+// Feature 3a: a JSON array of {afterSegment, title} objects — same "narrow,
+// schema-exact over fully generic" philosophy as kGrammar above. `integer`
+// is a deliberately NARROW, bounded rule (not the generic float-capable
+// `number` rule from grammars/json.gbnf) — "0" or 1-5 digits with no leading
+// zero, i.e. 0..99999, far more segments than any realistic transcript has,
+// which is all afterSegment ever needs to express.
+constexpr auto kChapterGrammar = R"GBNF(
+root    ::= "[" ws (chapter (ws "," ws chapter)*)? ws "]"
+chapter ::= "{" ws "\"afterSegment\"" ws ":" ws integer "," ws "\"title\"" ws ":" ws string ws "}"
+integer ::= "0" | [1-9] [0-9]{0,4}
+string  ::= "\"" ( [^"\\\x7F\x00-\x1F] | "\\" (["\\bfnrt] | "u" [0-9a-fA-F]{4}) )* "\""
+ws      ::= [ \t\n]*
+)GBNF";
+
+// Only the truly-fixed structural parts of the instruction live here — the
+// label/prelude phrasing in between is wordiness-dependent and built in
+// buildSystemPrompt() below.
+const char *kSystemPromptPrefix = "You produce a JSON object describing an audio transcript: ";
+const char *kSystemPromptSuffix =
+    ", and a comma-separated list of topical tags. Respond with ONLY the JSON object, nothing else.";
+
+// Feature 3a: the user message is the indexed segment list itself (built in
+// generateChapters() below, "0: text\n1: text\n..."), so this only needs to
+// explain the task and the exact response shape — same register as the
+// label/prelude prompt above, phrased for a small instruct model.
+const char *kChapterSystemPrompt =
+    "You divide an audio transcript into chapters. You are given the transcript as a "
+    "numbered list of its segments, one per line, formatted \"INDEX: text\". Propose chapter "
+    "boundaries for it — roughly one chapter every few minutes of spoken content, up to about "
+    "20 chapters for a long transcript and fewer for a short one; a short transcript covering "
+    "one continuous topic may need zero. For each chapter boundary (skip the very first "
+    "chapter — it always starts at segment 0 implicitly), return \"afterSegment\": the index of "
+    "the LAST segment of the PREVIOUS chapter, so the new chapter begins right after it; and "
+    "\"title\": a short (a few words) descriptive title for the chapter that STARTS there. "
+    "Respond with ONLY a JSON array of these objects, ordered by afterSegment ascending, "
+    "nothing else.";
+
+// Feature 1: 0.0-1.0 slider controlling how verbose the generated label and
+// prelude are, independent of the tag-related options below. 3-tier phrasing
+// (same threshold style as tagReuseBias below) rather than embedding the raw
+// float — a small model follows a clear qualitative instruction more
+// reliably than it would calibrate against a bare number. Mid tier matches
+// the wording this prompt always used before wordiness/prelude existed.
+QString labelPreludePhrasing(double wordiness)
+{
+    if (wordiness >= 0.67)
+        return QStringLiteral("a descriptive label (up to a short phrase), a detailed multi-sentence prelude");
+    if (wordiness >= 0.34)
+        return QStringLiteral("a short display label (a few words), a one-paragraph prelude");
+    return QStringLiteral("a very short label (1-3 words), a single concise prelude sentence");
+}
 
 // Item 14 "auto-categorize" mode: restrict tags to an existing vault-wide
 // vocabulary instead of freely inventing new ones. This is a prompt
@@ -48,9 +110,11 @@ const char *kSystemPrompt =
 // shown to the model as context, phrased at one of 3 tiers depending on
 // tagReuseBias — a graduated nudge, not a hard rule (that's what
 // restrictToExisting is for).
-QString buildSystemPrompt(const QStringList &existingTags, bool restrictToExisting, double tagReuseBias)
+QString buildSystemPrompt(const QStringList &existingTags, bool restrictToExisting, double tagReuseBias,
+                           double wordiness)
 {
-    QString prompt = QString::fromUtf8(kSystemPrompt);
+    QString prompt = QString::fromUtf8(kSystemPromptPrefix) + labelPreludePhrasing(wordiness)
+        + QString::fromUtf8(kSystemPromptSuffix);
     if (existingTags.isEmpty())
         return prompt;
 
@@ -129,8 +193,9 @@ LabelingEngine::~LabelingEngine()
         llama_model_free(m_model);
 }
 
-std::optional<LabelResult> LabelingEngine::label(const QString &transcriptText, const QStringList &existingTags,
-                                                  bool restrictToExisting, double tagReuseBias, QString *errorOut)
+std::optional<QString> LabelingEngine::runGrammarConstrained(const QString &systemPrompt, const QString &userText,
+                                                               const char *grammar, int maxOutputTokens,
+                                                               QString *errorOut)
 {
     if (!isValid()) {
         if (errorOut)
@@ -138,14 +203,14 @@ std::optional<LabelResult> LabelingEngine::label(const QString &transcriptText, 
         return std::nullopt;
     }
 
-    const QByteArray userUtf8 = transcriptText.left(kMaxInputChars).toUtf8();
-    const QByteArray systemUtf8 = buildSystemPrompt(existingTags, restrictToExisting, tagReuseBias).toUtf8();
+    const QByteArray userUtf8 = userText.toUtf8();
+    const QByteArray systemUtf8 = systemPrompt.toUtf8();
     const llama_vocab *vocab = llama_model_get_vocab(m_model);
 
-    llama_sampler *grammarSampler = llama_sampler_init_grammar(vocab, kGrammar, "root");
+    llama_sampler *grammarSampler = llama_sampler_init_grammar(vocab, grammar, "root");
     if (!grammarSampler) {
         if (errorOut)
-            *errorOut = QStringLiteral("failed to parse the labeling grammar");
+            *errorOut = QStringLiteral("failed to parse the generation grammar");
         return std::nullopt;
     }
     llama_sampler *chain = llama_sampler_chain_init(llama_sampler_chain_default_params());
@@ -174,8 +239,9 @@ std::optional<LabelResult> LabelingEngine::label(const QString &transcriptText, 
     }
     const std::string prompt(formatted.data(), len);
 
-    // Each label() call is an independent single-shot generation, not a
-    // multi-turn conversation — clear any state left by a previous call.
+    // Each call is an independent single-shot generation, not a multi-turn
+    // conversation — clear any state left by a previous call (label() or
+    // generateChapters(), whichever ran last on this shared context).
     llama_memory_clear(llama_get_memory(m_ctx), true);
 
     const int nPromptTokens =
@@ -194,7 +260,7 @@ std::optional<LabelResult> LabelingEngine::label(const QString &transcriptText, 
     std::string response;
     const int nCtx = llama_n_ctx(m_ctx);
     bool overflowed = false;
-    for (int i = 0; i < kMaxOutputTokens; ++i) {
+    for (int i = 0; i < maxOutputTokens; ++i) {
         const int nCtxUsed = llama_memory_seq_pos_max(llama_get_memory(m_ctx), 0) + 1;
         if (nCtxUsed + batch.n_tokens > nCtx) {
             overflowed = true;
@@ -203,7 +269,7 @@ std::optional<LabelResult> LabelingEngine::label(const QString &transcriptText, 
         if (llama_decode(m_ctx, batch) != 0) {
             llama_sampler_free(chain);
             if (errorOut)
-                *errorOut = QStringLiteral("decode failed during labeling");
+                *errorOut = QStringLiteral("decode failed during generation");
             return std::nullopt;
         }
 
@@ -224,22 +290,79 @@ std::optional<LabelResult> LabelingEngine::label(const QString &transcriptText, 
 
     if (overflowed) {
         if (errorOut)
-            *errorOut = QStringLiteral("context size exceeded during labeling");
+            *errorOut = QStringLiteral("context size exceeded during generation");
         return std::nullopt;
     }
 
-    const QJsonDocument doc = QJsonDocument::fromJson(QByteArray::fromStdString(response));
+    return QString::fromStdString(response);
+}
+
+std::optional<LabelResult> LabelingEngine::label(const QString &transcriptText, const QStringList &existingTags,
+                                                  bool restrictToExisting, double tagReuseBias, double wordiness,
+                                                  QString *errorOut)
+{
+    const QString systemPrompt = buildSystemPrompt(existingTags, restrictToExisting, tagReuseBias, wordiness);
+    const auto response =
+        runGrammarConstrained(systemPrompt, transcriptText.left(kMaxInputChars), kGrammar, kMaxOutputTokens, errorOut);
+    if (!response)
+        return std::nullopt;
+
+    const QJsonDocument doc = QJsonDocument::fromJson(response->toUtf8());
     if (!doc.isObject()) {
         if (errorOut)
-            *errorOut =
-                QStringLiteral("model did not produce valid JSON: %1").arg(QString::fromStdString(response));
+            *errorOut = QStringLiteral("model did not produce valid JSON: %1").arg(*response);
         return std::nullopt;
     }
 
     const QJsonObject obj = doc.object();
     LabelResult result;
     result.label = obj.value(QStringLiteral("label")).toString();
-    result.summary = obj.value(QStringLiteral("summary")).toString();
+    result.prelude = obj.value(QStringLiteral("prelude")).toString();
     result.tags = obj.value(QStringLiteral("tags")).toString();
     return result;
+}
+
+std::optional<QList<Chapter>> LabelingEngine::generateChapters(const QStringList &segmentTexts, QString *errorOut)
+{
+    QString indexed;
+    indexed.reserve(segmentTexts.size() * 24);
+    for (int i = 0; i < segmentTexts.size(); ++i) {
+        indexed += QString::number(i);
+        indexed += QStringLiteral(": ");
+        indexed += segmentTexts.at(i);
+        indexed += QLatin1Char('\n');
+    }
+    // See generateChapters()'s header doc comment: unlike label()'s silent
+    // truncation, flag it when it actually happens here — losing the tail of
+    // a long transcript's chapters would otherwise look like a bug, not a
+    // documented v1 limit.
+    if (indexed.size() > LabelingEngine::kMaxChapterInputChars) {
+        indexed.truncate(LabelingEngine::kMaxChapterInputChars);
+        qWarning() << "generateChapters: transcript truncated to" << LabelingEngine::kMaxChapterInputChars
+                   << "chars — chapters past that point will not be proposed";
+    }
+
+    const auto response = runGrammarConstrained(QString::fromUtf8(kChapterSystemPrompt), indexed, kChapterGrammar,
+                                                 kMaxChapterOutputTokens, errorOut);
+    if (!response)
+        return std::nullopt;
+
+    const QJsonDocument doc = QJsonDocument::fromJson(response->toUtf8());
+    if (!doc.isArray()) {
+        if (errorOut)
+            *errorOut = QStringLiteral("model did not produce a valid JSON array: %1").arg(*response);
+        return std::nullopt;
+    }
+
+    QList<Chapter> chapters;
+    const QJsonArray array = doc.array();
+    chapters.reserve(array.size());
+    for (const QJsonValue &v : array) {
+        const QJsonObject obj = v.toObject();
+        Chapter chapter;
+        chapter.afterSegmentIndex = obj.value(QStringLiteral("afterSegment")).toInt(-1);
+        chapter.title = obj.value(QStringLiteral("title")).toString();
+        chapters.append(chapter);
+    }
+    return chapters;
 }

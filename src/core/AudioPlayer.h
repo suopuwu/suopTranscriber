@@ -1,6 +1,7 @@
 #pragma once
 
 #include <QAudioOutput>
+#include <QMediaDevices>
 #include <QMediaPlayer>
 #include <QObject>
 #include <QUrl>
@@ -40,4 +41,5 @@ signals:
 private:
     QMediaPlayer m_player;
     QAudioOutput m_audioOutput;
+    QMediaDevices m_devices;
 };

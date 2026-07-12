@@ -61,6 +61,16 @@ public:
     // without leaving the audio/.md pair mismatched.
     Q_INVOKABLE bool renameFile(const QUrl &fileUrl, const QString &newBaseName, QString *errorOut = nullptr);
 
+    // Copies an external audio file (e.g. dragged in from the desktop) into
+    // the vault root — never a subfolder, regardless of where in the window
+    // the drop happened. A copy, not a move: the source may be on removable
+    // media or otherwise not the user's to lose (mirrors DESIGN.md's "USB
+    // import" language, "copy only new audio in"). Refuses (rather than
+    // silently overwriting or auto-renaming) if a file with the same name
+    // already exists at the destination, or if fileUrl isn't a recognized
+    // audio extension. Returns false and sets *errorOut on any failure.
+    Q_INVOKABLE bool importFile(const QUrl &fileUrl, QString *errorOut = nullptr);
+
     // Reveals fileUrl in the desktop's file manager with it selected (Wave D
     // item 2 — BottomBar's current-file path is clickable). Uses the
     // freedesktop.org FileManager1 D-Bus interface's ShowItems method (the
@@ -113,9 +123,30 @@ private:
     // change the QFileSystemWatcher reports.
     static QString sidecarMdPath(const Node *node);
     static QString frontmatterField(const QString &mdPath, const QString &key);
-    static QString transcriptBody(const QString &mdPath);
+    // Item P12: transcriptBody() backs search's transcript-content matching
+    // (VaultSearchProxyModel::matchesDirect) — before this cache, every
+    // keystroke re-opened and re-read every transcribed file's ENTIRE body
+    // from disk, for every candidate row, on every filter pass. Now a
+    // non-static const member (was static) so it can consult/populate
+    // m_transcriptBodyCache. Cache correctness relies purely on the
+    // mtime+size check below, NOT on any QFileSystemWatcher hook — an
+    // in-place frontmatter/body rewrite (e.g. a relabel) changes neither the
+    // directory listing nor triggers rebuild() (see item P19's finding on
+    // this), but DOES change the file's mtime/size, which this cache checks
+    // on every call regardless of what triggered it.
+    QString transcriptBody(const QString &mdPath) const;
+
+    struct CachedBody {
+        qint64 mtimeMs = 0;
+        qint64 size = -1;
+        QString body;
+    };
 
     QUrl m_vaultPath;
     std::unique_ptr<Node> m_root;
     QFileSystemWatcher m_watcher;
+    // Item P12: keyed by sidecar .md path — see transcriptBody()'s doc
+    // comment. mutable so transcriptBody() can stay callable from data()
+    // const.
+    mutable QHash<QString, CachedBody> m_transcriptBodyCache;
 };

@@ -102,7 +102,12 @@ Item {
         y: titleBar.height + 4
         width: 220
         padding: 4
-        modal: false
+        // O21: was modal:false — no real dim + no real input block (Qt's
+        // automatic block-plane only activates for modal:true). Outside
+        // clicks still close it via CloseOnPressOutside, they just no
+        // longer also land on whatever's behind the menu.
+        modal: true
+        dim: true
         focus: false
         closePolicy: Popup.CloseOnPressOutside | Popup.CloseOnEscape
         onClosed: titleBar.forceRetranscribeConfirming = false

@@ -11,17 +11,19 @@ Popup {
 
     width: 440
     height: Math.min(contentColumn.implicitHeight + 32, maxHeight)
-    // Non-modal: a modal Popup's input-blocking layer covers the ENTIRE
-    // window via Overlay.overlay, including the window-edge ResizeGrips
-    // (Main.qml) — that would silently eat every resize attempt while the
-    // popup was open. `dim` is set explicitly below (not left to follow
-    // `modal`), and closePolicy already closes on an outside press, so the
-    // popup still looks and dismisses the same way. Item 3 (Wave E):
-    // interaction with the rest of the window IS still blocked while this is
-    // open — via a separate input-swallowing MouseArea in Main.qml, declared
-    // below the ResizeGrips in z-order so those alone stay usable, rather
-    // than through this Popup's own modal/Overlay mechanism.
-    modal: false
+    // Modal: Overlay.overlay's automatic block-plane now genuinely blocks
+    // clicks/drags to Sidebar/MainPanel/BottomBar/TitleBar while this is
+    // open (a previous `modal: false` + input-swallowing MouseArea
+    // workaround in Main.qml correctly blocked hover but let TapHandler
+    // clicks pass through — TapHandlers use passive-grab semantics
+    // independent of that MouseArea's exclusive Item-grab). The window-edge
+    // ResizeGrips (Main.qml) stay usable despite the block-plane covering
+    // the whole window: they're reparented onto Overlay.overlay itself with
+    // a z above the popup's own block-plane/content, so they keep
+    // painting/receiving input on top of it. `dim` is still set explicitly
+    // below (not left to just follow `modal`) for the slider-drag
+    // passthrough behavior.
+    modal: true
     focus: true
     x: parent ? (parent.width - width) / 2 : 0
     y: parent ? (parent.height - height) / 2 : 0
@@ -38,6 +40,7 @@ Popup {
                                || mainOpacitySlider.pressed || rimWidthSlider.pressed
                                || highlightRadiusSlider.pressed || tagReuseBiasSlider.pressed
                                || timestampDecimalPlacesSlider.pressed
+                               || progressGlowWidthSlider.pressed || progressGlowRadiusSlider.pressed
 
     dim: !anyPressed
 
@@ -58,6 +61,8 @@ Popup {
                 || !AppSettings.isDefault("rimColor")
                 || !AppSettings.isDefault("highlightColor")
                 || !AppSettings.isDefault("highlightRadius")
+                || !AppSettings.isDefault("sidebarSelectionColor")
+                || !AppSettings.isDefault("sidebarSelectionBorderColor")
                 || !AppSettings.isDefault("useLabelsMainPanel")
                 || !AppSettings.isDefault("useLabelsSidebar")
                 || !AppSettings.isDefault("hideExtensionsSidebar")
@@ -66,6 +71,10 @@ Popup {
                 || !AppSettings.isDefault("restrictTagsToExisting")
                 || !AppSettings.isDefault("tagReuseBias")
                 || !AppSettings.isDefault("timestampDecimalPlaces")
+                || !AppSettings.isDefault("progressGlowEnabled")
+                || !AppSettings.isDefault("progressGlowColor")
+                || !AppSettings.isDefault("progressGlowWidth")
+                || !AppSettings.isDefault("progressGlowRadius")
     }
 
     background: Rectangle {
@@ -103,6 +112,30 @@ Popup {
         title: qsTr("Sentence Highlight Color")
         selectedColor: AppSettings.highlightColor
         onAccepted: AppSettings.highlightColor = selectedColor
+    }
+
+    ColorDialog {
+        id: sidebarSelectionColorDialog
+        title: qsTr("Sidebar Selection Color")
+        selectedColor: AppSettings.sidebarSelectionColor
+        options: ColorDialog.ShowAlphaChannel
+        onAccepted: AppSettings.sidebarSelectionColor = selectedColor
+    }
+
+    ColorDialog {
+        id: sidebarSelectionBorderColorDialog
+        title: qsTr("Sidebar Selection Border Color")
+        selectedColor: AppSettings.sidebarSelectionBorderColor
+        options: ColorDialog.ShowAlphaChannel
+        onAccepted: AppSettings.sidebarSelectionBorderColor = selectedColor
+    }
+
+    ColorDialog {
+        id: progressGlowColorDialog
+        title: qsTr("Progress Glow Color")
+        selectedColor: AppSettings.progressGlowColor
+        options: ColorDialog.ShowAlphaChannel
+        onAccepted: AppSettings.progressGlowColor = selectedColor
     }
 
     ScrollView {
@@ -535,6 +568,116 @@ Popup {
                     HoverBorder {
                         anchors.fill: parent
                         active: sidebarBlurResetButton.enabled && sidebarBlurResetButton.hovered
+                    }
+                }
+            }
+
+            RowLayout {
+                Layout.fillWidth: true
+                Label {
+                    Layout.fillWidth: true
+                    color: "white"
+                    text: qsTr("Selection fill color")
+                }
+                Button {
+                    id: sidebarSelectionColorButton
+                    text: qsTr("Choose…")
+                    hoverEnabled: true
+                    onClicked: sidebarSelectionColorDialog.open()
+
+                    background: Rectangle {
+                        radius: AppSettings.borderRadius
+                        color: (sidebarSelectionColorButton.hovered && sidebarSelectionColorButton.enabled) ? "#3a3a3a" : "#2a2a2a"
+                        border.width: 1
+                        border.color: "#3a3a3a"
+                    }
+                    HoverHandler {
+                        cursorShape: Qt.PointingHandCursor
+                    }
+                    HoverBorder {
+                        anchors.fill: parent
+                        active: sidebarSelectionColorButton.hovered
+                    }
+                }
+                Button {
+                    id: sidebarSelectionColorResetButton
+                    text: "↺"
+                    implicitWidth: 22
+                    implicitHeight: 22
+
+                    background: Rectangle {
+                        radius: AppSettings.borderRadius
+                        color: "transparent"
+                        border.width: 1
+                        border.color: "#3a3a3a"
+                    }
+                    enabled: !AppSettings.isDefault("sidebarSelectionColor")
+                    opacity: enabled ? 1 : 0.35
+                    hoverEnabled: enabled
+                    onClicked: AppSettings.resetProperty("sidebarSelectionColor")
+
+                    HoverHandler {
+                        cursorShape: Qt.PointingHandCursor
+                        enabled: sidebarSelectionColorResetButton.enabled
+                    }
+                    HoverBorder {
+                        anchors.fill: parent
+                        active: sidebarSelectionColorResetButton.enabled && sidebarSelectionColorResetButton.hovered
+                    }
+                }
+            }
+
+            RowLayout {
+                Layout.fillWidth: true
+                Label {
+                    Layout.fillWidth: true
+                    color: "white"
+                    text: qsTr("Selection border color")
+                }
+                Button {
+                    id: sidebarSelectionBorderColorButton
+                    text: qsTr("Choose…")
+                    hoverEnabled: true
+                    onClicked: sidebarSelectionBorderColorDialog.open()
+
+                    background: Rectangle {
+                        radius: AppSettings.borderRadius
+                        color: (sidebarSelectionBorderColorButton.hovered && sidebarSelectionBorderColorButton.enabled) ? "#3a3a3a" : "#2a2a2a"
+                        border.width: 1
+                        border.color: "#3a3a3a"
+                    }
+                    HoverHandler {
+                        cursorShape: Qt.PointingHandCursor
+                    }
+                    HoverBorder {
+                        anchors.fill: parent
+                        active: sidebarSelectionBorderColorButton.hovered
+                    }
+                }
+                Button {
+                    id: sidebarSelectionBorderColorResetButton
+                    text: "↺"
+                    implicitWidth: 22
+                    implicitHeight: 22
+
+                    background: Rectangle {
+                        radius: AppSettings.borderRadius
+                        color: "transparent"
+                        border.width: 1
+                        border.color: "#3a3a3a"
+                    }
+                    enabled: !AppSettings.isDefault("sidebarSelectionBorderColor")
+                    opacity: enabled ? 1 : 0.35
+                    hoverEnabled: enabled
+                    onClicked: AppSettings.resetProperty("sidebarSelectionBorderColor")
+
+                    HoverHandler {
+                        cursorShape: Qt.PointingHandCursor
+                        enabled: sidebarSelectionBorderColorResetButton.enabled
+                    }
+                    HoverBorder {
+                        anchors.fill: parent
+                        active: sidebarSelectionBorderColorResetButton.enabled && sidebarSelectionBorderColorResetButton.hovered
                     }
                 }
             }
@@ -1081,6 +1224,294 @@ Popup {
             }
 
             Label {
+                text: qsTr("Progress Glow")
+                color: "white"
+                font.bold: true
+            }
+
+            RowLayout {
+                Layout.fillWidth: true
+                Label {
+                    Layout.fillWidth: true
+                    color: "white"
+                    text: qsTr("Enabled")
+                }
+                Switch {
+                    id: progressGlowEnabledSwitch
+                    checked: AppSettings.progressGlowEnabled
+                    hoverEnabled: true
+                    onToggled: AppSettings.progressGlowEnabled = checked
+
+                    HoverHandler {
+                        cursorShape: Qt.PointingHandCursor
+                    }
+                    HoverBorder {
+                        anchors.fill: parent
+                        active: progressGlowEnabledSwitch.hovered
+                    }
+                }
+                Button {
+                    id: progressGlowEnabledResetButton
+                    text: "↺"
+                    implicitWidth: 22
+                    implicitHeight: 22
+
+                    background: Rectangle {
+                        radius: AppSettings.borderRadius
+                        color: "transparent"
+                        border.width: 1
+                        border.color: "#3a3a3a"
+                    }
+                    enabled: !AppSettings.isDefault("progressGlowEnabled")
+                    opacity: enabled ? 1 : 0.35
+                    hoverEnabled: enabled
+                    onClicked: AppSettings.resetProperty("progressGlowEnabled")
+
+                    HoverHandler {
+                        cursorShape: Qt.PointingHandCursor
+                        enabled: progressGlowEnabledResetButton.enabled
+                    }
+                    HoverBorder {
+                        anchors.fill: parent
+                        active: progressGlowEnabledResetButton.enabled && progressGlowEnabledResetButton.hovered
+                    }
+                }
+            }
+
+            Label {
+                visible: progressGlowEnabledSwitch.checked
+                Layout.fillWidth: true
+                wrapMode: Text.WordWrap
+                text: qsTr("Replaces the bottom info bar's progress bar with a thin glowing line across its top edge.")
+                color: "#888888"
+                font.pixelSize: 11
+            }
+
+            RowLayout {
+                Layout.fillWidth: true
+                visible: progressGlowEnabledSwitch.checked
+                Label {
+                    Layout.fillWidth: true
+                    color: "white"
+                    text: qsTr("Color")
+                }
+                Button {
+                    id: progressGlowColorButton
+                    text: qsTr("Choose…")
+                    hoverEnabled: true
+                    onClicked: progressGlowColorDialog.open()
+
+                    background: Rectangle {
+                        radius: AppSettings.borderRadius
+                        color: (progressGlowColorButton.hovered && progressGlowColorButton.enabled) ? "#3a3a3a" : "#2a2a2a"
+                        border.width: 1
+                        border.color: "#3a3a3a"
+                    }
+                    HoverHandler {
+                        cursorShape: Qt.PointingHandCursor
+                    }
+                    HoverBorder {
+                        anchors.fill: parent
+                        active: progressGlowColorButton.hovered
+                    }
+                }
+                Button {
+                    id: progressGlowColorResetButton
+                    text: "↺"
+                    implicitWidth: 22
+                    implicitHeight: 22
+
+                    background: Rectangle {
+                        radius: AppSettings.borderRadius
+                        color: "transparent"
+                        border.width: 1
+                        border.color: "#3a3a3a"
+                    }
+                    enabled: !AppSettings.isDefault("progressGlowColor")
+                    opacity: enabled ? 1 : 0.35
+                    hoverEnabled: enabled
+                    onClicked: AppSettings.resetProperty("progressGlowColor")
+
+                    HoverHandler {
+                        cursorShape: Qt.PointingHandCursor
+                        enabled: progressGlowColorResetButton.enabled
+                    }
+                    HoverBorder {
+                        anchors.fill: parent
+                        active: progressGlowColorResetButton.enabled && progressGlowColorResetButton.hovered
+                    }
+                }
+            }
+
+            RowLayout {
+                Layout.fillWidth: true
+                visible: progressGlowEnabledSwitch.checked
+                Label {
+                    Layout.preferredWidth: 90
+                    color: "white"
+                    text: qsTr("Width")
+                }
+                Slider {
+                    id: progressGlowWidthSlider
+                    Layout.fillWidth: true
+                    Layout.minimumWidth: 80
+                    from: 0
+                    to: 8
+                    value: AppSettings.progressGlowWidth
+                    hoverEnabled: true
+                    onMoved: AppSettings.progressGlowWidth = value
+
+                    HoverHandler {
+                        cursorShape: Qt.PointingHandCursor
+                    }
+                    HoverBorder {
+                        anchors.fill: parent
+                        active: progressGlowWidthSlider.hovered
+                    }
+                }
+                TextField {
+                    id: progressGlowWidthField
+                    Layout.preferredWidth: 56
+                    horizontalAlignment: TextInput.AlignRight
+                    hoverEnabled: true
+                    validator: DoubleValidator { bottom: progressGlowWidthSlider.from; top: progressGlowWidthSlider.to; decimals: 1 }
+                    onEditingFinished: {
+                        const v = parseFloat(text)
+                        if (!isNaN(v))
+                            AppSettings.progressGlowWidth = Math.max(progressGlowWidthSlider.from, Math.min(progressGlowWidthSlider.to, v))
+                        text = AppSettings.progressGlowWidth.toFixed(1)
+                    }
+
+                    background: UnderlineField { focused: progressGlowWidthField.activeFocus }
+
+                    Binding {
+                        target: progressGlowWidthField
+                        property: "text"
+                        value: AppSettings.progressGlowWidth.toFixed(1)
+                        when: !progressGlowWidthField.activeFocus
+                    }
+
+                    HoverHandler {
+                        cursorShape: Qt.PointingHandCursor
+                    }
+                    HoverBorder {
+                        anchors.fill: parent
+                        active: progressGlowWidthField.hovered
+                    }
+                }
+                Button {
+                    id: progressGlowWidthResetButton
+                    text: "↺"
+                    implicitWidth: 22
+                    implicitHeight: 22
+
+                    background: Rectangle {
+                        radius: AppSettings.borderRadius
+                        color: "transparent"
+                        border.width: 1
+                        border.color: "#3a3a3a"
+                    }
+                    enabled: !AppSettings.isDefault("progressGlowWidth")
+                    opacity: enabled ? 1 : 0.35
+                    hoverEnabled: enabled
+                    onClicked: AppSettings.resetProperty("progressGlowWidth")
+
+                    HoverHandler {
+                        cursorShape: Qt.PointingHandCursor
+                        enabled: progressGlowWidthResetButton.enabled
+                    }
+                    HoverBorder {
+                        anchors.fill: parent
+                        active: progressGlowWidthResetButton.enabled && progressGlowWidthResetButton.hovered
+                    }
+                }
+            }
+
+            RowLayout {
+                Layout.fillWidth: true
+                visible: progressGlowEnabledSwitch.checked
+                Label {
+                    Layout.preferredWidth: 90
+                    color: "white"
+                    text: qsTr("Glow radius")
+                }
+                Slider {
+                    id: progressGlowRadiusSlider
+                    Layout.fillWidth: true
+                    Layout.minimumWidth: 80
+                    from: 0
+                    to: 32
+                    value: AppSettings.progressGlowRadius
+                    hoverEnabled: true
+                    onMoved: AppSettings.progressGlowRadius = value
+
+                    HoverHandler {
+                        cursorShape: Qt.PointingHandCursor
+                    }
+                    HoverBorder {
+                        anchors.fill: parent
+                        active: progressGlowRadiusSlider.hovered
+                    }
+                }
+                TextField {
+                    id: progressGlowRadiusField
+                    Layout.preferredWidth: 56
+                    horizontalAlignment: TextInput.AlignRight
+                    hoverEnabled: true
+                    validator: DoubleValidator { bottom: progressGlowRadiusSlider.from; top: progressGlowRadiusSlider.to; decimals: 1 }
+                    onEditingFinished: {
+                        const v = parseFloat(text)
+                        if (!isNaN(v))
+                            AppSettings.progressGlowRadius = Math.max(progressGlowRadiusSlider.from, Math.min(progressGlowRadiusSlider.to, v))
+                        text = AppSettings.progressGlowRadius.toFixed(1)
+                    }
+
+                    background: UnderlineField { focused: progressGlowRadiusField.activeFocus }
+
+                    Binding {
+                        target: progressGlowRadiusField
+                        property: "text"
+                        value: AppSettings.progressGlowRadius.toFixed(1)
+                        when: !progressGlowRadiusField.activeFocus
+                    }
+
+                    HoverHandler {
+                        cursorShape: Qt.PointingHandCursor
+                    }
+                    HoverBorder {
+                        anchors.fill: parent
+                        active: progressGlowRadiusField.hovered
+                    }
+                }
+                Button {
+                    id: progressGlowRadiusResetButton
+                    text: "↺"
+                    implicitWidth: 22
+                    implicitHeight: 22
+
+                    background: Rectangle {
+                        radius: AppSettings.borderRadius
+                        color: "transparent"
+                        border.width: 1
+                        border.color: "#3a3a3a"
+                    }
+                    enabled: !AppSettings.isDefault("progressGlowRadius")
+                    opacity: enabled ? 1 : 0.35
+                    hoverEnabled: enabled
+                    onClicked: AppSettings.resetProperty("progressGlowRadius")
+
+                    HoverHandler {
+                        cursorShape: Qt.PointingHandCursor
+                        enabled: progressGlowRadiusResetButton.enabled
+                    }
+                    HoverBorder {
+                        anchors.fill: parent
+                        active: progressGlowRadiusResetButton.enabled && progressGlowRadiusResetButton.hovered
+                    }
+                }
+            }
+
+            Label {
                 text: qsTr("Timestamps")
                 color: "white"
                 font.bold: true
@@ -1401,7 +1832,7 @@ Popup {
                 Label {
                     Layout.fillWidth: true
                     color: "white"
-                    text: qsTr("Auto-generate label, summary, and tags")
+                    text: qsTr("Auto-generate label, prelude, and tags")
                 }
                 Switch {
                     id: autoLabelEnabledSwitch
@@ -1450,7 +1881,7 @@ Popup {
                 Layout.fillWidth: true
                 wrapMode: Text.WordWrap
                 text: qsTr("Runs a small local AI model (~2.5 GB download on first use) after each "
-                           + "transcription to generate a display label, summary, and tags.")
+                           + "transcription to generate a display label, prelude, and tags.")
                 color: "#888888"
                 font.pixelSize: 11
             }
@@ -1580,6 +2011,70 @@ Popup {
                 text: qsTr("How much to favor reusing an existing tag over inventing a new one. Low: "
                            + "prefer a precise new tag. High: stretch and reuse an existing tag even if "
                            + "it's only a loose fit.")
+                color: "#888888"
+                font.pixelSize: 11
+            }
+
+            RowLayout {
+                Layout.fillWidth: true
+                visible: autoLabelEnabledSwitch.checked
+                Label {
+                    Layout.preferredWidth: 90
+                    color: "white"
+                    text: qsTr("Label wordiness")
+                }
+                Slider {
+                    id: wordinessSlider
+                    Layout.fillWidth: true
+                    Layout.minimumWidth: 80
+                    from: 0
+                    to: 1
+                    value: AppSettings.wordiness
+                    hoverEnabled: true
+                    onMoved: AppSettings.wordiness = value
+
+                    HoverHandler {
+                        cursorShape: Qt.PointingHandCursor
+                    }
+                    HoverBorder {
+                        anchors.fill: parent
+                        active: wordinessSlider.hovered
+                    }
+                }
+                Button {
+                    id: wordinessResetButton
+                    text: "↺"
+                    implicitWidth: 22
+                    implicitHeight: 22
+
+                    background: Rectangle {
+                        radius: AppSettings.borderRadius
+                        color: "transparent"
+                        border.width: 1
+                        border.color: "#3a3a3a"
+                    }
+                    enabled: !AppSettings.isDefault("wordiness")
+                    opacity: enabled ? 1 : 0.35
+                    hoverEnabled: enabled
+                    onClicked: AppSettings.resetProperty("wordiness")
+
+                    HoverHandler {
+                        cursorShape: Qt.PointingHandCursor
+                        enabled: wordinessResetButton.enabled
+                    }
+                    HoverBorder {
+                        anchors.fill: parent
+                        active: wordinessResetButton.enabled && wordinessResetButton.hovered
+                    }
+                }
+            }
+
+            Label {
+                visible: autoLabelEnabledSwitch.checked
+                Layout.fillWidth: true
+                wrapMode: Text.WordWrap
+                text: qsTr("How verbose the AI-generated label and prelude are. Low: terse. High: "
+                           + "descriptive.")
                 color: "#888888"
                 font.pixelSize: 11
             }

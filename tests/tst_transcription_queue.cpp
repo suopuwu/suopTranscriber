@@ -333,7 +333,7 @@ private slots:
     {
         VaultFixture vault;
         const QUrl audioUrl = vault.audioUrl("interview.wav");
-        QFile md(vault.dir.path() + "/interview.md");
+        QFile md(vault.dir.path() + "/interview.wav.md");
         QVERIFY(md.open(QIODevice::WriteOnly));
         md.write("---\nmodel: ggml-base.en.bin\nspeakerDetection: true\nspeakers: Speaker 1, Speaker 2\n---\n\n"
                  "[0] [Speaker 1] hi\n[3.5] [Speaker 2] hello\n");
@@ -363,7 +363,7 @@ private slots:
     {
         VaultFixture vault;
         const QUrl audioUrl = vault.audioUrl("interview.wav");
-        QFile md(vault.dir.path() + "/interview.md");
+        QFile md(vault.dir.path() + "/interview.wav.md");
         QVERIFY(md.open(QIODevice::WriteOnly));
         md.write("---\nmodel: ggml-base.en.bin\nspeakerDetection: true\nspeakers: Speaker 1, Speaker 2\n---\n\n"
                  "[0] [Speaker 1] hi\n[3.5] [Speaker 2] hello\n");
@@ -395,7 +395,7 @@ private slots:
 
         const QUrl transcribeFile = vault.audioUrl("a.wav");
         const QUrl relabelFile = vault.audioUrl("b.wav");
-        QFile relabelMd(vault.dir.path() + "/b.md");
+        QFile relabelMd(vault.dir.path() + "/b.wav.md");
         QVERIFY(relabelMd.open(QIODevice::WriteOnly));
         relabelMd.write("---\nmodel: ggml-base.en.bin\n---\n\n[0] hello\n");
         relabelMd.close();
@@ -410,7 +410,7 @@ private slots:
         labelModel.close();
 
         const QUrl renameFile = vault.audioUrl("c.wav");
-        QFile renameMd(vault.dir.path() + "/c.md");
+        QFile renameMd(vault.dir.path() + "/c.wav.md");
         QVERIFY(renameMd.open(QIODevice::WriteOnly));
         renameMd.write("---\nmodel: ggml-base.en.bin\nspeakerDetection: true\nspeakers: Speaker 1\n---\n\n"
                        "[0] [Speaker 1] hi\n");
@@ -892,13 +892,55 @@ private slots:
         controller.transcribe(queuedFile1, vault.vaultUrl, kModelId, false);
         controller.transcribe(queuedFile2, vault.vaultUrl, kModelId, false);
 
-        const int secondId = controller.jobs().at(2).toMap().value("id").toInt();
-        controller.moveQueuedJob(secondId, 0); // move c.wav to the front of the queued sublist
-
-        const QVariantList jobs = controller.jobs();
-        QCOMPARE(jobs.at(0).toMap().value("fileUrl").toUrl(), activeFile); // Active row untouched
-        QCOMPARE(jobs.at(1).toMap().value("fileUrl").toUrl(), queuedFile2); // moved to front
+        // Item O15: each newly transcribe()d job jumps to the front of the
+        // QUEUE (never ahead of the Active row) — so c.wav (queued second)
+        // already landed ahead of b.wav (queued first) before any
+        // moveQueuedJob() call at all. See
+        // transcribe_newJobJumpsAheadOfQueuedWork_butNeverPreemptsActive()
+        // for that behavior in isolation; this test only cares that
+        // moveQueuedJob() itself reorders Queued entries without touching
+        // the Active row.
+        QVariantList jobs = controller.jobs();
+        QCOMPARE(jobs.at(0).toMap().value("fileUrl").toUrl(), activeFile);
+        QCOMPARE(jobs.at(1).toMap().value("fileUrl").toUrl(), queuedFile2);
         QCOMPARE(jobs.at(2).toMap().value("fileUrl").toUrl(), queuedFile1);
+
+        const int lastQueuedId = jobs.at(2).toMap().value("id").toInt();
+        controller.moveQueuedJob(lastQueuedId, 0); // move b.wav to the front of the queued sublist
+
+        jobs = controller.jobs();
+        QCOMPARE(jobs.at(0).toMap().value("fileUrl").toUrl(), activeFile); // Active row untouched
+        QCOMPARE(jobs.at(1).toMap().value("fileUrl").toUrl(), queuedFile1); // moved to front
+        QCOMPARE(jobs.at(2).toMap().value("fileUrl").toUrl(), queuedFile2);
+    }
+
+    // Item O15: a freshly transcribe()d job jumps ahead of whatever's
+    // already Queued, so it runs NEXT once the Active job finishes — but it
+    // must never preempt the job actually running right now. Three files
+    // queued back-to-back land as [active, newest-queued, ..., oldest-
+    // queued] — the exact reverse of plain FIFO append order — because each
+    // one is inserted right behind the Active row, ahead of whatever was
+    // already sitting there.
+    void transcribe_newJobJumpsAheadOfQueuedWork_butNeverPreemptsActive()
+    {
+        VaultFixture vault;
+        TranscriptionController controller;
+        const QUrl activeFile = vault.audioUrl("a.wav");
+        const QUrl firstQueued = vault.audioUrl("b.wav");
+        const QUrl secondQueued = vault.audioUrl("c.wav");
+
+        controller.transcribe(activeFile, vault.vaultUrl, kModelId, false);
+        QCOMPARE(statusOf(controller, activeFile), QStringLiteral("active"));
+
+        controller.transcribe(firstQueued, vault.vaultUrl, kModelId, false);
+        QCOMPARE(controller.queuedFileUrls(), QVariantList{firstQueued});
+
+        controller.transcribe(secondQueued, vault.vaultUrl, kModelId, false);
+        // secondQueued jumped ahead of firstQueued — the Active job is
+        // untouched (still a.wav, still "active"), but among Queued entries
+        // the most-recently-requested one is now first in line.
+        QCOMPARE(statusOf(controller, activeFile), QStringLiteral("active"));
+        QCOMPARE(controller.queuedFileUrls(), (QVariantList{secondQueued, firstQueued}));
     }
 
     // Item 1: a Queued job persists to <vault>/.transcriber/tasks.json and
@@ -1092,15 +1134,18 @@ private slots:
                                 .arg(controller.overallProgress())));
 
         // speakerDetection was false, so only these two phases ran — both
-        // must have a persisted sample now.
+        // must have a persisted sample now. Item P3: keys are now composite
+        // (phase|modelId[|diar]), not just the bare phase name — no "|diar"
+        // suffix here since speakerDetection was false for this job.
         QSettings settings;
         settings.beginGroup(QStringLiteral("phaseTimings"));
-        QVERIFY2(!settings.value(QStringLiteral("loading")).toList().isEmpty(),
+        QVERIFY2(!settings.value(QStringLiteral("loading|%1").arg(kModelId)).toList().isEmpty(),
                  "expected a persisted duration sample for the \"loading\" phase");
-        QVERIFY2(!settings.value(QStringLiteral("transcribing")).toList().isEmpty(),
+        QVERIFY2(!settings.value(QStringLiteral("transcribing|%1").arg(kModelId)).toList().isEmpty(),
                  "expected a persisted duration sample for the \"transcribing\" phase");
         // Never requested this job, so no sample should exist for it.
-        QVERIFY(settings.value(QStringLiteral("detecting-speakers")).toList().isEmpty());
+        QVERIFY(settings.value(QStringLiteral("detecting-speakers|%1").arg(kModelId)).toList().isEmpty());
+        QVERIFY(settings.value(QStringLiteral("detecting-speakers|%1|diar").arg(kModelId)).toList().isEmpty());
         settings.endGroup();
     }
 };

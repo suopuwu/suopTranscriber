@@ -129,7 +129,7 @@ private slots:
         QVERIFY(vault.isValid());
         QVERIFY(touch(vault.filePath("aaa.mp3")));
         QVERIFY(touch(vault.filePath("zzz.mp3")));
-        QVERIFY(touch(vault.filePath("zzz.md"), "---\nlabel: Budget Review\n---\n\n[00:00:00.000 - 00:00:01.000] hi\n"));
+        QVERIFY(touch(vault.filePath("zzz.mp3.md"), "---\nlabel: Budget Review\n---\n\n[00:00:00.000 - 00:00:01.000] hi\n"));
 
         VaultTreeModel source;
         source.setVaultPath(QUrl::fromLocalFile(vault.path()));
@@ -148,7 +148,7 @@ private slots:
         QVERIFY(vault.isValid());
         QVERIFY(touch(vault.filePath("aaa.mp3")));
         QVERIFY(touch(vault.filePath("zzz.mp3")));
-        QVERIFY(touch(vault.filePath("zzz.md"),
+        QVERIFY(touch(vault.filePath("zzz.mp3.md"),
                       "---\n---\n\n[00:00:00.000 - 00:00:01.000] the quarterly budget numbers\n"));
 
         VaultTreeModel source;
@@ -218,9 +218,9 @@ private slots:
         QTemporaryDir vault;
         QVERIFY(vault.isValid());
         QVERIFY(touch(vault.filePath("both.mp3")));
-        QVERIFY(touch(vault.filePath("both.md"), "---\ntags: finance, planning\n---\n\n[00:00:00.000 - 00:00:01.000] hi\n"));
+        QVERIFY(touch(vault.filePath("both.mp3.md"), "---\ntags: finance, planning\n---\n\n[00:00:00.000 - 00:00:01.000] hi\n"));
         QVERIFY(touch(vault.filePath("onlyfinance.mp3")));
-        QVERIFY(touch(vault.filePath("onlyfinance.md"), "---\ntags: finance\n---\n\n[00:00:00.000 - 00:00:01.000] hi\n"));
+        QVERIFY(touch(vault.filePath("onlyfinance.mp3.md"), "---\ntags: finance\n---\n\n[00:00:00.000 - 00:00:01.000] hi\n"));
         QVERIFY(touch(vault.filePath("untagged.mp3")));
 
         VaultTreeModel source;
@@ -240,7 +240,7 @@ private slots:
         QTemporaryDir vault;
         QVERIFY(vault.isValid());
         QVERIFY(touch(vault.filePath("keep/hit.mp3")));
-        QVERIFY(touch(vault.filePath("keep/hit.md"), "---\ntags: finance\n---\n\n[00:00:00.000 - 00:00:01.000] hi\n"));
+        QVERIFY(touch(vault.filePath("keep/hit.mp3.md"), "---\ntags: finance\n---\n\n[00:00:00.000 - 00:00:01.000] hi\n"));
         QVERIFY(touch(vault.filePath("drop/miss.mp3")));
 
         VaultTreeModel source;

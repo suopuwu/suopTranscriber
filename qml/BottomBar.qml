@@ -10,6 +10,10 @@ Item {
     property string vaultLocalPath: ""
     property TranscriptionController transcriptionController
     property VaultTreeModel vaultTreeModel
+    // Item 4/P28: same AudioPlayer instance MainPanel already plays through
+    // (see Main.qml's BottomBar instantiation) — only used here to show a
+    // "position / duration" readout, never to control playback itself.
+    property AudioPlayer player
     // Wave D item 2: the currently-open file's raw local path (audio file or
     // orphaned .md — whatever MainPanel currently shows), empty if none.
     property string currentFilePath: ""
@@ -176,6 +180,14 @@ Item {
         if (!bottomBar.busy)
             return ""
         const elapsed = bottomBar.formatDuration(bottomBar.activeElapsedMs)
+        // O16: a real cooperative pause never changes Job::status (it stays
+        // "active" the whole time — see JobStatus::Paused's doc comment for
+        // the one narrow case where it doesn't), so this is the one place
+        // that has to check activePaused directly rather than trusting the
+        // status string. The ETA is meaningless while frozen, so drop it
+        // entirely and say so instead of showing a stale "~Y left".
+        if (bottomBar.activePaused)
+            return qsTr("paused at %1").arg(elapsed)
         return bottomBar.estimatedRemainingMs >= 0
             ? (elapsed + " / ~" + bottomBar.formatDuration(bottomBar.estimatedRemainingMs) + " left")
             : elapsed
@@ -217,6 +229,7 @@ Item {
         case "rename": return qsTr("Rename")
         case "merge": return qsTr("Merge")
         case "download": return qsTr("Download")
+        case "chapters": return qsTr("Generate chapters")
         default: return qsTr("Transcribe")
         }
     }
@@ -245,6 +258,55 @@ Item {
         // corners natively instead of relying on an outer OpacityMask).
         bottomLeftRadius: AppSettings.useSystemTitlebar ? 0 : AppSettings.borderRadius
         bottomRightRadius: AppSettings.useSystemTitlebar ? 0 : AppSettings.borderRadius
+    }
+
+    // P11: alternative progress-bar style — a thin glowing line across the
+    // top edge of the bar, sweeping across the job's WHOLE lifetime (same
+    // taskOverallProgress the existing ProgressBar below uses, for a smooth
+    // blended-across-phases sweep rather than progress's per-phase reset).
+    // Opt-in via AppSettings.progressGlowEnabled — the existing percentage
+    // text/ProgressBar are left completely alone either way. Deliberately
+    // NOT using Qt5Compat.GraphicalEffects (Glow/RectangularGlow) — see
+    // Main.qml's comment above rootContent (~line 154) documenting a
+    // reproducible OpacityMask rendering bug on this Qt/RHI combination from
+    // that same module; the same shader risk almost certainly applies here
+    // too. Instead the "glow" is faked with layered, progressively wider and
+    // more transparent plain Rectangles behind a thin, fully-opaque core
+    // line — cheap, stock-QtQuick, no extra modules.
+    Item {
+        id: progressGlow
+        visible: AppSettings.progressGlowEnabled && bottomBar.busy
+        anchors.top: parent.top
+        anchors.left: parent.left
+        width: Math.max(0, bottomBar.width * bottomBar.taskOverallProgress)
+        height: AppSettings.progressGlowWidth + AppSettings.progressGlowRadius
+
+        // Outer halo — widest, most transparent.
+        Rectangle {
+            anchors.top: parent.top
+            anchors.left: parent.left
+            width: parent.width
+            height: AppSettings.progressGlowWidth + AppSettings.progressGlowRadius
+            color: AppSettings.progressGlowColor
+            opacity: 0.15
+        }
+        // Middle halo — narrower, more opaque.
+        Rectangle {
+            anchors.top: parent.top
+            anchors.left: parent.left
+            width: parent.width
+            height: AppSettings.progressGlowWidth + AppSettings.progressGlowRadius / 2
+            color: AppSettings.progressGlowColor
+            opacity: 0.35
+        }
+        // Core line — the real thin, fully-opaque edge.
+        Rectangle {
+            anchors.top: parent.top
+            anchors.left: parent.left
+            width: parent.width
+            height: AppSettings.progressGlowWidth
+            color: AppSettings.progressGlowColor
+        }
     }
 
     RowLayout {
@@ -358,8 +420,10 @@ Item {
             // being omitted for two of them.
             text: bottomBar.activeStopping
                 ? qsTr("(stopping…)")
-                : "(" + bottomBar.phaseLabel(bottomBar.currentPhase) + " "
-                  + (bottomBar.taskProgress * 100).toFixed(1) + "%)"
+                : bottomBar.activePaused
+                    ? qsTr("(paused)")
+                    : "(" + bottomBar.phaseLabel(bottomBar.currentPhase) + " "
+                      + (bottomBar.taskProgress * 100).toFixed(1) + "%)"
             color: "#888888"
             font.pixelSize: 11
         }
@@ -428,6 +492,38 @@ Item {
             }
         }
 
+        // O17: abort the Active job directly from the collapsed bar,
+        // without opening the Tasks popup — same visibility gating as
+        // pauseButton right above (its sibling), and same small-target
+        // ReleaseWithinBounds gesture fix.
+        Item {
+            id: stopButton
+            visible: pauseButton.visible
+            enabled: !bottomBar.activeStopping
+            opacity: enabled ? 1 : 0.4
+            Layout.preferredWidth: 16
+            Layout.preferredHeight: 16
+
+            HoverHandler {
+                id: stopHover
+                cursorShape: Qt.PointingHandCursor
+            }
+            TapHandler {
+                gesturePolicy: TapHandler.ReleaseWithinBounds
+                onTapped: bottomBar.transcriptionController.cancelActive()
+            }
+            HoverBorder {
+                anchors.fill: parent
+                active: stopHover.hovered
+            }
+            Text {
+                anchors.centerIn: parent
+                text: "⏹"
+                color: "#dddddd"
+                font.pixelSize: 11
+            }
+        }
+
         ProgressBar {
             Layout.preferredWidth: 140
             from: 0
@@ -446,6 +542,34 @@ Item {
             // would keep this visible (frozen, meaningless) after every job
             // finishes, since finished jobs stay listed until dismissed.
             visible: bottomBar.busy
+        }
+
+        // P28: current playback position / total duration for whatever
+        // audio is loaded in the player — independent of any transcription
+        // job, so it's gated on the player having a real source, not on
+        // bottomBar.busy. position/duration are real Q_PROPERTYs with their
+        // own NOTIFY signals (unlike activeElapsedMs above), so this binds
+        // directly with no polling needed. Reuses this file's own
+        // formatDuration() ("1:23" / "45s") rather than inventing a second
+        // time-format convention — MainPanel.qml has no equivalent numeric
+        // readout of its own to match (only the seek Slider itself).
+        Label {
+            visible: bottomBar.player && bottomBar.player.source.toString() !== ""
+            text: bottomBar.player
+                ? (bottomBar.formatDuration(bottomBar.player.position) + " / " + bottomBar.formatDuration(bottomBar.player.duration))
+                : ""
+            color: "#888888"
+            font.pixelSize: 11
+        }
+
+        // P22: which backend actually loaded the active model
+        // ("Vulkan"/"CUDA"/"CPU"/…) — mirrors MainPanel.qml's own O35
+        // indicator (same property, same visibility/style convention).
+        Label {
+            text: bottomBar.transcriptionController ? bottomBar.transcriptionController.activeBackendName : ""
+            visible: text !== ""
+            color: "#888888"
+            font.pixelSize: 11
         }
 
         Item {
@@ -492,8 +616,23 @@ Item {
         // one or two rows, the popup previously sized down tight enough
         // that a row's hover/hightlight hover border could visually poke
         // past the popup's own rounded bottom edge.
-        height: Math.max(jobColumn.implicitHeight + 16, 160)
-        modal: false
+        // P18: Math.max above was a FLOOR only — with many real tasks
+        // jobColumn.implicitHeight (header + unclipped ScrollView content)
+        // could exceed the window itself, pushing content below the
+        // popup's own visible bounds. Math.min adds a ceiling; the inner
+        // ScrollView's own Layout.preferredHeight cap (below) keeps its
+        // rows scrollable well before this outer cap is ever hit in
+        // practice, but the cap is still needed as a hard backstop.
+        height: Math.min(Math.max(jobColumn.implicitHeight + 16, 160), 500)
+        clip: true
+        // O21: was modal:false, which gives Qt no dim rectangle and no real
+        // block-plane — clicks/hover reached whatever was behind the popup
+        // (both MouseArea- and TapHandler-based) at the same time as the
+        // popup itself. CloseOnPressOutside still closes it on an outside
+        // click same as before; the click just no longer ALSO lands on
+        // whatever's behind it.
+        modal: true
+        dim: true
         focus: false
         closePolicy: Popup.CloseOnPressOutside | Popup.CloseOnEscape
 
@@ -630,7 +769,14 @@ Item {
 
                 ListView {
                     id: jobListView
-                    model: bottomBar.transcriptionController ? bottomBar.transcriptionController.jobs : []
+                    // P9: jobs() (C++) returns entries oldest-first
+                    // (append/insertion order) — reverse ONLY this display
+                    // binding so the list reads newest-first. Nothing else
+                    // (queuedPositionOf(), the move-up/down handlers, etc.)
+                    // touches this model — they all recompute position by
+                    // walking transcriptionController.jobs forward from
+                    // scratch, so they're unaffected by this being reversed.
+                    model: bottomBar.transcriptionController ? bottomBar.transcriptionController.jobs.slice().reverse() : []
                     spacing: 2
 
                     delegate: Item {
@@ -655,7 +801,35 @@ Item {
                             const s = modelData.fileUrl ? modelData.fileUrl.toString() : ""
                             return s.substring(s.lastIndexOf("/") + 1)
                         }
+                        // O16: same root cause as bottomBar.elapsedEtaText —
+                        // a real cooperative pause never changes
+                        // modelData.status away from "active" (only
+                        // JobStatus::Paused's narrow loading-restart edge
+                        // case does that), so this row has to check
+                        // bottomBar.activePaused directly too, not just the
+                        // status string, since this IS unambiguously the
+                        // Active row whenever modelData.status === "active"
+                        // (there's only ever one).
+                        readonly property bool isActivePaused: modelData.status === "active" && bottomBar.activePaused
+                        // O20: a cancelled job is reported as
+                        // status: Failed, error: "Cancelled" by the backend
+                        // (see TranscriptionController::jobs()'s doc
+                        // comment) — same as any other failure otherwise, so
+                        // without this check a user-initiated cancel and a
+                        // genuine transcription failure render identically.
+                        readonly property bool isCancelled: modelData.status === "failed" && modelData.error === "Cancelled"
+                        readonly property string statusText: {
+                            if (jobRow.isActivePaused)
+                                return qsTr("paused")
+                            if (jobRow.isCancelled)
+                                return qsTr("cancelled")
+                            return modelData.status
+                        }
                         readonly property color statusColor: {
+                            if (jobRow.isActivePaused)
+                                return "#e67e22"
+                            if (jobRow.isCancelled)
+                                return "#888888"
                             switch (modelData.status) {
                             case "done": return "#2ecc71"
                             case "failed": return "#e74c3c"
@@ -677,8 +851,14 @@ Item {
                         // whenever status is "active"); final duration once
                         // Done/Failed; nothing yet while Queued.
                         readonly property string detailText: {
-                            if (modelData.status === "active")
-                                return bottomBar.elapsedEtaText
+                            if (modelData.status === "active") {
+                                // Avoid "paused (paused at 45s)" — statusText
+                                // above already says "paused"; just the bare
+                                // elapsed time is needed here.
+                                return jobRow.isActivePaused
+                                    ? bottomBar.formatDuration(bottomBar.activeElapsedMs)
+                                    : bottomBar.elapsedEtaText
+                            }
                             if (modelData.status === "done" || modelData.status === "failed")
                                 return bottomBar.formatDuration(modelData.durationMs)
                             return ""
@@ -736,12 +916,24 @@ Item {
                                     font.pixelSize: 11
                                 }
                                 Label {
+                                    id: statusLabel
                                     Layout.preferredWidth: 96
                                     elide: Text.ElideRight
                                     horizontalAlignment: Text.AlignRight
-                                    text: modelData.status + (jobRow.detailText !== "" ? " (" + jobRow.detailText + ")" : "")
+                                    text: jobRow.statusText + (jobRow.detailText !== "" ? " (" + jobRow.detailText + ")" : "")
                                     color: "#888888"
                                     font.pixelSize: 9
+
+                                    // O20: surface the real error message on
+                                    // hover for a genuine failure (not a
+                                    // cancel) — the row itself has no room
+                                    // to show it inline without blowing past
+                                    // the popup's fixed width.
+                                    HoverHandler { id: statusHover }
+                                    ToolTip.visible: statusHover.hovered
+                                        && modelData.status === "failed" && !jobRow.isCancelled
+                                        && modelData.error !== ""
+                                    ToolTip.text: modelData.error
                                 }
 
 
