@@ -126,7 +126,7 @@ Item {
     property real progressGlowWidth: 2
     property real progressGlowRadius: 8
 
-    // Split-recording auto-combine (see TranscriptionController::
+    // Split-recording combine (see TranscriptionController::
     // findCombineGroups()'s doc comment): what happens to a group's original
     // files once ffmpeg has merged them. false (default) moves them into a
     // sibling ".combined" folder instead of deleting — safer default until
@@ -134,10 +134,20 @@ Item {
     // until confident" bias around anything that touches source recordings.
     property bool deleteOriginalsAfterCombine: false
 
-    // Split-recording combine rules — a list of {name, pattern, enabled}
-    // maps, each a QRegularExpression matched against a filename (see
-    // findCombineGroups()'s doc comment for the capture-group-as-identity
-    // semantics). Deliberately NOT part of `defaults`/isDefault()/
+    // Split-recording combine rules — a list of {name, pattern, enabled,
+    // sortGroupIndex, sortGroupText, sortGroupOccurrence} maps, each a
+    // QRegularExpression matched against a filename (see
+    // findCombineGroups()'s doc comment for the capture-group-as-identity/
+    // sort-differentiator semantics). sortGroupIndex/sortGroupText/
+    // sortGroupOccurrence are optional and absent on any rule that hasn't
+    // designated a sort differentiator — SettingsPopup.qml's
+    // commitPatternChange()/resolveSortGroupIndex() are the only writers,
+    // and always keep all three consistent with the current `pattern` (see
+    // their doc comments for why sortGroupText+sortGroupOccurrence, not
+    // just the numeric index, are the thing actually persisted as the
+    // source of truth — occurrence specifically disambiguates two
+    // differentiator runs that happen to share identical text). Deliberately
+    // NOT part of `defaults`/isDefault()/
     // resetProperty() below: that machinery is single-value reset-to-default
     // semantics, which doesn't fit a user-authored list (no sensible
     // "default" rule set, and the Settings UI manages entries directly via

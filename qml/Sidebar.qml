@@ -384,6 +384,48 @@ Rectangle {
                 ToolTip.delay: 500
             }
 
+            // Split-recording combine, run on demand rather than
+            // automatically: it used to fire on every vault-tree rebuild
+            // (open + every filesystem change, via VaultTreeModel's
+            // modelReset), silently merging files the moment a recorder
+            // dropped in a new part. That surprised users watching a vault
+            // fill up mid-recording, so it's now an explicit action here —
+            // see TranscriptionController::runCombineScan()'s doc comment.
+            Item {
+                id: combineButton
+                Layout.preferredWidth: 22
+                Layout.preferredHeight: 22
+                enabled: sidebar.transcriptionController && AppSettings.combineRules.length > 0
+
+                HoverHandler {
+                    id: combineHover
+                    cursorShape: Qt.PointingHandCursor
+                    enabled: combineButton.enabled
+                }
+                TapHandler {
+                    enabled: combineButton.enabled
+                    onTapped: {
+                        sidebar.transcriptionController.runCombineScan(
+                                    AppSettings.combineRules, sidebar.model.allAudioPaths(),
+                                    sidebar.vaultPath, AppSettings.deleteOriginalsAfterCombine)
+                    }
+                }
+                HoverBorder {
+                    anchors.fill: parent
+                    active: combineButton.enabled && combineHover.hovered
+                }
+                Text {
+                    anchors.centerIn: parent
+                    text: "⛓"
+                    color: combineButton.enabled ? "#dddddd" : "#666666"
+                    font.pixelSize: 15
+                }
+
+                ToolTip.visible: combineHover.hovered
+                ToolTip.text: qsTr("Combine split recordings")
+                ToolTip.delay: 500
+            }
+
             Item {
                 id: searchToggleButton
                 Layout.preferredWidth: 22
@@ -844,6 +886,23 @@ Rectangle {
                 function onJobStatusRevisionChanged() { treeDelegate.refreshJobStatus() }
             }
 
+            // Bug: TreeView recycles a fixed pool of delegate Items as rows
+            // scroll in/out of view (reuseItems defaults to true) — required
+            // properties like path/isAudio/isOrphanedMd get reassigned to the
+            // recycled Item for its new row, but metadata/jobStatus above are
+            // plain imperative properties that were only ever pushed once, at
+            // Component.onCompleted (i.e. whichever row this Item instance
+            // FIRST rendered). Every recycled reuse of that same instance kept
+            // showing that original row's label/jobStatus forever after,
+            // regardless of which file it now represents — this is why one
+            // label appeared to "repeat" at a fixed interval (the pool size)
+            // throughout the whole tree, not just in search. Refresh on every
+            // reassignment, not just first creation.
+            onPathChanged: {
+                treeDelegate.refreshMetadata()
+                treeDelegate.refreshJobStatus()
+            }
+
             Component.onCompleted: {
                 sidebar.setBulkEligible(treeDelegate.path, treeDelegate.bulkEligible)
                 sidebar.setRelabelEligible(treeDelegate.path, treeDelegate.relabelEligible)
@@ -867,9 +926,10 @@ Rectangle {
             // otherwise unused — see a prior bug in this exact codebase.
             // Instead this is now a plain property, explicitly (re)assigned
             // by refreshMetadata() — a genuine push, not a binding trick.
-            // readMetadata() resolves <completeBaseName>.md regardless of
-            // whether the given path is the audio file or the .md itself
-            // (self-referential for an orphaned .md), so this covers both.
+            // readMetadata() resolves the sidecar .md regardless of whether
+            // the given path is the audio file or the .md itself
+            // (sidecarPath() is self-referential when the path already ends
+            // in .md), so this covers both audio and orphaned rows.
             property var metadata: ({})
             function refreshMetadata() {
                 treeDelegate.metadata = ((treeDelegate.isAudio || treeDelegate.isOrphanedMd)

@@ -753,28 +753,58 @@ public:
     // here so QML doesn't need its own duplicate frontmatter-scanning logic.
     Q_INVOKABLE QStringList existingVaultTags(const QUrl &vaultUrl) const;
 
-    // Split-recording auto-combine: matches vault audio filenames against
+    // Split-recording combine: matches vault audio filenames against
     // user-authored regex rules (AppSettings.combineRules) to find groups of
     // files that are really one recording split by the recorder — see
     // findCombineGroups() in the .cpp for the full matching/grouping
     // semantics. Pure over its inputs (only touches disk via QFileInfo stats
     // on the paths passed in), so this same entry point backs both the
-    // Settings "test this rule" preview AND autoCombine()'s real enqueue
-    // decisions below. Each rule map: {name, pattern, enabled}. Returns one
-    // entry per detected group: {ruleName, key, files (QStringList,
-    // mtime-ascending), outputPath, status
+    // Settings "test this rule" preview AND runCombineScan()'s real enqueue
+    // decisions below. Each rule map: {name, pattern, enabled, sortGroupIndex}.
+    // Returns one entry per detected group: {ruleName, key, capturedValues
+    // (QStringList, the rule's GROUPING capture groups un-concatenated — key
+    // is these joined with no separator), files (QStringList, in combine
+    // order — see findCombineGroups()'s doc comment for the sort
+    // differentiator / mtime-default ordering rules), outputPath, status
     // ("ready"/"singleton"/"alreadyTranscribed"/"alreadyCombined"/"pending")}.
     Q_INVOKABLE QVariantList detectCombineGroups(const QVariantList &rules, const QStringList &audioPaths) const;
+
+    // Live validity check for a combine-rule pattern as the user types it in
+    // Settings — validates against the EXACT SAME regex engine
+    // findCombineGroups()/matchRuleCapturedKey() actually use (QRegularExpression),
+    // not QML/JS RegExp, whose syntax isn't guaranteed identical. Empty pattern
+    // is not an error (that's just "no rule authored yet"); returns the empty
+    // string on success, QRegularExpression's own errorString() otherwise.
+    Q_INVOKABLE QString regexValidationError(const QString &pattern) const;
+
+    // Backs Settings' per-rule "differentiator" buttons (SettingsPopup.qml):
+    // a differentiator is just a capturing group whose captured text joins
+    // matchRuleCapturedKey()'s combine-grouping key, but ONLY if it
+    // actually participates in every match — a capturing group sitting in
+    // an alternation branch that isn't always taken (e.g.
+    // `(sometext)|(some other text)`) doesn't reliably differentiate
+    // anything for the files that took the OTHER branch. Returns the
+    // subset of audioPaths where `pattern` (already the CANDIDATE pattern
+    // text — this method does no wrapping/rewriting itself) matches the
+    // filename overall but capture group `groupIndex` (1-based) has
+    // QRegularExpressionMatch::capturedStart() < 0, i.e. did not
+    // participate in that match at all. A valid-but-zero-length
+    // participation (e.g. `\d*` matching "") is NOT flagged — only
+    // non-participation is. Empty result = safe to use as a differentiator
+    // across every file currently in the vault.
+    Q_INVOKABLE QStringList differentiatorNonParticipatingFiles(const QString &pattern, int groupIndex,
+                                                                  const QStringList &audioPaths) const;
 
     // Runs detectCombineGroups() and enqueues a "combine" job (Job::combineOnly)
     // for every "ready" group not already queued (isCombineQueued()) — never
     // also queues a transcribe job; the merged file just becomes a normal
     // untranscribed vault entry the user transcribes like any other. Called
-    // from Main.qml on every VaultTreeModel rebuild (startup + every
-    // filesystem change), so newly-arrived recorder parts get combined
-    // without the user doing anything.
-    Q_INVOKABLE void autoCombine(const QVariantList &rules, const QStringList &audioPaths, const QUrl &vaultUrl,
-                                  bool deleteOriginals);
+    // from Sidebar.qml's ribbon "combine" button — a deliberate, user-
+    // initiated scan, not an automatic one (see the button's own doc
+    // comment for why: silently merging on every file-add was a surprise
+    // recorders shouldn't spring on the user without asking).
+    Q_INVOKABLE void runCombineScan(const QVariantList &rules, const QStringList &audioPaths, const QUrl &vaultUrl,
+                                     bool deleteOriginals);
 
 signals:
     void busyChanged();
@@ -862,7 +892,8 @@ private:
         // fileUrl doubles as the combine job's OUTPUT path for this kind,
         // same "reuse fileUrl for whatever this kind's one file is" pattern
         // the other *Only kinds already use. combineSourcePaths is the
-        // ordered (mtime-ascending) list of parts to concatenate.
+        // ordered (combine order — see findCombineGroups()'s doc comment)
+        // list of parts to concatenate.
         bool combineOnly = false;
         QStringList combineSourcePaths;
         bool deleteOriginalsAfterCombine = false;
@@ -887,59 +918,93 @@ private:
     // doc comment for the matching/grouping/status semantics. Mirrors
     // detectCombineGroups()'s QVariantMap shape one-to-one; kept as a real
     // struct internally so startJob()'s per-job safety check and
-    // autoCombine() don't have to round-trip through QVariant.
+    // runCombineScan() don't have to round-trip through QVariant.
     struct CombineGroup {
         QString ruleName;
         QString key;
-        QStringList files; // mtime-ascending
+        // The rule's GROUPING capture groups, un-concatenated (key is these
+        // joined with no separator) — deliberately excludes the sort
+        // differentiator's own group, if the rule has one (see
+        // findCombineGroups()'s doc comment: a sort differentiator is
+        // explicitly not a grouping one). Exposed to detectCombineGroups()'s
+        // QVariantList so the Settings preview can show a header of exactly
+        // which differentiator values grouped these files, not just the
+        // flattened key.
+        QStringList capturedValues;
+        QStringList files; // combine order — see findCombineGroups()'s doc comment
         QString outputPath;
         QString status; // "ready"/"singleton"/"alreadyTranscribed"/"alreadyCombined"/"pending"
     };
 
     // Matches every path in audioPaths against every enabled rule in `rules`
-    // ({name, pattern, enabled} maps) using QRegularExpression SEARCH
-    // semantics (not anchored unless the pattern itself has ^/$) against the
-    // full filename (name+ext). A match's capture groups (captured(1..N),
-    // concatenated) are the group-identity "key" — an uncaptured wildcard
-    // span (bare `.`, `\d{3}`, `.*`, ...) varies freely between members
-    // without affecting grouping, matching the user's stated model of
-    // "the rule gets the real string with the wildcard replaced; same real
-    // string = combine". A rule with zero capture groups therefore groups
-    // EVERY file it matches into one bucket (expected regex behavior, not a
-    // special case). Members are sorted by mtime ascending within each
-    // group. outputPath is derived from (sanitized ruleName, sanitized key)
-    // rather than any single member's filename, so it's re-derivable from
-    // just one surviving filename even after the rest have been moved into
+    // ({name, pattern, enabled, sortGroupIndex} maps) using QRegularExpression
+    // SEARCH semantics (not anchored unless the pattern itself has ^/$)
+    // against the full filename (name+ext). A match's capture groups
+    // (captured(1..N), concatenated, EXCLUDING the sortGroupIndex one if the
+    // rule has one — see below) are the group-identity "key" — an
+    // uncaptured wildcard span (bare `.`, `\d{3}`, `.*`, ...) varies freely
+    // between members without affecting grouping, matching the user's
+    // stated model of "the rule gets the real string with the wildcard
+    // replaced; same real string = combine". A rule with zero grouping
+    // capture groups therefore groups EVERY file it matches into one bucket
+    // (expected regex behavior, not a special case).
+    //
+    // Combine ORDER within a group: `sortGroupIndex` (1-based capture-group
+    // number, -1/absent = none) optionally names ONE of the rule's capture
+    // groups as the SORT differentiator instead of a grouping one — the
+    // Settings UI enforces "at most one, and it stops being a grouping
+    // differentiator the moment it's chosen" (matchRuleCapturedKey() excludes
+    // it from `key`/capturedValues entirely). When every member of a group
+    // captured a value for it, members are ordered by that value — compared
+    // numerically (QString::toDouble()) if EVERY member's value parses as a
+    // number, else compared as plain strings; "numeric or not" is decided
+    // once for the whole group, not per pair, since a comparator that
+    // switches between numeric and lexicographic per pair isn't a strict
+    // weak ordering (undefined behavior for std::sort). Falls back to mtime
+    // ascending — the default, and the ONLY order when no sort
+    // differentiator is configured — deliberately NOT file creation/birth
+    // time: birth time doesn't survive a plain file copy on Linux (cp/rsync/
+    // a cross-filesystem mv all stamp a fresh one on the destination), while
+    // mtime is preserved by every standard copy tool, and this app has no
+    // way to know (or reason to assume) whether a given vault's audio was
+    // recorded directly onto the vault path or copied in from an SD card —
+    // mtime is the only signal that's correct either way.
+    //
+    // outputPath is derived from (sanitized ruleName, sanitized key) rather
+    // than any single member's filename, so it's re-derivable from just one
+    // surviving filename even after the rest have been moved into
     // .combined/ — see startJob()'s safety-net re-check, which relies on
     // exactly that. status: "singleton" (only one match), "alreadyTranscribed"
     // (skip — some member already has a sibling .md, never silently discard
     // existing work), "alreadyCombined" (outputPath already exists on disk),
-    // "pending" (would be ready, but the newest member's mtime is inside
-    // kCombineStabilityWindowSecs of "now" — the recorder may still be
-    // writing it), else "ready".
+    // "pending" (would be ready, but the group's true most-recently-modified
+    // member — independent of whatever order the group ended up sorted into
+    // above — has an mtime inside kCombineStabilityWindowSecs of "now": the
+    // recorder may still be writing it), else "ready".
     static QList<CombineGroup> findCombineGroups(const QVariantList &rules, const QStringList &audioPaths);
     // True if a Queued/Active "combine" job already targets this exact
-    // outputPath — autoCombine()'s dedup check, mirrors isDownloadQueued().
+    // outputPath — runCombineScan()'s dedup check, mirrors isDownloadQueued().
     bool isCombineQueued(const QString &outputPath) const;
     // Builds and inserts a Queued Job for `group` at frontOfQueueInsertIndex()
     // (or the given insertIndex, for callers that already computed a
     // specific slot — see startJob()'s safety-net re-check). Shared by
-    // autoCombine() and startJob() so both enqueue combine jobs identically.
+    // runCombineScan() and startJob() so both enqueue combine jobs identically.
     void enqueueCombineJob(const CombineGroup &group, const QUrl &vaultUrl, bool deleteOriginals,
                             int insertIndex = -1);
     // Safety-net re-check, called from the very top of startJob() before any
     // state mutation — "double check the file being transcribed for parts
-    // before or after, whenever it is being transcribed" (a passive
-    // autoCombine() scan alone can miss a sibling part that appeared while
-    // this job sat Queued). Only acts on a plain transcribe-kind job (no
-    // other *Only flag/downloadTarget set) with a non-empty fileUrl; returns
-    // false immediately for anything else. Two outcomes when it does act:
+    // before or after, whenever it is being transcribed" (the user's last
+    // manual runCombineScan() run can miss a sibling part that appeared, or
+    // never have run at all this session, before this job sat Queued).
+    // Only acts on a plain transcribe-kind job (no other *Only
+    // flag/downloadTarget set) with a non-empty fileUrl; returns false
+    // immediately for anything else. Two outcomes when it does act:
     // (1) the merged output for this exact fileUrl's filename already
     // exists (recomputed from the filename alone, not group membership —
     // see findCombineGroups()'s outputPath doc comment) -> redirects
     // job.fileUrl in place and returns false, so startJob() falls through to
     // its normal dispatch against the now-merged file; (2) fileUrl is a
-    // member of a currently-"ready" group per the last autoCombine() scan
+    // member of a currently-"ready" group per the last runCombineScan() run
     // (m_combineRules/m_combineAudioPaths) -> inserts a combine Job ahead of
     // this one (same insert-ahead-of-transcribe shape as
     // maybeQueueDownloadJob), redirects job.fileUrl to the pending output,
@@ -1131,12 +1196,13 @@ private:
     // Set by loadPersistedQueue() (once per vault open) — where persistQueue()
     // writes back to. Empty (no persistence) until then.
     QUrl m_vaultUrl;
-    // Cached from the most recent autoCombine() call (Main.qml calls it on
-    // every VaultTreeModel rebuild — startup and every filesystem change) so
-    // maybeRedirectForCombine()'s per-job safety check has something to
+    // Cached from the most recent runCombineScan() call (Sidebar.qml's
+    // ribbon "combine" button — a user-initiated action now, not automatic)
+    // so maybeRedirectForCombine()'s per-job safety check has something to
     // consult without TranscriptionController needing its own
-    // VaultTreeModel/AppSettings reference. May be briefly stale between
-    // rebuilds — acceptable, see maybeRedirectForCombine()'s doc comment.
+    // VaultTreeModel/AppSettings reference. Only as fresh as the user's last
+    // manual combine run — possibly empty if they've never run one this
+    // session — acceptable, see maybeRedirectForCombine()'s doc comment.
     QVariantList m_combineRules;
     QStringList m_combineAudioPaths;
     bool m_combineDeleteOriginals = false;

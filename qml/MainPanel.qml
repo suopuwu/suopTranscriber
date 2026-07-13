@@ -2805,59 +2805,117 @@ Rectangle {
         // an overlay sibling of transcriptScrollView (not inside it, see
         // transcriptViewportContainer's doc comment) so it covers the same
         // full viewport without being counted as the ScrollView's content.
-        MouseArea {
+        //
+        // NOT a MouseArea, and NOT z-toggled — both were tried and both
+        // broke something real, confirmed empirically each time (offscreen
+        // QTest):
+        //   1. A statically-topmost MouseArea (the original version) caught
+        //      the click but stole the cursor from every hoverable element
+        //      underneath (segment hover highlights, edit-in-place tag/
+        //      speaker controls, IBeam cursors over editable text), even
+        //      fully idle — Qt Quick's cursor resolution is pure top-down
+        //      paint-order for the topmost HIT item, independent of
+        //      hoverEnabled/acceptedButtons, and MouseArea always
+        //      implicitly claims a cursor (default ArrowCursor) merely by
+        //      being the topmost hit item, regardless of its own config.
+        //   2. Toggling MouseArea's z below (-1) while idle (matching
+        //      Sidebar's TreeView-based fix) fixed the cursor but broke the
+        //      click itself: unlike a bare Flickable (which only claims
+        //      LeftButton by default and lets MiddleButton fall through),
+        //      QQC2's ScrollView/T.ScrollView Control claims ALL
+        //      mouse-button presses within its bounds at the outer Control
+        //      level before any per-button filtering, so a lower-z sibling
+        //      never sees a middle-click over it at all.
+        // The actual fix: a plain Item (not MouseArea) has NO implicit
+        // cursor at all, so it can sit PERMANENTLY topmost without
+        // poisoning cursor resolution for anything underneath, AS LONG AS
+        // it never itself binds an ENABLED cursor-setting handler while
+        // idle (confirmed empirically: a disabled
+        // HoverHandler{cursorShape:...} — enabled only once armed —
+        // doesn't count either, even selection-enabled TextEdit content
+        // underneath, e.g. preludeText, still shows its own IBeam cursor
+        // correctly). A permanently-topmost TapHandler reliably catches
+        // the middle-button press through ScrollView's swallow AND through
+        // a selectByMouse TextEdit's own exclusive grab (a TapHandler
+        // participates in per-button hit-testing the same way MouseArea's
+        // fallthrough does, but being an Item-not-MouseArea it doesn't drag
+        // the implicit-cursor baggage along). gesturePolicy:
+        // DragWithinBounds (not the default DragThreshold) matters too: the
+        // default cancels TapHandler's own grab — and stops delivering ANY
+        // further events to anyone, including the real release — the
+        // instant the drag exceeds the platform threshold, which is far
+        // too early for gesture 2's long hold-drag; DragWithinBounds only
+        // cancels if the pointer leaves this Item's bounds, which for a
+        // full-viewport overlay essentially never happens mid-gesture.
+        Item {
             id: middleDragScrollArea
             anchors.fill: parent
-            acceptedButtons: middleDragScrollArea.armed
-                             ? (Qt.LeftButton | Qt.MiddleButton | Qt.RightButton)
-                             : Qt.MiddleButton
-            hoverEnabled: true
+            z: 1
 
             property bool armed: false
             property real originY: 0
             property real currentY: 0
-            property bool buttonHeld: false
             property bool draggedWhileHeld: false
             readonly property int deadzone: 8
 
-            cursorShape: {
-                if (!middleDragScrollArea.armed)
-                    return Qt.ArrowCursor
-                const dy = Math.abs(middleDragScrollArea.currentY - middleDragScrollArea.originY)
-                return dy <= middleDragScrollArea.deadzone ? Qt.SizeAllCursor : Qt.SizeVerCursor
+            // Drives arming (both gestures start here) and gesture 2's
+            // continued tracking while the button stays held —
+            // point.position updates live during the whole held drag under
+            // DragWithinBounds, unlike the default gesturePolicy which
+            // would stop updating (and stop being told about the eventual
+            // release) as soon as the drag threshold is crossed.
+            TapHandler {
+                id: middleDragTap
+                acceptedButtons: middleDragScrollArea.armed
+                                 ? (Qt.LeftButton | Qt.MiddleButton | Qt.RightButton)
+                                 : Qt.MiddleButton
+                gesturePolicy: TapHandler.DragWithinBounds
+                onPressedChanged: {
+                    if (middleDragTap.pressed) {
+                        // Any click while already armed cancels it (Chrome
+                        // convention) instead of performing that button's
+                        // normal action — acceptedButtons above ensures
+                        // this branch is only reachable for non-middle
+                        // buttons once armed.
+                        if (middleDragScrollArea.armed) {
+                            middleDragScrollArea.armed = false
+                            return
+                        }
+                        middleDragScrollArea.draggedWhileHeld = false
+                        middleDragScrollArea.armed = true
+                        middleDragScrollArea.originY = middleDragTap.point.position.y
+                        middleDragScrollArea.currentY = middleDragTap.point.position.y
+                    } else if (middleDragScrollArea.draggedWhileHeld) {
+                        middleDragScrollArea.armed = false
+                        // else: real click, no drag — gesture 1 keeps running.
+                    }
+                }
+                onPointChanged: {
+                    if (!middleDragTap.pressed)
+                        return
+                    middleDragScrollArea.currentY = middleDragTap.point.position.y
+                    if (!middleDragScrollArea.draggedWhileHeld
+                            && Math.abs(middleDragScrollArea.currentY - middleDragScrollArea.originY) > middleDragScrollArea.deadzone) {
+                        middleDragScrollArea.draggedWhileHeld = true
+                    }
+                }
             }
 
-            onPressed: (mouse) => {
-                // Any click while already armed cancels it (Chrome
-                // convention) instead of performing that button's normal
-                // action — acceptedButtons above ensures this branch is
-                // the only one reachable for non-middle buttons.
-                if (middleDragScrollArea.armed) {
-                    middleDragScrollArea.armed = false
-                    return
+            // Drives gesture 1's free-scroll (no button held) and the
+            // visible cursor — enabled only while armed, so it never
+            // contributes a cursor (and never blocks hover-event delivery
+            // to covered content) while idle.
+            HoverHandler {
+                id: middleDragHover
+                enabled: middleDragScrollArea.armed
+                cursorShape: {
+                    const dy = Math.abs(middleDragScrollArea.currentY - middleDragScrollArea.originY)
+                    return dy <= middleDragScrollArea.deadzone ? Qt.SizeAllCursor : Qt.SizeVerCursor
                 }
-                middleDragScrollArea.buttonHeld = true
-                middleDragScrollArea.draggedWhileHeld = false
-                middleDragScrollArea.armed = true
-                const p = middleDragScrollArea.mapToItem(transcriptScrollView, mouse.x, mouse.y)
-                middleDragScrollArea.originY = p.y
-                middleDragScrollArea.currentY = p.y
-            }
-            onPositionChanged: (mouse) => {
-                const p = middleDragScrollArea.mapToItem(transcriptScrollView, mouse.x, mouse.y)
-                middleDragScrollArea.currentY = p.y
-                if (middleDragScrollArea.buttonHeld && !middleDragScrollArea.draggedWhileHeld
-                        && Math.abs(middleDragScrollArea.currentY - middleDragScrollArea.originY) > middleDragScrollArea.deadzone) {
-                    middleDragScrollArea.draggedWhileHeld = true
+                onPointChanged: {
+                    if (middleDragScrollArea.armed && !middleDragTap.pressed)
+                        middleDragScrollArea.currentY = middleDragHover.point.position.y
                 }
-            }
-            onReleased: (mouse) => {
-                if (mouse.button !== Qt.MiddleButton)
-                    return
-                middleDragScrollArea.buttonHeld = false
-                if (middleDragScrollArea.draggedWhileHeld)
-                    middleDragScrollArea.armed = false
-                // else: real click, no drag — gesture 1 keeps running.
             }
 
             // Repeating timer (never runs while idle — gated by `armed`,

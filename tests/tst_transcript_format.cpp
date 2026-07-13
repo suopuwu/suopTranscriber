@@ -139,6 +139,26 @@ private slots:
         QCOMPARE(meta.value("transcribedAt").toString(), QStringLiteral("2026-07-06T10:12:13"));
     }
 
+    // Regression: an orphaned .md (no matching audio file left in the vault)
+    // is passed to readMetadata() as ITS OWN path, not an audio path —
+    // sidecarPath() must recognize a path that already ends in .md and
+    // return it unchanged instead of appending another ".md" (which would
+    // look for a nonexistent "meeting.wav.md.md" and silently come back
+    // empty, the bug that made the sidebar fall back to showing orphaned
+    // rows' filename instead of their stored label).
+    void readMetadata_orphanedMdPath_isSelfReferential()
+    {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        const QString mdPath = writeFixture(dir.path(), "meeting.wav.md", kFixtureMd);
+        QVERIFY(!mdPath.isEmpty());
+
+        TranscriptionController controller;
+        const QVariantMap meta = controller.readMetadata(QUrl::fromLocalFile(mdPath));
+
+        QCOMPARE(meta.value("model").toString(), QStringLiteral("ggml-base.en.bin"));
+    }
+
     // "Sibling .md = transcribed" — no .md means not transcribed, reported
     // as an empty map (the QML side keys the green/yellow vault indicator
     // off this).

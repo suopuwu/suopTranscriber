@@ -21,6 +21,33 @@ class TstStyleGuide : public QObject
     }
 
 private slots:
+    // Regression: Sidebar.qml's treeDelegate (a TreeView row) recycles a
+    // fixed pool of delegate Items as rows scroll in/out of view — required
+    // properties like path/isAudio get reassigned to the recycled Item for
+    // its new row, but metadata/jobStatus are plain imperative properties
+    // only ever pushed at Component.onCompleted. Without an onPathChanged
+    // refresh, a recycled Item kept showing whichever label/job-status it
+    // FIRST loaded, forever, regardless of which file it was recycled to
+    // represent — this made one label appear to "repeat" throughout the
+    // whole tree at a fixed interval (the delegate pool size). No QQuickView
+    // in this test suite to actually drive TreeView recycling, so this is a
+    // source-scan guard against the fix regressing rather than a behavioral
+    // test.
+    void treeDelegate_refreshesMetadataAndJobStatusOnRecycle()
+    {
+        const QString src = readAll(QStringLiteral(SUOP_QML_DIR "/Sidebar.qml"));
+        QVERIFY2(!src.isEmpty(), "qml/Sidebar.qml must exist");
+        const int idx = src.indexOf(QStringLiteral("onPathChanged"));
+        QVERIFY2(idx >= 0,
+                 "treeDelegate must refresh metadata/jobStatus onPathChanged — TreeView recycles "
+                 "delegate Items across rows, so a Component.onCompleted-only push goes stale on reuse");
+        const QString after = src.mid(idx, 300);
+        QVERIFY2(after.contains(QStringLiteral("refreshMetadata()")),
+                 "onPathChanged must call refreshMetadata() so recycled rows show the right label");
+        QVERIFY2(after.contains(QStringLiteral("refreshJobStatus()")),
+                 "onPathChanged must call refreshJobStatus() so recycled rows show the right job status");
+    }
+
     // StyleGuide.md: the hover outline is the reusable HoverBorder.qml — a
     // transparent Rectangle, 1px white border, radius from AppSettings,
     // opacity animated in on hover.
@@ -89,6 +116,143 @@ private slots:
         const QString popup = readAll(QStringLiteral(SUOP_QML_DIR "/SettingsPopup.qml"));
         QVERIFY2(popup.contains(QStringLiteral("AppSettings.")),
                  "settings UI lives in SettingsPopup.qml bound to AppSettings (StyleGuide.md)");
+    }
+
+    // Combine-rule regex authoring aids, added to prevent the "ungrouped
+    // alternation" footgun (e.g. `^TX0._MIC*._(edit)|(orig)`, which really
+    // parses as two fully independent top-level alternatives because `|` has
+    // the lowest precedence of any regex operator). No QQuickView in this
+    // suite to drive the live bindings, so this is a source-scan guard that
+    // the validity indicator, the ungrouped-alternation warning, and the
+    // insert-token toolbar all still exist, rather than a behavioral test.
+    void settingsPopup_combineRulePatternAuthoringAids()
+    {
+        const QString src = readAll(QStringLiteral(SUOP_QML_DIR "/SettingsPopup.qml"));
+        QVERIFY2(!src.isEmpty(), "qml/SettingsPopup.qml must exist");
+
+        QVERIFY2(src.contains(QStringLiteral("transcriptionController.regexValidationError(")),
+                 "the pattern field's live validity indicator must call "
+                 "TranscriptionController::regexValidationError() (the real QRegularExpression engine), "
+                 "not a QML/JS RegExp re-implementation");
+
+        QVERIFY2(src.contains(QStringLiteral("function hasUngroupedAlternation(")),
+                 "must scan for a top-level (ungrouped) alternation — the exact bug in "
+                 "^TX0._MIC*._(edit)|(orig), where the un-anchored `(orig)` alternative "
+                 "matches that substring anywhere in any filename");
+        QVERIFY2(src.contains(QStringLiteral("hasUngroupedAlternation(rulePatternField.text)")),
+                 "the warning must be reactive off the live pattern field text, not just the committed rule");
+        QVERIFY2(src.contains(QStringLiteral("Wrap the alternatives: (?:a|b)")),
+                 "the inline warning must show the concrete fix, not just flag the problem");
+
+        QVERIFY2(src.contains(QStringLiteral("insertPatternToken(")),
+                 "an insert-token toolbar must exist so alternation/groups can be typed correctly "
+                 "without hand-authoring raw regex syntax");
+        QVERIFY2(src.contains(QStringLiteral("insertPatternToken(\"(?:|)\"")),
+                 "the Either/Or token must insert an already-grouped (?:|) — the whole point is "
+                 "that alternation is never inserted ungrouped in the first place");
+    }
+
+    // Combine-rule "differentiator" buttons: every non-exact-match run of a
+    // rule's pattern gets a clickable button that toggles whether files must
+    // share that run's captured text to combine. No QQuickView in this
+    // suite to drive the live bindings, so this is a source-scan guard that
+    // the toggle mechanism, the participation-block check, and the
+    // rule-overlap warning all still exist, rather than a behavioral test.
+    void settingsPopup_combineRuleDifferentiatorButtons()
+    {
+        const QString src = readAll(QStringLiteral(SUOP_QML_DIR "/SettingsPopup.qml"));
+        QVERIFY2(!src.isEmpty(), "qml/SettingsPopup.qml must exist");
+
+        QVERIFY2(src.contains(QStringLiteral("function findDifferentiatorRuns(")),
+                 "must derive the clickable runs from the pattern's non-exact-match (\"special\") "
+                 "tokens, merging consecutive ones together");
+        QVERIFY2(src.contains(QStringLiteral("function toggleDifferentiatorRun(")),
+                 "must mutate the rule's pattern text to add/remove a capturing group — "
+                 "matchRuleCapturedKey() (TranscriptionController.cpp) already treats every "
+                 "capture group as differentiating, so no C++ changes are needed for the toggle itself");
+        QVERIFY2(src.contains(QStringLiteral("function capturingGroupIndexAt(")),
+                 "capture-group numbering must be derived from a real paren-scan, not the "
+                 "literal/special display classifier — a literal-content group like (orig) is "
+                 "still a real capturing group to QRegularExpression");
+
+        QVERIFY2(src.contains(QStringLiteral("transcriptionController.differentiatorNonParticipatingFiles(")),
+                 "the block/warning check must call the real QRegularExpression engine "
+                 "(TranscriptionController::differentiatorNonParticipatingFiles()), not a QML/JS "
+                 "RegExp re-implementation, since it hinges on capture-group participation semantics");
+        QVERIFY2(src.contains(QStringLiteral("enabled: !blocked")),
+                 "a run whose differentiator wouldn't participate in every currently-matched file "
+                 "must have its toggle button disabled (blocked), not just warned about");
+
+        QVERIFY2(src.contains(QStringLiteral("function computeRuleOverlaps(")),
+                 "must warn (non-blocking — regex disjointness is undecidable in general) when two "
+                 "enabled rules empirically match the same vault file, or have identical pattern text");
+    }
+
+    // Each differentiator (real capturing group) must render in a distinct
+    // color in the combine-rule preview, and its button must match — so a
+    // user can visually confirm "same color everywhere -> these files
+    // combine" without reading regex. No QQuickView in this suite, so this
+    // is a source-scan guard that the palette, the preview overlay, and the
+    // button/preview color pairing all still exist.
+    void settingsPopup_differentiatorsHaveDistinctPreviewColors()
+    {
+        const QString src = readAll(QStringLiteral(SUOP_QML_DIR "/SettingsPopup.qml"));
+        QVERIFY2(!src.isEmpty(), "qml/SettingsPopup.qml must exist");
+
+        QVERIFY2(src.contains(QStringLiteral("property var differentiatorPalette:")),
+                 "must define a fixed-order categorical palette rather than generating hues ad hoc");
+        QVERIFY2(src.contains(QStringLiteral("function differentiatorColor(")),
+                 "must expose one lookup function so the palette has a single source of truth, "
+                 "shared by the preview overlay and the button styling");
+
+        // classifyFilenameHtml() must overlay per-group colors by matching
+        // the REAL pattern (capturing parens already present), not just
+        // literal/special classification — verify the overlay block exists
+        // inside that function specifically, not somewhere unrelated.
+        const qsizetype classifyIdx = src.indexOf(QStringLiteral("function classifyFilenameHtml("));
+        QVERIFY2(classifyIdx >= 0, "classifyFilenameHtml() must still exist");
+        const QString classifyBody = src.mid(classifyIdx, 4000);
+        QVERIFY2(classifyBody.contains(QStringLiteral("differentiatorColor(diffGroup[idx])")),
+                 "the filename-preview coloring must overlay differentiatorColor() per captured group, "
+                 "not just the base literal/special/none classification");
+
+        QVERIFY2(src.contains(QStringLiteral("settingsPopup.differentiatorColor(modelData.groupIndex)")),
+                 "an ON GROUPING differentiator button must use the SAME palette color as its span in "
+                 "the preview below, pairing color to a labeled button (the palette's CVD floor-band "
+                 "warning's accessibility mitigation, not just decoration)");
+        // A run marked as the SORT differentiator (see toggleDifferentiator()'s
+        // OFF -> GROUPING -> SORT -> OFF cycle) deliberately does NOT get a
+        // differentiatorColor() — that palette means "same color = same
+        // group," which stops being true the moment a run is excluded from
+        // the grouping key in favor of ordering by it instead.
+        QVERIFY2(src.contains(QStringLiteral("isSortRun")),
+                 "must track which run (if any) is the rule's sort differentiator so its button can be "
+                 "styled/labeled distinctly from a grouping one");
+    }
+
+    // Regression guard for a real bug caught in review: two differentiator
+    // runs can share byte-identical text (e.g. a device-id group and a
+    // part-number group both written as plain "(\d+)" — an entirely
+    // realistic pattern for this feature's own target use case). Matching
+    // the sort differentiator by text ALONE would silently resolve to
+    // whichever same-text run comes first, regardless of which one the user
+    // actually picked. resolveSortGroupIndex()/toggleDifferentiator() must
+    // also track/compare "occurrence" (the Nth same-text run, left to
+    // right) to disambiguate. No QQuickView harness in this suite to drive
+    // the actual JS logic, so this is a source-scan guard that the
+    // disambiguation machinery still exists, not a behavioral test.
+    void settingsPopup_sortDifferentiatorDisambiguatesDuplicateText()
+    {
+        const QString src = readAll(QStringLiteral(SUOP_QML_DIR "/SettingsPopup.qml"));
+        QVERIFY2(!src.isEmpty(), "qml/SettingsPopup.qml must exist");
+
+        QVERIFY2(src.contains(QStringLiteral("function resolveSortGroupIndex(pattern, sortGroupText, sortGroupOccurrence)")),
+                 "resolveSortGroupIndex() must take an occurrence parameter alongside the run's text — "
+                 "text alone can't distinguish two differentiator runs with identical text");
+        QVERIFY2(src.contains(QStringLiteral("sortGroupOccurrence")),
+                 "the occurrence must actually be threaded through and persisted on the rule (not just "
+                 "accepted as a dead parameter) — commitPatternChange()/AppSettings.combineRules must "
+                 "carry sortGroupOccurrence alongside sortGroupText");
     }
 
     // CLAUDE.md load-bearing constraint: Qt Multimedia only *plays* audio and

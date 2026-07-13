@@ -15,6 +15,37 @@ Popup {
     property var transcriptionController: null
     property var vaultTreeModel: null
 
+    // Rule-list-level overlap warnings (see computeRuleOverlaps()'s doc
+    // comment). Deliberately NOT a plain `property var x: <binding>` —
+    // vaultTreeModel.allAudioPaths() is a Q_INVOKABLE with no NOTIFY
+    // signal, so QML's binding engine can't track "the vault's file list
+    // changed" as a dependency at all, and on a freshly opened vault
+    // AppSettings.loadFromVault() (which sets combineRules, the only real
+    // tracked dependency here) runs BEFORE VaultTreeModel::rebuild()
+    // populates that file list (see Main.qml's own doc comment on that
+    // ordering) — so a declarative binding here would evaluate once, too
+    // early, against an empty file list, and then never again (same
+    // "frozen at initial value" class of bug as the dummy-dependency
+    // trick elsewhere in this codebase, just via a genuinely-untracked
+    // invokable instead). Recomputed imperatively instead: once whenever
+    // this popup actually opens (by then the vault a real user is looking
+    // at is definitely already loaded), and again on every combineRules
+    // change while open (rule add/edit/differentiator toggle).
+    property var combineOverlapWarnings: []
+    function updateCombineOverlapWarnings() {
+        settingsPopup.combineOverlapWarnings = settingsPopup.vaultTreeModel
+                ? settingsPopup.computeRuleOverlaps(AppSettings.combineRules, settingsPopup.vaultTreeModel.allAudioPaths())
+                : []
+    }
+    onOpened: settingsPopup.updateCombineOverlapWarnings()
+    Connections {
+        target: AppSettings
+        function onCombineRulesChanged() {
+            if (settingsPopup.opened)
+                settingsPopup.updateCombineOverlapWarnings()
+        }
+    }
+
     width: 440
     height: Math.min(contentColumn.implicitHeight + 32, maxHeight)
     // Modal: Overlay.overlay's automatic block-plane now genuinely blocks
@@ -33,7 +64,14 @@ Popup {
     focus: true
     x: parent ? (parent.width - width) / 2 : 0
     y: parent ? (parent.height - height) / 2 : 0
-    closePolicy: Popup.CloseOnEscape | Popup.CloseOnPressOutside
+    // Suspended (NoAutoClose) while middleDragScrollArea is armed: Escape
+    // and click-outside are how Chrome-style autoscroll cancels itself too,
+    // and without this the popup's own CloseOnEscape/CloseOnPressOutside
+    // would race the autoscroll's own cancel handling and close the whole
+    // Settings popup instead of just disarming the scroll.
+    closePolicy: middleDragScrollArea.armed
+                 ? Popup.NoAutoClose
+                 : (Popup.CloseOnEscape | Popup.CloseOnPressOutside)
 
     readonly property real maxHeight: parent ? parent.height * 0.9 : 600
 
@@ -93,6 +131,33 @@ Popup {
         rules[index] = Object.assign({}, rules[index], {[key]: value})
         AppSettings.combineRules = rules
     }
+    // The ONLY writer of rule `pattern` — every pattern edit (button-driven
+    // differentiator toggle, or hand-typed text in rulePatternField) must
+    // route through here rather than a plain updateRule(index, "pattern",
+    // ...), because it also re-derives/heals sortGroupIndex against the NEW
+    // pattern (see resolveSortGroupIndex()'s doc comment for why a stored
+    // index alone can't survive pattern edits, and why sortGroupOccurrence
+    // rides alongside sortGroupText to disambiguate duplicate-text runs).
+    // `overrideSortGroupText`/`overrideSortGroupOccurrence`, if given,
+    // REPLACE the rule's current sort-differentiator designation (used when
+    // the user just picked a different run to sort by, or cleared it with
+    // ""); omitted, they keep whatever the rule already had, just
+    // re-resolved against `newPattern`.
+    function commitPatternChange(index, newPattern, overrideSortGroupText, overrideSortGroupOccurrence) {
+        const rule = AppSettings.combineRules[index]
+        const targetText = overrideSortGroupText !== undefined ? overrideSortGroupText : (rule.sortGroupText || "")
+        const targetOccurrence = overrideSortGroupText !== undefined
+                ? (overrideSortGroupOccurrence || 0) : (rule.sortGroupOccurrence || 0)
+        const sortGroupIndex = settingsPopup.resolveSortGroupIndex(newPattern, targetText, targetOccurrence)
+        const rules = AppSettings.combineRules.slice()
+        rules[index] = Object.assign({}, rules[index], {
+            pattern: newPattern,
+            sortGroupText: sortGroupIndex > 0 ? targetText : "",
+            sortGroupOccurrence: sortGroupIndex > 0 ? targetOccurrence : 0,
+            sortGroupIndex: sortGroupIndex
+        })
+        AppSettings.combineRules = rules
+    }
     function addRule() {
         AppSettings.combineRules = AppSettings.combineRules.concat(
                     [{name: qsTr("New rule"), pattern: "", enabled: true}])
@@ -120,6 +185,590 @@ Popup {
                     : escapeRegexPreviewHtml(c)
         }
         return out
+    }
+
+    // Footgun guard: `|` (alternation) has the LOWEST precedence of any
+    // regex operator — lower than concatenation, lower than ^/$ — so a `|`
+    // not wrapped in its own group spans the ENTIRE pattern on either side,
+    // not just the neighboring token. E.g. `^TX0._MIC*._(edit)|(orig)` really
+    // parses as two fully independent top-level alternatives
+    // `^TX0._MIC*._(edit)` OR `(orig)` — and the second has no anchor, so it
+    // matches "orig" anywhere in any filename. Scans left to right tracking:
+    // backslash-escapes (an escaped `|`/`(`/`)`/`[`/`]` never counts as the
+    // metacharacter), character-class depth (a `|` or paren inside `[...]`
+    // is a literal, and classes never nest, so a single bool suffices), and
+    // paren depth (incremented on an unescaped `(` outside a class,
+    // decremented on an unescaped `)`). Returns true iff an unescaped `|` is
+    // found outside any character class AND at paren depth 0 — i.e. a
+    // top-level alternation not contained in its own group.
+    function hasUngroupedAlternation(pattern) {
+        let parenDepth = 0
+        let inClass = false
+        let escaped = false
+        for (let i = 0; i < pattern.length; i++) {
+            const c = pattern[i]
+            if (escaped) {
+                escaped = false
+                continue
+            }
+            if (c === "\\") {
+                escaped = true
+                continue
+            }
+            if (inClass) {
+                if (c === "]")
+                    inClass = false
+                continue
+            }
+            if (c === "[") {
+                inClass = true
+                continue
+            }
+            if (c === "(") {
+                parenDepth++
+                continue
+            }
+            if (c === ")") {
+                parenDepth = Math.max(0, parenDepth - 1)
+                continue
+            }
+            if (c === "|" && parenDepth === 0)
+                return true
+        }
+        return false
+    }
+
+    // Per-filename match coloring for the combine-preview list: splits a
+    // filename into runs classified as literally matched, matched via a
+    // regex special construct (wildcard/class/quantifier/group), or outside
+    // the pattern's match entirely — so it's visible at a glance which part
+    // of a real filename each bit of the pattern actually accounted for.
+    //
+    // Approach: tokenize the pattern at depth 0 (outside classes/groups),
+    // classing each atom literal-or-special (quantifiers always force
+    // special, since the matched length becomes variable even for a literal
+    // char; whole groups are opaque leaves, classed literal only if their
+    // content is itself pure-literal with no alternation). Then build a
+    // "measurement" copy of the pattern where every token is wrapped in its
+    // own capturing group (any capturing parens already inside a token's own
+    // text are neutralized first so group numbering stays 1:1 with the
+    // token list), exec it against the filename, and recover each token's
+    // matched substring positionally (searching forward from a cursor that
+    // only advances) rather than via match.indices/the 'd' flag, which may
+    // not exist in this QML JS engine.
+    function findClassEnd(str, start) {
+        let j = start + 1
+        if (str[j] === "^")
+            j++
+        if (str[j] === "]")
+            j++
+        while (j < str.length && str[j] !== "]") {
+            if (str[j] === "\\")
+                j++
+            j++
+        }
+        return Math.min(j + 1, str.length)
+    }
+    function findGroupEnd(str, start) {
+        let depth = 0
+        let j = start
+        while (j < str.length) {
+            const c = str[j]
+            if (c === "\\") {
+                j += 2
+                continue
+            }
+            if (c === "[") {
+                j = settingsPopup.findClassEnd(str, j)
+                continue
+            }
+            if (c === "(") {
+                depth++
+                j++
+                continue
+            }
+            if (c === ")") {
+                depth--
+                j++
+                if (depth === 0)
+                    return j
+                continue
+            }
+            j++
+        }
+        return j
+    }
+    function readQuantifierEnd(str, start) {
+        if (start >= str.length)
+            return start
+        const c = str[start]
+        if (c === "*" || c === "+" || c === "?")
+            return str[start + 1] === "?" ? start + 2 : start + 1
+        if (c === "{") {
+            const m = str.slice(start).match(/^\{\d+(,\d*)?\}\??/)
+            if (m)
+                return start + m[0].length
+        }
+        return start
+    }
+    // Rewrites `(` to `(?:` everywhere it isn't already `(?...`, so a
+    // token's own text can be wrapped in a fresh capturing group without
+    // its internal parens (if any, e.g. a whole matched group-atom) adding
+    // extra numbered groups that would desync classifications[] from the
+    // measurement pattern's real capture-group indices.
+    function neutralizeCapturingGroups(str) {
+        let out = ""
+        let i = 0
+        while (i < str.length) {
+            const c = str[i]
+            if (c === "\\") {
+                out += str.slice(i, i + 2)
+                i += 2
+                continue
+            }
+            if (c === "[") {
+                const end = settingsPopup.findClassEnd(str, i)
+                out += str.slice(i, end)
+                i = end
+                continue
+            }
+            if (c === "(" && str[i + 1] !== "?") {
+                out += "(?:"
+                i++
+                continue
+            }
+            out += c
+            i++
+        }
+        return out
+    }
+    function tokenizePatternTopLevel(str) {
+        const tokens = []
+        let hasTopLevelAlternation = false
+        let i = 0
+        while (i < str.length) {
+            const c = str[i]
+            if (c === "^" || c === "$") {
+                tokens.push({kind: "anchor", text: c})
+                i++
+                continue
+            }
+            if (c === "|") {
+                hasTopLevelAlternation = true
+                tokens.push({kind: "alt", text: "|"})
+                i++
+                continue
+            }
+            const atomStart = i
+            let atomKind = "literal"
+            if (c === "\\") {
+                const next = str[i + 1]
+                if (next === undefined) {
+                    i++
+                    continue
+                }
+                if ("dDwWsSbB".indexOf(next) >= 0)
+                    atomKind = "special"
+                i += 2
+            } else if (c === ".") {
+                atomKind = "special"
+                i++
+            } else if (c === "[") {
+                atomKind = "special"
+                i = settingsPopup.findClassEnd(str, i)
+            } else if (c === "(") {
+                const groupEnd = settingsPopup.findGroupEnd(str, i)
+                const inner = str.slice(i + 1, groupEnd - 1).replace(/^\?:/, "").replace(/^\?<[^>]+>/, "")
+                const innerResult = settingsPopup.tokenizePatternTopLevel(inner)
+                const innerIsPureLiteral = !innerResult.hasTopLevelAlternation
+                        && innerResult.tokens.every(function (t) { return t.kind === "literal" || t.kind === "anchor" })
+                atomKind = innerIsPureLiteral ? "literal" : "special"
+                i = groupEnd
+            } else {
+                i++
+            }
+            const qEnd = settingsPopup.readQuantifierEnd(str, i)
+            const quantified = qEnd > i
+            i = qEnd
+            tokens.push({kind: quantified ? "special" : atomKind, text: str.slice(atomStart, i)})
+        }
+        return {tokens: tokens, hasTopLevelAlternation: hasTopLevelAlternation}
+    }
+    function mergeLiteralTokens(tokens) {
+        const merged = []
+        for (const t of tokens) {
+            if (t.kind === "literal" && merged.length > 0 && merged[merged.length - 1].kind === "literal")
+                merged[merged.length - 1].text += t.text
+            else
+                merged.push({kind: t.kind, text: t.text})
+        }
+        return merged
+    }
+
+    // Fixed-order categorical palette for coloring each differentiator (real
+    // capturing group) distinctly in classifyFilenameHtml()'s preview and in
+    // an ON differentiator button's own highlight — so the button and every
+    // filename span it colors visibly pair up, which doubles as this
+    // palette's accessibility mitigation (see below). Slot order/values are
+    // the dataviz skill's dark-mode categorical theme (references/palette.md),
+    // validated against this popup's actual preview background via
+    // `node scripts/validate_palette.js "<hexes>" --mode dark --surface "#1e1e1e"`:
+    // lightness band, chroma floor, and contrast all PASS; worst adjacent CVD
+    // separation is a ΔE 10.3 WARN (8-12 floor band) — legal only with
+    // secondary encoding, satisfied here by the button/text pairing acting as
+    // a built-in per-color label (a colorblind user can still identify which
+    // differentiator is which by the button's own regex-snippet text, not
+    // color alone). Never reorder these — order is the CVD-safety mechanism,
+    // not cosmetic. A 9th+ differentiator wraps around rather than growing
+    // the palette (regex rules with >8 differentiators are not a case worth
+    // designing fresh colors for).
+    readonly property var differentiatorPalette: ["#3987e5", "#199e70", "#c98500", "#008300",
+                                                   "#9085e9", "#e66767", "#d55181", "#d95926"]
+    function differentiatorColor(groupIndex) {
+        return settingsPopup.differentiatorPalette[(groupIndex - 1) % settingsPopup.differentiatorPalette.length]
+    }
+
+    // --- Differentiator buttons ------------------------------------------
+    //
+    // A "differentiator" (see the combine-rule editor UI below) is really
+    // just a real capturing group: matchRuleCapturedKey()
+    // (TranscriptionController.cpp) already builds the combine-grouping key
+    // by concatenating every capture group 1..N in a matched filename, and
+    // a rule with zero capture groups puts every match in one bucket. So
+    // "toggle this pattern segment into a differentiator" is purely a text
+    // transform on the rule's own pattern string (wrap it in `(...)` to turn
+    // it on, `(?:...)` to turn it off) — the matching engine itself needs no
+    // changes at all.
+    //
+    // True capturing-group numbering (used both to know which run is
+    // already "on" and to ask the controller whether a given group always
+    // participates — see differentiatorNonParticipatingFiles() below) is
+    // NOT the same thing as tokenizePatternTopLevel()'s literal/special
+    // classification: a group with purely literal content, e.g. `(orig)`,
+    // classifies as "literal" (gets no button — nothing to differentiate,
+    // it's always the same text) but is STILL a real capturing group to
+    // QRegularExpression. So group numbering is derived independently, by
+    // scanning the pattern text for real capturing-group opens.
+
+    // True iff `pattern[i]` opens a REAL capturing group — plain "(" or a
+    // named group "(?<name>...)" — as opposed to a non-capturing "(?:", a
+    // lookahead "(?="/"(?!", or a lookbehind "(?<="/"(?<!". Mirrors
+    // tokenizePatternTopLevel()'s own recognition of "(?<name>...)" groups
+    // when extracting their inner content for classification.
+    function isCapturingGroupOpen(pattern, i) {
+        if (pattern[i] !== "(")
+            return false
+        if (pattern[i + 1] !== "?")
+            return true
+        return pattern[i + 2] === "<" && pattern[i + 3] !== "=" && pattern[i + 3] !== "!"
+    }
+
+    // 1-based real capture-group number of the group opening at exactly
+    // `openParenIndex` in `pattern`, by a left-to-right scan counting every
+    // real capturing-group open (see isCapturingGroupOpen()) — the same
+    // numbering QRegularExpression itself uses, regardless of nesting depth
+    // or whether a group's own content happens to be literal. Returns -1 if
+    // `openParenIndex` isn't actually a capturing-group open.
+    function capturingGroupIndexAt(pattern, openParenIndex) {
+        let count = 0
+        let i = 0
+        let inClass = false
+        while (i < pattern.length) {
+            const c = pattern[i]
+            if (c === "\\") {
+                i += 2
+                continue
+            }
+            if (inClass) {
+                if (c === "]")
+                    inClass = false
+                i++
+                continue
+            }
+            if (c === "[") {
+                inClass = true
+                i++
+                continue
+            }
+            if (c === "(") {
+                const capturing = settingsPopup.isCapturingGroupOpen(pattern, i)
+                if (capturing)
+                    count++
+                if (i === openParenIndex)
+                    return capturing ? count : -1
+            }
+            i++
+        }
+        return -1
+    }
+
+    // Merges consecutive "special" (non-exact-match) tokens from
+    // tokenizePatternTopLevel() into single runs — mirrors
+    // mergeLiteralTokens() above, but for "special" instead of "literal".
+    // Anchors, top-level "|", and literal tokens all break a run rather
+    // than being absorbed into it, so a differentiator button never spans
+    // across one of those.
+    function mergeSpecialRuns(tokens) {
+        const merged = []
+        for (const t of tokens) {
+            if (t.kind === "special" && merged.length > 0 && merged[merged.length - 1].kind === "run") {
+                merged[merged.length - 1].text += t.text
+                merged[merged.length - 1].tokenCount += 1
+            } else if (t.kind === "special") {
+                merged.push({kind: "run", text: t.text, tokenCount: 1})
+            } else {
+                merged.push({kind: t.kind, text: t.text, tokenCount: 1})
+            }
+        }
+        return merged
+    }
+
+    // The clickable differentiator runs for `pattern`: each maximal
+    // consecutive span of "special" tokens, with its [start, end) character
+    // offsets (reconstructed by summing preceding token/run text lengths —
+    // tokenizePatternTopLevel()'s tokens fully partition the pattern with
+    // no gaps) and whether it's already a differentiator (a single-token
+    // run that's already a real capturing group — see isCapturingGroupOpen()).
+    function findDifferentiatorRuns(pattern) {
+        const tokens = settingsPopup.tokenizePatternTopLevel(pattern).tokens
+        const runs = settingsPopup.mergeSpecialRuns(tokens)
+        const result = []
+        let offset = 0
+        for (const r of runs) {
+            if (r.kind === "run") {
+                const isDifferentiator = r.tokenCount === 1 && settingsPopup.isCapturingGroupOpen(r.text, 0)
+                result.push({start: offset, end: offset + r.text.length, text: r.text,
+                             tokenCount: r.tokenCount, isDifferentiator: isDifferentiator})
+            }
+            offset += r.text.length
+        }
+        return result
+    }
+
+    // Re-derives the live capture-group index of a rule's sort
+    // differentiator (see findDifferentiatorRuns()/toggleDifferentiator())
+    // against `pattern`, by matching the run's own literal text
+    // (`sortGroupText`) rather than trusting a stored index. Capture-group
+    // numbering is positional — toggling an EARLIER differentiator on/off
+    // (or hand-editing the pattern text directly, which the raw
+    // rulePatternField always allows) shifts every later group's index — so
+    // a bare persisted integer would silently drift onto the wrong group
+    // the next time the pattern changes. Matching by text instead keeps the
+    // designation correct across edits.
+    //
+    // Text alone is ambiguous when two differentiator runs are
+    // byte-identical (e.g. a device-id group and a part-number group both
+    // written as plain `(\d+)` — an entirely realistic pattern for this
+    // feature's own target use case, not a rare corner case), so
+    // `sortGroupOccurrence` (0-based) disambiguates: "the Nth differentiator
+    // run, left to right, whose text is sortGroupText" — computed once at
+    // selection time (see toggleDifferentiator()) and re-applied identically
+    // here on every resolve. This is exact as long as no NEW run sharing
+    // that same text gets inserted BEFORE the marked one between commits
+    // (which would shift its occurrence rank without changing its identity)
+    // — a narrow, accepted residual limitation, same spirit as
+    // computeRuleOverlaps()'s "regex disjointness is undecidable in
+    // general" pragmatism. Returns -1 if sortGroupText is empty or no
+    // longer identifies a real differentiator run at that occurrence in
+    // `pattern` (e.g. the user deleted or de-differentiated it) — the
+    // caller then knows to fall back to the recording-mtime default.
+    function resolveSortGroupIndex(pattern, sortGroupText, sortGroupOccurrence) {
+        if (!sortGroupText)
+            return -1
+        const sameText = settingsPopup.findDifferentiatorRuns(pattern).filter(function (r) {
+            return r.isDifferentiator && r.text === sortGroupText
+        })
+        const match = sameText[sortGroupOccurrence || 0]
+        return match ? settingsPopup.capturingGroupIndexAt(pattern, match.start) : -1
+    }
+
+    // Toggles a single differentiator run's capturing state and returns the
+    // FULL updated pattern string. Toggling OFF never fully strips a group's
+    // parens back to bare text — only flips "(" to "(?:" in place — since
+    // that could change match semantics for quantified/alternated content
+    // (e.g. `(a|b)+` -> `a|b+` is NOT equivalent, the same footgun
+    // hasUngroupedAlternation() above guards against). Toggling ON reuses
+    // neutralizeCapturingGroups() so any capturing parens already nested in
+    // the run's own text (e.g. an already-grouped sub-atom pulled into a
+    // multi-token run) don't separately contribute to
+    // matchRuleCapturedKey()'s concatenated key once the new outer group
+    // wraps them.
+    function toggleDifferentiatorRun(pattern, run) {
+        const before = pattern.slice(0, run.start)
+        const after = pattern.slice(run.end)
+        let newText
+        if (run.isDifferentiator)
+            newText = "(?:" + run.text.slice(1)
+        else if (run.tokenCount === 1 && run.text.startsWith("(?:"))
+            newText = "(" + run.text.slice(3)
+        else
+            newText = "(" + settingsPopup.neutralizeCapturingGroups(run.text) + ")"
+        return before + newText + after
+    }
+
+    // Non-blocking "these rules might conflict" warnings for the combine-
+    // rule list as a whole — general regex disjointness is undecidable for
+    // QRegularExpression's backtracking dialect (see
+    // hasUngroupedAlternation()'s doc comment for a taste of how gnarly
+    // that gets), so this only catches what's actually checkable: (a) two
+    // enabled rules with byte-identical pattern text (the "obvious" static
+    // case — zero false positives, catches the copy-paste-forgot-to-edit
+    // mistake), and (b) two enabled rules that empirically both match the
+    // SAME file currently in the vault, reusing detectCombineGroups()'s
+    // real matching (no new C++ needed — a file matched by 2+ rules today
+    // silently gets queued into 2+ separate combine jobs, since
+    // findCombineGroups() has no first-rule-wins dedup). Returns an object
+    // keyed by ruleName -> array of {other: otherRuleName, file: "" for the
+    // static case, or the shared filename for the empirical case}.
+    function computeRuleOverlaps(rules, audioPaths) {
+        const warnings = {}
+        function addWarning(ruleName, other, file) {
+            if (!warnings[ruleName])
+                warnings[ruleName] = []
+            warnings[ruleName].push({other: other, file: file})
+        }
+
+        const enabled = rules.filter(function (r) { return r.enabled && r.pattern.length > 0 })
+        for (let i = 0; i < enabled.length; i++) {
+            for (let j = i + 1; j < enabled.length; j++) {
+                if (enabled[i].pattern === enabled[j].pattern) {
+                    addWarning(enabled[i].name, enabled[j].name, "")
+                    addWarning(enabled[j].name, enabled[i].name, "")
+                }
+            }
+        }
+
+        if (settingsPopup.transcriptionController && enabled.length > 0) {
+            const groups = settingsPopup.transcriptionController.detectCombineGroups(enabled, audioPaths)
+            const fileToRules = {}
+            for (const g of groups) {
+                for (const f of g.files) {
+                    // detectCombineGroups() returns full paths — shorten to
+                    // just the filename for display, matching every other
+                    // file-listing spot in this popup (e.g. the preview
+                    // cards' own f.substring(f.lastIndexOf("/") + 1) below,
+                    // and differentiatorNonParticipatingFiles(), which
+                    // already returns bare filenames from the C++ side).
+                    const name = f.substring(f.lastIndexOf("/") + 1)
+                    if (!fileToRules[name])
+                        fileToRules[name] = []
+                    if (fileToRules[name].indexOf(g.ruleName) < 0)
+                        fileToRules[name].push(g.ruleName)
+                }
+            }
+            for (const f in fileToRules) {
+                const names = fileToRules[f]
+                if (names.length > 1) {
+                    for (let i = 0; i < names.length; i++)
+                        for (let j = 0; j < names.length; j++)
+                            if (i !== j)
+                                addWarning(names[i], names[j], f)
+                }
+            }
+        }
+        return warnings
+    }
+    function classifyFilenameHtml(pattern, fileName) {
+        if (!pattern)
+            return settingsPopup.escapeRegexPreviewHtml(fileName)
+
+        const tokens = settingsPopup.mergeLiteralTokens(
+                    settingsPopup.tokenizePatternTopLevel(pattern).tokens)
+        let measurementPattern = ""
+        const classifications = []
+        for (const t of tokens) {
+            if (t.kind === "anchor" || t.kind === "alt") {
+                measurementPattern += t.text
+                continue
+            }
+            classifications.push(t.kind)
+            measurementPattern += "(" + settingsPopup.neutralizeCapturingGroups(t.text) + ")"
+        }
+
+        let re
+        try {
+            re = new RegExp(measurementPattern)
+        } catch (e) {
+            return settingsPopup.escapeRegexPreviewHtml(fileName)
+        }
+        const m = re.exec(fileName)
+        const classes = new Array(fileName.length).fill(null)
+        if (m) {
+            let cursor = 0
+            for (let g = 0; g < classifications.length; g++) {
+                const captured = m[g + 1]
+                if (captured === undefined || captured.length === 0)
+                    continue
+                const posInMatch = m[0].indexOf(captured, cursor)
+                if (posInMatch < 0)
+                    continue
+                const start = m.index + posInMatch
+                const end = start + captured.length
+                for (let k = start; k < end; k++)
+                    classes[k] = classifications[g]
+                cursor = posInMatch + captured.length
+            }
+        }
+
+        // Overlay: each REAL capturing group in the pattern AS AUTHORED (a
+        // differentiator — see toggleDifferentiatorRun()'s doc comment; this
+        // includes any hand-typed literal-content group like `(orig)`, just
+        // as real a capture to matchRuleCapturedKey() as a toggled-on
+        // button) gets its own color from differentiatorPalette, keyed by
+        // its 1-based capture-group number — so two filenames that would
+        // actually combine under this rule visibly share the same colored
+        // text in every differentiator span, and diverge wherever they
+        // wouldn't combine. Matched against `pattern` directly (the real
+        // capturing parens are already there) rather than re-deriving via
+        // the measurement-pattern trick above — same "good enough for a
+        // preview, not the real combine decision" QML/JS RegExp tradeoff
+        // this function already makes for the literal/special coloring.
+        const diffGroup = new Array(fileName.length).fill(0)
+        let realRe = null
+        try {
+            realRe = new RegExp(pattern)
+        } catch (e) {
+            // invalid pattern mid-typing — leave realRe null, no overlay
+        }
+        if (realRe) {
+            const dm = realRe.exec(fileName)
+            if (dm) {
+                let dCursor = 0
+                for (let g = 1; g < dm.length; g++) {
+                    const captured = dm[g]
+                    if (captured === undefined || captured.length === 0)
+                        continue
+                    const posInMatch = dm[0].indexOf(captured, dCursor)
+                    if (posInMatch < 0)
+                        continue
+                    const start = dm.index + posInMatch
+                    const end = start + captured.length
+                    for (let k = start; k < end; k++)
+                        diffGroup[k] = g
+                    dCursor = posInMatch + captured.length
+                }
+            }
+        }
+
+        const colorFor = {literal: "#c9d4c9", special: "#e8a33d", none: "#666666"}
+        function colorAt(idx) {
+            return diffGroup[idx] > 0
+                    ? settingsPopup.differentiatorColor(diffGroup[idx])
+                    : colorFor[classes[idx] || "none"]
+        }
+        let html = ""
+        let runStart = 0
+        let runColor = fileName.length > 0 ? colorAt(0) : ""
+        for (let idx = 1; idx <= fileName.length; idx++) {
+            const currentColor = idx < fileName.length ? colorAt(idx) : null
+            if (currentColor !== runColor) {
+                html += "<span style=\"color:" + runColor + ";\">"
+                        + settingsPopup.escapeRegexPreviewHtml(fileName.slice(runStart, idx)) + "</span>"
+                runStart = idx
+                runColor = currentColor
+            }
+        }
+        return html
     }
 
     background: Rectangle {
@@ -2232,6 +2881,15 @@ Popup {
                                    + "files sharing the same TXnn id, even though the mic number and "
                                    + "timestamp differ between parts.")
                     }
+                    Label {
+                        Layout.maximumWidth: 300
+                        wrapMode: Text.WordWrap
+                        color: "#e8a33d"
+                        font.pixelSize: 11
+                        text: qsTr("|  (alternation) has the LOWEST precedence of any operator — "
+                                   + "an ungrouped a|b$ means \"a\" OR \"b$\" as two whole separate "
+                                   + "patterns. Always group it: (?:a|b).")
+                    }
                 }
             }
 
@@ -2249,9 +2907,178 @@ Popup {
 
                         property var previewGroups: []
                         property bool previewRun: false
+                        property var differentiatorRuns: []
 
                         Layout.fillWidth: true
                         spacing: 4
+
+                        // Inserts `snippet` at the current cursor position in
+                        // rulePatternField, places the cursor `cursorOffset`
+                        // characters into the inserted snippet, and refocuses
+                        // the field so typing continues immediately. Uses
+                        // TextInput.insert() rather than a raw `text =`
+                        // reassignment — verified empirically (offscreen
+                        // QTest) that reassigning the whole `text` property
+                        // silently clears TextInput's undo history, while
+                        // insert() records a normal undoable edit, so
+                        // Ctrl+Z/Ctrl+Y keep working after clicking one of
+                        // these buttons exactly as they do for typed input.
+                        // Deliberately does NOT call settingsPopup.updateRule()
+                        // itself — the field's own onEditingFinished commits
+                        // the change on focus-out/Enter exactly as it does for
+                        // manual typing, so insert-then-keep-typing and
+                        // insert-then-click-away both commit the same way.
+                        function insertPatternToken(snippet, cursorOffset) {
+                            const pos = rulePatternField.cursorPosition
+                            rulePatternField.insert(pos, snippet)
+                            rulePatternField.cursorPosition = pos + cursorOffset
+                            rulePatternField.forceActiveFocus()
+                        }
+
+                        // Re-runs the SAME detectCombineGroups() the ribbon
+                        // "combine" button and per-job safety-net redirect
+                        // use, so the preview below is always exactly what
+                        // would really happen with the pattern as currently
+                        // typed — not a separate simulation the user has to
+                        // remember to re-trigger.
+                        function updatePreview() {
+                            if (rulePatternField.text.length > 0 && settingsPopup.vaultTreeModel
+                                    && settingsPopup.transcriptionController) {
+                                // Resolved against the LIVE typed text, not the
+                                // committed rule.pattern — the pattern field can
+                                // be mid-edit (uncommitted) here, so the sort
+                                // differentiator's group index needs re-deriving
+                                // the same way commitPatternChange() does on an
+                                // actual commit, or a same-session edit that
+                                // shifts group numbering would show a stale
+                                // preview until the field loses focus.
+                                const sortGroupIndex = settingsPopup.resolveSortGroupIndex(
+                                            rulePatternField.text, ruleCard.modelData.sortGroupText || "",
+                                            ruleCard.modelData.sortGroupOccurrence || 0)
+                                const testRule = {name: ruleCard.modelData.name || qsTr("(unnamed)"),
+                                                   pattern: rulePatternField.text, enabled: true,
+                                                   sortGroupIndex: sortGroupIndex}
+                                ruleCard.previewGroups = settingsPopup.transcriptionController.detectCombineGroups(
+                                            [testRule], settingsPopup.vaultTreeModel.allAudioPaths())
+                                ruleCard.previewRun = true
+                            } else {
+                                ruleCard.previewGroups = []
+                                ruleCard.previewRun = false
+                            }
+                            ruleCard.updateDifferentiatorRuns()
+                        }
+
+                        // Recomputes the differentiator buttons for the
+                        // pattern as currently typed, including — per run —
+                        // which files (if any) would violate "this
+                        // differentiator must participate in every match"
+                        // (see TranscriptionController::
+                        // differentiatorNonParticipatingFiles()'s doc
+                        // comment: a zero-width capture is fine, only a
+                        // capture that doesn't participate AT ALL, e.g. it
+                        // sits in an alternation branch that wasn't taken,
+                        // counts). For an OFF run this decides whether the
+                        // button gets disabled (BLOCKED); for an already-ON
+                        // run it decides whether a non-blocking warning is
+                        // shown (nothing to block — the rule is already
+                        // saved this way).
+                        function updateDifferentiatorRuns() {
+                            const text = rulePatternField.text
+                            const runs = settingsPopup.findDifferentiatorRuns(text)
+                            const hasBackend = settingsPopup.transcriptionController && settingsPopup.vaultTreeModel
+                            const audioPaths = hasBackend ? settingsPopup.vaultTreeModel.allAudioPaths() : []
+                            // Disambiguates duplicate-text ON runs (e.g. two
+                            // "(\d+)" groups — an entirely realistic pattern,
+                            // not a corner case) for the sort-differentiator
+                            // designation: "the Nth ON run, left to right,
+                            // with this exact text" — see
+                            // resolveSortGroupIndex()'s doc comment, which
+                            // this counting must stay in lockstep with (same
+                            // isDifferentiator filter, same left-to-right
+                            // order).
+                            const occurrenceByText = {}
+                            for (const run of runs) {
+                                // groupIndex is the run's REAL (if already ON) or
+                                // HYPOTHETICAL (if OFF, as if just toggled ON)
+                                // capture-group number — cheap pure-text derivation,
+                                // computed unconditionally so an ON button can color
+                                // itself to match its differentiatorColor() preview
+                                // span even when there's no backend/vault to run the
+                                // participation check against.
+                                const candidatePattern = run.isDifferentiator
+                                        ? text : settingsPopup.toggleDifferentiatorRun(text, run)
+                                run.groupIndex = settingsPopup.capturingGroupIndexAt(candidatePattern, run.start)
+                                run.offendingFiles = (hasBackend && run.groupIndex > 0)
+                                        ? settingsPopup.transcriptionController.differentiatorNonParticipatingFiles(
+                                              candidatePattern, run.groupIndex, audioPaths)
+                                        : []
+                                if (run.isDifferentiator) {
+                                    run.occurrence = occurrenceByText[run.text] || 0
+                                    occurrenceByText[run.text] = run.occurrence + 1
+                                } else {
+                                    run.occurrence = 0
+                                }
+                            }
+                            ruleCard.differentiatorRuns = runs
+                        }
+
+                        // Direct-commit toggle (like removeRuleButton /
+                        // ruleEnabledSwitch above, NOT insertPatternToken's
+                        // rely-on-the-field's-own-commit pattern) — this
+                        // button's own click fully reassigns
+                        // AppSettings.combineRules itself, synchronously,
+                        // before any Repeater rebuild can happen, so it
+                        // doesn't hit the focus-steal race described in the
+                        // insert-token toolbar's doc comment below and
+                        // doesn't need focusPolicy: Qt.NoFocus.
+                        //
+                        // Three-state cycle per run: OFF (plain text) ->
+                        // GROUPING (capturing, contributes to the group
+                        // identity key) -> SORT (still capturing, but
+                        // EXCLUDED from the key — orders a group's members
+                        // by this value instead, numeric-aware; see
+                        // findCombineGroups()'s doc comment) -> back to OFF.
+                        // Only one run per rule can be in the SORT state at
+                        // a time — landing on it here always REPLACES
+                        // whatever the rule's previous sort differentiator
+                        // was, satisfying "a sort differentiator can't also
+                        // be a grouping one" by construction rather than as
+                        // a separate validation step.
+                        function toggleDifferentiator(run) {
+                            // Must compare occurrence too, not just text —
+                            // two runs can share identical text (e.g. two
+                            // "(\d+)" groups), and text alone can't tell
+                            // which specific one is currently the sort field.
+                            const isSortRun = run.isDifferentiator && ruleCard.modelData.sortGroupText === run.text
+                                    && (ruleCard.modelData.sortGroupOccurrence || 0) === run.occurrence
+                            if (isSortRun) {
+                                // SORT -> OFF
+                                const newPattern = settingsPopup.toggleDifferentiatorRun(rulePatternField.text, run)
+                                rulePatternField.text = newPattern
+                                settingsPopup.commitPatternChange(ruleCard.index, newPattern, "")
+                            } else if (run.isDifferentiator) {
+                                // GROUPING -> SORT (pattern text itself is
+                                // unchanged — only the sort designation moves)
+                                settingsPopup.commitPatternChange(ruleCard.index, rulePatternField.text, run.text, run.occurrence)
+                            } else {
+                                // OFF -> GROUPING
+                                const newPattern = settingsPopup.toggleDifferentiatorRun(rulePatternField.text, run)
+                                rulePatternField.text = newPattern
+                                settingsPopup.commitPatternChange(ruleCard.index, newPattern)
+                            }
+                        }
+
+                        // Debounced so the preview isn't recomputed on every
+                        // single keystroke — coalesces into one scan shortly
+                        // after typing settles, mirroring AppSettings' own
+                        // scheduleSave() debounce pattern.
+                        Timer {
+                            id: previewTimer
+                            interval: 300
+                            onTriggered: ruleCard.updatePreview()
+                        }
+
+                        Component.onCompleted: ruleCard.updatePreview()
 
                         Rectangle {
                             Layout.fillWidth: true
@@ -2306,7 +3133,8 @@ Popup {
                                 font.family: "monospace"
                                 hoverEnabled: true
                                 background: UnderlineField { focused: rulePatternField.activeFocus }
-                                onEditingFinished: settingsPopup.updateRule(ruleCard.index, "pattern", text)
+                                onEditingFinished: settingsPopup.commitPatternChange(ruleCard.index, text)
+                                onTextChanged: previewTimer.restart()
                             }
                             Button {
                                 id: regexInfoButton
@@ -2331,6 +3159,337 @@ Popup {
                             }
                         }
 
+                        // Live validity indicator — validates against the
+                        // EXACT SAME QRegularExpression engine
+                        // findCombineGroups()/matchRuleCapturedKey() actually
+                        // use (TranscriptionController::regexValidationError()),
+                        // not QML/JS RegExp, whose syntax isn't guaranteed
+                        // identical. Reactive off rulePatternField.text — this
+                        // is a plain Popup Repeater delegate, not a recycled
+                        // TreeView row, so a keystroke-reactive binding is
+                        // correct here (no explicit-push idiom needed).
+                        Label {
+                            id: patternValidityLabel
+                            Layout.fillWidth: true
+                            font.pixelSize: 11
+                            elide: Text.ElideRight
+                            visible: rulePatternField.text.length > 0 && settingsPopup.transcriptionController
+                            property string validationError: settingsPopup.transcriptionController
+                                    ? settingsPopup.transcriptionController.regexValidationError(rulePatternField.text)
+                                    : ""
+                            color: validationError.length > 0 ? "#e0664f" : "#5fbf7a"
+                            text: validationError.length > 0
+                                    ? ("✗ " + validationError)
+                                    : ("✓ " + qsTr("Valid"))
+                            HoverHandler { id: patternValidityHover }
+                            ToolTip.visible: patternValidityLabel.validationError.length > 0 && patternValidityHover.hovered
+                            ToolTip.text: patternValidityLabel.validationError
+                        }
+
+                        // Insert-token toolbar: each button inserts a snippet
+                        // at the cursor rather than committing directly, so
+                        // typing/editing-finished behaves exactly as if the
+                        // user had typed it themselves. "Either/Or" in
+                        // particular exists so alternation is never typed
+                        // ungrouped in the first place (see
+                        // hasUngroupedAlternation()'s doc comment above).
+                        // focusPolicy: Qt.NoFocus on every button below is
+                        // required, not decorative: a click's press phase
+                        // steals rulePatternField's active focus before the
+                        // click's release phase fires onClicked, which fires
+                        // rulePatternField's onEditingFinished, which commits
+                        // via settingsPopup.updateRule() — that reassigns the
+                        // WHOLE AppSettings.combineRules array, so the
+                        // Repeater destroys and recreates every rule card
+                        // (including the very button being pressed) before
+                        // "clicked" can fire. Without NoFocus, insertion only
+                        // succeeds on alternating clicks: the one after an
+                        // insertion has divergent uncommitted text and steals
+                        // focus, destroying the button mid-click; the next
+                        // click (nothing to commit) succeeds normally.
+                        Flow {
+                            Layout.fillWidth: true
+                            spacing: 4
+
+                            Button {
+                                id: insertDigitsButton
+                                text: qsTr("Digits")
+                                implicitHeight: 22
+                                background: Rectangle {
+                                    radius: AppSettings.borderRadius
+                                    color: "transparent"
+                                    border.width: 1
+                                    border.color: "#3a3a3a"
+                                }
+                                hoverEnabled: true
+                                focusPolicy: Qt.NoFocus
+                                onClicked: ruleCard.insertPatternToken("\\d+", 3)
+                                HoverHandler { cursorShape: Qt.PointingHandCursor }
+                                HoverBorder { anchors.fill: parent; active: insertDigitsButton.hovered }
+                            }
+                            Button {
+                                id: insertAnyButton
+                                text: qsTr("Any")
+                                implicitHeight: 22
+                                background: Rectangle {
+                                    radius: AppSettings.borderRadius
+                                    color: "transparent"
+                                    border.width: 1
+                                    border.color: "#3a3a3a"
+                                }
+                                hoverEnabled: true
+                                focusPolicy: Qt.NoFocus
+                                onClicked: ruleCard.insertPatternToken(".*?", 3)
+                                HoverHandler { cursorShape: Qt.PointingHandCursor }
+                                HoverBorder { anchors.fill: parent; active: insertAnyButton.hovered }
+                            }
+                            Button {
+                                id: insertGroupButton
+                                text: qsTr("Group")
+                                implicitHeight: 22
+                                background: Rectangle {
+                                    radius: AppSettings.borderRadius
+                                    color: "transparent"
+                                    border.width: 1
+                                    border.color: "#3a3a3a"
+                                }
+                                hoverEnabled: true
+                                focusPolicy: Qt.NoFocus
+                                onClicked: ruleCard.insertPatternToken("()", 1)
+                                HoverHandler { cursorShape: Qt.PointingHandCursor }
+                                HoverBorder { anchors.fill: parent; active: insertGroupButton.hovered }
+                            }
+                            Button {
+                                id: insertEitherOrButton
+                                text: qsTr("Either/Or")
+                                implicitHeight: 22
+                                background: Rectangle {
+                                    radius: AppSettings.borderRadius
+                                    color: "transparent"
+                                    border.width: 1
+                                    border.color: "#3a3a3a"
+                                }
+                                hoverEnabled: true
+                                focusPolicy: Qt.NoFocus
+                                onClicked: ruleCard.insertPatternToken("(?:|)", 3)
+                                HoverHandler { cursorShape: Qt.PointingHandCursor }
+                                HoverBorder { anchors.fill: parent; active: insertEitherOrButton.hovered }
+                            }
+                            Button {
+                                id: insertStartButton
+                                text: qsTr("Start")
+                                implicitHeight: 22
+                                background: Rectangle {
+                                    radius: AppSettings.borderRadius
+                                    color: "transparent"
+                                    border.width: 1
+                                    border.color: "#3a3a3a"
+                                }
+                                hoverEnabled: true
+                                focusPolicy: Qt.NoFocus
+                                onClicked: ruleCard.insertPatternToken("^", 1)
+                                HoverHandler { cursorShape: Qt.PointingHandCursor }
+                                HoverBorder { anchors.fill: parent; active: insertStartButton.hovered }
+                            }
+                            Button {
+                                id: insertEndButton
+                                text: qsTr("End")
+                                implicitHeight: 22
+                                background: Rectangle {
+                                    radius: AppSettings.borderRadius
+                                    color: "transparent"
+                                    border.width: 1
+                                    border.color: "#3a3a3a"
+                                }
+                                hoverEnabled: true
+                                focusPolicy: Qt.NoFocus
+                                onClicked: ruleCard.insertPatternToken("$", 1)
+                                HoverHandler { cursorShape: Qt.PointingHandCursor }
+                                HoverBorder { anchors.fill: parent; active: insertEndButton.hovered }
+                            }
+                        }
+
+                        // Ungrouped-alternation footgun warning — the single
+                        // highest-value guard here: `|` is the lowest-
+                        // precedence regex operator, so an ungrouped one
+                        // silently splits the WHOLE pattern into unrelated
+                        // top-level alternatives instead of choosing between
+                        // two local tokens. Only shown once the pattern is
+                        // otherwise syntactically valid (an invalid pattern
+                        // already gets its own error above).
+                        Text {
+                            Layout.fillWidth: true
+                            wrapMode: Text.Wrap
+                            font.pixelSize: 11
+                            color: "#e8a33d"
+                            visible: rulePatternField.text.length > 0
+                                     && patternValidityLabel.validationError.length === 0
+                                     && settingsPopup.hasUngroupedAlternation(rulePatternField.text)
+                            text: qsTr("This \"|\" isn't inside its own group, so it may match far more "
+                                       + "than intended — e.g. \"^a_|b$\" really means \"start with a_\" OR "
+                                       + "\"contains b$\" as two totally separate patterns, not \"a_ followed "
+                                       + "by either b\". Wrap the alternatives: (?:a|b).")
+                        }
+
+                        // Rule-list-level overlap warning — non-blocking (see
+                        // computeRuleOverlaps()'s doc comment: general regex
+                        // disjointness is undecidable, this only catches
+                        // identical-pattern-text and files that empirically
+                        // match more than one enabled rule right now).
+                        Text {
+                            Layout.fillWidth: true
+                            wrapMode: Text.Wrap
+                            font.pixelSize: 11
+                            color: "#e8a33d"
+                            property var overlaps: settingsPopup.combineOverlapWarnings[ruleCard.modelData.name] || []
+                            visible: overlaps.length > 0
+                            text: {
+                                if (overlaps.length === 0)
+                                    return ""
+                                const withFile = overlaps.filter(function (o) { return o.file.length > 0 })
+                                const identical = overlaps.filter(function (o) { return o.file.length === 0 })
+                                const parts = []
+                                if (identical.length > 0)
+                                    parts.push(qsTr("Same pattern as: %1").arg(
+                                            identical.map(function (o) { return o.other }).join(", ")))
+                                if (withFile.length > 0) {
+                                    const shown = withFile.slice(0, 3).map(function (o) {
+                                        return o.other + " (" + o.file + ")"
+                                    }).join(", ")
+                                    const extra = withFile.length > 3 ? qsTr(" +%1 more").arg(withFile.length - 3) : ""
+                                    parts.push(qsTr("Also matches the same file(s) as: %1%2").arg(shown).arg(extra))
+                                }
+                                return "⚠ " + parts.join(" ")
+                            }
+                        }
+
+                        // Differentiator buttons: one per non-exact-match
+                        // ("special") run of the pattern as currently typed
+                        // (see findDifferentiatorRuns()'s doc comment above).
+                        // Clicking toggles that run between a plain/
+                        // non-capturing match (still required for the file
+                        // to be recognized as part of a sequential group,
+                        // but doesn't affect WHICH group) and a real
+                        // capturing group (its captured text must be
+                        // identical across files for them to combine — see
+                        // matchRuleCapturedKey() in
+                        // TranscriptionController.cpp). Direct-commit click
+                        // handler (see ruleCard.toggleDifferentiator()'s doc
+                        // comment) — no focusPolicy: Qt.NoFocus needed here,
+                        // unlike the insert-token toolbar below.
+                        Flow {
+                            Layout.fillWidth: true
+                            spacing: 4
+                            visible: ruleCard.differentiatorRuns.length > 0
+
+                            Repeater {
+                                model: ruleCard.differentiatorRuns
+                                delegate: Button {
+                                    id: differentiatorButton
+                                    required property var modelData
+                                    readonly property bool blocked: !modelData.isDifferentiator
+                                            && modelData.offendingFiles.length > 0
+                                    // The third state of the OFF -> GROUPING ->
+                                    // SORT -> OFF cycle (see toggleDifferentiator()'s
+                                    // doc comment) — this run currently orders its
+                                    // group's files instead of identifying the
+                                    // group, so it deliberately does NOT get a
+                                    // differentiatorColor() (that palette means
+                                    // "same color = same group," which no longer
+                                    // applies once a run stops contributing to the
+                                    // key).
+                                    // Occurrence, not just text, must match —
+                                    // two runs can share identical text (e.g.
+                                    // two "(\d+)" groups), and only ONE of
+                                    // them is really the sort field.
+                                    readonly property bool isSortRun: ruleCard.modelData.sortGroupText === modelData.text
+                                            && (ruleCard.modelData.sortGroupOccurrence || 0) === modelData.occurrence
+                                    // The button's own highlight uses the SAME
+                                    // per-group color classifyFilenameHtml() paints
+                                    // that differentiator's text with in the preview
+                                    // below — pairs each color to the regex snippet
+                                    // that produced it (see differentiatorPalette's
+                                    // doc comment: this pairing is the accessibility
+                                    // mitigation for the palette's CVD floor-band
+                                    // warning, not just a nice-to-have). Qt.darker()/
+                                    // Qt.lighter() derive the fill/hover states from
+                                    // that one base color — the only place this file
+                                    // computes color variants instead of hand-picking
+                                    // hex per state, because 8 palette slots x 3
+                                    // states each isn't worth hand-tuning.
+                                    readonly property color baseColor: differentiatorButton.isSortRun
+                                            ? "#888888" : settingsPopup.differentiatorColor(modelData.groupIndex)
+                                    text: (differentiatorButton.isSortRun ? "⇅ " : (modelData.isDifferentiator ? "✓ " : "")) + modelData.text
+                                    implicitHeight: 22
+                                    enabled: !blocked
+                                    background: Rectangle {
+                                        radius: AppSettings.borderRadius
+                                        color: differentiatorButton.modelData.isDifferentiator
+                                                ? Qt.darker(differentiatorButton.baseColor, differentiatorButton.hovered ? 1.7 : 2.4)
+                                                : (differentiatorButton.hovered && !differentiatorButton.blocked
+                                                   ? "#3a3a3a" : "#2a2a2a")
+                                        border.width: 1
+                                        border.color: differentiatorButton.modelData.isDifferentiator
+                                                ? differentiatorButton.baseColor : "#3a3a3a"
+                                        opacity: differentiatorButton.blocked ? 0.5 : 1
+                                    }
+                                    font.family: "monospace"
+                                    font.pixelSize: 11
+                                    hoverEnabled: true
+                                    onClicked: ruleCard.toggleDifferentiator(modelData)
+                                    HoverHandler {
+                                        id: differentiatorHover
+                                        cursorShape: differentiatorButton.blocked ? Qt.ArrowCursor : Qt.PointingHandCursor
+                                    }
+                                    HoverBorder { anchors.fill: parent; active: differentiatorHover.hovered && !differentiatorButton.blocked }
+                                    ToolTip.visible: differentiatorHover.hovered
+                                    ToolTip.text: {
+                                        if (differentiatorButton.blocked) {
+                                            const shown = modelData.offendingFiles.slice(0, 3).join(", ")
+                                            const extra = modelData.offendingFiles.length > 3
+                                                    ? qsTr(" (+%1 more)").arg(modelData.offendingFiles.length - 3) : ""
+                                            return qsTr("Can't make this a differentiator — it doesn't appear in "
+                                                        + "some matching files at all: %1%2").arg(shown).arg(extra)
+                                        }
+                                        if (modelData.isDifferentiator && modelData.offendingFiles.length > 0) {
+                                            const shown = modelData.offendingFiles.slice(0, 3).join(", ")
+                                            return qsTr("Warning: doesn't appear in some matching files: %1").arg(shown)
+                                        }
+                                        if (differentiatorButton.isSortRun)
+                                            return qsTr("Sorts combined files by this value (numeric if every "
+                                                        + "matched file has a numeric one here, otherwise "
+                                                        + "alphabetical) instead of grouping by it. Click to turn off.")
+                                        if (modelData.isDifferentiator)
+                                            return qsTr("Differentiator — must match identically for files to "
+                                                        + "combine. Click to sort combined files by this instead.")
+                                        return qsTr("Click to make this a differentiator")
+                                    }
+                                }
+                            }
+                        }
+
+                        // Non-blocking warning for an already-ON
+                        // differentiator that doesn't participate in every
+                        // currently-matched file — can't block a click that
+                        // already happened / a rule that's already saved,
+                        // so this is advisory only (see
+                        // updateDifferentiatorRuns()'s doc comment).
+                        Text {
+                            Layout.fillWidth: true
+                            wrapMode: Text.Wrap
+                            font.pixelSize: 11
+                            color: "#e8a33d"
+                            property var brokenOnRuns: ruleCard.differentiatorRuns.filter(function (r) {
+                                return r.isDifferentiator && r.offendingFiles.length > 0
+                            })
+                            visible: brokenOnRuns.length > 0
+                            text: brokenOnRuns.length > 0
+                                    ? qsTr("⚠ Differentiator \"%1\" doesn't appear in some matching files: %2")
+                                          .arg(brokenOnRuns[0].text)
+                                          .arg(brokenOnRuns[0].offendingFiles.slice(0, 3).join(", "))
+                                    : ""
+                        }
+
                         // Live syntax-highlight readout — reflects every
                         // keystroke in rulePatternField directly (not the
                         // committed modelData.pattern), same "see it as you
@@ -2345,46 +3504,19 @@ Popup {
                             visible: rulePatternField.text.length > 0
                         }
 
-                        RowLayout {
-                            Layout.fillWidth: true
-                            Button {
-                                id: testRuleButton
-                                text: qsTr("Test this rule")
-                                implicitHeight: 22
-                                enabled: rulePatternField.text.length > 0 && settingsPopup.vaultTreeModel
-                                         && settingsPopup.transcriptionController
-                                background: Rectangle {
-                                    radius: AppSettings.borderRadius
-                                    color: "transparent"
-                                    border.width: 1
-                                    border.color: "#3a3a3a"
-                                }
-                                opacity: enabled ? 1 : 0.35
-                                hoverEnabled: enabled
-                                onClicked: {
-                                    const testRule = {name: ruleCard.modelData.name || qsTr("(unnamed)"),
-                                                       pattern: rulePatternField.text, enabled: true}
-                                    ruleCard.previewGroups = settingsPopup.transcriptionController.detectCombineGroups(
-                                                [testRule], settingsPopup.vaultTreeModel.allAudioPaths())
-                                    ruleCard.previewRun = true
-                                }
-                                HoverHandler { cursorShape: Qt.PointingHandCursor; enabled: testRuleButton.enabled }
-                                HoverBorder { anchors.fill: parent; active: testRuleButton.enabled && testRuleButton.hovered }
-                            }
-                            Label {
-                                visible: ruleCard.previewRun && ruleCard.previewGroups.length === 0
-                                text: qsTr("No files in this vault match.")
-                                color: "#888888"
-                                font.pixelSize: 11
-                            }
+                        Label {
+                            visible: ruleCard.previewRun && ruleCard.previewGroups.length === 0
+                            text: qsTr("No files in this vault match.")
+                            color: "#888888"
+                            font.pixelSize: 11
                         }
 
                         // Preview cards: one per detected group, showing the
                         // combine order and what would happen — this is the
-                        // SAME detectCombineGroups() the automatic scan and
-                        // the per-job safety-net redirect both use, so
-                        // what's shown here is exactly what would really
-                        // happen, not a separate simulation.
+                        // SAME detectCombineGroups() the ribbon "combine"
+                        // button and the per-job safety-net redirect both
+                        // use, so what's shown here is exactly what would
+                        // really happen, not a separate simulation.
                         Repeater {
                             model: ruleCard.previewRun ? ruleCard.previewGroups : []
                             delegate: Rectangle {
@@ -2402,9 +3534,41 @@ Popup {
                                     anchors.fill: parent
                                     anchors.margins: 6
                                     spacing: 2
-                                    Label {
+                                    // Header: exactly which differentiator
+                                    // values grouped these files together —
+                                    // color-matched to the differentiator
+                                    // toggle buttons and the per-filename
+                                    // highlighting below, so "same color
+                                    // here as up there" tells you why these
+                                    // files landed in the same group without
+                                    // reading regex.
+                                    TextEdit {
                                         Layout.fillWidth: true
                                         wrapMode: Text.WordWrap
+                                        readOnly: true
+                                        selectByMouse: true
+                                        selectionColor: Qt.rgba(0.35, 0.55, 0.85, 0.5)
+                                        color: "#888888"
+                                        font.pixelSize: 10
+                                        font.bold: true
+                                        textFormat: Text.RichText
+                                        text: {
+                                            const values = previewCard.modelData.capturedValues || []
+                                            if (values.length === 0)
+                                                return qsTr("No differentiators — this rule groups every matching file together")
+                                            return qsTr("Differentiators: ") + values.map(function (v, i) {
+                                                const shown = v.length > 0 ? settingsPopup.escapeRegexPreviewHtml(v) : qsTr("(empty)")
+                                                return "<span style=\"color:" + settingsPopup.differentiatorColor(i + 1) + ";\">"
+                                                        + shown + "</span>"
+                                            }).join(", ")
+                                        }
+                                    }
+                                    TextEdit {
+                                        Layout.fillWidth: true
+                                        wrapMode: Text.WordWrap
+                                        readOnly: true
+                                        selectByMouse: true
+                                        selectionColor: Qt.rgba(0.35, 0.55, 0.85, 0.5)
                                         color: "#dddddd"
                                         font.pixelSize: 11
                                         text: {
@@ -2418,20 +3582,28 @@ Popup {
                                             }
                                         }
                                     }
-                                    Label {
+                                    TextEdit {
                                         Layout.fillWidth: true
                                         wrapMode: Text.WordWrap
                                         visible: previewCard.modelData.files.length > 0
+                                        readOnly: true
+                                        selectByMouse: true
+                                        selectionColor: Qt.rgba(0.35, 0.55, 0.85, 0.5)
                                         color: "#888888"
                                         font.pixelSize: 10
+                                        textFormat: Text.RichText
                                         text: previewCard.modelData.files.map(function (f, i) {
-                                            return (i + 1) + ". " + f.substring(f.lastIndexOf("/") + 1)
-                                        }).join(" → ")
+                                            const name = f.substring(f.lastIndexOf("/") + 1)
+                                            return (i + 1) + ". " + settingsPopup.classifyFilenameHtml(rulePatternField.text, name)
+                                        }).join("<br>")
                                     }
-                                    Label {
+                                    TextEdit {
                                         Layout.fillWidth: true
                                         wrapMode: Text.WordWrap
                                         visible: previewCard.modelData.status === "ready"
+                                        readOnly: true
+                                        selectByMouse: true
+                                        selectionColor: Qt.rgba(0.35, 0.55, 0.85, 0.5)
                                         color: "#888888"
                                         font.pixelSize: 10
                                         text: qsTr("Output: %1").arg(
@@ -2462,5 +3634,149 @@ Popup {
                 }
             }
         }
+    }
+
+    // Chrome/Firefox-style middle-click autoscroll for the Settings
+    // ScrollView — same two-gesture pattern (quick click arms free-scroll;
+    // press-drag-release disarms on release) as MainPanel's transcript-view
+    // and Sidebar's file-tree middleDragScrollArea. Lives as a sibling
+    // overlay of scrollArea (not inside it) so it isn't counted as the
+    // ScrollView's own content; anchors match scrollArea's own margins so
+    // it only covers the actual visible scroll region, not the popup's
+    // title bar / rule-editor buttons that sit outside it.
+    //
+    // NOT a MouseArea, and NOT z-toggled — both were tried and both broke
+    // something real, confirmed empirically each time (offscreen QTest):
+    //   1. A statically-topmost MouseArea (the first version) reliably
+    //      caught the click but stole the cursor from every hoverable
+    //      button/slider underneath, even fully idle — Qt Quick's cursor
+    //      resolution is pure top-down paint-order for the topmost HIT
+    //      item, independent of hoverEnabled/acceptedButtons, and MouseArea
+    //      always implicitly claims a cursor (default ArrowCursor) merely
+    //      by being the topmost hit item, regardless of its own config.
+    //   2. Toggling MouseArea's z below (-1) while idle (the second
+    //      version, matching Sidebar's TreeView-based fix) fixed the cursor
+    //      but broke the click itself: unlike a bare Flickable (which only
+    //      claims LeftButton by default and lets MiddleButton fall
+    //      through), QQC2's ScrollView/T.ScrollView Control claims ALL
+    //      mouse-button presses within its bounds at the outer Control
+    //      level before any per-button filtering, so a lower-z sibling
+    //      never sees a middle-click over it at all. Sidebar's tree isn't
+    //      wrapped in a Control the same way, which is why that fix never
+    //      needed to contend with this.
+    // The actual fix: a plain Item (not MouseArea) has NO implicit cursor
+    // at all, so it can sit PERMANENTLY topmost without poisoning cursor
+    // resolution for anything underneath, AS LONG AS it never itself binds
+    // an ENABLED cursor-setting handler while idle (confirmed empirically:
+    // a disabled HoverHandler{cursorShape:...} — enabled only once armed —
+    // doesn't count either). A permanently-topmost TapHandler reliably
+    // catches the middle-button press through ScrollView's swallow (a
+    // TapHandler participates in per-button hit-testing the same way
+    // MouseArea's fallthrough does, but being an Item-not-MouseArea it
+    // doesn't drag the implicit-cursor baggage along). gesturePolicy:
+    // DragWithinBounds (not the default DragThreshold) matters too: the
+    // default cancels TapHandler's own grab — and stops delivering ANY
+    // further events to anyone, including the real release — the instant
+    // the drag exceeds the platform threshold, which is far too early for
+    // gesture 2's long hold-drag; DragWithinBounds only cancels if the
+    // pointer leaves this Item's bounds, which for a full-viewport overlay
+    // essentially never happens mid-gesture.
+    Item {
+        id: middleDragScrollArea
+        anchors.fill: parent
+        anchors.leftMargin: 16
+        anchors.topMargin: 16
+        anchors.bottomMargin: 16
+        anchors.rightMargin: 2
+        z: 1
+
+        property bool armed: false
+        property real originY: 0
+        property real currentY: 0
+        property bool draggedWhileHeld: false
+        readonly property int deadzone: 8
+
+        // Drives arming (both gestures start here) and gesture 2's
+        // continued tracking while the button stays held — point.position
+        // updates live during the whole held drag under DragWithinBounds,
+        // unlike the default gesturePolicy which would stop updating (and
+        // stop being told about the eventual release) as soon as the drag
+        // threshold is crossed.
+        TapHandler {
+            id: middleDragTap
+            acceptedButtons: middleDragScrollArea.armed
+                             ? (Qt.LeftButton | Qt.MiddleButton | Qt.RightButton)
+                             : Qt.MiddleButton
+            gesturePolicy: TapHandler.DragWithinBounds
+            onPressedChanged: {
+                if (middleDragTap.pressed) {
+                    // Any click while already armed cancels it (Chrome
+                    // convention) instead of performing that button's
+                    // normal action — acceptedButtons above ensures this
+                    // branch is only reachable for non-middle buttons once
+                    // armed.
+                    if (middleDragScrollArea.armed) {
+                        middleDragScrollArea.armed = false
+                        return
+                    }
+                    middleDragScrollArea.draggedWhileHeld = false
+                    middleDragScrollArea.armed = true
+                    middleDragScrollArea.originY = middleDragTap.point.position.y
+                    middleDragScrollArea.currentY = middleDragTap.point.position.y
+                } else if (middleDragScrollArea.draggedWhileHeld) {
+                    middleDragScrollArea.armed = false
+                    // else: real click, no drag — gesture 1 keeps running.
+                }
+            }
+            onPointChanged: {
+                if (!middleDragTap.pressed)
+                    return
+                middleDragScrollArea.currentY = middleDragTap.point.position.y
+                if (!middleDragScrollArea.draggedWhileHeld
+                        && Math.abs(middleDragScrollArea.currentY - middleDragScrollArea.originY) > middleDragScrollArea.deadzone) {
+                    middleDragScrollArea.draggedWhileHeld = true
+                }
+            }
+        }
+
+        // Drives gesture 1's free-scroll (no button held) and the visible
+        // cursor — enabled only while armed, so it never contributes a
+        // cursor (and never blocks hover-event delivery to covered
+        // buttons) while idle.
+        HoverHandler {
+            id: middleDragHover
+            enabled: middleDragScrollArea.armed
+            cursorShape: {
+                const dy = Math.abs(middleDragScrollArea.currentY - middleDragScrollArea.originY)
+                return dy <= middleDragScrollArea.deadzone ? Qt.SizeAllCursor : Qt.SizeVerCursor
+            }
+            onPointChanged: {
+                if (middleDragScrollArea.armed && !middleDragTap.pressed)
+                    middleDragScrollArea.currentY = middleDragHover.point.position.y
+            }
+        }
+
+        Timer {
+            interval: 16
+            repeat: true
+            running: middleDragScrollArea.armed
+            onTriggered: {
+                const flick = scrollArea.contentItem
+                const dy = middleDragScrollArea.currentY - middleDragScrollArea.originY
+                const deadzone = middleDragScrollArea.deadzone
+                if (Math.abs(dy) <= deadzone)
+                    return
+                const beyond = dy - Math.sign(dy) * deadzone
+                const speed = Math.sign(beyond) * beyond * beyond * 0.002
+                const maxY = Math.max(0, flick.contentHeight - flick.height)
+                flick.contentY = Math.max(0, Math.min(maxY, flick.contentY + speed))
+            }
+        }
+    }
+
+    Shortcut {
+        sequence: "Escape"
+        enabled: middleDragScrollArea.armed
+        onActivated: middleDragScrollArea.armed = false
     }
 }

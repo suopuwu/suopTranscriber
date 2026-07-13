@@ -1,9 +1,12 @@
-// Spec under test — split-recording auto-combine (see DESIGN.md's vault
+// Spec under test — split-recording combine (see DESIGN.md's vault
 // layout section and TranscriptionController::findCombineGroups()'s doc
 // comment): user-authored regex rules matched against vault filenames,
 // grouped by their CAPTURED text (not just "the rule matched"), ordered by
-// mtime, with the merged output filename derived from (ruleName, key) alone
-// so it's re-derivable even after the original parts are gone.
+// mtime by default — or by one designated, numeric-aware "sort
+// differentiator" capture group instead, which is then EXCLUDED from the
+// grouping key (it can't be both) — with the merged output filename derived
+// from (ruleName, key) alone so it's re-derivable even after the original
+// parts are gone.
 //
 // detectCombineGroups() is pure over its (rules, audioPaths) inputs (only
 // touches disk via QFileInfo stats on the paths given), so these tests never
@@ -20,12 +23,13 @@
 
 namespace {
 
-QVariantMap rule(const QString &name, const QString &pattern, bool enabled = true)
+QVariantMap rule(const QString &name, const QString &pattern, bool enabled = true, int sortGroupIndex = -1)
 {
     QVariantMap m;
     m["name"] = name;
     m["pattern"] = pattern;
     m["enabled"] = enabled;
+    m["sortGroupIndex"] = sortGroupIndex;
     return m;
 }
 
@@ -93,6 +97,88 @@ private slots:
         QVERIFY(group.value("outputPath").toString().endsWith(QStringLiteral(".combined.wav")));
     }
 
+    // sortGroupIndex names a SECOND capture group as the sort differentiator
+    // instead of a grouping one — group.key must then contain ONLY the
+    // device id (group 1), not the part number (group 2), proving the sort
+    // group is excluded from the grouping key. Order must come from the
+    // NUMERIC part number ("1" < "2" < "10"), not mtime — the files are
+    // touched in the OPPOSITE order (oldest = part 10, newest = part 1) so
+    // an mtime-ordered result would be provably wrong here.
+    void sortDifferentiator_numericOverridesMtimeOrder()
+    {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        const QString p10 = touchFile(dir.path(), "TX02_PART10.wav", 60);
+        const QString p2 = touchFile(dir.path(), "TX02_PART2.wav", 40);
+        const QString p1 = touchFile(dir.path(), "TX02_PART1.wav", 20);
+
+        TranscriptionController controller;
+        const QVariantList rules = {
+            rule("numbered parts", "^(TX\\d{2})_PART(\\d+)\\.wav$", /*enabled=*/true, /*sortGroupIndex=*/2)};
+        const QVariantList groups = controller.detectCombineGroups(rules, {p10, p2, p1});
+
+        const QVariantMap group = findGroup(groups, "numbered parts");
+        QCOMPARE(group.value("key").toString(), QStringLiteral("TX02"));
+        QCOMPARE(group.value("status").toString(), QStringLiteral("ready"));
+        QCOMPARE(group.value("files").toStringList(), QStringList({p1, p2, p10}));
+    }
+
+    // When the sort differentiator's captured values aren't ALL numeric
+    // (here "10" parses but "a"/"b" don't), the WHOLE group falls back to
+    // plain string comparison rather than a mixed numeric/lexicographic
+    // comparator (which wouldn't be a strict weak ordering). Files are
+    // touched in string-sorted order reversed, so an mtime-ordered result
+    // would again be provably wrong.
+    void sortDifferentiator_fallsBackToStringWhenNotAllNumeric()
+    {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        const QString pb = touchFile(dir.path(), "TX02_TAKEb.wav", 60);
+        const QString pa = touchFile(dir.path(), "TX02_TAKEa.wav", 40);
+        const QString p10 = touchFile(dir.path(), "TX02_TAKE10.wav", 20);
+
+        TranscriptionController controller;
+        const QVariantList rules = {
+            rule("string takes", "^(TX\\d{2})_TAKE(\\w+)\\.wav$", /*enabled=*/true, /*sortGroupIndex=*/2)};
+        const QVariantList groups = controller.detectCombineGroups(rules, {pb, pa, p10});
+
+        const QVariantMap group = findGroup(groups, "string takes");
+        QCOMPARE(group.value("files").toStringList(), QStringList({p10, pa, pb}));
+    }
+
+    // Both capture groups here are written with the IDENTICAL sub-pattern
+    // "(\d+)" — sortGroupIndex=2 must still pick out group 2 specifically
+    // (by POSITION, the way QRegularExpression itself numbers captures —
+    // entirely unaffected by whether two groups happen to look the same in
+    // the pattern text), not group 1. Group 1's captured value ("9") is
+    // constant across every file, so this also proves grouping itself
+    // still works via group 1 while group 2 is excluded from the key. If
+    // the exclusion/sort logic somehow mixed up which group is which, the
+    // resulting order would not match the group-2-ascending order asserted
+    // here.
+    void sortDifferentiator_duplicatePatternTextStillPicksCorrectGroupByPosition()
+    {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        // mtime order (oldest->newest): 9_20, 9_5, 9_10 — deliberately NOT
+        // the same as the expected group-2-ascending order below, so an
+        // accidental mtime fallback would also fail this test.
+        const QString p20 = touchFile(dir.path(), "9_20.wav", 60);
+        const QString p5 = touchFile(dir.path(), "9_5.wav", 40);
+        const QString p10 = touchFile(dir.path(), "9_10.wav", 20);
+
+        TranscriptionController controller;
+        const QVariantList rules = {rule("duplicate groups", "^(\\d+)_(\\d+)\\.wav$", /*enabled=*/true,
+                                          /*sortGroupIndex=*/2)};
+        const QVariantList groups = controller.detectCombineGroups(rules, {p20, p5, p10});
+
+        const QVariantMap group = findGroup(groups, "duplicate groups");
+        QCOMPARE(group.value("key").toString(), QStringLiteral("9"));
+        QCOMPARE(group.value("status").toString(), QStringLiteral("ready"));
+        // group 2 (the part after "_") ascending: 5, 10, 20
+        QCOMPARE(group.value("files").toStringList(), QStringList({p5, p10, p20}));
+    }
+
     // A rule with zero capture groups has no "real string" to distinguish
     // members by — every match shares one bucket, which is expected regex
     // behavior (per the design discussion), not a bug.
@@ -146,7 +232,7 @@ private slots:
 
     // A recorder may still be flushing the newest part — a group otherwise
     // "ready" but whose newest member was JUST modified reads as "pending",
-    // not "ready", so autoCombine() won't race a growing file.
+    // not "ready", so runCombineScan() won't race a growing file.
     void freshestMemberTooRecent_isPending()
     {
         QTemporaryDir dir;
@@ -202,6 +288,65 @@ private slots:
 
         const QVariantList invalidRules = {rule("broken", "(unterminated[")};
         QVERIFY(controller.detectCombineGroups(invalidRules, {p1, p2}).isEmpty());
+    }
+
+    // regexValidationError() backs the Settings pattern field's live validity
+    // indicator — it must validate against the exact same QRegularExpression
+    // engine findCombineGroups()/matchRuleCapturedKey() use, not QML/JS
+    // RegExp, so "valid" here really does mean "will match as expected"
+    // rather than merely "looked fine to a different regex dialect".
+    void regexValidationError_emptyValidAndInvalidPatterns()
+    {
+        TranscriptionController controller;
+        QCOMPARE(controller.regexValidationError(QString()), QString());
+        QCOMPARE(controller.regexValidationError(QStringLiteral("^(TX\\d{2})_.*\\.wav$")), QString());
+        QVERIFY(!controller.regexValidationError(QStringLiteral("(unterminated[")).isEmpty());
+    }
+
+    // differentiatorNonParticipatingFiles() backs the Settings differentiator
+    // buttons' "block the toggle" check — a capturing group sitting in an
+    // alternation branch that isn't always taken doesn't reliably
+    // differentiate anything for files that took the OTHER branch, so those
+    // files must be reported (capturedStart() < 0 == didn't participate at
+    // all), distinct from a valid-but-empty capture.
+    void differentiatorNonParticipatingFiles_flagsUntakenAlternationBranch()
+    {
+        TranscriptionController controller;
+        // Group 1 only participates for "sometext", group 2 only for
+        // "othertext" — for either file, exactly one of the two groups never
+        // participated in the match at all.
+        const QString pattern = QStringLiteral("^(sometext)|(othertext)$");
+        const QStringList files = {QStringLiteral("sometext"), QStringLiteral("othertext")};
+
+        const QStringList group1Offenders = controller.differentiatorNonParticipatingFiles(pattern, 1, files);
+        QCOMPARE(group1Offenders, QStringList({QStringLiteral("othertext")}));
+
+        const QStringList group2Offenders = controller.differentiatorNonParticipatingFiles(pattern, 2, files);
+        QCOMPARE(group2Offenders, QStringList({QStringLiteral("sometext")}));
+    }
+
+    // A zero-width capture (the group matched, just an empty string) is NOT
+    // "non-participating" — capturedStart() is a valid non-negative index
+    // even when the captured length is 0, only an untaken alternation branch
+    // produces -1.
+    void differentiatorNonParticipatingFiles_zeroWidthCaptureIsNotFlagged()
+    {
+        TranscriptionController controller;
+        const QString pattern = QStringLiteral("^prefix(\\d*)suffix$");
+        const QStringList files = {QStringLiteral("prefixsuffix"), QStringLiteral("prefix123suffix")};
+
+        QVERIFY(controller.differentiatorNonParticipatingFiles(pattern, 1, files).isEmpty());
+    }
+
+    // Invalid pattern, out-of-range group index, or a non-matching file must
+    // all be handled without crashing and without false positives.
+    void differentiatorNonParticipatingFiles_invalidInputsReturnEmpty()
+    {
+        TranscriptionController controller;
+        const QStringList files = {QStringLiteral("foo.wav")};
+        QVERIFY(controller.differentiatorNonParticipatingFiles(QStringLiteral("(unterminated["), 1, files).isEmpty());
+        QVERIFY(controller.differentiatorNonParticipatingFiles(QStringLiteral("^(\\d+)$"), 5, files).isEmpty());
+        QVERIFY(controller.differentiatorNonParticipatingFiles(QStringLiteral("^(\\d+)$"), 0, files).isEmpty());
     }
 };
 

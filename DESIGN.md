@@ -185,7 +185,8 @@ vault/
   preference. USB device allowlist and a model registry (below) are NOT part
   of this file yet — still not implemented.
 
-- **Transcribed indicator:** sibling `.md` exists → green; missing → yellow.
+- **Transcribed indicator:** sibling `.md` exists → green; missing → yellow;
+  orphaned `.md` (no sibling audio file) → blue.
   Watch with `QFileSystemWatcher` for live updates.
 - **No retranscription:** presence of `.md` means done.
 - **All transcription data lives in the single `.md` — no separate JSON
@@ -275,6 +276,6 @@ not blocking current feature development.
 
 ## Suggested first milestone
 
-Vault open + sidebar tree with green/yellow indicators + play a file with
+Vault open + sidebar tree with status indicators + play a file with
 `QMediaPlayer`. This exercises the file layout and audio backend before touching
 the engine protocol.

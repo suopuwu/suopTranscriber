@@ -83,9 +83,18 @@ QString formatTimestamp(double seconds)
 // before this change — accepted by the user as a one-time rename they'll
 // do themselves, in exchange for the stem-collision safety this buys going
 // forward. Do not revert without checking with the user first.
+// Self-referential for a path that's already a .md (an orphaned sidecar with
+// no matching audio) — mirrors VaultTreeModel::sidecarMdPath()'s isOrphanedMd
+// case. Without this, an orphaned .md's own path got ".md" appended AGAIN
+// (fi.fileName() keeps the existing ".md"), producing a nonexistent
+// "foo.wav.md.md" and silently empty readMetadata()/readTranscriptBody()
+// results — this is why orphaned entries fell back to showing their filename
+// instead of their stored label.
 QString sidecarPath(const QString &audioFilePath)
 {
     const QFileInfo fi(audioFilePath);
+    if (fi.suffix().compare(QStringLiteral("md"), Qt::CaseInsensitive) == 0)
+        return fi.absoluteFilePath();
     return fi.absolutePath() + "/" + fi.fileName() + ".md";
 }
 
@@ -936,16 +945,28 @@ QString sanitizeForFilename(const QString &raw)
 // growing/not-yet-closed file risks truncation or a corrupt merge.
 constexpr qint64 kCombineStabilityWindowSecs = 5;
 
-// One rule ({name, pattern, enabled} map) matched against a single filename
-// (not a full path — QFileInfo::fileName()), search semantics
-// (QRegularExpression, unanchored unless the pattern itself has ^/$). On a
-// match, returns the "real string" key: capture groups 1..N concatenated in
-// order (empty if the pattern has none) — see
+// One rule ({name, pattern, enabled, sortGroupIndex} map) matched against a
+// single filename (not a full path — QFileInfo::fileName()), search
+// semantics (QRegularExpression, unanchored unless the pattern itself has
+// ^/$). On a match, returns the "real string" key: capture groups 1..N
+// concatenated in order, EXCLUDING the rule's sort differentiator group if
+// it has one (empty key if the pattern has no OTHER capture groups) — see
 // TranscriptionController::findCombineGroups()'s doc comment for the full
 // semantics. Shared by findCombineGroups() (which tries every rule against
 // every candidate path) and maybeRedirectForCombine() (which only needs to
-// try every rule against ONE already-known filename).
-std::optional<QString> matchRuleCapturedKey(const QVariantMap &rule, const QString &fileName)
+// try every rule against ONE already-known filename). `capturedValuesOut`,
+// if given, is filled with the SAME (non-sort) capture groups
+// un-concatenated — only findCombineGroups() needs the individual values
+// (for the Settings preview header showing exactly which differentiator
+// values grouped these files); maybeRedirectForCombine() only ever needs the
+// flattened key. `sortValueOut`, if given, receives the sort differentiator
+// group's own captured text (untouched/nullopt if the rule has none
+// configured, or the configured index is out of range for this match) —
+// only findCombineGroups() uses this, to order a group's members by that
+// value instead of the mtime default.
+std::optional<QString> matchRuleCapturedKey(const QVariantMap &rule, const QString &fileName,
+                                             QStringList *capturedValuesOut = nullptr,
+                                             std::optional<QString> *sortValueOut = nullptr)
 {
     if (!rule.value(QStringLiteral("enabled"), true).toBool())
         return std::nullopt;
@@ -958,9 +979,19 @@ std::optional<QString> matchRuleCapturedKey(const QVariantMap &rule, const QStri
     const QRegularExpressionMatch m = re.match(fileName);
     if (!m.hasMatch())
         return std::nullopt;
+    const int sortGroupIndex = rule.value(QStringLiteral("sortGroupIndex"), -1).toInt();
     QString key;
-    for (int i = 1; i <= m.lastCapturedIndex(); ++i)
-        key += m.captured(i);
+    for (int i = 1; i <= m.lastCapturedIndex(); ++i) {
+        const QString captured = m.captured(i);
+        if (i == sortGroupIndex) {
+            if (sortValueOut)
+                *sortValueOut = captured;
+            continue; // the sort differentiator is explicitly NOT a grouping one
+        }
+        key += captured;
+        if (capturedValuesOut)
+            capturedValuesOut->append(captured);
+    }
     return key;
 }
 
@@ -1783,7 +1814,7 @@ public slots:
 
     // Split-recording combine (see
     // TranscriptionController::findCombineGroups()'s doc comment):
-    // concatenates sourcePaths (already mtime-ordered by the caller) into
+    // concatenates sourcePaths (already in combine order per the caller) into
     // outputPath via ffmpeg's concat demuxer with stream copy (lossless,
     // fast — these are same-format parts from the same recorder), then
     // moves (or deletes, per deleteOriginals) each source into a sibling
@@ -3038,6 +3069,28 @@ TranscriptionController::findCombineGroups(const QVariantList &rules, const QStr
         QString path;
         QString ruleName;
         QString key;
+        // Same capture groups as `key`, un-concatenated — every member of a
+        // group shares identical values here by construction (that's what
+        // makes them a group), so the group only needs one member's copy.
+        QStringList capturedValues;
+        // The rule's designated sort differentiator's captured text, if the
+        // rule has one AND it participated in this match — see the sort
+        // logic below for how this overrides the mtime default. A rule with
+        // no sort differentiator configured (the common case) leaves every
+        // candidate's sortValue empty (std::nullopt).
+        std::optional<QString> sortValue;
+        // Default combine-order signal, and always the stability-window
+        // signal below regardless of sort order: deliberately mtime, NOT
+        // file creation/birth time. Creation time would seem more semantically
+        // "correct" (it's when the recorder started this part), but it
+        // doesn't survive a plain file copy on Linux — cp/rsync/a
+        // cross-filesystem mv all stamp a fresh birth time on the
+        // destination, while mtime is preserved by every standard copy tool.
+        // Since this app doesn't control (and shouldn't assume anything
+        // about) how audio lands in the vault — direct recording onto a
+        // mounted vault path vs. copied off an SD card vs. synced some other
+        // way — mtime is the only signal that's reliably correct across all
+        // of them.
         QDateTime mtime;
     };
 
@@ -3047,8 +3100,10 @@ TranscriptionController::findCombineGroups(const QVariantList &rules, const QStr
         const QString ruleName = rule.value(QStringLiteral("name")).toString();
         for (const QString &path : audioPaths) {
             const QFileInfo info(path);
-            if (const auto key = matchRuleCapturedKey(rule, info.fileName()))
-                candidates.append(Candidate{path, ruleName, *key, info.lastModified()});
+            QStringList capturedValues;
+            std::optional<QString> sortValue;
+            if (const auto key = matchRuleCapturedKey(rule, info.fileName(), &capturedValues, &sortValue))
+                candidates.append(Candidate{path, ruleName, *key, capturedValues, sortValue, info.lastModified()});
         }
     }
 
@@ -3060,12 +3115,41 @@ TranscriptionController::findCombineGroups(const QVariantList &rules, const QStr
     QList<CombineGroup> groups;
     for (auto it = buckets.constBegin(); it != buckets.constEnd(); ++it) {
         QList<Candidate> members = it.value();
-        std::sort(members.begin(), members.end(),
-                  [](const Candidate &a, const Candidate &b) { return a.mtime < b.mtime; });
+
+        // Combine order: the rule's sort differentiator (numeric-aware if
+        // every member's captured value parses as a number, else plain
+        // string comparison), if configured and every member actually
+        // captured a value for it; otherwise mtime ascending (see
+        // Candidate::mtime's doc comment for why mtime, not creation time).
+        // "Numeric" is decided once for the whole group, not per pair — a
+        // comparator that's numeric for some pairs and lexicographic for
+        // others isn't a strict weak ordering, which is undefined behavior
+        // for std::sort.
+        const bool allHaveSortValue = std::all_of(members.begin(), members.end(),
+                                                   [](const Candidate &c) { return c.sortValue.has_value(); });
+        if (allHaveSortValue) {
+            const bool allNumeric = std::all_of(members.begin(), members.end(), [](const Candidate &c) {
+                bool ok = false;
+                c.sortValue->toDouble(&ok);
+                return ok;
+            });
+            if (allNumeric) {
+                std::sort(members.begin(), members.end(), [](const Candidate &a, const Candidate &b) {
+                    return a.sortValue->toDouble() < b.sortValue->toDouble();
+                });
+            } else {
+                std::sort(members.begin(), members.end(),
+                          [](const Candidate &a, const Candidate &b) { return *a.sortValue < *b.sortValue; });
+            }
+        } else {
+            std::sort(members.begin(), members.end(),
+                      [](const Candidate &a, const Candidate &b) { return a.mtime < b.mtime; });
+        }
 
         CombineGroup group;
         group.ruleName = it.key().first;
         group.key = it.key().second;
+        group.capturedValues = members.first().capturedValues;
         for (const Candidate &c : members)
             group.files << c.path;
 
@@ -3085,9 +3169,16 @@ TranscriptionController::findCombineGroups(const QVariantList &rules, const QStr
                     break;
                 }
             }
+            // Independent of whatever order `members` ended up sorted into
+            // above (recording-order sort ≠ mtime order once a sort
+            // differentiator is configured) — this check is genuinely about
+            // "is the recorder still actively writing the newest part," so
+            // it always needs the TRUE newest mtime, not just members.last().
+            const auto newest = std::max_element(members.begin(), members.end(),
+                                                  [](const Candidate &a, const Candidate &b) { return a.mtime < b.mtime; });
             if (anyTranscribed)
                 group.status = QStringLiteral("alreadyTranscribed");
-            else if (members.last().mtime.secsTo(now) < kCombineStabilityWindowSecs)
+            else if (newest->mtime.secsTo(now) < kCombineStabilityWindowSecs)
                 group.status = QStringLiteral("pending");
             else
                 group.status = QStringLiteral("ready");
@@ -3113,12 +3204,37 @@ QVariantList TranscriptionController::detectCombineGroups(const QVariantList &ru
         QVariantMap entry;
         entry[QStringLiteral("ruleName")] = group.ruleName;
         entry[QStringLiteral("key")] = group.key;
+        entry[QStringLiteral("capturedValues")] = group.capturedValues;
         entry[QStringLiteral("files")] = group.files;
         entry[QStringLiteral("outputPath")] = group.outputPath;
         entry[QStringLiteral("status")] = group.status;
         result << entry;
     }
     return result;
+}
+
+QString TranscriptionController::regexValidationError(const QString &pattern) const
+{
+    if (pattern.isEmpty())
+        return QString();
+    const QRegularExpression re(pattern);
+    return re.isValid() ? QString() : re.errorString();
+}
+
+QStringList TranscriptionController::differentiatorNonParticipatingFiles(const QString &pattern, int groupIndex,
+                                                                           const QStringList &audioPaths) const
+{
+    QStringList offending;
+    const QRegularExpression re(pattern);
+    if (!re.isValid() || groupIndex < 1 || groupIndex > re.captureCount())
+        return offending;
+    for (const QString &path : audioPaths) {
+        const QFileInfo info(path);
+        const QRegularExpressionMatch m = re.match(info.fileName());
+        if (m.hasMatch() && m.capturedStart(groupIndex) < 0)
+            offending << info.fileName();
+    }
+    return offending;
 }
 
 bool TranscriptionController::isCombineQueued(const QString &outputPath) const
@@ -3157,11 +3273,11 @@ bool TranscriptionController::maybeRedirectForCombine(int index)
 
     const QFileInfo info(job.fileUrl.toLocalFile());
 
-    // Outcome 1: a passive autoCombine() scan may already have merged this
-    // exact file's group (and moved the original fragment into .combined/)
-    // since this job was queued. The merged output's path is recomputable
-    // from this filename alone (see findCombineGroups()'s outputPath doc
-    // comment), so check for it directly.
+    // Outcome 1: an earlier manual runCombineScan() run may already have
+    // merged this exact file's group (and moved the original fragment into
+    // .combined/) since this job was queued. The merged output's path is
+    // recomputable from this filename alone (see findCombineGroups()'s
+    // outputPath doc comment), so check for it directly.
     for (const QVariant &ruleVar : m_combineRules) {
         const QVariantMap rule = ruleVar.toMap();
         const auto key = matchRuleCapturedKey(rule, info.fileName());
@@ -3175,7 +3291,7 @@ bool TranscriptionController::maybeRedirectForCombine(int index)
     }
 
     // Outcome 2: this file is a member of a currently-"ready" group per the
-    // last autoCombine() scan that hasn't been merged yet — insert the
+    // last runCombineScan() scan that hasn't been merged yet — insert the
     // combine job ahead of this one and redirect, same insert-ahead shape
     // maybeQueueDownloadJob() already uses for model downloads.
     const QString filePath = job.fileUrl.toLocalFile();
@@ -3202,8 +3318,8 @@ bool TranscriptionController::maybeRedirectForCombine(int index)
     return false;
 }
 
-void TranscriptionController::autoCombine(const QVariantList &rules, const QStringList &audioPaths,
-                                           const QUrl &vaultUrl, bool deleteOriginals)
+void TranscriptionController::runCombineScan(const QVariantList &rules, const QStringList &audioPaths,
+                                               const QUrl &vaultUrl, bool deleteOriginals)
 {
     // Cached for maybeRedirectForCombine()'s per-job safety check — see its
     // doc comment and the m_combineRules/m_combineAudioPaths field comments.

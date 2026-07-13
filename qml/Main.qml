@@ -178,21 +178,6 @@ ApplicationWindow {
             if (vaultModel.vaultPath.toString() !== "")
                 transcriptionController.loadPersistedQueue(vaultModel.vaultPath)
         }
-        // Split-recording auto-combine (see TranscriptionController::
-        // findCombineGroups()'s doc comment): modelReset fires from every
-        // VaultTreeModel::rebuild() — both the very first one (via
-        // onVaultPathChanged -> setVaultPath -> rebuild(), which runs AFTER
-        // the loadFromVault() above, so AppSettings.combineRules is already
-        // current for a freshly-opened vault) and every later
-        // QFileSystemWatcher-triggered rescan (a recorder dropping in a new
-        // part) — so this single hook covers "check at startup and at every
-        // file addition" without a second bespoke signal.
-        function onModelReset() {
-            if (vaultModel.vaultPath.toString() === "")
-                return
-            transcriptionController.autoCombine(AppSettings.combineRules, vaultModel.allAudioPaths(),
-                                                 vaultModel.vaultPath, AppSettings.deleteOriginalsAfterCombine)
-        }
     }
 
     Component.onCompleted: {
