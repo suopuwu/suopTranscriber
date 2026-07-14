@@ -30,6 +30,7 @@ public:
         IsOrphanedMdRole,
         LabelRole,
         TagsRole,
+        SpeakersRole,
         TranscriptBodyRole,
     };
     Q_ENUM(Roles)
@@ -134,6 +135,15 @@ public:
     // int), isAudio, isOrphanedMd, transcriptBody (raw body, or "" if
     // includeTranscriptions is false or the file isn't transcribed).
     Q_INVOKABLE QVariantList searchResults(const QString &query, bool includeTranscriptions) const;
+
+    // Recording feature: validates a user-chosen (or about-to-be-created)
+    // output folder actually lives inside this vault, before it's persisted
+    // to AppSettings.recordingOutputFolder. True iff candidatePath IS the
+    // vault root or a subdirectory of it; false for anything outside the
+    // vault root, including paths that use ".." to escape it. candidatePath
+    // need not exist yet (e.g. a folder the user is about to create) — only
+    // the vault root itself must exist.
+    Q_INVOKABLE bool isPathInsideVault(const QString &candidatePath) const;
 
 signals:
     void vaultPathChanged();

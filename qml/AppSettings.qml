@@ -31,6 +31,12 @@ Item {
     property real borderRadius: 8
     property bool useSystemTitlebar: true
 
+    // Shared accent color for hover outlines (HoverBorder.qml) and the
+    // always-editable-field focus underline (UnderlineField.qml) — both
+    // were hardcoded "white" until this was pulled out as one configurable
+    // setting.
+    property color accentColor: "white"
+
     property color sidebarBackgroundColor: "#1e1e1e"
     property real sidebarOpacity: 1.0
     property bool sidebarBlur: false
@@ -38,6 +44,11 @@ Item {
     property color mainBackgroundColor: "#252525"
     property real mainOpacity: 1.0
     property bool mainBlur: false
+
+    // Global on/off for UI animations/transitions (recording feature adds
+    // several new ones — e.g. level meters, recording-state pulses). Same
+    // "opt-out feature flag" shape as sidebarBlur/mainBlur above.
+    property bool animationsEnabled: true
 
     // AI auto-labeling (DESIGN.md "Model management"): opt-in second pass
     // after transcription, populates label/prelude/tags via LabelingEngine.
@@ -168,6 +179,18 @@ Item {
     // until confident" bias around anything that touches source recordings.
     property bool deleteOriginalsAfterCombine: false
 
+    // Where new in-app recordings are written to. Empty string (default)
+    // means "use vault root" — interpreted downstream by the recording
+    // controller, not here.
+    property string recordingOutputFolder: ""
+
+    // Input gain multipliers (1.0 = unity) applied to the microphone and
+    // system-audio capture streams before mixing, for the in-app recording
+    // feature — independently adjustable since a user might want to boost a
+    // quiet mic while leaving system audio untouched, or vice versa.
+    property real recordingMicGain: 1.0
+    property real recordingSystemGain: 1.0
+
     // Split-recording combine rules — a list of {name, pattern, enabled,
     // sortGroupIndex, sortGroupText, sortGroupOccurrence} maps, each a
     // QRegularExpression matched against a filename (see
@@ -197,12 +220,14 @@ Item {
     readonly property var defaults: ({
         borderRadius: 8,
         useSystemTitlebar: true,
+        accentColor: "white",
         sidebarBackgroundColor: "#1e1e1e",
         sidebarOpacity: 1.0,
         sidebarBlur: false,
         mainBackgroundColor: "#252525",
         mainOpacity: 1.0,
         mainBlur: false,
+        animationsEnabled: true,
         rimEnabled: true,
         rimWidth: 1,
         rimColor: "#99ffffff",
@@ -229,7 +254,10 @@ Item {
         progressGlowColor: "#ffffff",
         progressGlowWidth: 2,
         progressGlowRadius: 8,
-        deleteOriginalsAfterCombine: false
+        deleteOriginalsAfterCombine: false,
+        recordingOutputFolder: "",
+        recordingMicGain: 1.0,
+        recordingSystemGain: 1.0
     })
 
     // QML `color` values need to be stringified before crossing into a
@@ -307,12 +335,14 @@ Item {
         target: appSettings
         function onBorderRadiusChanged() { appSettings.scheduleSave() }
         function onUseSystemTitlebarChanged() { appSettings.scheduleSave() }
+        function onAccentColorChanged() { appSettings.scheduleSave() }
         function onSidebarBackgroundColorChanged() { appSettings.scheduleSave() }
         function onSidebarOpacityChanged() { appSettings.scheduleSave() }
         function onSidebarBlurChanged() { appSettings.scheduleSave() }
         function onMainBackgroundColorChanged() { appSettings.scheduleSave() }
         function onMainOpacityChanged() { appSettings.scheduleSave() }
         function onMainBlurChanged() { appSettings.scheduleSave() }
+        function onAnimationsEnabledChanged() { appSettings.scheduleSave() }
         function onRimEnabledChanged() { appSettings.scheduleSave() }
         function onRimWidthChanged() { appSettings.scheduleSave() }
         function onRimColorChanged() { appSettings.scheduleSave() }
@@ -339,6 +369,9 @@ Item {
         function onProgressGlowWidthChanged() { appSettings.scheduleSave() }
         function onProgressGlowRadiusChanged() { appSettings.scheduleSave() }
         function onDeleteOriginalsAfterCombineChanged() { appSettings.scheduleSave() }
+        function onRecordingOutputFolderChanged() { appSettings.scheduleSave() }
+        function onRecordingMicGainChanged() { appSettings.scheduleSave() }
+        function onRecordingSystemGainChanged() { appSettings.scheduleSave() }
         // combineRules isn't in `defaults` (see its own doc comment) but
         // still needs the same debounced-save-on-change wiring as every
         // other persisted key.

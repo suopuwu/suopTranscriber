@@ -1,10 +1,10 @@
 import QtQuick
 import SuopTranscriber
 
-// Item 14 (Wave E): shared TextField background — a bottom underline instead
-// of the default QQC2 boxed background, thicker/brighter (AppSettings
-// highlightColor) when the field has focus. Used as every TextField's
-// `background:` override so styling stays in one place.
+// Item 14 (Wave E): shared TextField background — a thin white bottom
+// underline instead of the default QQC2 boxed background, shown only while
+// the field has focus. Used as every TextField's `background:` override so
+// styling stays in one place.
 Item {
     property bool focused: false
 
@@ -14,14 +14,16 @@ Item {
         anchors.left: parent.left
         anchors.right: parent.right
         anchors.bottom: parent.bottom
-        height: focused ? 2 : 1
-        color: focused ? AppSettings.highlightColor : "#5a5a5a"
+        height: 1
+        color: AppSettings.accentColor
+        // Fully hidden until focused — an always-editable field (see
+        // StyleGuide.md "Always-editable text") must read as plain text the
+        // rest of the time, not a permanently-visible input box. Same
+        // fade idiom as HoverBorder's own opacity animation.
+        opacity: focused ? 1 : 0
 
-        Behavior on height {
-            NumberAnimation { duration: 100 }
-        }
-        Behavior on color {
-            ColorAnimation { duration: 100 }
+        Behavior on opacity {
+            NumberAnimation { duration: AppSettings.animationsEnabled ? 100 : 0 }
         }
     }
 }

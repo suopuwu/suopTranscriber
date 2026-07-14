@@ -110,6 +110,7 @@ Popup {
     function anySettingDirty() {
         return !AppSettings.isDefault("borderRadius")
                 || !AppSettings.isDefault("useSystemTitlebar")
+                || !AppSettings.isDefault("accentColor")
                 || !AppSettings.isDefault("sidebarBackgroundColor")
                 || !AppSettings.isDefault("sidebarOpacity")
                 || !AppSettings.isDefault("sidebarBlur")
@@ -841,6 +842,13 @@ Popup {
         selectedColor: AppSettings.rimColor
         options: ColorDialog.ShowAlphaChannel
         onAccepted: AppSettings.rimColor = selectedColor
+    }
+
+    ColorDialog {
+        id: accentColorDialog
+        title: qsTr("Accent Color")
+        selectedColor: AppSettings.accentColor
+        onAccepted: AppSettings.accentColor = selectedColor
     }
 
     ColorDialog {
@@ -2070,6 +2078,70 @@ Popup {
                     HoverBorder {
                         anchors.fill: parent
                         active: rimColorResetButton.enabled && rimColorResetButton.hovered
+                    }
+                }
+            }
+
+            // Shared accent color for hover outlines (HoverBorder.qml) and
+            // the always-editable-field focus underline
+            // (UnderlineField.qml) — both were hardcoded "white" before.
+            Label {
+                text: qsTr("Accent Color")
+                color: "white"
+                font.bold: true
+            }
+
+            RowLayout {
+                Layout.fillWidth: true
+                Label {
+                    Layout.fillWidth: true
+                    color: "white"
+                    text: qsTr("Color")
+                }
+                Button {
+                    id: accentColorButton
+                    text: qsTr("Choose…")
+                    hoverEnabled: true
+                    onClicked: accentColorDialog.open()
+
+                    background: Rectangle {
+                        radius: AppSettings.borderRadius
+                        color: (accentColorButton.hovered && accentColorButton.enabled) ? "#3a3a3a" : "#2a2a2a"
+                        border.width: 1
+                        border.color: "#3a3a3a"
+                    }
+                    HoverHandler {
+                        cursorShape: Qt.PointingHandCursor
+                    }
+                    HoverBorder {
+                        anchors.fill: parent
+                        active: accentColorButton.hovered
+                    }
+                }
+                Button {
+                    id: accentColorResetButton
+                    text: "↺"
+                    implicitWidth: 22
+                    implicitHeight: 22
+
+                    background: Rectangle {
+                        radius: AppSettings.borderRadius
+                        color: "transparent"
+                        border.width: 1
+                        border.color: "#3a3a3a"
+                    }
+                    enabled: !AppSettings.isDefault("accentColor")
+                    opacity: enabled ? 1 : 0.35
+                    hoverEnabled: enabled
+                    onClicked: AppSettings.resetProperty("accentColor")
+
+                    HoverHandler {
+                        cursorShape: Qt.PointingHandCursor
+                        enabled: accentColorResetButton.enabled
+                    }
+                    HoverBorder {
+                        anchors.fill: parent
+                        active: accentColorResetButton.enabled && accentColorResetButton.hovered
                     }
                 }
             }

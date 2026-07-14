@@ -22,6 +22,7 @@ class VaultSearchProxyModel : public QSortFilterProxyModel {
     Q_PROPERTY(bool includeTranscriptions READ includeTranscriptions WRITE setIncludeTranscriptions NOTIFY
                    includeTranscriptionsChanged)
     Q_PROPERTY(QStringList tagFilter READ tagFilter WRITE setTagFilter NOTIFY tagFilterChanged)
+    Q_PROPERTY(QStringList speakerFilter READ speakerFilter WRITE setSpeakerFilter NOTIFY speakerFilterChanged)
     Q_PROPERTY(
         QVariantMap fileSortKeys READ fileSortKeys WRITE setFileSortKeys NOTIFY fileSortKeysChanged)
 
@@ -41,6 +42,12 @@ public:
     void setIncludeTranscriptions(bool include);
     QStringList tagFilter() const;
     void setTagFilter(const QStringList &tags);
+    // Mirrors tagFilter exactly, but against VaultTreeModel::SpeakersRole
+    // (the "speakers:" frontmatter allowlist) instead of TagsRole — a
+    // second, independently-AND'd hard filter (both must pass if both are
+    // set; see filterAcceptsRow()).
+    QStringList speakerFilter() const;
+    void setSpeakerFilter(const QStringList &speakers);
 
     // Sidebar.qml's file-tree sort feature (Name / Date Modified asc-desc,
     // plus keeping combine-candidate groups tree-adjacent): path -> a
@@ -60,6 +67,7 @@ signals:
     void searchQueryChanged();
     void includeTranscriptionsChanged();
     void tagFilterChanged();
+    void speakerFilterChanged();
     void fileSortKeysChanged();
 
 protected:
@@ -71,9 +79,12 @@ private:
     bool matchesSearch(const QModelIndex &sourceIndex) const;
     bool rowHasAllFilterTags(const QModelIndex &sourceIndex) const;
     bool matchesTagFilter(const QModelIndex &sourceIndex) const;
+    bool rowHasAllFilterSpeakers(const QModelIndex &sourceIndex) const;
+    bool matchesSpeakerFilter(const QModelIndex &sourceIndex) const;
 
     QString m_searchQuery;
     bool m_includeTranscriptions = true;
     QStringList m_tagFilter;
+    QStringList m_speakerFilter;
     QVariantMap m_fileSortKeys;
 };

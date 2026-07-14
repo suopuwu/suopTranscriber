@@ -568,6 +568,19 @@ public:
     // themselves contain commas.
     Q_INVOKABLE bool setTags(const QUrl &fileUrl, const QStringList &tags, QString *errorOut = nullptr) const;
 
+    // Manual-edit counterpart for the transcript BODY's segment text itself
+    // (MainPanel's always-editable transcriptArea) — edits is a list of
+    // {t0: seconds as double, text: QString} maps, one per changed sentence
+    // (QML only sends the ones that actually differ, computed by diffing
+    // against displaySentences). Same splice-by-captured-offset technique as
+    // renameSpeakerInFile()/mergeSpeakersInFile() (TranscriptionController.cpp),
+    // just targeting segmentLinePattern()'s text capture group (3) instead of
+    // the speaker group (2) — timestamp/speaker tag/repeat-count marker/
+    // SPEAKER_TURN suffix are all left byte-for-byte untouched. Fails (no
+    // partial write) if ANY requested t0 doesn't match an existing segment
+    // line — same all-or-nothing shape as the other setters above.
+    Q_INVOKABLE bool setSentenceTexts(const QUrl &fileUrl, const QVariantList &edits, QString *errorOut = nullptr) const;
+
     // Feature 2: the multi-paragraph, editable "prelude" (upgrades the old
     // read-only single-line "summary") — stored in the .md BODY immediately
     // after frontmatter, terminated by the "<!-- prelude end -->" sentinel

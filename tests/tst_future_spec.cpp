@@ -99,6 +99,17 @@ private slots:
               "keeping the first segment's t0 and the last's t1 — explicitly 'not built day one'. "
               "NOT BUILT: native segments are used as-is.");
     }
+
+    void perAppAudioCapture_singleApplicationIsolation()
+    {
+        QSKIP("Recording feature: capturing ONE specific application's audio individually (e.g. "
+              "just Firefox, isolated from the rest of the system mix) is designed-but-not-built. "
+              "AudioRecorder (src/core/AudioRecorder.h/.cpp) only supports mic + the FULL "
+              "default-sink monitor mix via `parec`. Per-app isolation would need per-app stream "
+              "enumeration/routing (libpulse's sink-input list, or PipeWire's node graph via "
+              "libpipewire) to select just one application's stream instead of the whole monitor "
+              "— deliberately deferred out of scope for this change.");
+    }
 };
 
 QTEST_GUILESS_MAIN(TstFutureSpec)

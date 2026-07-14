@@ -10,7 +10,7 @@ set(SUOP_CORE_DIR ${CMAKE_SOURCE_DIR}/src/core)
 # so the app target stays untouched. QML_ELEMENT headers compile outside the
 # qml module as long as Qt6::Qml is linked.
 function(suop_add_test name)
-    cmake_parse_arguments(ARG "LINK_WHISPER;LINK_LLAMA;LINK_SHERPA_ONNX;LINK_QUICK" "" "SOURCES" ${ARGN})
+    cmake_parse_arguments(ARG "LINK_WHISPER;LINK_LLAMA;LINK_SHERPA_ONNX;LINK_QUICK;LINK_MULTIMEDIA" "" "SOURCES" ${ARGN})
     set(abs_sources "")
     foreach(src ${ARG_SOURCES})
         list(APPEND abs_sources ${SUOP_CORE_DIR}/${src})
@@ -24,6 +24,13 @@ function(suop_add_test name)
         # tst_sidebar_keynav.cpp's top-of-file comment for why this is
         # needed and what it does/doesn't cover.
         target_link_libraries(${name} PRIVATE Qt6::Quick Qt6::QuickControls2)
+    endif()
+    if(ARG_LINK_MULTIMEDIA)
+        # For tests that compile AudioRecorder.cpp/AudioPlayer.cpp — those
+        # reference QAudioSource/QMediaDevices etc. even when the test itself
+        # only exercises hardware-free helper functions (see
+        # tst_audiorecorder.cpp), so the TU still needs Qt6::Multimedia to link.
+        target_link_libraries(${name} PRIVATE Qt6::Multimedia)
     endif()
     if(ARG_LINK_WHISPER)
         target_link_libraries(${name} PRIVATE whisper)
@@ -62,6 +69,7 @@ suop_add_test(tst_engine_contract LINK_WHISPER
     SOURCES WhisperCppEngine.cpp AudioDecoder.cpp)
 suop_add_test(tst_vadchunking LINK_WHISPER SOURCES VadChunker.cpp)
 suop_add_test(tst_audiodecoder SOURCES AudioDecoder.cpp)
+suop_add_test(tst_audiorecorder LINK_MULTIMEDIA SOURCES AudioRecorder.cpp)
 suop_add_test(tst_labelingengine LINK_LLAMA SOURCES LabelingEngine.cpp)
 suop_add_test(tst_diarizationengine LINK_SHERPA_ONNX SOURCES DiarizationEngine.cpp AudioDecoder.cpp)
 suop_add_test(tst_future_spec)

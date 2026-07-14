@@ -327,6 +327,15 @@ QVariant VaultTreeModel::data(const QModelIndex &index, int role) const
         const QString mdPath = sidecarMdPath(node);
         return mdPath.isEmpty() ? QString() : frontmatterField(mdPath, QStringLiteral("tags"));
     }
+    case SpeakersRole: {
+        // "speakers:" frontmatter is kept in sync with the body's actual
+        // speaker tags by renameSpeakerInFile()/mergeSpeakersInFile()/
+        // syncSpeakersFrontmatterToBody() (TranscriptionController.cpp), same
+        // comma-separated shape as "tags:" — cheap frontmatter-only read,
+        // same as TagsRole above, no body scan needed.
+        const QString mdPath = sidecarMdPath(node);
+        return mdPath.isEmpty() ? QString() : frontmatterField(mdPath, QStringLiteral("speakers"));
+    }
     case TranscriptBodyRole: {
         if (node->status != TranscribedStatus)
             return QString();
@@ -349,6 +358,7 @@ QHash<int, QByteArray> VaultTreeModel::roleNames() const
         {IsOrphanedMdRole, "isOrphanedMd"},
         {LabelRole, "label"},
         {TagsRole, "tags"},
+        {SpeakersRole, "speakers"},
         {TranscriptBodyRole, "transcriptBody"},
     };
 }
@@ -465,6 +475,46 @@ bool VaultTreeModel::importFile(const QUrl &fileUrl, QString *errorOut)
 
     rebuild();
     return true;
+}
+
+bool VaultTreeModel::isPathInsideVault(const QString &candidatePath) const
+{
+    const QString localPath = vaultLocalPath();
+    if (localPath.isEmpty() || candidatePath.isEmpty())
+        return false;
+
+    // The vault root itself must exist (it always does once opened) for
+    // canonicalization to mean anything.
+    const QString vaultCanonical = QFileInfo(localPath).canonicalFilePath();
+    if (vaultCanonical.isEmpty())
+        return false;
+
+    // candidatePath may not exist yet (e.g. a folder the user is about to
+    // create/select in a dialog) — QFileInfo::canonicalFilePath() returns
+    // empty for a nonexistent path, so walk up to the nearest existing
+    // ancestor, canonicalize THAT (resolving any ".."/symlinks along the
+    // existing portion), then re-append the not-yet-created tail.
+    QString ancestor = QFileInfo(candidatePath).absoluteFilePath();
+    QString tail;
+    while (!QFileInfo::exists(ancestor)) {
+        const QString parent = QFileInfo(ancestor).absolutePath();
+        if (parent == ancestor)
+            return false; // walked past the filesystem root without finding anything real
+        const QString name = QFileInfo(ancestor).fileName();
+        tail = tail.isEmpty() ? name : name + '/' + tail;
+        ancestor = parent;
+    }
+
+    const QString ancestorCanonical = QFileInfo(ancestor).canonicalFilePath();
+    if (ancestorCanonical.isEmpty())
+        return false;
+    const QString candidateCanonical = tail.isEmpty() ? ancestorCanonical : ancestorCanonical + '/' + tail;
+
+    if (candidateCanonical == vaultCanonical)
+        return true;
+
+    const QString relative = QDir(vaultCanonical).relativeFilePath(candidateCanonical);
+    return !relative.startsWith(QStringLiteral("..")) && !QDir::isAbsolutePath(relative);
 }
 
 QVariantMap VaultTreeModel::readVaultSettings() const

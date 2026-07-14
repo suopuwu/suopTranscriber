@@ -48,6 +48,41 @@ must show both:
   <id>.activeFocus }`. Thin/dim normally, thicker + `AppSettings.highlightColor`
   when focused.
 
+## Always-editable text
+
+- Display-vs-edit is never a swap between two different elements (a `Label`/
+  read-only `TextEdit` that gets replaced by a `TextField`/`TextArea` on
+  click). One editable control is present at all times, styled via
+  `UnderlineField` (see "Text fields" above) so it reads as plain text until
+  focused. A visibility flag tied to focus state is exactly the bug this
+  fixes: the platform's native right-click "Copy" menu steals focus, and if
+  that flip hides the field, the box disappears out from under the user.
+- If the pill/control ALSO needs a click-triggered action other than editing
+  (e.g. filtering the sidebar by a speaker/tag pill) — don't gate the field's
+  own editability behind a separate edit-trigger icon to make room for it.
+  Overlapping `TapHandler`s (one on the field's container, one on a small
+  icon inside it) aren't mutually exclusive by default in Qt Quick — a tap
+  on the icon can fire both, which is exactly the "pencil button also
+  triggers the pill's other action" bug this replaces. Instead, keep the
+  field itself always directly editable (plain click places the cursor, same
+  as everywhere else) and give the OTHER action its own small dedicated
+  trigger icon (e.g. a `⇅` sort/filter `Text` + `TapHandler`) — never the
+  field's own click.
+- Commit convention:
+  - Single-line fields (title, a name, a tag): commit on `Return`
+    (`onAccepted`) AND on blur (`onActiveFocusChanged: if (!activeFocus)
+    commit(...)`) — safe once the field can no longer disappear.
+    `Keys.onEscapePressed` reverts the text to the last-known-good value
+    without committing.
+  - Multi-line/structured fields (a paragraph, or text where each line maps
+    to something else, e.g. one transcript line per timestamped segment):
+    commit on blur only, and block `Return` from inserting a newline
+    (`Keys.onReturnPressed: (event) => event.accepted = true`) if the
+    structure depends on a fixed line count. Validate that invariant
+    defensively at commit time too (a paste can slip a newline past the key
+    handler) and reject + revert with an inline warning banner rather than
+    writing a corrupted result.
+
 ## Warning banners
 
 - Inline, not a popup/toast: a plain `Label`, conditionally visible on a

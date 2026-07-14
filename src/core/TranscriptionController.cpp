@@ -3854,6 +3854,78 @@ bool TranscriptionController::setTags(const QUrl &fileUrl, const QStringList &ta
     return true;
 }
 
+// Manual-edit counterpart for segment text (MainPanel's always-editable
+// transcriptArea) — reuses parseSpeakerTaggedFile()/writeFrontmatterBlock()
+// (originally written for renameSpeakerInFile()/mergeSpeakersInFile() above)
+// since a single-segment text replace needs exactly the same "locate every
+// segment line via segmentLinePattern(knownSpeakers), splice by captured
+// offset, rewrite the whole file" shape — just targeting the TEXT capture
+// group (3) per requested t0 instead of the speaker group (2).
+bool TranscriptionController::setSentenceTexts(const QUrl &fileUrl, const QVariantList &edits, QString *errorOut) const
+{
+    const QString path = sidecarPath(fileUrl.toLocalFile());
+    QStringList frontmatterLines;
+    QString body;
+    int speakersLineIndex = -1;
+    QStringList knownSpeakers;
+    QStringList distinctTags;
+    if (!parseSpeakerTaggedFile(path, &frontmatterLines, &body, &speakersLineIndex, &knownSpeakers, &distinctTags,
+                                 errorOut))
+        return false;
+
+    QVector<QRegularExpressionMatch> matches;
+    QRegularExpressionMatchIterator it = segmentLinePattern(knownSpeakers).globalMatch(body);
+    while (it.hasNext())
+        matches.append(it.next());
+
+    struct PendingEdit {
+        qsizetype start;
+        qsizetype length;
+        QString text;
+    };
+    QVector<PendingEdit> pending;
+    pending.reserve(edits.size());
+
+    for (const QVariant &editVar : edits) {
+        const QVariantMap edit = editVar.toMap();
+        const double t0 = edit.value(QStringLiteral("t0")).toDouble();
+        QString newText = edit.value(QStringLiteral("text")).toString();
+        // A segment is exactly one body line by construction (see
+        // MainPanel.qml's displayData doc comment) — a stray newline here
+        // would corrupt that invariant, so collapse defensively rather than
+        // trusting the caller (QML already blocks Return/strips pasted
+        // newlines, but this is the actual safety boundary).
+        newText.replace(QLatin1Char('\n'), QLatin1Char(' '));
+
+        bool found = false;
+        for (const QRegularExpressionMatch &m : std::as_const(matches)) {
+            if (std::abs(parseCompactTimestamp(m.captured(1)) - t0) < 0.001) {
+                pending.append({m.capturedStart(3), m.capturedLength(3), newText});
+                found = true;
+                break;
+            }
+        }
+        if (!found) {
+            if (errorOut)
+                *errorOut = QStringLiteral("no segment found at timestamp %1").arg(formatTimestamp(t0));
+            return false;
+        }
+    }
+
+    // Splice from the END of the body backward so earlier edits' offsets
+    // stay valid as later ones are replaced (same technique as
+    // renameSpeakerInFile()/mergeSpeakersInFile() above).
+    std::sort(pending.begin(), pending.end(),
+              [](const PendingEdit &a, const PendingEdit &b) { return a.start > b.start; });
+    for (const PendingEdit &edit : std::as_const(pending))
+        body.replace(edit.start, edit.length, edit.text);
+
+    if (!writeFrontmatterBlock(path, frontmatterLines, body, errorOut))
+        return false;
+    emit finished(fileUrl, true, QString());
+    return true;
+}
+
 QString TranscriptionController::readPrelude(const QUrl &fileUrl) const
 {
     // Builds on readTranscriptBody() rather than re-skipping frontmatter by

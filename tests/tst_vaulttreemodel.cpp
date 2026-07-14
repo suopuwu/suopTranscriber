@@ -568,7 +568,8 @@ private slots:
         QVERIFY(vault.isValid());
         QVERIFY(touch(vault.filePath("talk.mp3")));
         QVERIFY(touch(vault.filePath("talk.mp3.md"),
-                      "---\nmodel: base\nlabel: Quarterly Talk\ntags: finance, meetings\n---\n\n"
+                      "---\nmodel: base\nlabel: Quarterly Talk\ntags: finance, meetings\n"
+                      "speakers: Alice, Bob\n---\n\n"
                       "[00:00:00.000 - 00:00:01.000] hello\n"));
 
         VaultTreeModel model;
@@ -578,10 +579,15 @@ private slots:
         QVERIFY(idx.isValid());
         QCOMPARE(model.data(idx, roleByName(model, "label")).toString(), QStringLiteral("Quarterly Talk"));
         QCOMPARE(model.data(idx, roleByName(model, "tags")).toString(), QStringLiteral("finance, meetings"));
+        // SpeakersRole mirrors TagsRole exactly (same frontmatter-only read,
+        // "speakers:" is kept in sync with the body by
+        // renameSpeakerInFile()/mergeSpeakersInFile() — see
+        // TranscriptionController.cpp).
+        QCOMPARE(model.data(idx, roleByName(model, "speakers")).toString(), QStringLiteral("Alice, Bob"));
     }
 
-    // An untranscribed audio file (no sidecar .md yet) yields empty label/tags
-    // rather than erroring or crashing.
+    // An untranscribed audio file (no sidecar .md yet) yields empty
+    // label/tags/speakers rather than erroring or crashing.
     void audioWithoutSidecarMd_labelAndTagsRolesAreEmpty()
     {
         QTemporaryDir vault;
@@ -595,6 +601,7 @@ private slots:
         QVERIFY(idx.isValid());
         QVERIFY(model.data(idx, roleByName(model, "label")).toString().isEmpty());
         QVERIFY(model.data(idx, roleByName(model, "tags")).toString().isEmpty());
+        QVERIFY(model.data(idx, roleByName(model, "speakers")).toString().isEmpty());
     }
 
     // TranscriptBodyRole returns the segment text (frontmatter stripped) for a
@@ -693,6 +700,75 @@ private slots:
         QString error;
         QVERIFY(!model.writeVaultSettings({{QStringLiteral("borderRadius"), 8}}, &error));
         QVERIFY(!error.isEmpty());
+    }
+
+    // Recording feature adds four new AppSettings keys (recordingOutputFolder,
+    // animationsEnabled, recordingMicGain, recordingSystemGain) — same
+    // round-trip mechanism as vaultSettings_roundTripsThroughHiddenJsonFile
+    // above, just proving the underlying JSON read/write handles the new
+    // keys' types (string/bool/real) correctly. AppSettings.qml itself has no
+    // dedicated QML-engine test harness in this file (see that test's shape).
+    void vaultSettings_roundTripsRecordingAndAnimationKeys()
+    {
+        QTemporaryDir vault;
+        QVERIFY(vault.isValid());
+
+        VaultTreeModel model;
+        model.setVaultPath(QUrl::fromLocalFile(vault.path()));
+
+        QVariantMap settings;
+        settings[QStringLiteral("recordingOutputFolder")] = QStringLiteral("recordings");
+        settings[QStringLiteral("animationsEnabled")] = false;
+        settings[QStringLiteral("recordingMicGain")] = 1.5;
+        settings[QStringLiteral("recordingSystemGain")] = 0.75;
+
+        QString error;
+        QVERIFY2(model.writeVaultSettings(settings, &error), qPrintable(error));
+
+        const QVariantMap readBack = model.readVaultSettings();
+        QCOMPARE(readBack.value(QStringLiteral("recordingOutputFolder")).toString(), QStringLiteral("recordings"));
+        QCOMPARE(readBack.value(QStringLiteral("animationsEnabled")).toBool(), false);
+        QCOMPARE(readBack.value(QStringLiteral("recordingMicGain")).toDouble(), 1.5);
+        QCOMPARE(readBack.value(QStringLiteral("recordingSystemGain")).toDouble(), 0.75);
+    }
+
+    // --- isPathInsideVault() (recording feature: output-folder validation) -------
+
+    // The vault root itself, and any subdirectory (nested or not), count as
+    // "inside" the vault.
+    void isPathInsideVault_acceptsVaultRootAndSubdirectory()
+    {
+        QTemporaryDir vault;
+        QVERIFY(vault.isValid());
+        QVERIFY(QDir().mkpath(vault.filePath("recordings/nested")));
+
+        VaultTreeModel model;
+        model.setVaultPath(QUrl::fromLocalFile(vault.path()));
+
+        QVERIFY(model.isPathInsideVault(vault.path()));
+        QVERIFY(model.isPathInsideVault(vault.filePath("recordings")));
+        QVERIFY(model.isPathInsideVault(vault.filePath("recordings/nested")));
+        // Doesn't need to exist yet — a folder the user is about to create.
+        QVERIFY(model.isPathInsideVault(vault.filePath("recordings/not-yet-created")));
+    }
+
+    // A sibling directory outside the vault root, or a path that uses ".."
+    // to climb back out of the vault, are both rejected.
+    void isPathInsideVault_rejectsSiblingAndDotDotEscape()
+    {
+        QTemporaryDir vault;
+        QVERIFY(vault.isValid());
+        QVERIFY(QDir().mkpath(vault.filePath("recordings")));
+
+        QTemporaryDir sibling;
+        QVERIFY(sibling.isValid());
+
+        VaultTreeModel model;
+        model.setVaultPath(QUrl::fromLocalFile(vault.path()));
+
+        QVERIFY(!model.isPathInsideVault(sibling.path()));
+        QVERIFY(!model.isPathInsideVault(vault.filePath("recordings/../..")));
+        QVERIFY(!model.isPathInsideVault(vault.filePath("recordings/../../escaped")));
     }
 
     // --- allAudioPaths() (TitleBar "force retranscribe all") ---------------------

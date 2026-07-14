@@ -9,6 +9,7 @@ Item {
     property string title: ""
     signal settingsRequested()
     signal forceRetranscribeAllRequested()
+    signal recordRequested()
 
     // Inline confirm state for the "Force retranscribe all" menu row (see
     // MainPanel.qml's speaker-merge confirm row for the same swap-in-place
@@ -66,12 +67,39 @@ Item {
         }
     }
 
+    Item {
+        id: recordButton
+        anchors.left: settingsButton.right
+        anchors.leftMargin: 4
+        anchors.verticalCenter: parent.verticalCenter
+        width: 24
+        height: 24
+
+        HoverHandler {
+            id: recordHover
+            cursorShape: Qt.PointingHandCursor
+        }
+        TapHandler {
+            onTapped: titleBar.recordRequested()
+        }
+        HoverBorder {
+            anchors.fill: parent
+            active: recordHover.hovered
+        }
+        Text {
+            anchors.centerIn: parent
+            text: "⏺"
+            color: "white"
+            font.pixelSize: 14
+        }
+    }
+
     // Infrequently used actions (currently just "force retranscribe all")
     // that don't warrant a spot in Settings — kept out of the way next to
     // the gear rather than cluttering the per-row/bulk sidebar controls.
     Item {
         id: moreActionsButton
-        anchors.left: settingsButton.right
+        anchors.left: recordButton.right
         anchors.leftMargin: 4
         anchors.verticalCenter: parent.verticalCenter
         width: 24

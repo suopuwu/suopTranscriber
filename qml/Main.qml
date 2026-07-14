@@ -21,6 +21,10 @@ ApplicationWindow {
         id: player
     }
 
+    AudioRecorder {
+        id: audioRecorder
+    }
+
     TranscriptionController {
         id: transcriptionController
     }
@@ -106,8 +110,8 @@ ApplicationWindow {
         const sidebarRect = sidebar.mapToItem(window.contentItem, 0, 0, sidebar.width, sidebar.height)
         const mainRect = mainPanel.mapToItem(window.contentItem, 0, 0, mainPanel.width, mainPanel.height)
         WindowEffects.updateBlur(window,
-            Qt.rect(sidebarRect.x, sidebarRect.y, sidebarRect.width, sidebarRect.height), AppSettings.sidebarBlur,
-            Qt.rect(mainRect.x, mainRect.y, mainRect.width, mainRect.height), AppSettings.mainBlur)
+            Qt.rect(sidebarRect.x, sidebarRect.y, sidebarRect.width, sidebarRect.height), AppSettings.sidebarBlur && AppSettings.animationsEnabled,
+            Qt.rect(mainRect.x, mainRect.y, mainRect.width, mainRect.height), AppSettings.mainBlur && AppSettings.animationsEnabled)
 
         // Sidebar/MainPanel only round the corners touching the SplitView
         // divider; those cutouts need a filler behind them (matching the
@@ -129,6 +133,7 @@ ApplicationWindow {
         target: AppSettings
         function onSidebarBlurChanged() { updateBlurRegions() }
         function onMainBlurChanged() { updateBlurRegions() }
+        function onAnimationsEnabledChanged() { updateBlurRegions() }
         function onBorderRadiusChanged() { Qt.callLater(updateBlurRegions) }
 
         function onUseSystemTitlebarChanged() {
@@ -281,6 +286,7 @@ ApplicationWindow {
                 visible: !AppSettings.useSystemTitlebar
                 onSettingsRequested: settingsPopup.open()
                 onForceRetranscribeAllRequested: sidebar.forceRetranscribeAll()
+                onRecordRequested: mainPanel.recording = !mainPanel.recording
             }
 
             SplitView {
@@ -327,10 +333,12 @@ ApplicationWindow {
                     vaultPath: vaultModel.vaultPath
                     vaultLocalPath: vaultModel.vaultLocalPath
                     player: player
+                    audioRecorder: audioRecorder
                     transcriptionController: transcriptionController
                     vaultTreeModel: vaultModel
                     onOpenVaultRequested: window.openVaultDialog()
                     onTagActivated: (tag) => sidebar.applyTagFilter(tag)
+                    onSpeakerActivated: (name) => sidebar.applySpeakerFilter(name)
                     onWidthChanged: Qt.callLater(window.updateBlurRegions)
                     onHeightChanged: Qt.callLater(window.updateBlurRegions)
                 }

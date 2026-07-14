@@ -1014,6 +1014,89 @@ private slots:
         QCOMPARE(controller.readMetadata(audioUrl).value("speakers").toString(), QStringLiteral("Alicia, Bob"));
     }
 
+    // Manual-edit counterpart for segment text (MainPanel's always-editable
+    // transcriptArea) — replaces just the TEXT of the matched t0 line(s),
+    // leaving timestamp/speaker tag/every other line byte-for-byte
+    // untouched. Multiple edits in one call splice correctly regardless of
+    // which line comes first in the body (see the C++ end-to-start splice
+    // order).
+    void setSentenceTexts_replacesTextPreservingTimestampAndSpeaker()
+    {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        writeFixture(dir.path(), "interview.wav.md",
+                     QStringLiteral("---\nmodel: ggml-base.en.bin\n"
+                                    "speakerDetection: true\nspeakers: Speaker 1, Speaker 2\n---\n\n"
+                                    "[0] [Speaker 1] hi\n"
+                                    "[3.5] [Speaker 2] hello\n"
+                                    "[7] [Speaker 1] how are you\n"));
+        const QUrl audioUrl = QUrl::fromLocalFile(dir.path() + "/interview.wav");
+
+        TranscriptionController controller;
+        QString error;
+        QVariantList edits;
+        edits.append(QVariantMap{{"t0", 0.0}, {"text", QStringLiteral("hi there")}});
+        edits.append(QVariantMap{{"t0", 7.0}, {"text", QStringLiteral("how ARE you")}});
+        QVERIFY(controller.setSentenceTexts(audioUrl, edits, &error));
+        QVERIFY2(error.isEmpty(), qPrintable(error));
+
+        const QString body = controller.readTranscriptBody(audioUrl);
+        QVERIFY(body.contains(QStringLiteral("[0] [Speaker 1] hi there")));
+        QVERIFY(body.contains(QStringLiteral("[3.5] [Speaker 2] hello"))); // untouched
+        QVERIFY(body.contains(QStringLiteral("[7] [Speaker 1] how ARE you")));
+        QVERIFY(!body.contains(QStringLiteral("how are you")));
+
+        // Round-trips through parseSentences too, not just the raw body.
+        const QVariantList sentences = controller.parseSentences(audioUrl);
+        QCOMPARE(sentences.size(), 3);
+        QCOMPARE(sentences.at(0).toMap().value("text").toString(), QStringLiteral("hi there"));
+    }
+
+    // Fails (no partial write) if a requested t0 doesn't match any existing
+    // segment line — the file is left completely untouched.
+    void setSentenceTexts_rejectsUnknownTimestamp()
+    {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        writeFixture(dir.path(), "meeting.wav.md", kFixtureMd);
+        const QUrl audioUrl = QUrl::fromLocalFile(dir.path() + "/meeting.wav");
+        const QString original = readAllBytes(dir.path() + "/meeting.wav.md");
+
+        TranscriptionController controller;
+        QString error;
+        QVariantList edits;
+        edits.append(QVariantMap{{"t0", 999.0}, {"text", QStringLiteral("nonexistent")}});
+        QVERIFY(!controller.setSentenceTexts(audioUrl, edits, &error));
+        QVERIFY(!error.isEmpty());
+        QCOMPARE(readAllBytes(dir.path() + "/meeting.wav.md"), original);
+    }
+
+    // A newline embedded in the new text is collapsed to a space rather than
+    // corrupting the one-line-per-segment file format (QML already blocks
+    // Return/strips pasted newlines before ever calling this, but the C++
+    // side is the actual safety boundary — see setSentenceTexts' doc
+    // comment).
+    void setSentenceTexts_collapsesEmbeddedNewline()
+    {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        writeFixture(dir.path(), "meeting.wav.md", kFixtureMd);
+        const QUrl audioUrl = QUrl::fromLocalFile(dir.path() + "/meeting.wav");
+
+        TranscriptionController controller;
+        QString error;
+        QVariantList edits;
+        edits.append(QVariantMap{{"t0", 0.0}, {"text", QStringLiteral("hello\nworld")}});
+        QVERIFY(controller.setSentenceTexts(audioUrl, edits, &error));
+
+        // kFixtureMd's body is the blank separator line + 2 segment lines
+        // (3 newlines total) — an embedded newline in the new text must
+        // collapse to a space, not introduce a 4th line.
+        const QString body = controller.readTranscriptBody(audioUrl);
+        QCOMPARE(body.count(QLatin1Char('\n')), 3);
+        QVERIFY(body.contains(QStringLiteral("hello world")));
+    }
+
     // Disallows setting two speakers to the same (case-insensitive) name —
     // the file is left completely untouched on rejection.
     void renameSpeaker_rejectsDuplicateName()

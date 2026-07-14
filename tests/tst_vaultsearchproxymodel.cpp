@@ -270,6 +270,58 @@ private slots:
         QCOMPARE(proxy.rowCount(), 2);
     }
 
+    // speakerFilter mirrors tagFilter exactly (same AND-all-requested,
+    // hides-non-matching-rows shape), just against VaultTreeModel's
+    // SpeakersRole ("speakers:" frontmatter) instead of TagsRole.
+    void speakerFilter_hidesRowsMissingAnyRequestedSpeaker()
+    {
+        QTemporaryDir vault;
+        QVERIFY(vault.isValid());
+        QVERIFY(touch(vault.filePath("both.mp3")));
+        QVERIFY(touch(vault.filePath("both.mp3.md"),
+                      "---\nspeakers: Alice, Bob\n---\n\n[00:00:00.000 - 00:00:01.000] hi\n"));
+        QVERIFY(touch(vault.filePath("onlyalice.mp3")));
+        QVERIFY(touch(vault.filePath("onlyalice.mp3.md"),
+                      "---\nspeakers: Alice\n---\n\n[00:00:00.000 - 00:00:01.000] hi\n"));
+        QVERIFY(touch(vault.filePath("nospeakers.mp3")));
+
+        VaultTreeModel source;
+        source.setVaultPath(QUrl::fromLocalFile(vault.path()));
+
+        VaultSearchProxyModel proxy;
+        proxy.setSourceModel(&source);
+        proxy.setSpeakerFilter({QStringLiteral("Alice"), QStringLiteral("Bob")});
+
+        QCOMPARE(siblingNamesInOrder(proxy), QStringList({"both.mp3"}));
+    }
+
+    // tagFilter and speakerFilter are independently AND'd — a row must
+    // satisfy BOTH when both are set, not either.
+    void tagFilterAndSpeakerFilter_bothMustMatch()
+    {
+        QTemporaryDir vault;
+        QVERIFY(vault.isValid());
+        QVERIFY(touch(vault.filePath("both.mp3")));
+        QVERIFY(touch(vault.filePath("both.mp3.md"),
+                      "---\ntags: finance\nspeakers: Alice\n---\n\n[00:00:00.000 - 00:00:01.000] hi\n"));
+        QVERIFY(touch(vault.filePath("onlytag.mp3")));
+        QVERIFY(touch(vault.filePath("onlytag.mp3.md"),
+                      "---\ntags: finance\n---\n\n[00:00:00.000 - 00:00:01.000] hi\n"));
+        QVERIFY(touch(vault.filePath("onlyspeaker.mp3")));
+        QVERIFY(touch(vault.filePath("onlyspeaker.mp3.md"),
+                      "---\nspeakers: Alice\n---\n\n[00:00:00.000 - 00:00:01.000] hi\n"));
+
+        VaultTreeModel source;
+        source.setVaultPath(QUrl::fromLocalFile(vault.path()));
+
+        VaultSearchProxyModel proxy;
+        proxy.setSourceModel(&source);
+        proxy.setTagFilter({QStringLiteral("finance")});
+        proxy.setSpeakerFilter({QStringLiteral("Alice")});
+
+        QCOMPARE(siblingNamesInOrder(proxy), QStringList({"both.mp3"}));
+    }
+
     // --- fileSortKeys (Sidebar.qml sort mode + combine-candidate clustering) ---
 
     // Two paths sharing groupRank (element 0) but differing in ownRank

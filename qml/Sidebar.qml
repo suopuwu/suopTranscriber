@@ -35,6 +35,13 @@ Rectangle {
     readonly property var activeTagFilters: sidebar.tagFilterText.split(",")
         .map(t => t.trim()).filter(t => t.length > 0)
 
+    // Mirrors tagFilterText/activeTagFilters/applyTagFilter above, against
+    // VaultSearchProxyModel.speakerFilter instead — see MainPanel's
+    // speakerActivated signal (fired by clicking a speaker pill).
+    property string speakerFilterText: ""
+    readonly property var activeSpeakerFilters: sidebar.speakerFilterText.split(",")
+        .map(s => s.trim()).filter(s => s.length > 0)
+
     // Item 16: MainPanel's tag pill onClicked calls this (Main.qml wires
     // sidebar as a direct id, no signal roundtrip needed) — appends this tag
     // to any existing filter (skipping a case-insensitive duplicate) and
@@ -45,6 +52,14 @@ Rectangle {
         if (!existing.some(t => t.toLowerCase() === tag.toLowerCase()))
             existing.push(tag)
         sidebar.tagFilterText = existing.join(", ")
+    }
+
+    function applySpeakerFilter(name) {
+        sidebar.searchExpanded = true
+        const existing = sidebar.speakerFilterText.split(",").map(s => s.trim()).filter(s => s.length > 0)
+        if (!existing.some(s => s.toLowerCase() === name.toLowerCase()))
+            existing.push(name)
+        sidebar.speakerFilterText = existing.join(", ")
     }
 
     // Item 17: suggestions for the tag fragment currently being typed (text
@@ -150,6 +165,7 @@ Rectangle {
         // TreeView's own point of view, since the TreeView is never visible
         // while sidebar.searchQuery is non-"" in the first place.
         tagFilter: sidebar.activeTagFilters
+        speakerFilter: sidebar.activeSpeakerFilters
     }
 
     // Search UI rearchitecture: while a text search query is active, the
@@ -328,8 +344,13 @@ Rectangle {
     property var combineBottomMergedPaths: ({})
     // path -> 1-based index in its group's combine order (group.files order,
     // i.e. the order files are actually concatenated in — see
-    // combineOrderBadge below). Populated in the same "ready" groups loop as
-    // combineReadyPaths so the two can never disagree on membership.
+    // combineOrderBadge below). Populated for every 2+-member group
+    // regardless of status (same sweep as clusterKeyOf/groupFileOrder in
+    // refreshTreeOrdering() — the badge itself is still only ever shown for
+    // "ready" groups via treeDelegate.combineEligible, but reusing the one
+    // all-statuses map here is what keeps this in lockstep with the tree's
+    // own intra-group display order, which also needs an order for
+    // non-ready groups to sort consistently).
     property var combineOrderPaths: ({})
 
     // Sort mode / combine-candidate clustering (see AppSettings.sortMode's
@@ -339,16 +360,13 @@ Rectangle {
     // see refreshTreeOrdering()'s body for how each is derived.
     function refreshTreeOrdering() {
         const newMap = {}
-        const orderMap = {}
         const audioPaths = (sidebar.transcriptionController && sidebar.model) ? sidebar.model.allAudioPaths() : []
         const groups = (audioPaths.length > 0 && AppSettings.combineRules.length > 0)
                 ? sidebar.transcriptionController.detectCombineGroups(AppSettings.combineRules, audioPaths) : []
         for (const g of groups) {
             if (g.status === "ready") {
-                for (let i = 0; i < g.files.length; i++) {
-                    newMap[g.files[i]] = g.outputPath
-                    orderMap[g.files[i]] = i + 1
-                }
+                for (const f of g.files)
+                    newMap[f] = g.outputPath
             }
         }
 
@@ -358,11 +376,28 @@ Rectangle {
         // tree") is a broader concern than the ready-only outline highlight
         // above, since even a not-currently-combinable group still benefits
         // from its members sitting next to each other.
+        //
+        // groupFileOrder: path -> 1-based index within g.files, same
+        // all-statuses sweep. g.files is already in whatever order
+        // findCombineGroups() actually uses to combine (the rule's
+        // configured sort differentiator if it has one and every member
+        // captured a value for it, else mtime ascending — see that
+        // function's doc comment in TranscriptionController.cpp) — reusing
+        // that order here, instead of independently re-deriving an
+        // mtime-only rank in QML, is what guarantees the tree's display
+        // order and the per-row combine-order badge's numbering (both driven
+        // from this one map — see memberOrderRank below and
+        // sidebar.combineOrderPaths) can never disagree, even for a rule
+        // whose combine order isn't mtime-based at all.
         const clusterKeyOf = {}
+        const groupFileOrder = {}
         for (const g of groups) {
             if (g.files.length >= 2) {
-                for (const f of g.files)
+                for (let i = 0; i < g.files.length; i++) {
+                    const f = g.files[i]
                     clusterKeyOf[f] = g.outputPath
+                    groupFileOrder[f] = i + 1
+                }
             }
         }
 
@@ -371,10 +406,8 @@ Rectangle {
         // compare (see VaultSearchProxyModel::fileSortKeys' doc comment).
         // mtimes is only fetched when actually needed — audioLastModified()
         // walks the whole tree, no need to pay for that on the (default)
-        // "name" mode UNLESS a group exists (memberOrderRank below always
-        // needs mtimes for intra-group order, regardless of sortMode).
-        const mtimes = (sidebar.model && (AppSettings.sortMode !== "name" || Object.keys(clusterKeyOf).length > 0))
-                ? sidebar.model.audioLastModified() : {}
+        // "name" mode.
+        const mtimes = (AppSettings.sortMode !== "name" && sidebar.model) ? sidebar.model.audioLastModified() : {}
         function ownRank(path) {
             if (AppSettings.sortMode === "name") {
                 const slash = path.lastIndexOf("/")
@@ -392,19 +425,19 @@ Rectangle {
         }
 
         // memberOrderRank: a group member's position AMONG ITS OWN
-        // groupmates — always mtime ASCENDING (oldest/part-1 first, at the
-        // top), regardless of AppSettings.sortMode, matching the actual
-        // combine order (TranscriptionController::findCombineGroups()'
-        // mtime-ascending default — see combineOrderBadge). Split-recording
-        // parts are chronological by nature; letting the global name/date
-        // sort reorder them within their own group read as broken (e.g.
-        // "name" mode would alphabetize takes instead of keeping recording
-        // order). Only ever used as sortKeys' second element for grouped
-        // files below — ungrouped files still use plain ownRank, so vaults
-        // without combine rules see no change.
+        // groupmates, always following g.files' own combine order (via
+        // groupFileOrder above) regardless of AppSettings.sortMode — so the
+        // first-to-be-combined file is always at the top. That order is
+        // mtime ascending BY DEFAULT, but a rule with a configured sort
+        // differentiator orders members by that instead (see
+        // groupFileOrder's doc comment) — deriving this from the same map
+        // the combine-order badge uses, rather than independently
+        // recomputing an mtime rank in QML, keeps display order and badge
+        // numbering from ever disagreeing. Only ever used as sortKeys'
+        // second element for grouped files below — ungrouped files still
+        // use plain ownRank, so vaults without combine rules see no change.
         function memberOrderRank(path) {
-            const ms = mtimes[path] || 0
-            return String(ms).padStart(16, "0")
+            return String(groupFileOrder[path] || 0).padStart(16, "0")
         }
 
         // groupRank: the MINIMUM ownRank among a group's members, for every
@@ -463,7 +496,7 @@ Rectangle {
         }
 
         sidebar.combineReadyPaths = newMap
-        sidebar.combineOrderPaths = orderMap
+        sidebar.combineOrderPaths = groupFileOrder
         sidebar.combineTopMergedPaths = topMerged
         sidebar.combineBottomMergedPaths = bottomMerged
         searchProxy.fileSortKeys = sortKeys
@@ -629,11 +662,14 @@ Rectangle {
         anchors.top: parent.top
         anchors.left: parent.left
         anchors.right: parent.right
-        // Item 17 (Wave E): a 2nd row (tag filter input) appears below the
-        // search row while expanded, so this needs to grow to fit both.
-        // O12: a 3rd, variable-height row (wrapping tag-filter chips) grows
-        // this further still, only while at least one tag filter is active.
-        height: sidebar.searchExpanded ? (64 + (tagChipsFlow.visible ? tagChipsFlow.height + 4 : 0)) : 32
+        // Bug fix: this used to be a hand-maintained magic-number formula
+        // (base rows + tagChipsFlow.height) that silently went stale when
+        // the speaker filter row/chips were added later without updating
+        // it, undersizing the ribbon and letting the tree/searchResultsView
+        // (anchored to ribbon.bottom) overlap the bottom search rows.
+        // Binding to expandedColumn.implicitHeight tracks whatever rows
+        // actually exist, so future additions can't repeat this bug.
+        height: sidebar.searchExpanded ? expandedColumn.implicitHeight : 32
 
         RowLayout {
             anchors.fill: parent
@@ -941,6 +977,7 @@ Rectangle {
         }
 
         Column {
+            id: expandedColumn
             anchors.fill: parent
             anchors.leftMargin: 6
             anchors.rightMargin: 6
@@ -992,7 +1029,7 @@ Rectangle {
                     border.width: 1
                     border.color: sidebar.searchIncludeTranscriptions ? "#2ecc71" : "#4a4a4a"
 
-                    Behavior on color { ColorAnimation { duration: 100 } }
+                    Behavior on color { ColorAnimation { duration: AppSettings.animationsEnabled ? 100 : 0 } }
                 }
                 Label {
                     id: includeTranscriptionsLabel
@@ -1144,6 +1181,122 @@ Rectangle {
                                 anchors.centerIn: parent
                                 text: "×"
                                 color: tagChipRemoveHover.hovered ? "white" : "#999999"
+                                font.pixelSize: 12
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Speaker filter — mirrors the tag filter immediately above
+        // (RowLayout TextField+clear, then a removable-chips Flow) but
+        // against VaultSearchProxyModel.speakerFilter/VaultTreeModel's
+        // SpeakersRole instead of tags. No autocomplete-suggestions popup
+        // (unlike tagFilterField's tagSuggestions()) — not requested, and
+        // speaker vocabulary isn't vault-wide indexed the way tags are.
+        RowLayout {
+            width: parent.width
+            height: 24
+            spacing: 6
+
+            TextField {
+                id: speakerFilterField
+                Layout.fillWidth: true
+                Layout.preferredHeight: 24
+                placeholderText: qsTr("Filter by speakers (comma-separated)…")
+                text: sidebar.speakerFilterText
+                onTextChanged: sidebar.speakerFilterText = text
+
+                background: UnderlineField { focused: speakerFilterField.activeFocus }
+
+                HoverHandler {
+                    cursorShape: Qt.IBeamCursor
+                }
+            }
+
+            Item {
+                id: speakerFilterClearButton
+                visible: sidebar.speakerFilterText !== ""
+                Layout.preferredWidth: 20
+                Layout.preferredHeight: 20
+
+                HoverHandler {
+                    id: speakerFilterClearHover
+                    cursorShape: Qt.PointingHandCursor
+                }
+                TapHandler {
+                    onTapped: sidebar.speakerFilterText = ""
+                }
+                HoverBorder {
+                    anchors.fill: parent
+                    active: speakerFilterClearHover.hovered
+                }
+                Text {
+                    anchors.centerIn: parent
+                    text: "×"
+                    color: "#dddddd"
+                    font.pixelSize: 15
+                }
+            }
+        }
+
+        Flow {
+            id: speakerChipsFlow
+            width: parent.width
+            visible: sidebar.activeSpeakerFilters.length > 0
+            spacing: 4
+
+            Repeater {
+                model: sidebar.activeSpeakerFilters
+
+                Rectangle {
+                    id: speakerChip
+                    required property string modelData
+                    required property int index
+                    radius: AppSettings.borderRadius
+                    color: speakerChipHover.hovered ? "#3f3f3f" : "#333333"
+                    border.width: 1
+                    border.color: "#4a4a4a"
+                    implicitWidth: speakerChipRow.implicitWidth + 10
+                    implicitHeight: speakerChipRow.implicitHeight + 6
+
+                    HoverHandler {
+                        id: speakerChipHover
+                    }
+
+                    Row {
+                        id: speakerChipRow
+                        anchors.centerIn: parent
+                        spacing: 4
+
+                        Label {
+                            anchors.verticalCenter: parent.verticalCenter
+                            text: speakerChip.modelData
+                            color: "#cccccc"
+                            font.pixelSize: 11
+                        }
+
+                        Item {
+                            id: speakerChipRemove
+                            anchors.verticalCenter: parent.verticalCenter
+                            width: 12
+                            height: 12
+
+                            HoverHandler {
+                                id: speakerChipRemoveHover
+                                cursorShape: Qt.PointingHandCursor
+                            }
+                            TapHandler {
+                                onTapped: {
+                                    const remaining = sidebar.activeSpeakerFilters.filter((s, i) => i !== speakerChip.index)
+                                    sidebar.speakerFilterText = remaining.join(", ")
+                                }
+                            }
+                            Text {
+                                anchors.centerIn: parent
+                                text: "×"
+                                color: speakerChipRemoveHover.hovered ? "white" : "#999999"
                                 font.pixelSize: 12
                             }
                         }
@@ -1862,7 +2015,7 @@ Rectangle {
                     enabled: opacity > 0
 
                     Behavior on opacity {
-                        NumberAnimation { duration: 120 }
+                        NumberAnimation { duration: AppSettings.animationsEnabled ? 120 : 0 }
                     }
 
                     ToolTip.visible: rowTranscribeHover.hovered
@@ -1917,7 +2070,7 @@ Rectangle {
                     enabled: opacity > 0
 
                     Behavior on opacity {
-                        NumberAnimation { duration: 120 }
+                        NumberAnimation { duration: AppSettings.animationsEnabled ? 120 : 0 }
                     }
 
                     ToolTip.visible: rowRelabelHover.hovered
@@ -1968,7 +2121,7 @@ Rectangle {
                     enabled: opacity > 0
 
                     Behavior on opacity {
-                        NumberAnimation { duration: 120 }
+                        NumberAnimation { duration: AppSettings.animationsEnabled ? 120 : 0 }
                     }
 
                     ToolTip.visible: rowChaptersHover.hovered
@@ -2040,7 +2193,7 @@ Rectangle {
                 enabled: opacity > 0
 
                 Behavior on opacity {
-                    NumberAnimation { duration: 120 }
+                    NumberAnimation { duration: AppSettings.animationsEnabled ? 120 : 0 }
                 }
 
                 ToolTip.visible: groupMergeHover.hovered
@@ -2073,7 +2226,7 @@ Rectangle {
                     border.color: treeDelegate.combineGroupColor
                     opacity: groupMergeButton.enabled && groupMergeHover.hovered ? 1 : 0
                     Behavior on opacity {
-                        NumberAnimation { duration: 100 }
+                        NumberAnimation { duration: AppSettings.animationsEnabled ? 100 : 0 }
                     }
                 }
                 Text {
@@ -2108,7 +2261,7 @@ Rectangle {
                 opacity: sidebar.hoveredCombineGroup === treeDelegate.combineOutputPath ? 1 : 0
 
                 Behavior on opacity {
-                    NumberAnimation { duration: 120 }
+                    NumberAnimation { duration: AppSettings.animationsEnabled ? 120 : 0 }
                 }
 
                 Rectangle {

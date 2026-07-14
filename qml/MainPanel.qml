@@ -1,5 +1,6 @@
 import QtQuick
 import QtQuick.Controls
+import QtQuick.Dialogs
 import QtQuick.Layouts
 import SuopTranscriber
 
@@ -9,14 +10,31 @@ Rectangle {
     property url vaultPath
     property string vaultLocalPath: ""
     property AudioPlayer player
+    property AudioRecorder audioRecorder
     property TranscriptionController transcriptionController
     property VaultTreeModel vaultTreeModel
+    // Set true/false only by TitleBar's record toggle (see Main.qml's
+    // onRecordRequested) — gates the recorder page below and hides the
+    // normal per-file content while it's showing (see the two `visible:`
+    // bindings just above the recorder page block).
+    property bool recording: false
     property var storedMetadata: ({})
     readonly property bool hasStoredMetadata: Object.keys(mainPanel.storedMetadata).length > 0
+    // Gates transcriptArea's editability below — mirrors
+    // transcribeIconButton.isActive's own busy+currentFile check further
+    // down this file. Editing while this file's transcription job is
+    // actively appending live segments would fight the same text the user
+    // is typing into.
+    readonly property bool transcribingThisFile: mainPanel.transcriptionController && mainPanel.player
+        && mainPanel.transcriptionController.busy
+        && mainPanel.transcriptionController.currentFile.toString() === mainPanel.player.source.toString()
     signal openVaultRequested()
     // Item 16 (Wave E): a tag pill was clicked — Main.qml routes this to
     // sidebar.applyTagFilter(tag).
     signal tagActivated(string tag)
+    // A speaker pill was clicked — Main.qml routes this to
+    // sidebar.applySpeakerFilter(name), mirroring tagActivated above.
+    signal speakerActivated(string name)
 
     // Text-only view for an orphaned .md (no matching audio) — mutually
     // exclusive with player.source; showAudioFile()/showOrphanedMd() below
@@ -24,15 +42,12 @@ Rectangle {
     property string orphanedMdPath: ""
     property var orphanedMdMetadata: ({})
 
-    property bool renamingTitle: false
-
     // Feature 2: multi-paragraph, editable prelude (upgrades O26's old
     // read-only single-line summary) — lives in the .md BODY, not
     // storedMetadata/frontmatter (see TranscriptionController::readPrelude()),
     // so it needs its own property, populated alongside storedMetadata in
     // refreshMetadata() below.
     property string prelude: ""
-    property bool editingPrelude: false
 
     // Feature 3b/3c: chapter markers (see
     // TranscriptionController::readChapters()) — shared by the seek-bar tick
@@ -65,6 +80,15 @@ Rectangle {
         return dot > 0 ? name.substring(0, dot) : name
     }
 
+    // Recorder page's live duration counter — audioRecorder.elapsedMs is
+    // wall-clock ms since capture actually began (see AudioRecorder.h).
+    function formatDuration(ms) {
+        const totalSeconds = Math.floor(ms / 1000)
+        const minutes = Math.floor(totalSeconds / 60)
+        const seconds = totalSeconds % 60
+        return (minutes < 10 ? "0" : "") + minutes + ":" + (seconds < 10 ? "0" : "") + seconds
+    }
+
     function refreshMetadata() {
         storedMetadata = (player && player.source.toString() !== "" && transcriptionController)
             ? transcriptionController.readMetadata(player.source) : ({})
@@ -74,6 +98,13 @@ Rectangle {
         // every other stored setting here.
         speakerDetectionToggle.checked =
             mainPanel.hasStoredMetadata ? storedMetadata.speakerDetection === true : true
+        // titleField is always-editable (no display/edit swap — see its doc
+        // comment), so its `text: displayTitle()` binding is a one-shot: it's
+        // severed the first time the user types. Resync explicitly on every
+        // metadata refresh, skipped while the user is actively editing so
+        // this never fights their in-progress typing.
+        if (!titleField.activeFocus)
+            titleField.text = mainPanel.displayTitle()
     }
 
     // Item P23: split out of refreshMetadata() above — prelude/chapters live
@@ -109,11 +140,17 @@ Rectangle {
             : (player ? player.source.toString() : "")
         mainPanel.chapters = (chaptersUrl !== "" && transcriptionController)
             ? transcriptionController.readChapters(chaptersUrl) : []
+        // preludeArea is always-editable (see its doc comment) — same
+        // one-shot-binding caveat as titleField, resynced here.
+        if (!preludeArea.activeFocus)
+            preludeArea.text = mainPanel.prelude
     }
 
     function refreshOrphanedMetadata() {
         orphanedMdMetadata = (mainPanel.orphanedMdPath !== "" && mainPanel.transcriptionController)
             ? mainPanel.transcriptionController.readMetadata("file://" + mainPanel.orphanedMdPath) : ({})
+        if (!titleField.activeFocus)
+            titleField.text = mainPanel.displayTitle()
     }
 
     function showAudioFile(path) {
@@ -195,11 +232,6 @@ Rectangle {
     // case, since it rewrites the transcript body sentences reads from.
     property int sentencesRevision: 0
 
-    // Which speaker pill (if any) is currently showing its rename TextField
-    // — mirrors renamingTitle's click-to-rename pattern, just keyed by id
-    // since there can be several pills.
-    property string renamingSpeakerId: ""
-
     // Surfaced briefly next to the Speakers row (see speakerOpErrorTimer) —
     // this app has no toast/notification system, so a small inline red
     // label is the simplest consistent way to explain a rejected rename OR
@@ -212,6 +244,16 @@ Rectangle {
         id: speakerOpErrorTimer
         interval: 4000
         onTriggered: mainPanel.speakerOpError = ""
+    }
+
+    // Same auto-clearing inline-banner shape as speakerOpError above, for
+    // commitTranscriptEdits()'s rejection paths.
+    property string transcriptEditError: ""
+
+    Timer {
+        id: transcriptEditErrorTimer
+        interval: 4000
+        onTriggered: mainPanel.transcriptEditError = ""
     }
 
     // The file a speaker rename/merge should be applied to — the orphaned-md
@@ -231,7 +273,6 @@ Rectangle {
     // (possibly already-overridden) name.
     function commitSpeakerRename(oldName, newValue) {
         const trimmed = newValue.trim()
-        mainPanel.renamingSpeakerId = ""
         if (trimmed === "" || !mainPanel.transcriptionController)
             return
         if (trimmed === mainPanel.effectiveSpeakerName(oldName))
@@ -455,6 +496,10 @@ Rectangle {
         case "tags":
             mainPanel.transcriptionController.setTags(entry.fileUrl, entry.oldValue)
             break
+        case "transcriptText":
+            if (mainPanel.transcriptionController.setSentenceTexts(entry.fileUrl, entry.oldValue))
+                mainPanel.sentencesRevision += 1
+            break
         case "speakerRename": {
             // Mirrors commitSpeakerRename()'s own optimistic overlay so the
             // pill updates instantly here too, not just via the eventual
@@ -486,9 +531,15 @@ Rectangle {
 
     function commitRename(newValue) {
         const trimmed = newValue.trim()
-        mainPanel.renamingTitle = false
-        if (trimmed === "" || !mainPanel.transcriptionController)
+        if (trimmed === "" || !mainPanel.transcriptionController) {
+            // titleField.text lost its declarative binding to displayTitle()
+            // the moment the user typed into it (QML severs a `text: expr`
+            // binding on the first imperative write) — resync explicitly here
+            // and at every other exit path below so it always reflects the
+            // real on-disk value once the field loses focus.
+            titleField.text = mainPanel.displayTitle()
             return
+        }
 
         if (mainPanel.orphanedMdPath !== "") {
             if (AppSettings.useLabelsMainPanel) {
@@ -526,22 +577,79 @@ Rectangle {
         }
     }
 
-    // Feature 2: Save action for the prelude editor below. Explicit
-    // Save/Cancel rather than commit-on-Enter (titleField's pattern) since
-    // the prelude is multi-line — plain Enter has to insert a newline
-    // instead. Orphaned-md files never show the prelude editor (see its
-    // visible: condition below), so unlike commitRename() this only needs
-    // the player.source path. setLabel()'s failures are already silently
-    // ignored by commitRename() above; matched here for consistency.
+    // Autosaves the prelude editor below on blur (see preludeArea's
+    // onActiveFocusChanged) — no explicit Save/Cancel; plain Enter just
+    // inserts a newline since the prelude is multi-line, same as
+    // transcriptArea's own blur-commit below. Orphaned-md files never show
+    // the prelude editor (see its visible: condition below), so unlike
+    // commitRename() this only needs the player.source path. setLabel()'s
+    // failures are already silently ignored by commitRename() above;
+    // matched here for consistency.
     function commitPrelude(newValue) {
-        mainPanel.editingPrelude = false
-        if (!mainPanel.transcriptionController || !mainPanel.player || mainPanel.player.source.toString() === "")
+        if (!mainPanel.transcriptionController || !mainPanel.player || mainPanel.player.source.toString() === "") {
+            preludeArea.text = mainPanel.prelude
             return
-        if (newValue !== mainPanel.prelude)
-            mainPanel.pushUndo({type: "prelude", fileUrl: mainPanel.player.source, oldValue: mainPanel.prelude})
+        }
+        if (newValue === mainPanel.prelude)
+            return
+        mainPanel.pushUndo({type: "prelude", fileUrl: mainPanel.player.source, oldValue: mainPanel.prelude})
         mainPanel.transcriptionController.setPrelude(mainPanel.player.source, newValue)
         mainPanel.refreshMetadata()
         mainPanel.refreshPreludeAndChapters()
+    }
+
+    // Commits transcriptArea's edited text back to the vault file — called
+    // on blur (see transcriptArea's onActiveFocusChanged). newText is the
+    // WHOLE document; Return is blocked from inserting a newline and pasted
+    // newlines are collapsed (see transcriptArea's Keys.onReturnPressed and
+    // onTextChanged) specifically to preserve the one-line-per-sentence
+    // invariant displaySentences' char offsets depend on — the line-count
+    // check below is a defensive fallback, not the primary guard.
+    function commitTranscriptEdits(newText) {
+        if (!mainPanel.transcriptionController || !mainPanel.player || mainPanel.player.source.toString() === "")
+            return
+        const lines = newText.split("\n")
+        const entries = mainPanel.displaySentences
+        if (lines.length !== entries.length) {
+            mainPanel.transcriptEditError = qsTr("Edit not saved: line count changed unexpectedly.")
+            transcriptEditErrorTimer.restart()
+            transcriptArea.text = mainPanel.displayText
+            return
+        }
+
+        const edits = []
+        const oldValues = []
+        for (let i = 0; i < entries.length; i++) {
+            const entry = entries[i]
+            if (entry.isChapterHeading)
+                continue // blank reserved line — not editable content, see displayData
+            // entry.text may carry a trailing " (Nx)" repeat-count marker
+            // beyond entry.length (see displayData's doc comment) — derive
+            // it generically and strip it back off the (possibly edited)
+            // line before treating the rest as the new spoken-words text, so
+            // the marker itself is never sent as part of an edit.
+            const suffix = entry.text.length > entry.length ? entry.text.slice(entry.length) : ""
+            let line = lines[i]
+            if (suffix !== "" && line.endsWith(suffix))
+                line = line.slice(0, line.length - suffix.length)
+            const original = entry.text.slice(0, entry.length)
+            if (line !== original) {
+                edits.push({t0: entry.t0, text: line})
+                oldValues.push({t0: entry.t0, text: original})
+            }
+        }
+        if (edits.length === 0)
+            return // no-op: nothing actually changed
+
+        mainPanel.pushUndo({type: "transcriptText", fileUrl: mainPanel.player.source, oldValue: oldValues})
+        const ok = mainPanel.transcriptionController.setSentenceTexts(mainPanel.player.source, edits)
+        if (ok) {
+            mainPanel.sentencesRevision += 1
+        } else {
+            mainPanel.transcriptEditError = qsTr("Edit not saved: could not write the file.")
+            transcriptEditErrorTimer.restart()
+            transcriptArea.text = mainPanel.displayText
+        }
     }
 
     // Item P15/P20: adds/removes one tag from the current file's list and
@@ -567,6 +675,29 @@ Rectangle {
         const current = mainPanel.currentTags()
         mainPanel.pushUndo({type: "tags", fileUrl: mainPanel.currentFileUrl(), oldValue: current})
         mainPanel.transcriptionController.setTags(mainPanel.currentFileUrl(), current.filter(t => t !== tag))
+    }
+
+    // Inline rename of an existing tag pill (mirrors commitSpeakerRename's
+    // shape) — maps onto the same bulk setTags(wholeArray) API rather than a
+    // dedicated C++ call, since there is no single-tag rename primitive (nor
+    // any need for one: the whole array is small and already rewritten
+    // wholesale by add/removeTag above).
+    function renameTag(oldTag, newValue) {
+        const trimmed = newValue.trim()
+        if (trimmed === "" || !mainPanel.transcriptionController)
+            return
+        if (trimmed === oldTag)
+            return // no-op: unchanged
+        const current = mainPanel.currentTags()
+        if (current.some(t => t !== oldTag && t.toLowerCase() === trimmed.toLowerCase()))
+            return // no-op: duplicate (case-insensitive) — silent, matches addTag()'s own dup handling
+        const idx = current.indexOf(oldTag)
+        if (idx < 0)
+            return
+        const updated = current.slice()
+        updated[idx] = trimmed
+        mainPanel.pushUndo({type: "tags", fileUrl: mainPanel.currentFileUrl(), oldValue: current})
+        mainPanel.transcriptionController.setTags(mainPanel.currentFileUrl(), updated)
     }
 
     // Item P23: transcriptBody/sentences used to be readonly computed
@@ -776,6 +907,14 @@ Rectangle {
     }
     readonly property string displayText: mainPanel.displayData.text
     readonly property var displaySentences: mainPanel.displayData.sentences
+    // transcriptArea is always-editable (see its doc comment) — its
+    // `text: mainPanel.displayText` binding is a one-shot, severed the
+    // moment the user types (same caveat as titleField/preludeArea above).
+    // displayText is a plain property (unlike displayTitle()/prelude's
+    // refresh-function-driven resync), so its own change signal is the
+    // simplest resync hook — skipped while focused so this never fights an
+    // in-progress edit.
+    onDisplayTextChanged: if (!transcriptArea.activeFocus) transcriptArea.text = mainPanel.displayText
 
     // Gutter column layout (Item: separate gutter areas for timestamp vs.
     // speaker name, kept as named constants so both are easy to re-style/
@@ -796,6 +935,16 @@ Rectangle {
     // Sized to the widest speaker name actually shown (renamed or not) —
     // 0 when the transcript has no speaker detection at all, so no gutter
     // (and no spacing gap) is reserved for a column nothing will use.
+    // Clicking a speaker name IN THE GUTTER (as opposed to clicking a
+    // speaker PILL above, which filters the sidebar — see speakerActivated)
+    // dims every OTHER speaker's lines in the currently-open transcript,
+    // toggled off by clicking the same name again. Deliberately does not
+    // touch transcriptArea's actual text/selection at all (see
+    // speakerDimOverlayRepeater below) — the document stays one continuous
+    // editable string throughout, only a visual overlay changes, so this
+    // can't conflict with Step C's always-editable transcript.
+    property string gutterSpeakerFilter: ""
+
     readonly property real speakerGutterWidth: {
         if (mainPanel.distinctSpeakerIds.length === 0)
             return 0
@@ -1104,6 +1253,7 @@ Rectangle {
             mainPanel.beginTranscriptLoad()
             transcriptRepaintNudgeTimer.restart()
             mainPanel.undoStack = []
+            mainPanel.gutterSpeakerFilter = ""
         }
     }
     // Item P8/P16: showOrphanedMd() switches files by setting orphanedMdPath
@@ -1115,6 +1265,7 @@ Rectangle {
         mainPanel.beginTranscriptLoad()
         transcriptRepaintNudgeTimer.restart()
         mainPanel.undoStack = []
+        mainPanel.gutterSpeakerFilter = ""
     }
     Connections {
         target: mainPanel.transcriptionController
@@ -1225,7 +1376,7 @@ Rectangle {
 
     Item {
         anchors.fill: parent
-        visible: mainPanel.vaultPath.toString() === ""
+        visible: mainPanel.vaultPath.toString() === "" && !mainPanel.recording
 
         Button {
             id: openVaultButton
@@ -1254,7 +1405,7 @@ Rectangle {
         anchors.fill: parent
         anchors.margins: 16
         spacing: 12
-        visible: mainPanel.vaultPath.toString() !== ""
+        visible: mainPanel.vaultPath.toString() !== "" && !mainPanel.recording
 
         // Item 13: playback progress bar relocated to the very top, full
         // width, with a play/pause icon instead of a separate Play button.
@@ -1371,10 +1522,10 @@ Rectangle {
                         radius: width / 2
                         color: "transparent"
                         border.width: 1
-                        border.color: "white"
+                        border.color: AppSettings.accentColor
                         opacity: seekSlider.hovered ? 1 : 0
                         Behavior on opacity {
-                            NumberAnimation { duration: 100 }
+                            NumberAnimation { duration: AppSettings.animationsEnabled ? 100 : 0 }
                         }
                     }
                     Rectangle {
@@ -1447,45 +1598,41 @@ Rectangle {
                     Item {
                         id: titleRow
                         Layout.fillWidth: true
-                        implicitHeight: Math.max(titleLabel.implicitHeight, titleField.implicitHeight)
+                        implicitHeight: titleField.implicitHeight
 
-                        Label {
-                            id: titleLabel
-                            anchors.fill: parent
-                            visible: !mainPanel.renamingTitle
-                            elide: Text.ElideMiddle
-                            text: mainPanel.displayTitle()
-                            color: "white"
-                            font.pixelSize: 14
-
-                            HoverHandler {
-                                id: titleHover
-                                cursorShape: Qt.PointingHandCursor
-                            }
-                            TapHandler {
-                                onTapped: {
-                                    titleField.text = mainPanel.displayTitle()
-                                    mainPanel.renamingTitle = true
-                                    titleField.forceActiveFocus()
-                                    titleField.selectAll()
-                                }
-                            }
-                            HoverBorder {
-                                anchors.fill: parent
-                                active: titleHover.hovered
-                            }
-                        }
-
+                        // Always-editable: a single TextField is present at all
+                        // times (no display-Label/edit-TextField swap), styled by
+                        // UnderlineField to look like plain text until focused.
+                        // This is what fixes the right-click-copy bug — since
+                        // there is no visibility state tied to focus, the native
+                        // TextEditingContextMenu stealing focus on right-click can
+                        // no longer hide the field out from under the user.
                         TextField {
                             id: titleField
                             anchors.fill: parent
-                            visible: mainPanel.renamingTitle
+                            color: "white"
+                            font.pixelSize: 14
+                            text: mainPanel.displayTitle()
+                            // QQC2's Basic-style TextField has its own
+                            // padding (6px, +4 more on the left) and
+                            // UnderlineField's background otherwise imposes
+                            // a 24px min-height — both invisible while this
+                            // was a transient edit-mode field, but a
+                            // permanent, jarring size/spacing change now
+                            // that it's always present. Zeroed so this reads
+                            // at exactly the old Label's tight size.
+                            padding: 0
+                            leftPadding: 0
+                            rightPadding: 0
+                            topPadding: 0
+                            bottomPadding: 0
+
                             onAccepted: mainPanel.commitRename(text)
-                            onActiveFocusChanged: if (!activeFocus && mainPanel.renamingTitle) mainPanel.commitRename(text)
+                            onActiveFocusChanged: if (!activeFocus) mainPanel.commitRename(text)
 
-                            background: UnderlineField { focused: titleField.activeFocus }
+                            background: UnderlineField { implicitHeight: 0; focused: titleField.activeFocus }
 
-                            Keys.onEscapePressed: mainPanel.renamingTitle = false
+                            Keys.onEscapePressed: titleField.text = mainPanel.displayTitle()
                         }
                     }
 
@@ -1504,7 +1651,7 @@ Rectangle {
                     Label {
                         id: filenameSubtitle
                         Layout.fillWidth: true
-                        visible: !mainPanel.renamingTitle && AppSettings.useLabelsMainPanel
+                        visible: AppSettings.useLabelsMainPanel
                                  && mainPanel.orphanedMdPath === "" && !!mainPanel.storedMetadata.label
                         elide: Text.ElideMiddle
                         text: (mainPanel.player && mainPanel.player.source.toString() !== "")
@@ -1819,19 +1966,29 @@ Rectangle {
                             implicitWidth: tagPillRow.implicitWidth + 12
                             implicitHeight: tagPillRow.implicitHeight + 6
 
-                            // Item 16 (Wave E): clicking the pill body (NOT
-                            // the "x" below) filters the sidebar tree to
-                            // files with that tag — the "x" TapHandler grabs
-                            // the point first when the tap lands inside it
-                            // (same exclusive-grab pattern already used by
-                            // speakerPillItem's rename tap vs. its merge-
-                            // confirm ✓/✕ labels), so the two never both fire.
+                            // tagField below is directly editable (plain
+                            // click places the cursor, same idiom as
+                            // titleField/preludeArea) — filtering the
+                            // sidebar tree by this tag now goes through
+                            // tagSortIcon's dedicated trigger instead of the
+                            // pill body, so the two can never both fire off
+                            // one tap.
                             HoverHandler {
                                 id: tagPillHover
                                 cursorShape: Qt.PointingHandCursor
                             }
-                            TapHandler {
-                                onTapped: mainPanel.tagActivated(tagPill.modelData)
+
+                            // Reverts to the true on-disk tag text if the
+                            // field was left empty, otherwise hands off to
+                            // renameTag() — mirrors speakerPillItem's own
+                            // commitOrRevert (see its doc comment for why
+                            // this can't live inside renameTag() itself).
+                            function commitOrRevert(value) {
+                                if (value.trim() === "") {
+                                    tagField.text = tagPill.modelData
+                                    return
+                                }
+                                mainPanel.renameTag(tagPill.modelData, value)
                             }
 
                             RowLayout {
@@ -1839,11 +1996,52 @@ Rectangle {
                                 anchors.centerIn: parent
                                 spacing: 4
 
-                                Label {
-                                    id: tagLabel
-                                    text: tagPill.modelData
+                                TextField {
+                                    id: tagField
+                                    Layout.alignment: Qt.AlignVCenter
                                     color: "#cccccc"
                                     font.pixelSize: 11
+                                    text: tagPill.modelData
+                                    selectByMouse: true
+                                    // See titleField's doc comment — zeroed
+                                    // to match the old Label's tight sizing
+                                    // inside this pill.
+                                    padding: 0
+                                    leftPadding: 0
+                                    rightPadding: 0
+                                    topPadding: 0
+                                    bottomPadding: 0
+
+                                    onAccepted: tagPill.commitOrRevert(text)
+                                    onActiveFocusChanged: if (!activeFocus) tagPill.commitOrRevert(text)
+
+                                    background: UnderlineField { implicitHeight: 0; focused: tagField.activeFocus }
+
+                                    Keys.onEscapePressed: tagField.text = tagPill.modelData
+                                }
+
+                                // Filters the sidebar tree to files with this
+                                // tag (see mainPanel.tagActivated's doc
+                                // comment) — a dedicated button rather than
+                                // the pencil-icon-doubling-as-edit-trigger
+                                // this used to be, since that made a single
+                                // tap on the icon fire BOTH the sidebar
+                                // filter and (via tagField's own click-to-
+                                // edit) a text edit at once.
+                                Text {
+                                    id: tagSortIcon
+                                    Layout.alignment: Qt.AlignVCenter
+                                    text: "▽"
+                                    color: tagSortIconHover.hovered ? "#dddddd" : "#888888"
+                                    font.pixelSize: 10
+
+                                    HoverHandler {
+                                        id: tagSortIconHover
+                                        cursorShape: Qt.PointingHandCursor
+                                    }
+                                    TapHandler {
+                                        onTapped: mainPanel.tagActivated(tagPill.modelData)
+                                    }
                                 }
 
                                 // Item P20: per-pill delete — always visible
@@ -1869,68 +2067,35 @@ Rectangle {
                         }
                     }
 
-                    // Item P15: inline "+ tag" affordance — a small icon
-                    // that swaps to a compact TextField on click (mirrors
-                    // the title/prelude/speaker-pill click-to-edit idiom
-                    // already used throughout this file), committing on
-                    // Enter or on losing focus.
-                    Item {
-                        id: tagAddButton
-                        visible: !tagAddField.editing
-                        implicitWidth: tagAddLabel.implicitWidth + 12
-                        implicitHeight: tagAddLabel.implicitHeight + 6
-
-                        HoverHandler {
-                            id: tagAddHover
-                            cursorShape: Qt.PointingHandCursor
-                        }
-                        TapHandler {
-                            onTapped: {
-                                tagAddField.editing = true
-                                tagAddField.forceActiveFocus()
-                            }
-                        }
-                        Rectangle {
-                            anchors.fill: parent
-                            radius: AppSettings.borderRadius
-                            color: tagAddHover.hovered ? "#3f3f3f" : "transparent"
-                            border.width: 1
-                            border.color: "#4a4a4a"
-                        }
-                        Label {
-                            id: tagAddLabel
-                            anchors.centerIn: parent
-                            text: "+ " + qsTr("tag")
-                            color: "#999999"
-                            font.pixelSize: 11
-                        }
-                    }
-
+                    // Always-editable "+ tag" entry field (see titleField's
+                    // doc comment for the general pattern) — a single
+                    // TextField is present at all times, no icon/TextField
+                    // swap. Committing (Enter) adds the tag and clears back
+                    // to the placeholder; losing focus without committing
+                    // discards whatever partial text was typed (this field
+                    // has no persisted value of its own to revert to, unlike
+                    // title/prelude/speaker/tag-rename above).
                     TextField {
                         id: tagAddField
-                        property bool editing: false
-                        visible: editing
-                        implicitWidth: 100
+                        implicitWidth: 70
                         font.pixelSize: 11
-                        placeholderText: qsTr("New tag…")
+                        placeholderText: "+ " + qsTr("tag")
+                        // See titleField's doc comment — zeroed to match the
+                        // tag pills' own tight sizing.
+                        padding: 0
+                        leftPadding: 0
+                        rightPadding: 0
+                        topPadding: 0
+                        bottomPadding: 0
 
-                        background: UnderlineField { focused: tagAddField.activeFocus }
+                        background: UnderlineField { implicitHeight: 0; focused: tagAddField.activeFocus }
 
                         onAccepted: {
                             mainPanel.addTag(text)
                             text = ""
-                            tagAddField.editing = false
                         }
-                        onActiveFocusChanged: {
-                            if (!activeFocus) {
-                                tagAddField.editing = false
-                                tagAddField.text = ""
-                            }
-                        }
-                        Keys.onEscapePressed: {
-                            tagAddField.editing = false
-                            tagAddField.text = ""
-                        }
+                        onActiveFocusChanged: if (!activeFocus) text = ""
+                        Keys.onEscapePressed: text = ""
                     }
                 }
 
@@ -1958,15 +2123,27 @@ Rectangle {
                         Item {
                             id: speakerPillItem
                             required property string modelData
-                            readonly property bool renaming: mainPanel.renamingSpeakerId === modelData
                             readonly property bool confirmingMerge: mainPanel.mergeConfirmSourceId === modelData
                             readonly property bool pendingMerge: modelData in mainPanel.pendingSpeakerMerges
                             readonly property bool isDropTarget: mainPanel.dragHoverSpeakerId === modelData
-                            implicitWidth: (renaming ? speakerNameField.implicitWidth
-                                            : confirmingMerge ? mergeConfirmRow.implicitWidth
-                                            : speakerPillLabel.implicitWidth) + 12
+                            implicitWidth: (confirmingMerge ? mergeConfirmRow.implicitWidth
+                                            : speakerPillRow.implicitWidth) + 12
                             implicitHeight: 22
                             opacity: pendingMerge ? 0.5 : 1.0
+
+                            // Reverts to the true on-disk name if the field was
+                            // left empty, otherwise hands off to
+                            // commitSpeakerRename() — factored out since both
+                            // onAccepted and onActiveFocusChanged below need it,
+                            // and commitSpeakerRename() itself has no way to
+                            // reach back into this specific delegate's field.
+                            function commitOrRevert(value) {
+                                if (value.trim() === "") {
+                                    speakerNameField.text = mainPanel.effectiveSpeakerName(speakerPillItem.modelData)
+                                    return
+                                }
+                                mainPanel.commitSpeakerRename(speakerPillItem.modelData, value)
+                            }
 
                             Rectangle {
                                 anchors.fill: parent
@@ -1975,32 +2152,38 @@ Rectangle {
                                        : speakerPillHover.hovered ? "#3f5f7f" : "#2f4f5f"
                                 border.width: speakerPillItem.isDropTarget ? 2 : 1
                                 border.color: speakerPillItem.isDropTarget ? "#6fdf9f" : "#4a6a7a"
-                                visible: !speakerPillItem.renaming
                             }
                             HoverHandler {
                                 id: speakerPillHover
                                 cursorShape: Qt.PointingHandCursor
-                                enabled: !speakerPillItem.renaming && !speakerPillItem.confirmingMerge
+                                enabled: !speakerPillItem.confirmingMerge
                             }
-                            TapHandler {
-                                enabled: !speakerPillItem.renaming && !speakerPillItem.confirmingMerge
-                                         && !speakerPillItem.pendingMerge
-                                onTapped: {
-                                    speakerNameField.text = mainPanel.effectiveSpeakerName(speakerPillItem.modelData)
-                                    mainPanel.renamingSpeakerId = speakerPillItem.modelData
-                                    speakerNameField.forceActiveFocus()
-                                    speakerNameField.selectAll()
-                                }
-                            }
+                            // Filtering the sidebar file tree by this speaker
+                            // now goes through speakerSortIcon's dedicated
+                            // trigger below (mirrors tagPill's own
+                            // tagSortIcon) rather than the pill body — a
+                            // plain click on the pill instead falls through
+                            // to speakerNameField for direct editing.
+                            //
                             // Drag source AND (via mainPanel.speakerIdAtScenePos())
-                            // the mechanism that finds the drop target — coexists
-                            // with the TapHandler above; Qt's pointer handlers
-                            // already disambiguate a plain tap (rename) from a
-                            // drag past the movement threshold (merge).
+                            // the mechanism that finds the drop target. Coexists
+                            // with speakerNameField's own click-to-focus/text-
+                            // selection below via Qt's pointer-handler grab
+                            // arbitration — a plain click or short drag (cursor
+                            // placement, text selection) falls through to the
+                            // TextField; only a drag past DragHandler's movement
+                            // threshold takes an exclusive grab (merge). Once the
+                            // field actually HAS focus, disabled outright so an
+                            // in-progress text-selection drag can never be
+                            // hijacked into a merge-drag (see its own landmine
+                            // comment history — real click-drag text selection
+                            // was previously judged incompatible with this
+                            // gesture; disabling only while focused resolves it
+                            // without giving up either capability).
                             DragHandler {
                                 id: speakerPillDrag
-                                enabled: !speakerPillItem.renaming && !speakerPillItem.confirmingMerge
-                                         && !speakerPillItem.pendingMerge
+                                enabled: !speakerPillItem.confirmingMerge && !speakerPillItem.pendingMerge
+                                         && !speakerNameField.activeFocus
                                 target: null
                                 onActiveChanged: {
                                     if (active) {
@@ -2025,27 +2208,87 @@ Rectangle {
                                         mainPanel.speakerIdAtScenePos(scenePos.x, scenePos.y, speakerPillItem.modelData)
                                 }
                             }
-                            Label {
-                                id: speakerPillLabel
-                                anchors.centerIn: parent
-                                visible: !speakerPillItem.renaming && !speakerPillItem.confirmingMerge
-                                text: mainPanel.effectiveSpeakerName(speakerPillItem.modelData)
-                                color: "#dddddd"
-                                font.pixelSize: 11
 
-                                // Item P27: cursor-shape-only treatment — the
-                                // pill's TapHandler (rename) and DragHandler
-                                // (merge, both declared on the parent
-                                // speakerPillItem above) grab on press, so
-                                // giving this label real click-drag text
-                                // selection (a TextEdit/MouseArea, which
-                                // would need its own grab) would compete
-                                // with — and likely break — the existing
-                                // drag-to-merge gesture. HoverHandler alone
-                                // never grabs, so it can show the I-beam
-                                // hint without taking over the pointer.
-                                HoverHandler {
-                                    cursorShape: Qt.IBeamCursor
+                            // Always-editable (see titleField's doc comment
+                            // for the general pattern): a single TextField is
+                            // present at all times, no Label/TextField swap,
+                            // and a plain click places the cursor directly
+                            // (activeFocusOnPress/selectByMouse both true) —
+                            // speakerSortIcon is the dedicated sidebar-filter
+                            // trigger instead. Hidden only while this pill is
+                            // showing its merge-confirmation row.
+                            Row {
+                                id: speakerPillRow
+                                anchors.centerIn: parent
+                                spacing: 3
+                                visible: !speakerPillItem.confirmingMerge
+
+                                TextField {
+                                    id: speakerNameField
+                                    anchors.verticalCenter: parent.verticalCenter
+                                    color: "#dddddd"
+                                    font.pixelSize: 11
+                                    text: mainPanel.effectiveSpeakerName(speakerPillItem.modelData)
+                                    selectByMouse: true
+                                    // See titleField's doc comment — zeroed
+                                    // so this fits the pill's fixed 22px
+                                    // implicitHeight the same as the old
+                                    // Label did, instead of overflowing it.
+                                    padding: 0
+                                    leftPadding: 0
+                                    rightPadding: 0
+                                    topPadding: 0
+                                    bottomPadding: 0
+
+                                    onAccepted: speakerPillItem.commitOrRevert(text)
+                                    onActiveFocusChanged: if (!activeFocus) speakerPillItem.commitOrRevert(text)
+
+                                    background: UnderlineField { implicitHeight: 0; focused: speakerNameField.activeFocus }
+
+                                    Keys.onEscapePressed: speakerNameField.text = mainPanel.effectiveSpeakerName(speakerPillItem.modelData)
+
+                                    // Resyncs after a FAILED rename specifically
+                                    // — a successful one instead reparses via
+                                    // sentencesRevision, which recreates this
+                                    // whole delegate fresh (see
+                                    // distinctSpeakerIds), so only the failure
+                                    // path needs an explicit reset back to the
+                                    // true on-disk name. text's binding above is
+                                    // a one-shot, severed the moment the user
+                                    // types (same caveat as titleField/
+                                    // preludeArea).
+                                    Connections {
+                                        target: mainPanel.transcriptionController
+                                        function onSpeakerRenamed(fileUrl, oldName, ok) {
+                                            if (!ok && oldName === speakerPillItem.modelData)
+                                                speakerNameField.text = mainPanel.effectiveSpeakerName(speakerPillItem.modelData)
+                                        }
+                                    }
+                                }
+
+                                // Filters the sidebar tree to files with this
+                                // speaker (see mainPanel.speakerActivated's
+                                // doc comment) — mirrors tagSortIcon above,
+                                // and for the same reason: this used to be a
+                                // pencil icon doubling as the rename trigger,
+                                // which fired both the rename focus AND (via
+                                // the pill-body tap) the sidebar filter off a
+                                // single tap.
+                                Text {
+                                    id: speakerSortIcon
+                                    anchors.verticalCenter: parent.verticalCenter
+                                    text: "⇅"
+                                    color: speakerSortIconHover.hovered ? "#dddddd" : "#888888"
+                                    font.pixelSize: 10
+
+                                    HoverHandler {
+                                        id: speakerSortIconHover
+                                        cursorShape: Qt.PointingHandCursor
+                                    }
+                                    TapHandler {
+                                        enabled: !speakerPillItem.confirmingMerge && !speakerPillItem.pendingMerge
+                                        onTapped: mainPanel.speakerActivated(mainPanel.effectiveSpeakerName(speakerPillItem.modelData))
+                                    }
                                 }
                             }
 
@@ -2053,8 +2296,7 @@ Rectangle {
                             // mainPanel.resolveSpeakerMerge()'s doc comment for
                             // when this shows instead of committing immediately.
                             // Inline rather than a popup, per StyleGuide.md
-                            // ("Warning banners: inline, not a popup/toast") and
-                            // matching the rename Label<->TextField swap above.
+                            // ("Warning banners: inline, not a popup/toast").
                             RowLayout {
                                 id: mergeConfirmRow
                                 anchors.centerIn: parent
@@ -2081,20 +2323,6 @@ Rectangle {
                                     HoverHandler { cursorShape: Qt.PointingHandCursor }
                                     TapHandler { onTapped: mainPanel.confirmSpeakerMerge(false) }
                                 }
-                            }
-
-                            TextField {
-                                id: speakerNameField
-                                anchors.centerIn: parent
-                                visible: speakerPillItem.renaming
-                                font.pixelSize: 11
-                                onAccepted: mainPanel.commitSpeakerRename(speakerPillItem.modelData, text)
-                                onActiveFocusChanged: if (!activeFocus && speakerPillItem.renaming)
-                                                          mainPanel.commitSpeakerRename(speakerPillItem.modelData, text)
-
-                                background: UnderlineField { focused: speakerNameField.activeFocus }
-
-                                Keys.onEscapePressed: mainPanel.renamingSpeakerId = ""
                             }
                         }
                     }
@@ -2143,7 +2371,7 @@ Rectangle {
                 // edited, just larger and unbolded so it reads as
                 // descriptive prose rather than a status line. Same
                 // click-to-edit idiom as titleLabel/titleField above, but a
-                // TextArea (multi-line) with explicit Save/Cancel instead of
+                // TextArea (multi-line) that autosaves on blur instead of
                 // commit-on-Enter — plain Enter must insert a newline here.
                 // Visibility mirrors O26's own gating exactly (never shown
                 // for an orphaned .md, only once the file has been
@@ -2152,114 +2380,36 @@ Rectangle {
                     id: preludeContainer
                     Layout.fillWidth: true
                     visible: mainPanel.orphanedMdPath === "" && mainPanel.hasStoredMetadata
-                    implicitHeight: mainPanel.editingPrelude
-                        ? preludeEditColumn.implicitHeight : preludeLabel.implicitHeight
+                    implicitHeight: preludeArea.implicitHeight
 
-                    // Item P27: read-mode prelude is now a real selectable
-                    // TextEdit (I-beam cursor, click-drag select/copy) —
-                    // it can no longer double as the click-to-edit target
-                    // (a plain click there now positions the text cursor/
-                    // starts a selection instead), so preludeEditIcon below
-                    // is the new, narrower trigger into edit mode.
-                    Item {
-                        id: preludeLabel
+                    // Always-editable: a single TextArea is present at all
+                    // times (no display-TextEdit/edit-TextArea swap, mirrors
+                    // titleField's pattern above) — clicking directly into
+                    // the text starts editing, no separate pencil-icon
+                    // trigger needed any more. Autosaves via commitPrelude()
+                    // the moment focus leaves the field (see
+                    // onActiveFocusChanged below), no Save/Cancel chrome.
+                    TextArea {
+                        id: preludeArea
                         anchors.left: parent.left
                         anchors.right: parent.right
-                        visible: !mainPanel.editingPrelude
-                        implicitHeight: preludeText.implicitHeight
-
-                        TextEdit {
-                            id: preludeText
-                            anchors.left: parent.left
-                            anchors.right: parent.right
-                            anchors.rightMargin: preludeEditIcon.implicitWidth + 6
-                            readOnly: true
-                            selectByMouse: true
-                            selectByKeyboard: true
-                            persistentSelection: true
-                            activeFocusOnPress: false
-                            text: mainPanel.prelude || qsTr("Click to add a prelude…")
-                            wrapMode: TextEdit.WordWrap
-                            color: mainPanel.prelude ? "#aaaaaa" : "#666666"
-                            font.pixelSize: 12
-                            font.italic: !mainPanel.prelude
-
-                            HoverHandler {
-                                cursorShape: Qt.IBeamCursor
-                            }
-                        }
-
-                        Text {
-                            id: preludeEditIcon
-                            anchors.right: parent.right
-                            anchors.top: parent.top
-                            text: "✎"
-                            color: preludeIconHover.hovered ? "#dddddd" : "#888888"
-                            font.pixelSize: 11
-
-                            HoverHandler {
-                                id: preludeIconHover
-                                cursorShape: Qt.PointingHandCursor
-                            }
-                            TapHandler {
-                                onTapped: {
-                                    preludeArea.text = mainPanel.prelude
-                                    mainPanel.editingPrelude = true
-                                    preludeArea.forceActiveFocus()
-                                }
-                            }
-                            HoverBorder {
-                                anchors.fill: parent
-                                anchors.margins: -3
-                                active: preludeIconHover.hovered
-                            }
-                        }
-                    }
-
-                    ColumnLayout {
-                        id: preludeEditColumn
-                        anchors.left: parent.left
-                        anchors.right: parent.right
-                        visible: mainPanel.editingPrelude
-                        spacing: 4
-
-                        TextArea {
-                            id: preludeArea
-                            Layout.fillWidth: true
-                            wrapMode: TextArea.Wrap
-                            color: "#dddddd"
-                            font.pixelSize: 12
-                            selectByMouse: true
-                            selectByKeyboard: true
-                            background: Rectangle {
-                                color: "transparent"
-                                radius: AppSettings.borderRadius
-                                border.width: 1
-                                border.color: "#5a5a5a"
-                            }
-                            Keys.onEscapePressed: mainPanel.editingPrelude = false
-                        }
-
-                        RowLayout {
-                            Layout.alignment: Qt.AlignRight
-                            spacing: 12
-
-                            Label {
-                                text: qsTr("Cancel")
-                                color: "#e07a7a"
-                                font.pixelSize: 11
-                                HoverHandler { cursorShape: Qt.PointingHandCursor }
-                                TapHandler { onTapped: mainPanel.editingPrelude = false }
-                            }
-                            Label {
-                                text: qsTr("Save")
-                                color: "#8fdf9f"
-                                font.pixelSize: 11
-                                font.bold: true
-                                HoverHandler { cursorShape: Qt.PointingHandCursor }
-                                TapHandler { onTapped: mainPanel.commitPrelude(preludeArea.text) }
-                            }
-                        }
+                        wrapMode: TextArea.Wrap
+                        color: "#dddddd"
+                        font.pixelSize: 12
+                        selectByMouse: true
+                        selectByKeyboard: true
+                        text: mainPanel.prelude
+                        placeholderText: qsTr("Click to add a prelude…")
+                        // See titleField's doc comment — zeroed to match
+                        // the old read-only TextEdit's tight sizing.
+                        padding: 0
+                        leftPadding: 0
+                        rightPadding: 0
+                        topPadding: 0
+                        bottomPadding: 0
+                        background: UnderlineField { implicitHeight: 0; focused: preludeArea.activeFocus }
+                        Keys.onEscapePressed: preludeArea.text = mainPanel.prelude
+                        onActiveFocusChanged: if (!activeFocus) mainPanel.commitPrelude(text)
                     }
                 }
 
@@ -2412,7 +2562,7 @@ Rectangle {
                             border.width: 1
                             border.color: speakerDetectionToggle.checked ? "#2ecc71" : "#4a4a4a"
 
-                            Behavior on color { ColorAnimation { duration: 100 } }
+                            Behavior on color { ColorAnimation { duration: AppSettings.animationsEnabled ? 100 : 0 } }
                         }
                         Label {
                             id: speakerDetectionLabel
@@ -2548,17 +2698,64 @@ Rectangle {
                     }
                 }
 
+            // Rejected transcript-edit feedback (line-count mismatch or a
+            // failed write) — see commitTranscriptEdits(). Same auto-
+            // clearing inline-banner shape as speakerOpError elsewhere in
+            // this file.
+            Label {
+                Layout.fillWidth: true
+                visible: mainPanel.transcriptEditError !== ""
+                text: mainPanel.transcriptEditError
+                color: "#e07a7a"
+                font.pixelSize: 11
+                wrapMode: Text.WordWrap
+            }
+
             TextArea {
                 id: transcriptArea
                 Layout.fillWidth: true
                 visible: mainPanel.transcriptBody !== ""
-                readOnly: true
+                // Always-editable (see titleField's doc comment for the
+                // general pattern) — kept read-only only while there's
+                // nothing transcribed yet to edit, or while THIS file's
+                // transcription job is actively appending live segments
+                // (mainPanel.transcribingThisFile) — editing concurrently
+                // with that would fight the same text. Return is blocked
+                // from inserting a newline (see Keys.onReturnPressed below)
+                // to preserve the one-line-per-sentence invariant
+                // displaySentences' char offsets depend on; a multi-line
+                // paste slipping past that is instead caught defensively at
+                // commit time (see the Keys.onReturnPressed comment below).
+                // Commit happens on blur (onActiveFocusChanged), diffed
+                // against displaySentences by
+                // mainPanel.commitTranscriptEdits().
+                readOnly: !mainPanel.hasStoredMetadata || mainPanel.transcribingThisFile
                 wrapMode: TextArea.Wrap
                 text: mainPanel.displayText
                 color: "#dddddd"
-                background: null
+                // See titleField's doc comment — zeroed (except leftPadding,
+                // which is intentionally set below to reserve the gutter
+                // columns) to match the old read-only TextArea's sizing.
+                padding: 0
+                rightPadding: 0
+                topPadding: 0
+                bottomPadding: 0
+                background: UnderlineField { implicitHeight: 0; focused: transcriptArea.activeFocus }
                 selectByMouse: true
                 selectByKeyboard: true
+
+                // Return is the primary defense against inserting a new
+                // line (see the doc comment above) — a multi-line PASTE
+                // slipping past this is instead caught defensively at
+                // commit time: commitTranscriptEdits() rejects (and
+                // reverts) the whole edit if the resulting line count
+                // doesn't match displaySentences.length, rather than trying
+                // to sanitize text live on every keystroke here (which would
+                // fight cursor position for a rare edge case already
+                // defended at the one point it actually matters — commit).
+                Keys.onReturnPressed: (event) => event.accepted = true
+                Keys.onEnterPressed: (event) => event.accepted = true
+                onActiveFocusChanged: if (!activeFocus) mainPanel.commitTranscriptEdits(transcriptArea.text)
                 // Reserves space for the timestamp + speaker gutters below
                 // — neither is part of this control's actual text (see
                 // displayText's doc comment), so a click-drag selection can
@@ -2711,6 +2908,42 @@ Rectangle {
                         HoverHandler {
                             cursorShape: Qt.IBeamCursor
                         }
+                        // Toggles gutterSpeakerFilter — coexists with
+                        // selectByMouse's native click-drag select/copy the
+                        // same way speakerNameField's rename-vs-filter split
+                        // coexists with speakerPillDrag: a plain tap (no
+                        // movement) reaches this handler, a drag is claimed
+                        // by the TextEdit's own native selection.
+                        TapHandler {
+                            onTapped: mainPanel.gutterSpeakerFilter =
+                                (mainPanel.gutterSpeakerFilter === modelData.speaker) ? "" : modelData.speaker
+                        }
+                    }
+                }
+
+                // Dims every sentence NOT matching gutterSpeakerFilter above
+                // — deliberately an overlay, not a change to
+                // transcriptArea's actual text/selection (see
+                // gutterSpeakerFilter's own doc comment for why). Reuses
+                // gutterLineRects the same way the gutter labels do; a long
+                // sentence that wraps across multiple visual lines only gets
+                // its first visual line dimmed (cosmetic-only gap, the
+                // underlying sentence data is unaffected either way).
+                Repeater {
+                    id: speakerDimOverlayRepeater
+                    model: mainPanel.displaySentences
+
+                    Rectangle {
+                        required property var modelData
+                        required property int index
+                        readonly property rect lineRect: transcriptArea.gutterLineRects[index] || Qt.rect(0, 0, 0, 0)
+                        visible: mainPanel.gutterSpeakerFilter !== "" && !modelData.isChapterHeading
+                                 && modelData.speaker !== mainPanel.gutterSpeakerFilter
+                        x: transcriptArea.leftPadding
+                        y: lineRect.y
+                        width: transcriptArea.width - transcriptArea.leftPadding
+                        height: lineRect.height
+                        color: Qt.rgba(0, 0, 0, 0.55)
                     }
                 }
 
@@ -2982,6 +3215,450 @@ Rectangle {
             color: "#2f4f5f"
             border.width: 1
             border.color: "#6fdf9f"
+        }
+    }
+
+    // Recorder page: sibling of the two content blocks above, gated on
+    // mainPanel.recording (toggled by TitleBar's record button, see
+    // Main.qml's onRecordRequested). Exactly one of the three top-level
+    // blocks is ever visible at once.
+    Item {
+        id: recorderPage
+        anchors.fill: parent
+        visible: mainPanel.recording
+
+        property bool useMic: true
+        property bool useSystemAudio: false
+        property string selectedMicId: ""
+        property var micDevices: []
+        // Backing string for the shared warning banner below — cleared
+        // whenever the folder picker succeeds/reopens, or whenever
+        // audioRecorder.lastError clears (see the Connections block below).
+        property string recordingFolderError: ""
+        // Recent RMS samples for the scrolling waveform Canvas, oldest
+        // first, capped at ~100 (see waveformCanvas below). AppSettings.
+        // animationsEnabled off collapses this to a single-element "static
+        // level" array instead of a scrolling history (CLAUDE.md/this
+        // app's convention: that flag kills continuous-update CPU/GPU work).
+        property var levelSamples: []
+
+        function refreshMicDevices() {
+            recorderPage.micDevices = mainPanel.audioRecorder ? mainPanel.audioRecorder.availableMicDevices() : []
+            if (recorderPage.selectedMicId === "" && recorderPage.micDevices.length > 0)
+                recorderPage.selectedMicId = recorderPage.micDevices[0].id
+        }
+
+        onVisibleChanged: if (recorderPage.visible) recorderPage.refreshMicDevices()
+        Component.onCompleted: recorderPage.refreshMicDevices()
+
+        // audioRecorder.lastError clearing (a fresh startRecording() call
+        // clears it server-side) should also clear the shared banner if
+        // it was the error currently showing.
+        Connections {
+            target: mainPanel.audioRecorder
+            function onLevelUpdated() {
+                if (AppSettings.animationsEnabled) {
+                    const samples = recorderPage.levelSamples.slice()
+                    samples.push(mainPanel.audioRecorder.currentLevel)
+                    if (samples.length > 100)
+                        samples.shift()
+                    recorderPage.levelSamples = samples
+                } else {
+                    recorderPage.levelSamples = [mainPanel.audioRecorder.currentLevel]
+                }
+                waveformCanvas.requestPaint()
+            }
+        }
+
+        // No vault open: don't let the user configure mic/folder pickers
+        // with nothing to record into. Same "Open Vault" button precedent
+        // as the empty-vault block above.
+        Item {
+            anchors.fill: parent
+            visible: mainPanel.vaultPath.toString() === ""
+
+            Button {
+                id: recorderOpenVaultButton
+                anchors.centerIn: parent
+                text: qsTr("Open Vault")
+                hoverEnabled: true
+                onClicked: mainPanel.openVaultRequested()
+
+                background: Rectangle {
+                    radius: AppSettings.borderRadius
+                    color: (recorderOpenVaultButton.hovered && recorderOpenVaultButton.enabled) ? "#3a3a3a" : "#2a2a2a"
+                    border.width: 1
+                    border.color: "#3a3a3a"
+                }
+                HoverHandler {
+                    cursorShape: Qt.PointingHandCursor
+                }
+                HoverBorder {
+                    anchors.fill: parent
+                    active: recorderOpenVaultButton.hovered
+                }
+            }
+        }
+
+        ColumnLayout {
+            id: recorderContent
+            anchors.fill: parent
+            anchors.margins: 16
+            spacing: 12
+            visible: mainPanel.vaultPath.toString() !== ""
+
+            // Microphone row: toggle + device combo + gain slider.
+            RowLayout {
+                Layout.fillWidth: true
+                spacing: 12
+
+                Item {
+                    id: micToggle
+                    Layout.preferredWidth: micToggleLabel.implicitWidth + 16
+                    Layout.preferredHeight: 24
+
+                    HoverHandler {
+                        id: micToggleHover
+                        cursorShape: Qt.PointingHandCursor
+                    }
+                    TapHandler {
+                        onTapped: recorderPage.useMic = !recorderPage.useMic
+                    }
+                    Rectangle {
+                        anchors.fill: parent
+                        radius: AppSettings.borderRadius
+                        color: recorderPage.useMic
+                               ? (micToggleHover.hovered ? "#2ecc71" : "#25a25a")
+                               : (micToggleHover.hovered ? "#3a3a3a" : "#2a2a2a")
+                        border.width: 1
+                        border.color: recorderPage.useMic ? "#2ecc71" : "#4a4a4a"
+
+                        Behavior on color { ColorAnimation { duration: AppSettings.animationsEnabled ? 100 : 0 } }
+                    }
+                    Label {
+                        id: micToggleLabel
+                        anchors.centerIn: parent
+                        text: qsTr("Microphone")
+                        color: recorderPage.useMic ? "white" : "#aaaaaa"
+                        font.pixelSize: 11
+                    }
+                }
+
+                ComboBox {
+                    id: micCombo
+                    Layout.preferredWidth: 220
+                    enabled: recorderPage.useMic
+                    hoverEnabled: true
+                    textRole: "name"
+                    valueRole: "id"
+                    model: recorderPage.micDevices
+                    onActivated: recorderPage.selectedMicId = micCombo.currentValue
+
+                    HoverHandler {
+                        cursorShape: Qt.PointingHandCursor
+                        enabled: micCombo.enabled
+                    }
+                    HoverBorder {
+                        anchors.fill: parent
+                        active: micCombo.enabled && micCombo.hovered
+                    }
+                }
+
+                Slider {
+                    id: micGainSlider
+                    Layout.fillWidth: true
+                    enabled: recorderPage.useMic
+                    hoverEnabled: true
+                    from: 0.0
+                    to: 2.0
+                    value: AppSettings.recordingMicGain
+                    onMoved: AppSettings.recordingMicGain = value
+
+                    HoverHandler {
+                        cursorShape: Qt.PointingHandCursor
+                        enabled: micGainSlider.enabled
+                    }
+                    HoverBorder {
+                        anchors.fill: parent
+                        active: micGainSlider.enabled && micGainSlider.hovered
+                    }
+                }
+            }
+
+            // System audio row: toggle (parec's default-sink monitor, "all
+            // windows" mix — see AudioRecorder.h) + its own gain slider.
+            RowLayout {
+                Layout.fillWidth: true
+                spacing: 12
+
+                Item {
+                    id: systemAudioToggle
+                    Layout.preferredWidth: systemAudioToggleLabel.implicitWidth + 16
+                    Layout.preferredHeight: 24
+
+                    HoverHandler {
+                        id: systemAudioToggleHover
+                        cursorShape: Qt.PointingHandCursor
+                    }
+                    TapHandler {
+                        onTapped: recorderPage.useSystemAudio = !recorderPage.useSystemAudio
+                    }
+                    Rectangle {
+                        anchors.fill: parent
+                        radius: AppSettings.borderRadius
+                        color: recorderPage.useSystemAudio
+                               ? (systemAudioToggleHover.hovered ? "#2ecc71" : "#25a25a")
+                               : (systemAudioToggleHover.hovered ? "#3a3a3a" : "#2a2a2a")
+                        border.width: 1
+                        border.color: recorderPage.useSystemAudio ? "#2ecc71" : "#4a4a4a"
+
+                        Behavior on color { ColorAnimation { duration: AppSettings.animationsEnabled ? 100 : 0 } }
+                    }
+                    Label {
+                        id: systemAudioToggleLabel
+                        anchors.centerIn: parent
+                        text: qsTr("System Audio")
+                        color: recorderPage.useSystemAudio ? "white" : "#aaaaaa"
+                        font.pixelSize: 11
+                    }
+                }
+
+                Slider {
+                    id: systemGainSlider
+                    Layout.fillWidth: true
+                    enabled: recorderPage.useSystemAudio
+                    hoverEnabled: true
+                    from: 0.0
+                    to: 2.0
+                    value: AppSettings.recordingSystemGain
+                    onMoved: AppSettings.recordingSystemGain = value
+
+                    HoverHandler {
+                        cursorShape: Qt.PointingHandCursor
+                        enabled: systemGainSlider.enabled
+                    }
+                    HoverBorder {
+                        anchors.fill: parent
+                        active: systemGainSlider.enabled && systemGainSlider.hovered
+                    }
+                }
+            }
+
+            // Start/Stop + disable-animations + duration counter row.
+            RowLayout {
+                Layout.fillWidth: true
+                spacing: 12
+
+                Item {
+                    id: recordToggleButton
+                    Layout.preferredWidth: 32
+                    Layout.preferredHeight: 32
+                    enabled: recorderPage.useMic || recorderPage.useSystemAudio || mainPanel.audioRecorder.recording
+
+                    HoverHandler {
+                        id: recordToggleHover
+                        cursorShape: Qt.PointingHandCursor
+                        enabled: recordToggleButton.enabled
+                    }
+                    TapHandler {
+                        enabled: recordToggleButton.enabled
+                        onTapped: {
+                            if (mainPanel.audioRecorder.recording) {
+                                mainPanel.audioRecorder.stopRecording()
+                            } else {
+                                recorderPage.recordingFolderError = ""
+                                mainPanel.audioRecorder.startRecording(
+                                    mainPanel.vaultPath, AppSettings.recordingOutputFolder,
+                                    recorderPage.useMic, recorderPage.selectedMicId,
+                                    recorderPage.useSystemAudio, AppSettings.recordingMicGain,
+                                    AppSettings.recordingSystemGain)
+                            }
+                        }
+                    }
+                    Rectangle {
+                        anchors.fill: parent
+                        radius: AppSettings.borderRadius
+                        color: (recordToggleHover.hovered && recordToggleButton.enabled) ? "#3a3a3a" : "#2a2a2a"
+                    }
+                    HoverBorder {
+                        anchors.fill: parent
+                        active: recordToggleButton.enabled && recordToggleHover.hovered
+                    }
+                    ToolTip.visible: recordToggleHover.hovered
+                    ToolTip.text: mainPanel.audioRecorder.recording ? qsTr("Stop recording") : qsTr("Start recording")
+                    ToolTip.delay: 500
+                    Text {
+                        anchors.centerIn: parent
+                        text: mainPanel.audioRecorder.recording ? "⏹" : "⏺"
+                        color: mainPanel.audioRecorder.recording ? "#e07a7a" : "#6fdf9f"
+                        font.pixelSize: 16
+                    }
+                }
+
+                // Global animations/blur kill switch — placed here per the
+                // user's explicit placement decision, but affects the whole
+                // app (every existing Behavior/compositor blur already gates
+                // on AppSettings.animationsEnabled), not just this page.
+                Item {
+                    id: animationsToggleButton
+                    Layout.preferredWidth: 32
+                    Layout.preferredHeight: 32
+
+                    HoverHandler {
+                        id: animationsToggleHover
+                        cursorShape: Qt.PointingHandCursor
+                    }
+                    TapHandler {
+                        onTapped: AppSettings.animationsEnabled = !AppSettings.animationsEnabled
+                    }
+                    Rectangle {
+                        anchors.fill: parent
+                        radius: AppSettings.borderRadius
+                        color: animationsToggleHover.hovered ? "#3a3a3a" : "#2a2a2a"
+                    }
+                    HoverBorder {
+                        anchors.fill: parent
+                        active: animationsToggleHover.hovered
+                    }
+                    ToolTip.visible: animationsToggleHover.hovered
+                    ToolTip.text: AppSettings.animationsEnabled ? qsTr("Disable animations") : qsTr("Enable animations")
+                    ToolTip.delay: 500
+                    Text {
+                        anchors.centerIn: parent
+                        text: "❄"
+                        color: AppSettings.animationsEnabled ? "#dddddd" : "#6fdf9f"
+                        font.pixelSize: 15
+                    }
+                }
+
+                Label {
+                    id: recordingDurationLabel
+                    text: mainPanel.formatDuration(mainPanel.audioRecorder ? mainPanel.audioRecorder.elapsedMs : 0)
+                    color: "white"
+                    font.pixelSize: 16
+                }
+
+                Item { Layout.fillWidth: true }
+
+                // Output folder picker.
+                Item {
+                    id: changeFolderButton
+                    Layout.preferredWidth: 32
+                    Layout.preferredHeight: 32
+
+                    HoverHandler {
+                        id: changeFolderHover
+                        cursorShape: Qt.PointingHandCursor
+                    }
+                    TapHandler {
+                        onTapped: {
+                            const sub = AppSettings.recordingOutputFolder
+                            recordingFolderDialog.currentFolder =
+                                "file://" + mainPanel.vaultLocalPath + (sub ? "/" + sub : "")
+                            recordingFolderDialog.open()
+                        }
+                    }
+                    Rectangle {
+                        anchors.fill: parent
+                        radius: AppSettings.borderRadius
+                        color: changeFolderHover.hovered ? "#3a3a3a" : "#2a2a2a"
+                    }
+                    HoverBorder {
+                        anchors.fill: parent
+                        active: changeFolderHover.hovered
+                    }
+                    ToolTip.visible: changeFolderHover.hovered
+                    ToolTip.text: qsTr("Change output folder")
+                    ToolTip.delay: 500
+                    Text {
+                        anchors.centerIn: parent
+                        text: "📁"
+                        font.pixelSize: 15
+                    }
+                }
+            }
+
+            // Shared warning banner (StyleGuide.md "Warning banners"): shows
+            // whichever of the folder-picker rejection / audioRecorder's own
+            // lastError is currently non-empty. No dismiss button — clears
+            // itself the next time the folder picker succeeds/reopens, or
+            // the next time lastErrorChanged reports an empty string.
+            Label {
+                Layout.fillWidth: true
+                visible: text !== ""
+                text: recorderPage.recordingFolderError !== "" ? recorderPage.recordingFolderError
+                      : (mainPanel.audioRecorder ? mainPanel.audioRecorder.lastError : "")
+                color: "#e07a7a"
+                font.pixelSize: 11
+                wrapMode: Text.WordWrap
+            }
+
+            // Scrolling waveform/level indicator — mirrors playPauseIcon's
+            // Canvas idiom above (getContext("2d")/onPaint), fed from
+            // recorderPage.levelSamples (pushed on each throttled
+            // levelUpdated tick, see the Connections block above).
+            Canvas {
+                id: waveformCanvas
+                Layout.fillWidth: true
+                Layout.preferredHeight: 80
+
+                onWidthChanged: requestPaint()
+                onHeightChanged: requestPaint()
+
+                onPaint: {
+                    const ctx = getContext("2d")
+                    ctx.reset()
+                    ctx.fillStyle = "#1a1a1a"
+                    ctx.fillRect(0, 0, width, height)
+
+                    const samples = recorderPage.levelSamples
+                    if (samples.length === 0)
+                        return
+
+                    ctx.strokeStyle = "#6fdf9f"
+                    ctx.lineWidth = 2
+
+                    if (!AppSettings.animationsEnabled) {
+                        // Static flat line at the last-known level — no
+                        // scrolling history while animations are off.
+                        const level = samples[samples.length - 1]
+                        const y = height - level * height
+                        ctx.beginPath()
+                        ctx.moveTo(0, y)
+                        ctx.lineTo(width, y)
+                        ctx.stroke()
+                        return
+                    }
+
+                    const maxSamples = 100
+                    const stepX = width / Math.max(1, maxSamples - 1)
+                    ctx.beginPath()
+                    for (let i = 0; i < samples.length; i++) {
+                        const x = width - (samples.length - i) * stepX
+                        const y = height - samples[i] * height
+                        if (i === 0)
+                            ctx.moveTo(x, y)
+                        else
+                            ctx.lineTo(x, y)
+                    }
+                    ctx.stroke()
+                }
+            }
+        }
+    }
+
+    FolderDialog {
+        id: recordingFolderDialog
+        onAccepted: {
+            const localPath = recordingFolderDialog.selectedFolder.toString().replace("file://", "")
+            if (!mainPanel.vaultTreeModel || !mainPanel.vaultTreeModel.isPathInsideVault(localPath)) {
+                recorderPage.recordingFolderError = qsTr("That folder is outside the vault — pick a location inside it.")
+                return
+            }
+            recorderPage.recordingFolderError = ""
+            const prefix = mainPanel.vaultLocalPath + "/"
+            AppSettings.recordingOutputFolder = localPath === mainPanel.vaultLocalPath ? ""
+                : (localPath.startsWith(prefix) ? localPath.slice(prefix.length) : localPath)
         }
     }
 }

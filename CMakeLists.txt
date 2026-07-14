@@ -193,6 +193,8 @@ qt_add_qml_module(suopTranscriber
         src/core/VaultSearchProxyModel.cpp
         src/core/AudioPlayer.h
         src/core/AudioPlayer.cpp
+        src/core/AudioRecorder.h
+        src/core/AudioRecorder.cpp
         src/core/WindowEffects.h
         src/core/WindowEffects.cpp
         src/core/AudioDecoder.h

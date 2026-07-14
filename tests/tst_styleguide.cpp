@@ -91,9 +91,43 @@ private slots:
         QVERIFY(src.contains(QStringLiteral("color: \"transparent\"")));
         QVERIFY(src.contains(QStringLiteral("radius: AppSettings.borderRadius")));
         QVERIFY(src.contains(QStringLiteral("border.width: 1")));
-        QVERIFY(src.contains(QStringLiteral("border.color: \"white\"")));
+        QVERIFY2(src.contains(QStringLiteral("border.color: AppSettings.accentColor")),
+                 "hover outline color must come from the configurable AppSettings.accentColor, not a "
+                 "hardcoded \"white\"");
         QVERIFY2(src.contains(QStringLiteral("Behavior on opacity")),
                  "hover outline must fade, not pop (StyleGuide.md)");
+    }
+
+    // StyleGuide.md "Always-editable text": display-vs-edit must never be a
+    // swap between two different elements gated by a focus-mode bool — that
+    // pattern is exactly what let the native right-click "Copy" context
+    // menu's focus-steal hide the edit field out from under the user
+    // (titleField's old renamingTitle/commitRename() bug). Guards against
+    // the swap creeping back in for any of the five always-editable fields;
+    // no QQuickView harness in this suite to exercise the actual right-click
+    // behavior directly.
+    void mainPanel_hasNoDisplayEditSwapStateForAlwaysEditableFields()
+    {
+        const QString src = readAll(QStringLiteral(SUOP_QML_DIR "/MainPanel.qml"));
+        QVERIFY2(!src.isEmpty(), "qml/MainPanel.qml must exist");
+        QVERIFY2(!src.contains(QStringLiteral("renamingTitle")),
+                 "titleField must be always-editable, not swapped via a renamingTitle bool");
+        QVERIFY2(!src.contains(QStringLiteral("editingPrelude")),
+                 "preludeArea must be always-editable, not swapped via an editingPrelude bool");
+        QVERIFY2(!src.contains(QStringLiteral("renamingSpeakerId")),
+                 "speakerNameField must be always-editable, not swapped via a renamingSpeakerId property");
+        QVERIFY2(src.contains(QStringLiteral("id: titleField")) && src.contains(QStringLiteral("id: preludeArea"))
+                     && src.contains(QStringLiteral("id: speakerNameField")) && src.contains(QStringLiteral("id: tagField"))
+                     && src.contains(QStringLiteral("id: tagAddField")) && src.contains(QStringLiteral("id: transcriptArea")),
+                 "all always-editable fields (title/prelude/speaker/tag/tag-add/transcript) must exist");
+
+        // transcriptArea must not be unconditionally readOnly (the old
+        // always-read-only TextArea, before segment text became editable).
+        const int transcriptAreaIdx = src.indexOf(QStringLiteral("id: transcriptArea"));
+        QVERIFY(transcriptAreaIdx >= 0);
+        const QString transcriptAreaBlock = src.mid(transcriptAreaIdx, 600);
+        QVERIFY2(!transcriptAreaBlock.contains(QStringLiteral("readOnly: true")),
+                 "transcriptArea must be conditionally editable, not hardcoded readOnly: true");
     }
 
     // StyleGuide.md: one global AppSettings.borderRadius, used everywhere a
@@ -389,6 +423,7 @@ private slots:
         QVERIFY2(src.contains(QStringLiteral("searchResultsView.positionViewAtIndex(idx, ListView.Contain)")),
                  "moveNoteSelection must scroll searchResultsView to reveal the newly-selected row");
     }
+
 };
 
 QTEST_GUILESS_MAIN(TstStyleGuide)

@@ -54,6 +54,20 @@ void VaultSearchProxyModel::setTagFilter(const QStringList &tags)
     invalidate();
 }
 
+QStringList VaultSearchProxyModel::speakerFilter() const
+{
+    return m_speakerFilter;
+}
+
+void VaultSearchProxyModel::setSpeakerFilter(const QStringList &speakers)
+{
+    if (speakers == m_speakerFilter)
+        return;
+    m_speakerFilter = speakers;
+    emit speakerFilterChanged();
+    invalidate();
+}
+
 QVariantMap VaultSearchProxyModel::fileSortKeys() const
 {
     return m_fileSortKeys;
@@ -71,11 +85,13 @@ void VaultSearchProxyModel::setFileSortKeys(const QVariantMap &keys)
 bool VaultSearchProxyModel::filterAcceptsRow(int sourceRow, const QModelIndex &sourceParent) const
 {
     // Free-text searchQuery never hides rows (item 9: matches sort to the
-    // top, non-matches just dim). tagFilter is a genuinely harder filter
-    // (item 16/17): a row failing it IS hidden.
-    if (m_tagFilter.isEmpty())
+    // top, non-matches just dim). tagFilter/speakerFilter are genuinely
+    // harder filters: a row failing either IS hidden. Both must pass when
+    // both are set (independent AND, same as tagFilter's own multi-tag AND).
+    if (m_tagFilter.isEmpty() && m_speakerFilter.isEmpty())
         return true;
-    return matchesTagFilter(sourceModel()->index(sourceRow, 0, sourceParent));
+    const QModelIndex idx = sourceModel()->index(sourceRow, 0, sourceParent);
+    return matchesTagFilter(idx) && matchesSpeakerFilter(idx);
 }
 
 bool VaultSearchProxyModel::rowHasAllFilterTags(const QModelIndex &sourceIndex) const
@@ -117,6 +133,49 @@ bool VaultSearchProxyModel::matchesTagFilter(const QModelIndex &sourceIndex) con
     const int rows = src->rowCount(sourceIndex);
     for (int i = 0; i < rows; ++i) {
         if (matchesTagFilter(src->index(i, 0, sourceIndex)))
+            return true;
+    }
+    return false;
+}
+
+bool VaultSearchProxyModel::rowHasAllFilterSpeakers(const QModelIndex &sourceIndex) const
+{
+    const QString speakersRaw = sourceModel()->data(sourceIndex, VaultTreeModel::SpeakersRole).toString();
+    const QStringList rowSpeakers = speakersRaw.split(QLatin1Char(','), Qt::SkipEmptyParts);
+    for (const QString &required : m_speakerFilter) {
+        const QString trimmedRequired = required.trimmed();
+        if (trimmedRequired.isEmpty())
+            continue;
+        bool found = false;
+        for (const QString &rowSpeaker : rowSpeakers) {
+            if (rowSpeaker.trimmed().compare(trimmedRequired, Qt::CaseInsensitive) == 0) {
+                found = true;
+                break;
+            }
+        }
+        if (!found)
+            return false;
+    }
+    return true;
+}
+
+bool VaultSearchProxyModel::matchesSpeakerFilter(const QModelIndex &sourceIndex) const
+{
+    if (m_speakerFilter.isEmpty())
+        return true;
+
+    if (rowHasAllFilterSpeakers(sourceIndex))
+        return true;
+
+    const QAbstractItemModel *src = sourceModel();
+    if (!src->data(sourceIndex, VaultTreeModel::IsDirRole).toBool())
+        return false;
+
+    // A directory is kept if ANY descendant has all the requested speakers —
+    // same recursive-match shape as matchesTagFilter.
+    const int rows = src->rowCount(sourceIndex);
+    for (int i = 0; i < rows; ++i) {
+        if (matchesSpeakerFilter(src->index(i, 0, sourceIndex)))
             return true;
     }
     return false;
