@@ -177,6 +177,71 @@ Rectangle {
             ? sidebar.model.searchResults(sidebar.searchQuery, sidebar.searchIncludeTranscriptions)
             : []
     }
+
+    // Reuses the exact fileActivated/orphanedMdActivated signal path a
+    // click emits — currentPath's persistent outline (Main.qml) and
+    // MainPanel's open file update as a side effect of that binding, same as
+    // clicking the row directly. No separate "selected note" state exists.
+    function activateNote(path, isOrphanedMd) {
+        if (isOrphanedMd)
+            sidebar.orphanedMdActivated(path)
+        else
+            sidebar.fileActivated(path)
+    }
+
+    // Backs the Up/Down Shortcut items near Ctrl+F's: moves to the
+    // previous/next NOTE (audio file or orphaned .md; directories are
+    // skipped) relative to sidebar.currentPath, in on-screen order — and
+    // scrolls the newly-selected row into view if it was offscreen (a
+    // keyboard-driven selection change with no visible feedback would be
+    // indistinguishable from doing nothing).
+    function moveNoteSelection(direction) {
+        if (sidebar.searchQuery !== "") {
+            // Flat mode (searchResultsView) — already leaf-only, in display
+            // order, no tree walk needed.
+            const results = sidebar.searchResultsList
+            if (!results || results.length === 0)
+                return
+            let idx = results.findIndex(r => r.path === sidebar.currentPath)
+            idx = idx < 0 ? (direction > 0 ? 0 : results.length - 1)
+                          : Math.max(0, Math.min(results.length - 1, idx + direction))
+            sidebar.activateNote(results[idx].path, results[idx].isOrphanedMd)
+            // Contain (not Visible): scrolls minimally so the row is FULLY
+            // in view, not just barely clipped-in — matches the row the
+            // outline just jumped to rather than leaving it half-hidden.
+            searchResultsView.positionViewAtIndex(idx, ListView.Contain)
+            return
+        }
+
+        // Walks TreeView's own visible-row order (tree.index(row, 0) — NOT
+        // modelIndex(row, column), which is deprecated in favor of this
+        // exact overload as of this Qt version), not a raw tree traversal —
+        // a collapsed directory's children must be skipped exactly as they
+        // are onscreen, same as what a click could actually reach. Keeps
+        // each note's TreeView row alongside its path so the row is
+        // available below for positionViewAtRow, without a second scan to
+        // re-find it.
+        const notes = []
+        for (let r = 0; r < tree.rows; r++) {
+            const rowIndex = tree.index(r, 0)
+            const isAudio = searchProxy.data(rowIndex, VaultTreeModel.IsAudioRole)
+            const isOrphanedMd = searchProxy.data(rowIndex, VaultTreeModel.IsOrphanedMdRole)
+            if (isAudio || isOrphanedMd) {
+                notes.push({
+                    path: searchProxy.data(rowIndex, VaultTreeModel.PathRole),
+                    isOrphanedMd: isOrphanedMd,
+                    row: r
+                })
+            }
+        }
+        if (notes.length === 0)
+            return
+        let idx = notes.findIndex(n => n.path === sidebar.currentPath)
+        idx = idx < 0 ? (direction > 0 ? 0 : notes.length - 1)
+                      : Math.max(0, Math.min(notes.length - 1, idx + direction))
+        sidebar.activateNote(notes[idx].path, notes[idx].isOrphanedMd)
+        tree.positionViewAtRow(notes[idx].row, TableView.Contain)
+    }
     onSearchQueryChanged: sidebar.refreshSearchResults()
     onSearchIncludeTranscriptionsChanged: sidebar.refreshSearchResults()
     Connections {
@@ -542,6 +607,21 @@ Rectangle {
             sidebar.searchExpanded = true
             searchField.forceActiveFocus()
         }
+    }
+
+    // Vertical arrow-key navigation between notes, gated on the tree/
+    // search-results view actually having keyboard focus (grabbed by their
+    // TapHandlers above on click) — inert while a TextField elsewhere has
+    // focus, since only one item can have activeFocus at a time.
+    Shortcut {
+        sequence: "Up"
+        enabled: tree.activeFocus || searchResultsView.activeFocus
+        onActivated: sidebar.moveNoteSelection(-1)
+    }
+    Shortcut {
+        sequence: "Down"
+        enabled: tree.activeFocus || searchResultsView.activeFocus
+        onActivated: sidebar.moveNoteSelection(1)
     }
 
     Item {
@@ -1479,6 +1559,13 @@ Rectangle {
 
             TapHandler {
                 onTapped: {
+                    // Grabs keyboard focus so Up/Down (see the Shortcut
+                    // items near Ctrl+F's) can move between notes right
+                    // after a click — never touches sidebar.currentPath, so
+                    // the persistent "currently open" outline (O7) is
+                    // unaffected; clicking into MainPanel afterward moves
+                    // activeFocus away exactly as it always has.
+                    treeDelegate.treeView.forceActiveFocus()
                     if (treeDelegate.isDir) {
                         treeDelegate.treeView.toggleExpanded(treeDelegate.row)
                     } else if (treeDelegate.isAudio) {
@@ -2108,7 +2195,9 @@ Rectangle {
                 onTapped: {
                     // Mirrors treeDelegate's TapHandler exactly (minus the
                     // isDir/toggleExpanded branch — results are always
-                    // leaves, never directories).
+                    // leaves, never directories), including the
+                    // forceActiveFocus() so Up/Down works here too.
+                    searchResultsView.forceActiveFocus()
                     if (resultDelegate.resultIsAudio)
                         sidebar.fileActivated(resultDelegate.resultPath)
                     else if (resultDelegate.resultIsOrphanedMd)

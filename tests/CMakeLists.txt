@@ -10,7 +10,7 @@ set(SUOP_CORE_DIR ${CMAKE_SOURCE_DIR}/src/core)
 # so the app target stays untouched. QML_ELEMENT headers compile outside the
 # qml module as long as Qt6::Qml is linked.
 function(suop_add_test name)
-    cmake_parse_arguments(ARG "LINK_WHISPER;LINK_LLAMA;LINK_SHERPA_ONNX" "" "SOURCES" ${ARGN})
+    cmake_parse_arguments(ARG "LINK_WHISPER;LINK_LLAMA;LINK_SHERPA_ONNX;LINK_QUICK" "" "SOURCES" ${ARGN})
     set(abs_sources "")
     foreach(src ${ARG_SOURCES})
         list(APPEND abs_sources ${SUOP_CORE_DIR}/${src})
@@ -18,6 +18,13 @@ function(suop_add_test name)
     qt_add_executable(${name} ${name}.cpp ${abs_sources})
     target_include_directories(${name} PRIVATE ${SUOP_CORE_DIR})
     target_link_libraries(${name} PRIVATE Qt6::Core Qt6::Qml Qt6::Test)
+    if(ARG_LINK_QUICK)
+        # For tests that load real .qml files into an actual (offscreen)
+        # QQuickView rather than just linking a QML_ELEMENT C++ class — see
+        # tst_sidebar_keynav.cpp's top-of-file comment for why this is
+        # needed and what it does/doesn't cover.
+        target_link_libraries(${name} PRIVATE Qt6::Quick Qt6::QuickControls2)
+    endif()
     if(ARG_LINK_WHISPER)
         target_link_libraries(${name} PRIVATE whisper)
     endif()
@@ -59,3 +66,4 @@ suop_add_test(tst_labelingengine LINK_LLAMA SOURCES LabelingEngine.cpp)
 suop_add_test(tst_diarizationengine LINK_SHERPA_ONNX SOURCES DiarizationEngine.cpp AudioDecoder.cpp)
 suop_add_test(tst_future_spec)
 suop_add_test(tst_styleguide)
+suop_add_test(tst_sidebar_keynav LINK_QUICK SOURCES VaultTreeModel.cpp VaultSearchProxyModel.cpp)

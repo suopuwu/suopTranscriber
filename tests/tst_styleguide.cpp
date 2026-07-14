@@ -345,6 +345,50 @@ private slots:
         QVERIFY2(cursorFiles >= 4, "pointer-cursor convention should appear across the UI files");
         QVERIFY2(hoverBorderUses >= 3, "HoverBorder should be the reused hover-outline component");
     }
+
+    // Feature: Up/Down should move to the previous/next note (audio file or
+    // orphaned .md) when a sidebar row has keyboard focus, in both the
+    // normal TreeView and the flat searchResultsView shown during a text
+    // search. No QQuickView in this test suite to actually deliver key
+    // events to a TreeView delegate, so this is a source-scan guard: the
+    // Shortcut items must exist, gated on the actual view having focus
+    // (not sidebar.currentPath, which is MainPanel's "currently open" state
+    // and must stay untouched by this), and both TapHandlers must grab
+    // focus on click so a freshly-clicked row is what Up/Down moves from.
+    void sidebar_arrowKeyNavigatesNotes()
+    {
+        const QString src = readAll(QStringLiteral(SUOP_QML_DIR "/Sidebar.qml"));
+        QVERIFY2(!src.isEmpty(), "qml/Sidebar.qml must exist");
+
+        QVERIFY2(src.contains(QStringLiteral("function moveNoteSelection(direction)")),
+                 "Sidebar.qml must define moveNoteSelection() to back Up/Down navigation");
+
+        const int upIdx = src.indexOf(QStringLiteral("sequence: \"Up\""));
+        const int downIdx = src.indexOf(QStringLiteral("sequence: \"Down\""));
+        QVERIFY2(upIdx >= 0, "Up must be wired as a Shortcut");
+        QVERIFY2(downIdx >= 0, "Down must be wired as a Shortcut");
+        const QString upBlock = src.mid(upIdx, 200);
+        const QString downBlock = src.mid(downIdx, 200);
+        QVERIFY2(upBlock.contains(QStringLiteral("tree.activeFocus || searchResultsView.activeFocus")),
+                 "Up shortcut must be gated on the tree/search-results view actually having focus, "
+                 "not on sidebar.currentPath (MainPanel's open-file state, unrelated to keyboard focus)");
+        QVERIFY2(downBlock.contains(QStringLiteral("tree.activeFocus || searchResultsView.activeFocus")),
+                 "Down shortcut must be gated the same way as Up");
+        QVERIFY2(upBlock.contains(QStringLiteral("moveNoteSelection(-1)")), "Up must move backward");
+        QVERIFY2(downBlock.contains(QStringLiteral("moveNoteSelection(1)")), "Down must move forward");
+
+        QVERIFY2(src.contains(QStringLiteral("treeDelegate.treeView.forceActiveFocus()")),
+                 "clicking a tree row must grab keyboard focus so Up/Down has something to move from");
+        QVERIFY2(src.contains(QStringLiteral("searchResultsView.forceActiveFocus()")),
+                 "clicking a search-result row must grab keyboard focus so Up/Down works there too");
+
+        // Moving to an offscreen note must scroll it into view, in both
+        // the TreeView and the flat search-results ListView.
+        QVERIFY2(src.contains(QStringLiteral("tree.positionViewAtRow(notes[idx].row, TableView.Contain)")),
+                 "moveNoteSelection must scroll TreeView to reveal the newly-selected row");
+        QVERIFY2(src.contains(QStringLiteral("searchResultsView.positionViewAtIndex(idx, ListView.Contain)")),
+                 "moveNoteSelection must scroll searchResultsView to reveal the newly-selected row");
+    }
 };
 
 QTEST_GUILESS_MAIN(TstStyleGuide)
