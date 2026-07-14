@@ -117,7 +117,9 @@ private slots:
                 // Circle idiom: nearby width/height == 2 * radius.
                 bool isCircle = false;
                 const QRegularExpression size(
-                    QStringLiteral("^\\s*(?:width|height|implicitWidth|implicitHeight):\\s*(\\d+(?:\\.\\d+)?)\\s*$"));
+                    QStringLiteral("^\\s*(?:width|height|implicitWidth|implicitHeight|"
+                                   "Layout\\.preferredWidth|Layout\\.preferredHeight):"
+                                   "\\s*(\\d+(?:\\.\\d+)?)\\s*$"));
                 for (int j = qMax(0, i - 6); j < qMin<qsizetype>(lines.size(), i + 7); ++j) {
                     const auto s = size.match(lines[j]);
                     if (s.hasMatch() && qFuzzyCompare(s.captured(1).toDouble(), 2.0 * r))

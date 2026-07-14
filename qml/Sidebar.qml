@@ -261,6 +261,11 @@ Rectangle {
     // apart again.
     property var combineTopMergedPaths: ({})
     property var combineBottomMergedPaths: ({})
+    // path -> 1-based index in its group's combine order (group.files order,
+    // i.e. the order files are actually concatenated in — see
+    // combineOrderBadge below). Populated in the same "ready" groups loop as
+    // combineReadyPaths so the two can never disagree on membership.
+    property var combineOrderPaths: ({})
 
     // Sort mode / combine-candidate clustering (see AppSettings.sortMode's
     // doc comment and CombineGroupOutline usage below): computed once here,
@@ -269,13 +274,16 @@ Rectangle {
     // see refreshTreeOrdering()'s body for how each is derived.
     function refreshTreeOrdering() {
         const newMap = {}
+        const orderMap = {}
         const audioPaths = (sidebar.transcriptionController && sidebar.model) ? sidebar.model.allAudioPaths() : []
         const groups = (audioPaths.length > 0 && AppSettings.combineRules.length > 0)
                 ? sidebar.transcriptionController.detectCombineGroups(AppSettings.combineRules, audioPaths) : []
         for (const g of groups) {
             if (g.status === "ready") {
-                for (const f of g.files)
-                    newMap[f] = g.outputPath
+                for (let i = 0; i < g.files.length; i++) {
+                    newMap[g.files[i]] = g.outputPath
+                    orderMap[g.files[i]] = i + 1
+                }
             }
         }
 
@@ -298,8 +306,10 @@ Rectangle {
         // compare (see VaultSearchProxyModel::fileSortKeys' doc comment).
         // mtimes is only fetched when actually needed — audioLastModified()
         // walks the whole tree, no need to pay for that on the (default)
-        // "name" mode.
-        const mtimes = (AppSettings.sortMode !== "name" && sidebar.model) ? sidebar.model.audioLastModified() : {}
+        // "name" mode UNLESS a group exists (memberOrderRank below always
+        // needs mtimes for intra-group order, regardless of sortMode).
+        const mtimes = (sidebar.model && (AppSettings.sortMode !== "name" || Object.keys(clusterKeyOf).length > 0))
+                ? sidebar.model.audioLastModified() : {}
         function ownRank(path) {
             if (AppSettings.sortMode === "name") {
                 const slash = path.lastIndexOf("/")
@@ -314,6 +324,22 @@ Rectangle {
             // timestamps into the same padded string.
             const value = AppSettings.sortMode === "dateAsc" ? ms : (Number.MAX_SAFE_INTEGER - ms)
             return String(value).padStart(16, "0")
+        }
+
+        // memberOrderRank: a group member's position AMONG ITS OWN
+        // groupmates — always mtime ASCENDING (oldest/part-1 first, at the
+        // top), regardless of AppSettings.sortMode, matching the actual
+        // combine order (TranscriptionController::findCombineGroups()'
+        // mtime-ascending default — see combineOrderBadge). Split-recording
+        // parts are chronological by nature; letting the global name/date
+        // sort reorder them within their own group read as broken (e.g.
+        // "name" mode would alphabetize takes instead of keeping recording
+        // order). Only ever used as sortKeys' second element for grouped
+        // files below — ungrouped files still use plain ownRank, so vaults
+        // without combine rules see no change.
+        function memberOrderRank(path) {
+            const ms = mtimes[path] || 0
+            return String(ms).padStart(16, "0")
         }
 
         // groupRank: the MINIMUM ownRank among a group's members, for every
@@ -343,7 +369,8 @@ Rectangle {
         const sortKeys = {}
         for (const path of audioPaths) {
             const key = clusterKeyOf[path]
-            sortKeys[path] = [key !== undefined ? groupRankOf[key] : ownRank(path), ownRank(path)]
+            sortKeys[path] = [key !== undefined ? groupRankOf[key] : ownRank(path),
+                               key !== undefined ? memberOrderRank(path) : ownRank(path)]
         }
 
         // Adjacency (combineTopMerged/combineBottomMerged) has to be
@@ -371,6 +398,7 @@ Rectangle {
         }
 
         sidebar.combineReadyPaths = newMap
+        sidebar.combineOrderPaths = orderMap
         sidebar.combineTopMergedPaths = topMerged
         sidebar.combineBottomMergedPaths = bottomMerged
         searchProxy.fileSortKeys = sortKeys
@@ -1292,6 +1320,12 @@ Rectangle {
                     ? sidebar.combineReadyPaths[treeDelegate.path] : ""
             readonly property color combineGroupColor: treeDelegate.combineEligible
                     ? sidebar.combineGroupColor(treeDelegate.combineOutputPath) : "transparent"
+            // 1-based position in the group's combine order (group.files
+            // order from findCombineGroups() — the order files are actually
+            // concatenated in, not necessarily this tree's display order).
+            // Drives combineOrderBadge below.
+            readonly property int combineOrder: treeDelegate.combineEligible
+                    ? (sidebar.combineOrderPaths[treeDelegate.path] || 0) : 0
 
             // Merges this row's outline with a vertically-adjacent row's
             // outline when they're in the SAME combine group, so a
@@ -1461,8 +1495,8 @@ Rectangle {
             // at that inset; adding it again here would double it.
             HoverBorder {
                 anchors.fill: parent
-                anchors.topMargin: 3
-                anchors.bottomMargin: 3
+                anchors.topMargin: 1
+                anchors.bottomMargin: 1
                 anchors.leftMargin: AppSettings.sidebarEdgeLeftMargin
                 active: rowHover.hovered
             }
@@ -1472,8 +1506,8 @@ Rectangle {
             // white) so both can be visible at once without being confused.
             Rectangle {
                 anchors.fill: parent
-                anchors.topMargin: 3
-                anchors.bottomMargin: 3
+                anchors.topMargin: 1
+                anchors.bottomMargin: 1
                 anchors.leftMargin: AppSettings.sidebarEdgeLeftMargin
                 visible: treeDelegate.path === sidebar.currentPath
                 color: AppSettings.sidebarSelectionColor
@@ -1542,7 +1576,22 @@ Rectangle {
                 y: treeDelegate.showSnippet ? 4 : (treeDelegate.height - treeColumn.implicitHeight) / 2
                 spacing: 2
 
-                Row {
+                // RowLayout, not Row — lets the title Text below
+                // Layout.fillWidth to consume exactly whatever space its
+                // ACTUALLY-VISIBLE siblings leave. A plain Row can't express
+                // that: the title's width had to subtract a fixed worst-case
+                // buffer (36px = expand-glyph 10 + status dot 8 + job dot 6 +
+                // 3 spacings) for siblings that usually aren't all present
+                // (a typical leaf row with no in-progress job only spends
+                // ~16px), so the buffer overshot by ~20px and the name
+                // elided noticeably before it needed to (user report — not a
+                // Text/elide quirk, just this fixed constant). Layout
+                // children can't use `anchors` (unsupported on direct Layout
+                // children, unlike Row/Column) — Layout.alignment:
+                // Qt.AlignVCenter below replaces each item's old
+                // anchors.verticalCenter.
+                RowLayout {
+                    width: treeDelegate.width - treeColumn.x
                     spacing: 4
 
                     Text {
@@ -1556,8 +1605,8 @@ Rectangle {
                         // sibling file rows now, which reads fine since a
                         // dir's children are already indented a further
                         // level below it anyway.
-                        anchors.verticalCenter: parent.verticalCenter
-                        width: (treeDelegate.isDir && treeDelegate.hasChildren) ? 10 : 0
+                        Layout.alignment: Qt.AlignVCenter
+                        Layout.preferredWidth: (treeDelegate.isDir && treeDelegate.hasChildren) ? 10 : 0
                         horizontalAlignment: Text.AlignHCenter
                         text: (treeDelegate.isDir && treeDelegate.hasChildren)
                               ? (treeDelegate.expanded ? "−" : "+")
@@ -1566,10 +1615,10 @@ Rectangle {
                     }
 
                     Rectangle {
-                        anchors.verticalCenter: parent.verticalCenter
+                        Layout.alignment: Qt.AlignVCenter
                         visible: treeDelegate.isAudio || treeDelegate.isOrphanedMd
-                        width: 8
-                        height: 8
+                        Layout.preferredWidth: 8
+                        Layout.preferredHeight: 8
                         radius: 4
                         color: treeDelegate.status === 2 ? "#2ecc71" : (treeDelegate.isOrphanedMd ? "#3498db" : "#f1c40f")
                     }
@@ -1583,10 +1632,10 @@ Rectangle {
                     // statuses (see sidebar.setJobStatus's gating).
                     Rectangle {
                         id: jobStatusDot
-                        anchors.verticalCenter: parent.verticalCenter
+                        Layout.alignment: Qt.AlignVCenter
                         visible: treeDelegate.isAudio && treeDelegate.jobStatus >= 0 && treeDelegate.jobStatus <= 2
-                        width: 6
-                        height: 6
+                        Layout.preferredWidth: 6
+                        Layout.preferredHeight: 6
                         radius: 3
                         color: treeDelegate.jobStatus === 1 ? "#3498db"
                                : (treeDelegate.jobStatus === 0 ? "#f39c12" : "#95a5a6")
@@ -1601,7 +1650,7 @@ Rectangle {
                     }
 
                     Text {
-                        anchors.verticalCenter: parent.verticalCenter
+                        Layout.alignment: Qt.AlignVCenter
                         // Item 1 (Wave D): sidebar previously always showed the
                         // raw filename — AppSettings.useLabelsSidebar (a
                         // display-only toggle; Sidebar has no rename UI, unlike
@@ -1614,9 +1663,11 @@ Rectangle {
                         // filename (routine for split-recording candidates —
                         // exactly the "acme mic 3"-style names combine rules
                         // target) ran under the sidebar's scrollbar/edge
-                        // instead of stopping short of it. Sized to the FULL
-                        // remaining row width, not shrunk to dodge the
-                        // per-row action-icon cluster (rowTranscribeButton/
+                        // instead of stopping short of it. Fills whatever
+                        // width the RowLayout above has left after its other,
+                        // actually-visible children (see RowLayout's own doc
+                        // comment) — not shrunk to dodge the per-row
+                        // action-icon cluster (rowTranscribeButton/
                         // rowRelabelButton/rowChaptersButton/groupMergeButton)
                         // — those icons are hover-only overlays (declared
                         // after this Column, so they already paint on top —
@@ -1625,10 +1676,8 @@ Rectangle {
                         // even while they're showing (user report: reserving
                         // space for them made names truncate the instant the
                         // icons faded in, for icons that weren't even always
-                        // present). 36px below covers this Row's own
-                        // preceding siblings' worst case (expand glyph 10 +
-                        // status dot 8 + job dot 6 + 3*4 spacing).
-                        width: Math.max(40, treeDelegate.width - treeColumn.x - 36)
+                        // present).
+                        Layout.fillWidth: true
                         elide: Text.ElideRight
                         clip: true
                         textFormat: sidebar.searchQuery !== "" ? Text.StyledText : Text.PlainText
@@ -1883,18 +1932,20 @@ Rectangle {
             // group has one action," not another per-row icon.
             Item {
                 id: groupMergeButton
-                // Anchored to the LEFT of actionButtonRow (rather than
-                // parent.right — that rightmost spot is where
-                // rowTranscribeButton always fades in for any hovered audio
-                // row, including this group's own top row, so anchoring
-                // here too would have the two buttons land right on top of
-                // each other) — actionButtonRow's own width already tracks
-                // only the icons THIS row is actually eligible for (see its
-                // doc comment), so this follows automatically instead of
-                // assuming a fixed 3-icon-wide cluster.
-                anchors.right: actionButtonRow.left
-                anchors.rightMargin: 4
-                anchors.verticalCenter: parent.verticalCenter
+                // Fixed to the row's top-left corner instead of anchored
+                // off actionButtonRow (rowTranscribeButton/rowRelabelButton/
+                // rowChaptersButton) — this button only ever renders on the
+                // group's TOP row (see visible below), but the hover that
+                // reveals it (sidebar.hoveredCombineGroup) can be triggered
+                // by ANY row in the group, not just this one. Anchoring
+                // relative to a sibling cluster whose own layout can shift
+                // independently of THIS hover state is fragile and hard to
+                // exercise with a real hover test — a fixed corner sidesteps
+                // that entirely (user report, 2026-07-13).
+                anchors.left: parent.left
+                anchors.leftMargin: AppSettings.sidebarEdgeLeftMargin + 2 + combineOrderBadge.width + 2
+                anchors.top: parent.top
+                anchors.topMargin: 2
                 width: 20
                 height: 20
                 visible: treeDelegate.combineEligible && !treeDelegate.combineTopMerged
@@ -1941,6 +1992,46 @@ Rectangle {
                 Text {
                     anchors.centerIn: parent
                     text: "⊕"
+                    color: treeDelegate.combineGroupColor
+                    font.pixelSize: 13
+                }
+            }
+
+            // Per-row combine-order badge: this file's 1-based position in
+            // its group's combine order (treeDelegate.combineOrder, from
+            // group.files — the order files actually get concatenated in,
+            // not necessarily this tree's display order). Unlike
+            // groupMergeButton above, this renders on EVERY member row (the
+            // merge action only makes sense once per group, but each file
+            // needs its own ordinal) — positioned as the leftmost item of
+            // the overlay cluster (groupMergeButton anchors off THIS item's
+            // width, to its right) since the ordinal reads more naturally
+            // before the action, and gated by the same
+            // sidebar.hoveredCombineGroup hover so they appear/disappear
+            // together.
+            Item {
+                id: combineOrderBadge
+                anchors.left: parent.left
+                anchors.leftMargin: AppSettings.sidebarEdgeLeftMargin + 2
+                anchors.top: parent.top
+                anchors.topMargin: 2
+                width: 20
+                height: 20
+                visible: treeDelegate.combineEligible
+                opacity: sidebar.hoveredCombineGroup === treeDelegate.combineOutputPath ? 1 : 0
+
+                Behavior on opacity {
+                    NumberAnimation { duration: 120 }
+                }
+
+                Rectangle {
+                    anchors.fill: parent
+                    radius: AppSettings.borderRadius
+                    color: AppSettings.sidebarBackgroundColor
+                }
+                Text {
+                    anchors.centerIn: parent
+                    text: treeDelegate.combineOrder
                     color: treeDelegate.combineGroupColor
                     font.pixelSize: 13
                 }
@@ -2028,8 +2119,8 @@ Rectangle {
             // already subtracts the full AppSettings.sidebarRightMargin.
             HoverBorder {
                 anchors.fill: parent
-                anchors.topMargin: 3
-                anchors.bottomMargin: 3
+                anchors.topMargin: 1
+                anchors.bottomMargin: 1
                 anchors.leftMargin: AppSettings.sidebarEdgeLeftMargin
                 active: resultHover.hovered
             }
@@ -2037,8 +2128,8 @@ Rectangle {
             // O7: same persistent "currently open" highlight as treeDelegate.
             Rectangle {
                 anchors.fill: parent
-                anchors.topMargin: 3
-                anchors.bottomMargin: 3
+                anchors.topMargin: 1
+                anchors.bottomMargin: 1
                 anchors.leftMargin: AppSettings.sidebarEdgeLeftMargin
                 visible: resultDelegate.resultPath === sidebar.currentPath
                 color: AppSettings.sidebarSelectionColor
