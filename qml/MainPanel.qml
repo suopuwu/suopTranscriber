@@ -1492,6 +1492,18 @@ Rectangle {
                 }
             }
 
+            // Playback position/total duration — own display on the
+            // playback bar itself, deliberately separate from BottomBar's
+            // task progress text (which only ever shows task elapsed/ETA,
+            // never anything playback-related).
+            Label {
+                text: mainPanel.player
+                    ? (mainPanel.formatDuration(mainPanel.player.position) + " / " + mainPanel.formatDuration(mainPanel.player.duration))
+                    : "0:00 / 0:00"
+                color: "#aaaaaa"
+                font.pixelSize: 11
+            }
+
             // Item 10: the hover highlight rings only the handle/puck, not
             // the whole track — custom `handle:` so we own that geometry
             // instead of the default QQC2 style's whole-control HoverBorder.
@@ -1648,16 +1660,28 @@ Rectangle {
                     // untranscribed file with labels-mode on still just
                     // shows its filename as the title itself, so a
                     // filename-under-filename subtitle would be redundant).
-                    Label {
+                    TextEdit {
                         id: filenameSubtitle
                         Layout.fillWidth: true
                         visible: AppSettings.useLabelsMainPanel
                                  && mainPanel.orphanedMdPath === "" && !!mainPanel.storedMetadata.label
-                        elide: Text.ElideMiddle
+                        readOnly: true
+                        selectByMouse: true
+                        selectByKeyboard: true
+                        activeFocusOnPress: false
+                        // No persistentSelection: this and the "Previously
+                        // transcribed" line below should behave like normal
+                        // independent selections — picking one clears the
+                        // other, not two simultaneous highlights.
+                        // TextEdit has no `elide` (unlike the Label this
+                        // replaces) — same tradeoff already accepted for
+                        // speakerGutterRepeater below.
                         text: (mainPanel.player && mainPanel.player.source.toString() !== "")
                               ? mainPanel.relativeToVault(mainPanel.player.source) : ""
                         color: "#777777"
                         font.pixelSize: 10
+
+                        HoverHandler { cursorShape: Qt.IBeamCursor }
                     }
                 }
             }
@@ -2353,14 +2377,20 @@ Rectangle {
                     spacing: 12
                     visible: mainPanel.orphanedMdPath === "" && mainPanel.hasStoredMetadata
 
-                    Label {
+                    TextEdit {
                         Layout.fillWidth: true
-                        wrapMode: Text.WordWrap
+                        wrapMode: TextEdit.WordWrap
+                        readOnly: true
+                        selectByMouse: true
+                        selectByKeyboard: true
+                        activeFocusOnPress: false
                         text: qsTr("Previously transcribed — model: %1, speaker detection: %2")
                               .arg(mainPanel.storedMetadata.model || "?")
                               .arg(mainPanel.storedMetadata.speakerDetection ? qsTr("on") : qsTr("off"))
                         color: "#aaaaaa"
                         font.pixelSize: 11
+
+                        HoverHandler { cursorShape: Qt.IBeamCursor }
                     }
                 }
 
@@ -2496,7 +2526,6 @@ Rectangle {
                                     readOnly: true
                                     selectByMouse: true
                                     selectByKeyboard: true
-                                    persistentSelection: true
                                     activeFocusOnPress: false
                                     text: chapterRow.modelData.title
                                     color: "#cccccc"
@@ -2892,7 +2921,6 @@ Rectangle {
                         readOnly: true
                         selectByMouse: true
                         selectByKeyboard: true
-                        persistentSelection: true
                         activeFocusOnPress: false
                         // Right-aligned so the name sits right up against
                         // the transcript text (only gutterSpacing away)

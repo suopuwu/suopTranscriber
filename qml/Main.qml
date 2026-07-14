@@ -354,10 +354,6 @@ ApplicationWindow {
                                  : (mainPanel.player.source.toString() !== ""
                                     ? mainPanel.player.source.toString().replace("file://", "") : "")
                 transcriptionController: transcriptionController
-                // Item 4/P28: same AudioPlayer instance MainPanel already
-                // plays through — only used for a read-only position/
-                // duration readout in the bottom bar.
-                player: player
                 onSettingsRequested: settingsPopup.open()
                 onTaskActivated: (path) => mainPanel.showAudioFile(path)
             }

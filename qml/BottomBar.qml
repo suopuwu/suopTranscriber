@@ -10,10 +10,6 @@ Item {
     property string vaultLocalPath: ""
     property TranscriptionController transcriptionController
     property VaultTreeModel vaultTreeModel
-    // Item 4/P28: same AudioPlayer instance MainPanel already plays through
-    // (see Main.qml's BottomBar instantiation) — only used here to show a
-    // "position / duration" readout, never to control playback itself.
-    property AudioPlayer player
     // Wave D item 2: the currently-open file's raw local path (audio file or
     // orphaned .md — whatever MainPanel currently shows), empty if none.
     property string currentFilePath: ""
@@ -555,24 +551,6 @@ Item {
             // would keep this visible (frozen, meaningless) after every job
             // finishes, since finished jobs stay listed until dismissed.
             visible: bottomBar.busy
-        }
-
-        // P28: current playback position / total duration for whatever
-        // audio is loaded in the player — independent of any transcription
-        // job, so it's gated on the player having a real source, not on
-        // bottomBar.busy. position/duration are real Q_PROPERTYs with their
-        // own NOTIFY signals (unlike activeElapsedMs above), so this binds
-        // directly with no polling needed. Reuses this file's own
-        // formatDuration() ("1:23" / "45s") rather than inventing a second
-        // time-format convention — MainPanel.qml has no equivalent numeric
-        // readout of its own to match (only the seek Slider itself).
-        Label {
-            visible: bottomBar.player && bottomBar.player.source.toString() !== ""
-            text: bottomBar.player
-                ? (bottomBar.formatDuration(bottomBar.player.position) + " / " + bottomBar.formatDuration(bottomBar.player.duration))
-                : ""
-            color: "#888888"
-            font.pixelSize: 11
         }
 
         // P22: which backend actually loaded the active model

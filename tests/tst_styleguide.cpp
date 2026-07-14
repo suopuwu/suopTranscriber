@@ -98,6 +98,22 @@ private slots:
                  "hover outline must fade, not pop (StyleGuide.md)");
     }
 
+    // Always-editable fields with no other visual cue that they're a text
+    // box (title/tags/speakers/prelude) should hint at their editability on
+    // hover — the underline previews at 50% opacity before the field is
+    // actually focused (1). Source-scan since there's no QQuickView here to
+    // drive a real HoverHandler.
+    void underlineField_hoverPreviewsAtHalfOpacity()
+    {
+        const QString src = readAll(QStringLiteral(SUOP_QML_DIR "/UnderlineField.qml"));
+        QVERIFY2(!src.isEmpty(), "qml/UnderlineField.qml must exist");
+        QVERIFY2(src.contains(QStringLiteral("HoverHandler")),
+                 "UnderlineField must track hover state to preview the underline before focus");
+        QVERIFY2(src.contains(QStringLiteral("hovered ? 0.5 : 0")),
+                 "unfocused hover state must show the underline at 50% opacity, not fully hidden or "
+                 "fully shown");
+    }
+
     // StyleGuide.md "Always-editable text": display-vs-edit must never be a
     // swap between two different elements gated by a focus-mode bool — that
     // pattern is exactly what let the native right-click "Copy" context
