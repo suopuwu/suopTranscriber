@@ -1613,20 +1613,22 @@ Rectangle {
                         // Bug: this Text had no width bound at all, so a long
                         // filename (routine for split-recording candidates —
                         // exactly the "acme mic 3"-style names combine rules
-                        // target) painted straight through the per-row icon
-                        // cluster (rowTranscribeButton/rowRelabelButton/
-                        // rowChaptersButton/groupMergeButton, ~100px reserved
-                        // on the right) instead of stopping short of it — the
-                        // combine group's merge button rendered on top of
-                        // mid-filename characters instead of in its own clear
-                        // space, reading as "no combine icon" at a glance. 36px
-                        // below covers this Row's own preceding siblings'
-                        // worst case (expand glyph 10 + status dot 8 + job dot
-                        // 6 + 3*4 spacing). clip (not just elide) backstops the
-                        // StyledText highlight case below — elide is
-                        // documented elsewhere in this file as unreliable
-                        // together with StyledText.
-                        width: Math.max(40, treeDelegate.width - treeColumn.x - 36 - 100)
+                        // target) ran under the sidebar's scrollbar/edge
+                        // instead of stopping short of it. Sized to the FULL
+                        // remaining row width, not shrunk to dodge the
+                        // per-row action-icon cluster (rowTranscribeButton/
+                        // rowRelabelButton/rowChaptersButton/groupMergeButton)
+                        // — those icons are hover-only overlays (declared
+                        // after this Column, so they already paint on top —
+                        // see actionButtonRow below) rather than reserved
+                        // layout space, so there's nothing to truncate for
+                        // even while they're showing (user report: reserving
+                        // space for them made names truncate the instant the
+                        // icons faded in, for icons that weren't even always
+                        // present). 36px below covers this Row's own
+                        // preceding siblings' worst case (expand glyph 10 +
+                        // status dot 8 + job dot 6 + 3*4 spacing).
+                        width: Math.max(40, treeDelegate.width - treeColumn.x - 36)
                         elide: Text.ElideRight
                         clip: true
                         textFormat: sidebar.searchQuery !== "" ? Text.StyledText : Text.PlainText
@@ -1685,141 +1687,184 @@ Rectangle {
                 }
             }
 
-            Item {
-                id: rowTranscribeButton
+            // Per-row action-icon cluster (transcribe/relabel/chapters) — a
+            // Row rather than each Item individually anchored to its
+            // neighbor's .left, so the cluster's actual width tracks
+            // whichever icons THIS row is actually eligible for. An
+            // untranscribed row is only ever eligible for transcribe, not
+            // relabel/chapters — with the old fixed anchor chain, the
+            // ineligible ones still occupied their 20px+4px slot (just
+            // invisible via opacity 0), so groupMergeButton (anchored off
+            // rowChaptersButton.left) always sat 3 icons' worth of gap away
+            // regardless of how many icons this row actually had (user
+            // report). `visible` here is the row's PERMANENT eligibility
+            // (isAudio/relabelEligible/chaptersEligible) — Row only reserves
+            // space for visible children — while each icon's own `opacity`
+            // stays the hover-only fade, so the cluster's width doesn't
+            // itself animate/jump as rowHover toggles, only the icons within
+            // it fade. layoutDirection: RightToLeft keeps declaration order
+            // matching visual order (transcribe rightmost, same as before).
+            Row {
+                id: actionButtonRow
                 anchors.right: parent.right
                 anchors.rightMargin: 8
                 anchors.verticalCenter: parent.verticalCenter
-                width: 20
-                height: 20
-                // Always available for any audio row, transcribed or not — a
-                // manual, explicit re-run should never be blocked (only
-                // "transcribe all"/bulkEligible above skips already-current
-                // files; this per-row icon is a deliberate single-file
-                // request, so it always fires).
-                opacity: (rowHover.hovered && treeDelegate.isAudio) ? 1 : 0
-                enabled: opacity > 0
+                layoutDirection: Qt.RightToLeft
+                spacing: 4
 
-                Behavior on opacity {
-                    NumberAnimation { duration: 120 }
-                }
+                Item {
+                    id: rowTranscribeButton
+                    // Always available for any audio row, transcribed or
+                    // not — a manual, explicit re-run should never be
+                    // blocked (only "transcribe all"/bulkEligible above
+                    // skips already-current files; this per-row icon is a
+                    // deliberate single-file request, so it always fires).
+                    visible: treeDelegate.isAudio
+                    width: 20
+                    height: 20
+                    opacity: rowHover.hovered ? 1 : 0
+                    enabled: opacity > 0
 
-                ToolTip.visible: rowTranscribeHover.hovered
-                ToolTip.text: treeDelegate.status === 2 ? qsTr("Re-transcribe") : qsTr("Transcribe")
-                ToolTip.delay: 500
+                    Behavior on opacity {
+                        NumberAnimation { duration: 120 }
+                    }
 
-                HoverHandler {
-                    id: rowTranscribeHover
-                    cursorShape: Qt.PointingHandCursor
-                    enabled: rowTranscribeButton.enabled
-                }
-                TapHandler {
-                    enabled: rowTranscribeButton.enabled
-                    onTapped: sidebar.transcriptionController.transcribe(
-                                  "file://" + treeDelegate.path, sidebar.vaultPath, AppSettings.defaultModel, false,
-                                  AppSettings.autoLabelEnabled, AppSettings.restrictTagsToExisting,
-                                  AppSettings.tagReuseBias, AppSettings.wordiness)
-                }
-                HoverBorder {
-                    anchors.fill: parent
-                    active: rowTranscribeButton.enabled && rowTranscribeHover.hovered
-                }
-                Text {
-                    anchors.centerIn: parent
-                    text: "⤒"
-                    color: "#dddddd"
-                    font.pixelSize: 13
-                }
-            }
+                    ToolTip.visible: rowTranscribeHover.hovered
+                    ToolTip.text: treeDelegate.status === 2 ? qsTr("Re-transcribe") : qsTr("Transcribe")
+                    ToolTip.delay: 500
 
-            // Wave D item 7: per-row "regenerate auto-title", same fade-in
-            // pattern as rowTranscribeButton but for already-transcribed rows.
-            // The transcribe icon is now always shown for any audio row (see
-            // above), so this always sits directly to its left — no more
-            // "invisible transcribe button leaves a gap" case to special-case.
-            Item {
-                id: rowRelabelButton
-                anchors.right: rowTranscribeButton.left
-                anchors.rightMargin: 4
-                anchors.verticalCenter: parent.verticalCenter
-                width: 20
-                height: 20
-                opacity: (rowHover.hovered && treeDelegate.relabelEligible) ? 1 : 0
-                enabled: opacity > 0
-
-                Behavior on opacity {
-                    NumberAnimation { duration: 120 }
-                }
-
-                ToolTip.visible: rowRelabelHover.hovered
-                ToolTip.text: qsTr("Regenerate auto-title")
-                ToolTip.delay: 500
-
-                HoverHandler {
-                    id: rowRelabelHover
-                    cursorShape: Qt.PointingHandCursor
-                    enabled: rowRelabelButton.enabled
-                }
-                TapHandler {
-                    enabled: rowRelabelButton.enabled
-                    onTapped: sidebar.transcriptionController.relabel("file://" + treeDelegate.path, sidebar.vaultPath,
-                                                                       AppSettings.restrictTagsToExisting,
-                                                                       AppSettings.tagReuseBias, AppSettings.wordiness)
-                }
-                HoverBorder {
-                    anchors.fill: parent
-                    active: rowRelabelButton.enabled && rowRelabelHover.hovered
-                }
-                Text {
-                    anchors.centerIn: parent
-                    text: "↻"
-                    color: "#dddddd"
-                    font.pixelSize: 13
-                }
-            }
-
-            // Per-row "regenerate chapters", same fade-in shape as
-            // rowRelabelButton but gated on chaptersEligible instead of
-            // relabelEligible — orphaned .md rows qualify too, since chapter
-            // generation never touches audio (see chaptersEligible's doc
-            // comment above). Sits one slot further left in the icon cluster.
-            Item {
-                id: rowChaptersButton
-                anchors.right: rowRelabelButton.left
-                anchors.rightMargin: 4
-                anchors.verticalCenter: parent.verticalCenter
-                width: 20
-                height: 20
-                opacity: (rowHover.hovered && treeDelegate.chaptersEligible) ? 1 : 0
-                enabled: opacity > 0
-
-                Behavior on opacity {
-                    NumberAnimation { duration: 120 }
+                    HoverHandler {
+                        id: rowTranscribeHover
+                        cursorShape: Qt.PointingHandCursor
+                        enabled: rowTranscribeButton.enabled
+                    }
+                    TapHandler {
+                        enabled: rowTranscribeButton.enabled
+                        onTapped: sidebar.transcriptionController.transcribe(
+                                      "file://" + treeDelegate.path, sidebar.vaultPath, AppSettings.defaultModel,
+                                      false, AppSettings.autoLabelEnabled, AppSettings.restrictTagsToExisting,
+                                      AppSettings.tagReuseBias, AppSettings.wordiness)
+                    }
+                    // Opaque backdrop so the glyph reads clearly against
+                    // whatever filename text it's overlapping (these icons
+                    // sit ON TOP of the label Text now, not beside it in
+                    // reserved space — see that Text's own doc comment) —
+                    // fades in/out together with this Item since Qt Quick
+                    // multiplies a child's opacity by its parent's, so no
+                    // separate Behavior needed here.
+                    Rectangle {
+                        anchors.fill: parent
+                        radius: AppSettings.borderRadius
+                        color: AppSettings.sidebarBackgroundColor
+                    }
+                    HoverBorder {
+                        anchors.fill: parent
+                        active: rowTranscribeButton.enabled && rowTranscribeHover.hovered
+                    }
+                    Text {
+                        anchors.centerIn: parent
+                        text: "⤒"
+                        color: "#dddddd"
+                        font.pixelSize: 13
+                    }
                 }
 
-                ToolTip.visible: rowChaptersHover.hovered
-                ToolTip.text: qsTr("Regenerate chapters")
-                ToolTip.delay: 500
+                // Wave D item 7: per-row "regenerate auto-title", same
+                // fade-in pattern as rowTranscribeButton but for
+                // already-transcribed rows.
+                Item {
+                    id: rowRelabelButton
+                    visible: treeDelegate.relabelEligible
+                    width: 20
+                    height: 20
+                    opacity: rowHover.hovered ? 1 : 0
+                    enabled: opacity > 0
 
-                HoverHandler {
-                    id: rowChaptersHover
-                    cursorShape: Qt.PointingHandCursor
-                    enabled: rowChaptersButton.enabled
+                    Behavior on opacity {
+                        NumberAnimation { duration: 120 }
+                    }
+
+                    ToolTip.visible: rowRelabelHover.hovered
+                    ToolTip.text: qsTr("Regenerate auto-title")
+                    ToolTip.delay: 500
+
+                    HoverHandler {
+                        id: rowRelabelHover
+                        cursorShape: Qt.PointingHandCursor
+                        enabled: rowRelabelButton.enabled
+                    }
+                    TapHandler {
+                        enabled: rowRelabelButton.enabled
+                        onTapped: sidebar.transcriptionController.relabel(
+                                      "file://" + treeDelegate.path, sidebar.vaultPath,
+                                      AppSettings.restrictTagsToExisting, AppSettings.tagReuseBias,
+                                      AppSettings.wordiness)
+                    }
+                    // See rowTranscribeButton's identical backdrop above.
+                    Rectangle {
+                        anchors.fill: parent
+                        radius: AppSettings.borderRadius
+                        color: AppSettings.sidebarBackgroundColor
+                    }
+                    HoverBorder {
+                        anchors.fill: parent
+                        active: rowRelabelButton.enabled && rowRelabelHover.hovered
+                    }
+                    Text {
+                        anchors.centerIn: parent
+                        text: "↻"
+                        color: "#dddddd"
+                        font.pixelSize: 13
+                    }
                 }
-                TapHandler {
-                    enabled: rowChaptersButton.enabled
-                    onTapped: sidebar.transcriptionController.generateChapters(
-                                  "file://" + treeDelegate.path, sidebar.vaultPath)
-                }
-                HoverBorder {
-                    anchors.fill: parent
-                    active: rowChaptersButton.enabled && rowChaptersHover.hovered
-                }
-                Text {
-                    anchors.centerIn: parent
-                    text: "≡"
-                    color: "#dddddd"
-                    font.pixelSize: 13
+
+                // Per-row "regenerate chapters", same fade-in shape as
+                // rowRelabelButton but gated on chaptersEligible instead of
+                // relabelEligible — orphaned .md rows qualify too, since
+                // chapter generation never touches audio (see
+                // chaptersEligible's doc comment above).
+                Item {
+                    id: rowChaptersButton
+                    visible: treeDelegate.chaptersEligible
+                    width: 20
+                    height: 20
+                    opacity: rowHover.hovered ? 1 : 0
+                    enabled: opacity > 0
+
+                    Behavior on opacity {
+                        NumberAnimation { duration: 120 }
+                    }
+
+                    ToolTip.visible: rowChaptersHover.hovered
+                    ToolTip.text: qsTr("Regenerate chapters")
+                    ToolTip.delay: 500
+
+                    HoverHandler {
+                        id: rowChaptersHover
+                        cursorShape: Qt.PointingHandCursor
+                        enabled: rowChaptersButton.enabled
+                    }
+                    TapHandler {
+                        enabled: rowChaptersButton.enabled
+                        onTapped: sidebar.transcriptionController.generateChapters(
+                                      "file://" + treeDelegate.path, sidebar.vaultPath)
+                    }
+                    // See rowTranscribeButton's identical backdrop above.
+                    Rectangle {
+                        anchors.fill: parent
+                        radius: AppSettings.borderRadius
+                        color: AppSettings.sidebarBackgroundColor
+                    }
+                    HoverBorder {
+                        anchors.fill: parent
+                        active: rowChaptersButton.enabled && rowChaptersHover.hovered
+                    }
+                    Text {
+                        anchors.centerIn: parent
+                        text: "≡"
+                        color: "#dddddd"
+                        font.pixelSize: 13
+                    }
                 }
             }
 
@@ -1838,14 +1883,16 @@ Rectangle {
             // group has one action," not another per-row icon.
             Item {
                 id: groupMergeButton
-                // Anchored to the LEFT of the per-row action cluster
-                // (transcribe/relabel/chapters, which end at
-                // rowChaptersButton) rather than parent.right — that rightmost
-                // spot is where rowTranscribeButton always fades in for any
-                // hovered audio row, including this group's own top row, so
-                // anchoring here too would have the two buttons land right on
-                // top of each other.
-                anchors.right: rowChaptersButton.left
+                // Anchored to the LEFT of actionButtonRow (rather than
+                // parent.right — that rightmost spot is where
+                // rowTranscribeButton always fades in for any hovered audio
+                // row, including this group's own top row, so anchoring
+                // here too would have the two buttons land right on top of
+                // each other) — actionButtonRow's own width already tracks
+                // only the icons THIS row is actually eligible for (see its
+                // doc comment), so this follows automatically instead of
+                // assuming a fixed 3-icon-wide cluster.
+                anchors.right: actionButtonRow.left
                 anchors.rightMargin: 4
                 anchors.verticalCenter: parent.verticalCenter
                 width: 20
@@ -1873,6 +1920,12 @@ Rectangle {
                                   AppSettings.combineRules, sidebar.model.allAudioPaths(),
                                   treeDelegate.combineOutputPath, sidebar.vaultPath,
                                   AppSettings.deleteOriginalsAfterCombine)
+                }
+                // See rowTranscribeButton's identical backdrop doc comment.
+                Rectangle {
+                    anchors.fill: parent
+                    radius: AppSettings.borderRadius
+                    color: AppSettings.sidebarBackgroundColor
                 }
                 Rectangle {
                     anchors.fill: parent
