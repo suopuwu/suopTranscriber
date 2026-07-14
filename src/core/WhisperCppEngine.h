@@ -38,6 +38,20 @@ public:
     // ggml/llama.cpp log call would then write through freed memory.
     QString activeBackendName() const override;
 
+    // Gates whisper.cpp's own internal Silero VAD (whisper_full_params.vad —
+    // see whisper.h) inside transcribe(), which skips non-speech regions of
+    // the given chunk and reduces the silence-driven hallucination whisper.cpp
+    // is otherwise prone to (see DESIGN.md's audio-preprocessing notes).
+    // Complements (does not replace) VadChunker's app-level windowing: that
+    // pass only trims silence AT window boundaries, so a window can still
+    // contain an internal pause between two grouped VAD segments — this
+    // mops up exactly that residual case. Empty (default) means "no VAD
+    // gating", today's behavior. Reloaded from whisper_vad_model_path fresh
+    // on every transcribe() call internally (see whisper.cpp's
+    // whisper_full()) — acceptable, the model is ~1MB.
+    void setVadModelPath(const QString &path) { m_vadModelPath = path; }
+
 private:
     whisper_context *m_ctx = nullptr;
+    QString m_vadModelPath;
 };

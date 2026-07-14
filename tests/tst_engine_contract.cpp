@@ -195,6 +195,52 @@ private slots:
         QCOMPARE(lastTotal, 5.0);
     }
 
+    // Spec (DESIGN.md "Durable / resumable transcription", chunking half —
+    // see VadChunker.h): once a file is split into multiple windows, each
+    // window is its own transcribe() call with its own offsetSeconds, and
+    // the APP stitches their chunk-relative segments back into one globally-
+    // ordered, correctly-offset stream — the real multi-chunk case the
+    // single-chunk test above stands in for.
+    void multiChunkStitch_producesGloballyOrderedOffsetSegments()
+    {
+        FakeEngine engine;
+
+        // Two chunks, as if VadChunker had split a 65s file into windows
+        // [0, 60) and [60, 65) — FakeEngine always reports the same two
+        // chunk-relative segments {0-2.5, 2.5-5} regardless of chunk content,
+        // so each window's raw output is identical and only the offset
+        // merge distinguishes them.
+        AudioChunk chunk1;
+        chunk1.pcm16kMono.assign(60 * 16000, 0.0f);
+        chunk1.offsetSeconds = 0.0;
+
+        AudioChunk chunk2;
+        chunk2.pcm16kMono.assign(5 * 16000, 0.0f);
+        chunk2.offsetSeconds = 60.0;
+
+        std::vector<Segment> stitched;
+        for (const AudioChunk &chunk : {chunk1, chunk2}) {
+            const std::vector<Segment> raw = engine.transcribe(
+                chunk, [](double, double) {}, [](const Segment &) {});
+            for (Segment s : raw) {
+                s.t0 += chunk.offsetSeconds;
+                s.t1 += chunk.offsetSeconds;
+                stitched.push_back(s);
+            }
+        }
+
+        QCOMPARE(stitched.size(), std::size_t(4));
+        // Strictly increasing, globally-offset timestamps across the
+        // chunk boundary — this is the whole point of the offset merge.
+        for (std::size_t i = 1; i < stitched.size(); ++i) {
+            QVERIFY2(stitched[i].t0 >= stitched[i - 1].t0,
+                     "segments must stay in global chronological order across chunks");
+        }
+        QCOMPARE(stitched.front().t0, 0.0);
+        QCOMPARE(stitched[2].t0, 60.0); // first segment of the second chunk
+        QCOMPARE(stitched.back().t1, 65.0);
+    }
+
     // Spec: constructing WhisperCppEngine with a bad model path must not
     // crash (whisper_init returns nullptr); isValid() reports the failure and
     // transcribe() is a documented no-op — empty vector, no callbacks fired

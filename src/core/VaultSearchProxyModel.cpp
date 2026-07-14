@@ -54,6 +54,20 @@ void VaultSearchProxyModel::setTagFilter(const QStringList &tags)
     invalidate();
 }
 
+QVariantMap VaultSearchProxyModel::fileSortKeys() const
+{
+    return m_fileSortKeys;
+}
+
+void VaultSearchProxyModel::setFileSortKeys(const QVariantMap &keys)
+{
+    if (keys == m_fileSortKeys)
+        return;
+    m_fileSortKeys = keys;
+    emit fileSortKeysChanged();
+    invalidate();
+}
+
 bool VaultSearchProxyModel::filterAcceptsRow(int sourceRow, const QModelIndex &sourceParent) const
 {
     // Free-text searchQuery never hides rows (item 9: matches sort to the
@@ -169,9 +183,57 @@ bool VaultSearchProxyModel::lessThan(const QModelIndex &left, const QModelIndex 
         if (leftMatches != rightMatches)
             return leftMatches;
     }
-    // No query, or tied match status: preserve the source model's own order
-    // (scanDirectory() already sorts dirs-first, alphabetical) instead of
-    // re-deriving a comparison here.
+
+    const QAbstractItemModel *src = sourceModel();
+    const bool leftIsDir = src->data(left, VaultTreeModel::IsDirRole).toBool();
+    const bool rightIsDir = src->data(right, VaultTreeModel::IsDirRole).toBool();
+    if (leftIsDir != rightIsDir) {
+        // Directories always sort first — was an accidental side effect of
+        // scanDirectory()'s row order below when that was the only ordering
+        // signal; now explicit, since fileSortKeys below can reorder files
+        // independently of their source row.
+        return leftIsDir;
+    }
+
+    if (!leftIsDir && !m_fileSortKeys.isEmpty()) {
+        const QVariantList leftKey = m_fileSortKeys.value(src->data(left, VaultTreeModel::PathRole).toString()).toList();
+        const QVariantList rightKey =
+            m_fileSortKeys.value(src->data(right, VaultTreeModel::PathRole).toString()).toList();
+        // Sidebar.qml's file-tree sort (sort mode + combine-candidate
+        // clustering) — see VaultSearchProxyModel.h's fileSortKeys doc
+        // comment. Orphaned .md files have no entry (out of scope — combine
+        // candidates and mtime sorting are audio-specific).
+        //
+        // Bug: a keyed/keyless split that falls straight through to the
+        // row()-order default below (as this used to) isn't a valid total
+        // order once EITHER side can be keyed — e.g. keyed-A < row-based-B
+        // and row-based-B < keyed-C says nothing about how A compares to C,
+        // so QSortFilterProxyModel's sort (which assumes a strict weak
+        // ordering) can misplace or destabilize entries that never even
+        // touch fileSortKeys. Making "has a key" its own ordering tier first
+        // — keyed files always before keyless ones — keeps every pairwise
+        // comparison consistent with every other, at the cost of keyless
+        // files (orphaned .md) always landing after every audio file in the
+        // same folder instead of interleaving at their old alphabetical spot.
+        const bool leftHasKey = leftKey.size() == 2;
+        const bool rightHasKey = rightKey.size() == 2;
+        if (leftHasKey != rightHasKey)
+            return leftHasKey;
+        if (leftHasKey) {
+            const QString leftGroup = leftKey.at(0).toString();
+            const QString rightGroup = rightKey.at(0).toString();
+            if (leftGroup != rightGroup)
+                return leftGroup < rightGroup;
+            const QString leftOwn = leftKey.at(1).toString();
+            const QString rightOwn = rightKey.at(1).toString();
+            if (leftOwn != rightOwn)
+                return leftOwn < rightOwn;
+        }
+    }
+
+    // No query, tied match status, and no (or tied) fileSortKeys: preserve
+    // the source model's own order (scanDirectory() already sorts
+    // dirs-first, alphabetical) instead of re-deriving a comparison here.
     return left.row() < right.row();
 }
 

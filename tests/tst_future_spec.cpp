@@ -16,12 +16,12 @@ private slots:
     // UI-validation list for manual testing (no click/playback automation in
     // this environment).
 
-    void vadChunking_silenceAlignedWindows()
-    {
-        QSKIP("DESIGN.md 'Durable / resumable transcription': chunk on silence via Silero VAD in "
-              "~2-5 min windows, not fixed slices. NOT BUILT: the worker feeds the whole file as a "
-              "single AudioChunk with offsetSeconds = 0.0.");
-    }
+    // vadChunking_silenceAlignedWindows: BUILT. VadChunker::computeWindows()
+    // (src/core/VadChunker.h/.cpp) chunks on silence via whisper.cpp's Silero
+    // VAD in ~2-5 min windows, splitting only at gaps between VAD segments
+    // (never mid-segment) — see tests/tst_vadchunking.cpp. The resume/
+    // checkpoint half of this same DESIGN.md milestone (below) is still not
+    // built.
 
     void partialJsonl_checkpointAppend()
     {
@@ -44,13 +44,11 @@ private slots:
               "(no partial file exists to delete).");
     }
 
-    void offsetMerge_multiChunkStitching()
-    {
-        QSKIP("DESIGN.md / CLAUDE.md: the app (never the engine) adds each chunk's global offset "
-              "when stitching windows. The single-chunk merge callsite exists and is exercised by "
-              "tst_engine_contract's FakeEngine test; the real multi-chunk stitch is NOT BUILT "
-              "(blocked on VAD chunking).");
-    }
+    // offsetMerge_multiChunkStitching: BUILT. TranscriptionController::run()'s
+    // worker loop now transcribes each VadChunker window as its own
+    // AudioChunk and adds offsetSeconds to every segment in onSegment before
+    // writing/labeling — see tst_engine_contract.cpp's
+    // multiChunkStitch_producesGloballyOrderedOffsetSegments().
 
     void subprocessEngines_manifestAndCapabilities()
     {
@@ -79,7 +77,7 @@ private slots:
     void vaultConfigJson_appScopedSettingsDivergence()
     {
         QSKIP("DESIGN.md 'Vault / file layout': RESOLVED for settings (Wave E item 9) — "
-              "appearance/behavior settings now round-trip through <vault>/.suopTranscriber "
+              "appearance/behavior settings now round-trip through <vault>/.transcriber/settings.json "
               "(JSON), see VaultTreeModel::readVaultSettings/writeVaultSettings and "
               "AppSettings.qml's loadFromVault/saveToVault (tested: "
               "tst_vaulttreemodel.cpp's vaultSettings_* cases). STILL DIVERGENT: a USB device "

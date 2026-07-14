@@ -64,6 +64,11 @@ bool areDiarizationModelsDownloaded(const QUrl &vaultPath)
         && QFileInfo::exists(dir.filePath(QString(kDiarizationEmbeddingFileName)));
 }
 
+bool isVadModelDownloaded(const QUrl &vaultPath)
+{
+    return QFileInfo::exists(modelsDirFor(vaultPath).filePath(QString(kVadModelFileName)));
+}
+
 namespace {
 
 // Probes Content-Length via a HEAD request, without downloading anything —
@@ -252,6 +257,26 @@ QString ensureLabelModel(const QUrl &vaultPath, QString *errorOut, const Downloa
     const QString url = QStringLiteral("https://huggingface.co/unsloth/Qwen3-4B-Instruct-2507-GGUF/resolve/main/%1")
                              .arg(kLabelModelFileName);
     return downloadToModelsDir(modelsDir, QString(kLabelModelFileName), url, errorOut, onProgress, control);
+}
+
+QString ensureVadModel(const QUrl &vaultPath, QString *errorOut, const DownloadProgressCallback &onProgress,
+                        const DownloadControl &control)
+{
+    const QDir modelsDir = modelsDirFor(vaultPath);
+    const QString modelPath = modelsDir.filePath(QString(kVadModelFileName));
+
+    if (QFileInfo::exists(modelPath))
+        return modelPath;
+
+    if (!modelsDir.mkpath(".")) {
+        if (errorOut)
+            *errorOut = QStringLiteral("could not create %1").arg(modelsDir.path());
+        return {};
+    }
+
+    const QString url = QStringLiteral("https://huggingface.co/ggml-org/whisper-vad/resolve/main/%1")
+                             .arg(kVadModelFileName);
+    return downloadToModelsDir(modelsDir, QString(kVadModelFileName), url, errorOut, onProgress, control);
 }
 
 bool ensureDiarizationModels(const QUrl &vaultPath, QString *segmentationPathOut, QString *embeddingPathOut,

@@ -806,6 +806,16 @@ public:
     Q_INVOKABLE void runCombineScan(const QVariantList &rules, const QStringList &audioPaths, const QUrl &vaultUrl,
                                      bool deleteOriginals);
 
+    // Sidebar per-row "combine this group" hover button (item 51): same
+    // matching/enqueue machinery as runCombineScan() above but scoped to the
+    // ONE group whose outputPath matches — see runCombineScan()'s doc
+    // comment for why the ribbon button's "scan everything ready" behavior
+    // is deliberately not what a single-row action should do. No-ops
+    // (returns silently) if that group is no longer "ready" or already
+    // queued by the time this runs.
+    Q_INVOKABLE void combineGroup(const QVariantList &rules, const QStringList &audioPaths,
+                                   const QString &outputPath, const QUrl &vaultUrl, bool deleteOriginals);
+
 signals:
     void busyChanged();
     void progressChanged();

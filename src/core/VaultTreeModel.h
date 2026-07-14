@@ -81,11 +81,11 @@ public:
     // silently a no-op rather than an error the user needs to handle.
     Q_INVOKABLE void revealInFileManager(const QUrl &fileUrl) const;
 
-    // Item 9 (Wave E): vault-scoped settings file (`.suopTranscriber`, JSON)
-    // at the vault root — a hidden dotfile, so it's naturally invisible to
-    // rebuild()/scanDirectory()'s scan (QDir's default filters exclude
-    // hidden entries; a suffix-less dotfile also never matches the ".md"
-    // check even if that changed). Empty map / false+*errorOut if there's no
+    // Item 9 (Wave E): vault-scoped settings file (`.transcriber/settings.json`,
+    // JSON) — lives inside the hidden `.transcriber/` config dir, so it's
+    // naturally invisible to rebuild()/scanDirectory()'s scan (QDir's default
+    // filters exclude hidden entries). writeVaultSettings() creates
+    // `.transcriber/` if missing. Empty map / false+*errorOut if there's no
     // vault open or the file can't be read/written — callers (AppSettings)
     // fall back to defaults in that case.
     Q_INVOKABLE QVariantMap readVaultSettings() const;
@@ -96,6 +96,15 @@ public:
     // to be realized (Sidebar's untranscribedPaths/transcribedPaths only
     // cover the current viewport). Used by "force retranscribe all".
     Q_INVOKABLE QStringList allAudioPaths() const;
+
+    // Same traversal as allAudioPaths(), paired with each file's mtime —
+    // Sidebar.qml's file-tree sort feature (Name / Date Modified asc/desc)
+    // needs raw per-file mtimes to build its sort keys, and QML has no direct
+    // filesystem access of its own. Keys are absolute paths (same strings
+    // allAudioPaths() returns), values are QFileInfo::lastModified()'s
+    // toMSecsSinceEpoch() (a double once crossed into JS, but well within
+    // Number.MAX_SAFE_INTEGER for any realistic timestamp).
+    Q_INVOKABLE QVariantMap audioLastModified() const;
 
     // Search UI rearchitecture: flat, already-computed search results for
     // Sidebar.qml's separate results ListView (shown instead of the normal
@@ -145,6 +154,7 @@ private:
     std::unique_ptr<Node> scanDirectory(const QString &dirPath, Node *parent) const;
     Node *nodeFromIndex(const QModelIndex &index) const;
     static void collectAudioPaths(const Node *node, QStringList &out);
+    static void collectAudioLastModified(const Node *node, QVariantMap &out);
     // Backs searchResults() — not static (unlike collectAudioPaths above)
     // because it needs transcriptBody(), which consults m_transcriptBodyCache.
     void collectSearchResults(const Node *node, const QString &queryLower, bool includeTranscriptions,

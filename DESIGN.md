@@ -143,17 +143,33 @@ Do not build that on day one.
 
 Independent of highlighting granularity — this exists for the resume requirement.
 
-- Chunk on **silence via VAD** (Silero VAD), ~2–5 min VAD-aligned windows. Don't
-  chunk at fixed 30s (slices words).
-- Checkpoint after each window: append committed segments to
-  `.name.partial.jsonl` with the last global offset.
-- On restart: if `.md` is missing but a partial exists, resume from that offset.
-- On full completion: write the `.md` (see "Vault / file layout" — timing lives
-  in the `.md` itself, not a separate sidecar), delete the partial.
-- Apply the app-side offset merge when stitching windows.
-
-Not yet implemented (see "Vault / file layout" below for what durability
-currently looks like without it).
+- **BUILT:** chunk on **silence via VAD** (Silero VAD, whisper.cpp's built-in
+  API), ~2–5 min VAD-aligned windows, splitting only at gaps between speech
+  segments — never a fixed 30s slice that could cut a word mid-segment. See
+  `VadChunker::computeWindows()`/`groupSegmentsIntoWindows()`
+  (`src/core/VadChunker.h/.cpp`, tested in `tests/tst_vadchunking.cpp`).
+  Degrades gracefully to a single whole-file window (today's pre-chunking
+  behavior) if the VAD model can't be downloaded/loaded — recorded honestly
+  via the `.md`'s `vad`/`vadError` frontmatter fields, never a silent
+  substitution.
+- **BUILT:** the app-side offset merge is now real (not a no-op) — each
+  window is its own `AudioChunk` with `offsetSeconds` set to the window's
+  start, and `TranscriptionController`'s `onSegment` adds that offset before
+  writing/labeling. See `tst_engine_contract.cpp`'s
+  `multiChunkStitch_producesGloballyOrderedOffsetSegments()`.
+  whisper.cpp's own per-window Silero VAD gating (`WhisperCppEngine::
+  setVadModelPath()`) is also wired in, independent of the windowing above —
+  it further skips any residual silence gap that survived grouping *inside*
+  a window, reducing whisper.cpp's silence-driven hallucination.
+- **NOT YET BUILT:** checkpoint after each window to `.name.partial.jsonl`
+  with the last global offset; on restart, resume from that offset if `.md`
+  is missing but a partial exists; on full completion, delete the partial.
+  Current durability is coarser without this: frontmatter written at job
+  start + per-segment flush of the `.md` itself (see "Vault / file layout"
+  below) — a killed job leaves a truncated `.md` and a re-run starts over
+  from scratch, it just no longer re-decodes/re-runs VAD as one giant
+  single-shot pass now that chunking exists underneath where resume will
+  eventually hook in.
 
 ## Vault / file layout (Obsidian-style)
 
@@ -161,8 +177,8 @@ One user-chosen root holds config, audio, and transcriptions:
 
 ```
 vault/
-  .suopTranscriber                # settings (JSON) — see below; user-requested filename
   .transcriber/
+    settings.json                # vault-scoped settings (JSON) — see below
     engines/                    # engine manifests + scripts
     models/                     # downloaded model files (large: 2–4 GB each)
   interviews/2026-06-30.m4a
@@ -170,14 +186,14 @@ vault/
   interviews/.2026-06-30.partial.jsonl  # exists only mid-transcription (resume)
 ```
 
-- **Vault-scoped settings (`.suopTranscriber`):** appearance/behavior settings
-  (`AppSettings.qml`'s `defaults` map — colors, opacity, radii, label-display
-  toggles, auto-labeling options, etc.) round-trip through this hidden JSON
-  file at the vault root, via `VaultTreeModel::readVaultSettings()`/
-  `writeVaultSettings()`. A hidden dotfile with no recognized extension, so
-  it's naturally excluded from the sidebar tree (`QDir`'s default entry
-  filters skip hidden files; it also never matches the `.md`/audio-extension
-  checks even if that changed). Loaded on `vaultPath` change
+- **Vault-scoped settings (`.transcriber/settings.json`):** appearance/behavior
+  settings (`AppSettings.qml`'s `defaults` map — colors, opacity, radii,
+  label-display toggles, auto-labeling options, etc.) round-trip through this
+  JSON file inside the vault's hidden `.transcriber/` config dir, via
+  `VaultTreeModel::readVaultSettings()`/`writeVaultSettings()` (the latter
+  creates `.transcriber/` if missing). `.transcriber/` is itself a hidden
+  dotdir, so it's naturally excluded from the sidebar tree (`QDir`'s default
+  entry filters skip hidden entries). Loaded on `vaultPath` change
   (`AppSettings.loadFromVault`), saved (debounced) on any settings change
   (`AppSettings.saveToVault`). `lastVaultPath`/`lastModel` stay app-scoped
   (`QtCore.Settings`, `~/.config`) — they're last-used bootstrap state needed

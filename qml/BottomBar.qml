@@ -280,7 +280,18 @@ Item {
         visible: AppSettings.progressGlowEnabled && bottomBar.busy
         anchors.top: parent.top
         anchors.left: parent.left
-        width: Math.max(0, bottomBar.width * bottomBar.taskOverallProgress)
+        // Bug: taskOverallProgress is genuinely 0.0 at the exact instant a
+        // job goes busy (see TranscriptionController::recomputeOverallProgress()
+        // — the "loading" phase starts its synthetic progress at 0 and ramps
+        // up from there), and unlike the plain ProgressBar below (which
+        // always paints its own background groove regardless of value),
+        // these Rectangles have no track — at width 0 they draw literally
+        // nothing. For any job whose busy phases resolve quickly, that
+        // could mean the glow never becomes visibly wider than 0 before the
+        // job finishes, reading as "doesn't work" rather than "just started
+        // at 0%". A small width floor keeps it visible as soon as busy
+        // flips true.
+        width: Math.max(4, bottomBar.width * bottomBar.taskOverallProgress)
         height: AppSettings.progressGlowWidth + AppSettings.progressGlowRadius
 
         // Outer halo — widest, most transparent.

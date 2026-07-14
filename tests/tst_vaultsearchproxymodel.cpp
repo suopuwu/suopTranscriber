@@ -269,6 +269,88 @@ private slots:
 
         QCOMPARE(proxy.rowCount(), 2);
     }
+
+    // --- fileSortKeys (Sidebar.qml sort mode + combine-candidate clustering) ---
+
+    // Two paths sharing groupRank (element 0) but differing in ownRank
+    // (element 1) sort adjacently, ordered by ownRank within the pair — the
+    // "cluster then order within the cluster" composite key Sidebar.qml
+    // builds (see refreshTreeOrdering()'s doc comment).
+    void fileSortKeys_sameGroupRank_ordersByOwnRankAndStaysAdjacent()
+    {
+        QTemporaryDir vault;
+        QVERIFY(vault.isValid());
+        QVERIFY(touch(vault.filePath("b.mp3")));
+        QVERIFY(touch(vault.filePath("a.mp3")));
+        QVERIFY(touch(vault.filePath("z.mp3")));
+
+        VaultTreeModel source;
+        source.setVaultPath(QUrl::fromLocalFile(vault.path()));
+
+        VaultSearchProxyModel proxy;
+        proxy.setSourceModel(&source);
+
+        QVariantMap keys;
+        keys.insert(vault.filePath("a.mp3"), QVariantList() << "group1" << "a");
+        keys.insert(vault.filePath("b.mp3"), QVariantList() << "group1" << "b");
+        keys.insert(vault.filePath("z.mp3"), QVariantList() << "group0" << "z");
+        proxy.setFileSortKeys(keys);
+
+        QCOMPARE(siblingNamesInOrder(proxy), QStringList({"z.mp3", "a.mp3", "b.mp3"}));
+    }
+
+    // Directories always sort ahead of files regardless of fileSortKeys —
+    // only files get reordered by sort mode/clustering, folders keep their
+    // existing dirs-first position.
+    void fileSortKeys_directoriesStayFirst()
+    {
+        QTemporaryDir vault;
+        QVERIFY(vault.isValid());
+        QVERIFY(touch(vault.filePath("aaa.mp3")));
+        QVERIFY(touch(vault.filePath("zzz_dir/inside.mp3")));
+
+        VaultTreeModel source;
+        source.setVaultPath(QUrl::fromLocalFile(vault.path()));
+
+        VaultSearchProxyModel proxy;
+        proxy.setSourceModel(&source);
+
+        QVariantMap keys;
+        keys.insert(vault.filePath("aaa.mp3"), QVariantList() << "aaa.mp3" << "aaa.mp3");
+        proxy.setFileSortKeys(keys);
+
+        QCOMPARE(siblingNamesInOrder(proxy), QStringList({"zzz_dir", "aaa.mp3"}));
+    }
+
+    // A path with no fileSortKeys entry (e.g. an orphaned .md — combine
+    // clustering and date sort are audio-only) doesn't crash or vanish —
+    // Bug: it used to fall back to comparing raw row() against keyed
+    // siblings, which isn't a valid total order once ANY sibling is keyed
+    // (see lessThan()'s doc comment) and could destabilize the WHOLE
+    // sibling list's order, not just the keyless entry's own position. Keyed
+    // files (here, "aaa.mp3" — alphabetically first, but it has a key
+    // claiming last place) now always sort before every keyless file
+    // regardless of either's own value, so "orphaned.md" (no key) lands
+    // after it despite "orphaned.md" < "aaa.mp3" alphabetically.
+    void fileSortKeys_pathWithNoEntry_alwaysSortsAfterKeyedSiblings()
+    {
+        QTemporaryDir vault;
+        QVERIFY(vault.isValid());
+        QVERIFY(touch(vault.filePath("orphaned.md")));
+        QVERIFY(touch(vault.filePath("aaa.mp3")));
+
+        VaultTreeModel source;
+        source.setVaultPath(QUrl::fromLocalFile(vault.path()));
+
+        VaultSearchProxyModel proxy;
+        proxy.setSourceModel(&source);
+
+        QVariantMap keys;
+        keys.insert(vault.filePath("aaa.mp3"), QVariantList() << "zzz" << "zzz");
+        proxy.setFileSortKeys(keys);
+
+        QCOMPARE(siblingNamesInOrder(proxy), QStringList({"aaa.mp3", "orphaned.md"}));
+    }
 };
 
 QTEST_GUILESS_MAIN(TstVaultSearchProxyModel)

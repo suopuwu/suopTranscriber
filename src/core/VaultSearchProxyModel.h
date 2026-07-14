@@ -2,6 +2,7 @@
 
 #include <QSortFilterProxyModel>
 #include <QStringList>
+#include <QVariantMap>
 #include <qqml.h>
 
 // Item 9: sidebar search sort + match highlighting/snippet support. Wraps a
@@ -21,6 +22,8 @@ class VaultSearchProxyModel : public QSortFilterProxyModel {
     Q_PROPERTY(bool includeTranscriptions READ includeTranscriptions WRITE setIncludeTranscriptions NOTIFY
                    includeTranscriptionsChanged)
     Q_PROPERTY(QStringList tagFilter READ tagFilter WRITE setTagFilter NOTIFY tagFilterChanged)
+    Q_PROPERTY(
+        QVariantMap fileSortKeys READ fileSortKeys WRITE setFileSortKeys NOTIFY fileSortKeysChanged)
 
 public:
     // Extra role beyond what VaultTreeModel::roleNames() forwards: whether
@@ -39,6 +42,17 @@ public:
     QStringList tagFilter() const;
     void setTagFilter(const QStringList &tags);
 
+    // Sidebar.qml's file-tree sort feature (Name / Date Modified asc-desc,
+    // plus keeping combine-candidate groups tree-adjacent): path -> a
+    // 2-element [groupRank, ownRank] string list, precomputed in QML (it
+    // already has both AppSettings.combineRules and
+    // TranscriptionController::detectCombineGroups() available) and pushed
+    // here as one map so lessThan() only ever does a plain QString compare —
+    // same "QML computes, proxy just compares" shape as MatchesSearchRole
+    // above, avoiding a second copy of the grouping logic in C++.
+    QVariantMap fileSortKeys() const;
+    void setFileSortKeys(const QVariantMap &keys);
+
     QVariant data(const QModelIndex &proxyIndex, int role) const override;
     QHash<int, QByteArray> roleNames() const override;
 
@@ -46,6 +60,7 @@ signals:
     void searchQueryChanged();
     void includeTranscriptionsChanged();
     void tagFilterChanged();
+    void fileSortKeysChanged();
 
 protected:
     bool filterAcceptsRow(int sourceRow, const QModelIndex &sourceParent) const override;
@@ -60,4 +75,5 @@ private:
     QString m_searchQuery;
     bool m_includeTranscriptions = true;
     QStringList m_tagFilter;
+    QVariantMap m_fileSortKeys;
 };

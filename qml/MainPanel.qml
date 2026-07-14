@@ -101,8 +101,14 @@ Rectangle {
     function refreshPreludeAndChapters() {
         mainPanel.prelude = (player && player.source.toString() !== "" && transcriptionController)
             ? transcriptionController.readPrelude(player.source) : ""
-        mainPanel.chapters = (player && player.source.toString() !== "" && transcriptionController)
-            ? transcriptionController.readChapters(player.source) : []
+        // Chapters, unlike prelude, are also readable for an orphaned .md —
+        // TranscriptionController::readChapters() only ever reads the .md's
+        // existing body, never audio, same reasoning as generateChaptersButton
+        // above.
+        const chaptersUrl = mainPanel.orphanedMdPath !== "" ? ("file://" + mainPanel.orphanedMdPath)
+            : (player ? player.source.toString() : "")
+        mainPanel.chapters = (chaptersUrl !== "" && transcriptionController)
+            ? transcriptionController.readChapters(chaptersUrl) : []
     }
 
     function refreshOrphanedMetadata() {
@@ -1615,22 +1621,24 @@ Rectangle {
             }
 
             // Feature 3c: "Generate chapters" — mirrors regenerateLabelButton
-            // above exactly (same enable/tooltip/hover shape), but scoped to
-            // player-backed files only (not orphaned .md), matching the
-            // prelude editor's same restriction just below (chapters, like
-            // the prelude, are only ever read via refreshMetadata(), not
-            // refreshOrphanedMetadata()) — placed here in the icon-button
-            // cluster rather than inside the chapter list's own header row
-            // so it's still reachable to generate a FIRST set of chapters
-            // when mainPanel.chapters is still empty (the list itself only
-            // renders once chapters.length > 0).
+            // above exactly, including orphaned-.md support: chapter
+            // generation (TranscriptionController::generateChaptersJob())
+            // only ever reads the .md's existing frontmatter/body, never the
+            // audio file, so it works identically whether the row is
+            // player-backed or an orphaned .md — placed here in the
+            // icon-button cluster rather than inside the chapter list's own
+            // header row so it's still reachable to generate a FIRST set of
+            // chapters when mainPanel.chapters is still empty (the list
+            // itself only renders once chapters.length > 0).
             Item {
                 id: generateChaptersButton
                 Layout.preferredWidth: 22
                 Layout.preferredHeight: 22
                 visible: mainPanel.transcriptionController
-                         && mainPanel.orphanedMdPath === "" && mainPanel.hasStoredMetadata
-                enabled: visible && !mainPanel.transcriptionController.isQueued(mainPanel.player.source)
+                         && (mainPanel.orphanedMdPath !== "" || mainPanel.hasStoredMetadata)
+                readonly property url targetUrl: mainPanel.orphanedMdPath !== ""
+                    ? ("file://" + mainPanel.orphanedMdPath) : mainPanel.player.source
+                enabled: visible && !mainPanel.transcriptionController.isQueued(generateChaptersButton.targetUrl)
 
                 ToolTip.visible: generateChaptersHover.hovered
                 ToolTip.text: qsTr("Generate chapters")
@@ -1643,7 +1651,7 @@ Rectangle {
                 }
                 TapHandler {
                     enabled: generateChaptersButton.enabled
-                    onTapped: mainPanel.transcriptionController.generateChapters(mainPanel.player.source, mainPanel.vaultPath)
+                    onTapped: mainPanel.transcriptionController.generateChapters(generateChaptersButton.targetUrl, mainPanel.vaultPath)
                 }
                 HoverBorder {
                     anchors.fill: parent
@@ -2258,9 +2266,12 @@ Rectangle {
                 // Feature 3c: collapsible chapter list — same tap-to-seek
                 // idiom as the seek-bar tick marks (3b) and
                 // timestampClickArea further below. Only ever visible once
-                // mainPanel.chapters is non-empty (never for an orphaned
-                // .md, same restriction as the prelude editor above — see
-                // its own comment). Collapse toggle uses the same "+"/"−"
+                // mainPanel.chapters is non-empty — unlike the prelude editor
+                // above, this IS shown for an orphaned .md (chapters only
+                // ever read the .md body, never audio — see
+                // refreshPreludeAndChapters()'s doc comment); tapping a
+                // timestamp is just inert there since mainPanel.player has no
+                // source to seek. Collapse toggle uses the same "+"/"−"
                 // disclosure glyph Sidebar.qml already uses for its tree
                 // rows, rather than introducing a new ▶/▼ convention;
                 // defaults EXPANDED since most files will only have a
@@ -2271,7 +2282,7 @@ Rectangle {
                 ColumnLayout {
                     id: chapterListColumn
                     Layout.fillWidth: true
-                    visible: mainPanel.orphanedMdPath === "" && mainPanel.chapters.length > 0
+                    visible: mainPanel.chapters.length > 0
                     spacing: 4
 
                     RowLayout {

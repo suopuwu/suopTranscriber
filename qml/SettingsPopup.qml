@@ -37,7 +37,21 @@ Popup {
                 ? settingsPopup.computeRuleOverlaps(AppSettings.combineRules, settingsPopup.vaultTreeModel.allAudioPaths())
                 : []
     }
-    onOpened: settingsPopup.updateCombineOverlapWarnings()
+    // Bug 50: detectCombineGroups() itself is fully live (QFileInfo::exists() checked fresh
+    // every call, no C++-side caching) — but each ruleCard's own previewGroups is a cached JS
+    // property only recomputed on Component.onCompleted (once, ever, since this popup is a
+    // persistent singleton — see Main.qml) or on a pattern-text edit. Without this, deleting a
+    // combined output file (or any other disk change) while Settings is closed left a stale
+    // "Already combined" preview showing until app restart, since simply reopening the popup
+    // never re-ran updatePreview(). Same fix shape as updateCombineOverlapWarnings() above.
+    onOpened: {
+        settingsPopup.updateCombineOverlapWarnings()
+        for (let i = 0; i < combineRuleRepeater.count; i++) {
+            const item = combineRuleRepeater.itemAt(i)
+            if (item)
+                item.updatePreview()
+        }
+    }
     Connections {
         target: AppSettings
         function onCombineRulesChanged() {
@@ -85,6 +99,8 @@ Popup {
                                || highlightRadiusSlider.pressed || tagReuseBiasSlider.pressed
                                || timestampDecimalPlacesSlider.pressed
                                || progressGlowWidthSlider.pressed || progressGlowRadiusSlider.pressed
+                               || sidebarEdgeLeftMarginSlider.pressed || sidebarContentLeftMarginSlider.pressed
+                               || sidebarRightMarginSlider.pressed
 
     dim: !anyPressed
 
@@ -120,16 +136,42 @@ Popup {
                 || !AppSettings.isDefault("progressGlowWidth")
                 || !AppSettings.isDefault("progressGlowRadius")
                 || !AppSettings.isDefault("deleteOriginalsAfterCombine")
+                || !AppSettings.isDefault("sidebarEdgeLeftMargin")
+                || !AppSettings.isDefault("sidebarContentLeftMargin")
+                || !AppSettings.isDefault("sidebarRightMargin")
+    }
+
+    // Bug 53: every write below reassigns the WHOLE AppSettings.combineRules
+    // array, which (being a plain JS array, no incremental model
+    // notifications possible) makes the rule-list Repeater destroy and
+    // recreate every rule card on every single edit — see
+    // feedback_repeater_array_rebuild_eats_click memory. That rebuild was
+    // observed to scroll the Settings section back to the top; restoring
+    // scrollArea's contentY across the reassignment fixes the symptom
+    // directly regardless of the exact internal trigger (Qt.callLater so the
+    // restore lands after the rebuild's own layout pass settles, not before
+    // it can re-clamp).
+    function commitCombineRules(newRules) {
+        const savedContentY = scrollArea.contentItem ? scrollArea.contentItem.contentY : -1
+        AppSettings.combineRules = newRules
+        if (savedContentY >= 0) {
+            Qt.callLater(function () {
+                if (scrollArea.contentItem)
+                    scrollArea.contentItem.contentY = savedContentY
+            })
+        }
     }
 
     // Rule mutation helpers: AppSettings.combineRules is a plain JS array
     // (see its own doc comment in AppSettings.qml — no per-value reset
     // semantics fit it), so every edit rebuilds and reassigns the whole
-    // array to trigger combineRulesChanged.
+    // array to trigger combineRulesChanged. All four route through
+    // commitCombineRules() above rather than assigning AppSettings.combineRules
+    // directly, so scroll position is preserved consistently everywhere.
     function updateRule(index, key, value) {
         const rules = AppSettings.combineRules.slice()
         rules[index] = Object.assign({}, rules[index], {[key]: value})
-        AppSettings.combineRules = rules
+        settingsPopup.commitCombineRules(rules)
     }
     // The ONLY writer of rule `pattern` — every pattern edit (button-driven
     // differentiator toggle, or hand-typed text in rulePatternField) must
@@ -156,16 +198,16 @@ Popup {
             sortGroupOccurrence: sortGroupIndex > 0 ? targetOccurrence : 0,
             sortGroupIndex: sortGroupIndex
         })
-        AppSettings.combineRules = rules
+        settingsPopup.commitCombineRules(rules)
     }
     function addRule() {
-        AppSettings.combineRules = AppSettings.combineRules.concat(
-                    [{name: qsTr("New rule"), pattern: "", enabled: true}])
+        settingsPopup.commitCombineRules(AppSettings.combineRules.concat(
+                    [{name: qsTr("New rule"), pattern: "", enabled: true}]))
     }
     function removeRule(index) {
         const rules = AppSettings.combineRules.slice()
         rules.splice(index, 1)
-        AppSettings.combineRules = rules
+        settingsPopup.commitCombineRules(rules)
     }
 
     // Not a full syntax highlighter — just enough to make regex
@@ -848,6 +890,27 @@ Popup {
         ScrollBar.horizontal.policy: ScrollBar.AlwaysOff
         opacity: settingsPopup.anyPressed ? 0 : 1
 
+        // Bug 54: horizontal scrolling is never wanted in this popup (the
+        // scrollbar above is already permanently AlwaysOff) — but Right-arrow
+        // at the end of a TextField's text (e.g. rulePatternField) could
+        // still drag the underlying Flickable's contentX away from 0 (Qt
+        // Quick's cursor-follow/ensure-visible behavior for a TextInput
+        // nested in a Flickable), letting the whole popup pan offscreen.
+        // A plain `Binding{value:0}` does NOT hold here — verified with an
+        // offscreen QTest repro: since the value has no reactive dependency,
+        // QML applies it once and any later direct write to contentX (which
+        // is exactly what the cursor-follow mechanism does) simply overrides
+        // it with no further reassertion. An explicit onContentXChanged reset
+        // (confirmed via the same repro to snap a manual drift straight back
+        // to 0) is what's actually needed.
+        Connections {
+            target: scrollArea.contentItem
+            function onContentXChanged() {
+                if (scrollArea.contentItem.contentX !== 0)
+                    scrollArea.contentItem.contentX = 0
+            }
+        }
+
         ColumnLayout {
             id: contentColumn
             // NOT parent.width: a QML child declared directly inside
@@ -1372,6 +1435,255 @@ Popup {
                     HoverBorder {
                         anchors.fill: parent
                         active: sidebarSelectionBorderColorResetButton.enabled && sidebarSelectionBorderColorResetButton.hovered
+                    }
+                }
+            }
+
+            RowLayout {
+                Layout.fillWidth: true
+                Label {
+                    Layout.preferredWidth: 90
+                    color: "white"
+                    text: qsTr("Left edge margin")
+                }
+                Slider {
+                    id: sidebarEdgeLeftMarginSlider
+                    Layout.fillWidth: true
+                    Layout.minimumWidth: 80
+                    from: 0
+                    to: 20
+                    value: AppSettings.sidebarEdgeLeftMargin
+                    hoverEnabled: true
+                    onMoved: AppSettings.sidebarEdgeLeftMargin = value
+
+                    HoverHandler {
+                        cursorShape: Qt.PointingHandCursor
+                    }
+                    HoverBorder {
+                        anchors.fill: parent
+                        active: sidebarEdgeLeftMarginSlider.hovered
+                    }
+                }
+                TextField {
+                    id: sidebarEdgeLeftMarginField
+                    Layout.preferredWidth: 56
+                    horizontalAlignment: TextInput.AlignRight
+                    hoverEnabled: true
+                    validator: DoubleValidator { bottom: sidebarEdgeLeftMarginSlider.from; top: sidebarEdgeLeftMarginSlider.to; decimals: 1 }
+                    onEditingFinished: {
+                        const v = parseFloat(text)
+                        if (!isNaN(v))
+                            AppSettings.sidebarEdgeLeftMargin = Math.max(sidebarEdgeLeftMarginSlider.from, Math.min(sidebarEdgeLeftMarginSlider.to, v))
+                        text = AppSettings.sidebarEdgeLeftMargin.toFixed(1)
+                    }
+
+                    background: UnderlineField { focused: sidebarEdgeLeftMarginField.activeFocus }
+
+                    Binding {
+                        target: sidebarEdgeLeftMarginField
+                        property: "text"
+                        value: AppSettings.sidebarEdgeLeftMargin.toFixed(1)
+                        when: !sidebarEdgeLeftMarginField.activeFocus
+                    }
+
+                    HoverHandler {
+                        cursorShape: Qt.PointingHandCursor
+                    }
+                    HoverBorder {
+                        anchors.fill: parent
+                        active: sidebarEdgeLeftMarginField.hovered
+                    }
+                }
+                Button {
+                    id: sidebarEdgeLeftMarginResetButton
+                    text: "↺"
+                    implicitWidth: 22
+                    implicitHeight: 22
+
+                    background: Rectangle {
+                        radius: AppSettings.borderRadius
+                        color: "transparent"
+                        border.width: 1
+                        border.color: "#3a3a3a"
+                    }
+                    enabled: !AppSettings.isDefault("sidebarEdgeLeftMargin")
+                    opacity: enabled ? 1 : 0.35
+                    hoverEnabled: enabled
+                    onClicked: AppSettings.resetProperty("sidebarEdgeLeftMargin")
+
+                    HoverHandler {
+                        cursorShape: Qt.PointingHandCursor
+                        enabled: sidebarEdgeLeftMarginResetButton.enabled
+                    }
+                    HoverBorder {
+                        anchors.fill: parent
+                        active: sidebarEdgeLeftMarginResetButton.enabled && sidebarEdgeLeftMarginResetButton.hovered
+                    }
+                }
+            }
+
+            RowLayout {
+                Layout.fillWidth: true
+                Label {
+                    Layout.preferredWidth: 90
+                    color: "white"
+                    text: qsTr("Left content margin")
+                }
+                Slider {
+                    id: sidebarContentLeftMarginSlider
+                    Layout.fillWidth: true
+                    Layout.minimumWidth: 80
+                    from: 0
+                    to: 20
+                    value: AppSettings.sidebarContentLeftMargin
+                    hoverEnabled: true
+                    onMoved: AppSettings.sidebarContentLeftMargin = value
+
+                    HoverHandler {
+                        cursorShape: Qt.PointingHandCursor
+                    }
+                    HoverBorder {
+                        anchors.fill: parent
+                        active: sidebarContentLeftMarginSlider.hovered
+                    }
+                }
+                TextField {
+                    id: sidebarContentLeftMarginField
+                    Layout.preferredWidth: 56
+                    horizontalAlignment: TextInput.AlignRight
+                    hoverEnabled: true
+                    validator: DoubleValidator { bottom: sidebarContentLeftMarginSlider.from; top: sidebarContentLeftMarginSlider.to; decimals: 1 }
+                    onEditingFinished: {
+                        const v = parseFloat(text)
+                        if (!isNaN(v))
+                            AppSettings.sidebarContentLeftMargin = Math.max(sidebarContentLeftMarginSlider.from, Math.min(sidebarContentLeftMarginSlider.to, v))
+                        text = AppSettings.sidebarContentLeftMargin.toFixed(1)
+                    }
+
+                    background: UnderlineField { focused: sidebarContentLeftMarginField.activeFocus }
+
+                    Binding {
+                        target: sidebarContentLeftMarginField
+                        property: "text"
+                        value: AppSettings.sidebarContentLeftMargin.toFixed(1)
+                        when: !sidebarContentLeftMarginField.activeFocus
+                    }
+
+                    HoverHandler {
+                        cursorShape: Qt.PointingHandCursor
+                    }
+                    HoverBorder {
+                        anchors.fill: parent
+                        active: sidebarContentLeftMarginField.hovered
+                    }
+                }
+                Button {
+                    id: sidebarContentLeftMarginResetButton
+                    text: "↺"
+                    implicitWidth: 22
+                    implicitHeight: 22
+
+                    background: Rectangle {
+                        radius: AppSettings.borderRadius
+                        color: "transparent"
+                        border.width: 1
+                        border.color: "#3a3a3a"
+                    }
+                    enabled: !AppSettings.isDefault("sidebarContentLeftMargin")
+                    opacity: enabled ? 1 : 0.35
+                    hoverEnabled: enabled
+                    onClicked: AppSettings.resetProperty("sidebarContentLeftMargin")
+
+                    HoverHandler {
+                        cursorShape: Qt.PointingHandCursor
+                        enabled: sidebarContentLeftMarginResetButton.enabled
+                    }
+                    HoverBorder {
+                        anchors.fill: parent
+                        active: sidebarContentLeftMarginResetButton.enabled && sidebarContentLeftMarginResetButton.hovered
+                    }
+                }
+            }
+
+            RowLayout {
+                Layout.fillWidth: true
+                Label {
+                    Layout.preferredWidth: 90
+                    color: "white"
+                    text: qsTr("Right margin")
+                }
+                Slider {
+                    id: sidebarRightMarginSlider
+                    Layout.fillWidth: true
+                    Layout.minimumWidth: 80
+                    from: 0
+                    to: 40
+                    value: AppSettings.sidebarRightMargin
+                    hoverEnabled: true
+                    onMoved: AppSettings.sidebarRightMargin = value
+
+                    HoverHandler {
+                        cursorShape: Qt.PointingHandCursor
+                    }
+                    HoverBorder {
+                        anchors.fill: parent
+                        active: sidebarRightMarginSlider.hovered
+                    }
+                }
+                TextField {
+                    id: sidebarRightMarginField
+                    Layout.preferredWidth: 56
+                    horizontalAlignment: TextInput.AlignRight
+                    hoverEnabled: true
+                    validator: DoubleValidator { bottom: sidebarRightMarginSlider.from; top: sidebarRightMarginSlider.to; decimals: 1 }
+                    onEditingFinished: {
+                        const v = parseFloat(text)
+                        if (!isNaN(v))
+                            AppSettings.sidebarRightMargin = Math.max(sidebarRightMarginSlider.from, Math.min(sidebarRightMarginSlider.to, v))
+                        text = AppSettings.sidebarRightMargin.toFixed(1)
+                    }
+
+                    background: UnderlineField { focused: sidebarRightMarginField.activeFocus }
+
+                    Binding {
+                        target: sidebarRightMarginField
+                        property: "text"
+                        value: AppSettings.sidebarRightMargin.toFixed(1)
+                        when: !sidebarRightMarginField.activeFocus
+                    }
+
+                    HoverHandler {
+                        cursorShape: Qt.PointingHandCursor
+                    }
+                    HoverBorder {
+                        anchors.fill: parent
+                        active: sidebarRightMarginField.hovered
+                    }
+                }
+                Button {
+                    id: sidebarRightMarginResetButton
+                    text: "↺"
+                    implicitWidth: 22
+                    implicitHeight: 22
+
+                    background: Rectangle {
+                        radius: AppSettings.borderRadius
+                        color: "transparent"
+                        border.width: 1
+                        border.color: "#3a3a3a"
+                    }
+                    enabled: !AppSettings.isDefault("sidebarRightMargin")
+                    opacity: enabled ? 1 : 0.35
+                    hoverEnabled: enabled
+                    onClicked: AppSettings.resetProperty("sidebarRightMargin")
+
+                    HoverHandler {
+                        cursorShape: Qt.PointingHandCursor
+                        enabled: sidebarRightMarginResetButton.enabled
+                    }
+                    HoverBorder {
+                        anchors.fill: parent
+                        active: sidebarRightMarginResetButton.enabled && sidebarRightMarginResetButton.hovered
                     }
                 }
             }
@@ -2898,6 +3210,7 @@ Popup {
                 spacing: 8
 
                 Repeater {
+                    id: combineRuleRepeater
                     model: AppSettings.combineRules
 
                     delegate: ColumnLayout {
@@ -2928,7 +3241,14 @@ Popup {
                         // the change on focus-out/Enter exactly as it does for
                         // manual typing, so insert-then-keep-typing and
                         // insert-then-click-away both commit the same way.
+                        // A non-empty selection is removed first so the button
+                        // OVERWRITES it rather than inserting alongside it —
+                        // remove() is just as undoable as insert() (both are
+                        // real TextInput edit operations, unlike a `text =`
+                        // reassignment), so Ctrl+Z still works in one step.
                         function insertPatternToken(snippet, cursorOffset) {
+                            if (rulePatternField.selectedText.length > 0)
+                                rulePatternField.remove(rulePatternField.selectionStart, rulePatternField.selectionEnd)
                             const pos = rulePatternField.cursorPosition
                             rulePatternField.insert(pos, snippet)
                             rulePatternField.cursorPosition = pos + cursorOffset

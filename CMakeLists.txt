@@ -176,6 +176,7 @@ qt_add_qml_module(suopTranscriber
         qml/Main.qml
         qml/AppSettings.qml
         qml/HoverBorder.qml
+        qml/CombineGroupOutline.qml
         qml/UnderlineField.qml
         qml/TitleBar.qml
         qml/Sidebar.qml
@@ -198,6 +199,8 @@ qt_add_qml_module(suopTranscriber
         src/core/AudioDecoder.cpp
         src/core/WhisperCppEngine.h
         src/core/WhisperCppEngine.cpp
+        src/core/VadChunker.h
+        src/core/VadChunker.cpp
         src/core/LabelingEngine.h
         src/core/LabelingEngine.cpp
         src/core/DiarizationEngine.h

@@ -48,6 +48,31 @@ QString makeLongSyntheticWav(const QString &path, int seconds = 180)
     return QFileInfo::exists(path) ? path : QString();
 }
 
+// A 10s tone: 5s at -3dB ("loud" half) concatenated with 5s at -30dB ("quiet"
+// half) — a 27dB (~22x amplitude) gap, standing in for a quiet voice in an
+// otherwise-loud recording (DESIGN.md/AudioDecoder.cpp's speechnorm comment).
+QString makeLoudQuietWav(const QString &path)
+{
+    QProcess gen;
+    gen.start("ffmpeg", {"-y",
+                          "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=16000:duration=5",
+                          "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=16000:duration=5",
+                          "-filter_complex",
+                          "[0:a]volume=-3dB[loud];[1:a]volume=-30dB[quiet];[loud][quiet]concat=n=2:v=0:a=1[out]",
+                          "-map", "[out]", "-ac", "1", path});
+    if (!gen.waitForFinished(30000) || gen.exitCode() != 0)
+        return QString();
+    return QFileInfo::exists(path) ? path : QString();
+}
+
+double rms(const std::vector<float> &pcm, std::size_t begin, std::size_t end)
+{
+    double sumSquares = 0.0;
+    for (std::size_t i = begin; i < end; ++i)
+        sumSquares += static_cast<double>(pcm[i]) * pcm[i];
+    return std::sqrt(sumSquares / static_cast<double>(end - begin));
+}
+
 // Snapshot a directory's file names — used to prove decoding leaves no
 // artifacts behind (the no-temp-WAV design).
 QStringList dirEntries(const QString &path)
@@ -245,6 +270,44 @@ private slots:
         QVERIFY2(pauseChecks > 5,
                  qPrintable(QStringLiteral("only %1 pause checks — pause didn't actually block the loop")
                                 .arg(pauseChecks)));
+    }
+
+    // Spec (this feature): decodeTo16kMono applies ffmpeg's speechnorm filter
+    // so a quiet passage in an otherwise-loud recording isn't left far below
+    // whisper.cpp's mel-normalization clamp floor (see AudioDecoder.cpp's
+    // speechnorm comment). Proof: a synthetic 27dB (~22x) loud/quiet gap must
+    // come out of decodeTo16kMono() meaningfully narrower — genuine adaptive
+    // leveling, not a no-op or a uniform gain that preserves the same ratio.
+    // Thresholds are empirically grounded (see AudioDecoder.cpp's comment):
+    // measured ~9.8x post-normalization ratio with generous slack either side.
+    void speechnormNarrowsQuietPassageGap()
+    {
+        REQUIRE_FFMPEG();
+
+        QTemporaryDir tempDir;
+        QVERIFY(tempDir.isValid());
+        const QString wavPath = makeLoudQuietWav(tempDir.filePath(QStringLiteral("loud_quiet.wav")));
+        if (wavPath.isEmpty())
+            QSKIP("could not generate synthetic loud/quiet test audio via ffmpeg");
+
+        QString error;
+        const auto pcm = AudioDecoder::decodeTo16kMono(wavPath, &error);
+        QVERIFY2(pcm.has_value(), qPrintable(error));
+
+        // 10s at 16kHz split into two 5s halves; trim a small guard band
+        // around the midpoint so speechnorm's own reaction lag at the
+        // loud->quiet transition doesn't contaminate either measurement.
+        const std::size_t half = pcm->size() / 2;
+        const std::size_t guard = 8000; // 0.5s
+        const double loudRms = rms(*pcm, 0, half - guard);
+        const double quietRms = rms(*pcm, half + guard, pcm->size());
+
+        QVERIFY2(quietRms > 1e-6, "quiet half must not be silence after normalization");
+        const double ratio = loudRms / quietRms;
+        QVERIFY2(ratio < 15.0,
+                 qPrintable(QStringLiteral("post-speechnorm loud/quiet RMS ratio %1 — gap barely narrowed "
+                                            "from the raw ~22x, leveling isn't actually working")
+                                .arg(ratio)));
     }
 };
 

@@ -474,7 +474,7 @@ QVariantMap VaultTreeModel::readVaultSettings() const
     if (localPath.isEmpty())
         return result;
 
-    QFile file(localPath + QStringLiteral("/.suopTranscriber"));
+    QFile file(localPath + QStringLiteral("/.transcriber/settings.json"));
     if (!file.open(QIODevice::ReadOnly))
         return result;
 
@@ -493,7 +493,14 @@ bool VaultTreeModel::writeVaultSettings(const QVariantMap &settings, QString *er
         return false;
     }
 
-    QFile file(localPath + QStringLiteral("/.suopTranscriber"));
+    const QDir configDir(localPath + QStringLiteral("/.transcriber"));
+    if (!configDir.mkpath(QStringLiteral("."))) {
+        if (errorOut)
+            *errorOut = QStringLiteral("could not create %1").arg(configDir.path());
+        return false;
+    }
+
+    QFile file(configDir.filePath(QStringLiteral("settings.json")));
     if (!file.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
         if (errorOut)
             *errorOut = QStringLiteral("could not open %1 for writing").arg(file.fileName());
@@ -518,6 +525,21 @@ void VaultTreeModel::collectAudioPaths(const Node *node, QStringList &out)
         out << node->path;
     for (const auto &child : node->children)
         collectAudioPaths(child.get(), out);
+}
+
+QVariantMap VaultTreeModel::audioLastModified() const
+{
+    QVariantMap out;
+    collectAudioLastModified(m_root.get(), out);
+    return out;
+}
+
+void VaultTreeModel::collectAudioLastModified(const Node *node, QVariantMap &out)
+{
+    if (node->isAudio)
+        out.insert(node->path, QVariant::fromValue(QFileInfo(node->path).lastModified().toMSecsSinceEpoch()));
+    for (const auto &child : node->children)
+        collectAudioLastModified(child.get(), out);
 }
 
 QVariantList VaultTreeModel::searchResults(const QString &query, bool includeTranscriptions) const

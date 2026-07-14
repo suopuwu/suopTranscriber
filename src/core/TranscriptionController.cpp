@@ -36,6 +36,7 @@
 #include "LabelingEngine.h"
 #include "ModelManager.h"
 #include "Segment.h"
+#include "VadChunker.h"
 #include "WhisperCppEngine.h"
 
 namespace {
@@ -340,9 +341,16 @@ int jobStatusPriority(TranscriptionController::JobStatus status)
 // reads false (the transcription still ran, ASR-only) rather than
 // misrepresenting a feature that didn't actually run (see ModelManager's
 // usedFallback/modelFallback for the same never-misrepresent principle).
+//
+// vad/vadError (this feature): whether whisper.cpp's built-in Silero VAD
+// gating actually ran (see WhisperCppEngine::setVadModelPath() and
+// VadChunker.h) — unlike speechnorm (unconditional, no failure mode, so it
+// gets no frontmatter field at all), VAD depends on a small model download
+// that can fail (network/disk), and ASR must still proceed without it. Same
+// never-misrepresent contract as speakerDetection/speakerDetectionError.
 void writeFrontmatter(QFile &mdFile, const QString &modelUsed, bool speakerDetection, bool modelFallback,
                       const QString &requestedModelId, const QStringList &speakerLabels,
-                      const QString &speakerDetectionError)
+                      const QString &speakerDetectionError, bool vad, const QString &vadError)
 {
     QTextStream out(&mdFile);
     out << "---\n";
@@ -352,6 +360,9 @@ void writeFrontmatter(QFile &mdFile, const QString &modelUsed, bool speakerDetec
         out << "speakers: " << speakerLabels.join(QStringLiteral(", ")) << '\n';
     if (!speakerDetectionError.isEmpty())
         out << "speakerDetectionError: " << speakerDetectionError << '\n';
+    out << "vad: " << (vad ? "true" : "false") << '\n';
+    if (!vadError.isEmpty())
+        out << "vadError: " << vadError << '\n';
     out << "transcribedAt: " << QDateTime::currentDateTime().toString(Qt::ISODate) << '\n';
     if (modelFallback) {
         out << "modelRequested: " << requestedModelId << '\n';
@@ -1403,6 +1414,36 @@ public slots:
             return;
         }
 
+        // VAD (this feature — DESIGN.md "Durable / resumable transcription",
+        // chunking half; see VadChunker.h): one small model does double duty —
+        // (a) whisper.cpp's own per-window silence gating (set on m_engine
+        // below) and (b) finding VAD-aligned window boundaries so a long file
+        // is transcribed as several bounded whisper_full() calls instead of
+        // one unbounded one (reduces long-context hallucination drift). A
+        // download/load failure degrades gracefully to today's single
+        // whole-file window with no gating — never blocks the job — recorded
+        // honestly in frontmatter below, same contract as speaker detection's
+        // speakerDetectionError.
+        QString vadError;
+        const QString vadModelPath = ModelManager::ensureVadModel(QUrl::fromLocalFile(vaultPath), &vadError);
+        std::vector<VadChunker::Window> windows;
+        bool vadActive = false;
+        if (!vadModelPath.isEmpty()) {
+            QString chunkingError;
+            windows = VadChunker::computeWindows(*pcm, vadModelPath, &chunkingError);
+            if (chunkingError.isEmpty())
+                vadActive = true;
+            else
+                vadError = chunkingError;
+        }
+        if (windows.empty())
+            windows.push_back({0.0, static_cast<double>(pcm->size()) / 16000.0});
+        // Reset on every job (not just a failure this time) — m_engine is a
+        // persistent member reused across jobs/files, so a PREVIOUS job's
+        // successful VAD path must not silently leak into this one if this
+        // job's VAD failed.
+        m_engine->setVadModelPath(vadActive ? vadModelPath : QString());
+
         QFile mdFile(sidecarPath(filePath));
         if (!mdFile.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
             emit finished(false, QStringLiteral("could not open %1 for writing").arg(mdFile.fileName()));
@@ -1414,24 +1455,22 @@ public slots:
             speakerLabels.append(QStringLiteral("Speaker %1").arg(i));
 
         writeFrontmatter(mdFile, QFileInfo(modelPath).fileName(), effectiveSpeakerDetection, modelFallback, modelId,
-                          speakerLabels, speakerDetectionError);
+                          speakerLabels, speakerDetectionError, vadActive, vadError);
         SegmentLineWriter lineWriter(mdFile);
 
-        AudioChunk chunk;
-        chunk.pcm16kMono = std::move(*pcm);
-        chunk.offsetSeconds = 0.0; // whole-file, single chunk — no VAD chunking yet
-
-        // "transcribing": whisper's own per-segment progress. Item 6 (Wave
-        // N): progress() is this phase's OWN 0->1 regardless of whether
+        // "transcribing": whisper's own per-segment progress, blended across
+        // ALL windows into one cumulative 0->1 (see secondsDoneInPriorWindows
+        // below) — each window's own done/total would otherwise snap the bar
+        // back to 0% at every window boundary. Item 6 (Wave N):
+        // progress() is this phase's OWN 0->1 regardless of whether
         // diarization ran before it — TranscriptionController blends it into
         // overallProgress using this phase's rolling-average share (see
         // recomputeOverallProgress()'s doc comment), not a fixed half.
         emit phase(QStringLiteral("transcribing"));
         emit progress(0.0);
-        ProgressCallback onProgress = [this](double done, double total) {
-            const double fraction = total > 0 ? done / total : 0.0;
-            emit progress(fraction);
-        };
+        const double totalFileSeconds = static_cast<double>(pcm->size()) / 16000.0;
+        double secondsDoneInPriorWindows = 0.0;
+
         // Drives TranscriptionController::liveUpdateTick (see its doc
         // comment) — throttled independently of whisper's own progress
         // ticks, which fire on every internal decode-loop iteration
@@ -1442,25 +1481,6 @@ public slots:
         QElapsedTimer liveTimer;
         liveTimer.start();
         qint64 lastLiveTickMs = -kLiveUpdateThrottleMs;
-        SegmentCallback onSegment = [&lineWriter, &diarizedTurns, effectiveSpeakerDetection, &liveTimer,
-                                      &lastLiveTickMs, this](const Segment &segment) {
-            // Chunk offset merge is the app's job (see WhisperCppEngine.cpp);
-            // with offsetSeconds always 0 this milestone it's a no-op, kept
-            // explicit here as the seam for when chunking lands.
-            // See isNonSpeechAnnotation()'s doc comment: a hallucinated
-            // "[APPLAUSE]"/"[MUSIC]"/etc. segment never gets a speaker
-            // label, regardless of what diarization found nearby.
-            const bool isSpeech = !isNonSpeechAnnotation(QString::fromStdString(segment.text).trimmed());
-            const QString label = (effectiveSpeakerDetection && isSpeech)
-                ? labelForSegment(diarizedTurns, segment.t0, segment.t1) : QString();
-            lineWriter.append(segment, label);
-
-            const qint64 nowMs = liveTimer.elapsed();
-            if (nowMs - lastLiveTickMs >= kLiveUpdateThrottleMs) {
-                lastLiveTickMs = nowMs;
-                emit segmentWritten();
-            }
-        };
 
         // Wave N (task system): whisper.cpp checks this deep inside its own
         // encode/decode loops (see WhisperCppEngine.cpp's onAbortCheck) —
@@ -1469,7 +1489,61 @@ public slots:
         // whisper_full() mid-file rather than only at its next natural
         // boundary, unlike diarization above.
         const AbortCallback onAbort = [this] { return waitWhilePausedOrCancelled(); };
-        m_engine->transcribe(chunk, onProgress, onSegment, onAbort);
+
+        for (const VadChunker::Window &window : windows) {
+            // Between-window pause/cancel checkpoint — a single-window file
+            // (today's pre-chunking behavior) never had this gap; mid-window
+            // pause/cancel is still handled by onAbort above, unchanged.
+            if (waitWhilePausedOrCancelled())
+                break;
+
+            const auto startSample = static_cast<std::size_t>(window.startSeconds * 16000.0);
+            const auto endSample =
+                std::min(pcm->size(), static_cast<std::size_t>(window.endSeconds * 16000.0));
+            if (endSample <= startSample)
+                continue;
+
+            AudioChunk chunk;
+            chunk.pcm16kMono.assign(pcm->begin() + static_cast<std::ptrdiff_t>(startSample),
+                                     pcm->begin() + static_cast<std::ptrdiff_t>(endSample));
+            chunk.offsetSeconds = window.startSeconds;
+            const double windowSeconds = static_cast<double>(chunk.pcm16kMono.size()) / 16000.0;
+
+            ProgressCallback onProgress = [this, &secondsDoneInPriorWindows, totalFileSeconds](double done, double) {
+                const double fraction =
+                    totalFileSeconds > 0 ? (secondsDoneInPriorWindows + done) / totalFileSeconds : 0.0;
+                emit progress(fraction);
+            };
+            SegmentCallback onSegment = [&lineWriter, &diarizedTurns, effectiveSpeakerDetection, &liveTimer,
+                                          &lastLiveTickMs, &chunk, this](const Segment &rawSegment) {
+                // Chunk offset merge is the app's job (see
+                // WhisperCppEngine.cpp/DESIGN.md "Engine architecture") — this
+                // is now a REAL merge for multi-window files, not the no-op
+                // it was when every job was a single offsetSeconds=0.0 chunk.
+                Segment segment = rawSegment;
+                segment.t0 += chunk.offsetSeconds;
+                segment.t1 += chunk.offsetSeconds;
+                // See isNonSpeechAnnotation()'s doc comment: a hallucinated
+                // "[APPLAUSE]"/"[MUSIC]"/etc. segment never gets a speaker
+                // label, regardless of what diarization found nearby.
+                const bool isSpeech = !isNonSpeechAnnotation(QString::fromStdString(segment.text).trimmed());
+                const QString label = (effectiveSpeakerDetection && isSpeech)
+                    ? labelForSegment(diarizedTurns, segment.t0, segment.t1) : QString();
+                lineWriter.append(segment, label);
+
+                const qint64 nowMs = liveTimer.elapsed();
+                if (nowMs - lastLiveTickMs >= kLiveUpdateThrottleMs) {
+                    lastLiveTickMs = nowMs;
+                    emit segmentWritten();
+                }
+            };
+
+            m_engine->transcribe(chunk, onProgress, onSegment, onAbort);
+            secondsDoneInPriorWindows += windowSeconds;
+
+            if (isCancelRequested())
+                break;
+        }
         mdFile.close();
 
         // See syncSpeakersFrontmatterToBody()'s doc comment — the
@@ -3343,6 +3417,35 @@ void TranscriptionController::runCombineScan(const QVariantList &rules, const QS
     // (see startNext()'s doc comment).
     if (m_activeIndex < 0)
         startNext();
+}
+
+// Sidebar's per-row "combine this group" hover button (item 51): same shape
+// as runCombineScan() above but filtered to the ONE group whose outputPath
+// matches — a deliberate single-group action, not "scan and enqueue
+// everything ready" the ribbon button performs. Silently no-ops if that
+// group is no longer "ready" (e.g. a concurrent edit/scan already changed
+// its status) or already queued — the sidebar only shows this button for a
+// row it just computed as "ready" via detectCombineGroups(), but that
+// snapshot can go stale between hover and click just as easily as
+// runCombineScan()'s own dedup check already accounts for.
+void TranscriptionController::combineGroup(const QVariantList &rules, const QStringList &audioPaths,
+                                            const QString &outputPath, const QUrl &vaultUrl, bool deleteOriginals)
+{
+    m_combineRules = rules;
+    m_combineAudioPaths = audioPaths;
+    m_combineDeleteOriginals = deleteOriginals;
+
+    for (const CombineGroup &group : findCombineGroups(rules, audioPaths)) {
+        if (group.outputPath != outputPath)
+            continue;
+        if (group.status != QStringLiteral("ready") || isCombineQueued(group.outputPath))
+            return;
+        enqueueCombineJob(group, vaultUrl, deleteOriginals);
+        emit queueChanged();
+        if (m_activeIndex < 0)
+            startNext();
+        return;
+    }
 }
 
 QString TranscriptionController::tasksJsonPath(const QUrl &vaultUrl)

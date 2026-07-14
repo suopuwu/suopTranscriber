@@ -3,7 +3,7 @@ import QtQuick
 import QtCore
 
 // Item 9 (Wave E): appearance/behavior settings now live in the VAULT
-// (<vault>/.suopTranscriber, JSON — VaultTreeModel::readVaultSettings/
+// (<vault>/.transcriber/settings.json — VaultTreeModel::readVaultSettings/
 // writeVaultSettings), not an app-scoped QSettings .conf file — different
 // vaults can have different look/behavior preferences. lastVaultPath stays
 // app-scoped (small nested Settings below): it's last-used STATE needed to
@@ -99,6 +99,32 @@ Item {
     property color sidebarSelectionColor: "#33ffffff"
     property color sidebarSelectionBorderColor: "#ffffff"
 
+    // Sidebar file-tree row outlines (HoverBorder/selection highlight/
+    // CombineGroupOutline) and their content (status dot/label) previously
+    // hardcoded these two left-side gaps (user reports, 2026-07-12) — now
+    // independently configurable, same shape as rimWidth/highlightRadius
+    // above. sidebarEdgeLeftMargin is the outline's own inset from the
+    // sidebar's true left edge; sidebarContentLeftMargin is the FURTHER gap
+    // from the outline's left edge to where the row's own content (status
+    // dot/label) starts. Left-only: top/right/bottom insets are unrelated
+    // fixed values elsewhere (see Sidebar.qml's treeDelegate).
+    property real sidebarEdgeLeftMargin: 4
+    property real sidebarContentLeftMargin: 5
+
+    // Sidebar file-tree rows' TOTAL right-side gap, from the sidebar's true
+    // right edge to the outlines' (HoverBorder/selection highlight/
+    // CombineGroupOutline) right edge — covers both the space the Basic
+    // style's vertical ScrollBar overlay actually needs (~14px, see
+    // Sidebar.qml's treeDelegate.implicitWidth doc comment) AND whatever
+    // extra breathing room beyond that. Originally split across a fixed,
+    // non-configurable -14 PLUS a separate configurable few-px extra, which
+    // left a visible gap even with the extra dragged to 0 (user report,
+    // 2026-07-12) — now ONE setting controls the whole thing, so 0 truly
+    // means flush with the sidebar's right edge (and, deliberately, back
+    // under the scrollbar overlay — the user's explicit choice at that
+    // point). Default (17) reproduces the original fixed 14+3 look.
+    property real sidebarRightMargin: 17
+
     // Transcript gutter's displayed timestamp precision — NOT the stored
     // data (segment lines always keep full sub-second precision on disk,
     // see TranscriptionController::formatTimestamp); this only rounds what
@@ -114,6 +140,14 @@ Item {
     // Default state of the speaker-detection toggle for new transcriptions.
     // Matches the previous hardcoded fallback in MainPanel.qml.
     property bool defaultSpeakerDetection: true
+
+    // Sidebar file-tree order: "name" (default, alphabetical dirs-first —
+    // matches this app's original/only behavior), "dateDesc" (Date Modified,
+    // newest first), "dateAsc" (Date Modified, oldest first). Combine
+    // candidates (see combineRules below) are always kept tree-adjacent
+    // regardless of which of these is active — sortMode only decides the
+    // order of groups and of files within a group, not whether they cluster.
+    property string sortMode: "name"
 
     // BottomBar's opt-in alternative to the default ProgressBar: a thin
     // glowing line across the top edge of the bottom info bar. Off by
@@ -157,7 +191,7 @@ Item {
 
     // Single source of truth for every per-setting/global "reset to
     // default" button, AND for loadFromVault()/saveToVault() below (every
-    // key here round-trips through the vault's .suopTranscriber file).
+    // key here round-trips through the vault's .transcriber/settings.json file).
     // lastVaultPath is intentionally excluded: it tracks last-used state,
     // not a vault-specific appearance/behavior setting.
     readonly property var defaults: ({
@@ -184,9 +218,13 @@ Item {
         highlightRadius: 8,
         sidebarSelectionColor: "#33ffffff",
         sidebarSelectionBorderColor: "#ffffff",
+        sidebarEdgeLeftMargin: 4,
+        sidebarContentLeftMargin: 5,
+        sidebarRightMargin: 17,
         timestampDecimalPlaces: 0,
         defaultModel: "base.en",
         defaultSpeakerDetection: true,
+        sortMode: "name",
         progressGlowEnabled: false,
         progressGlowColor: "#ffffff",
         progressGlowWidth: 2,
@@ -221,7 +259,7 @@ Item {
             resetProperty(key)
     }
 
-    // Reads <vault>/.suopTranscriber (VaultTreeModel::readVaultSettings) and
+    // Reads <vault>/.transcriber/settings.json (VaultTreeModel::readVaultSettings) and
     // applies every known key, falling back to its default if the file is
     // missing/empty (fresh vault) or doesn't have that particular key yet
     // (settings added in a later app version). suppressSave guards against
@@ -289,9 +327,13 @@ Item {
         function onHighlightRadiusChanged() { appSettings.scheduleSave() }
         function onSidebarSelectionColorChanged() { appSettings.scheduleSave() }
         function onSidebarSelectionBorderColorChanged() { appSettings.scheduleSave() }
+        function onSidebarEdgeLeftMarginChanged() { appSettings.scheduleSave() }
+        function onSidebarContentLeftMarginChanged() { appSettings.scheduleSave() }
+        function onSidebarRightMarginChanged() { appSettings.scheduleSave() }
         function onTimestampDecimalPlacesChanged() { appSettings.scheduleSave() }
         function onDefaultModelChanged() { appSettings.scheduleSave() }
         function onDefaultSpeakerDetectionChanged() { appSettings.scheduleSave() }
+        function onSortModeChanged() { appSettings.scheduleSave() }
         function onProgressGlowEnabledChanged() { appSettings.scheduleSave() }
         function onProgressGlowColorChanged() { appSettings.scheduleSave() }
         function onProgressGlowWidthChanged() { appSettings.scheduleSave() }

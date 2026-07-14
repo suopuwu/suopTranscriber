@@ -141,6 +141,17 @@ std::vector<Segment> WhisperCppEngine::transcribe(const AudioChunk &chunk, const
         wparams.abort_callback_user_data = const_cast<AbortCallback *>(&onAbort);
     }
 
+    // Kept alive for the whisper_full() call below — vad_model_path is a raw
+    // pointer into this buffer, not a copy (see setVadModelPath()'s doc
+    // comment).
+    QByteArray vadModelPathUtf8;
+    if (!m_vadModelPath.isEmpty()) {
+        vadModelPathUtf8 = m_vadModelPath.toUtf8();
+        wparams.vad = true;
+        wparams.vad_model_path = vadModelPathUtf8.constData();
+        wparams.vad_params = whisper_vad_default_params();
+    }
+
     whisper_full(m_ctx, wparams, chunk.pcm16kMono.data(), static_cast<int>(chunk.pcm16kMono.size()));
 
     // Segments are chunk-relative on purpose — the app (not the engine)

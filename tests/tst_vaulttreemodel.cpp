@@ -14,6 +14,7 @@
 #include <QAbstractItemModelTester>
 #include <QDir>
 #include <QFile>
+#include <QFileInfo>
 #include <QTemporaryDir>
 #include <QUrl>
 
@@ -634,11 +635,11 @@ private slots:
         QVERIFY(model.data(idx, roleByName(model, "transcriptBody")).toString().isEmpty());
     }
 
-    // --- Vault-scoped settings (Item 9: .suopTranscriber JSON file) --------------
+    // --- Vault-scoped settings (Item 9: .transcriber/settings.json JSON file) ---
 
     // writeVaultSettings() then readVaultSettings() round-trips arbitrary
-    // key/value data through a hidden .suopTranscriber JSON file at the
-    // vault root.
+    // key/value data through a JSON file inside the vault's hidden
+    // .transcriber/ config dir (created on demand).
     void vaultSettings_roundTripsThroughHiddenJsonFile()
     {
         QTemporaryDir vault;
@@ -654,7 +655,7 @@ private slots:
 
         QString error;
         QVERIFY2(model.writeVaultSettings(settings, &error), qPrintable(error));
-        QVERIFY(QFileInfo::exists(vault.filePath(".suopTranscriber")));
+        QVERIFY(QFileInfo::exists(vault.filePath(".transcriber/settings.json")));
 
         const QVariantMap readBack = model.readVaultSettings();
         QCOMPARE(readBack.value(QStringLiteral("borderRadius")).toDouble(), 12.5);
@@ -662,10 +663,10 @@ private slots:
         QCOMPARE(readBack.value(QStringLiteral("sidebarBackgroundColor")).toString(), QStringLiteral("#112233"));
     }
 
-    // The settings dotfile is hidden (QDir's default filters exclude it) and
-    // has no recognized extension, so it never appears as a tree node (not
-    // an orphaned .md, not audio) even though it sits at the vault root
-    // alongside real content.
+    // The settings file lives inside .transcriber/, which is itself a hidden
+    // dotdir (QDir's default filters exclude it), so neither it nor its
+    // contents ever appear as a tree node even though it sits at the vault
+    // root alongside real content.
     void vaultSettingsFile_neverAppearsAsATreeNode()
     {
         QTemporaryDir vault;
@@ -678,7 +679,7 @@ private slots:
 
         QCOMPARE(model.rowCount(), 1);
         QVERIFY(findByName(model, "song.mp3").isValid());
-        QVERIFY(!findByName(model, ".suopTranscriber").isValid());
+        QVERIFY(!findByName(model, ".transcriber").isValid());
     }
 
     // No vault open (empty vaultLocalPath): readVaultSettings() returns an
@@ -735,6 +736,42 @@ private slots:
         model.setVaultPath(QUrl::fromLocalFile(vault.path()));
 
         QVERIFY(model.allAudioPaths().isEmpty());
+    }
+
+    // --- audioLastModified() (Sidebar.qml file-tree sort: Date Modified) --------
+
+    // One entry per audio path (same set allAudioPaths() returns), each
+    // matching QFileInfo::lastModified() for that file — Sidebar.qml's
+    // sort-mode feature has no other way to read raw mtimes from QML.
+    void audioLastModified_matchesQFileInfoForEveryAudioFile()
+    {
+        QTemporaryDir vault;
+        QVERIFY(vault.isValid());
+        QVERIFY(touch(vault.filePath("a.mp3")));
+        QVERIFY(touch(vault.filePath("nested/b.wav")));
+        QVERIFY(touch(vault.filePath("orphaned.md")));
+        QVERIFY(touch(vault.filePath("notes.txt")));
+
+        VaultTreeModel model;
+        model.setVaultPath(QUrl::fromLocalFile(vault.path()));
+
+        const QVariantMap mtimes = model.audioLastModified();
+        QCOMPARE(mtimes.size(), 2);
+        for (const QString &path : { vault.filePath("a.mp3"), vault.filePath("nested/b.wav") }) {
+            QVERIFY(mtimes.contains(path));
+            QCOMPARE(mtimes.value(path).toLongLong(), QFileInfo(path).lastModified().toMSecsSinceEpoch());
+        }
+    }
+
+    void audioLastModified_emptyVault_returnsEmptyMap()
+    {
+        QTemporaryDir vault;
+        QVERIFY(vault.isValid());
+
+        VaultTreeModel model;
+        model.setVaultPath(QUrl::fromLocalFile(vault.path()));
+
+        QVERIFY(model.audioLastModified().isEmpty());
     }
 
     // --- Model contract ----------------------------------------------------------

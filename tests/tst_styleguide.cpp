@@ -48,6 +48,39 @@ private slots:
                  "onPathChanged must call refreshJobStatus() so recycled rows show the right job status");
     }
 
+    // Regression: treeDelegate's filename Text had no width bound at all, so
+    // a long filename (routine for split-recording combine candidates — the
+    // very files Item 51's groupMergeButton targets) painted straight
+    // through the per-row icon cluster on the right (rowTranscribeButton/
+    // rowRelabelButton/rowChaptersButton/groupMergeButton) instead of
+    // stopping short of it, so the "⊕" combine button rendered on top of
+    // mid-filename characters instead of in its own clear space — reading as
+    // "no combine icon" rather than a garbled one. No QQuickView in this
+    // test suite to actually lay out a long filename and inspect the
+    // rendered pixels, so this is a source-scan guard against the fix
+    // (bounded width + elide + clip) regressing rather than a behavioral
+    // test.
+    void treeDelegate_filenameTextReservesSpaceForRowIconCluster()
+    {
+        const QString src = readAll(QStringLiteral(SUOP_QML_DIR "/Sidebar.qml"));
+        QVERIFY2(!src.isEmpty(), "qml/Sidebar.qml must exist");
+        const int rowIdx = src.indexOf(QStringLiteral("id: rowTranscribeButton"));
+        QVERIFY2(rowIdx >= 0, "rowTranscribeButton must exist in Sidebar.qml's treeDelegate");
+        const QString before = src.left(rowIdx);
+        const int textIdx = before.indexOf(QStringLiteral("useLabelsSidebar"));
+        QVERIFY2(textIdx >= 0, "treeDelegate's filename Text (AppSettings.useLabelsSidebar) must exist "
+                               "before the per-row icon cluster");
+        const QString filenameTextBlock = before.mid(textIdx, before.length() - textIdx);
+        QVERIFY2(filenameTextBlock.contains(QStringLiteral("elide: Text.ElideRight")),
+                 "treeDelegate's filename Text must elide — otherwise a long filename overlaps the "
+                 "per-row icon cluster (rowTranscribeButton/groupMergeButton/etc) instead of stopping "
+                 "short of it");
+        QVERIFY2(filenameTextBlock.contains(QStringLiteral("clip: true")),
+                 "treeDelegate's filename Text must clip — elide is documented elsewhere in this file "
+                 "as unreliable together with Text.StyledText (the search-highlight case), so clip is "
+                 "the backstop that keeps overflow from painting over the icon cluster even then");
+    }
+
     // StyleGuide.md: the hover outline is the reusable HoverBorder.qml — a
     // transparent Rectangle, 1px white border, radius from AppSettings,
     // opacity animated in on hover.

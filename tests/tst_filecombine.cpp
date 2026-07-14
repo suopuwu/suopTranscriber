@@ -348,6 +348,89 @@ private slots:
         QVERIFY(controller.differentiatorNonParticipatingFiles(QStringLiteral("^(\\d+)$"), 5, files).isEmpty());
         QVERIFY(controller.differentiatorNonParticipatingFiles(QStringLiteral("^(\\d+)$"), 0, files).isEmpty());
     }
+
+    // Item 51: combineGroup() is the sidebar's per-row "combine this group"
+    // button — same matching as runCombineScan() but scoped to the ONE group
+    // whose outputPath matches, and must not touch any other detected group.
+    void combineGroup_enqueuesOnlyTheMatchingReadyGroup()
+    {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        const QString a1 = touchFile(dir.path(), "TXA_MIC001_orig.wav", 60);
+        const QString a2 = touchFile(dir.path(), "TXA_MIC002_orig.wav", 40);
+        const QString b1 = touchFile(dir.path(), "TXB_MIC001_orig.wav", 60);
+        const QString b2 = touchFile(dir.path(), "TXB_MIC002_orig.wav", 40);
+
+        TranscriptionController controller;
+        const QVariantList rules = {rule("two groups", "^(TX[AB])_MIC\\d{3}_orig\\.wav$")};
+        const QStringList allPaths = {a1, a2, b1, b2};
+        const QVariantList groups = controller.detectCombineGroups(rules, allPaths);
+        QCOMPARE(groups.size(), 2);
+
+        // findGroup() only returns the first match by ruleName — both groups
+        // share "two groups" as ruleName, so pick apart by key directly.
+        QVariantMap targetA, targetB;
+        for (const QVariant &g : groups) {
+            const QVariantMap m = g.toMap();
+            if (m.value("key").toString() == "TXA")
+                targetA = m;
+            else if (m.value("key").toString() == "TXB")
+                targetB = m;
+        }
+        QVERIFY(!targetA.isEmpty());
+        QVERIFY(!targetB.isEmpty());
+        QCOMPARE(targetA.value("status").toString(), QStringLiteral("ready"));
+        QCOMPARE(targetB.value("status").toString(), QStringLiteral("ready"));
+
+        const QUrl vaultUrl = QUrl::fromLocalFile(dir.path());
+        controller.combineGroup(rules, allPaths, targetA.value("outputPath").toString(), vaultUrl, false);
+
+        const QVariantList jobsAfter = controller.jobs();
+        QCOMPARE(jobsAfter.size(), 1);
+        const QVariantMap job = jobsAfter.first().toMap();
+        QCOMPARE(job.value("kind").toString(), QStringLiteral("combine"));
+        QCOMPARE(job.value("fileUrl").toUrl(), QUrl::fromLocalFile(targetA.value("outputPath").toString()));
+    }
+
+    // A group that isn't "ready" (here: a singleton, only one match) must be
+    // silently ignored — no job enqueued.
+    void combineGroup_nonReadyGroupIsIgnored()
+    {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        const QString only = touchFile(dir.path(), "TX01_MIC001_orig.wav", 60);
+
+        TranscriptionController controller;
+        const QVariantList rules = {rule("singleton rule", "^(TX\\d{2})_MIC\\d{3}_orig\\.wav$")};
+        const QStringList allPaths = {only};
+        const QVariantMap group = findGroup(controller.detectCombineGroups(rules, allPaths), "singleton rule");
+        QCOMPARE(group.value("status").toString(), QStringLiteral("singleton"));
+
+        controller.combineGroup(rules, allPaths, group.value("outputPath").toString(),
+                                 QUrl::fromLocalFile(dir.path()), false);
+        QVERIFY(controller.jobs().isEmpty());
+    }
+
+    // Calling combineGroup() twice for the same group must not double-queue
+    // it — mirrors runCombineScan()'s own isCombineQueued() dedup.
+    void combineGroup_alreadyQueuedIsNotDuplicated()
+    {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        const QString p1 = touchFile(dir.path(), "TX01_MIC001_orig.wav", 60);
+        const QString p2 = touchFile(dir.path(), "TX01_MIC002_orig.wav", 40);
+
+        TranscriptionController controller;
+        const QVariantList rules = {rule("dup rule", "^(TX\\d{2})_MIC\\d{3}_orig\\.wav$")};
+        const QStringList allPaths = {p1, p2};
+        const QVariantMap group = findGroup(controller.detectCombineGroups(rules, allPaths), "dup rule");
+        QCOMPARE(group.value("status").toString(), QStringLiteral("ready"));
+
+        const QUrl vaultUrl = QUrl::fromLocalFile(dir.path());
+        controller.combineGroup(rules, allPaths, group.value("outputPath").toString(), vaultUrl, false);
+        controller.combineGroup(rules, allPaths, group.value("outputPath").toString(), vaultUrl, false);
+        QCOMPARE(controller.jobs().size(), 1);
+    }
 };
 
 QTEST_GUILESS_MAIN(TstFileCombine)

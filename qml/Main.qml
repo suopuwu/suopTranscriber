@@ -165,7 +165,7 @@ ApplicationWindow {
         function onVaultPathChanged() {
             AppSettings.lastVaultPath = vaultModel.vaultPath
             // Item 9 (Wave E): settings are vault-scoped now — load the
-            // newly-opened vault's own .suopTranscriber (falling back to
+            // newly-opened vault's own .transcriber/settings.json (falling back to
             // defaults for a vault that doesn't have one yet) rather than
             // keep whatever the PREVIOUS vault had in memory.
             if (vaultModel.vaultPath.toString() !== "")

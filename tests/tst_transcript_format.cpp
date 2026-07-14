@@ -24,6 +24,7 @@
 #include <QTemporaryDir>
 #include <QUrl>
 
+#include "ModelManager.h"
 #include "TranscriptionController.h"
 
 namespace {
@@ -137,6 +138,43 @@ private slots:
         QCOMPARE(meta.value("model").toString(), QStringLiteral("ggml-base.en.bin"));
         QCOMPARE(meta.value("speakerDetection"), QVariant(true));
         QCOMPARE(meta.value("transcribedAt").toString(), QStringLiteral("2026-07-06T10:12:13"));
+    }
+
+    // Spec (this feature — see WhisperCppEngine::setVadModelPath()/
+    // VadChunker.h): writeFrontmatter()'s new `vad`/`vadError` keys round-trip
+    // through readMetadata() with the SAME generic key:value parsing every
+    // other frontmatter field already uses — no special-casing needed,
+    // mirroring speakerDetection/speakerDetectionError exactly.
+    void readMetadata_parsesVadKeys()
+    {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        writeFixture(dir.path(), "gated.wav.md",
+                     QStringLiteral("---\n"
+                                    "model: ggml-base.en.bin\n"
+                                    "speakerDetection: false\n"
+                                    "vad: true\n"
+                                    "transcribedAt: 2026-07-06T10:12:13\n"
+                                    "---\n\n"
+                                    "[0] hello\n"));
+        writeFixture(dir.path(), "ungated.wav.md",
+                     QStringLiteral("---\n"
+                                    "model: ggml-base.en.bin\n"
+                                    "speakerDetection: false\n"
+                                    "vad: false\n"
+                                    "vadError: no VAD model available\n"
+                                    "transcribedAt: 2026-07-06T10:12:13\n"
+                                    "---\n\n"
+                                    "[0] hello\n"));
+
+        TranscriptionController controller;
+        const QVariantMap gated = controller.readMetadata(QUrl::fromLocalFile(dir.path() + "/gated.wav"));
+        QCOMPARE(gated.value("vad"), QVariant(true));
+        QVERIFY(!gated.contains("vadError"));
+
+        const QVariantMap ungated = controller.readMetadata(QUrl::fromLocalFile(dir.path() + "/ungated.wav"));
+        QCOMPARE(ungated.value("vad"), QVariant(false));
+        QCOMPARE(ungated.value("vadError").toString(), QStringLiteral("no VAD model available"));
     }
 
     // Regression: an orphaned .md (no matching audio file left in the vault)
@@ -1194,6 +1232,17 @@ private slots:
         const QString samplePath = vault.path() + "/jfk.wav";
         QVERIFY(QFile::copy(QStringLiteral(SUOP_SAMPLES_DIR "/jfk.wav"), samplePath));
 
+        // Plant whisper.cpp's own vendored for-tests VAD model (real,
+        // full-size — whisper.cpp's own test suite uses it too, see
+        // third_party/whisper.cpp/tests/CMakeLists.txt's VAD_MODEL_PATH) at
+        // ensureVadModel()'s expected filename, so this test's VAD gating
+        // (this feature) never needs a live network download — same
+        // plant-don't-download precedent as the whisper model above.
+        const QString plantedVadPath = modelsDir + "/" + ModelManager::kVadModelFileName;
+        QVERIFY(QFile::copy(
+            QStringLiteral(SUOP_REPO_DIR "/third_party/whisper.cpp/models/for-tests-silero-v6.2.0-ggml.bin"),
+            plantedVadPath));
+
         TranscriptionController controller;
         QSignalSpy finishedSpy(&controller, &TranscriptionController::finished);
         const QUrl audioUrl = QUrl::fromLocalFile(samplePath);
@@ -1217,15 +1266,23 @@ private slots:
         // The REAL write path (appendSegmentLine/formatTimestamp) must
         // produce the compact, zero-trimmed timestamp — not the old
         // zero-padded "[00:00:00.000]" shape. The very first segment starts
-        // at (or extremely near) 0.0s, so its line should read just "[0]"
+        // near the beginning of the file, so its line should read just "[0]"
         // or "[0.xxx]", never "[00:00:00...".
         const QString body = controller.readTranscriptBody(audioUrl);
         QVERIFY2(!body.isEmpty(), "expected at least one segment line from a real transcription");
         QVERIFY2(!body.contains(QStringLiteral("[00:")),
                  qPrintable(QStringLiteral("segment line still zero-padded, expected compact format:\n") + body));
+        // Not an exact 0.0: with VAD gating active (this feature — see
+        // VadChunker.h/WhisperCppEngine::setVadModelPath()), whisper.cpp
+        // correctly excludes jfk.wav's genuine ~0.3s of leading silence
+        // before "We choose..." starts, so the first segment's t0 reflects
+        // real speech onset rather than an ungated "starts at 0 regardless
+        // of silence" artifact. Still asserts "near the start of the file",
+        // which is the property this check actually cares about.
         const QVariantList sentences = controller.parseSentences(audioUrl);
         QVERIFY(!sentences.isEmpty());
-        QCOMPARE(sentences.first().toMap().value("t0").toDouble(), 0.0);
+        QVERIFY2(sentences.first().toMap().value("t0").toDouble() < 2.0,
+                 "first segment should start near the beginning of the file");
     }
 
     // Real end-to-end run of the FULL speaker-detection wiring (not just

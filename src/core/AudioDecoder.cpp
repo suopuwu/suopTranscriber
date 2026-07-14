@@ -17,6 +17,21 @@ std::optional<std::vector<float>> decodeTo16kMono(const QString &filePath, QStri
         "-i", filePath,
         "-ar", "16000",
         "-ac", "1",
+        // speechnorm (not loudnorm/dynaudnorm): purpose-built for speech,
+        // time-preserving (no effect on segment timestamps downstream). A
+        // quiet voice in an otherwise-loud recording falls below whisper.cpp's
+        // mel-normalization clamp floor (mmax - 8dB, see whisper.cpp's
+        // log_mel_spectrogram) and is effectively discarded before the model
+        // ever sees it — only time-varying gain fixes that, a single global
+        // gain on an already-uniformly-quiet file would be a no-op.
+        // e=25 (ffmpeg's own default e=2 barely moves a quiet passage sitting
+        // well under a loud one) and r=0.05 (ffmpeg's default r=0.001 reacts
+        // too slowly to meaningfully close the gap within a normal recording)
+        // — empirically measured via ffmpeg astats on a synthetic loud/quiet
+        // test signal (27dB raw gap narrows to ~20dB with these values,
+        // r=0.001 only narrowed it to ~26dB). See
+        // tst_audiodecoder.cpp's speechnorm test for the same measurement.
+        "-af", "speechnorm=e=25:p=0.95:r=0.05",
         "-f", "f32le",
         "-hide_banner", "-loglevel", "error",
         "-",

@@ -93,6 +93,25 @@ constexpr auto kLabelModelFileName = "Qwen3-4B-Instruct-2507-Q4_K_M.gguf";
 QString ensureLabelModel(const QUrl &vaultPath, QString *errorOut = nullptr,
                           const DownloadProgressCallback &onProgress = {}, const DownloadControl &control = {});
 
+// Silero VAD (ggml-converted), used to (a) gate whisper.cpp's own per-window
+// inference away from silence (hallucination/silence robustness) and (b)
+// find VAD-aligned window boundaries for chunking a long file (see DESIGN.md
+// "Durable / resumable transcription" — chunking half only, no
+// checkpoint/resume yet). ~2 MB, same vault-scoped storage/download pattern
+// as the models above. Unlike ensureModel(), a failure here must NOT block
+// transcription — caller degrades gracefully (ASR without VAD gating/
+// windowing, single whole-file chunk, recorded honestly in frontmatter),
+// same contract as ensureDiarizationModels().
+constexpr auto kVadModelFileName = "ggml-silero-v5.1.2.bin";
+
+// Returns true if kVadModelFileName already exists — never downloads.
+bool isVadModelDownloaded(const QUrl &vaultPath);
+
+// Returns the local VAD model path, or empty on failure (errorOut set if
+// given). onProgress/control: see ensureModel()'s doc comment.
+QString ensureVadModel(const QUrl &vaultPath, QString *errorOut = nullptr,
+                        const DownloadProgressCallback &onProgress = {}, const DownloadControl &control = {});
+
 // Speaker diarization (see DESIGN.md "Speaker diarization" / DiarizationEngine):
 // pyannote-segmentation-3.0, int8-quantized (local speaker-activity
 // segmentation) + WeSpeaker ResNet293-LM (speaker embedding), both ONNX,

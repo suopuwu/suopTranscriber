@@ -191,7 +191,10 @@ Rectangle {
         // Connections can bind to, same as searchProxy's own onModelReset
         // above.
         target: sidebar.model
-        function onModelReset() { sidebar.refreshSearchResults() }
+        function onModelReset() {
+            sidebar.refreshSearchResults()
+            sidebar.refreshTreeOrdering()
+        }
     }
 
     // O9: bumped on every transcribe/relabel completion so each realized
@@ -208,8 +211,224 @@ Rectangle {
     property int jobStatusRevision: 0
     Connections {
         target: sidebar.transcriptionController
-        function onFinished(fileUrl, ok, error) { sidebar.metadataRevision += 1 }
-        function onJobStatusesChanged() { sidebar.jobStatusRevision += 1 }
+        function onFinished(fileUrl, ok, error) {
+            sidebar.metadataRevision += 1
+            sidebar.refreshTreeOrdering()
+        }
+        function onJobStatusesChanged() {
+            sidebar.jobStatusRevision += 1
+            sidebar.refreshTreeOrdering()
+        }
+    }
+
+    // Item 51: path -> outputPath, for every file currently a member of a
+    // "ready" (would-combine-if-run) group per detectCombineGroups() — drives
+    // both the row highlight and the per-group merge button below. Unlike
+    // untranscribedPaths/transcribedPaths/chaptersPaths above (populated
+    // bottom-up by each realized delegate reporting its OWN eligibility),
+    // group membership can't be known from a single file in isolation — this
+    // is a GLOBAL computation over the whole file list, same shape as
+    // SettingsPopup.qml's combineOverlapWarnings, refreshed imperatively on
+    // the same class of triggers (rules changed, vault contents changed, a
+    // job finished) rather than a declarative binding (detectCombineGroups()
+    // is a plain Q_INVOKABLE with no reactive dependency tracking of its
+    // own). combineReadyPaths itself IS a genuine QML property with a real
+    // NOTIFY signal, though, so treeDelegate.combineEligible below can bind
+    // to it directly — no revision-counter push idiom needed for that part.
+    property var combineReadyPaths: ({})
+    // Bug: combineTopMerged/combineBottomMerged used to be derived from
+    // sidebar.rowPaths, a row-number -> path map pushed by each realized
+    // TreeView delegate purely so a row could ask its VISUAL neighbors'
+    // paths. That only ever reflected whichever rows TreeView happened to
+    // have realized (reuseItems recycles a small fixed pool) — for any group
+    // bigger than the realized pool, an interior row's neighbor lookup could
+    // come back "unknown" and get conservatively treated as a group
+    // boundary, drawing a full 4-sided box mid-run instead of a suppressed
+    // seam.
+    //
+    // Fixed that, but a real vault then exposed a SECOND bug from the same
+    // root cause: adjacency was computed from allAudioPaths()'s raw
+    // (dirs-first, alphabetical) order, which is only ONE possible tree
+    // order now that searchProxy can reorder files by sortMode/combine-group
+    // clustering (see refreshTreeOrdering() below) — a combine rule whose
+    // key doesn't happen to match the alphabetical grouping (e.g. this app's
+    // own "acme mic 3" rule: grouped by date+edit/orig, NOT by MIC number, so
+    // alphabetical order alternates edit/orig every row) left same-group
+    // files almost never adjacent, so nearly every member rendered its own
+    // isolated box instead of one merged run. Both combineTopMergedPaths/
+    // combineBottomMergedPaths AND the tree's own visual order now come from
+    // the SAME sorted array (see refreshTreeOrdering()), so they can't drift
+    // apart again.
+    property var combineTopMergedPaths: ({})
+    property var combineBottomMergedPaths: ({})
+
+    // Sort mode / combine-candidate clustering (see AppSettings.sortMode's
+    // doc comment and CombineGroupOutline usage below): computed once here,
+    // covering three concerns that all boil down to "what order do files
+    // appear in" and so have to be computed together to stay consistent —
+    // see refreshTreeOrdering()'s body for how each is derived.
+    function refreshTreeOrdering() {
+        const newMap = {}
+        const audioPaths = (sidebar.transcriptionController && sidebar.model) ? sidebar.model.allAudioPaths() : []
+        const groups = (audioPaths.length > 0 && AppSettings.combineRules.length > 0)
+                ? sidebar.transcriptionController.detectCombineGroups(AppSettings.combineRules, audioPaths) : []
+        for (const g of groups) {
+            if (g.status === "ready") {
+                for (const f of g.files)
+                    newMap[f] = g.outputPath
+            }
+        }
+
+        // clusterKeyOf: path -> stable group id, for every group with 2+
+        // files regardless of ready/pending/alreadyTranscribed/
+        // alreadyCombined status — clustering ("stick together in the file
+        // tree") is a broader concern than the ready-only outline highlight
+        // above, since even a not-currently-combinable group still benefits
+        // from its members sitting next to each other.
+        const clusterKeyOf = {}
+        for (const g of groups) {
+            if (g.files.length >= 2) {
+                for (const f of g.files)
+                    clusterKeyOf[f] = g.outputPath
+            }
+        }
+
+        // ownRank: this file's own comparable value for the active sort
+        // mode, as a plain string so the C++ proxy only ever does a QString
+        // compare (see VaultSearchProxyModel::fileSortKeys' doc comment).
+        // mtimes is only fetched when actually needed — audioLastModified()
+        // walks the whole tree, no need to pay for that on the (default)
+        // "name" mode.
+        const mtimes = (AppSettings.sortMode !== "name" && sidebar.model) ? sidebar.model.audioLastModified() : {}
+        function ownRank(path) {
+            if (AppSettings.sortMode === "name") {
+                const slash = path.lastIndexOf("/")
+                return (slash >= 0 ? path.slice(slash + 1) : path).toLowerCase()
+            }
+            const ms = mtimes[path] || 0
+            // Number.MAX_SAFE_INTEGER, not some larger power of ten — mtimes
+            // are milliseconds-since-epoch (~1.7e12 today), safely inside
+            // JS's exact-integer range, so this subtraction (for "newest
+            // first") stays exact. A bigger constant like 1e20 would lose
+            // enough float64 precision at this magnitude to collide distinct
+            // timestamps into the same padded string.
+            const value = AppSettings.sortMode === "dateAsc" ? ms : (Number.MAX_SAFE_INTEGER - ms)
+            return String(value).padStart(16, "0")
+        }
+
+        // groupRank: the MINIMUM ownRank among a group's members, for every
+        // file in a 2+-member group, else just the file's own ownRank (a
+        // lone file is its own one-member "group"). Since ownRank's
+        // encoding above already flips for "dateDesc" (newest maps to the
+        // smallest padded string), taking the min here naturally picks
+        // whichever member is "first" under the CURRENT sort direction as
+        // the group's representative — its earliest member for "name"/
+        // "dateAsc", its most recently modified member for "dateDesc" — so
+        // a group sorts alongside other items near its own most-relevant
+        // edge instead of always anchoring to one fixed member regardless
+        // of direction. With sortMode "name" and no active groups,
+        // groupRank === ownRank for every file, so ordering is
+        // byte-identical to plain alphabetical — no behavior change for
+        // vaults without combine rules.
+        const groupRankOf = {}
+        for (const path of audioPaths) {
+            const key = clusterKeyOf[path]
+            if (key === undefined)
+                continue
+            const rank = ownRank(path)
+            if (groupRankOf[key] === undefined || rank < groupRankOf[key])
+                groupRankOf[key] = rank
+        }
+
+        const sortKeys = {}
+        for (const path of audioPaths) {
+            const key = clusterKeyOf[path]
+            sortKeys[path] = [key !== undefined ? groupRankOf[key] : ownRank(path), ownRank(path)]
+        }
+
+        // Adjacency (combineTopMerged/combineBottomMerged) has to be
+        // computed from the SAME order the tree actually ends up displaying
+        // — see this property's doc comment above for the bug that bit when
+        // this used allAudioPaths()'s raw order instead.
+        const displayOrder = audioPaths.slice().sort((a, b) => {
+            const ka = sortKeys[a], kb = sortKeys[b]
+            if (ka[0] !== kb[0])
+                return ka[0] < kb[0] ? -1 : 1
+            if (ka[1] !== kb[1])
+                return ka[1] < kb[1] ? -1 : 1
+            return 0
+        })
+        const topMerged = {}
+        const bottomMerged = {}
+        for (let i = 0; i < displayOrder.length; i++) {
+            const path = displayOrder[i]
+            if (newMap[path] === undefined)
+                continue
+            if (i > 0 && newMap[displayOrder[i - 1]] === newMap[path])
+                topMerged[path] = true
+            if (i < displayOrder.length - 1 && newMap[displayOrder[i + 1]] === newMap[path])
+                bottomMerged[path] = true
+        }
+
+        sidebar.combineReadyPaths = newMap
+        sidebar.combineTopMergedPaths = topMerged
+        sidebar.combineBottomMergedPaths = bottomMerged
+        searchProxy.fileSortKeys = sortKeys
+    }
+    Component.onCompleted: sidebar.refreshTreeOrdering()
+    Connections {
+        target: AppSettings
+        function onCombineRulesChanged() { sidebar.refreshTreeOrdering() }
+        function onSortModeChanged() { sidebar.refreshTreeOrdering() }
+    }
+
+    // Item 51 refinement: stable, distinct color per group, derived from the
+    // group's outputPath (unique per group, stable across rescans) via a
+    // simple string hash -> hue — no sequential group-index bookkeeping
+    // needed, so it stays correct even as groups appear/disappear/reorder.
+    // Fixed saturation/lightness chosen to stay readable against this app's
+    // dark sidebar background regardless of hue.
+    function combineGroupColor(outputPath) {
+        let hash = 0
+        for (let i = 0; i < outputPath.length; i++)
+            hash = (hash * 31 + outputPath.charCodeAt(i)) | 0
+        const hue = (Math.abs(hash) % 360) / 360
+        return Qt.hsla(hue, 0.55, 0.6, 1.0)
+    }
+
+    // Item 51 refinement: path of the combine group currently under the
+    // pointer (empty when none), pushed by whichever treeDelegate's rowHover
+    // enters/leaves a combineEligible row — same push idiom as
+    // untranscribedPaths/etc. below. Drives the per-group merge button
+    // (rendered once per group, not once per row — see groupMergeButton)
+    // so hovering ANY member reveals it, instead of the button living in
+    // each row's already-busy per-file action cluster.
+    property string hoveredCombineGroup: ""
+    // Bug (user report, 2026-07-13): moving the pointer directly from one
+    // group member row to an ADJACENT one made the button disappear instead
+    // of staying up — hoveredCombineGroup was a plain last-write-wins string,
+    // so whichever row's onHoveredChanged(hovered: false) fired LAST always
+    // cleared it, even when a same-group sibling's onHoveredChanged(hovered:
+    // true) had already fired first (Qt Quick doesn't guarantee the old
+    // row's leave fires before the new row's enter). A per-group reference
+    // count fixes this: entering increments this group's count and (re)sets
+    // hoveredCombineGroup; leaving decrements it and only clears
+    // hoveredCombineGroup once the count actually reaches 0, so a leave that
+    // follows a same-group sibling's enter no longer wins.
+    property var hoveredCombineGroupCounts: ({})
+    function enterCombineGroupHover(outputPath) {
+        sidebar.hoveredCombineGroupCounts[outputPath] = (sidebar.hoveredCombineGroupCounts[outputPath] || 0) + 1
+        sidebar.hoveredCombineGroup = outputPath
+    }
+    function leaveCombineGroupHover(outputPath) {
+        const next = (sidebar.hoveredCombineGroupCounts[outputPath] || 0) - 1
+        if (next > 0) {
+            sidebar.hoveredCombineGroupCounts[outputPath] = next
+        } else {
+            delete sidebar.hoveredCombineGroupCounts[outputPath]
+            if (sidebar.hoveredCombineGroup === outputPath)
+                sidebar.hoveredCombineGroup = ""
+        }
     }
 
     // path -> true, populated/depopulated by delegates as they realize/
@@ -231,6 +450,20 @@ Rectangle {
             sidebar.transcribedPaths[path] = true
         else
             delete sidebar.transcribedPaths[path]
+    }
+
+    // Same tracking pattern again, for "regenerate all chapters"
+    // (chaptersAllButton) — a superset of transcribedPaths above, since
+    // chapter generation (TranscriptionController::generateChaptersJob())
+    // only ever reads the .md's existing transcript body and never touches
+    // audio, so an orphaned .md (audio deleted, text still present) is just
+    // as eligible as a transcribed audio row. See treeDelegate.chaptersEligible.
+    property var chaptersPaths: ({})
+    function setChaptersEligible(path, eligible) {
+        if (eligible)
+            sidebar.chaptersPaths[path] = true
+        else
+            delete sidebar.chaptersPaths[path]
     }
 
     // P6: path -> JobStatus int (Queued/Active/Paused only — see setJobStatus),
@@ -384,6 +617,46 @@ Rectangle {
                 ToolTip.delay: 500
             }
 
+            // Bulk "regenerate chapters", same shape as relabelAllButton
+            // above but over chaptersPaths (a superset of transcribedPaths —
+            // see treeDelegate.chaptersEligible for why orphaned .md rows
+            // qualify too) and calls the chapters-only bulk entry point,
+            // generateChaptersAll().
+            Item {
+                id: chaptersAllButton
+                Layout.preferredWidth: 22
+                Layout.preferredHeight: 22
+                enabled: sidebar.transcriptionController && Object.keys(sidebar.chaptersPaths).length > 0
+
+                HoverHandler {
+                    id: chaptersAllHover
+                    cursorShape: Qt.PointingHandCursor
+                    enabled: chaptersAllButton.enabled
+                }
+                TapHandler {
+                    enabled: chaptersAllButton.enabled
+                    onTapped: {
+                        const paths = Object.keys(sidebar.chaptersPaths)
+                        const urls = paths.map((p) => "file://" + p)
+                        sidebar.transcriptionController.generateChaptersAll(urls, sidebar.vaultPath)
+                    }
+                }
+                HoverBorder {
+                    anchors.fill: parent
+                    active: chaptersAllButton.enabled && chaptersAllHover.hovered
+                }
+                Text {
+                    anchors.centerIn: parent
+                    text: "≡"
+                    color: chaptersAllButton.enabled ? "#dddddd" : "#666666"
+                    font.pixelSize: 15
+                }
+
+                ToolTip.visible: chaptersAllHover.hovered
+                ToolTip.text: qsTr("Regenerate all chapters")
+                ToolTip.delay: 500
+            }
+
             // Split-recording combine, run on demand rather than
             // automatically: it used to fire on every vault-tree rebuild
             // (open + every filesystem change, via VaultTreeModel's
@@ -424,6 +697,107 @@ Rectangle {
                 ToolTip.visible: combineHover.hovered
                 ToolTip.text: qsTr("Combine split recordings")
                 ToolTip.delay: 500
+            }
+
+            // File-tree sort mode (Name / Date Modified newest-first /
+            // Date Modified oldest-first) — see AppSettings.sortMode's doc
+            // comment. Combine-candidate clustering (refreshTreeOrdering())
+            // is automatic whenever combine rules exist and composes with
+            // whichever of these is active, so there's no separate toggle
+            // for it here.
+            Item {
+                id: sortModeButton
+                Layout.preferredWidth: 22
+                Layout.preferredHeight: 22
+
+                HoverHandler {
+                    id: sortModeHover
+                    cursorShape: Qt.PointingHandCursor
+                }
+                TapHandler {
+                    onTapped: sortModeMenu.visible ? sortModeMenu.close() : sortModeMenu.open()
+                }
+                HoverBorder {
+                    anchors.fill: parent
+                    active: sortModeHover.hovered
+                }
+                Text {
+                    anchors.centerIn: parent
+                    text: "⇅"
+                    color: "#dddddd"
+                    font.pixelSize: 15
+                }
+
+                ToolTip.visible: sortModeHover.hovered
+                ToolTip.text: qsTr("Sort files")
+                ToolTip.delay: 500
+
+                // Same custom-Popup shape as TitleBar.qml's "⋯" overflow
+                // menu (moreActionsMenu) — this codebase has no QQC2
+                // Menu/MenuItem usage anywhere, just a Popup anchored off its
+                // trigger button with plain Item rows inside.
+                Popup {
+                    id: sortModeMenu
+                    x: 0
+                    y: sortModeButton.height + 4
+                    width: 220
+                    padding: 4
+                    modal: true
+                    dim: true
+                    focus: false
+                    closePolicy: Popup.CloseOnPressOutside | Popup.CloseOnEscape
+
+                    background: Rectangle {
+                        color: "#242424"
+                        radius: AppSettings.borderRadius
+                        border.width: 1
+                        border.color: "#3a3a3a"
+                    }
+
+                    Column {
+                        width: sortModeMenu.width - sortModeMenu.padding * 2
+                        spacing: 2
+
+                        Repeater {
+                            model: [
+                                { value: "name", label: qsTr("Name") },
+                                { value: "dateDesc", label: qsTr("Date modified (newest first)") },
+                                { value: "dateAsc", label: qsTr("Date modified (oldest first)") }
+                            ]
+                            delegate: Item {
+                                id: sortOptionRow
+                                required property var modelData
+                                width: parent.width
+                                height: 28
+
+                                HoverHandler {
+                                    id: sortOptionHover
+                                    cursorShape: Qt.PointingHandCursor
+                                }
+                                TapHandler {
+                                    onTapped: {
+                                        AppSettings.sortMode = sortOptionRow.modelData.value
+                                        sortModeMenu.close()
+                                    }
+                                }
+                                Rectangle {
+                                    anchors.fill: parent
+                                    radius: AppSettings.borderRadius
+                                    color: sortOptionHover.hovered ? "#3a3a3a" : "transparent"
+                                }
+                                Text {
+                                    anchors.left: parent.left
+                                    anchors.leftMargin: 8
+                                    anchors.verticalCenter: parent.verticalCenter
+                                    text: (AppSettings.sortMode === sortOptionRow.modelData.value ? "✓ " : "")
+                                          + sortOptionRow.modelData.label
+                                    color: "white"
+                                    font.pixelSize: 12
+                                }
+                            }
+                        }
+                    }
+                }
             }
 
             Item {
@@ -747,6 +1121,20 @@ Rectangle {
         anchors.bottom: parent.bottom
         clip: true
 
+        // Bug: driving the single column's width purely from the
+        // delegate's own implicitWidth (tree.width - sidebarRightMargin)
+        // left TableView's column-width cache stale when
+        // AppSettings.sidebarRightMargin changed LIVE (e.g. dragging the
+        // Settings popup's slider) — forceLayout() alone (see the
+        // Connections block below) wasn't enough to invalidate it, even
+        // though the delegate's own implicitWidth property had genuinely
+        // re-evaluated. columnWidthProvider is TableView's own documented,
+        // officially-supported mechanism for a column whose width depends
+        // on external reactive state; forceLayout() reliably re-invokes it.
+        columnWidthProvider: function (column) {
+            return Math.max(0, tree.width - AppSettings.sidebarRightMargin)
+        }
+
         // AlwaysOn (not the Basic style's default AsNeeded-but-invisible-
         // until-active overlay): the ask was a genuinely visible scrollbar
         // affordance, not just scroll functionality — TreeView already
@@ -822,9 +1210,25 @@ Rectangle {
             function onSearchExpandedChanged() { tree.forceLayout() }
         }
 
+        // columnWidthProvider above needs an explicit forceLayout() call
+        // whenever one of ITS OWN external inputs changes — same
+        // requirement Qt's docs call out for this exact case (a
+        // dynamically-computed column width), and the same
+        // stale-cached-geometry class of bug relayoutForSearchStateChange
+        // above works around on HEIGHT.
+        Connections {
+            target: AppSettings
+            function onSidebarRightMarginChanged() { tree.forceLayout() }
+        }
+
         delegate: Item {
             id: treeDelegate
-            implicitWidth: tree.width
+            // Column width (and so this delegate's own width) comes from
+            // tree.columnWidthProvider above, not implicitWidth here — see
+            // that property's doc comment for why (the Basic style's
+            // vertical ScrollBar is an OVERLAY needing a dedicated lane, and
+            // AppSettings.sidebarRightMargin is the ONE setting for that
+            // whole right-side gap, live-reactive via columnWidthProvider).
             // Item 2 (Wave E): snippetText now wraps instead of truncating,
             // so its height is variable — grow to fit instead of a fixed 44.
             implicitHeight: treeDelegate.showSnippet ? (28 + snippetText.implicitHeight + 4) : 28
@@ -868,6 +1272,44 @@ Rectangle {
             readonly property bool relabelEligible: treeDelegate.isAudio && treeDelegate.status === 2
             onRelabelEligibleChanged: sidebar.setRelabelEligible(treeDelegate.path, treeDelegate.relabelEligible)
 
+            // Chapters, unlike relabel, only ever read the .md's existing
+            // transcript body (TranscriptionController::generateChaptersJob()
+            // never touches audio) — so an orphaned .md is just as eligible
+            // as an already-transcribed audio row.
+            readonly property bool chaptersEligible: treeDelegate.relabelEligible || treeDelegate.isOrphanedMd
+            onChaptersEligibleChanged: sidebar.setChaptersEligible(treeDelegate.path, treeDelegate.chaptersEligible)
+
+            // Item 51: true iff this row is a member of a "ready" (would-
+            // combine-if-run) split-recording group per
+            // sidebar.combineReadyPaths — a genuinely reactive binding (both
+            // combineReadyPaths and path have real NOTIFY signals), unlike
+            // jobStatus above which needs the explicit refresh idiom because
+            // jobStatusForPath() itself has none. Drives the row highlight
+            // and groupMergeButton below.
+            readonly property bool combineEligible: treeDelegate.isAudio
+                    && sidebar.combineReadyPaths[treeDelegate.path] !== undefined
+            readonly property string combineOutputPath: treeDelegate.combineEligible
+                    ? sidebar.combineReadyPaths[treeDelegate.path] : ""
+            readonly property color combineGroupColor: treeDelegate.combineEligible
+                    ? sidebar.combineGroupColor(treeDelegate.combineOutputPath) : "transparent"
+
+            // Merges this row's outline with a vertically-adjacent row's
+            // outline when they're in the SAME combine group, so a
+            // contiguous run of group members reads as one unified outline
+            // (only the outer perimeter drawn) instead of N stacked boxes —
+            // see CombineGroupOutline below. Plain reactive bindings against
+            // sidebar.combineTopMergedPaths/combineBottomMergedPaths (see
+            // refreshTreeOrdering()'s doc comment for why those are computed
+            // from the tree's actual display order, not from which rows
+            // TreeView happens to have realized). Non-adjacent members of
+            // the same group (rare — e.g. files split across folders) simply
+            // get their own separate merged run; still correct, just not a
+            // single perimeter in that case.
+            readonly property bool combineTopMerged: treeDelegate.combineEligible
+                    && sidebar.combineTopMergedPaths[treeDelegate.path] === true
+            readonly property bool combineBottomMerged: treeDelegate.combineEligible
+                    && sidebar.combineBottomMergedPaths[treeDelegate.path] === true
+
             // P6: JobStatus int for this row's file (None/Queued/Active/
             // Paused/Done/Failed, see TranscriptionController::JobStatus) —
             // unlike bulkEligible/relabelEligible above this can't be a
@@ -906,13 +1348,23 @@ Rectangle {
             Component.onCompleted: {
                 sidebar.setBulkEligible(treeDelegate.path, treeDelegate.bulkEligible)
                 sidebar.setRelabelEligible(treeDelegate.path, treeDelegate.relabelEligible)
+                sidebar.setChaptersEligible(treeDelegate.path, treeDelegate.chaptersEligible)
                 treeDelegate.refreshMetadata()
                 treeDelegate.refreshJobStatus()
             }
             Component.onDestruction: {
                 sidebar.setBulkEligible(treeDelegate.path, false)
                 sidebar.setRelabelEligible(treeDelegate.path, false)
+                sidebar.setChaptersEligible(treeDelegate.path, false)
                 sidebar.setJobStatus(treeDelegate.path, -1)
+                // Balance the hover count if this row is destroyed (e.g.
+                // TreeView recycling) WHILE still counted as hovering —
+                // otherwise that increment would never be decremented and
+                // the group's button could get stuck visible forever.
+                if (treeDelegate.activeHoverGroupPath !== "") {
+                    sidebar.leaveCombineGroupHover(treeDelegate.activeHoverGroupPath)
+                    treeDelegate.activeHoverGroupPath = ""
+                }
             }
 
             // O9: was a pure readonly binding (isAudio/isOrphanedMd/
@@ -960,9 +1412,35 @@ Rectangle {
 
             opacity: treeDelegate.matchesSearch ? 1 : 0.3
 
+            // The specific group path THIS row is currently counted as
+            // hovering, per sidebar.enterCombineGroupHover()/
+            // leaveCombineGroupHover() — captured at enter time and reused
+            // at leave time rather than re-reading treeDelegate.
+            // combineOutputPath, which can change out from under a hovered
+            // row if TreeView recycles this delegate Item to a different
+            // file mid-hover (see onPathChanged's own doc comment for why
+            // that recycling happens at all).
+            property string activeHoverGroupPath: ""
+
             HoverHandler {
                 id: rowHover
                 cursorShape: Qt.PointingHandCursor
+                // Item 51 refinement: pushes this row's group into
+                // sidebar.hoveredCombineGroup so the ONE per-group merge
+                // button (see groupMergeButton) reveals on hovering ANY
+                // member row, not just this exact one. Reference-counted
+                // (see sidebar.hoveredCombineGroupCounts' doc comment) so
+                // moving the pointer directly from one member row to an
+                // adjacent one doesn't flicker the button off.
+                onHoveredChanged: {
+                    if (rowHover.hovered && treeDelegate.combineEligible) {
+                        treeDelegate.activeHoverGroupPath = treeDelegate.combineOutputPath
+                        sidebar.enterCombineGroupHover(treeDelegate.activeHoverGroupPath)
+                    } else if (!rowHover.hovered && treeDelegate.activeHoverGroupPath !== "") {
+                        sidebar.leaveCombineGroupHover(treeDelegate.activeHoverGroupPath)
+                        treeDelegate.activeHoverGroupPath = ""
+                    }
+                }
             }
 
             TapHandler {
@@ -977,9 +1455,15 @@ Rectangle {
                 }
             }
 
+            // Note: no anchors.rightMargin here — tree.columnWidthProvider
+            // already subtracts the FULL AppSettings.sidebarRightMargin from
+            // this row's own width, so this Item's right edge already sits
+            // at that inset; adding it again here would double it.
             HoverBorder {
                 anchors.fill: parent
-                anchors.margins: 1
+                anchors.topMargin: 3
+                anchors.bottomMargin: 3
+                anchors.leftMargin: AppSettings.sidebarEdgeLeftMargin
                 active: rowHover.hovered
             }
 
@@ -988,7 +1472,9 @@ Rectangle {
             // white) so both can be visible at once without being confused.
             Rectangle {
                 anchors.fill: parent
-                anchors.margins: 1
+                anchors.topMargin: 3
+                anchors.bottomMargin: 3
+                anchors.leftMargin: AppSettings.sidebarEdgeLeftMargin
                 visible: treeDelegate.path === sidebar.currentPath
                 color: AppSettings.sidebarSelectionColor
                 radius: AppSettings.borderRadius
@@ -996,9 +1482,57 @@ Rectangle {
                 border.color: AppSettings.sidebarSelectionBorderColor
             }
 
+            // Item 51: border-only (not a fill, so it composes with the
+            // selection highlight above instead of covering it) highlight for
+            // rows that are members of a "ready" — would-combine-if-run —
+            // split-recording group, colored per-group (combineGroupColor),
+            // same stroke weight and corner radius as HoverBorder. A
+            // contiguous run of same-group rows suppresses the edges they
+            // SHARE with a same-group neighbor (combineTopMerged/
+            // combineBottomMerged — see CombineGroupOutline's doc comment for
+            // why a plain bordered Rectangle can't do this) so the run reads
+            // as one continuous rounded outline instead of N stacked boxes.
+            CombineGroupOutline {
+                anchors.fill: parent
+                // Horizontal inset matches HoverBorder's (breathing room from
+                // the sidebar's own left/right edges), but the vertical
+                // inset is much smaller — unlike HoverBorder (one row at a
+                // time), this draws the OUTER top/bottom edge of a whole
+                // multi-row merged group, and a 3px inset there read as
+                // unwanted padding separating the group from the unrelated
+                // rows directly above/below it (user report).
+                // No anchors.rightMargin — see the sibling HoverBorder's
+                // comment above; tree.columnWidthProvider already accounts
+                // for the full right-side gap.
+                anchors.leftMargin: AppSettings.sidebarEdgeLeftMargin
+                anchors.topMargin: 1
+                anchors.bottomMargin: 1
+                // Must match anchors.topMargin/bottomMargin above — see this
+                // property's doc comment in CombineGroupOutline.qml.
+                edgeMargin: 1
+                visible: treeDelegate.combineEligible
+                strokeColor: treeDelegate.combineGroupColor
+                // Shape's anti-aliased curve stroke reads visibly thinner
+                // than a Rectangle border of the same nominal width (the
+                // latter renders as a crisp, fully-opaque line; the former
+                // spreads coverage across the AA edge) — bumped up from 1 to
+                // match HoverBorder's actual perceived weight instead of its
+                // literal border.width value.
+                strokeWidth: 1.5
+                cornerRadius: AppSettings.borderRadius
+                topRounded: !treeDelegate.combineTopMerged
+                bottomRounded: !treeDelegate.combineBottomMerged
+            }
+
             Column {
                 id: treeColumn
-                x: treeDelegate.depth * 16 + 6
+                // AppSettings.sidebarEdgeLeftMargin matches the outlines'
+                // own left inset (HoverBorder/selection/CombineGroupOutline
+                // above); sidebarContentLeftMargin is the FURTHER configurable
+                // gap from that outline's left edge to where the row's own
+                // content (status dot/label) begins — see both properties'
+                // doc comments in AppSettings.qml.
+                x: treeDelegate.depth * 16 + AppSettings.sidebarEdgeLeftMargin + AppSettings.sidebarContentLeftMargin
                 // See the identical fix + explanation on searchResultsView's
                 // resultColumn in this same file — conditionally toggling
                 // between anchors.top and anchors.verticalCenter via
@@ -1009,14 +1543,21 @@ Rectangle {
                 spacing: 2
 
                 Row {
-                    spacing: 6
+                    spacing: 4
 
                     Text {
-                        // Fixed-width wrapper: always reserves space so file
-                        // rows and dir rows stay aligned, even though the
-                        // glyph itself only renders for expandable dirs.
+                        // Collapses to 0 width for the common case (a leaf
+                        // row, no expand glyph to show) instead of always
+                        // reserving a fixed column — that reservation was
+                        // the dominant contributor to a left margin much
+                        // bigger than the row's own vertical centering gap
+                        // (user report). Expandable dir rows still get their
+                        // glyph; only ITS OWN name shifts right relative to
+                        // sibling file rows now, which reads fine since a
+                        // dir's children are already indented a further
+                        // level below it anyway.
                         anchors.verticalCenter: parent.verticalCenter
-                        width: 14
+                        width: (treeDelegate.isDir && treeDelegate.hasChildren) ? 10 : 0
                         horizontalAlignment: Text.AlignHCenter
                         text: (treeDelegate.isDir && treeDelegate.hasChildren)
                               ? (treeDelegate.expanded ? "−" : "+")
@@ -1068,6 +1609,26 @@ Rectangle {
                         // stored label instead, when one exists.
                         // Item 9: when the query matches this text directly,
                         // the match is highlighted via rich text.
+                        //
+                        // Bug: this Text had no width bound at all, so a long
+                        // filename (routine for split-recording candidates —
+                        // exactly the "acme mic 3"-style names combine rules
+                        // target) painted straight through the per-row icon
+                        // cluster (rowTranscribeButton/rowRelabelButton/
+                        // rowChaptersButton/groupMergeButton, ~100px reserved
+                        // on the right) instead of stopping short of it — the
+                        // combine group's merge button rendered on top of
+                        // mid-filename characters instead of in its own clear
+                        // space, reading as "no combine icon" at a glance. 36px
+                        // below covers this Row's own preceding siblings'
+                        // worst case (expand glyph 10 + status dot 8 + job dot
+                        // 6 + 3*4 spacing). clip (not just elide) backstops the
+                        // StyledText highlight case below — elide is
+                        // documented elsewhere in this file as unreliable
+                        // together with StyledText.
+                        width: Math.max(40, treeDelegate.width - treeColumn.x - 36 - 100)
+                        elide: Text.ElideRight
+                        clip: true
                         textFormat: sidebar.searchQuery !== "" ? Text.StyledText : Text.PlainText
                         text: {
                             const base = (function () {
@@ -1092,14 +1653,16 @@ Rectangle {
                 // instead of eliding; (2) the highlight span now actually
                 // renders, for the same reason; (3) clicking it opens the
                 // file and jumps to the searched phrase; (4) explicit `x`
-                // matches the title Text's own left edge (glyph column +
-                // spacing + status dot + spacing = 34px), instead of
-                // starting flush at the row's true left edge like before.
+                // matches the title Text's own left edge (glyph column is
+                // always 0-width here — showSnippet only ever applies to
+                // audio/orphaned rows, never directories — so just spacing +
+                // status dot + spacing = 16px), instead of starting flush at
+                // the row's true left edge like before.
                 Text {
                     id: snippetText
                     visible: treeDelegate.showSnippet
-                    x: 34
-                    width: Math.max(10, tree.width - x - 16)
+                    x: 16
+                    width: Math.max(10, treeDelegate.width - x - 16)
                     textFormat: Text.StyledText
                     text: treeDelegate.snippetText
                     color: "#999999"
@@ -1214,6 +1777,121 @@ Rectangle {
                     font.pixelSize: 13
                 }
             }
+
+            // Per-row "regenerate chapters", same fade-in shape as
+            // rowRelabelButton but gated on chaptersEligible instead of
+            // relabelEligible — orphaned .md rows qualify too, since chapter
+            // generation never touches audio (see chaptersEligible's doc
+            // comment above). Sits one slot further left in the icon cluster.
+            Item {
+                id: rowChaptersButton
+                anchors.right: rowRelabelButton.left
+                anchors.rightMargin: 4
+                anchors.verticalCenter: parent.verticalCenter
+                width: 20
+                height: 20
+                opacity: (rowHover.hovered && treeDelegate.chaptersEligible) ? 1 : 0
+                enabled: opacity > 0
+
+                Behavior on opacity {
+                    NumberAnimation { duration: 120 }
+                }
+
+                ToolTip.visible: rowChaptersHover.hovered
+                ToolTip.text: qsTr("Regenerate chapters")
+                ToolTip.delay: 500
+
+                HoverHandler {
+                    id: rowChaptersHover
+                    cursorShape: Qt.PointingHandCursor
+                    enabled: rowChaptersButton.enabled
+                }
+                TapHandler {
+                    enabled: rowChaptersButton.enabled
+                    onTapped: sidebar.transcriptionController.generateChapters(
+                                  "file://" + treeDelegate.path, sidebar.vaultPath)
+                }
+                HoverBorder {
+                    anchors.fill: parent
+                    active: rowChaptersButton.enabled && rowChaptersHover.hovered
+                }
+                Text {
+                    anchors.centerIn: parent
+                    text: "≡"
+                    color: "#dddddd"
+                    font.pixelSize: 13
+                }
+            }
+
+            // Item 51 refinement: ONE "combine this group now" button per
+            // group, not one per row — it used to live in this row's
+            // already-busy per-file action cluster (transcribe/relabel/
+            // chapters icons), competing with the row's own hover highlight
+            // for attention and only ever appearing while hovering this
+            // EXACT row. Now it's decoupled from that cluster entirely:
+            // rendered only on the group's TOP row (!combineTopMerged, i.e.
+            // the top of the merged outline — user report, 2026-07-13: was
+            // the bottom row, moved to the top so it reads next to the
+            // group's "first" file) and revealed by hovering ANY member row,
+            // via sidebar.hoveredCombineGroup (see rowHover's
+            // onHoveredChanged above) — so it reads as "the whole outlined
+            // group has one action," not another per-row icon.
+            Item {
+                id: groupMergeButton
+                // Anchored to the LEFT of the per-row action cluster
+                // (transcribe/relabel/chapters, which end at
+                // rowChaptersButton) rather than parent.right — that rightmost
+                // spot is where rowTranscribeButton always fades in for any
+                // hovered audio row, including this group's own top row, so
+                // anchoring here too would have the two buttons land right on
+                // top of each other.
+                anchors.right: rowChaptersButton.left
+                anchors.rightMargin: 4
+                anchors.verticalCenter: parent.verticalCenter
+                width: 20
+                height: 20
+                visible: treeDelegate.combineEligible && !treeDelegate.combineTopMerged
+                opacity: sidebar.hoveredCombineGroup === treeDelegate.combineOutputPath ? 1 : 0
+                enabled: opacity > 0
+
+                Behavior on opacity {
+                    NumberAnimation { duration: 120 }
+                }
+
+                ToolTip.visible: groupMergeHover.hovered
+                ToolTip.text: qsTr("Combine this group")
+                ToolTip.delay: 500
+
+                HoverHandler {
+                    id: groupMergeHover
+                    cursorShape: Qt.PointingHandCursor
+                    enabled: groupMergeButton.enabled
+                }
+                TapHandler {
+                    enabled: groupMergeButton.enabled
+                    onTapped: sidebar.transcriptionController.combineGroup(
+                                  AppSettings.combineRules, sidebar.model.allAudioPaths(),
+                                  treeDelegate.combineOutputPath, sidebar.vaultPath,
+                                  AppSettings.deleteOriginalsAfterCombine)
+                }
+                Rectangle {
+                    anchors.fill: parent
+                    color: "transparent"
+                    radius: AppSettings.borderRadius
+                    border.width: 1
+                    border.color: treeDelegate.combineGroupColor
+                    opacity: groupMergeButton.enabled && groupMergeHover.hovered ? 1 : 0
+                    Behavior on opacity {
+                        NumberAnimation { duration: 100 }
+                    }
+                }
+                Text {
+                    anchors.centerIn: parent
+                    text: "⊕"
+                    color: treeDelegate.combineGroupColor
+                    font.pixelSize: 13
+                }
+            }
         }
     }
 
@@ -1240,7 +1918,12 @@ Rectangle {
         delegate: Item {
             id: resultDelegate
             required property var modelData
-            width: searchResultsView.width
+            // Same unified right-side gap as tree.columnWidthProvider above
+            // (see that property's doc comment) — but this is a plain
+            // ListView delegate, not a TableView column, so this ordinary
+            // width binding stays live-reactive on its own; no
+            // columnWidthProvider/forceLayout() equivalent needed here.
+            width: searchResultsView.width - AppSettings.sidebarRightMargin
 
             readonly property string resultPath: resultDelegate.modelData.path
             readonly property string resultName: resultDelegate.modelData.name
@@ -1288,16 +1971,22 @@ Rectangle {
                         sidebar.orphanedMdActivated(resultDelegate.resultPath)
                 }
             }
+            // Note: no anchors.rightMargin — resultDelegate.width above
+            // already subtracts the full AppSettings.sidebarRightMargin.
             HoverBorder {
                 anchors.fill: parent
-                anchors.margins: 1
+                anchors.topMargin: 3
+                anchors.bottomMargin: 3
+                anchors.leftMargin: AppSettings.sidebarEdgeLeftMargin
                 active: resultHover.hovered
             }
 
             // O7: same persistent "currently open" highlight as treeDelegate.
             Rectangle {
                 anchors.fill: parent
-                anchors.margins: 1
+                anchors.topMargin: 3
+                anchors.bottomMargin: 3
+                anchors.leftMargin: AppSettings.sidebarEdgeLeftMargin
                 visible: resultDelegate.resultPath === sidebar.currentPath
                 color: AppSettings.sidebarSelectionColor
                 radius: AppSettings.borderRadius
@@ -1307,7 +1996,8 @@ Rectangle {
 
             Column {
                 id: resultColumn
-                x: 6
+                // Same shape as treeDelegate.treeColumn's x above.
+                x: AppSettings.sidebarEdgeLeftMargin + AppSettings.sidebarContentLeftMargin
                 // Bug fix: conditionally toggling BETWEEN anchors.top and
                 // anchors.verticalCenter via ternary+undefined is fragile —
                 // Qt Quick's anchoring engine doesn't reliably clear/re-apply
@@ -1350,7 +2040,7 @@ Rectangle {
                     id: resultSnippetText
                     visible: resultDelegate.showSnippet
                     x: 14
-                    width: Math.max(10, searchResultsView.width - x - 16)
+                    width: Math.max(10, resultDelegate.width - x - 16)
                     textFormat: Text.StyledText
                     text: resultDelegate.snippetText
                     color: "#999999"
