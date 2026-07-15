@@ -239,7 +239,7 @@ private slots:
         };
 
         QString error;
-        const auto result = engine.generateChapters(segmentTexts, &error);
+        const auto result = engine.generateChapters(segmentTexts, /* density */ 0.5, &error);
         QVERIFY2(result.has_value(), qPrintable(error));
 
         for (const Chapter &chapter : *result) {
@@ -249,6 +249,38 @@ private slots:
                                     .arg(segmentTexts.size())));
             QVERIFY2(!chapter.title.isEmpty(), "chapter title must be non-empty");
         }
+    }
+
+    // Item 27 (chapter density): density must actually change the chapter
+    // system prompt's instruction — a low density should steer the model
+    // toward FEWER boundaries ("conservative"/"few"), a high one toward MORE
+    // ("granular"/"30"), with the mid default matching the historical "up to
+    // ~20" wording. Pure string test on the exposed prompt builder, no model
+    // needed (mirrors the deterministic backendKind-style checks).
+    void chapterSystemPrompt_densityChangesInstruction()
+    {
+        const QString low = LabelingEngine::chapterSystemPrompt(0.0);
+        const QString mid = LabelingEngine::chapterSystemPrompt(0.5);
+        const QString high = LabelingEngine::chapterSystemPrompt(1.0);
+
+        // The three tiers must produce materially different text.
+        QVERIFY(low != mid);
+        QVERIFY(mid != high);
+        QVERIFY(low != high);
+
+        // Directional sanity on the tier wording.
+        QVERIFY2(low.contains(QStringLiteral("conservative"), Qt::CaseInsensitive)
+                      || low.contains(QStringLiteral("few"), Qt::CaseInsensitive),
+                 qPrintable(low));
+        QVERIFY2(high.contains(QStringLiteral("granular"), Qt::CaseInsensitive)
+                      || high.contains(QStringLiteral("30")),
+                 qPrintable(high));
+        QVERIFY2(mid.contains(QStringLiteral("20")), qPrintable(mid));
+
+        // The fixed structural instruction (afterSegment/title JSON contract)
+        // must survive in every tier — density only swaps the count sentence.
+        for (const QString &p : {low, mid, high})
+            QVERIFY2(p.contains(QStringLiteral("afterSegment")), qPrintable(p));
     }
 
     // Follow-up to generateChapters()'s over-eager-boundary problem: see
@@ -261,12 +293,12 @@ private slots:
         const QList<Chapter> oneChapter = {{5, QStringLiteral("Solo chapter")}};
 
         QString error;
-        const auto result = engine.mergeSimilarChapters(oneChapter, {}, &error);
+        const auto result = engine.mergeSimilarChapters(oneChapter, {}, 0.5, &error);
         QVERIFY2(result.has_value(), qPrintable(error));
         QCOMPARE(result->size(), 1);
         QCOMPARE(result->first().title, QStringLiteral("Solo chapter"));
 
-        const auto emptyResult = engine.mergeSimilarChapters({}, {}, &error);
+        const auto emptyResult = engine.mergeSimilarChapters({}, {}, 0.5, &error);
         QVERIFY2(emptyResult.has_value(), qPrintable(error));
         QVERIFY(emptyResult->isEmpty());
     }
@@ -315,7 +347,7 @@ private slots:
         };
 
         QString error;
-        const auto result = engine.mergeSimilarChapters(overSplit, segmentTexts, &error);
+        const auto result = engine.mergeSimilarChapters(overSplit, segmentTexts, 0.5, &error);
         QVERIFY2(result.has_value(), qPrintable(error));
 
         QCOMPARE(result->size(), 2);

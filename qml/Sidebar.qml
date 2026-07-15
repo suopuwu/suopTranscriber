@@ -197,12 +197,468 @@ Rectangle {
     // Reuses the exact fileActivated/orphanedMdActivated signal path a
     // click emits — currentPath's persistent outline (Main.qml) and
     // MainPanel's open file update as a side effect of that binding, same as
-    // clicking the row directly. No separate "selected note" state exists.
+    // clicking the row directly.
     function activateNote(path, isOrphanedMd) {
         if (isOrphanedMd)
             sidebar.orphanedMdActivated(path)
         else
             sidebar.fileActivated(path)
+    }
+
+    // Item 3: multi-select, layered on top of currentPath above rather than
+    // replacing it — currentPath stays MainPanel's single "what's open"
+    // pointer (O7), selectedPaths is a separate, purely-sidebar-local flat
+    // array of note (audio/orphaned-.md) paths. Directories are never
+    // selectable — clicking one only ever toggles expand (see treeDelegate's
+    // TapHandler), same as before this item.
+    property var selectedPaths: []
+    // The last note path clicked WITHOUT Shift — the anchor a Shift-click
+    // range is measured from (repeated Shift-clicks re-extend/shrink from
+    // this same anchor, matching common file-manager convention, rather than
+    // sliding the anchor to wherever the previous Shift-click landed).
+    property string lastClickedPath: ""
+
+    // Item 41: the moving end of a keyboard range gesture (Shift+Up/Down) —
+    // distinct from lastClickedPath, which is the fixed anchor the range is
+    // measured FROM. A plain click/plain arrow/group-jump collapses both to
+    // the same row (single selection); Shift+arrow walks this cursor while
+    // the anchor stays put, exactly like Shift+click's moving end.
+    property string selectionCursorPath: ""
+    // Item 41: which of the current row's per-row action buttons currently
+    // holds keyboard focus — "" means focus is on the tree row itself (no
+    // button focused), otherwise one of "transcribe"/"relabel"/"chapters"
+    // (the actionButtonRow's declaration order). Left/Right move this in/out
+    // and along the cluster; Enter/Return/Space activate the named button for
+    // sidebar.currentPath. Kept as sidebar-level state (not real activeFocus
+    // on a delegate child) because TreeView recycles delegates, so a focused
+    // button would be lost the moment its row scrolls out of the pool.
+    property string actionButtonFocus: ""
+    // Reset button focus whenever the keyboard-current row changes (plain
+    // arrow, group-jump, or a click that opens a different file) — leaving
+    // the row must drop out of its action cluster back onto the row itself.
+    onCurrentPathChanged: sidebar.actionButtonFocus = ""
+
+    // Notes (audio/orphaned .md — never directories) in on-screen order,
+    // exactly as a user could click them. Same shape as moveNoteSelection's
+    // own two branches below (flat searchResultsList while a text search is
+    // active, else a TreeView row walk skipping collapsed children) but
+    // paths-only — Shift-range only ever needs "where does X sit relative to
+    // Y in what's visible," not moveNoteSelection's row-for-scrolling detail.
+    function visibleNotePaths() {
+        if (sidebar.searchQuery !== "")
+            return sidebar.searchResultsList.map((r) => r.path)
+        const paths = []
+        for (let r = 0; r < tree.rows; r++) {
+            const rowIndex = tree.index(r, 0)
+            if (searchProxy.data(rowIndex, VaultTreeModel.IsAudioRole)
+                    || searchProxy.data(rowIndex, VaultTreeModel.IsOrphanedMdRole))
+                paths.push(searchProxy.data(rowIndex, VaultTreeModel.PathRole))
+        }
+        return paths
+    }
+
+    // Single entry point for both treeDelegate's and searchResultsView's
+    // TapHandlers (see each's onTapped below) — modifiers come from
+    // TapHandler.point.modifiers (QQuickHandlerPoint's own property, not
+    // something the tapped signal itself carries). Plain click keeps the
+    // exact pre-item-3 behavior (select just this row AND open it — the two
+    // were always the same action here). Shift/Ctrl-click only change
+    // selectedPaths, deliberately WITHOUT calling activateNote — same as
+    // Nautilus/most file managers, where building a multi-selection
+    // shouldn't also keep swapping MainPanel's open file out from under the
+    // user on every click.
+    function handleNoteClick(path, isOrphanedMd, modifiers) {
+        const shift = (modifiers & Qt.ShiftModifier) !== 0
+        const ctrl = (modifiers & Qt.ControlModifier) !== 0
+        // Item 41: the clicked row is the new moving end for any subsequent
+        // keyboard Shift+arrow extension (Shift-click's moving end is exactly
+        // where the pointer landed).
+        sidebar.selectionCursorPath = path
+        if (shift && sidebar.lastClickedPath !== "") {
+            const order = sidebar.visibleNotePaths()
+            const fromIdx = order.indexOf(sidebar.lastClickedPath)
+            const toIdx = order.indexOf(path)
+            if (fromIdx >= 0 && toIdx >= 0) {
+                const lo = Math.min(fromIdx, toIdx)
+                const hi = Math.max(fromIdx, toIdx)
+                sidebar.selectedPaths = order.slice(lo, hi + 1)
+            } else {
+                // Anchor no longer visible (e.g. scrolled out from under a
+                // collapsed dir) — fall back to a plain single-select rather
+                // than silently doing nothing.
+                sidebar.selectedPaths = [path]
+                sidebar.lastClickedPath = path
+            }
+        } else if (ctrl) {
+            sidebar.selectedPaths = sidebar.selectedPaths.indexOf(path) >= 0
+                ? sidebar.selectedPaths.filter((p) => p !== path)
+                : sidebar.selectedPaths.concat([path])
+            sidebar.lastClickedPath = path
+        } else {
+            sidebar.selectedPaths = [path]
+            sidebar.lastClickedPath = path
+            sidebar.activateNote(path, isOrphanedMd)
+        }
+    }
+
+    // transcribeAllButton/relabelAllButton/chaptersAllButton (see the ribbon
+    // below) each pass their own eligibility map (untranscribedPaths/
+    // transcribedPaths/chaptersPaths) here — with 2+ rows selected, bulk
+    // narrows to that selection (intersected with eligibility); with 0 or 1
+    // selected, bulk keeps its original "everything eligible" behavior so
+    // single-file workflows (no selection ever made) are unaffected.
+    function bulkTargetPaths(eligibleMap) {
+        const eligible = Object.keys(eligibleMap)
+        if (sidebar.selectedPaths.length < 2)
+            return eligible
+        return eligible.filter((p) => sidebar.selectedPaths.indexOf(p) >= 0)
+    }
+
+    // Item 44: the current multi-selection narrowed to AUDIO notes only.
+    // combineSelected() concatenates audio, so an orphaned .md that got
+    // selected must be dropped. Reads isAudio from searchResultNotes() (the
+    // same visible-note metadata the search run-all eligibility uses, valid in
+    // both text-search and tree modes), intersected with selectedPaths.
+    // Returns [] for a selection of fewer than two audio files — the caller's
+    // and the UI's >= 2 gate.
+    function selectedAudioPaths() {
+        const selected = sidebar.selectedPaths
+        if (selected.length < 2)
+            return []
+        return sidebar.searchResultNotes()
+            .filter((n) => n.isAudio && selected.indexOf(n.path) >= 0)
+            .map((n) => n.path)
+    }
+
+    // Item 44: manual "combine selected" — hand the explicit, user-selected
+    // audio files to the controller's combineSelected(), which reuses the same
+    // combine job/worker the rule-driven auto-combine uses. Ordering (mtime
+    // ascending) and the merged output name are decided controller-side; the
+    // sidebar just supplies the file list as file:// URLs. No-op unless 2+
+    // audio files are selected (the UI gates on the same condition).
+    function combineSelectedFiles() {
+        if (!sidebar.transcriptionController)
+            return
+        const paths = sidebar.selectedAudioPaths()
+        if (paths.length < 2)
+            return
+        sidebar.transcriptionController.combineSelected(paths.map((p) => "file://" + p), sidebar.vaultPath)
+    }
+
+    // Item 39: run-all over the CURRENT SEARCH/FILTER RESULTS (the third,
+    // search-menu home for the transcribe/relabel/chapters actions, alongside
+    // the ribbon's bulk buttons and treeDelegate's per-row cluster). The
+    // filtered/visible note set in whichever mode is active — the flat
+    // searchResultsList while a text query is present (VaultTreeModel::
+    // searchResults(), already the matched set), else the tag/speaker-filtered
+    // tree rows (searchProxy hides non-matching rows via filterAcceptsRow).
+    // Same dual-mode shape as visibleNotePaths() above, but carries each note's
+    // eligibility fields (isAudio/isOrphanedMd/status) so the three search
+    // buttons can intersect with the SAME eligibility rules the ribbon's
+    // bulk/relabel/chapters buttons use (treeDelegate.bulkEligible/
+    // relabelEligible/chaptersEligible). Self-contained (reads searchResultsList
+    // + searchProxy directly) rather than the realized-delegate eligibility
+    // maps, since in text-search mode the tree isn't realized at all.
+    function searchResultNotes() {
+        if (sidebar.searchQuery !== "")
+            return sidebar.searchResultsList.map((r) => ({
+                path: r.path, isAudio: r.isAudio,
+                isOrphanedMd: r.isOrphanedMd, status: r.status }))
+        const notes = []
+        for (let r = 0; r < tree.rows; r++) {
+            const ri = tree.index(r, 0)
+            const isAudio = searchProxy.data(ri, VaultTreeModel.IsAudioRole)
+            const isOrphanedMd = searchProxy.data(ri, VaultTreeModel.IsOrphanedMdRole)
+            if (isAudio || isOrphanedMd)
+                notes.push({
+                    path: searchProxy.data(ri, VaultTreeModel.PathRole),
+                    isAudio: isAudio, isOrphanedMd: isOrphanedMd,
+                    status: searchProxy.data(ri, VaultTreeModel.StatusRole) })
+        }
+        return notes
+    }
+
+    // The filtered/visible note paths — the task's searchResultPaths(); same
+    // set visibleNotePaths() returns, kept as its own name because the search
+    // run-all buttons and their eligibility filters below are all phrased in
+    // terms of "the search results".
+    function searchResultPaths() {
+        return sidebar.searchResultNotes().map((n) => n.path)
+    }
+
+    // Per-action eligible subsets of the filtered set, each mirroring the exact
+    // rule its ribbon counterpart uses (status 2 == TranscribedStatus, matching
+    // the numeric literal treeDelegate/resultDelegate already use):
+    //  - transcribe: audio not already matching an existing transcription for
+    //    the default model (re-transcribe with a different model still counts),
+    //    exactly treeDelegate.bulkEligible.
+    //  - relabel:    already-transcribed audio (treeDelegate.relabelEligible).
+    //  - chapters:   transcribed audio OR an orphaned .md, since chapter
+    //    generation only reads the .md body (treeDelegate.chaptersEligible).
+    function searchTranscribePaths() {
+        if (!sidebar.transcriptionController)
+            return []
+        return sidebar.searchResultNotes()
+            .filter((n) => n.isAudio
+                    && !sidebar.transcriptionController.matchesExistingTranscription(
+                           "file://" + n.path, AppSettings.defaultModel, false))
+            .map((n) => n.path)
+    }
+    function searchRelabelPaths() {
+        return sidebar.searchResultNotes()
+            .filter((n) => n.isAudio && n.status === 2)
+            .map((n) => n.path)
+    }
+    function searchChaptersPaths() {
+        return sidebar.searchResultNotes()
+            .filter((n) => (n.isAudio && n.status === 2) || n.isOrphanedMd)
+            .map((n) => n.path)
+    }
+    // Item 52: search-scoped "detect speakers" — transcribed audio in the
+    // filtered set (same rule as searchRelabelPaths(); diarization needs an
+    // existing transcript and decodes the audio, so no orphaned .md).
+    function searchDetectSpeakersPaths() {
+        return sidebar.searchResultNotes()
+            .filter((n) => n.isAudio && n.status === 2)
+            .map((n) => n.path)
+    }
+    // Items 24/53: search-scoped "run all jobs" — same eligibility as
+    // searchTranscribePaths() (untranscribed audio in the filtered set), since
+    // run-all's whole point is the full pipeline on files that need it; an
+    // already-transcribed result's label/chapters are the other two search
+    // buttons' job (runAllJobs() itself skips a redundant re-transcribe anyway).
+    function searchRunAllPaths() {
+        if (!sidebar.transcriptionController)
+            return []
+        return sidebar.searchResultNotes()
+            .filter((n) => n.isAudio
+                    && !sidebar.transcriptionController.matchesExistingTranscription(
+                           "file://" + n.path, AppSettings.defaultModel, false))
+            .map((n) => n.path)
+    }
+
+    // Whether any filter/search is actually narrowing the visible set — the
+    // search buttons stay disabled otherwise so they can't silently run over
+    // the ENTIRE vault (that's the ribbon's job); they only ever act on a
+    // genuinely filtered subset. activeTagFilters/activeSpeakerFilters always
+    // split to length >= 1 (a bare "" yields [""]), so gate on the raw text.
+    readonly property bool searchFilterActive: sidebar.searchQuery !== ""
+        || sidebar.tagFilterText.trim() !== "" || sidebar.speakerFilterText.trim() !== ""
+
+    // Item 41 helpers ------------------------------------------------------
+    // Parent directory of a note path (everything before the last "/"), used
+    // to define a "group" (contiguous run of same-parent notes) for the
+    // Ctrl+Up/Down group-boundary jump below.
+    function parentDir(path) {
+        const i = path.lastIndexOf("/")
+        return i >= 0 ? path.substring(0, i) : ""
+    }
+
+    // Emit the right activation signal for a bare path — visibleNotePaths()
+    // is paths-only, but activateNote() needs isOrphanedMd to pick
+    // orphanedMdActivated vs fileActivated, so look it up from whichever
+    // view's model backs the current mode.
+    function activateNotePath(path) {
+        if (sidebar.searchQuery !== "") {
+            const r = sidebar.searchResultsList.find((x) => x.path === path)
+            if (r)
+                sidebar.activateNote(path, r.isOrphanedMd)
+            return
+        }
+        for (let row = 0; row < tree.rows; row++) {
+            const ri = tree.index(row, 0)
+            if (searchProxy.data(ri, VaultTreeModel.PathRole) === path) {
+                sidebar.activateNote(path, searchProxy.data(ri, VaultTreeModel.IsOrphanedMdRole))
+                return
+            }
+        }
+    }
+
+    // Scroll a note (by path) fully into view in whichever view is showing —
+    // the by-row/by-index variants moveNoteSelection uses inline, but reached
+    // from a path when the caller (extend/group-jump) only has the path.
+    function scrollNoteIntoView(path) {
+        if (sidebar.searchQuery !== "") {
+            const i = sidebar.searchResultsList.findIndex((r) => r.path === path)
+            if (i >= 0)
+                searchResultsView.positionViewAtIndex(i, ListView.Contain)
+            return
+        }
+        for (let row = 0; row < tree.rows; row++) {
+            if (searchProxy.data(tree.index(row, 0), VaultTreeModel.PathRole) === path) {
+                tree.positionViewAtRow(row, TableView.Contain)
+                return
+            }
+        }
+    }
+
+    // Item 42: focus the in-app file explorer (this tree) and reveal `path` in
+    // it — the target of the bottom bar's current-file label click, which used
+    // to shell out to the OS file manager. `path` is normally already
+    // sidebar.currentPath (BottomBar mirrors MainPanel's open file), so the row
+    // already carries currentPath's persistent outline; this just gives the
+    // tree keyboard focus and scrolls the row into view, syncing the
+    // selection/cursor state so subsequent arrow-nav starts from it. Under an
+    // active text search the TreeView is hidden, so focus the results list and
+    // scroll to the row if it's among the matches (best-effort — no forced
+    // search clear).
+    function focusAndRevealNote(path) {
+        if (path === "")
+            return
+        if (sidebar.searchQuery !== "") {
+            searchResultsView.forceActiveFocus()
+            sidebar.scrollNoteIntoView(path)
+            return
+        }
+        tree.forceActiveFocus()
+        sidebar.selectedPaths = [path]
+        sidebar.lastClickedPath = path
+        sidebar.selectionCursorPath = path
+        sidebar.scrollNoteIntoView(path)
+    }
+
+    // Single-select + open + reveal one note, collapsing anchor and cursor
+    // onto it — the shared tail of a plain arrow move and a Ctrl+arrow group
+    // jump (both behave like a plain click).
+    function selectAndOpenNote(path) {
+        sidebar.selectedPaths = [path]
+        sidebar.lastClickedPath = path
+        sidebar.selectionCursorPath = path
+        sidebar.activateNotePath(path)
+        sidebar.scrollNoteIntoView(path)
+    }
+
+    // Shift+Up/Down: grow/shrink the selection between the fixed anchor
+    // (lastClickedPath) and a moving cursor (selectionCursorPath), mirroring
+    // Shift-click's contiguous range. Does NOT open a file (matches
+    // handleNoteClick's shift branch, which only changes selectedPaths).
+    function extendNoteSelection(direction) {
+        sidebar.actionButtonFocus = ""
+        const order = sidebar.visibleNotePaths()
+        if (order.length === 0)
+            return
+        let anchorIdx = order.indexOf(sidebar.lastClickedPath !== "" ? sidebar.lastClickedPath
+                                                                      : sidebar.currentPath)
+        let cursorIdx = order.indexOf(sidebar.selectionCursorPath !== "" ? sidebar.selectionCursorPath
+                                                                         : sidebar.currentPath)
+        if (anchorIdx < 0)
+            anchorIdx = cursorIdx >= 0 ? cursorIdx : 0
+        if (cursorIdx < 0)
+            cursorIdx = anchorIdx
+        cursorIdx = Math.max(0, Math.min(order.length - 1, cursorIdx + direction))
+        sidebar.lastClickedPath = order[anchorIdx]
+        sidebar.selectionCursorPath = order[cursorIdx]
+        const lo = Math.min(anchorIdx, cursorIdx)
+        const hi = Math.max(anchorIdx, cursorIdx)
+        sidebar.selectedPaths = order.slice(lo, hi + 1)
+        sidebar.scrollNoteIntoView(order[cursorIdx])
+    }
+
+    // Ctrl+Up/Down: jump to the boundary of the current group — the first/
+    // last note sharing the current row's parent folder. Already at that
+    // boundary? Step one note into the adjacent group (its near boundary), so
+    // repeated presses walk group-by-group instead of dead-ending. Opens the
+    // landed note like a plain move.
+    function jumpToGroupBoundary(direction) {
+        const order = sidebar.visibleNotePaths()
+        if (order.length === 0)
+            return
+        let idx = order.indexOf(sidebar.currentPath)
+        if (idx < 0) {
+            sidebar.selectAndOpenNote(order[direction > 0 ? 0 : order.length - 1])
+            return
+        }
+        const parent = sidebar.parentDir(order[idx])
+        let j = idx
+        while (true) {
+            const k = j + direction
+            if (k < 0 || k > order.length - 1)
+                break
+            if (sidebar.parentDir(order[k]) !== parent)
+                break
+            j = k
+        }
+        if (j === idx) {
+            // Already at this group's edge — hop into the neighbouring group.
+            const k = idx + direction
+            if (k >= 0 && k <= order.length - 1)
+                j = k
+        }
+        sidebar.selectAndOpenNote(order[j])
+    }
+
+    // Right/Left move keyboard focus into and along the current row's action-
+    // button cluster; Left off the first button (direction -1 from index 0)
+    // returns to the row. currentRowActionButtons() lists exactly the buttons
+    // the treeDelegate renders for currentPath, in the same declaration order.
+    function currentRowActionButtons() {
+        if (sidebar.currentPath === "" || sidebar.searchQuery !== "")
+            return []
+        for (let row = 0; row < tree.rows; row++) {
+            const ri = tree.index(row, 0)
+            if (searchProxy.data(ri, VaultTreeModel.PathRole) !== sidebar.currentPath)
+                continue
+            const isAudio = searchProxy.data(ri, VaultTreeModel.IsAudioRole)
+            const isOrphanedMd = searchProxy.data(ri, VaultTreeModel.IsOrphanedMdRole)
+            const relabelEligible = isAudio && searchProxy.data(ri, VaultTreeModel.StatusRole) === 2
+            const chaptersEligible = relabelEligible || isOrphanedMd
+            const list = []
+            if (isAudio)
+                list.push("transcribe")
+            if (relabelEligible)
+                list.push("relabel")
+            if (chaptersEligible)
+                list.push("chapters")
+            // Item 52: detect-speakers matches rowDetectSpeakersButton's own
+            // visibility (transcribed audio only — diarization decodes the
+            // audio, so no orphaned .md, same rule as relabelEligible).
+            if (relabelEligible)
+                list.push("detectSpeakers")
+            // Items 24/53: run-all matches rowRunAllButton's own visibility
+            // (any note — audio or orphaned .md).
+            if (isAudio || isOrphanedMd)
+                list.push("runAll")
+            return list
+        }
+        return []
+    }
+    function focusActionButton(direction) {
+        const order = sidebar.currentRowActionButtons()
+        if (order.length === 0)
+            return
+        const next = order.indexOf(sidebar.actionButtonFocus) + direction
+        if (next < 0) {
+            sidebar.actionButtonFocus = ""    // Left out of the cluster, back to the row
+            return
+        }
+        sidebar.actionButtonFocus = order[Math.min(next, order.length - 1)]
+    }
+    // Enter/Return/Space on a keyboard-focused action button — replays the
+    // exact controller call that button's own TapHandler makes, for
+    // currentPath.
+    function activateFocusedActionButton() {
+        if (sidebar.actionButtonFocus === "" || sidebar.currentPath === ""
+                || !sidebar.transcriptionController)
+            return
+        const url = "file://" + sidebar.currentPath
+        if (sidebar.actionButtonFocus === "transcribe")
+            sidebar.transcriptionController.transcribe(
+                url, sidebar.vaultPath, AppSettings.defaultModel, false,
+                AppSettings.autoLabelEnabled, AppSettings.restrictTagsToExisting,
+                AppSettings.tagReuseBias, AppSettings.wordiness)
+        else if (sidebar.actionButtonFocus === "relabel")
+            sidebar.transcriptionController.relabel(
+                url, sidebar.vaultPath, AppSettings.restrictTagsToExisting,
+                AppSettings.tagReuseBias, AppSettings.wordiness)
+        else if (sidebar.actionButtonFocus === "chapters")
+            sidebar.transcriptionController.generateChapters(url, sidebar.vaultPath, AppSettings.chapterDensity)
+        else if (sidebar.actionButtonFocus === "detectSpeakers")
+            sidebar.transcriptionController.diarizeFile(url, sidebar.vaultPath)
+        else if (sidebar.actionButtonFocus === "runAll")
+            sidebar.transcriptionController.runAllJobs(
+                url, sidebar.vaultPath, AppSettings.defaultModel, false,
+                AppSettings.restrictTagsToExisting, AppSettings.tagReuseBias,
+                AppSettings.wordiness, AppSettings.chapterDensity)
     }
 
     // Backs the Up/Down Shortcut items near Ctrl+F's: moves to the
@@ -222,6 +678,12 @@ Rectangle {
             idx = idx < 0 ? (direction > 0 ? 0 : results.length - 1)
                           : Math.max(0, Math.min(results.length - 1, idx + direction))
             sidebar.activateNote(results[idx].path, results[idx].isOrphanedMd)
+            // Item 41: a plain arrow drives selection exactly like a plain
+            // click — collapse the selection (and both range endpoints) onto
+            // the single landed note.
+            sidebar.selectedPaths = [results[idx].path]
+            sidebar.lastClickedPath = results[idx].path
+            sidebar.selectionCursorPath = results[idx].path
             // Contain (not Visible): scrolls minimally so the row is FULLY
             // in view, not just barely clipped-in — matches the row the
             // outline just jumped to rather than leaving it half-hidden.
@@ -256,9 +718,25 @@ Rectangle {
         idx = idx < 0 ? (direction > 0 ? 0 : notes.length - 1)
                       : Math.max(0, Math.min(notes.length - 1, idx + direction))
         sidebar.activateNote(notes[idx].path, notes[idx].isOrphanedMd)
+        // Item 41: plain arrow == plain click for selection — single-select
+        // the landed note and collapse both range endpoints onto it.
+        sidebar.selectedPaths = [notes[idx].path]
+        sidebar.lastClickedPath = notes[idx].path
+        sidebar.selectionCursorPath = notes[idx].path
         tree.positionViewAtRow(notes[idx].row, TableView.Contain)
     }
-    onSearchQueryChanged: sidebar.refreshSearchResults()
+    onSearchQueryChanged: {
+        sidebar.refreshSearchResults()
+        // Item 3: entering/leaving text search swaps which flattened order
+        // visibleNotePaths() walks (searchResultsList vs. the TreeView row
+        // walk) — a Shift-range anchor or selection built in one context
+        // doesn't map cleanly onto the other, so start fresh rather than
+        // risk a stale/confusing carry-over.
+        sidebar.selectedPaths = []
+        sidebar.lastClickedPath = ""
+        sidebar.selectionCursorPath = ""
+        sidebar.actionButtonFocus = ""
+    }
     onSearchIncludeTranscriptionsChanged: sidebar.refreshSearchResults()
     Connections {
         target: sidebar
@@ -275,6 +753,14 @@ Rectangle {
         function onModelReset() {
             sidebar.refreshSearchResults()
             sidebar.refreshTreeOrdering()
+            // Item 3: vault contents changed (file added/removed/renamed) —
+            // a stale selectedPaths entry could point at a file that no
+            // longer exists, so drop the selection defensively rather than
+            // risk bulk actions silently no-op'ing on a vanished path.
+            sidebar.selectedPaths = []
+            sidebar.lastClickedPath = ""
+            sidebar.selectionCursorPath = ""
+            sidebar.actionButtonFocus = ""
         }
     }
 
@@ -295,6 +781,14 @@ Rectangle {
         function onFinished(fileUrl, ok, error) {
             sidebar.metadataRevision += 1
             sidebar.refreshTreeOrdering()
+            // Item 6: labels/tags/chapters are written in-place into an
+            // already-existing .md, which QFileSystemWatcher::directoryChanged
+            // never fires for — so the tree row would stay stale until some
+            // unrelated directory event (e.g. the NEXT file's .md being
+            // created) triggered a rebuild ("delayed by one"). Nudge the model
+            // to re-query just this row now that its file finished writing.
+            if (ok && sidebar.model && sidebar.model.refreshFile)
+                sidebar.model.refreshFile(fileUrl)
         }
         function onJobStatusesChanged() {
             sidebar.jobStatusRevision += 1
@@ -625,6 +1119,124 @@ Rectangle {
                                                         AppSettings.tagReuseBias, AppSettings.wordiness)
     }
 
+    // Item 40 (folder management): right-click context menu over tree rows /
+    // empty tree area to create + delete folders and move a file into another
+    // folder. Custom Popups in the same style as the sortModeMenu above and
+    // TitleBar.qml's moreActionsMenu — this codebase uses no QQC2 Menu, just a
+    // Popup with plain Item rows. State is captured at right-click time; the
+    // shared menus below read it.
+    property string ctxPath: ""       // the right-clicked row's own path ("" for empty area)
+    property bool ctxIsDir: false
+    property bool ctxIsNote: false    // audio file or orphaned .md
+    property bool ctxIsAudio: false   // Item 2: audio file specifically (gates "Delete transcript")
+    property int ctxStatus: 0         // Item 2: VaultTreeModel::Status of the row (2 == Transcribed)
+    // Directory a "New folder" gets created inside: the row itself when a
+    // directory is clicked, else the clicked note's parent dir, else the
+    // vault root (empty-area right-click).
+    property string ctxCreateInDir: ""
+    property real ctxMenuX: 0
+    property real ctxMenuY: 0
+    // Destinations for the "Move to…" picker (from VaultTreeModel.vaultFolders(),
+    // minus the file's own current directory).
+    property var moveFolderList: []
+
+    function openContextMenu(path, isDir, isNote, isAudio, status, createInDir, x, y) {
+        sidebar.ctxPath = path
+        sidebar.ctxIsDir = isDir
+        sidebar.ctxIsNote = isNote
+        sidebar.ctxIsAudio = isAudio
+        sidebar.ctxStatus = status
+        sidebar.ctxCreateInDir = createInDir
+        sidebar.ctxMenuX = x
+        sidebar.ctxMenuY = y
+        contextMenu.open()
+    }
+
+    function beginCreateFolder(dirPath) {
+        sidebar.ctxCreateInDir = dirPath
+        newFolderField.text = ""
+        newFolderError.text = ""
+        newFolderPopup.open()
+        newFolderField.forceActiveFocus()
+    }
+
+    function confirmNewFolder() {
+        if (!sidebar.model)
+            return
+        const name = newFolderField.text.trim()
+        if (name === "") {
+            newFolderError.text = qsTr("Enter a folder name.")
+            return
+        }
+        // Model paths are raw local paths; a Q_INVOKABLE QUrl param needs the
+        // file:// scheme or QUrl::toLocalFile() comes back empty (same as the
+        // transcribe/relabel calls elsewhere in this file).
+        if (sidebar.model.createFolder("file://" + sidebar.ctxCreateInDir, name))
+            newFolderPopup.close()
+        else
+            newFolderError.text = qsTr("Couldn't create folder — invalid name, or it already exists.")
+    }
+
+    function openMoveTo() {
+        const all = sidebar.model ? sidebar.model.vaultFolders() : []
+        const ownDir = sidebar.ctxPath.substring(0, sidebar.ctxPath.lastIndexOf("/"))
+        sidebar.moveFolderList = all.filter((f) => f !== ownDir)
+        moveToPopup.open()
+    }
+
+    function moveNoteTo(destDir) {
+        if (sidebar.model)
+            sidebar.model.moveFile("file://" + sidebar.ctxPath, "file://" + destDir)
+        moveToPopup.close()
+    }
+
+    function confirmDeleteFolder() {
+        if (sidebar.model && sidebar.ctxPath !== "")
+            sidebar.model.deleteFolder("file://" + sidebar.ctxPath)
+        deleteConfirmPopup.close()
+    }
+
+    // Item 2 (delete transcript / delete file): both destructive file actions
+    // route through the shared fileDeleteConfirmPopup below, keyed by
+    // pendingDeleteMode. VaultTreeModel::deleteTranscript()/deleteFile()
+    // move files to the trash (recoverable), but a confirm is still required
+    // for a destructive user action.
+    property string pendingDeletePath: ""
+    property string pendingDeleteMode: "" // "transcript" | "file"
+
+    function beginDeleteTranscript(path) {
+        sidebar.pendingDeletePath = path
+        sidebar.pendingDeleteMode = "transcript"
+        fileDeleteConfirmPopup.open()
+    }
+
+    function beginDeleteFile(path) {
+        sidebar.pendingDeletePath = path
+        sidebar.pendingDeleteMode = "file"
+        fileDeleteConfirmPopup.open()
+    }
+
+    function confirmFileDelete() {
+        if (sidebar.model && sidebar.pendingDeletePath !== "") {
+            if (sidebar.pendingDeleteMode === "transcript")
+                sidebar.model.deleteTranscript("file://" + sidebar.pendingDeletePath)
+            else
+                sidebar.model.deleteFile("file://" + sidebar.pendingDeletePath)
+        }
+        fileDeleteConfirmPopup.close()
+    }
+
+    // Display name for a move destination: relative to the vault root, or a
+    // "(vault root)" label for the root itself.
+    function folderDisplayName(path) {
+        const root = sidebar.model ? sidebar.model.vaultLocalPath : ""
+        if (path === root)
+            return qsTr("(vault root)")
+        if (root !== "" && path.startsWith(root + "/"))
+            return path.substring(root.length + 1)
+        return path
+    }
+
     color: Qt.rgba(AppSettings.sidebarBackgroundColor.r, AppSettings.sidebarBackgroundColor.g,
                     AppSettings.sidebarBackgroundColor.b, AppSettings.sidebarOpacity)
     // Only the corners touching the SplitView divider are rounded; the
@@ -655,6 +1267,62 @@ Rectangle {
         sequence: "Down"
         enabled: tree.activeFocus || searchResultsView.activeFocus
         onActivated: sidebar.moveNoteSelection(1)
+    }
+
+    // Item 41: Shift+Up/Down extend the selection range from the anchor
+    // (mirrors Shift-click), same focus gating as plain Up/Down.
+    Shortcut {
+        sequence: "Shift+Up"
+        enabled: tree.activeFocus || searchResultsView.activeFocus
+        onActivated: sidebar.extendNoteSelection(-1)
+    }
+    Shortcut {
+        sequence: "Shift+Down"
+        enabled: tree.activeFocus || searchResultsView.activeFocus
+        onActivated: sidebar.extendNoteSelection(1)
+    }
+
+    // Item 41: Ctrl+Up/Down jump to the current group's (parent-folder's)
+    // first/last note, then hop group-by-group on repeat.
+    Shortcut {
+        sequence: "Ctrl+Up"
+        enabled: tree.activeFocus || searchResultsView.activeFocus
+        onActivated: sidebar.jumpToGroupBoundary(-1)
+    }
+    Shortcut {
+        sequence: "Ctrl+Down"
+        enabled: tree.activeFocus || searchResultsView.activeFocus
+        onActivated: sidebar.jumpToGroupBoundary(1)
+    }
+
+    // Item 41: Left/Right move keyboard focus into/along the current row's
+    // per-row action-button cluster (transcribe/relabel/chapters). Tree-only:
+    // the flat search-results view has no such cluster. Right enters the
+    // first button; Left off the first button returns to the row.
+    Shortcut {
+        sequence: "Right"
+        enabled: tree.activeFocus
+        onActivated: sidebar.focusActionButton(1)
+    }
+    Shortcut {
+        sequence: "Left"
+        enabled: tree.activeFocus
+        onActivated: sidebar.focusActionButton(-1)
+    }
+    // Enter/Return/Space activate the keyboard-focused action button; inert
+    // (falls through to any other handler) unless a button is actually
+    // focused, so they don't shadow unrelated Space/Return uses otherwise.
+    Shortcut {
+        sequences: ["Return", "Enter", "Space"]
+        enabled: tree.activeFocus && sidebar.actionButtonFocus !== ""
+        onActivated: sidebar.activateFocusedActionButton()
+    }
+    // Escape drops out of the action cluster back onto the row (only while a
+    // button is focused, so it still reaches search-close etc. otherwise).
+    Shortcut {
+        sequence: "Escape"
+        enabled: tree.activeFocus && sidebar.actionButtonFocus !== ""
+        onActivated: sidebar.actionButtonFocus = ""
     }
 
     Item {
@@ -691,7 +1359,11 @@ Rectangle {
                     onTapped: {
                         if (!sidebar.transcriptionController)
                             return
-                        const paths = Object.keys(sidebar.untranscribedPaths)
+                        // Item 3: with 2+ rows selected, narrow to the
+                        // selection (intersected with eligibility) —
+                        // otherwise (0 or 1 selected) keep acting on every
+                        // untranscribed file, same as before this item.
+                        const paths = sidebar.bulkTargetPaths(sidebar.untranscribedPaths)
                         if (paths.length === 0)
                             return
                         // Model paths are raw local paths, not file:// URLs
@@ -728,7 +1400,8 @@ Rectangle {
                 id: relabelAllButton
                 Layout.preferredWidth: 22
                 Layout.preferredHeight: 22
-                enabled: sidebar.transcriptionController && Object.keys(sidebar.transcribedPaths).length > 0
+                // Item 3: same selected-vs-all narrowing as transcribeAllButton.
+                enabled: sidebar.transcriptionController && sidebar.bulkTargetPaths(sidebar.transcribedPaths).length > 0
 
                 HoverHandler {
                     id: relabelAllHover
@@ -738,7 +1411,7 @@ Rectangle {
                 TapHandler {
                     enabled: relabelAllButton.enabled
                     onTapped: {
-                        const paths = Object.keys(sidebar.transcribedPaths)
+                        const paths = sidebar.bulkTargetPaths(sidebar.transcribedPaths)
                         const urls = paths.map((p) => "file://" + p)
                         sidebar.transcriptionController.relabelAll(urls, sidebar.vaultPath,
                                                                      AppSettings.restrictTagsToExisting,
@@ -770,7 +1443,8 @@ Rectangle {
                 id: chaptersAllButton
                 Layout.preferredWidth: 22
                 Layout.preferredHeight: 22
-                enabled: sidebar.transcriptionController && Object.keys(sidebar.chaptersPaths).length > 0
+                // Item 3: same selected-vs-all narrowing as transcribeAllButton.
+                enabled: sidebar.transcriptionController && sidebar.bulkTargetPaths(sidebar.chaptersPaths).length > 0
 
                 HoverHandler {
                     id: chaptersAllHover
@@ -780,9 +1454,10 @@ Rectangle {
                 TapHandler {
                     enabled: chaptersAllButton.enabled
                     onTapped: {
-                        const paths = Object.keys(sidebar.chaptersPaths)
+                        const paths = sidebar.bulkTargetPaths(sidebar.chaptersPaths)
                         const urls = paths.map((p) => "file://" + p)
-                        sidebar.transcriptionController.generateChaptersAll(urls, sidebar.vaultPath)
+                        sidebar.transcriptionController.generateChaptersAll(urls, sidebar.vaultPath,
+                                                                              AppSettings.chapterDensity)
                     }
                 }
                 HoverBorder {
@@ -798,6 +1473,97 @@ Rectangle {
 
                 ToolTip.visible: chaptersAllHover.hovered
                 ToolTip.text: qsTr("Regenerate all chapters")
+                ToolTip.delay: 500
+            }
+
+            // Item 52 (CLAUDE.md per-file-action parity): bulk "detect speakers"
+            // — runs standalone diarization over the transcribed audio files
+            // (same transcribedPaths eligibility relabelAllButton uses, since
+            // diarization needs an existing transcript), calling
+            // diarizeFilesForPaths(). Mirrors MainPanel's detectSpeakersButton
+            // and the per-row rowDetectSpeakersButton below.
+            Item {
+                id: detectSpeakersAllButton
+                Layout.preferredWidth: 22
+                Layout.preferredHeight: 22
+                // Same selected-vs-all narrowing as the other ribbon buttons.
+                enabled: sidebar.transcriptionController && sidebar.bulkTargetPaths(sidebar.transcribedPaths).length > 0
+
+                HoverHandler {
+                    id: detectSpeakersAllHover
+                    cursorShape: Qt.PointingHandCursor
+                    enabled: detectSpeakersAllButton.enabled
+                }
+                TapHandler {
+                    enabled: detectSpeakersAllButton.enabled
+                    onTapped: {
+                        const paths = sidebar.bulkTargetPaths(sidebar.transcribedPaths)
+                        const urls = paths.map((p) => "file://" + p)
+                        sidebar.transcriptionController.diarizeFilesForPaths(urls, sidebar.vaultPath)
+                    }
+                }
+                HoverBorder {
+                    anchors.fill: parent
+                    active: detectSpeakersAllButton.enabled && detectSpeakersAllHover.hovered
+                }
+                Text {
+                    anchors.centerIn: parent
+                    text: "☻"
+                    color: detectSpeakersAllButton.enabled ? "#dddddd" : "#666666"
+                    font.pixelSize: 14
+                }
+
+                ToolTip.visible: detectSpeakersAllHover.hovered
+                ToolTip.text: qsTr("Detect speakers for all transcribed audio")
+                ToolTip.delay: 500
+            }
+
+            // Items 24/53: bulk "run all jobs" — the full transcribe->label->
+            // chapters pipeline for every untranscribed file (same eligibility
+            // as transcribeAllButton above: an already-transcribed file's
+            // label/chapters are the relabelAll/chaptersAll buttons' job).
+            // runAllJobs() itself skips the transcribe step for anything that
+            // slips through already-transcribed, so it's safe regardless.
+            Item {
+                id: runAllButton
+                Layout.preferredWidth: 22
+                Layout.preferredHeight: 22
+                enabled: sidebar.transcriptionController
+                         && sidebar.bulkTargetPaths(sidebar.untranscribedPaths).length > 0
+
+                HoverHandler {
+                    id: runAllHover
+                    cursorShape: Qt.PointingHandCursor
+                    enabled: runAllButton.enabled
+                }
+                TapHandler {
+                    enabled: runAllButton.enabled
+                    onTapped: {
+                        const paths = sidebar.bulkTargetPaths(sidebar.untranscribedPaths)
+                        if (paths.length === 0)
+                            return
+                        const urls = paths.map((p) => "file://" + p)
+                        sidebar.transcriptionController.runAllJobsForPaths(urls, sidebar.vaultPath,
+                                                                            AppSettings.defaultModel, false,
+                                                                            AppSettings.restrictTagsToExisting,
+                                                                            AppSettings.tagReuseBias,
+                                                                            AppSettings.wordiness,
+                                                                            AppSettings.chapterDensity)
+                    }
+                }
+                HoverBorder {
+                    anchors.fill: parent
+                    active: runAllButton.enabled && runAllHover.hovered
+                }
+                Text {
+                    anchors.centerIn: parent
+                    text: "»"
+                    color: runAllButton.enabled ? "#dddddd" : "#666666"
+                    font.pixelSize: 15
+                }
+
+                ToolTip.visible: runAllHover.hovered
+                ToolTip.text: qsTr("Run all jobs (transcribe, label, chapters)")
                 ToolTip.delay: 500
             }
 
@@ -974,6 +1740,53 @@ Rectangle {
             Item {
                 Layout.fillWidth: true
             }
+
+            // Item 3: "N selected" indicator, only shown once a genuine
+            // multi-selection exists (2+ rows) — a single selected row is
+            // already communicated by the existing O7 "currently open"
+            // outline in the tree below, so showing "1 selected" here too
+            // would be redundant. Same typography as BottomBar.qml's
+            // tasksLabel (the closest existing "small status readout next
+            // to a toolbar" precedent in this codebase).
+            Label {
+                id: multiSelectCountLabel
+                visible: sidebar.selectedPaths.length > 1
+                text: qsTr("%1 selected").arg(sidebar.selectedPaths.length)
+                color: "#aaaaaa"
+                font.pixelSize: 11
+                Layout.alignment: Qt.AlignVCenter
+            }
+
+            // Item 44: discoverable "Combine" button next to the "N selected"
+            // indicator — the nice-to-have companion to the context-menu entry.
+            // Shown only when 2+ AUDIO files are selected (same gate as the
+            // context entry); calls the same combineSelectedFiles() path.
+            Item {
+                id: combineSelectedButton
+                visible: sidebar.selectedAudioPaths().length >= 2
+                Layout.preferredHeight: 22
+                Layout.preferredWidth: combineSelectedButtonText.implicitWidth + 12
+                Layout.alignment: Qt.AlignVCenter
+
+                HoverHandler {
+                    id: combineSelectedButtonHover
+                    cursorShape: Qt.PointingHandCursor
+                }
+                TapHandler {
+                    onTapped: sidebar.combineSelectedFiles()
+                }
+                HoverBorder {
+                    anchors.fill: parent
+                    active: combineSelectedButtonHover.hovered
+                }
+                Text {
+                    id: combineSelectedButtonText
+                    anchors.centerIn: parent
+                    text: qsTr("Combine")
+                    color: "#dddddd"
+                    font.pixelSize: 11
+                }
+            }
         }
 
         Column {
@@ -1054,6 +1867,13 @@ Rectangle {
                         searchField.text = ""
                         sidebar.searchQuery = ""
                         sidebar.searchExpanded = false
+                        // Item 49: closing search used to leave the tag
+                        // filter (a separate, orthogonal feature — see
+                        // activeTagFilters' doc comment) active, so rows
+                        // stayed hidden even after the search UI itself was
+                        // gone. Exiting search now fully clears filtering.
+                        tagFilterField.text = ""
+                        sidebar.tagFilterText = ""
                     }
                 }
                 HoverBorder {
@@ -1147,6 +1967,7 @@ Rectangle {
 
                     HoverHandler {
                         id: tagChipHover
+                        cursorShape: Qt.PointingHandCursor
                     }
 
                     Row {
@@ -1304,6 +2125,232 @@ Rectangle {
                 }
             }
         }
+
+        // Item 39: run-all actions scoped to the current search/filter results
+        // (searchResultPaths()). Third home for transcribe/relabel/chapters,
+        // matching CLAUDE.md's per-file-action-parity rule (ribbon = bulk,
+        // treeDelegate cluster = per-row, this = filtered set). Each button
+        // reuses the EXACT controller-call idiom + args its ribbon counterpart
+        // uses (transcribeAll/relabelAll/generateChaptersAll), just over its
+        // eligible subset of the filtered set instead of bulkTargetPaths(...).
+        // Disabled unless a filter is actually active AND that action's
+        // eligible subset is non-empty (see searchFilterActive + the per-action
+        // helpers above), so they never silently run over the whole vault.
+        RowLayout {
+            width: parent.width
+            height: 24
+            spacing: 4
+
+            Label {
+                text: qsTr("Run on results:")
+                color: "#aaaaaa"
+                font.pixelSize: 11
+                Layout.alignment: Qt.AlignVCenter
+            }
+
+            Item {
+                id: searchTranscribeButton
+                Layout.preferredWidth: 22
+                Layout.preferredHeight: 22
+                enabled: sidebar.searchFilterActive && sidebar.searchTranscribePaths().length > 0
+
+                HoverHandler {
+                    id: searchTranscribeHover
+                    cursorShape: Qt.PointingHandCursor
+                    enabled: searchTranscribeButton.enabled
+                }
+                TapHandler {
+                    enabled: searchTranscribeButton.enabled
+                    onTapped: {
+                        const paths = sidebar.searchTranscribePaths()
+                        if (paths.length === 0)
+                            return
+                        const urls = paths.map((p) => "file://" + p)
+                        sidebar.transcriptionController.transcribeAll(urls, sidebar.vaultPath, AppSettings.defaultModel,
+                                                                        false, AppSettings.autoLabelEnabled,
+                                                                        AppSettings.restrictTagsToExisting,
+                                                                        AppSettings.tagReuseBias, AppSettings.wordiness)
+                    }
+                }
+                HoverBorder {
+                    anchors.fill: parent
+                    active: searchTranscribeButton.enabled && searchTranscribeHover.hovered
+                }
+                Text {
+                    anchors.centerIn: parent
+                    text: "⤒"
+                    color: searchTranscribeButton.enabled ? "#dddddd" : "#666666"
+                    font.pixelSize: 15
+                }
+
+                ToolTip.visible: searchTranscribeHover.hovered
+                ToolTip.text: qsTr("Transcribe untranscribed results")
+                ToolTip.delay: 500
+            }
+
+            Item {
+                id: searchRelabelButton
+                Layout.preferredWidth: 22
+                Layout.preferredHeight: 22
+                enabled: sidebar.transcriptionController && sidebar.searchFilterActive
+                         && sidebar.searchRelabelPaths().length > 0
+
+                HoverHandler {
+                    id: searchRelabelHover
+                    cursorShape: Qt.PointingHandCursor
+                    enabled: searchRelabelButton.enabled
+                }
+                TapHandler {
+                    enabled: searchRelabelButton.enabled
+                    onTapped: {
+                        const paths = sidebar.searchRelabelPaths()
+                        const urls = paths.map((p) => "file://" + p)
+                        sidebar.transcriptionController.relabelAll(urls, sidebar.vaultPath,
+                                                                     AppSettings.restrictTagsToExisting,
+                                                                     AppSettings.tagReuseBias, AppSettings.wordiness)
+                    }
+                }
+                HoverBorder {
+                    anchors.fill: parent
+                    active: searchRelabelButton.enabled && searchRelabelHover.hovered
+                }
+                Text {
+                    anchors.centerIn: parent
+                    text: "↻"
+                    color: searchRelabelButton.enabled ? "#dddddd" : "#666666"
+                    font.pixelSize: 15
+                }
+
+                ToolTip.visible: searchRelabelHover.hovered
+                ToolTip.text: qsTr("Regenerate auto-titles for results")
+                ToolTip.delay: 500
+            }
+
+            Item {
+                id: searchChaptersButton
+                Layout.preferredWidth: 22
+                Layout.preferredHeight: 22
+                enabled: sidebar.transcriptionController && sidebar.searchFilterActive
+                         && sidebar.searchChaptersPaths().length > 0
+
+                HoverHandler {
+                    id: searchChaptersHover
+                    cursorShape: Qt.PointingHandCursor
+                    enabled: searchChaptersButton.enabled
+                }
+                TapHandler {
+                    enabled: searchChaptersButton.enabled
+                    onTapped: {
+                        const paths = sidebar.searchChaptersPaths()
+                        const urls = paths.map((p) => "file://" + p)
+                        sidebar.transcriptionController.generateChaptersAll(urls, sidebar.vaultPath,
+                                                                              AppSettings.chapterDensity)
+                    }
+                }
+                HoverBorder {
+                    anchors.fill: parent
+                    active: searchChaptersButton.enabled && searchChaptersHover.hovered
+                }
+                Text {
+                    anchors.centerIn: parent
+                    text: "≡"
+                    color: searchChaptersButton.enabled ? "#dddddd" : "#666666"
+                    font.pixelSize: 15
+                }
+
+                ToolTip.visible: searchChaptersHover.hovered
+                ToolTip.text: qsTr("Regenerate chapters for results")
+                ToolTip.delay: 500
+            }
+
+            // Item 52 (CLAUDE.md per-file-action parity): search-scoped
+            // "detect speakers", parity with the ribbon's detectSpeakersAllButton
+            // and treeDelegate's rowDetectSpeakersButton — over the transcribed
+            // audio in the filtered result set.
+            Item {
+                id: searchDetectSpeakersButton
+                Layout.preferredWidth: 22
+                Layout.preferredHeight: 22
+                enabled: sidebar.transcriptionController && sidebar.searchFilterActive
+                         && sidebar.searchDetectSpeakersPaths().length > 0
+
+                HoverHandler {
+                    id: searchDetectSpeakersHover
+                    cursorShape: Qt.PointingHandCursor
+                    enabled: searchDetectSpeakersButton.enabled
+                }
+                TapHandler {
+                    enabled: searchDetectSpeakersButton.enabled
+                    onTapped: {
+                        const paths = sidebar.searchDetectSpeakersPaths()
+                        const urls = paths.map((p) => "file://" + p)
+                        sidebar.transcriptionController.diarizeFilesForPaths(urls, sidebar.vaultPath)
+                    }
+                }
+                HoverBorder {
+                    anchors.fill: parent
+                    active: searchDetectSpeakersButton.enabled && searchDetectSpeakersHover.hovered
+                }
+                Text {
+                    anchors.centerIn: parent
+                    text: "☻"
+                    color: searchDetectSpeakersButton.enabled ? "#dddddd" : "#666666"
+                    font.pixelSize: 14
+                }
+
+                ToolTip.visible: searchDetectSpeakersHover.hovered
+                ToolTip.text: qsTr("Detect speakers for results")
+                ToolTip.delay: 500
+            }
+
+            // Items 24/53: search-scoped "run all jobs", parity with the
+            // ribbon's runAllButton and treeDelegate's rowRunAllButton — over
+            // the untranscribed audio in the filtered result set.
+            Item {
+                id: searchRunAllButton
+                Layout.preferredWidth: 22
+                Layout.preferredHeight: 22
+                enabled: sidebar.transcriptionController && sidebar.searchFilterActive
+                         && sidebar.searchRunAllPaths().length > 0
+
+                HoverHandler {
+                    id: searchRunAllHover
+                    cursorShape: Qt.PointingHandCursor
+                    enabled: searchRunAllButton.enabled
+                }
+                TapHandler {
+                    enabled: searchRunAllButton.enabled
+                    onTapped: {
+                        const paths = sidebar.searchRunAllPaths()
+                        if (paths.length === 0)
+                            return
+                        const urls = paths.map((p) => "file://" + p)
+                        sidebar.transcriptionController.runAllJobsForPaths(urls, sidebar.vaultPath,
+                                                                            AppSettings.defaultModel, false,
+                                                                            AppSettings.restrictTagsToExisting,
+                                                                            AppSettings.tagReuseBias,
+                                                                            AppSettings.wordiness,
+                                                                            AppSettings.chapterDensity)
+                    }
+                }
+                HoverBorder {
+                    anchors.fill: parent
+                    active: searchRunAllButton.enabled && searchRunAllHover.hovered
+                }
+                Text {
+                    anchors.centerIn: parent
+                    text: "»"
+                    color: searchRunAllButton.enabled ? "#dddddd" : "#666666"
+                    font.pixelSize: 15
+                }
+
+                ToolTip.visible: searchRunAllHover.hovered
+                ToolTip.text: qsTr("Run all jobs for results")
+                ToolTip.delay: 500
+            }
+
+            Item { Layout.fillWidth: true }
+        }
         }
 
         // Item 17: autofill suggestions for the tag currently being typed
@@ -1404,6 +2451,22 @@ Rectangle {
         // (see ScrollBar.qml's `state` condition), rather than only
         // flashing in while a scroll is in progress.
         ScrollBar.vertical: ScrollBar { policy: ScrollBar.AlwaysOn }
+
+        // Item 40: right-click on empty tree space (below the rows) opens the
+        // context menu targeting the vault root — so "New folder" at the root
+        // is reachable even with no rows to right-click. A row's own
+        // treeRowContextTap (deeper in the hierarchy) takes the exclusive
+        // grab first, so this only fires for genuinely empty area.
+        TapHandler {
+            id: treeEmptyContextTap
+            acceptedButtons: Qt.RightButton
+            onTapped: {
+                const p = tree.mapToItem(sidebar, treeEmptyContextTap.point.position.x,
+                                          treeEmptyContextTap.point.position.y)
+                sidebar.openContextMenu("", false, false, false, 0,
+                                         sidebar.model ? sidebar.model.vaultLocalPath : "", p.x, p.y)
+            }
+        }
 
         function expandAll() {
             // Descending order: expanding a row only inserts rows
@@ -1539,6 +2602,16 @@ Rectangle {
             // as an already-transcribed audio row.
             readonly property bool chaptersEligible: treeDelegate.relabelEligible || treeDelegate.isOrphanedMd
             onChaptersEligibleChanged: sidebar.setChaptersEligible(treeDelegate.path, treeDelegate.chaptersEligible)
+
+            // Item 41: the per-row action cluster is normally hover-only, but
+            // the keyboard-current/open row (currentPath) keeps its buttons
+            // revealed without a mouse hover, so Left/Right into the cluster
+            // has a visible target and the selected file's actions are always
+            // reachable. Non-selected rows still reveal on hover only.
+            // (rowHover is declared further down the delegate; QML resolves id
+            // references regardless of textual order.)
+            readonly property bool rowActionsRevealed: rowHover.hovered
+                    || treeDelegate.path === sidebar.currentPath
 
             // Item 51: true iff this row is a member of a "ready" (would-
             // combine-if-run) split-recording group per
@@ -1710,7 +2783,29 @@ Rectangle {
                 }
             }
 
+            // Item 40: right-click (or press-and-hold) opens the folder-
+            // management context menu for this row — separate TapHandler so
+            // it doesn't disturb the left-click open/expand handler below.
             TapHandler {
+                id: treeRowContextTap
+                acceptedButtons: Qt.RightButton
+                onTapped: {
+                    const p = treeDelegate.mapToItem(sidebar, treeRowContextTap.point.position.x,
+                                                       treeRowContextTap.point.position.y)
+                    // "New folder" target: a directory row creates inside
+                    // itself; a note row creates inside its own parent dir.
+                    const createIn = treeDelegate.isDir
+                        ? treeDelegate.path
+                        : treeDelegate.path.substring(0, treeDelegate.path.lastIndexOf("/"))
+                    sidebar.openContextMenu(treeDelegate.path, treeDelegate.isDir,
+                                             treeDelegate.isAudio || treeDelegate.isOrphanedMd,
+                                             treeDelegate.isAudio, treeDelegate.status,
+                                             createIn, p.x, p.y)
+                }
+            }
+
+            TapHandler {
+                id: treeRowTap
                 onTapped: {
                     // Grabs keyboard focus so Up/Down (see the Shortcut
                     // items near Ctrl+F's) can move between notes right
@@ -1721,10 +2816,13 @@ Rectangle {
                     treeDelegate.treeView.forceActiveFocus()
                     if (treeDelegate.isDir) {
                         treeDelegate.treeView.toggleExpanded(treeDelegate.row)
-                    } else if (treeDelegate.isAudio) {
-                        sidebar.fileActivated(treeDelegate.path)
-                    } else if (treeDelegate.isOrphanedMd) {
-                        sidebar.orphanedMdActivated(treeDelegate.path)
+                    } else if (treeDelegate.isAudio || treeDelegate.isOrphanedMd) {
+                        // Item 3: Shift/Ctrl-click multi-select — see
+                        // sidebar.handleNoteClick's doc comment. modifiers
+                        // comes from this TapHandler's own point (Qt
+                        // doesn't pass them as an onTapped argument).
+                        sidebar.handleNoteClick(treeDelegate.path, treeDelegate.isOrphanedMd,
+                                                 treeRowTap.point.modifiers)
                     }
                 }
             }
@@ -1754,6 +2852,26 @@ Rectangle {
                 radius: AppSettings.borderRadius
                 border.width: 1
                 border.color: AppSettings.sidebarSelectionBorderColor
+            }
+
+            // Item 3: multi-select highlight — border-only (not a fill, so
+            // it composes with the O7 "currently open" rectangle above
+            // instead of competing with it) and only shown once a genuine
+            // multi-selection exists (2+ rows), since a lone selected row is
+            // already the same row O7's highlight marks as open. Reuses
+            // AppSettings.highlightColor (the same color already used for
+            // search-match spans) rather than adding a new configurable
+            // color for what's a secondary affordance.
+            Rectangle {
+                anchors.fill: parent
+                anchors.topMargin: 1
+                anchors.bottomMargin: 1
+                anchors.leftMargin: AppSettings.sidebarEdgeLeftMargin
+                visible: sidebar.selectedPaths.length > 1 && sidebar.selectedPaths.indexOf(treeDelegate.path) >= 0
+                color: "transparent"
+                radius: AppSettings.borderRadius
+                border.width: 1
+                border.color: AppSettings.highlightColor
             }
 
             // Item 51: border-only (not a fill, so it composes with the
@@ -1918,7 +3036,17 @@ Rectangle {
                         // icons faded in, for icons that weren't even always
                         // present).
                         Layout.fillWidth: true
-                        elide: Text.ElideRight
+                        // Item 8 bug fix: elide + Text.StyledText is an
+                        // unsupported/unpredictable combination in Qt
+                        // Quick's Text (see snippetText's identical fix
+                        // above, item 2/Wave E, which this file already
+                        // documents) — this Text switches to StyledText
+                        // whenever a search query is active (for the
+                        // highlight <span> markup below), so eliding must be
+                        // OFF exactly then. clip: true is the backstop that
+                        // still keeps overflow from painting over the
+                        // per-row icon cluster while elide is off.
+                        elide: textFormat === Text.PlainText ? Text.ElideRight : Text.ElideNone
                         clip: true
                         textFormat: sidebar.searchQuery !== "" ? Text.StyledText : Text.PlainText
                         text: {
@@ -2011,7 +3139,7 @@ Rectangle {
                     visible: treeDelegate.isAudio
                     width: 20
                     height: 20
-                    opacity: rowHover.hovered ? 1 : 0
+                    opacity: treeDelegate.rowActionsRevealed ? 1 : 0
                     enabled: opacity > 0
 
                     Behavior on opacity {
@@ -2048,7 +3176,12 @@ Rectangle {
                     }
                     HoverBorder {
                         anchors.fill: parent
-                        active: rowTranscribeButton.enabled && rowTranscribeHover.hovered
+                        // Item 41: also outline when this button holds
+                        // keyboard focus (Left/Right cluster nav) on the
+                        // current row.
+                        active: (rowTranscribeButton.enabled && rowTranscribeHover.hovered)
+                                || (tree.activeFocus && treeDelegate.path === sidebar.currentPath
+                                    && sidebar.actionButtonFocus === "transcribe")
                     }
                     Text {
                         anchors.centerIn: parent
@@ -2066,7 +3199,7 @@ Rectangle {
                     visible: treeDelegate.relabelEligible
                     width: 20
                     height: 20
-                    opacity: rowHover.hovered ? 1 : 0
+                    opacity: treeDelegate.rowActionsRevealed ? 1 : 0
                     enabled: opacity > 0
 
                     Behavior on opacity {
@@ -2097,7 +3230,9 @@ Rectangle {
                     }
                     HoverBorder {
                         anchors.fill: parent
-                        active: rowRelabelButton.enabled && rowRelabelHover.hovered
+                        active: (rowRelabelButton.enabled && rowRelabelHover.hovered)
+                                || (tree.activeFocus && treeDelegate.path === sidebar.currentPath
+                                    && sidebar.actionButtonFocus === "relabel")
                     }
                     Text {
                         anchors.centerIn: parent
@@ -2117,7 +3252,7 @@ Rectangle {
                     visible: treeDelegate.chaptersEligible
                     width: 20
                     height: 20
-                    opacity: rowHover.hovered ? 1 : 0
+                    opacity: treeDelegate.rowActionsRevealed ? 1 : 0
                     enabled: opacity > 0
 
                     Behavior on opacity {
@@ -2136,6 +3271,57 @@ Rectangle {
                     TapHandler {
                         enabled: rowChaptersButton.enabled
                         onTapped: sidebar.transcriptionController.generateChapters(
+                                      "file://" + treeDelegate.path, sidebar.vaultPath, AppSettings.chapterDensity)
+                    }
+                    // See rowTranscribeButton's identical backdrop above.
+                    Rectangle {
+                        anchors.fill: parent
+                        radius: AppSettings.borderRadius
+                        color: AppSettings.sidebarBackgroundColor
+                    }
+                    HoverBorder {
+                        anchors.fill: parent
+                        active: (rowChaptersButton.enabled && rowChaptersHover.hovered)
+                                || (tree.activeFocus && treeDelegate.path === sidebar.currentPath
+                                    && sidebar.actionButtonFocus === "chapters")
+                    }
+                    Text {
+                        anchors.centerIn: parent
+                        text: "≡"
+                        color: "#dddddd"
+                        font.pixelSize: 13
+                    }
+                }
+
+                // Item 52 (CLAUDE.md per-file-action parity): per-row "detect
+                // speakers", same fade-in shape as rowChaptersButton but gated
+                // on relabelEligible (transcribed audio only — diarization
+                // decodes the audio, so no orphaned .md). Calls diarizeFile()
+                // like MainPanel's detectSpeakersButton.
+                Item {
+                    id: rowDetectSpeakersButton
+                    visible: treeDelegate.relabelEligible
+                    width: 20
+                    height: 20
+                    opacity: treeDelegate.rowActionsRevealed ? 1 : 0
+                    enabled: opacity > 0
+
+                    Behavior on opacity {
+                        NumberAnimation { duration: AppSettings.animationsEnabled ? 120 : 0 }
+                    }
+
+                    ToolTip.visible: rowDetectSpeakersHover.hovered
+                    ToolTip.text: qsTr("Detect speakers")
+                    ToolTip.delay: 500
+
+                    HoverHandler {
+                        id: rowDetectSpeakersHover
+                        cursorShape: Qt.PointingHandCursor
+                        enabled: rowDetectSpeakersButton.enabled
+                    }
+                    TapHandler {
+                        enabled: rowDetectSpeakersButton.enabled
+                        onTapped: sidebar.transcriptionController.diarizeFile(
                                       "file://" + treeDelegate.path, sidebar.vaultPath)
                     }
                     // See rowTranscribeButton's identical backdrop above.
@@ -2146,11 +3332,66 @@ Rectangle {
                     }
                     HoverBorder {
                         anchors.fill: parent
-                        active: rowChaptersButton.enabled && rowChaptersHover.hovered
+                        active: (rowDetectSpeakersButton.enabled && rowDetectSpeakersHover.hovered)
+                                || (tree.activeFocus && treeDelegate.path === sidebar.currentPath
+                                    && sidebar.actionButtonFocus === "detectSpeakers")
                     }
                     Text {
                         anchors.centerIn: parent
-                        text: "≡"
+                        text: "☻"
+                        color: "#dddddd"
+                        font.pixelSize: 13
+                    }
+                }
+
+                // Items 24/53: per-row "run all jobs" — full transcribe->
+                // label->chapters pipeline for THIS one file. Visible for any
+                // note (audio or orphaned .md); runAllJobs() skips the
+                // transcribe step for anything already transcribed (incl. an
+                // orphaned .md), so it's the right action regardless of status.
+                Item {
+                    id: rowRunAllButton
+                    visible: treeDelegate.isAudio || treeDelegate.isOrphanedMd
+                    width: 20
+                    height: 20
+                    opacity: treeDelegate.rowActionsRevealed ? 1 : 0
+                    enabled: opacity > 0
+
+                    Behavior on opacity {
+                        NumberAnimation { duration: AppSettings.animationsEnabled ? 120 : 0 }
+                    }
+
+                    ToolTip.visible: rowRunAllHover.hovered
+                    ToolTip.text: qsTr("Run all jobs (transcribe, label, chapters)")
+                    ToolTip.delay: 500
+
+                    HoverHandler {
+                        id: rowRunAllHover
+                        cursorShape: Qt.PointingHandCursor
+                        enabled: rowRunAllButton.enabled
+                    }
+                    TapHandler {
+                        enabled: rowRunAllButton.enabled
+                        onTapped: sidebar.transcriptionController.runAllJobs(
+                                      "file://" + treeDelegate.path, sidebar.vaultPath, AppSettings.defaultModel,
+                                      false, AppSettings.restrictTagsToExisting, AppSettings.tagReuseBias,
+                                      AppSettings.wordiness, AppSettings.chapterDensity)
+                    }
+                    // See rowTranscribeButton's identical backdrop above.
+                    Rectangle {
+                        anchors.fill: parent
+                        radius: AppSettings.borderRadius
+                        color: AppSettings.sidebarBackgroundColor
+                    }
+                    HoverBorder {
+                        anchors.fill: parent
+                        active: (rowRunAllButton.enabled && rowRunAllHover.hovered)
+                                || (tree.activeFocus && treeDelegate.path === sidebar.currentPath
+                                    && sidebar.actionButtonFocus === "runAll")
+                    }
+                    Text {
+                        anchors.centerIn: parent
+                        text: "»"
                         color: "#dddddd"
                         font.pixelSize: 13
                     }
@@ -2345,16 +3586,18 @@ Rectangle {
                 cursorShape: Qt.PointingHandCursor
             }
             TapHandler {
+                id: resultRowTap
                 onTapped: {
                     // Mirrors treeDelegate's TapHandler exactly (minus the
                     // isDir/toggleExpanded branch — results are always
                     // leaves, never directories), including the
-                    // forceActiveFocus() so Up/Down works here too.
+                    // forceActiveFocus() so Up/Down works here too, and
+                    // (item 3) routing through the same handleNoteClick for
+                    // Shift/Ctrl multi-select.
                     searchResultsView.forceActiveFocus()
-                    if (resultDelegate.resultIsAudio)
-                        sidebar.fileActivated(resultDelegate.resultPath)
-                    else if (resultDelegate.resultIsOrphanedMd)
-                        sidebar.orphanedMdActivated(resultDelegate.resultPath)
+                    if (resultDelegate.resultIsAudio || resultDelegate.resultIsOrphanedMd)
+                        sidebar.handleNoteClick(resultDelegate.resultPath, resultDelegate.resultIsOrphanedMd,
+                                                 resultRowTap.point.modifiers)
                 }
             }
             // Note: no anchors.rightMargin — resultDelegate.width above
@@ -2378,6 +3621,20 @@ Rectangle {
                 radius: AppSettings.borderRadius
                 border.width: 1
                 border.color: AppSettings.sidebarSelectionBorderColor
+            }
+
+            // Item 3: same multi-select highlight as treeDelegate's above.
+            Rectangle {
+                anchors.fill: parent
+                anchors.topMargin: 1
+                anchors.bottomMargin: 1
+                anchors.leftMargin: AppSettings.sidebarEdgeLeftMargin
+                visible: sidebar.selectedPaths.length > 1
+                         && sidebar.selectedPaths.indexOf(resultDelegate.resultPath) >= 0
+                color: "transparent"
+                radius: AppSettings.borderRadius
+                border.width: 1
+                border.color: AppSettings.highlightColor
             }
 
             Column {
@@ -2571,5 +3828,596 @@ Rectangle {
         sequence: "Escape"
         enabled: middleDragScrollArea.armed
         onActivated: middleDragScrollArea.armed = false
+    }
+
+    // Item 40: folder-management context menu. Same custom-Popup shape as the
+    // sortModeMenu above (this codebase has no QQC2 Menu) — plain Item rows,
+    // each with a HoverHandler (pointer cursor) + TapHandler.
+    Popup {
+        id: contextMenu
+        x: sidebar.ctxMenuX
+        y: sidebar.ctxMenuY
+        width: 200
+        padding: 4
+        modal: true
+        dim: true
+        focus: false
+        closePolicy: Popup.CloseOnPressOutside | Popup.CloseOnEscape
+
+        background: Rectangle {
+            color: "#242424"
+            radius: AppSettings.borderRadius
+            border.width: 1
+            border.color: "#3a3a3a"
+        }
+
+        Column {
+            width: contextMenu.width - contextMenu.padding * 2
+            spacing: 2
+
+            // "New folder" — always available; creates inside the clicked
+            // directory (or the clicked note's parent dir, or the vault root
+            // for an empty-area click).
+            Item {
+                id: ctxNewFolderRow
+                width: parent.width
+                height: 28
+
+                HoverHandler {
+                    id: ctxNewFolderHover
+                    cursorShape: Qt.PointingHandCursor
+                }
+                TapHandler {
+                    onTapped: {
+                        contextMenu.close()
+                        sidebar.beginCreateFolder(sidebar.ctxCreateInDir)
+                    }
+                }
+                Rectangle {
+                    anchors.fill: parent
+                    radius: AppSettings.borderRadius
+                    color: ctxNewFolderHover.hovered ? "#3a3a3a" : "transparent"
+                }
+                Text {
+                    anchors.left: parent.left
+                    anchors.leftMargin: 8
+                    anchors.verticalCenter: parent.verticalCenter
+                    text: qsTr("New folder")
+                    color: "white"
+                    font.pixelSize: 12
+                }
+            }
+
+            // Item 44: "Combine selected (N)" — manual combine of the current
+            // multi-selection. Visible only when 2+ AUDIO files are selected
+            // (selectedAudioPaths() drops any orphaned .md), independent of
+            // which specific row was right-clicked; the cleanest home for the
+            // action alongside the other context entries. Calls
+            // combineSelectedFiles() -> controller.combineSelected().
+            Item {
+                id: ctxCombineSelectedRow
+                visible: sidebar.selectedAudioPaths().length >= 2
+                width: parent.width
+                height: 28
+
+                HoverHandler {
+                    id: ctxCombineSelectedHover
+                    cursorShape: Qt.PointingHandCursor
+                }
+                TapHandler {
+                    onTapped: {
+                        contextMenu.close()
+                        sidebar.combineSelectedFiles()
+                    }
+                }
+                Rectangle {
+                    anchors.fill: parent
+                    radius: AppSettings.borderRadius
+                    color: ctxCombineSelectedHover.hovered ? "#3a3a3a" : "transparent"
+                }
+                Text {
+                    anchors.left: parent.left
+                    anchors.leftMargin: 8
+                    anchors.verticalCenter: parent.verticalCenter
+                    text: qsTr("Combine selected (%1)").arg(sidebar.selectedAudioPaths().length)
+                    color: "white"
+                    font.pixelSize: 12
+                }
+            }
+
+            // "Move to…" — only for a note (audio / orphaned .md); a note
+            // carries its sidecars when moved (VaultTreeModel::moveFile).
+            Item {
+                id: ctxMoveRow
+                visible: sidebar.ctxIsNote
+                width: parent.width
+                height: 28
+
+                HoverHandler {
+                    id: ctxMoveHover
+                    cursorShape: Qt.PointingHandCursor
+                }
+                TapHandler {
+                    onTapped: {
+                        contextMenu.close()
+                        sidebar.openMoveTo()
+                    }
+                }
+                Rectangle {
+                    anchors.fill: parent
+                    radius: AppSettings.borderRadius
+                    color: ctxMoveHover.hovered ? "#3a3a3a" : "transparent"
+                }
+                Text {
+                    anchors.left: parent.left
+                    anchors.leftMargin: 8
+                    anchors.verticalCenter: parent.verticalCenter
+                    text: qsTr("Move to…")
+                    color: "white"
+                    font.pixelSize: 12
+                }
+            }
+
+            // "Delete folder" — only for a directory row (recursive delete,
+            // guarded against the vault root in VaultTreeModel::deleteFolder).
+            Item {
+                id: ctxDeleteRow
+                visible: sidebar.ctxIsDir
+                width: parent.width
+                height: 28
+
+                HoverHandler {
+                    id: ctxDeleteHover
+                    cursorShape: Qt.PointingHandCursor
+                }
+                TapHandler {
+                    onTapped: {
+                        contextMenu.close()
+                        deleteConfirmPopup.open()
+                    }
+                }
+                Rectangle {
+                    anchors.fill: parent
+                    radius: AppSettings.borderRadius
+                    color: ctxDeleteHover.hovered ? "#3a3a3a" : "transparent"
+                }
+                Text {
+                    anchors.left: parent.left
+                    anchors.leftMargin: 8
+                    anchors.verticalCenter: parent.verticalCenter
+                    text: qsTr("Delete folder")
+                    color: "#e07a7a"
+                    font.pixelSize: 12
+                }
+            }
+
+            // Item 2: "Delete transcript" — only for a transcribed AUDIO row
+            // (status 2 == TranscribedStatus). Removes the sibling .md,
+            // reverting the audio to untranscribed; the audio itself is kept.
+            // (An orphaned .md has no audio to keep, so it gets "Delete file"
+            // below instead, not this.)
+            Item {
+                id: ctxDeleteTranscriptRow
+                visible: sidebar.ctxIsAudio && sidebar.ctxStatus === 2
+                width: parent.width
+                height: 28
+
+                HoverHandler {
+                    id: ctxDeleteTranscriptHover
+                    cursorShape: Qt.PointingHandCursor
+                }
+                TapHandler {
+                    onTapped: {
+                        contextMenu.close()
+                        sidebar.beginDeleteTranscript(sidebar.ctxPath)
+                    }
+                }
+                Rectangle {
+                    anchors.fill: parent
+                    radius: AppSettings.borderRadius
+                    color: ctxDeleteTranscriptHover.hovered ? "#3a3a3a" : "transparent"
+                }
+                Text {
+                    anchors.left: parent.left
+                    anchors.leftMargin: 8
+                    anchors.verticalCenter: parent.verticalCenter
+                    text: qsTr("Delete transcript")
+                    color: "#e07a7a"
+                    font.pixelSize: 12
+                }
+            }
+
+            // Item 2: "Delete file" — for any note row (audio or orphaned .md):
+            // deletes the file and all its sidecars (audio + .md + partial), or
+            // just the orphaned .md alone.
+            Item {
+                id: ctxDeleteFileRow
+                visible: sidebar.ctxIsNote
+                width: parent.width
+                height: 28
+
+                HoverHandler {
+                    id: ctxDeleteFileHover
+                    cursorShape: Qt.PointingHandCursor
+                }
+                TapHandler {
+                    onTapped: {
+                        contextMenu.close()
+                        sidebar.beginDeleteFile(sidebar.ctxPath)
+                    }
+                }
+                Rectangle {
+                    anchors.fill: parent
+                    radius: AppSettings.borderRadius
+                    color: ctxDeleteFileHover.hovered ? "#3a3a3a" : "transparent"
+                }
+                Text {
+                    anchors.left: parent.left
+                    anchors.leftMargin: 8
+                    anchors.verticalCenter: parent.verticalCenter
+                    text: qsTr("Delete file")
+                    color: "#e07a7a"
+                    font.pixelSize: 12
+                }
+            }
+        }
+    }
+
+    // Item 40: "New folder" name entry.
+    Popup {
+        id: newFolderPopup
+        x: sidebar.ctxMenuX
+        y: sidebar.ctxMenuY
+        width: 240
+        padding: 8
+        modal: true
+        dim: true
+        focus: true
+        closePolicy: Popup.CloseOnPressOutside | Popup.CloseOnEscape
+
+        background: Rectangle {
+            color: "#242424"
+            radius: AppSettings.borderRadius
+            border.width: 1
+            border.color: "#3a3a3a"
+        }
+
+        Column {
+            width: newFolderPopup.width - newFolderPopup.padding * 2
+            spacing: 6
+
+            Text {
+                text: qsTr("New folder")
+                color: "white"
+                font.pixelSize: 12
+            }
+
+            TextField {
+                id: newFolderField
+                width: parent.width
+                placeholderText: qsTr("Folder name")
+                background: UnderlineField { focused: newFolderField.activeFocus }
+                onAccepted: sidebar.confirmNewFolder()
+
+                HoverHandler {
+                    cursorShape: Qt.IBeamCursor
+                }
+            }
+
+            // Inline warning banner (StyleGuide.md): plain Label, visible on a
+            // non-empty backing string, error color #e07a7a.
+            Label {
+                id: newFolderError
+                width: parent.width
+                visible: text !== ""
+                text: ""
+                color: "#e07a7a"
+                font.pixelSize: 11
+                wrapMode: Text.WordWrap
+            }
+
+            Row {
+                anchors.right: parent.right
+                spacing: 6
+
+                Item {
+                    id: newFolderCancelButton
+                    width: newFolderCancelLabel.implicitWidth + 16
+                    height: 24
+                    HoverHandler {
+                        id: newFolderCancelHover
+                        cursorShape: Qt.PointingHandCursor
+                    }
+                    TapHandler {
+                        onTapped: newFolderPopup.close()
+                    }
+                    HoverBorder {
+                        anchors.fill: parent
+                        active: newFolderCancelHover.hovered
+                    }
+                    Text {
+                        id: newFolderCancelLabel
+                        anchors.centerIn: parent
+                        text: qsTr("Cancel")
+                        color: "#aaaaaa"
+                        font.pixelSize: 12
+                    }
+                }
+
+                Item {
+                    id: newFolderCreateButton
+                    width: newFolderCreateLabel.implicitWidth + 16
+                    height: 24
+                    HoverHandler {
+                        id: newFolderCreateHover
+                        cursorShape: Qt.PointingHandCursor
+                    }
+                    TapHandler {
+                        onTapped: sidebar.confirmNewFolder()
+                    }
+                    HoverBorder {
+                        anchors.fill: parent
+                        active: newFolderCreateHover.hovered
+                    }
+                    Text {
+                        id: newFolderCreateLabel
+                        anchors.centerIn: parent
+                        text: qsTr("Create")
+                        color: "white"
+                        font.pixelSize: 12
+                    }
+                }
+            }
+        }
+    }
+
+    // Item 40: "Move to…" destination picker — one row per vault folder
+    // (VaultTreeModel.vaultFolders(), minus the file's own current dir).
+    Popup {
+        id: moveToPopup
+        x: sidebar.ctxMenuX
+        y: sidebar.ctxMenuY
+        width: 260
+        padding: 4
+        modal: true
+        dim: true
+        focus: false
+        closePolicy: Popup.CloseOnPressOutside | Popup.CloseOnEscape
+
+        background: Rectangle {
+            color: "#242424"
+            radius: AppSettings.borderRadius
+            border.width: 1
+            border.color: "#3a3a3a"
+        }
+
+        Column {
+            width: moveToPopup.width - moveToPopup.padding * 2
+            spacing: 2
+
+            Text {
+                width: parent.width
+                leftPadding: 8
+                topPadding: 4
+                bottomPadding: 2
+                text: qsTr("Move to…")
+                color: "#aaaaaa"
+                font.pixelSize: 11
+            }
+
+            Repeater {
+                model: sidebar.moveFolderList
+
+                delegate: Item {
+                    id: moveFolderRow
+                    required property string modelData
+                    width: parent.width
+                    height: 28
+
+                    HoverHandler {
+                        id: moveFolderHover
+                        cursorShape: Qt.PointingHandCursor
+                    }
+                    TapHandler {
+                        onTapped: sidebar.moveNoteTo(moveFolderRow.modelData)
+                    }
+                    Rectangle {
+                        anchors.fill: parent
+                        radius: AppSettings.borderRadius
+                        color: moveFolderHover.hovered ? "#3a3a3a" : "transparent"
+                    }
+                    Text {
+                        anchors.left: parent.left
+                        anchors.leftMargin: 8
+                        anchors.verticalCenter: parent.verticalCenter
+                        width: parent.width - 16
+                        elide: Text.ElideMiddle
+                        text: sidebar.folderDisplayName(moveFolderRow.modelData)
+                        color: "white"
+                        font.pixelSize: 12
+                    }
+                }
+            }
+        }
+    }
+
+    // Item 40: delete-folder confirmation (recursive delete is destructive).
+    Popup {
+        id: deleteConfirmPopup
+        x: sidebar.ctxMenuX
+        y: sidebar.ctxMenuY
+        width: 260
+        padding: 8
+        modal: true
+        dim: true
+        focus: true
+        closePolicy: Popup.CloseOnPressOutside | Popup.CloseOnEscape
+
+        background: Rectangle {
+            color: "#242424"
+            radius: AppSettings.borderRadius
+            border.width: 1
+            border.color: "#3a3a3a"
+        }
+
+        Column {
+            width: deleteConfirmPopup.width - deleteConfirmPopup.padding * 2
+            spacing: 8
+
+            Label {
+                width: parent.width
+                wrapMode: Text.WordWrap
+                text: qsTr("Delete “%1” and everything inside it? This can't be undone.")
+                      .arg(sidebar.ctxPath.substring(sidebar.ctxPath.lastIndexOf("/") + 1))
+                color: "white"
+                font.pixelSize: 12
+            }
+
+            Row {
+                anchors.right: parent.right
+                spacing: 6
+
+                Item {
+                    id: deleteCancelButton
+                    width: deleteCancelLabel.implicitWidth + 16
+                    height: 24
+                    HoverHandler {
+                        id: deleteCancelHover
+                        cursorShape: Qt.PointingHandCursor
+                    }
+                    TapHandler {
+                        onTapped: deleteConfirmPopup.close()
+                    }
+                    HoverBorder {
+                        anchors.fill: parent
+                        active: deleteCancelHover.hovered
+                    }
+                    Text {
+                        id: deleteCancelLabel
+                        anchors.centerIn: parent
+                        text: qsTr("Cancel")
+                        color: "#aaaaaa"
+                        font.pixelSize: 12
+                    }
+                }
+
+                Item {
+                    id: deleteConfirmButton
+                    width: deleteConfirmLabel.implicitWidth + 16
+                    height: 24
+                    HoverHandler {
+                        id: deleteConfirmHover
+                        cursorShape: Qt.PointingHandCursor
+                    }
+                    TapHandler {
+                        onTapped: sidebar.confirmDeleteFolder()
+                    }
+                    HoverBorder {
+                        anchors.fill: parent
+                        active: deleteConfirmHover.hovered
+                    }
+                    Text {
+                        id: deleteConfirmLabel
+                        anchors.centerIn: parent
+                        text: qsTr("Delete")
+                        color: "#e07a7a"
+                        font.pixelSize: 12
+                    }
+                }
+            }
+        }
+    }
+
+    // Item 2: shared confirmation for "Delete transcript" / "Delete file"
+    // (destructive, though the files go to the trash — recoverable). Mirrors
+    // deleteConfirmPopup's style; the message + confirm action switch on
+    // sidebar.pendingDeleteMode.
+    Popup {
+        id: fileDeleteConfirmPopup
+        x: sidebar.ctxMenuX
+        y: sidebar.ctxMenuY
+        width: 280
+        padding: 8
+        modal: true
+        dim: true
+        focus: true
+        closePolicy: Popup.CloseOnPressOutside | Popup.CloseOnEscape
+
+        background: Rectangle {
+            color: "#242424"
+            radius: AppSettings.borderRadius
+            border.width: 1
+            border.color: "#3a3a3a"
+        }
+
+        Column {
+            width: fileDeleteConfirmPopup.width - fileDeleteConfirmPopup.padding * 2
+            spacing: 8
+
+            Label {
+                width: parent.width
+                wrapMode: Text.WordWrap
+                text: sidebar.pendingDeleteMode === "transcript"
+                      ? qsTr("Delete the transcript for “%1”? The audio file is kept. Moved to the trash.")
+                        .arg(sidebar.pendingDeletePath.substring(sidebar.pendingDeletePath.lastIndexOf("/") + 1))
+                      : qsTr("Delete “%1” and its transcript? Moved to the trash.")
+                        .arg(sidebar.pendingDeletePath.substring(sidebar.pendingDeletePath.lastIndexOf("/") + 1))
+                color: "white"
+                font.pixelSize: 12
+            }
+
+            Row {
+                anchors.right: parent.right
+                spacing: 6
+
+                Item {
+                    id: fileDeleteCancelButton
+                    width: fileDeleteCancelLabel.implicitWidth + 16
+                    height: 24
+                    HoverHandler {
+                        id: fileDeleteCancelHover
+                        cursorShape: Qt.PointingHandCursor
+                    }
+                    TapHandler {
+                        onTapped: fileDeleteConfirmPopup.close()
+                    }
+                    HoverBorder {
+                        anchors.fill: parent
+                        active: fileDeleteCancelHover.hovered
+                    }
+                    Text {
+                        id: fileDeleteCancelLabel
+                        anchors.centerIn: parent
+                        text: qsTr("Cancel")
+                        color: "#aaaaaa"
+                        font.pixelSize: 12
+                    }
+                }
+
+                Item {
+                    id: fileDeleteConfirmButton
+                    width: fileDeleteConfirmLabel.implicitWidth + 16
+                    height: 24
+                    HoverHandler {
+                        id: fileDeleteConfirmHover
+                        cursorShape: Qt.PointingHandCursor
+                    }
+                    TapHandler {
+                        onTapped: sidebar.confirmFileDelete()
+                    }
+                    HoverBorder {
+                        anchors.fill: parent
+                        active: fileDeleteConfirmHover.hovered
+                    }
+                    Text {
+                        id: fileDeleteConfirmLabel
+                        anchors.centerIn: parent
+                        text: sidebar.pendingDeleteMode === "transcript" ? qsTr("Delete transcript") : qsTr("Delete file")
+                        color: "#e07a7a"
+                        font.pixelSize: 12
+                    }
+                }
+            }
+        }
     }
 }

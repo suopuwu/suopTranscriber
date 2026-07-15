@@ -55,12 +55,18 @@ ApplicationWindow {
 
     // Drag-and-drop import: dropping audio file(s) anywhere on the window
     // copies them into the vault ROOT (never a subfolder, regardless of
-    // where over the window the drop lands — see fileDropArea below) via
-    // VaultTreeModel::importFile(). Failures (wrong file type, name
-    // collision, no vault open) aren't fatal to the whole drop — every
-    // dropped file is attempted independently, and any that failed are
-    // named in a small auto-clearing banner (this app's established
-    // no-toast-system convention, see MainPanel's speakerOpError).
+    // where over the window the drop lands — see fileDropArea below). Item
+    // 37: the copy is now ASYNC — each file is validated synchronously
+    // (VaultTreeModel::importDestinationFor(), instant feedback for wrong
+    // type / collision / no vault) then its byte-copy is enqueued as an
+    // "import" task on TranscriptionController's worker thread
+    // (importAudio()), so dropping a large file no longer freezes the UI and
+    // every import appears in the Tasks queue. Validation failures aren't
+    // fatal to the whole drop — every dropped file is attempted
+    // independently, and any that failed validation are named in a small
+    // auto-clearing banner (this app's established no-toast-system
+    // convention, see MainPanel's speakerOpError); a copy that fails on the
+    // worker surfaces as a Failed row in the Tasks popup instead.
     property string importError: ""
     function importDroppedUrls(urls) {
         if (vaultModel.vaultPath.toString() === "") {
@@ -70,8 +76,16 @@ ApplicationWindow {
         }
         const failed = []
         for (const url of urls) {
-            if (!vaultModel.importFile(url))
+            // Item 37: validate synchronously (instant feedback for wrong
+            // type / collision / no vault), then enqueue the slow byte-copy as
+            // an async "import" task on TranscriptionController's worker thread
+            // so a large file never freezes the UI. A copy that fails on the
+            // worker shows up as a Failed row in the Tasks popup instead.
+            const dest = vaultModel.importDestinationFor(url)
+            if (dest === "")
                 failed.push(url.toString().split("/").pop())
+            else
+                transcriptionController.importAudio(url, "file://" + dest, vaultModel.vaultPath)
         }
         if (failed.length > 0) {
             window.importError = qsTr("Couldn't import: %1").arg(failed.join(", "))
@@ -363,6 +377,10 @@ ApplicationWindow {
                 transcriptionController: transcriptionController
                 onSettingsRequested: settingsPopup.open()
                 onTaskActivated: (path) => mainPanel.showAudioFile(path)
+                // Item 42: clicking the bottom-left current-file label focuses
+                // the in-app file explorer (Sidebar tree) and scrolls/selects
+                // the open file there, instead of opening the OS file manager.
+                onFocusFileExplorerRequested: (path) => sidebar.focusAndRevealNote(path)
             }
         }
 

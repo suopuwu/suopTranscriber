@@ -34,6 +34,20 @@ Rectangle {
     readonly property bool transcribingThisFile: mainPanel.transcriptionController && mainPanel.player
         && mainPanel.transcriptionController.busy
         && mainPanel.transcriptionController.currentFile.toString() === mainPanel.player.source.toString()
+    // Item 55: true only in the window between THIS file's (re)transcription
+    // job starting and the first NEW segment actually landing on disk — i.e.
+    // while the OLD transcript is still all that's visible and nothing live
+    // has streamed in yet. Set true whenever transcribingThisFile flips true,
+    // cleared the instant the first live tick arrives for the open file (see
+    // onLiveUpdateTickChanged below) — live content strictly postdates the
+    // frontmatter/job start, so that tick is the reliable "the new transcript
+    // has started being written" edge. Drives showTranscribingOverlay below,
+    // which blurs/dims + disables the stale transcript and shows a spinner
+    // until real output begins streaming.
+    property bool awaitingFirstSegment: false
+    readonly property bool showTranscribingOverlay: mainPanel.transcribingThisFile
+        && mainPanel.awaitingFirstSegment
+    onTranscribingThisFileChanged: mainPanel.awaitingFirstSegment = mainPanel.transcribingThisFile
     signal openVaultRequested()
     // Item 16 (Wave E): a tag pill was clicked — Main.qml routes this to
     // sidebar.applyTagFilter(tag).
@@ -63,6 +77,24 @@ Rectangle {
     property var chapters: []
     property bool chaptersExpanded: true
 
+    // Item 34/35: at most ONE chapter title is in click-to-edit/selectable
+    // state at a time — keyed by the chapter's REAL t0 (chapters[i].t0, the
+    // same timestamp setChapterTitle/deleteChapter expect), shared by BOTH
+    // the TOC row and the in-transcript heading so activating one exits the
+    // other. -1 = none editing (no chapter has a negative timestamp, so it's
+    // a safe sentinel even for the t0==0 first chapter). This single-state
+    // approach is what kills item 34's multiple-simultaneous-highlights bug:
+    // a title is a plain, non-selectable label until it becomes the one
+    // active edit field, so no two rows can hold lingering selections at once.
+    property real editingChapterTs: -1
+
+    // Item 33: which chapters are collapsed in the transcript body, keyed by
+    // String(chapterT0) → true. displayData below drops a collapsed chapter's
+    // body sentences from BOTH the flowing text and displaySentences (keeping
+    // the heading itself), so the monolithic transcriptArea string, its
+    // overlay Repeaters, and searchCorpus() all stay offset-consistent.
+    property var collapsedChapters: ({})
+
     property string searchQuery: ""
     property bool searchExpanded: false
     property int searchMatchIndex: -1
@@ -74,6 +106,16 @@ Rectangle {
     property int searchMatchOrdinal: 0
     property int searchMatchStart: -1
     property int searchMatchLength: 0
+
+    // Item 7: find & replace state (distinct from the read-only search above)
+    // — a regex/literal find pattern, a replacement string, mode toggles,
+    // and an inline-banner backing string for an invalid regex.
+    property bool findReplaceExpanded: false
+    property string findText: ""
+    property string replaceText: ""
+    property bool findRegexEnabled: false
+    property bool findCaseInsensitive: false
+    property string findReplaceError: ""
 
     function relativeToVault(fileUrl) {
         const filePath = fileUrl.toString()
@@ -98,12 +140,17 @@ Rectangle {
     function refreshMetadata() {
         storedMetadata = (player && player.source.toString() !== "" && transcriptionController)
             ? transcriptionController.readMetadata(player.source) : ({})
-        // Speaker detection defaults ON for an untranscribed file (see
-        // DESIGN.md "Speaker diarization") — an already-transcribed file
-        // instead honors whatever was actually used last time, same as
-        // every other stored setting here.
+        // An untranscribed file reflects the user's saved vault-wide default
+        // (AppSettings.defaultSpeakerDetection), exactly as the model picker
+        // effectively does — an already-transcribed file instead honors
+        // whatever was actually used last time, same as every other stored
+        // setting here. (This assignment is programmatic and never triggers
+        // the write-back at speakerDetectionToggle's TapHandler.onTapped —
+        // that fires only on a real user tap — so there's no churn/feedback
+        // loop with AppSettings.defaultSpeakerDetection.)
         speakerDetectionToggle.checked =
-            mainPanel.hasStoredMetadata ? storedMetadata.speakerDetection === true : true
+            mainPanel.hasStoredMetadata ? storedMetadata.speakerDetection === true
+                                        : AppSettings.defaultSpeakerDetection
         // titleField is always-editable (no display/edit swap — see its doc
         // comment), so its `text: displayTitle()` binding is a one-shot: it's
         // severed the first time the user types. Resync explicitly on every
@@ -150,6 +197,71 @@ Rectangle {
         // one-shot-binding caveat as titleField, resynced here.
         if (!preludeArea.activeFocus)
             preludeArea.text = mainPanel.prelude
+    }
+
+    // Item 17: insert a MANUAL chapter marker at the current playback
+    // position and drop straight into renaming it. Player-backed only (adding
+    // "at the playhead" is meaningless for an orphaned .md with no audio) —
+    // the add affordance is hidden in that case. addChapter/setChapterTitle/
+    // deleteChapter all emit finished(), which the Connections block below
+    // routes back into refreshPreludeAndChapters(), so mainPanel.chapters
+    // (and the interleaved transcript headings) repopulate on their own.
+    function addChapterAtPlayhead() {
+        const url = mainPanel.currentFileUrl()
+        if (!mainPanel.transcriptionController || String(url) === "" || !mainPanel.player)
+            return
+        const seconds = mainPanel.player.position / 1000
+        const title = qsTr("New chapter")
+        // Item 20: undo of an add is a delete at the same timestamp.
+        mainPanel.pushUndo({type: "chapterEdit", op: "add", fileUrl: url,
+                            timestamp: seconds, title: title, manual: true})
+        mainPanel.transcriptionController.addChapter(url, seconds, title)
+        mainPanel.editingChapterTs = seconds
+    }
+
+    // Item 35: commit a chapter rename via setChapterTitle (which promotes an
+    // auto chapter to manual on edit, per the backend). No-op on an empty or
+    // unchanged title, mirroring commitRename()/commitPrelude(). Keyed by the
+    // chapter's real t0 — shared by the TOC row and the transcript heading.
+    function commitChapterTitle(timestamp, oldTitle, newValue) {
+        const url = mainPanel.currentFileUrl()
+        if (!mainPanel.transcriptionController || String(url) === "")
+            return
+        const trimmed = newValue.trim()
+        if (trimmed === "" || trimmed === oldTitle)
+            return
+        // Item 20: rename is symmetric — undo restores oldTitle, redo re-applies.
+        mainPanel.pushUndo({type: "chapterEdit", op: "rename", fileUrl: url,
+                            timestamp: timestamp, oldTitle: oldTitle, newTitle: trimmed})
+        mainPanel.transcriptionController.setChapterTitle(url, timestamp, trimmed)
+    }
+
+    // Item 17: remove a chapter marker. manual is carried into the undo entry
+    // so an undo (add-back) can be recorded honestly, though addChapter always
+    // re-creates a manual marker regardless.
+    function deleteChapterAt(timestamp, title, manual) {
+        const url = mainPanel.currentFileUrl()
+        if (!mainPanel.transcriptionController || String(url) === "")
+            return
+        // Item 20: undo of a delete re-adds the chapter with its old title.
+        mainPanel.pushUndo({type: "chapterEdit", op: "delete", fileUrl: url,
+                            timestamp: timestamp, title: title, manual: manual})
+        mainPanel.transcriptionController.deleteChapter(url, timestamp)
+        if (mainPanel.editingChapterTs === timestamp)
+            mainPanel.editingChapterTs = -1
+    }
+
+    // Item 33: toggle a chapter's collapsed state in the transcript (keyed by
+    // its real t0). Reassigns the whole map so collapsedChaptersChanged fires
+    // and displayData re-evaluates (a plain in-place mutation wouldn't notify).
+    function toggleChapterCollapse(chapterT0) {
+        const key = String(chapterT0)
+        const updated = Object.assign({}, mainPanel.collapsedChapters)
+        if (updated[key])
+            delete updated[key]
+        else
+            updated[key] = true
+        mainPanel.collapsedChapters = updated
     }
 
     function refreshOrphanedMetadata() {
@@ -271,6 +383,38 @@ Rectangle {
     function currentFileUrl() {
         return mainPanel.orphanedMdPath !== "" ? ("file://" + mainPanel.orphanedMdPath)
                                                 : (mainPanel.player ? mainPanel.player.source : "")
+    }
+
+    // Item 2 (delete): the open file's two destructive actions. Both confirm
+    // first (deleteFileConfirmPopup) — files go to the trash
+    // (VaultTreeModel::deleteTranscript()/deleteFile(), recoverable) but a
+    // destructive click still warrants a confirm. The actual view refresh/
+    // clear happens off VaultTreeModel's transcriptDeleted/fileDeleted signals
+    // (the Connections block below), so it works whether the delete was
+    // triggered here OR from the Sidebar for the same open file.
+    property string pendingDeleteMode: "" // "transcript" | "file"
+
+    function requestDeleteTranscript() {
+        mainPanel.pendingDeleteMode = "transcript"
+        deleteFileConfirmPopup.open()
+    }
+
+    function requestDeleteFile() {
+        mainPanel.pendingDeleteMode = "file"
+        deleteFileConfirmPopup.open()
+    }
+
+    function confirmFileDelete() {
+        if (mainPanel.vaultTreeModel) {
+            const url = mainPanel.currentFileUrl()
+            if (String(url) !== "") {
+                if (mainPanel.pendingDeleteMode === "transcript")
+                    mainPanel.vaultTreeModel.deleteTranscript(url)
+                else
+                    mainPanel.vaultTreeModel.deleteFile(url)
+            }
+        }
+        deleteFileConfirmPopup.close()
     }
 
     // oldName must be the speaker's TRUE on-disk name (i.e. an entry from
@@ -464,19 +608,23 @@ Rectangle {
         }
     }
 
-    // Item P16: minimal flat undo (no redo) for the four kinds of small
-    // manual edits this panel can make directly (label, prelude, tags,
-    // speaker rename) — a plain JS stack of {type, ...} entries, each
-    // recording enough to reverse itself, pushed BEFORE the mutation it
-    // guards. Reset whenever the open file changes (see onSourceChanged/
-    // onOrphanedMdPathChanged below) so Ctrl+Z never reaches across a file
-    // switch into a different note's history. Speaker MERGE is
-    // deliberately NOT undoable here — unlike a rename, a merge collapses
-    // two distinct speaker identities into one (which sentences originally
-    // belonged to the losing speaker is no longer recoverable from the
-    // rewritten transcript alone), so there is no simple reverse operation
-    // to record.
+    // Item P16 / Item 46: undo+redo for the small manual edits this panel
+    // can make directly (label, prelude, tags, transcript text, speaker
+    // rename) — a plain JS stack of {type, ...} entries, each recording
+    // BOTH its pre-edit (oldValue) and post-edit (newValue) state so the
+    // SAME entry object can be replayed in either direction: undoLast()
+    // applies the "undo" side and moves it to redoStack; redoLast() applies
+    // the "redo" side and moves it back. Entries are pushed BEFORE the
+    // mutation they guard. Both stacks reset whenever the open file changes
+    // (see onSourceChanged/onOrphanedMdPathChanged below) so Ctrl+Z/Ctrl+Y
+    // never reach across a file switch into a different note's history.
+    // Speaker MERGE is deliberately NOT tracked here — unlike a rename, a
+    // merge collapses two distinct speaker identities into one (which
+    // sentences originally belonged to the losing speaker is no longer
+    // recoverable from the rewritten transcript alone), so there is no
+    // simple reverse operation to record.
     property var undoStack: []
+    property var redoStack: []
 
     // Reassigns (rather than push()/pop() in place) so undoStackChanged()
     // actually fires — a plain JS array mutated in place doesn't notify any
@@ -485,6 +633,100 @@ Rectangle {
     // hooks the property's own notify signal, not the array contents.
     function pushUndo(entry) {
         mainPanel.undoStack = mainPanel.undoStack.concat([entry])
+        // A fresh user edit invalidates any pending redo history — standard
+        // undo/redo semantics: once the user diverges from the undone
+        // branch, that branch is no longer reachable. (undoLast()/redoLast()
+        // push to the stacks directly, NOT through here, so replaying
+        // history never triggers this clear.)
+        mainPanel.redoStack = []
+    }
+
+    // Applies one history entry in the given direction ("undo" restores its
+    // pre-edit value; "redo" re-applies the edit). Undo and redo share this
+    // one dispatch — direction alone decides which stored value is written —
+    // so the two can never drift apart, and any new entry type added here is
+    // automatically redoable too (e.g. a future "chapterEdit" just needs its
+    // own case; nothing else changes). Speaker rename is a from→to op rather
+    // than a value set, so its two directions are the swapped ends of the
+    // one rename.
+    // Re-reads the open file's metadata after an undo/redo that wrote
+    // frontmatter (label/prelude/tags) — mirrors the exact refresh
+    // commitRename()/commitPrelude() already run after a normal edit, routed
+    // by orphaned-vs-player the same way they are. Undo/redo is per-file, so
+    // "current file" is always the one the entry's fileUrl refers to.
+    function refreshCurrentFileMetadata() {
+        if (mainPanel.orphanedMdPath !== "") {
+            mainPanel.refreshOrphanedMetadata()
+        } else {
+            mainPanel.refreshMetadata()
+            mainPanel.refreshPreludeAndChapters()
+        }
+    }
+
+    function applyHistoryEntry(entry, direction) {
+        if (!mainPanel.transcriptionController)
+            return
+        const undo = (direction === "undo")
+        switch (entry.type) {
+        case "label":
+            mainPanel.transcriptionController.setLabel(entry.fileUrl, undo ? entry.oldValue : entry.newValue)
+            // Same refresh commitRename() runs after a normal label edit, so
+            // undo/redo of a label visibly re-titles the panel too — not just
+            // the transcriptText/speakerRename cases, which self-refresh via
+            // sentencesRevision/pendingSpeakerRenames.
+            mainPanel.refreshCurrentFileMetadata()
+            break
+        case "prelude":
+            mainPanel.transcriptionController.setPrelude(entry.fileUrl, undo ? entry.oldValue : entry.newValue)
+            mainPanel.refreshCurrentFileMetadata()
+            break
+        case "tags":
+            mainPanel.transcriptionController.setTags(entry.fileUrl, undo ? entry.oldValue : entry.newValue)
+            mainPanel.refreshCurrentFileMetadata()
+            break
+        case "transcriptText":
+            if (mainPanel.transcriptionController.setSentenceTexts(entry.fileUrl, undo ? entry.oldValue : entry.newValue))
+                mainPanel.sentencesRevision += 1
+            break
+        case "speakerRename": {
+            // reverseOld→reverseNew is the UNDO of the original rename (see
+            // commitSpeakerRename); the REDO is simply the swapped ends.
+            // Mirrors commitSpeakerRename()'s own optimistic overlay so the
+            // pill updates instantly here too, not just via the eventual
+            // background rewrite + sentencesRevision bump.
+            const from = undo ? entry.reverseOld : entry.reverseNew
+            const to = undo ? entry.reverseNew : entry.reverseOld
+            const updated = Object.assign({}, mainPanel.pendingSpeakerRenames)
+            updated[from] = to
+            mainPanel.pendingSpeakerRenames = updated
+            mainPanel.transcriptionController.renameSpeaker(entry.fileUrl, from, to)
+            break
+        }
+        case "chapterEdit": {
+            // Item 20: chapter add/rename/delete, undoable/redoable like every
+            // other entry type. All three backend calls emit finished(), which
+            // the Connections block refreshes chapters from — so, unlike the
+            // label/prelude/tags cases above, no explicit
+            // refreshCurrentFileMetadata() is needed here.
+            const tc = mainPanel.transcriptionController
+            if (entry.op === "rename") {
+                tc.setChapterTitle(entry.fileUrl, entry.timestamp, undo ? entry.oldTitle : entry.newTitle)
+            } else if (entry.op === "add") {
+                // undo an add = delete it; redo = add it back.
+                if (undo)
+                    tc.deleteChapter(entry.fileUrl, entry.timestamp)
+                else
+                    tc.addChapter(entry.fileUrl, entry.timestamp, entry.title)
+            } else if (entry.op === "delete") {
+                // undo a delete = add it back with its old title; redo = delete again.
+                if (undo)
+                    tc.addChapter(entry.fileUrl, entry.timestamp, entry.title)
+                else
+                    tc.deleteChapter(entry.fileUrl, entry.timestamp)
+            }
+            break
+        }
+        }
     }
 
     function undoLast() {
@@ -492,31 +734,31 @@ Rectangle {
             return
         const entry = mainPanel.undoStack[mainPanel.undoStack.length - 1]
         mainPanel.undoStack = mainPanel.undoStack.slice(0, -1)
-        switch (entry.type) {
-        case "label":
-            mainPanel.transcriptionController.setLabel(entry.fileUrl, entry.oldValue)
-            break
-        case "prelude":
-            mainPanel.transcriptionController.setPrelude(entry.fileUrl, entry.oldValue)
-            break
-        case "tags":
-            mainPanel.transcriptionController.setTags(entry.fileUrl, entry.oldValue)
-            break
-        case "transcriptText":
-            if (mainPanel.transcriptionController.setSentenceTexts(entry.fileUrl, entry.oldValue))
-                mainPanel.sentencesRevision += 1
-            break
-        case "speakerRename": {
-            // Mirrors commitSpeakerRename()'s own optimistic overlay so the
-            // pill updates instantly here too, not just via the eventual
-            // background rewrite + sentencesRevision bump.
-            const updated = Object.assign({}, mainPanel.pendingSpeakerRenames)
-            updated[entry.reverseOld] = entry.reverseNew
-            mainPanel.pendingSpeakerRenames = updated
-            mainPanel.transcriptionController.renameSpeaker(entry.fileUrl, entry.reverseOld, entry.reverseNew)
-            break
-        }
-        }
+        mainPanel.applyHistoryEntry(entry, "undo")
+        mainPanel.redoStack = mainPanel.redoStack.concat([entry])
+    }
+
+    function redoLast() {
+        if (mainPanel.redoStack.length === 0 || !mainPanel.transcriptionController)
+            return
+        const entry = mainPanel.redoStack[mainPanel.redoStack.length - 1]
+        mainPanel.redoStack = mainPanel.redoStack.slice(0, -1)
+        mainPanel.applyHistoryEntry(entry, "redo")
+        mainPanel.undoStack = mainPanel.undoStack.concat([entry])
+    }
+
+    // Item 51: clears the selection in the panel's main selectable text
+    // bodies (transcript + prelude). deselect() is a no-op when there is no
+    // selection, so this is always safe — it never disturbs cursor position
+    // or focus. Called by the root deselect TapHandler below when a click
+    // lands on a non-interactive region.
+    function deselectTextSelections() {
+        transcriptArea.deselect()
+        preludeArea.deselect()
+        // Item 34: clicking a non-interactive region also commits+exits any
+        // in-progress chapter-title edit — the active title's onEditingChanged
+        // handler forces its own blur (→ commit) when this clears.
+        mainPanel.editingChapterTs = -1
     }
 
     function displayTitle() {
@@ -551,7 +793,7 @@ Rectangle {
             if (AppSettings.useLabelsMainPanel) {
                 const oldLabel = mainPanel.orphanedMdMetadata.label || ""
                 if (trimmed !== oldLabel)
-                    mainPanel.pushUndo({type: "label", fileUrl: "file://" + mainPanel.orphanedMdPath, oldValue: oldLabel})
+                    mainPanel.pushUndo({type: "label", fileUrl: "file://" + mainPanel.orphanedMdPath, oldValue: oldLabel, newValue: trimmed})
                 mainPanel.transcriptionController.setLabel("file://" + mainPanel.orphanedMdPath, trimmed)
                 mainPanel.refreshOrphanedMetadata()
             } else if (mainPanel.vaultTreeModel
@@ -567,7 +809,7 @@ Rectangle {
             if (AppSettings.useLabelsMainPanel) {
                 const oldLabel = mainPanel.storedMetadata.label || ""
                 if (trimmed !== oldLabel)
-                    mainPanel.pushUndo({type: "label", fileUrl: mainPanel.player.source, oldValue: oldLabel})
+                    mainPanel.pushUndo({type: "label", fileUrl: mainPanel.player.source, oldValue: oldLabel, newValue: trimmed})
                 mainPanel.transcriptionController.setLabel(mainPanel.player.source, trimmed)
                 mainPanel.refreshMetadata()
                 mainPanel.refreshPreludeAndChapters()
@@ -598,7 +840,7 @@ Rectangle {
         }
         if (newValue === mainPanel.prelude)
             return
-        mainPanel.pushUndo({type: "prelude", fileUrl: mainPanel.player.source, oldValue: mainPanel.prelude})
+        mainPanel.pushUndo({type: "prelude", fileUrl: mainPanel.player.source, oldValue: mainPanel.prelude, newValue: newValue})
         mainPanel.transcriptionController.setPrelude(mainPanel.player.source, newValue)
         mainPanel.refreshMetadata()
         mainPanel.refreshPreludeAndChapters()
@@ -647,7 +889,7 @@ Rectangle {
         if (edits.length === 0)
             return // no-op: nothing actually changed
 
-        mainPanel.pushUndo({type: "transcriptText", fileUrl: mainPanel.player.source, oldValue: oldValues})
+        mainPanel.pushUndo({type: "transcriptText", fileUrl: mainPanel.player.source, oldValue: oldValues, newValue: edits})
         const ok = mainPanel.transcriptionController.setSentenceTexts(mainPanel.player.source, edits)
         if (ok) {
             mainPanel.sentencesRevision += 1
@@ -671,7 +913,7 @@ Rectangle {
         const current = mainPanel.currentTags()
         if (current.some(t => t.toLowerCase() === trimmed.toLowerCase()))
             return // no-op: duplicate (case-insensitive)
-        mainPanel.pushUndo({type: "tags", fileUrl: mainPanel.currentFileUrl(), oldValue: current})
+        mainPanel.pushUndo({type: "tags", fileUrl: mainPanel.currentFileUrl(), oldValue: current, newValue: current.concat([trimmed])})
         mainPanel.transcriptionController.setTags(mainPanel.currentFileUrl(), current.concat([trimmed]))
     }
 
@@ -679,7 +921,7 @@ Rectangle {
         if (!mainPanel.transcriptionController)
             return
         const current = mainPanel.currentTags()
-        mainPanel.pushUndo({type: "tags", fileUrl: mainPanel.currentFileUrl(), oldValue: current})
+        mainPanel.pushUndo({type: "tags", fileUrl: mainPanel.currentFileUrl(), oldValue: current, newValue: current.filter(t => t !== tag)})
         mainPanel.transcriptionController.setTags(mainPanel.currentFileUrl(), current.filter(t => t !== tag))
     }
 
@@ -702,7 +944,7 @@ Rectangle {
             return
         const updated = current.slice()
         updated[idx] = trimmed
-        mainPanel.pushUndo({type: "tags", fileUrl: mainPanel.currentFileUrl(), oldValue: current})
+        mainPanel.pushUndo({type: "tags", fileUrl: mainPanel.currentFileUrl(), oldValue: current, newValue: updated})
         mainPanel.transcriptionController.setTags(mainPanel.currentFileUrl(), updated)
     }
 
@@ -803,8 +1045,25 @@ Rectangle {
         // prefix-diff cache), unlike the cold-open case above.
         function onLiveUpdateTickChanged() {
             if (mainPanel.player
-                    && mainPanel.transcriptionController.currentFile.toString() === mainPanel.player.source.toString())
+                    && mainPanel.transcriptionController.currentFile.toString() === mainPanel.player.source.toString()) {
+                // Item 32: a live tick means the first segment has been
+                // written, which strictly postdates the frontmatter written
+                // at job START — so hasStoredMetadata is guaranteed readable
+                // by now. onProgressChanged (the other metadata-refresh site)
+                // can fire during model-load, BEFORE the frontmatter flush,
+                // so on a file's very FIRST transcription its regenerate
+                // label/prelude/chapters buttons (gated on hasStoredMetadata)
+                // could stay hidden until the next progress tick or a full
+                // reopen. Refreshing metadata here — on the definitely-
+                // post-frontmatter content edge — closes that hole and also
+                // guarantees refreshTranscriptSync() below sees hasStoredMetadata
+                // true (it gates the body read on it), so live output shows.
+                mainPanel.refreshMetadata()
+                // Item 55: the new transcript has started being written — drop
+                // the blur/spinner overlay so live output streams in visibly.
+                mainPanel.awaitingFirstSegment = false
                 mainPanel.refreshTranscriptSync()
+            }
         }
     }
 
@@ -861,12 +1120,24 @@ Rectangle {
         const list = []
         let previousSpeaker = null
         const chapterList = mainPanel.chapters
+        const collapsed = mainPanel.collapsedChapters
         let chapterIdx = 0
+        // Real t0 of the chapter the CURRENT sentence falls under (-1 = before
+        // the first chapter marker / no chapters). Item 33 keys collapse off
+        // this; the displayT0 the heading itself renders at is separately
+        // clamped (see below), so the two are tracked independently.
+        let currentChapterT0 = -1
 
-        function pushHeading(chapter) {
+        // displayT0 is the (possibly clamped) time the heading is positioned/
+        // highlighted at; chapter.t0 is the chapter's REAL timestamp, carried
+        // through as chapterT0 so the heading's edit/collapse/delete controls
+        // address the actual chapter marker (setChapterTitle/deleteChapter/
+        // collapse all key off the real t0, never the clamped one).
+        function pushHeading(chapter, displayT0) {
             const headingStart = text.length
-            list.push({t0: chapter.t0, speaker: "", text: "", start: headingStart, length: 0,
-                       showGutter: false, isChapterHeading: true, chapterTitle: chapter.title})
+            list.push({t0: displayT0, chapterT0: chapter.t0, speaker: "", text: "", start: headingStart, length: 0,
+                       showGutter: false, isChapterHeading: true, chapterTitle: chapter.title,
+                       chapterManual: !!chapter.manual})
             text += "\n"
             previousSpeaker = null // next real sentence's gutter shows fresh after a section break
         }
@@ -881,9 +1152,17 @@ Rectangle {
             if (s.text.trim() === "")
                 continue
             while (chapterIdx < chapterList.length && chapterList[chapterIdx].t0 <= s.t0) {
-                pushHeading({t0: Math.min(chapterList[chapterIdx].t0, s.t0), title: chapterList[chapterIdx].title})
+                currentChapterT0 = chapterList[chapterIdx].t0
+                pushHeading(chapterList[chapterIdx], Math.min(chapterList[chapterIdx].t0, s.t0))
                 chapterIdx++
             }
+            // Item 33: a collapsed chapter hides its body entirely — the
+            // sentence is dropped from BOTH `text` and `list` (its heading was
+            // already pushed above and stays visible), keeping every
+            // downstream offset consumer (transcriptArea's string, the overlay
+            // Repeaters, searchCorpus()) consistent.
+            if (currentChapterT0 !== -1 && collapsed[String(currentChapterT0)])
+                continue
             const start = text.length
             const speaker = s.speaker === "" ? "" : mainPanel.effectiveSpeakerName(s.speaker)
             const showGutter = (speaker === "") || (previousSpeaker === null) || (speaker !== previousSpeaker)
@@ -896,7 +1175,8 @@ Rectangle {
             // as gutter timestamps/speaker names — decoration, not content).
             const displayText = s.repeatCount > 1 ? s.text + " (" + s.repeatCount + "x)" : s.text
             list.push({t0: s.t0, speaker: speaker, text: displayText, start: start, length: s.text.length,
-                       showGutter: showGutter, isChapterHeading: false, chapterTitle: ""})
+                       showGutter: showGutter, isChapterHeading: false, chapterTitle: "",
+                       chapterT0: currentChapterT0, chapterManual: false})
             previousSpeaker = speaker
             text += displayText + "\n"
         }
@@ -904,7 +1184,7 @@ Rectangle {
         // marker with no further speech) still gets a heading rather than
         // being silently dropped.
         while (chapterIdx < chapterList.length) {
-            pushHeading(chapterList[chapterIdx])
+            pushHeading(chapterList[chapterIdx], chapterList[chapterIdx].t0)
             chapterIdx++
         }
         if (text.length > 0)
@@ -1243,6 +1523,75 @@ Rectangle {
         mainPanel.locateMatch(mainPanel.searchMatchIndex < 0 ? 0 : mainPanel.searchMatchIndex + 1)
     }
 
+    // Item 7: compiles findText into a JS RegExp — treated as literal text
+    // (special chars escaped) unless findRegexEnabled, always with "g" when
+    // `global`, plus "i" when findCaseInsensitive. An invalid pattern sets
+    // the inline findReplaceError banner and returns null instead of
+    // throwing, so a half-typed regex never crashes the binding.
+    function buildFindRegex(global) {
+        mainPanel.findReplaceError = ""
+        if (mainPanel.findText === "")
+            return null
+        let pattern = mainPanel.findText
+        if (!mainPanel.findRegexEnabled)
+            pattern = pattern.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
+        let flags = global ? "g" : ""
+        if (mainPanel.findCaseInsensitive)
+            flags += "i"
+        try {
+            return new RegExp(pattern, flags)
+        } catch (e) {
+            mainPanel.findReplaceError = qsTr("Invalid pattern: %1").arg(e.message)
+            return null
+        }
+    }
+
+    // Routes a replaced whole-transcript string back through the SAME commit
+    // path the editable transcriptArea uses on blur. commitTranscriptEdits()
+    // diffs it per-sentence-line against displaySentences and — critically —
+    // REJECTS + reverts (with its own inline banner) any edit that changes
+    // the line count. So a replacement that only alters characters WITHIN
+    // existing segment lines round-trips cleanly, while one that would add or
+    // remove lines (e.g. a replacement containing a newline, or a pattern
+    // matching across a segment boundary) is refused rather than corrupting
+    // the one-line-per-segment structure. No parallel persistence path.
+    function applyTranscriptReplacement(result) {
+        if (result === transcriptArea.text)
+            return // nothing matched / no change
+        mainPanel.commitTranscriptEdits(result)
+    }
+
+    // Replace only the FIRST match: a non-global RegExp makes String.replace
+    // hit just the first occurrence, honoring $1/$& backreferences.
+    function replaceNext() {
+        const re = mainPanel.buildFindRegex(false)
+        if (!re)
+            return
+        let result
+        try {
+            result = transcriptArea.text.replace(re, mainPanel.replaceText)
+        } catch (e) {
+            mainPanel.findReplaceError = qsTr("Invalid replacement: %1").arg(e.message)
+            return
+        }
+        mainPanel.applyTranscriptReplacement(result)
+    }
+
+    // Replace every match (global RegExp).
+    function replaceAll() {
+        const re = mainPanel.buildFindRegex(true)
+        if (!re)
+            return
+        let result
+        try {
+            result = transcriptArea.text.replace(re, mainPanel.replaceText)
+        } catch (e) {
+            mainPanel.findReplaceError = qsTr("Invalid replacement: %1").arg(e.message)
+            return
+        }
+        mainPanel.applyTranscriptReplacement(result)
+    }
+
     Connections {
         target: mainPanel.player
         // Item P8: restart the repaint nudge on EVERY file open, not just
@@ -1259,7 +1608,13 @@ Rectangle {
             mainPanel.beginTranscriptLoad()
             transcriptRepaintNudgeTimer.restart()
             mainPanel.undoStack = []
+            mainPanel.redoStack = []
             mainPanel.gutterSpeakerFilter = ""
+            // Item 33/34: collapse + which-chapter-is-editing are per-file
+            // view state keyed by this file's chapter timestamps — reset on a
+            // file switch so they never leak into a different note's chapters.
+            mainPanel.collapsedChapters = ({})
+            mainPanel.editingChapterTs = -1
         }
     }
     // Item P8/P16: showOrphanedMd() switches files by setting orphanedMdPath
@@ -1271,7 +1626,10 @@ Rectangle {
         mainPanel.beginTranscriptLoad()
         transcriptRepaintNudgeTimer.restart()
         mainPanel.undoStack = []
+        mainPanel.redoStack = []
         mainPanel.gutterSpeakerFilter = ""
+        mainPanel.collapsedChapters = ({})
+        mainPanel.editingChapterTs = -1
     }
     Connections {
         target: mainPanel.transcriptionController
@@ -1291,6 +1649,27 @@ Rectangle {
                     && mainPanel.transcriptionController.currentFile.toString() === mainPanel.player.source.toString()) {
                 mainPanel.refreshMetadata()
                 mainPanel.refreshPreludeAndChapters()
+            }
+        }
+    }
+    // Item 2 (delete): react to a transcript/file deletion of the OPEN file —
+    // whether triggered here (MainPanel's delete icons) or from the Sidebar's
+    // context menu for the same file. transcriptDeleted keeps the audio, so
+    // just re-read metadata (it reverts to untranscribed); fileDeleted removes
+    // the whole thing, so clear the view. Both compare against currentFileUrl()
+    // so an unrelated file's deletion never disturbs what's open.
+    Connections {
+        target: mainPanel.vaultTreeModel
+        function onTranscriptDeleted(fileUrl) {
+            if (fileUrl.toString() === mainPanel.currentFileUrl().toString()) {
+                mainPanel.refreshMetadata()
+                mainPanel.refreshPreludeAndChapters()
+            }
+        }
+        function onFileDeleted(fileUrl) {
+            if (fileUrl.toString() === mainPanel.currentFileUrl().toString()) {
+                mainPanel.player.source = ""
+                mainPanel.orphanedMdPath = ""
             }
         }
     }
@@ -1343,6 +1722,27 @@ Rectangle {
 
         if (mainPanel.transcriptionController && mainPanel.player && mainPanel.transcriptionController.busy
                 && mainPanel.transcriptionController.currentFile.toString() === mainPanel.player.source.toString()) {
+            // Item 56 investigation (NEEDS LIVE REPRO — no concrete defect
+            // found in static analysis): the scroll-follow reads the correct
+            // object — transcriptScrollView.contentItem is the ScrollView's
+            // internal Flickable, where contentY/contentHeight/height live —
+            // the same one middleDragScrollArea and locateMatch() drive. The
+            // "am I at the bottom?" test is measured against the PRE-growth
+            // geometry (before Qt.callLater/re-layout), which is intentional
+            // (O6: don't yank a user who scrolled up). commit b72b365's
+            // editable-TextArea change (background: UnderlineField{
+            // implicitHeight: 0 } + zeroed padding) was explicitly sized "to
+            // match the old read-only TextArea's sizing" (see transcriptArea's
+            // padding comment), so transcriptArea.implicitHeight — and thus
+            // contentHeight — should be unchanged by it; the threshold is not
+            // comparing against a stale/zeroed height here. No defect found,
+            // so per CLAUDE.md this is deliberately NOT changed speculatively.
+            // If follow still misbehaves in a live run, the likely culprit is
+            // a transiently-wrong contentHeight for one frame right as
+            // transcriptArea's `visible: transcriptBody !== ""` flips true
+            // (the same repaint race transcriptRepaintNudgeTimer works around)
+            // — reproduce live and re-check contentHeight timing before
+            // touching this.
             const flick = transcriptScrollView.contentItem
             const nearBottomThreshold = 40
             const wasAtBottom = flick.contentY >= flick.contentHeight - flick.height - nearBottomThreshold
@@ -1364,12 +1764,54 @@ Rectangle {
         }
     }
 
-    // Item P16: undoes the last label/prelude/tag/speaker-rename edit made
-    // through this panel — see undoStack's own doc comment above.
+    // Item P16: undoes the last label/prelude/tag/transcript/speaker-rename
+    // edit made through this panel — see undoStack's own doc comment above.
     Shortcut {
         sequence: "Ctrl+Z"
         enabled: mainPanel.activeFocus && mainPanel.undoStack.length > 0
         onActivated: mainPanel.undoLast()
+    }
+
+    // Item 46 / Item 20: redo — re-applies the most recently undone edit.
+    // Bound to BOTH conventional redo chords (Ctrl+Y and Ctrl+Shift+Z), each
+    // as its own Shortcut so both work regardless of platform habit. Gated
+    // the same way Ctrl+Z is (panel focus + a non-empty redoStack).
+    Shortcut {
+        sequences: ["Ctrl+Y", "Ctrl+Shift+Z"]
+        enabled: mainPanel.activeFocus && mainPanel.redoStack.length > 0
+        onActivated: mainPanel.redoLast()
+    }
+
+    // Item 7: Ctrl+H toggles the find & replace bar (and focuses the find
+    // field when opening), same enable-gate as Ctrl+F's search.
+    Shortcut {
+        sequence: "Ctrl+H"
+        enabled: mainPanel.activeFocus && (mainPanel.orphanedMdPath !== ""
+                     || (mainPanel.player && mainPanel.player.source.toString() !== ""))
+        onActivated: {
+            mainPanel.findReplaceExpanded = !mainPanel.findReplaceExpanded
+            if (mainPanel.findReplaceExpanded)
+                findField.forceActiveFocus()
+        }
+    }
+
+    // Item 51: a plain left-click landing on a non-interactive region (the
+    // panel's empty background, a gap between rows) clears any active text
+    // selection. Attached to the root so it only fires when nothing deeper
+    // under the pointer consumes the press — a deeper handler always wins
+    // Qt Quick's pointer hit-testing, so clicking INTO a field (its own
+    // press grab), a timestamp/seek TapHandler, a button, or middle-drag
+    // panning (middleDragScrollArea's MiddleButton TapHandler) all still
+    // work untouched. Deliberately a TapHandler, NOT a MouseArea: an
+    // Item-attached handler carries no implicit cursor, so unlike a
+    // MouseArea it can span the whole panel without poisoning the
+    // I-beam/pointer cursor resolution of everything above it (see the
+    // project's MouseArea cursor-bleed notes). The default gesturePolicy
+    // (DragThreshold) means a click-drag that selects text is NOT treated as
+    // a tap, so dragging out a selection never immediately self-clears.
+    TapHandler {
+        acceptedButtons: Qt.LeftButton
+        onTapped: mainPanel.deselectTextSelections()
     }
 
     color: Qt.rgba(AppSettings.mainBackgroundColor.r, AppSettings.mainBackgroundColor.g,
@@ -1651,6 +2093,11 @@ Rectangle {
                             background: UnderlineField { implicitHeight: 0; focused: titleField.activeFocus }
 
                             Keys.onEscapePressed: titleField.text = mainPanel.displayTitle()
+
+                            // Item 13: QQC2 TextField has no built-in I-beam
+                            // — add one so it reads as editable text, same
+                            // idiom as transcriptArea/searchField.
+                            HoverHandler { cursorShape: Qt.IBeamCursor }
                         }
                     }
 
@@ -1752,6 +2199,59 @@ Rectangle {
                 }
             }
 
+            // Items 24/53: "Run all jobs" — queues the full transcribe->label
+            // ->chapters pipeline for the open file. Per the user's spec, shown
+            // ONLY when there's no transcription yet (an untranscribed audio
+            // file): once transcribed, the individual regenerate-label /
+            // generate-chapters icons beside it cover the derived passes. Not
+            // shown for an orphaned .md (nothing to transcribe — the
+            // relabel/chapters icons already handle that case).
+            Item {
+                id: runAllIconButton
+                Layout.preferredWidth: 22
+                Layout.preferredHeight: 22
+                visible: mainPanel.transcriptionController && mainPanel.player
+                         && mainPanel.player.source.toString() !== ""
+                         && mainPanel.orphanedMdPath === "" && !mainPanel.hasStoredMetadata
+                readonly property bool isQueued: mainPanel.transcriptionController && mainPanel.player
+                    && mainPanel.transcriptionController.queuedFileUrls.some(
+                           u => u.toString() === mainPanel.player.source.toString())
+                enabled: visible && !runAllIconButton.isQueued
+                         && !(mainPanel.transcriptionController.busy
+                              && mainPanel.transcriptionController.currentFile.toString()
+                                 === mainPanel.player.source.toString())
+
+                ToolTip.visible: runAllIconHover.hovered
+                ToolTip.text: qsTr("Run all jobs (transcribe, label, chapters)")
+                ToolTip.delay: 500
+
+                HoverHandler {
+                    id: runAllIconHover
+                    cursorShape: Qt.PointingHandCursor
+                    enabled: runAllIconButton.enabled
+                }
+                TapHandler {
+                    enabled: runAllIconButton.enabled
+                    onTapped: mainPanel.transcriptionController.runAllJobs(mainPanel.player.source, mainPanel.vaultPath,
+                                                                            modelCombo.currentValue,
+                                                                            speakerDetectionToggle.checked,
+                                                                            AppSettings.restrictTagsToExisting,
+                                                                            AppSettings.tagReuseBias,
+                                                                            AppSettings.wordiness,
+                                                                            AppSettings.chapterDensity)
+                }
+                HoverBorder {
+                    anchors.fill: parent
+                    active: runAllIconButton.enabled && runAllIconHover.hovered
+                }
+                Text {
+                    anchors.centerIn: parent
+                    text: "»"
+                    color: runAllIconButton.enabled ? "#dddddd" : "#666666"
+                    font.pixelSize: 15
+                }
+            }
+
             // Item 9: regenerate auto-title — re-runs just the AI labeling
             // pass on the already-transcribed text (no re-transcription).
             // Visible whenever there's a transcript to label, independent of
@@ -1828,7 +2328,7 @@ Rectangle {
                 }
                 TapHandler {
                     enabled: generateChaptersButton.enabled
-                    onTapped: mainPanel.transcriptionController.generateChapters(generateChaptersButton.targetUrl, mainPanel.vaultPath)
+                    onTapped: mainPanel.transcriptionController.generateChapters(generateChaptersButton.targetUrl, mainPanel.vaultPath, AppSettings.chapterDensity)
                 }
                 HoverBorder {
                     anchors.fill: parent
@@ -1839,6 +2339,136 @@ Rectangle {
                     text: "≡"
                     color: generateChaptersButton.enabled ? "#dddddd" : "#666666"
                     font.pixelSize: 15
+                }
+            }
+
+            // Item 52: "Detect speakers" — runs speaker diarization
+            // (TranscriptionController::diarizeFile()) as its own standalone job
+            // on the already-transcribed OPEN file, WITHOUT re-transcribing.
+            // Lets the user add speaker detection after the fact, or redo it.
+            // Unlike regenerateLabel/generateChapters (which read only the .md),
+            // diarization decodes the AUDIO, so this is offered only for a
+            // real audio-backed transcribed file — not an orphaned .md (no
+            // audio to diarize). See DESIGN.md "Speaker diarization".
+            //
+            // NOTE (OWED, CLAUDE.md per-file-action parity): the Sidebar ribbon
+            // ("detect speakers for all") and per-row hover "detect speakers"
+            // buttons are not added this wave (another agent owns Sidebar.qml).
+            // They should call diarizeFile() / diarizeFilesForPaths() (already
+            // added to TranscriptionController) as a follow-up.
+            Item {
+                id: detectSpeakersButton
+                Layout.preferredWidth: 22
+                Layout.preferredHeight: 22
+                visible: mainPanel.transcriptionController
+                         && mainPanel.orphanedMdPath === "" && mainPanel.hasStoredMetadata
+                readonly property url targetUrl: mainPanel.player.source
+                enabled: visible && !mainPanel.transcriptionController.isQueued(detectSpeakersButton.targetUrl)
+
+                ToolTip.visible: detectSpeakersHover.hovered
+                ToolTip.text: qsTr("Detect speakers")
+                ToolTip.delay: 500
+
+                HoverHandler {
+                    id: detectSpeakersHover
+                    cursorShape: Qt.PointingHandCursor
+                    enabled: detectSpeakersButton.enabled
+                }
+                TapHandler {
+                    enabled: detectSpeakersButton.enabled
+                    onTapped: mainPanel.transcriptionController.diarizeFile(detectSpeakersButton.targetUrl,
+                                                                            mainPanel.vaultPath)
+                }
+                HoverBorder {
+                    anchors.fill: parent
+                    active: detectSpeakersButton.enabled && detectSpeakersHover.hovered
+                }
+                Text {
+                    anchors.centerIn: parent
+                    text: "☻"
+                    color: detectSpeakersButton.enabled ? "#dddddd" : "#666666"
+                    font.pixelSize: 14
+                }
+            }
+
+            // Item 2: "Delete transcript" — removes the open transcribed audio
+            // file's sibling .md (VaultTreeModel::deleteTranscript()), reverting
+            // it to untranscribed while KEEPING the audio. Only for a
+            // transcribed AUDIO file (an orphaned .md has no audio to keep — it
+            // gets "Delete file" instead). Disabled while a job is
+            // queued/active for this file (deleting its sidecar mid-write would
+            // fight the worker) — same isQueued gate the regenerate icons use.
+            Item {
+                id: deleteTranscriptButton
+                Layout.preferredWidth: 22
+                Layout.preferredHeight: 22
+                visible: mainPanel.transcriptionController && mainPanel.vaultTreeModel && mainPanel.player
+                         && mainPanel.orphanedMdPath === "" && mainPanel.hasStoredMetadata
+                readonly property url targetUrl: mainPanel.player.source
+                enabled: visible && !mainPanel.transcriptionController.isQueued(deleteTranscriptButton.targetUrl)
+
+                ToolTip.visible: deleteTranscriptHover.hovered
+                ToolTip.text: qsTr("Delete transcript (keep audio)")
+                ToolTip.delay: 500
+
+                HoverHandler {
+                    id: deleteTranscriptHover
+                    cursorShape: Qt.PointingHandCursor
+                    enabled: deleteTranscriptButton.enabled
+                }
+                TapHandler {
+                    enabled: deleteTranscriptButton.enabled
+                    onTapped: mainPanel.requestDeleteTranscript()
+                }
+                HoverBorder {
+                    anchors.fill: parent
+                    active: deleteTranscriptButton.enabled && deleteTranscriptHover.hovered
+                }
+                Text {
+                    anchors.centerIn: parent
+                    text: "⌫"
+                    color: deleteTranscriptButton.enabled ? "#e07a7a" : "#666666"
+                    font.pixelSize: 14
+                }
+            }
+
+            // Item 2: "Delete file" — deletes the whole open file and its
+            // sidecars (VaultTreeModel::deleteFile()): audio + .md + partial,
+            // or an orphaned .md alone. Shown for any open file (audio OR
+            // orphaned .md). Same isQueued gate as above.
+            Item {
+                id: deleteFileButton
+                Layout.preferredWidth: 22
+                Layout.preferredHeight: 22
+                visible: mainPanel.vaultTreeModel
+                         && (mainPanel.orphanedMdPath !== ""
+                             || (mainPanel.player && mainPanel.player.source.toString() !== ""))
+                readonly property url targetUrl: mainPanel.currentFileUrl()
+                enabled: visible && (!mainPanel.transcriptionController
+                         || !mainPanel.transcriptionController.isQueued(deleteFileButton.targetUrl))
+
+                ToolTip.visible: deleteFileHover.hovered
+                ToolTip.text: qsTr("Delete file")
+                ToolTip.delay: 500
+
+                HoverHandler {
+                    id: deleteFileHover
+                    cursorShape: Qt.PointingHandCursor
+                    enabled: deleteFileButton.enabled
+                }
+                TapHandler {
+                    enabled: deleteFileButton.enabled
+                    onTapped: mainPanel.requestDeleteFile()
+                }
+                HoverBorder {
+                    anchors.fill: parent
+                    active: deleteFileButton.enabled && deleteFileHover.hovered
+                }
+                Text {
+                    anchors.centerIn: parent
+                    text: "⌦"
+                    color: deleteFileButton.enabled ? "#e07a7a" : "#666666"
+                    font.pixelSize: 14
                 }
             }
 
@@ -1929,6 +2559,226 @@ Rectangle {
                     font.pixelSize: 15
                 }
             }
+
+            // Item 7: find & replace toggle — opens the replace bar below
+            // (the same bar Ctrl+H toggles). Its own icon so the feature is
+            // discoverable without knowing the shortcut. Item+TapHandler (no
+            // focusable QQC2 control) so it never steals focus.
+            Item {
+                id: findReplaceToggleButton
+                Layout.preferredWidth: 22
+                Layout.preferredHeight: 22
+                visible: mainPanel.orphanedMdPath !== ""
+                         || (mainPanel.player && mainPanel.player.source.toString() !== "")
+
+                HoverHandler { id: findReplaceToggleHover; cursorShape: Qt.PointingHandCursor }
+                TapHandler {
+                    onTapped: {
+                        mainPanel.findReplaceExpanded = !mainPanel.findReplaceExpanded
+                        if (mainPanel.findReplaceExpanded)
+                            findField.forceActiveFocus()
+                    }
+                }
+                HoverBorder {
+                    anchors.fill: parent
+                    active: findReplaceToggleHover.hovered
+                }
+                Text {
+                    anchors.centerIn: parent
+                    text: "⇄"
+                    color: mainPanel.findReplaceExpanded ? AppSettings.accentColor : "#dddddd"
+                    font.pixelSize: 14
+                }
+            }
+        }
+
+        // Item 7: find & replace bar — sticky, right under the title/search
+        // row, shown on the findReplaceExpanded bool (same show/hide idiom as
+        // searchField). Regex mode uses JS RegExp (see buildFindRegex); an
+        // invalid pattern shows the inline error banner below rather than
+        // throwing. Replace routes through commitTranscriptEdits() via
+        // replaceNext()/replaceAll(), so it inherits that path's per-sentence
+        // line-count safety check.
+        ColumnLayout {
+            Layout.fillWidth: true
+            visible: mainPanel.findReplaceExpanded
+            spacing: 4
+
+            RowLayout {
+                Layout.fillWidth: true
+                spacing: 8
+
+                Label {
+                    text: qsTr("Find")
+                    color: "#888888"
+                    font.pixelSize: 11
+                }
+
+                TextField {
+                    id: findField
+                    Layout.preferredWidth: 180
+                    placeholderText: mainPanel.findRegexEnabled ? qsTr("pattern…") : qsTr("text…")
+                    text: mainPanel.findText
+                    onTextChanged: {
+                        mainPanel.findText = text
+                        // Live-validate so an invalid regex flags immediately
+                        // (buildFindRegex sets/clears findReplaceError).
+                        mainPanel.buildFindRegex(false)
+                    }
+                    color: mainPanel.findReplaceError !== "" ? "#e07a7a" : "#dddddd"
+                    background: UnderlineField { focused: findField.activeFocus }
+                    HoverHandler { cursorShape: Qt.IBeamCursor }
+                }
+
+                // Regex mode toggle (.*) — active state uses the app accent
+                // so it reads as a mode, not a one-shot button.
+                Item {
+                    id: regexToggle
+                    Layout.preferredWidth: 26
+                    Layout.preferredHeight: 22
+                    HoverHandler { id: regexToggleHover; cursorShape: Qt.PointingHandCursor }
+                    TapHandler {
+                        onTapped: {
+                            mainPanel.findRegexEnabled = !mainPanel.findRegexEnabled
+                            mainPanel.buildFindRegex(false) // re-validate under the new mode
+                        }
+                    }
+                    HoverBorder { anchors.fill: parent; active: regexToggleHover.hovered }
+                    Text {
+                        anchors.centerIn: parent
+                        text: ".*"
+                        color: mainPanel.findRegexEnabled ? AppSettings.accentColor : "#888888"
+                        font.pixelSize: 13
+                        font.bold: mainPanel.findRegexEnabled
+                    }
+                }
+
+                // Case-insensitive toggle (Aa).
+                Item {
+                    id: caseToggle
+                    Layout.preferredWidth: 26
+                    Layout.preferredHeight: 22
+                    HoverHandler { id: caseToggleHover; cursorShape: Qt.PointingHandCursor }
+                    TapHandler { onTapped: mainPanel.findCaseInsensitive = !mainPanel.findCaseInsensitive }
+                    HoverBorder { anchors.fill: parent; active: caseToggleHover.hovered }
+                    Text {
+                        anchors.centerIn: parent
+                        text: "Aa"
+                        color: mainPanel.findCaseInsensitive ? AppSettings.accentColor : "#888888"
+                        font.pixelSize: 12
+                        font.bold: mainPanel.findCaseInsensitive
+                    }
+                }
+
+                Item { Layout.fillWidth: true }
+            }
+
+            RowLayout {
+                Layout.fillWidth: true
+                spacing: 8
+
+                Label {
+                    text: qsTr("Replace")
+                    color: "#888888"
+                    font.pixelSize: 11
+                }
+
+                TextField {
+                    id: replaceField
+                    Layout.preferredWidth: 180
+                    placeholderText: qsTr("replacement…")
+                    text: mainPanel.replaceText
+                    onTextChanged: mainPanel.replaceText = text
+                    color: "#dddddd"
+                    background: UnderlineField { focused: replaceField.activeFocus }
+                    HoverHandler { cursorShape: Qt.IBeamCursor }
+                }
+
+                // Replace / Replace-all: Item+TapHandler buttons (NOT
+                // focusable QQC2 Buttons) so they never steal focus from the
+                // find/replace fields on press — project memory: a focusable
+                // button next to a focused TextField grabs focus on press.
+                Item {
+                    id: replaceNextButton
+                    Layout.preferredHeight: 22
+                    Layout.preferredWidth: replaceNextText.implicitWidth + 16
+                    HoverHandler { id: replaceNextHover; cursorShape: Qt.PointingHandCursor }
+                    TapHandler { onTapped: mainPanel.replaceNext() }
+                    Rectangle {
+                        anchors.fill: parent
+                        radius: AppSettings.borderRadius
+                        color: "transparent"
+                        border.width: 1
+                        border.color: "#3a3a3a"
+                    }
+                    HoverBorder { anchors.fill: parent; active: replaceNextHover.hovered }
+                    Text {
+                        id: replaceNextText
+                        anchors.centerIn: parent
+                        text: qsTr("Replace")
+                        color: "#dddddd"
+                        font.pixelSize: 11
+                    }
+                }
+
+                Item {
+                    id: replaceAllButton
+                    Layout.preferredHeight: 22
+                    Layout.preferredWidth: replaceAllText.implicitWidth + 16
+                    HoverHandler { id: replaceAllHover; cursorShape: Qt.PointingHandCursor }
+                    TapHandler { onTapped: mainPanel.replaceAll() }
+                    Rectangle {
+                        anchors.fill: parent
+                        radius: AppSettings.borderRadius
+                        color: "transparent"
+                        border.width: 1
+                        border.color: "#3a3a3a"
+                    }
+                    HoverBorder { anchors.fill: parent; active: replaceAllHover.hovered }
+                    Text {
+                        id: replaceAllText
+                        anchors.centerIn: parent
+                        text: qsTr("Replace all")
+                        color: "#dddddd"
+                        font.pixelSize: 11
+                    }
+                }
+
+                Item { Layout.fillWidth: true }
+
+                // Close the bar (mirrors searchCloseButton's "×").
+                Item {
+                    id: findReplaceCloseButton
+                    Layout.preferredWidth: 20
+                    Layout.preferredHeight: 20
+                    HoverHandler { id: findReplaceCloseHover; cursorShape: Qt.PointingHandCursor }
+                    TapHandler {
+                        onTapped: {
+                            mainPanel.findReplaceExpanded = false
+                            mainPanel.findReplaceError = ""
+                        }
+                    }
+                    HoverBorder { anchors.fill: parent; active: findReplaceCloseHover.hovered }
+                    Text {
+                        anchors.centerIn: parent
+                        text: "×"
+                        color: "#dddddd"
+                        font.pixelSize: 15
+                    }
+                }
+            }
+
+            // Invalid-regex inline error (StyleGuide.md warning-banner
+            // convention: backing string, #e07a7a, 11px, wrapping — no
+            // separate visible flag beyond the string being non-empty).
+            Label {
+                Layout.fillWidth: true
+                visible: mainPanel.findReplaceError !== ""
+                text: mainPanel.findReplaceError
+                color: "#e07a7a"
+                font.pixelSize: 11
+                wrapMode: Text.WordWrap
+            }
         }
 
         // Item: only the playback progress bar and title/regen/search row
@@ -1961,6 +2811,19 @@ Rectangle {
             id: transcriptScrollView
             anchors.fill: parent
             clip: true
+            // Item 55: while a (re)transcription for THIS file has started but
+            // no new segment has streamed in yet, dim + hard-disable the stale
+            // transcript so it can't be selected/hovered/scrolled/edited (the
+            // transcribingOverlay sibling below shows a spinner on top). The
+            // moment live output begins (awaitingFirstSegment clears on the
+            // first live tick) this reverts and the user watches it stream in.
+            // A true gaussian blur was deliberately avoided here: it needs a
+            // new QtQuick.Effects/Qt5Compat.GraphicalEffects import, and per
+            // project memory a fresh QML import can crash-on-load (or silently
+            // freeze) under AOT — uncheckable without a live GUI run — so dim
+            // is the AOT-safe half of "blur/dim".
+            enabled: !mainPanel.showTranscribingOverlay
+            opacity: mainPanel.showTranscribingOverlay ? 0.25 : 1
             ScrollBar.horizontal.policy: ScrollBar.AlwaysOff
 
             ColumnLayout {
@@ -2048,6 +2911,9 @@ Rectangle {
                                     background: UnderlineField { implicitHeight: 0; focused: tagField.activeFocus }
 
                                     Keys.onEscapePressed: tagField.text = tagPill.modelData
+
+                                    // Item 13: editable text needs an I-beam.
+                                    HoverHandler { cursorShape: Qt.IBeamCursor }
                                 }
 
                                 // Filters the sidebar tree to files with this
@@ -2126,6 +2992,9 @@ Rectangle {
                         }
                         onActiveFocusChanged: if (!activeFocus) text = ""
                         Keys.onEscapePressed: text = ""
+
+                        // Item 13: editable text needs an I-beam.
+                        HoverHandler { cursorShape: Qt.IBeamCursor }
                     }
                 }
 
@@ -2274,6 +3143,9 @@ Rectangle {
                                     onActiveFocusChanged: if (!activeFocus) speakerPillItem.commitOrRevert(text)
 
                                     background: UnderlineField { implicitHeight: 0; focused: speakerNameField.activeFocus }
+
+                                    // Item 13: editable text needs an I-beam.
+                                    HoverHandler { cursorShape: Qt.IBeamCursor }
 
                                     Keys.onEscapePressed: speakerNameField.text = mainPanel.effectiveSpeakerName(speakerPillItem.modelData)
 
@@ -2446,6 +3318,11 @@ Rectangle {
                         background: UnderlineField { implicitHeight: 0; focused: preludeArea.activeFocus }
                         Keys.onEscapePressed: preludeArea.text = mainPanel.prelude
                         onActiveFocusChanged: if (!activeFocus) mainPanel.commitPrelude(text)
+
+                        // Item 13: this LOST its I-beam when b72b365 turned the
+                        // old read-only TextEdit into an editable TextArea —
+                        // QQC2 TextArea has no built-in one, restore it here.
+                        HoverHandler { cursorShape: Qt.IBeamCursor }
                     }
                 }
 
@@ -2494,6 +3371,40 @@ Rectangle {
                             HoverHandler { cursorShape: Qt.PointingHandCursor }
                             TapHandler { onTapped: mainPanel.chaptersExpanded = !mainPanel.chaptersExpanded }
                         }
+
+                        // Item 17: add a MANUAL chapter at the current
+                        // playhead. Player-backed only (an orphaned .md has no
+                        // audio to position against). Item+TapHandler rather
+                        // than a focusable QQC2 Button so tapping it can't
+                        // steal focus from a chapter title being renamed
+                        // (project-memory focus-grab warning) — it just adds +
+                        // drops into editing the new one.
+                        Item {
+                            id: addChapterButton
+                            Layout.preferredWidth: 18
+                            Layout.preferredHeight: 18
+                            visible: !!mainPanel.player && mainPanel.player.source.toString() !== ""
+
+                            ToolTip.visible: addChapterHover.hovered
+                            ToolTip.text: qsTr("Add chapter at playhead")
+                            ToolTip.delay: 500
+
+                            HoverHandler {
+                                id: addChapterHover
+                                cursorShape: Qt.PointingHandCursor
+                            }
+                            TapHandler { onTapped: mainPanel.addChapterAtPlayhead() }
+                            HoverBorder {
+                                anchors.fill: parent
+                                active: addChapterHover.hovered
+                            }
+                            Text {
+                                anchors.centerIn: parent
+                                text: "+"
+                                color: "#8fdf9f"
+                                font.pixelSize: 14
+                            }
+                        }
                     }
 
                     ColumnLayout {
@@ -2526,18 +3437,127 @@ Rectangle {
                                     HoverHandler { cursorShape: Qt.PointingHandCursor }
                                     TapHandler { onTapped: mainPanel.player.position = chapterRow.modelData.t0 * 1000 }
                                 }
+
+                                // Item 17: manual chapters (user-created or
+                                // -edited) get a subtle pencil marker,
+                                // distinguishing them from auto-generated ones
+                                // via readChapters()' `manual` bool.
+                                Text {
+                                    visible: !!chapterRow.modelData.manual
+                                    text: "✎"
+                                    color: "#8fdf9f"
+                                    font.pixelSize: 10
+                                }
+
+                                // Item 34/35: click-to-edit chapter title. NOT
+                                // free-selectable at rest (readOnly + no
+                                // selectByMouse) — that's what kills the
+                                // multiple-simultaneous-highlights bug (item
+                                // 34): only when THIS chapter becomes the
+                                // single active edit (editingChapterTs === its
+                                // real t0) does it turn into a focused,
+                                // selectable field. Tapping another title (or
+                                // clicking away → deselectTextSelections)
+                                // reassigns editingChapterTs, whose change
+                                // blurs+commits this one. Commit routes through
+                                // setChapterTitle via commitChapterTitle().
                                 TextEdit {
+                                    id: tocChapterTitle
+                                    readonly property bool editing: mainPanel.editingChapterTs === chapterRow.modelData.t0
                                     Layout.fillWidth: true
                                     clip: true
-                                    readOnly: true
-                                    selectByMouse: true
-                                    selectByKeyboard: true
+                                    readOnly: !tocChapterTitle.editing
+                                    selectByMouse: tocChapterTitle.editing
+                                    selectByKeyboard: tocChapterTitle.editing
                                     activeFocusOnPress: false
                                     text: chapterRow.modelData.title
                                     color: "#cccccc"
                                     font.pixelSize: 11
 
                                     HoverHandler { cursorShape: Qt.IBeamCursor }
+                                    // Only the tapped instance focuses itself
+                                    // (a chapter has BOTH a TOC row and a
+                                    // transcript heading bound to the same
+                                    // editingChapterTs — focusing from
+                                    // onEditingChanged would make them fight
+                                    // over which grabs focus).
+                                    TapHandler {
+                                        onTapped: {
+                                            mainPanel.editingChapterTs = chapterRow.modelData.t0
+                                            if (!tocChapterTitle.activeFocus) {
+                                                tocChapterTitle.forceActiveFocus()
+                                                tocChapterTitle.selectAll()
+                                            }
+                                        }
+                                    }
+                                    // Exit side only: when this stops being the
+                                    // active edit while still focused, blur
+                                    // (→ commit). The unfocused twin skips this.
+                                    onEditingChanged: {
+                                        if (!tocChapterTitle.editing && tocChapterTitle.activeFocus)
+                                            tocChapterTitle.focus = false
+                                    }
+                                    onActiveFocusChanged: {
+                                        if (!tocChapterTitle.activeFocus) {
+                                            mainPanel.commitChapterTitle(chapterRow.modelData.t0,
+                                                                         chapterRow.modelData.title,
+                                                                         tocChapterTitle.text)
+                                            // Only clear if we're still the active
+                                            // one — a tap on another title already
+                                            // moved editingChapterTs, don't clobber it.
+                                            if (mainPanel.editingChapterTs === chapterRow.modelData.t0)
+                                                mainPanel.editingChapterTs = -1
+                                        }
+                                    }
+                                    // Single-line commit convention (StyleGuide):
+                                    // Return commits (blocks the newline), Escape
+                                    // reverts to the last-known-good title.
+                                    Keys.onReturnPressed: (event) => {
+                                        event.accepted = true
+                                        mainPanel.editingChapterTs = -1
+                                    }
+                                    Keys.onEnterPressed: (event) => {
+                                        event.accepted = true
+                                        mainPanel.editingChapterTs = -1
+                                    }
+                                    Keys.onEscapePressed: (event) => {
+                                        event.accepted = true
+                                        tocChapterTitle.text = chapterRow.modelData.title
+                                        mainPanel.editingChapterTs = -1
+                                    }
+                                }
+
+                                // Item 17: delete this chapter marker.
+                                // Item+TapHandler (not a focusable Button) for
+                                // the same focus-grab reason as addChapterButton.
+                                Item {
+                                    id: deleteChapterButton
+                                    Layout.preferredWidth: 16
+                                    Layout.preferredHeight: 16
+
+                                    ToolTip.visible: deleteChapterHover.hovered
+                                    ToolTip.text: qsTr("Delete chapter")
+                                    ToolTip.delay: 500
+
+                                    HoverHandler {
+                                        id: deleteChapterHover
+                                        cursorShape: Qt.PointingHandCursor
+                                    }
+                                    TapHandler {
+                                        onTapped: mainPanel.deleteChapterAt(chapterRow.modelData.t0,
+                                                                            chapterRow.modelData.title,
+                                                                            !!chapterRow.modelData.manual)
+                                    }
+                                    HoverBorder {
+                                        anchors.fill: parent
+                                        active: deleteChapterHover.hovered
+                                    }
+                                    Text {
+                                        anchors.centerIn: parent
+                                        text: "×"
+                                        color: "#c07a7a"
+                                        font.pixelSize: 13
+                                    }
                                 }
                             }
                         }
@@ -2660,6 +3680,17 @@ Rectangle {
                             active: modelCombo.hovered
                         }
 
+                        // Item P2: closed-state box gets the app's own corner
+                        // radius (QQC2's default box is square-cornered),
+                        // matching the popup background below (same radius,
+                        // same fill/border colors).
+                        background: Rectangle {
+                            color: "#242424"
+                            radius: AppSettings.borderRadius
+                            border.width: 1
+                            border.color: "#3a3a3a"
+                        }
+
                         // O29: small dot per entry — green if that model's
                         // weights are already on disk, gray if picking it
                         // will first queue a download job.
@@ -2722,11 +3753,13 @@ Rectangle {
                         }
                     }
 
-                    // O35: which backend actually loaded the active model
-                    // ("Vulkan"/"CUDA"/"CPU"/…) — empty (and hidden) until
-                    // the first model load completes in this session.
+                    // O35 / Item 25: the coarse "gpu"/"cpu" kind of the
+                    // backend that loaded the active model (activeBackendKind,
+                    // not the raw Vulkan/CUDA/CPU name) — matching the bottom
+                    // bar's own indicator. Empty (and hidden) until the first
+                    // model load completes in this session.
                     Label {
-                        text: mainPanel.transcriptionController ? mainPanel.transcriptionController.activeBackendName : ""
+                        text: mainPanel.transcriptionController ? mainPanel.transcriptionController.activeBackendKind : ""
                         visible: text !== ""
                         color: "#888888"
                         font.pixelSize: 11
@@ -2999,6 +4032,8 @@ Rectangle {
                         id: chapterHeadingRow
                         required property var modelData
                         required property int index
+                        readonly property bool collapsed:
+                            !!mainPanel.collapsedChapters[String(chapterHeadingRow.modelData.chapterT0)]
                         visible: chapterHeadingRow.modelData.isChapterHeading
                         readonly property rect lineRect: transcriptArea.gutterLineRects[index] || Qt.rect(0, 0, 0, 0)
                         x: 0
@@ -3007,18 +4042,80 @@ Rectangle {
                         height: lineRect.height
                         spacing: 8
 
-                        Rectangle {
-                            Layout.preferredWidth: 16
-                            Layout.preferredHeight: 1
+                        // Item 33: a dedicated disclosure triangle collapses/
+                        // expands this chapter's body in the transcript
+                        // (displayData drops the collapsed sentences). Kept
+                        // SEPARATE from the title (which is click-to-edit, item
+                        // 35) so the two gestures never collide — a triangle is
+                        // the least ambiguous collapse affordance (task note).
+                        Text {
                             Layout.alignment: Qt.AlignVCenter
-                            color: "#3a3a3a"
+                            text: chapterHeadingRow.collapsed ? "▸" : "▾"
+                            color: "#8fdf9f"
+                            font.pixelSize: 10
+
+                            HoverHandler { cursorShape: Qt.PointingHandCursor }
+                            TapHandler {
+                                onTapped: mainPanel.toggleChapterCollapse(chapterHeadingRow.modelData.chapterT0)
+                            }
                         }
-                        Label {
+                        // Item 35: the transcript heading is now click-to-edit
+                        // too, sharing the SAME single-active-edit state
+                        // (editingChapterTs, keyed by the real chapterT0) as
+                        // the TOC row, so editing one exits the other. Commits
+                        // through setChapterTitle via commitChapterTitle().
+                        TextEdit {
+                            id: headingTitle
+                            readonly property bool editing:
+                                mainPanel.editingChapterTs === chapterHeadingRow.modelData.chapterT0
                             Layout.alignment: Qt.AlignVCenter
+                            readOnly: !headingTitle.editing
+                            selectByMouse: headingTitle.editing
+                            selectByKeyboard: headingTitle.editing
+                            activeFocusOnPress: false
                             text: chapterHeadingRow.modelData.chapterTitle
                             color: "#8fdf9f"
                             font.pixelSize: 12
                             font.bold: true
+
+                            HoverHandler { cursorShape: Qt.IBeamCursor }
+                            // Only the tapped instance focuses itself (see the
+                            // TOC title's twin handler for why).
+                            TapHandler {
+                                onTapped: {
+                                    if (!headingTitle.editing) {
+                                        mainPanel.editingChapterTs = chapterHeadingRow.modelData.chapterT0
+                                        headingTitle.forceActiveFocus()
+                                        headingTitle.selectAll()
+                                    }
+                                }
+                            }
+                            onEditingChanged: {
+                                if (!headingTitle.editing && headingTitle.activeFocus)
+                                    headingTitle.focus = false
+                            }
+                            onActiveFocusChanged: {
+                                if (!headingTitle.activeFocus) {
+                                    mainPanel.commitChapterTitle(chapterHeadingRow.modelData.chapterT0,
+                                                                 chapterHeadingRow.modelData.chapterTitle,
+                                                                 headingTitle.text)
+                                    if (mainPanel.editingChapterTs === chapterHeadingRow.modelData.chapterT0)
+                                        mainPanel.editingChapterTs = -1
+                                }
+                            }
+                            Keys.onReturnPressed: (event) => {
+                                event.accepted = true
+                                mainPanel.editingChapterTs = -1
+                            }
+                            Keys.onEnterPressed: (event) => {
+                                event.accepted = true
+                                mainPanel.editingChapterTs = -1
+                            }
+                            Keys.onEscapePressed: (event) => {
+                                event.accepted = true
+                                headingTitle.text = chapterHeadingRow.modelData.chapterTitle
+                                mainPanel.editingChapterTs = -1
+                            }
                         }
                         Rectangle {
                             Layout.fillWidth: true
@@ -3065,6 +4162,47 @@ Rectangle {
             } // end scrollableContent ColumnLayout
         } // end transcriptScrollView
 
+        // Item 55: loading overlay shown from the instant THIS file's
+        // (re)transcription starts until the first new segment lands (see
+        // showTranscribingOverlay / awaitingFirstSegment). A dim scrim over
+        // the (already dimmed + disabled) stale transcript plus a centered
+        // BusyIndicator + "Transcribing…" label. It also swallows pointer
+        // input (TapHandler for clicks/drags, HoverHandler for the wait
+        // cursor) so nothing underneath reacts while the old transcript is
+        // frozen. Sibling of transcriptScrollView inside
+        // transcriptViewportContainer, so it's scoped to exactly the
+        // transcript region (not the sticky header). Reuses the built-in
+        // QQC2 BusyIndicator (the app had no existing spinner component) so
+        // it inherits the app's control style.
+        Rectangle {
+            id: transcribingOverlay
+            anchors.fill: parent
+            z: 2
+            visible: mainPanel.showTranscribingOverlay
+            color: Qt.rgba(AppSettings.mainBackgroundColor.r, AppSettings.mainBackgroundColor.g,
+                           AppSettings.mainBackgroundColor.b, 0.55)
+
+            // Block interaction with the frozen transcript beneath while shown.
+            HoverHandler { cursorShape: Qt.BusyCursor }
+            TapHandler { acceptedButtons: Qt.AllButtons }
+
+            ColumnLayout {
+                anchors.centerIn: parent
+                spacing: 10
+
+                BusyIndicator {
+                    Layout.alignment: Qt.AlignHCenter
+                    running: transcribingOverlay.visible
+                }
+                Label {
+                    Layout.alignment: Qt.AlignHCenter
+                    text: qsTr("Transcribing…")
+                    color: "#dddddd"
+                    font.pixelSize: 13
+                }
+            }
+        }
+
         // Item 12 (Wave E, rewritten): Chrome/Firefox-style middle-click
         // autoscroll — two gestures, both ending in the SAME free-scroll
         // state: (1) a quick click (press+release, no real drag) arms
@@ -3079,10 +4217,26 @@ Rectangle {
         // acceptedButtons only widens to Left/Right while armed (so any
         // button click cancels, matching Chrome) — while idle only
         // MiddleButton is accepted, so left-click text selection and the
-        // scrollbar's own drag pass straight through untouched. Lives as
+        // scrollbar's own drag pass straight through untouched. Declared as
         // an overlay sibling of transcriptScrollView (not inside it, see
-        // transcriptViewportContainer's doc comment) so it covers the same
-        // full viewport without being counted as the ScrollView's content.
+        // transcriptViewportContainer's doc comment) so the ScrollView keeps
+        // exactly one flickable content child — but VISUALLY reparented to
+        // mainPanel (see `parent: mainPanel` below) so its bounds span the
+        // whole note page, not just the transcript box.
+        //
+        // Item 57: the armed-hover-tracking region MUST be wider than
+        // transcriptViewportContainer. Qt Quick hover delivery is
+        // bounds-scoped per item: once armed and free-scrolling (gesture 1,
+        // no button held), the HoverHandler below only keeps firing
+        // onPointChanged — and thus keeps updating currentY, which the
+        // autoscroll timer reads — while the pointer is within this Item's
+        // bounds. Scoped to just the transcript sub-region, moving the cursor
+        // onto any sibling outside it (tag pills, prelude, chapter list,
+        // title field, the sticky header) froze currentY and silently halted
+        // the scroll, unlike Chrome which keeps scrolling wherever the cursor
+        // goes. Reparenting to mainPanel widens the tracked region to the
+        // entire panel (the widest a note-page-scoped fix can reach from this
+        // file — the sidebar/titlebar/bottombar are separate panels).
         //
         // NOT a MouseArea, and NOT z-toggled — both were tried and both
         // broke something real, confirmed empirically each time (offscreen
@@ -3127,8 +4281,20 @@ Rectangle {
         // full-viewport overlay essentially never happens mid-gesture.
         Item {
             id: middleDragScrollArea
+            // Item 57: reparented to the whole panel so `anchors.fill: parent`
+            // (parent === mainPanel after this) makes the armed
+            // hover-tracking region the entire note page rather than just the
+            // transcript viewport — see the block comment above. Declared
+            // inside transcriptViewportContainer only for locality; the
+            // `parent:` reassignment moves it out of the note-page
+            // ColumnLayout's visual tree, so it also needs its own `visible`
+            // gate (it no longer inherits the note page's) — inert on the
+            // recorder/USB/empty pages where there's no transcript to pan.
+            parent: mainPanel
             anchors.fill: parent
             z: 1
+            visible: mainPanel.vaultPath.toString() !== "" && !mainPanel.recording
+                     && !mainPanel.usbGrabberOpen
 
             property bool armed: false
             property real originY: 0
@@ -3882,6 +5048,8 @@ Rectangle {
                             background: UnderlineField { focused: catchAllExtensionField.activeFocus }
                             onEditingFinished: usbGrabberPage.commitRuleField("*", "", "extensionFilter",
                                 text.split(",").map(s => s.trim()).filter(s => s.length > 0))
+                            // Item 13: editable text needs an I-beam.
+                            HoverHandler { cursorShape: Qt.IBeamCursor }
                         }
                         Switch {
                             id: catchAllPreserveSwitch
@@ -3901,6 +5069,8 @@ Rectangle {
                         text: usbGrabberPage.catchAllRule.startFolder || ""
                         background: UnderlineField { focused: catchAllStartFolderField.activeFocus }
                         onEditingFinished: usbGrabberPage.commitRuleField("*", "", "startFolder", text)
+                        // Item 13: editable text needs an I-beam.
+                        HoverHandler { cursorShape: Qt.IBeamCursor }
                     }
                 }
 
@@ -4005,6 +5175,8 @@ Rectangle {
                                 onEditingFinished: usbGrabberPage.commitRuleField(deviceCard.modelData.serial,
                                     deviceCard.modelData.label, "extensionFilter",
                                     text.split(",").map(s => s.trim()).filter(s => s.length > 0))
+                                // Item 13: editable text needs an I-beam.
+                                HoverHandler { cursorShape: Qt.IBeamCursor }
                             }
                             Switch {
                                 id: devicePreserveSwitch
@@ -4026,6 +5198,8 @@ Rectangle {
                             background: UnderlineField { focused: deviceStartFolderField.activeFocus }
                             onEditingFinished: usbGrabberPage.commitRuleField(deviceCard.modelData.serial,
                                 deviceCard.modelData.label, "startFolder", text)
+                            // Item 13: editable text needs an I-beam.
+                            HoverHandler { cursorShape: Qt.IBeamCursor }
                         }
                     }
                 }
@@ -4090,6 +5264,96 @@ Rectangle {
                             font.pixelSize: 11
                             wrapMode: Text.WordWrap
                         }
+                    }
+                }
+            }
+        }
+    }
+
+    // Item 2 (delete): confirmation for the open file's "Delete transcript" /
+    // "Delete file" icon actions. Message + confirm label switch on
+    // mainPanel.pendingDeleteMode; the files go to the trash (recoverable) but
+    // a destructive click still confirms first.
+    Popup {
+        id: deleteFileConfirmPopup
+        anchors.centerIn: Overlay.overlay
+        width: 320
+        padding: 12
+        modal: true
+        dim: true
+        focus: true
+        closePolicy: Popup.CloseOnPressOutside | Popup.CloseOnEscape
+
+        background: Rectangle {
+            color: "#242424"
+            radius: AppSettings.borderRadius
+            border.width: 1
+            border.color: "#3a3a3a"
+        }
+
+        ColumnLayout {
+            width: deleteFileConfirmPopup.width - deleteFileConfirmPopup.padding * 2
+            spacing: 10
+
+            Label {
+                Layout.fillWidth: true
+                wrapMode: Text.WordWrap
+                text: mainPanel.pendingDeleteMode === "transcript"
+                      ? qsTr("Delete this transcript? The audio file is kept. Moved to the trash.")
+                      : qsTr("Delete this file and its transcript? Moved to the trash.")
+                color: "white"
+                font.pixelSize: 12
+            }
+
+            RowLayout {
+                Layout.alignment: Qt.AlignRight
+                spacing: 6
+
+                Item {
+                    id: deleteFileCancelButton
+                    Layout.preferredWidth: deleteFileCancelLabel.implicitWidth + 16
+                    Layout.preferredHeight: 24
+                    HoverHandler {
+                        id: deleteFileCancelHover
+                        cursorShape: Qt.PointingHandCursor
+                    }
+                    TapHandler {
+                        onTapped: deleteFileConfirmPopup.close()
+                    }
+                    HoverBorder {
+                        anchors.fill: parent
+                        active: deleteFileCancelHover.hovered
+                    }
+                    Text {
+                        id: deleteFileCancelLabel
+                        anchors.centerIn: parent
+                        text: qsTr("Cancel")
+                        color: "#aaaaaa"
+                        font.pixelSize: 12
+                    }
+                }
+
+                Item {
+                    id: deleteFileConfirmButton
+                    Layout.preferredWidth: deleteFileConfirmLabel.implicitWidth + 16
+                    Layout.preferredHeight: 24
+                    HoverHandler {
+                        id: deleteFileConfirmHover
+                        cursorShape: Qt.PointingHandCursor
+                    }
+                    TapHandler {
+                        onTapped: mainPanel.confirmFileDelete()
+                    }
+                    HoverBorder {
+                        anchors.fill: parent
+                        active: deleteFileConfirmHover.hovered
+                    }
+                    Text {
+                        id: deleteFileConfirmLabel
+                        anchors.centerIn: parent
+                        text: mainPanel.pendingDeleteMode === "transcript" ? qsTr("Delete transcript") : qsTr("Delete file")
+                        color: "#e07a7a"
+                        font.pixelSize: 12
                     }
                 }
             }

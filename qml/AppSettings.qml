@@ -75,6 +75,13 @@ Item {
     // mechanism as tagReuseBias above.
     property real wordiness: 0.5
 
+    // Item 27: chapter-generation density (0.0-1.0) passed straight through
+    // to TranscriptionController::generateChapters() (default 0.5). Unlike
+    // wordiness/tagReuseBias (which map to 3 discrete prompt tiers) this is a
+    // genuinely continuous knob — higher = more chapters. Same vault-scoped/
+    // debounced-save/reset mechanism as the sliders above.
+    property real chapterDensity: 0.5
+
     // Thin white translucent edge by default — "liquid glass" look.
     property bool rimEnabled: true
     property real rimWidth: 1
@@ -166,10 +173,20 @@ Item {
     // above) — same shape as the rimEnabled/rimWidth/rimColor triple, plus
     // one extra numeric (progressGlowRadius) for how far the glow blur
     // extends, since a glow needs both a thickness and a blur spread.
-    property bool progressGlowEnabled: false
+    property bool progressGlowEnabled: true
     property color progressGlowColor: "#ffffff"
     property real progressGlowWidth: 2
     property real progressGlowRadius: 8
+    // How many stacked halo layers sit behind the opaque core line (the core
+    // line itself is always present and NOT counted here). BottomBar.qml's
+    // Repeater interpolates each layer's width and opacity across this count,
+    // so 2 reproduces the original hand-written outer(~0.15)/inner(~0.35)
+    // pair and higher counts smooth/deepen the glow.
+    property int progressGlowLayerCount: 2
+    // When the glow is enabled, hide the standard determinate ProgressBar so
+    // the glow does the job alone. Independent of progressGlowEnabled so a
+    // user can turn this off to show both at once.
+    property bool progressGlowHidesBar: true
 
     // Split-recording combine (see TranscriptionController::
     // findCombineGroups()'s doc comment): what happens to a group's original
@@ -239,6 +256,7 @@ Item {
         restrictTagsToExisting: false,
         tagReuseBias: 0.5,
         wordiness: 0.5,
+        chapterDensity: 0.5,
         highlightColor: "#3a5a7a",
         highlightRadius: 8,
         sidebarSelectionColor: "#33ffffff",
@@ -250,10 +268,12 @@ Item {
         defaultModel: "base.en",
         defaultSpeakerDetection: true,
         sortMode: "name",
-        progressGlowEnabled: false,
+        progressGlowEnabled: true,
         progressGlowColor: "#ffffff",
         progressGlowWidth: 2,
         progressGlowRadius: 8,
+        progressGlowLayerCount: 2,
+        progressGlowHidesBar: true,
         deleteOriginalsAfterCombine: false,
         recordingOutputFolder: "",
         recordingMicGain: 1.0,
@@ -353,6 +373,8 @@ Item {
         function onAutoLabelEnabledChanged() { appSettings.scheduleSave() }
         function onRestrictTagsToExistingChanged() { appSettings.scheduleSave() }
         function onTagReuseBiasChanged() { appSettings.scheduleSave() }
+        function onWordinessChanged() { appSettings.scheduleSave() }
+        function onChapterDensityChanged() { appSettings.scheduleSave() }
         function onHighlightColorChanged() { appSettings.scheduleSave() }
         function onHighlightRadiusChanged() { appSettings.scheduleSave() }
         function onSidebarSelectionColorChanged() { appSettings.scheduleSave() }
@@ -368,6 +390,8 @@ Item {
         function onProgressGlowColorChanged() { appSettings.scheduleSave() }
         function onProgressGlowWidthChanged() { appSettings.scheduleSave() }
         function onProgressGlowRadiusChanged() { appSettings.scheduleSave() }
+        function onProgressGlowLayerCountChanged() { appSettings.scheduleSave() }
+        function onProgressGlowHidesBarChanged() { appSettings.scheduleSave() }
         function onDeleteOriginalsAfterCombineChanged() { appSettings.scheduleSave() }
         function onRecordingOutputFolderChanged() { appSettings.scheduleSave() }
         function onRecordingMicGainChanged() { appSettings.scheduleSave() }

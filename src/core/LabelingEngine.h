@@ -115,8 +115,23 @@ public:
     // multi-hour file silently only getting chapters for its first stretch
     // would read as a bug, not a documented limit.
     //
+    // Item 27 (chapter density): density is a 0.0-1.0 slider (mirrors label()'s
+    // wordiness) controlling HOW MANY boundaries to propose — low ("only the
+    // few most significant topic shifts") vs high ("granular, up to ~30
+    // chapters"). Fed into the system prompt as a 3-tier qualitative
+    // instruction (see chapterSystemPrompt()), not a bare number a small
+    // model calibrates poorly against. Default 0.5 == the mid tier this
+    // prompt always used before density existed.
+    //
     // Returns std::nullopt on failure (errorOut set if given).
-    std::optional<QList<Chapter>> generateChapters(const QStringList &segmentTexts, QString *errorOut = nullptr);
+    std::optional<QList<Chapter>> generateChapters(const QStringList &segmentTexts, double density = 0.5,
+                                                    QString *errorOut = nullptr);
+
+    // Item 27: the density-parameterized chapter system prompt generateChapters()
+    // uses internally — exposed static so it's unit-testable directly (a low
+    // vs high density must produce materially different instruction text)
+    // without loading a ~2.5GB GGUF.
+    static QString chapterSystemPrompt(double density);
 
     // Follow-up to generateChapters() above: small instruct models are
     // unreliable at the open-ended "how many boundaries does this transcript
@@ -152,8 +167,15 @@ public:
     // generateChapters(). Callers that would rather keep an unmerged result
     // than fail the whole job on a transient generation error should treat
     // that as non-fatal and fall back to the input list.
+    //
+    // Item 27: density (0.0-1.0, same slider generateChapters() takes) tunes
+    // this pass's aggressiveness in the opposite direction — a HIGH density
+    // (the user wants MORE chapters) makes the per-pair prompt err toward
+    // KEEPING adjacent chapters separate, a LOW density errs strongly toward
+    // merging. Default 0.5 == the neutral "err toward merging unless clearly
+    // different" wording this pass used before density existed.
     std::optional<QList<Chapter>> mergeSimilarChapters(const QList<Chapter> &chapters,
-                                                         const QStringList &segmentTexts,
+                                                         const QStringList &segmentTexts, double density = 0.5,
                                                          QString *errorOut = nullptr);
 
     // Item P34: the same limit generateChapters() truncates to internally

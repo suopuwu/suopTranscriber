@@ -139,6 +139,38 @@ usually sentence-ish. Start by highlighting native segments as-is. Only if neede
 later, merge/split on `.?!`, keeping the first segment's `t0` and the last's `t1`.
 Do not build that on day one.
 
+## Speaker diarization
+
+Speaker detection is a **separate engine** from transcription — `DiarizationEngine`
+(`src/core/DiarizationEngine.h/.cpp`), sherpa-onnx's pyannote segmentation +
+WeSpeaker embedding + agglomerative clustering, independent of which whisper
+model is selected (unlike the old tdrz heuristic, it never constrains model
+choice). Speaker count is always auto-detected via a clustering distance
+threshold — no "number of speakers" UI.
+
+It runs one full pass over the same 16 kHz mono PCM whisper transcribes,
+producing `DiarizedTurn`s (`{start, end, speaker}`), and each segment is tagged
+with the diarized turn it overlaps most (`labelForSegment`). Two ways to invoke
+it, both through `TranscriptionController`'s single worker thread and sharing one
+diarization-core routine (`TranscriptionWorker::runDiarizationPass`):
+
+- **Inline, at transcribe time** — the `speakerDetection` toggle. Diarization
+  runs *before* whisper so the real speaker-label set is known when frontmatter
+  is written; each segment is labeled as it streams in. A failure here never
+  blocks transcription — ASR still runs, ASR-only, and frontmatter records
+  `speakerDetection: false` + `speakerDetectionError` (never-misrepresent).
+- **Standalone, after the fact** — the `diarizeOnly` job (`diarizeFile()`, the
+  MainPanel "Detect speakers" action). Re-runs (or adds) speaker detection on an
+  already-transcribed file *without* re-transcribing: reads the existing `.md`'s
+  segments, decodes the audio, diarizes, and splices the speaker tags back in
+  (`spliceBodySpeakers`). A diarization failure here *is* the job's result.
+
+Speakers are written **into the `.md`**: a leading `[Speaker N]` tag on each
+segment line (the tag text is the display name — renaming rewrites the tags in
+the body), plus a `speakers:` frontmatter allowlist of the labels actually used.
+Diarization has **no mid-pass abort hook** (sherpa-onnx's progress callback is
+`void`), so a cancel takes effect at the post-diarize checkpoint, not instantly.
+
 ## Durable / resumable transcription
 
 Independent of highlighting granularity — this exists for the resume requirement.

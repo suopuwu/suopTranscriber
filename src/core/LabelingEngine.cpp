@@ -85,18 +85,38 @@ const char *kSystemPromptSuffix =
 // Feature 3a: the user message is the indexed segment list itself (built in
 // generateChapters() below, "0: text\n1: text\n..."), so this only needs to
 // explain the task and the exact response shape — same register as the
-// label/prelude prompt above, phrased for a small instruct model.
-const char *kChapterSystemPrompt =
+// label/prelude prompt above, phrased for a small instruct model. Item 27:
+// the density instruction that used to be a fixed "Up to about 20 chapters"
+// sentence now sits between this prefix and suffix (see
+// chapterDensityPhrasing() / LabelingEngine::chapterSystemPrompt()).
+const char *kChapterSystemPromptPrefix =
     "You divide an audio transcript into chapters. You are given the transcript as a "
     "numbered list of its segments, one per line, formatted \"INDEX: text\". Propose chapter "
     "boundaries only where the topic or subject actually changes — do not add a boundary just "
     "because time has passed. A transcript covering one continuous topic throughout may need "
-    "zero boundaries; do not force chapters into it. Up to about 20 chapters for a very long, "
-    "multi-topic transcript. For each chapter boundary (skip the very first chapter — it "
+    "zero boundaries; do not force chapters into it. ";
+const char *kChapterSystemPromptSuffix =
+    " For each chapter boundary (skip the very first chapter — it "
     "always starts at segment 0 implicitly), return \"afterSegment\": the index of the LAST "
     "segment of the PREVIOUS chapter, so the new chapter begins right after it; and \"title\": "
     "a short (a few words) descriptive title for the chapter that STARTS there. Respond with "
     "ONLY a JSON array of these objects, ordered by afterSegment ascending, nothing else.";
+
+// Item 27: density (0.0-1.0) -> how many chapters to propose. 3-tier
+// qualitative phrasing (same style as labelPreludePhrasing/tagReuseBias) — a
+// small model follows a clear instruction far more reliably than it calibrates
+// against a bare number. Mid tier is the exact "up to ~20" wording this prompt
+// used before density existed.
+QString chapterDensityPhrasing(double density)
+{
+    if (density >= 0.67)
+        return QStringLiteral("Be granular: add a boundary wherever the topic meaningfully shifts, up to "
+                              "about 30 chapters for a long, multi-topic transcript.");
+    if (density >= 0.34)
+        return QStringLiteral("Up to about 20 chapters for a very long, multi-topic transcript.");
+    return QStringLiteral("Be conservative: propose boundaries ONLY at the few most significant topic "
+                          "shifts — a handful of chapters at most, even for a long transcript.");
+}
 
 // mergeSimilarChapters() follow-up pass: a plain yes/no decision, not a JSON
 // object — there's nothing else to constrain the shape of.
@@ -104,19 +124,33 @@ constexpr auto kChapterMergeGrammar = R"GBNF(
 root ::= "yes" | "no"
 )GBNF";
 
-// Companion to kChapterSystemPrompt: rather than tuning that prompt further
+// Companion to chapterSystemPrompt(): rather than tuning that prompt further
 // to make the model more conservative about proposing boundaries in the
 // first place (small instruct models are unreliable at open-ended "how many
 // boundaries does this need" judgment calls), this runs a SEPARATE, much
 // narrower pass afterward — a single bounded yes/no per adjacent pair — to
 // collapse over-eager chapters back down. See
 // LabelingEngine::mergeSimilarChapters()'s doc comment for the scan shape.
-const char *kChapterMergeSystemPrompt =
-    "You are shown two ADJACENT chapters from an audio transcript, each as a title and a short "
-    "excerpt of its actual content. Decide whether they are close enough in topic that they "
-    "should be merged into a single chapter, rather than kept as two separate ones — err toward "
-    "merging unless they are clearly about different things. Respond with ONLY \"yes\" or "
-    "\"no\", nothing else.";
+// Item 27: density tunes the merge bias INVERSELY to generateChapters() — a
+// high density (user wants more chapters) keeps adjacent chapters separate
+// unless near-duplicate; a low density merges aggressively.
+QString chapterMergeSystemPrompt(double density)
+{
+    QString bias;
+    if (density >= 0.67)
+        bias = QStringLiteral("Keep them SEPARATE unless they are clearly about the same specific topic — "
+                              "only merge near-duplicates.");
+    else if (density >= 0.34)
+        bias = QStringLiteral("Err toward merging unless they are clearly about different things.");
+    else
+        bias = QStringLiteral("Err STRONGLY toward merging — only keep them separate if they are plainly "
+                              "about entirely different topics.");
+    return QStringLiteral("You are shown two ADJACENT chapters from an audio transcript, each as a title "
+                          "and a short excerpt of its actual content. Decide whether they are close enough "
+                          "in topic that they should be merged into a single chapter, rather than kept as "
+                          "two separate ones. %1 Respond with ONLY \"yes\" or \"no\", nothing else.")
+        .arg(bias);
+}
 
 // Feature 1: 0.0-1.0 slider controlling how verbose the generated label and
 // prelude are, independent of the tag-related options below. 3-tier phrasing
@@ -126,6 +160,14 @@ const char *kChapterMergeSystemPrompt =
 // the wording this prompt always used before wordiness/prelude existed.
 QString labelPreludePhrasing(double wordiness)
 {
+    // Item 58: a very-long transcript should be allowed a fuller prelude than
+    // the old top tier's "detailed multi-sentence" — relabelJob() raises the
+    // EFFECTIVE wordiness into this >=0.9 tier for multi-hour transcripts (see
+    // TranscriptionController::effectiveWordinessForLength()), so a 2-3 hour
+    // recording gets a walk-through-each-topic prelude, not a single paragraph.
+    if (wordiness >= 0.9)
+        return QStringLiteral("a descriptive label (up to a short phrase), a thorough multi-paragraph prelude "
+                              "that walks through each major topic covered in the transcript");
     if (wordiness >= 0.67)
         return QStringLiteral("a descriptive label (up to a short phrase), a detailed multi-sentence prelude");
     if (wordiness >= 0.34)
@@ -374,7 +416,14 @@ std::optional<LabelResult> LabelingEngine::label(const QString &transcriptText, 
     return result;
 }
 
-std::optional<QList<Chapter>> LabelingEngine::generateChapters(const QStringList &segmentTexts, QString *errorOut)
+QString LabelingEngine::chapterSystemPrompt(double density)
+{
+    return QString::fromUtf8(kChapterSystemPromptPrefix) + chapterDensityPhrasing(density)
+        + QString::fromUtf8(kChapterSystemPromptSuffix);
+}
+
+std::optional<QList<Chapter>> LabelingEngine::generateChapters(const QStringList &segmentTexts, double density,
+                                                                QString *errorOut)
 {
     QString indexed;
     indexed.reserve(segmentTexts.size() * 24);
@@ -394,7 +443,7 @@ std::optional<QList<Chapter>> LabelingEngine::generateChapters(const QStringList
                    << "chars — chapters past that point will not be proposed";
     }
 
-    const auto response = runGrammarConstrained(QString::fromUtf8(kChapterSystemPrompt), indexed, kChapterGrammar,
+    const auto response = runGrammarConstrained(chapterSystemPrompt(density), indexed, kChapterGrammar,
                                                  kMaxChapterOutputTokens, errorOut);
     if (!response)
         return std::nullopt;
@@ -421,7 +470,7 @@ std::optional<QList<Chapter>> LabelingEngine::generateChapters(const QStringList
 
 std::optional<QList<Chapter>> LabelingEngine::mergeSimilarChapters(const QList<Chapter> &chapters,
                                                                      const QStringList &segmentTexts,
-                                                                     QString *errorOut)
+                                                                     double density, QString *errorOut)
 {
     if (chapters.size() < 2)
         return chapters;
@@ -447,7 +496,7 @@ std::optional<QList<Chapter>> LabelingEngine::mergeSimilarChapters(const QList<C
                                            candidate.title,
                                            chapterExcerpt(segmentTexts, candidate.afterSegmentIndex + 1));
 
-        const auto response = runGrammarConstrained(QString::fromUtf8(kChapterMergeSystemPrompt), userText,
+        const auto response = runGrammarConstrained(chapterMergeSystemPrompt(density), userText,
                                                       kChapterMergeGrammar, kChapterMergeOutputTokens, errorOut);
         if (!response)
             return std::nullopt;

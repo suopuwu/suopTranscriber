@@ -15,6 +15,16 @@ Popup {
     property var transcriptionController: null
     property var vaultTreeModel: null
 
+    // Item 38: the settings dialog is split into pages selected from a
+    // left-hand navigation rail. currentPage indexes into pageNames and gates
+    // which per-section wrappers in contentColumn are visible, so the user
+    // sees one page at a time instead of one giant scroll. Purely a
+    // presentation reorg — every control/binding/save-hook is unchanged, only
+    // grouped behind a page gate.
+    readonly property var pageNames: [qsTr("Appearance"), qsTr("Sidebar & Layout"),
+                                      qsTr("Transcription & AI"), qsTr("Combine")]
+    property int currentPage: 0
+
     // Rule-list-level overlap warnings (see computeRuleOverlaps()'s doc
     // comment). Deliberately NOT a plain `property var x: <binding>` —
     // vaultTreeModel.allAudioPaths() is a Q_INVOKABLE with no NOTIFY
@@ -83,8 +93,14 @@ Popup {
         }
     }
 
-    width: 440
-    height: Math.min(contentColumn.implicitHeight + 32, maxHeight)
+    width: 640
+    // Sized to the ACTIVE page: contentColumn.implicitHeight reflects only the
+    // currently-visible section wrappers (a ColumnLayout excludes invisible
+    // children), so the popup grows/shrinks per page and caps at maxHeight
+    // (then the ScrollView scrolls). Also floored to fit the nav rail.
+    height: Math.min(maxHeight,
+                     Math.max(navColumn.implicitHeight + 32,
+                              headerRow.implicitHeight + contentColumn.implicitHeight + 42))
     // Modal: Overlay.overlay's automatic block-plane now genuinely blocks
     // clicks/drags to Sidebar/MainPanel/BottomBar/TitleBar while this is
     // open (a previous `modal: false` + input-swallowing MouseArea
@@ -122,6 +138,7 @@ Popup {
                                || highlightRadiusSlider.pressed
                                || timestampDecimalPlacesSlider.pressed
                                || progressGlowWidthSlider.pressed || progressGlowRadiusSlider.pressed
+                               || progressGlowLayerCountSlider.pressed
                                || sidebarEdgeLeftMarginSlider.pressed || sidebarContentLeftMarginSlider.pressed
                                || sidebarRightMarginSlider.pressed
 
@@ -154,11 +171,15 @@ Popup {
                 || !AppSettings.isDefault("autoLabelEnabled")
                 || !AppSettings.isDefault("restrictTagsToExisting")
                 || !AppSettings.isDefault("tagReuseBias")
+                || !AppSettings.isDefault("wordiness")
+                || !AppSettings.isDefault("chapterDensity")
                 || !AppSettings.isDefault("timestampDecimalPlaces")
                 || !AppSettings.isDefault("progressGlowEnabled")
                 || !AppSettings.isDefault("progressGlowColor")
                 || !AppSettings.isDefault("progressGlowWidth")
                 || !AppSettings.isDefault("progressGlowRadius")
+                || !AppSettings.isDefault("progressGlowLayerCount")
+                || !AppSettings.isDefault("progressGlowHidesBar")
                 || !AppSettings.isDefault("deleteOriginalsAfterCombine")
                 || !AppSettings.isDefault("sidebarEdgeLeftMargin")
                 || !AppSettings.isDefault("sidebarContentLeftMargin")
@@ -241,6 +262,12 @@ Popup {
     function escapeRegexPreviewHtml(s) {
         return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
     }
+    // Literal characters get an explicit light color too (#c9d4c9, the same
+    // "literal" shade classifyFilenameHtml()'s colorFor table already uses
+    // below) — not just the metacharacters. The readout Text this feeds has
+    // no color set of its own (textFormat: Text.RichText spans control it
+    // entirely), so an unstyled literal character fell through to Qt Quick's
+    // default black, nearly invisible against this popup's dark background.
     function highlightPattern(pattern) {
         const meta = ".^$*+?()[]{}|\\"
         let out = ""
@@ -248,7 +275,7 @@ Popup {
             const c = pattern[i]
             out += meta.indexOf(c) >= 0
                     ? "<span style=\"color:#e8a33d; font-weight:bold;\">" + escapeRegexPreviewHtml(c) + "</span>"
-                    : escapeRegexPreviewHtml(c)
+                    : "<span style=\"color:#c9d4c9;\">" + escapeRegexPreviewHtml(c) + "</span>"
         }
         return out
     }
@@ -905,17 +932,140 @@ Popup {
         onAccepted: AppSettings.progressGlowColor = selectedColor
     }
 
-    ScrollView {
-        id: scrollArea
-        anchors.fill: parent
+    // Item 38: left navigation rail — one entry per page in pageNames. Each
+    // entry sets currentPage; the matching section wrappers in contentColumn
+    // show, the rest hide. Anchored (not in a Layout) so scrollArea/the
+    // middle-drag overlay can anchor to its right edge as siblings.
+    ColumnLayout {
+        id: navColumn
+        anchors.left: parent.left
+        anchors.top: parent.top
+        anchors.bottom: parent.bottom
         anchors.leftMargin: 16
         anchors.topMargin: 16
         anchors.bottomMargin: 16
+        width: 150
+        spacing: 4
+
+        Repeater {
+            model: settingsPopup.pageNames
+            delegate: Button {
+                id: navButton
+                required property int index
+                required property string modelData
+                readonly property bool selected: settingsPopup.currentPage === navButton.index
+                Layout.fillWidth: true
+                text: modelData
+                hoverEnabled: true
+                onClicked: settingsPopup.currentPage = navButton.index
+
+                contentItem: Text {
+                    text: navButton.text
+                    color: "white"
+                    font.pixelSize: 13
+                    font.bold: navButton.selected
+                    leftPadding: 8
+                    horizontalAlignment: Text.AlignLeft
+                    verticalAlignment: Text.AlignVCenter
+                    elide: Text.ElideRight
+                }
+                background: Rectangle {
+                    radius: AppSettings.borderRadius
+                    color: navButton.selected
+                            ? Qt.rgba(AppSettings.highlightColor.r, AppSettings.highlightColor.g,
+                                      AppSettings.highlightColor.b, 0.22)
+                            : (navButton.hovered ? "#2f2f2f" : "transparent")
+                    border.width: navButton.selected ? 1 : 0
+                    border.color: AppSettings.highlightColor
+                }
+                HoverHandler {
+                    cursorShape: Qt.PointingHandCursor
+                }
+                HoverBorder {
+                    anchors.fill: parent
+                    active: navButton.hovered
+                }
+            }
+        }
+        Item { Layout.fillHeight: true }
+    }
+
+    // Persistent dialog chrome — title + global actions, reachable from every
+    // page (Item 38 moved these out of the scrolling content).
+    RowLayout {
+        id: headerRow
+        anchors.left: navColumn.right
+        anchors.right: parent.right
+        anchors.top: parent.top
+        anchors.leftMargin: 12
+        anchors.topMargin: 16
+        anchors.rightMargin: 16
+        spacing: 8
+
+        Label {
+            Layout.fillWidth: true
+            text: qsTr("Settings")
+            color: "white"
+            font.bold: true
+            font.pixelSize: 16
+        }
+        Button {
+            id: changeVaultButton
+            text: qsTr("Change Vault")
+            hoverEnabled: true
+            onClicked: settingsPopup.changeVaultRequested()
+
+            background: Rectangle {
+                radius: AppSettings.borderRadius
+                color: (changeVaultButton.hovered && changeVaultButton.enabled) ? "#3a3a3a" : "#2a2a2a"
+                border.width: 1
+                border.color: "#3a3a3a"
+            }
+            HoverHandler {
+                cursorShape: Qt.PointingHandCursor
+            }
+            HoverBorder {
+                anchors.fill: parent
+                active: changeVaultButton.hovered
+            }
+        }
+        Button {
+            id: resetAllButton
+            text: qsTr("Reset to defaults")
+            enabled: settingsPopup.anySettingDirty()
+            opacity: enabled ? 1 : 0.35
+            hoverEnabled: enabled
+            onClicked: AppSettings.resetAll()
+
+            background: Rectangle {
+                radius: AppSettings.borderRadius
+                color: (resetAllButton.hovered && resetAllButton.enabled) ? "#3a3a3a" : "#2a2a2a"
+                border.width: 1
+                border.color: "#3a3a3a"
+            }
+            HoverHandler {
+                cursorShape: Qt.PointingHandCursor
+                enabled: resetAllButton.enabled
+            }
+            HoverBorder {
+                anchors.fill: parent
+                active: resetAllButton.enabled && resetAllButton.hovered
+            }
+        }
+    }
+
+    ScrollView {
+        id: scrollArea
+        anchors.left: navColumn.right
+        anchors.right: parent.right
+        anchors.top: headerRow.bottom
+        anchors.bottom: parent.bottom
+        anchors.leftMargin: 12
+        anchors.topMargin: 10
+        anchors.bottomMargin: 16
         // Reduced by the same 14px contentColumn reserves below for the
-        // scrollbar overlay — keeps the CONTENT symmetric (16px inset on
-        // both sides) by giving the scrollbar its own lane inside the right
-        // margin, instead of 14px of clearance stacking on top of a full
-        // 16px margin and making the popup look lopsided.
+        // scrollbar overlay — keeps the CONTENT symmetric by giving the
+        // scrollbar its own lane inside the right margin.
         anchors.rightMargin: 2
         clip: true
         ScrollBar.horizontal.policy: ScrollBar.AlwaysOff
@@ -966,68 +1116,11 @@ Popup {
             clip: true
             spacing: 10
 
-            RowLayout {
+            // ===== Page 0: Appearance section (Item 38 page wrapper) =====
+            ColumnLayout {
                 Layout.fillWidth: true
-                Label {
-                    Layout.fillWidth: true
-                    text: qsTr("Settings")
-                    color: "white"
-                    font.bold: true
-                    font.pixelSize: 16
-                }
-                Button {
-                    id: resetAllButton
-                    text: qsTr("Reset to defaults")
-                    enabled: settingsPopup.anySettingDirty()
-                    opacity: enabled ? 1 : 0.35
-                    hoverEnabled: enabled
-                    onClicked: AppSettings.resetAll()
-
-                    background: Rectangle {
-                        radius: AppSettings.borderRadius
-                        color: (resetAllButton.hovered && resetAllButton.enabled) ? "#3a3a3a" : "#2a2a2a"
-                        border.width: 1
-                        border.color: "#3a3a3a"
-                    }
-                    HoverHandler {
-                        cursorShape: Qt.PointingHandCursor
-                        enabled: resetAllButton.enabled
-                    }
-                    HoverBorder {
-                        anchors.fill: parent
-                        active: resetAllButton.enabled && resetAllButton.hovered
-                    }
-                }
-            }
-
-            RowLayout {
-                Layout.fillWidth: true
-                Label {
-                    Layout.fillWidth: true
-                    color: "white"
-                    text: qsTr("Vault")
-                }
-                Button {
-                    id: changeVaultButton
-                    text: qsTr("Change Vault")
-                    hoverEnabled: true
-                    onClicked: settingsPopup.changeVaultRequested()
-
-                    background: Rectangle {
-                        radius: AppSettings.borderRadius
-                        color: (changeVaultButton.hovered && changeVaultButton.enabled) ? "#3a3a3a" : "#2a2a2a"
-                        border.width: 1
-                        border.color: "#3a3a3a"
-                    }
-                    HoverHandler {
-                        cursorShape: Qt.PointingHandCursor
-                    }
-                    HoverBorder {
-                        anchors.fill: parent
-                        active: changeVaultButton.hovered
-                    }
-                }
-            }
+                spacing: 10
+                visible: settingsPopup.currentPage === 0
 
             Label {
                 text: qsTr("Appearance")
@@ -1039,6 +1132,7 @@ Popup {
                 Layout.fillWidth: true
                 Label {
                     Layout.preferredWidth: 90
+                    elide: Text.ElideRight
                     color: "white"
                     text: qsTr("Border radius")
                 }
@@ -1167,6 +1261,14 @@ Popup {
                 }
             }
 
+            }
+
+            // ===== Page 1: Sidebar section (Item 38 page wrapper) =====
+            ColumnLayout {
+                Layout.fillWidth: true
+                spacing: 10
+                visible: settingsPopup.currentPage === 1
+
             Label {
                 text: qsTr("Sidebar")
                 color: "white"
@@ -1232,6 +1334,7 @@ Popup {
                 Layout.fillWidth: true
                 Label {
                     Layout.preferredWidth: 90
+                    elide: Text.ElideRight
                     color: "white"
                     text: qsTr("Opacity")
                 }
@@ -1474,6 +1577,7 @@ Popup {
                 Layout.fillWidth: true
                 Label {
                     Layout.preferredWidth: 90
+                    elide: Text.ElideRight
                     color: "white"
                     text: qsTr("Left edge margin")
                 }
@@ -1557,6 +1661,7 @@ Popup {
                 Layout.fillWidth: true
                 Label {
                     Layout.preferredWidth: 90
+                    elide: Text.ElideRight
                     color: "white"
                     text: qsTr("Left content margin")
                 }
@@ -1640,6 +1745,7 @@ Popup {
                 Layout.fillWidth: true
                 Label {
                     Layout.preferredWidth: 90
+                    elide: Text.ElideRight
                     color: "white"
                     text: qsTr("Right margin")
                 }
@@ -1719,6 +1825,14 @@ Popup {
                 }
             }
 
+            }
+
+            // Main panel section (page 1)
+            ColumnLayout {
+                Layout.fillWidth: true
+                spacing: 10
+                visible: settingsPopup.currentPage === 1
+
             Label {
                 text: qsTr("Main panel")
                 color: "white"
@@ -1784,6 +1898,7 @@ Popup {
                 Layout.fillWidth: true
                 Label {
                     Layout.preferredWidth: 90
+                    elide: Text.ElideRight
                     color: "white"
                     text: qsTr("Opacity")
                 }
@@ -1912,6 +2027,14 @@ Popup {
                 }
             }
 
+            }
+
+            // Rim section (page 0)
+            ColumnLayout {
+                Layout.fillWidth: true
+                spacing: 10
+                visible: settingsPopup.currentPage === 0
+
             Label {
                 text: qsTr("Rim")
                 color: "white"
@@ -1971,6 +2094,7 @@ Popup {
                 Layout.fillWidth: true
                 Label {
                     Layout.preferredWidth: 90
+                    elide: Text.ElideRight
                     color: "white"
                     text: qsTr("Width")
                 }
@@ -2105,6 +2229,14 @@ Popup {
                 }
             }
 
+            }
+
+            // Accent Color section (page 0)
+            ColumnLayout {
+                Layout.fillWidth: true
+                spacing: 10
+                visible: settingsPopup.currentPage === 0
+
             // Shared accent color for hover outlines (HoverBorder.qml) and
             // the always-editable-field focus underline
             // (UnderlineField.qml) — both were hardcoded "white" before.
@@ -2168,6 +2300,14 @@ Popup {
                     }
                 }
             }
+
+            }
+
+            // Sentence Highlight section (page 0)
+            ColumnLayout {
+                Layout.fillWidth: true
+                spacing: 10
+                visible: settingsPopup.currentPage === 0
 
             Label {
                 text: qsTr("Sentence Highlight")
@@ -2237,6 +2377,7 @@ Popup {
                 Layout.fillWidth: true
                 Label {
                     Layout.preferredWidth: 90
+                    elide: Text.ElideRight
                     color: "white"
                     text: qsTr("Radius")
                 }
@@ -2323,6 +2464,14 @@ Popup {
                 color: "#888888"
                 font.pixelSize: 11
             }
+
+            }
+
+            // Progress Glow section (page 0)
+            ColumnLayout {
+                Layout.fillWidth: true
+                spacing: 10
+                visible: settingsPopup.currentPage === 0
 
             Label {
                 text: qsTr("Progress Glow")
@@ -2449,6 +2598,7 @@ Popup {
                 visible: progressGlowEnabledSwitch.checked
                 Label {
                     Layout.preferredWidth: 90
+                    elide: Text.ElideRight
                     color: "white"
                     text: qsTr("Width")
                 }
@@ -2533,6 +2683,7 @@ Popup {
                 visible: progressGlowEnabledSwitch.checked
                 Label {
                     Layout.preferredWidth: 90
+                    elide: Text.ElideRight
                     color: "white"
                     text: qsTr("Glow radius")
                 }
@@ -2612,6 +2763,160 @@ Popup {
                 }
             }
 
+            RowLayout {
+                Layout.fillWidth: true
+                visible: progressGlowEnabledSwitch.checked
+                Label {
+                    Layout.preferredWidth: 90
+                    elide: Text.ElideRight
+                    color: "white"
+                    text: qsTr("Layers")
+                }
+                Slider {
+                    id: progressGlowLayerCountSlider
+                    Layout.fillWidth: true
+                    Layout.minimumWidth: 80
+                    from: 1
+                    to: 5
+                    stepSize: 1
+                    snapMode: Slider.SnapAlways
+                    value: AppSettings.progressGlowLayerCount
+                    hoverEnabled: true
+                    onMoved: AppSettings.progressGlowLayerCount = Math.round(value)
+
+                    HoverHandler {
+                        cursorShape: Qt.PointingHandCursor
+                    }
+                    HoverBorder {
+                        anchors.fill: parent
+                        active: progressGlowLayerCountSlider.hovered
+                    }
+                }
+                TextField {
+                    id: progressGlowLayerCountField
+                    Layout.preferredWidth: 56
+                    horizontalAlignment: TextInput.AlignRight
+                    hoverEnabled: true
+                    validator: IntValidator { bottom: progressGlowLayerCountSlider.from; top: progressGlowLayerCountSlider.to }
+                    onEditingFinished: {
+                        const v = parseInt(text)
+                        if (!isNaN(v))
+                            AppSettings.progressGlowLayerCount = Math.max(progressGlowLayerCountSlider.from, Math.min(progressGlowLayerCountSlider.to, v))
+                        text = AppSettings.progressGlowLayerCount.toFixed(0)
+                    }
+
+                    background: UnderlineField { focused: progressGlowLayerCountField.activeFocus }
+
+                    Binding {
+                        target: progressGlowLayerCountField
+                        property: "text"
+                        value: AppSettings.progressGlowLayerCount.toFixed(0)
+                        when: !progressGlowLayerCountField.activeFocus
+                    }
+
+                    HoverHandler {
+                        cursorShape: Qt.PointingHandCursor
+                    }
+                    HoverBorder {
+                        anchors.fill: parent
+                        active: progressGlowLayerCountField.hovered
+                    }
+                }
+                Button {
+                    id: progressGlowLayerCountResetButton
+                    text: "↺"
+                    implicitWidth: 22
+                    implicitHeight: 22
+
+                    background: Rectangle {
+                        radius: AppSettings.borderRadius
+                        color: "transparent"
+                        border.width: 1
+                        border.color: "#3a3a3a"
+                    }
+                    enabled: !AppSettings.isDefault("progressGlowLayerCount")
+                    opacity: enabled ? 1 : 0.35
+                    hoverEnabled: enabled
+                    onClicked: AppSettings.resetProperty("progressGlowLayerCount")
+
+                    HoverHandler {
+                        cursorShape: Qt.PointingHandCursor
+                        enabled: progressGlowLayerCountResetButton.enabled
+                    }
+                    HoverBorder {
+                        anchors.fill: parent
+                        active: progressGlowLayerCountResetButton.enabled && progressGlowLayerCountResetButton.hovered
+                    }
+                }
+            }
+
+            RowLayout {
+                Layout.fillWidth: true
+                visible: progressGlowEnabledSwitch.checked
+                Label {
+                    Layout.fillWidth: true
+                    color: "white"
+                    text: qsTr("Hide standard progress bar")
+                }
+                Switch {
+                    id: progressGlowHidesBarSwitch
+                    checked: AppSettings.progressGlowHidesBar
+                    hoverEnabled: true
+                    onToggled: AppSettings.progressGlowHidesBar = checked
+
+                    HoverHandler {
+                        cursorShape: Qt.PointingHandCursor
+                    }
+                    HoverBorder {
+                        anchors.fill: parent
+                        active: progressGlowHidesBarSwitch.hovered
+                    }
+                }
+                Button {
+                    id: progressGlowHidesBarResetButton
+                    text: "↺"
+                    implicitWidth: 22
+                    implicitHeight: 22
+
+                    background: Rectangle {
+                        radius: AppSettings.borderRadius
+                        color: "transparent"
+                        border.width: 1
+                        border.color: "#3a3a3a"
+                    }
+                    enabled: !AppSettings.isDefault("progressGlowHidesBar")
+                    opacity: enabled ? 1 : 0.35
+                    hoverEnabled: enabled
+                    onClicked: AppSettings.resetProperty("progressGlowHidesBar")
+
+                    HoverHandler {
+                        cursorShape: Qt.PointingHandCursor
+                        enabled: progressGlowHidesBarResetButton.enabled
+                    }
+                    HoverBorder {
+                        anchors.fill: parent
+                        active: progressGlowHidesBarResetButton.enabled && progressGlowHidesBarResetButton.hovered
+                    }
+                }
+            }
+
+            Label {
+                visible: progressGlowEnabledSwitch.checked
+                Layout.fillWidth: true
+                wrapMode: Text.WordWrap
+                text: qsTr("When on, the standard progress bar is hidden while the glow is active. Turn off to show both.")
+                color: "#888888"
+                font.pixelSize: 11
+            }
+
+            }
+
+            // ===== Page 1 (cont.): Timestamps section =====
+            ColumnLayout {
+                Layout.fillWidth: true
+                spacing: 10
+                visible: settingsPopup.currentPage === 1
+
             Label {
                 text: qsTr("Timestamps")
                 color: "white"
@@ -2622,6 +2927,7 @@ Popup {
                 Layout.fillWidth: true
                 Label {
                     Layout.preferredWidth: 90
+                    elide: Text.ElideRight
                     color: "white"
                     text: qsTr("Decimal places")
                 }
@@ -2710,6 +3016,14 @@ Popup {
                 color: "#888888"
                 font.pixelSize: 11
             }
+
+            }
+
+            // ===== Page 2: Files section =====
+            ColumnLayout {
+                Layout.fillWidth: true
+                spacing: 10
+                visible: settingsPopup.currentPage === 2
 
             Label {
                 text: qsTr("Files")
@@ -2922,6 +3236,14 @@ Popup {
                 }
             }
 
+            }
+
+            // AI Auto-Labeling section (page 2)
+            ColumnLayout {
+                Layout.fillWidth: true
+                spacing: 10
+                visible: settingsPopup.currentPage === 2
+
             Label {
                 text: qsTr("AI Auto-Labeling")
                 color: "white"
@@ -3056,6 +3378,7 @@ Popup {
                 visible: autoLabelEnabledSwitch.checked && !restrictTagsToExistingSwitch.checked
                 Label {
                     Layout.preferredWidth: 90
+                    elide: Text.ElideRight
                     color: "white"
                     text: qsTr("Tag reuse bias")
                 }
@@ -3134,6 +3457,7 @@ Popup {
                 visible: autoLabelEnabledSwitch.checked
                 Label {
                     Layout.preferredWidth: 90
+                    elide: Text.ElideRight
                     color: "white"
                     text: qsTr("Label wordiness")
                 }
@@ -3205,6 +3529,94 @@ Popup {
                 font.pixelSize: 11
             }
 
+            // Item 27: chapter-generation density. Deliberately NOT gated on
+            // autoLabelEnabledSwitch (unlike the two sliders above) — chapters
+            // are generated on demand via the "Generate chapters" button
+            // regardless of whether the auto-label pass is enabled, so this
+            // knob must stay reachable even with auto-labeling off. Continuous
+            // (no discrete-tier snap) since generateChapters() takes a raw
+            // 0.0-1.0 double, not a 3-way prompt tier.
+            RowLayout {
+                Layout.fillWidth: true
+                Label {
+                    Layout.preferredWidth: 90
+                    elide: Text.ElideRight
+                    color: "white"
+                    text: qsTr("Chapter density")
+                }
+                Label {
+                    text: qsTr("fewer")
+                    color: "#888888"
+                    font.pixelSize: 10
+                }
+                Slider {
+                    id: chapterDensitySlider
+                    Layout.fillWidth: true
+                    Layout.minimumWidth: 80
+                    from: 0
+                    to: 1
+                    value: AppSettings.chapterDensity
+                    hoverEnabled: true
+                    onMoved: AppSettings.chapterDensity = value
+
+                    HoverHandler {
+                        cursorShape: Qt.PointingHandCursor
+                    }
+                    HoverBorder {
+                        anchors.fill: parent
+                        active: chapterDensitySlider.hovered
+                    }
+                }
+                Label {
+                    text: qsTr("more")
+                    color: "#888888"
+                    font.pixelSize: 10
+                }
+                Button {
+                    id: chapterDensityResetButton
+                    text: "↺"
+                    implicitWidth: 22
+                    implicitHeight: 22
+
+                    background: Rectangle {
+                        radius: AppSettings.borderRadius
+                        color: "transparent"
+                        border.width: 1
+                        border.color: "#3a3a3a"
+                    }
+                    enabled: !AppSettings.isDefault("chapterDensity")
+                    opacity: enabled ? 1 : 0.35
+                    hoverEnabled: enabled
+                    onClicked: AppSettings.resetProperty("chapterDensity")
+
+                    HoverHandler {
+                        cursorShape: Qt.PointingHandCursor
+                        enabled: chapterDensityResetButton.enabled
+                    }
+                    HoverBorder {
+                        anchors.fill: parent
+                        active: chapterDensityResetButton.enabled && chapterDensityResetButton.hovered
+                    }
+                }
+            }
+
+            Label {
+                Layout.fillWidth: true
+                wrapMode: Text.WordWrap
+                text: qsTr("How many chapters \"Generate chapters\" produces. Fewer: only major "
+                           + "topic shifts. More: finer-grained sections.")
+                color: "#888888"
+                font.pixelSize: 11
+            }
+
+            }
+
+            // ===== Page 3: Combine split recordings section =====
+            ColumnLayout {
+                Layout.fillWidth: true
+                spacing: 10
+                visible: settingsPopup.currentPage === 3
+
             Label {
                 text: qsTr("Combine split recordings")
                 color: "white"
@@ -3268,59 +3680,6 @@ Popup {
                     HoverBorder {
                         anchors.fill: parent
                         active: deleteOriginalsAfterCombineResetButton.enabled && deleteOriginalsAfterCombineResetButton.hovered
-                    }
-                }
-            }
-
-            Popup {
-                id: regexHelpPopup
-                width: 340
-                modal: false
-                focus: false
-                closePolicy: Popup.CloseOnEscape | Popup.CloseOnPressOutside
-
-                background: Rectangle {
-                    color: "#2a2a2a"
-                    radius: AppSettings.borderRadius
-                    border.width: 1
-                    border.color: "#3a3a3a"
-                }
-
-                contentItem: ColumnLayout {
-                    spacing: 4
-                    Label { text: qsTr("Regex quick reference"); color: "white"; font.bold: true }
-                    Label { text: qsTr(".  any single character"); color: "#cccccc"; font.pixelSize: 11 }
-                    Label { text: qsTr("*  +  ?  repeat: 0-or-more, 1-or-more, 0-or-1 times"); color: "#cccccc"; font.pixelSize: 11 }
-                    Label { text: qsTr("^  $  start / end of the filename"); color: "#cccccc"; font.pixelSize: 11 }
-                    Label { text: qsTr("\\d  \\w  \\s  a digit / word / space character"); color: "#cccccc"; font.pixelSize: 11 }
-                    Label { text: qsTr("{n}  {n,m}  exactly n, or between n and m, repeats"); color: "#cccccc"; font.pixelSize: 11 }
-                    Label { text: qsTr("[...]  any one of these characters"); color: "#cccccc"; font.pixelSize: 11 }
-                    Label {
-                        Layout.maximumWidth: 300
-                        wrapMode: Text.WordWrap
-                        color: "#cccccc"
-                        font.pixelSize: 11
-                        text: qsTr("(...)  capture group — text captured here must be IDENTICAL "
-                                   + "across files for them to be combined. Everything else (literal "
-                                   + "text, or an uncaptured wildcard) may vary freely between parts.")
-                    }
-                    Label {
-                        Layout.maximumWidth: 300
-                        wrapMode: Text.WordWrap
-                        color: "#888888"
-                        font.pixelSize: 11
-                        text: qsTr("Example: ^(TX\\d{2})_MIC\\d{3}_\\d{8}_\\d{6}_orig\\.wav$ groups "
-                                   + "files sharing the same TXnn id, even though the mic number and "
-                                   + "timestamp differ between parts.")
-                    }
-                    Label {
-                        Layout.maximumWidth: 300
-                        wrapMode: Text.WordWrap
-                        color: "#e8a33d"
-                        font.pixelSize: 11
-                        text: qsTr("|  (alternation) has the LOWEST precedence of any operator — "
-                                   + "an ungrouped a|b$ means \"a\" OR \"b$\" as two whole separate "
-                                   + "patterns. Always group it: (?:a|b).")
                     }
                 }
             }
@@ -3563,40 +3922,39 @@ Popup {
                             }
                         }
 
-                        RowLayout {
+                        TextField {
+                            id: rulePatternField
                             Layout.fillWidth: true
-                            TextField {
-                                id: rulePatternField
-                                Layout.fillWidth: true
-                                text: ruleCard.modelData.pattern
-                                placeholderText: qsTr("^(TX\\d{2})_MIC\\d{3}_.*_orig\\.wav$")
-                                font.family: "monospace"
-                                hoverEnabled: true
-                                background: UnderlineField { focused: rulePatternField.activeFocus }
-                                onEditingFinished: settingsPopup.commitPatternChange(ruleCard.index, text)
-                                onTextChanged: previewTimer.restart()
-                            }
-                            Button {
-                                id: regexInfoButton
-                                text: "ⓘ"
-                                implicitWidth: 22
-                                implicitHeight: 22
-                                background: Rectangle {
-                                    radius: AppSettings.borderRadius
-                                    color: "transparent"
-                                    border.width: 1
-                                    border.color: "#3a3a3a"
-                                }
-                                hoverEnabled: true
-                                onClicked: {
-                                    regexHelpPopup.parent = regexInfoButton
-                                    regexHelpPopup.x = -regexHelpPopup.width + regexInfoButton.width
-                                    regexHelpPopup.y = regexInfoButton.height + 4
-                                    regexHelpPopup.open()
-                                }
-                                HoverHandler { cursorShape: Qt.PointingHandCursor }
-                                HoverBorder { anchors.fill: parent; active: regexInfoButton.hovered }
-                            }
+                            text: ruleCard.modelData.pattern
+                            placeholderText: qsTr("^(TX\\d{2})_MIC\\d{3}_.*_orig\\.wav$")
+                            font.family: "monospace"
+                            hoverEnabled: true
+                            background: UnderlineField { focused: rulePatternField.activeFocus }
+                            onEditingFinished: settingsPopup.commitPatternChange(ruleCard.index, text)
+                            onTextChanged: previewTimer.restart()
+                        }
+
+                        // Item 43: was a non-modal Popup reparented onto the
+                        // small "ⓘ" info button (regexInfoButton), positioned
+                        // relative to THAT button rather than this popup's own
+                        // root — near an edge, or after the rule list scrolls,
+                        // it could render partially/fully outside
+                        // settingsPopup's own bounds, and being non-modal it
+                        // never dimmed/blocked the rule-card text behind it.
+                        // Replaced with plain always-visible inline text
+                        // directly under the pattern field, so it can never
+                        // escape this card's own layout.
+                        Label {
+                            Layout.fillWidth: true
+                            wrapMode: Text.WordWrap
+                            color: "#888888"
+                            font.pixelSize: 11
+                            text: qsTr("Regex quick reference: . any char · * + ? repeat (0-or-more / "
+                                       + "1-or-more / 0-or-1) · ^ $ start/end · \\d \\w \\s digit/word/space "
+                                       + "· {n} {n,m} repeat count · [...] any one of these · (...) capture "
+                                       + "group — must match IDENTICALLY across files to combine, everything "
+                                       + "else may vary freely. | (alternation) has the LOWEST precedence of "
+                                       + "any operator — always group it: (?:a|b).")
                         }
 
                         // Live validity indicator — validates against the
@@ -3933,7 +4291,7 @@ Popup {
                         // Live syntax-highlight readout — reflects every
                         // keystroke in rulePatternField directly (not the
                         // committed modelData.pattern), same "see it as you
-                        // type" intent as the regex info popup above.
+                        // type" intent as the regex quick-reference text above.
                         Text {
                             Layout.fillWidth: true
                             textFormat: Text.RichText
@@ -4073,6 +4431,7 @@ Popup {
                     HoverBorder { anchors.fill: parent; active: addRuleButton.hovered }
                 }
             }
+            }
         }
     }
 
@@ -4123,9 +4482,17 @@ Popup {
     // essentially never happens mid-gesture.
     Item {
         id: middleDragScrollArea
-        anchors.fill: parent
-        anchors.leftMargin: 16
-        anchors.topMargin: 16
+        // Anchored to the same region as scrollArea (right of the nav rail,
+        // below the header chrome) so the overlay only covers the scrollable
+        // page content, not the nav rail or persistent header. Still a Popup
+        // sibling of scrollArea (not inside it), so it isn't counted as the
+        // ScrollView's own content — see the doc comment above.
+        anchors.left: navColumn.right
+        anchors.right: parent.right
+        anchors.top: headerRow.bottom
+        anchors.bottom: parent.bottom
+        anchors.leftMargin: 12
+        anchors.topMargin: 10
         anchors.bottomMargin: 16
         anchors.rightMargin: 2
         z: 1
@@ -4144,8 +4511,24 @@ Popup {
         // threshold is crossed.
         TapHandler {
             id: middleDragTap
+            // Item 45: LeftButton is deliberately NOT included here, even
+            // while armed. This overlay sits topmost (z:1) over
+            // rulePatternField (the regex TextField) — widening to include
+            // LeftButton so "any click while armed cancels it" (Chrome
+            // convention) covered left clicks too meant a left-click meant
+            // to start a text selection got intercepted as a disarm-click
+            // instead of ever reaching the TextField, so text selection
+            // inside the regex box sometimes just didn't work (it dragged
+            // instead). Only Middle/Right actually need the disarm-cancel
+            // semantics here — a stray left click during an armed
+            // middle-drag now just passes straight through to whatever's
+            // underneath (the TextField starts a selection normally; a
+            // control like a Slider/Switch performs its own click). The one
+            // trade-off: a left click no longer disarms the scroll by
+            // itself — Escape, a middle/right click, or clicking outside the
+            // popup still do.
             acceptedButtons: middleDragScrollArea.armed
-                             ? (Qt.LeftButton | Qt.MiddleButton | Qt.RightButton)
+                             ? (Qt.MiddleButton | Qt.RightButton)
                              : Qt.MiddleButton
             gesturePolicy: TapHandler.DragWithinBounds
             onPressedChanged: {
@@ -4153,8 +4536,8 @@ Popup {
                     // Any click while already armed cancels it (Chrome
                     // convention) instead of performing that button's
                     // normal action — acceptedButtons above ensures this
-                    // branch is only reachable for non-middle buttons once
-                    // armed.
+                    // branch is only reachable for Middle/Right once armed
+                    // (Left passes through instead, see the comment above).
                     if (middleDragScrollArea.armed) {
                         middleDragScrollArea.armed = false
                         return

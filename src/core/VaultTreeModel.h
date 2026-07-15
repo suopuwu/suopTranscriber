@@ -63,15 +63,93 @@ public:
     // without leaving the audio/.md pair mismatched.
     Q_INVOKABLE bool renameFile(const QUrl &fileUrl, const QString &newBaseName, QString *errorOut = nullptr);
 
-    // Copies an external audio file (e.g. dragged in from the desktop) into
-    // the vault root — never a subfolder, regardless of where in the window
-    // the drop happened. A copy, not a move: the source may be on removable
-    // media or otherwise not the user's to lose (mirrors DESIGN.md's "USB
-    // import" language, "copy only new audio in"). Refuses (rather than
-    // silently overwriting or auto-renaming) if a file with the same name
-    // already exists at the destination, or if fileUrl isn't a recognized
-    // audio extension. Returns false and sets *errorOut on any failure.
-    Q_INVOKABLE bool importFile(const QUrl &fileUrl, QString *errorOut = nullptr);
+    // Item 37: synchronous, cheap VALIDATOR for a drag-and-drop / external
+    // audio import — the actual byte-copy is now an async worker-thread job in
+    // TranscriptionController (see importAudio()), so the freeze from a large
+    // blocking QFile::copy on the GUI thread is gone. This half stays on the
+    // GUI thread so the user gets IMMEDIATE feedback for the fast failure
+    // modes (wrong type / collision / no vault) before anything is enqueued.
+    // Returns the absolute destination path the file WOULD be copied to (the
+    // vault root — never a subfolder, regardless of where in the window the
+    // drop landed; a copy, not a move, since the source may be on removable
+    // media, mirroring DESIGN.md's "USB import" "copy only new audio in"), or
+    // an empty string (with *errorOut set) if fileUrl isn't a recognized audio
+    // extension, a same-named file already exists at the destination, or no
+    // vault is open. The caller (Main.qml) hands a non-empty result plus the
+    // source url to TranscriptionController::importAudio() to do the copy off
+    // the GUI thread as a tracked task.
+    Q_INVOKABLE QString importDestinationFor(const QUrl &fileUrl, QString *errorOut = nullptr) const;
+
+    // Item 40 (folder management): creates a new subfolder named `name`
+    // inside parentDirUrl (QDir::mkpath). Rejects an empty/whitespace-only
+    // name, a name containing a path separator or other filesystem-invalid
+    // character (same character set renameFile() rejects), a parentDir that
+    // isn't inside the open vault, and a name that would collide with an
+    // existing entry — returning false rather than clobbering or escaping the
+    // vault. rebuild()s on success so the watcher starts watching the new
+    // folder (note: an empty folder stays hidden from the tree by the same
+    // no-audio-content pruning DESIGN.md describes — it becomes visible once a
+    // file is moved into it).
+    Q_INVOKABLE bool createFolder(const QUrl &parentDirUrl, const QString &name);
+
+    // Item 40: recursively deletes folderUrl and everything under it
+    // (QDir::removeRecursively). Guarded: refuses to delete the vault root
+    // itself, or any path that isn't strictly inside the vault. Returns false
+    // on guard/failure. rebuild()s on success (drops the deleted folder from
+    // the watched set).
+    Q_INVOKABLE bool deleteFolder(const QUrl &folderUrl);
+
+    // Item 40: moves a single file (QFile::rename) into destDirUrl. When the
+    // moved file is an AUDIO file it carries its sibling transcript data too —
+    // the <fileName>.md sidecar (same full-filename convention as
+    // sidecarMdPath()/renameFile(), NOT a stripped stem — see item P7) and, if
+    // present, the .<fileName>.partial.jsonl resume-state file (CLAUDE.md
+    // vault layout). A standalone orphaned .md (or any non-audio file) moves
+    // on its own. Rejects a move whose source/destination escapes the vault,
+    // a destination equal to the file's current directory (no-op), or any
+    // destination collision (checked across the whole audio+sidecars set
+    // before anything moves, so the pair is never left split across folders);
+    // rolls back a partial move on failure. rebuild()s on success.
+    Q_INVOKABLE bool moveFile(const QUrl &fileUrl, const QUrl &destDirUrl);
+
+    // Item 40: moves/renames a folder into destParentUrl (QDir::rename).
+    // Guarded like deleteFolder() (never the vault root, never outside the
+    // vault) plus: refuses to move a folder into itself or one of its own
+    // descendants, and refuses a name collision at the destination. rebuild()s
+    // on success.
+    Q_INVOKABLE bool moveFolder(const QUrl &folderUrl, const QUrl &destParentUrl);
+
+    // Item 2 (delete transcript): removes an audio file's sibling transcript —
+    // the <fileName>.md sidecar plus, if present, its
+    // .<fileName>.partial.jsonl resume-state file (same full-filename
+    // convention as sidecarMdPath()/moveFile()) — reverting the audio file to
+    // "untranscribed" (yellow) while KEEPING the audio itself. When fileUrl
+    // names an orphaned .md directly, that .md IS the transcript, so it's the
+    // thing removed. Files are sent to the trash (QFile::moveToTrash) so an
+    // accidental delete stays recoverable, falling back to a permanent
+    // remove() only if trashing fails. Guards: refuses a path outside the
+    // vault; a no-op returning false if there's no sidecar .md to delete.
+    // rebuild()s + emits transcriptDeleted(fileUrl) on success.
+    Q_INVOKABLE bool deleteTranscript(const QUrl &fileUrl);
+
+    // Item 2 (delete file): removes a file and ALL its sidecars — for an audio
+    // file, the audio itself plus its <fileName>.md and
+    // .<fileName>.partial.jsonl (whichever exist); for an orphaned .md passed
+    // directly, just that .md. Trash-first (QFile::moveToTrash), permanent
+    // remove() only as a fallback, same recoverable-delete choice as
+    // deleteTranscript() above. Guards: refuses any path outside the vault
+    // (and only ever operates on a real file, never a directory / the vault
+    // root); returns false if the named file doesn't exist. rebuild()s +
+    // emits fileDeleted(fileUrl) on success.
+    Q_INVOKABLE bool deleteFile(const QUrl &fileUrl);
+
+    // Item 40: every real directory inside the vault (walks the filesystem
+    // directly, NOT the pruned tree — a freshly-created empty folder must be a
+    // valid move destination even though it's hidden from the tree until it
+    // has content), vault root first, then subfolders depth-first by name.
+    // Backs Sidebar.qml's "Move to…" destination picker. Hidden dotdirs
+    // (.transcriber) are excluded (QDir::Dirs skips hidden entries).
+    Q_INVOKABLE QStringList vaultFolders() const;
 
     // Reveals fileUrl in the desktop's file manager with it selected (Wave D
     // item 2 — BottomBar's current-file path is clickable). Uses the
@@ -162,8 +240,50 @@ public:
     // the vault root itself must exist.
     Q_INVOKABLE bool isPathInsideVault(const QString &candidatePath) const;
 
+    // Bug fix: "label always delayed by one file in the file explorer".
+    // rebuild() only ever runs from QFileSystemWatcher::directoryChanged,
+    // which fires on a directory's file add/remove/rename but NEVER on an
+    // in-place content rewrite of a file that already existed. Auto-label
+    // (TranscriptionController::writeLabelingFields()), "generate chapters"
+    // (writeChaptersField()), speaker rename/merge
+    // (renameSpeakerInFile()/mergeSpeakersInFile()), and the manual
+    // setLabel()/setTags()/setPrelude()/setSentenceTexts() editors all
+    // rewrite an ALREADY-EXISTING sidecar .md in place — the .md's
+    // directory-level existence never changes, so none of those writes
+    // trigger a watcher event, and this row's LabelRole/TagsRole/etc. (read
+    // fresh from disk on every data() call — see frontmatterField()'s doc
+    // comment; nothing here is cached except TranscriptBodyRole) sit
+    // correctly updated on disk but the view never re-queries them until
+    // some LATER, unrelated directory event (typically the NEXT file's .md
+    // being created) happens to force a full rebuild(). That's the "delayed
+    // by one file" symptom (see Item P19's comment on
+    // TranscriptionController::setLabel()).
+    //
+    // TranscriptionController::finished(fileUrl, ok, error) already fires
+    // right after every one of those rewrites lands on disk (both from the
+    // queued job pipeline's onWorkerFinished() and directly from the
+    // synchronous const setters) — this method is the cheap, single-row
+    // counterpart a `finished` handler is expected to call: it locates
+    // fileUrl's row (fileUrl may name the audio file OR a standalone
+    // orphaned .md — either way, whichever this Node's own path is) and
+    // emits dataChanged() for just that row, without rescanning the
+    // directory or resetting the whole model. A no-op if fileUrl doesn't
+    // resolve to any node currently in the tree (e.g. a stale signal for a
+    // file that's since been deleted/renamed, or one outside the vault).
+    Q_INVOKABLE void refreshFile(const QUrl &fileUrl);
+
 signals:
     void vaultPathChanged();
+    // Item 2 (delete): a transcript (.md sidecar) was removed by
+    // deleteTranscript(), leaving the audio in place (fileUrl is the audio
+    // file whose transcript was deleted, or the orphaned .md that was
+    // removed). MainPanel listens so the open file, if it's this one, reverts
+    // to its untranscribed view rather than showing stale transcript data.
+    void transcriptDeleted(const QUrl &fileUrl);
+    // Item 2 (delete): a whole file (audio + sidecars, or an orphaned .md)
+    // was removed by deleteFile(). MainPanel listens so it clears/closes the
+    // view when the deleted file is the one currently open.
+    void fileDeleted(const QUrl &fileUrl);
 
 private:
     struct Node {
@@ -180,8 +300,22 @@ private:
     void rebuild();
     std::unique_ptr<Node> scanDirectory(const QString &dirPath, Node *parent) const;
     Node *nodeFromIndex(const QModelIndex &index) const;
+    // Backs refreshFile() — plain depth-first search by absolute path (the
+    // tree has no path->Node lookup table; this stays cheap because it's
+    // only called once per finished()/setLabel()-style event, not per
+    // frame).
+    static Node *findNodeByPath(Node *node, const QString &path);
+    // Backs refreshFile() — the inverse of nodeFromIndex(): finds node's row
+    // within its own parent's children and builds the matching QModelIndex.
+    // Returns an invalid index for the root node (no parent) or an orphaned
+    // node no longer reachable from m_root (shouldn't happen; defensive).
+    QModelIndex indexForNode(const Node *node) const;
     static void collectAudioPaths(const Node *node, QStringList &out);
     static void collectAudioLastModified(const Node *node, QVariantMap &out);
+    // Backs vaultFolders() — a raw filesystem walk (not a tree walk), so
+    // empty/content-less folders the tree prunes are still listed as move
+    // destinations.
+    static void collectFolderPaths(const QString &dirPath, QStringList &out);
     // Backs searchResults() — not static (unlike collectAudioPaths above)
     // because it needs transcriptBody(), which consults m_transcriptBodyCache.
     void collectSearchResults(const Node *node, const QString &queryLower, bool includeTranscriptions,

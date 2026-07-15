@@ -17,11 +17,16 @@
 #include <QVector>
 #include <qqml.h>
 
+#include <vector>
+
 #include "RollingAverage.h"
 #include "Segment.h"
 
 class QTimer;
 class TranscriptionWorker;
+struct DiarizedTurn; // DiarizationEngine.h — forward-declared so this header
+                     // needn't pull in sherpa-onnx (spliceBodySpeakers only
+                     // takes a const-ref to a vector of these).
 
 // Writes segment lines to an open sidecar .md file (see appendSegmentLine's
 // former doc comment / CLAUDE.md "vault layout"), merging a REPEATING CYCLE
@@ -128,6 +133,45 @@ struct ResolvedChapter {
 // with synthetic values, without needing a real label model.
 QString spliceBodyChapters(const QString &body, const QList<ResolvedChapter> &chapters);
 
+// Item P34 / item 28: splits a transcript's segment list into consecutive
+// windows, each formatted-char count kept within LabelingEngine::
+// kMaxChapterInputChars, so TranscriptionWorker::generateChaptersJob() can
+// call generateChapters() once per window instead of silently truncating one
+// oversized call. Returns the segment index each window STARTS at (always
+// [0, ...]); window w spans [result[w], result[w+1]) (or to the end for the
+// last). Item 28 bug: a tiny trailing window is folded into the previous one
+// ONLY when the combined window still fits kMaxChapterInputChars — otherwise
+// the fold would push the merged window back over budget and
+// generateChapters() would truncate exactly the folded-in tail, so the final
+// stretch of a long transcript got zero chapters. Declared here (rather than
+// file-local in the .cpp) so the windowing/budget invariant is unit-testable
+// directly with synthetic segment text, without a real label model.
+QList<int> computeChapterWindows(const QStringList &segmentTexts);
+
+// Item 52 (standalone speaker diarization): given an already-transcribed
+// .md's `body` and its frontmatter "speakers:" allowlist (`knownSpeakers`),
+// assigns each segment line the diarized speaker `turns` say it overlaps
+// (labelForSegment()'s time-overlap rule) and splices a "[Speaker N]" tag
+// into that line IN PLACE — replacing an existing tag if the line already had
+// one (a re-diarize), or inserting one right after the timestamp if not
+// (adding speakers to a file transcribed without them). Everything else
+// (prelude, "## [ts] title" chapter markers, "(×N)" repeat markers, the
+// spoken text itself) is preserved byte-for-byte; edits are spliced from the
+// end of the body backward so earlier captured offsets stay valid. A
+// hallucinated non-speech annotation line (isNonSpeechAnnotation, e.g.
+// "[MUSIC]") is never tagged, matching run()'s inline path. `totalSeconds`
+// (the decoded audio length) stands in for the LAST segment's end time —
+// every earlier segment's end is the next segment's start (the file format
+// stores no t1). *appliedSpeakersOut, if given, receives the distinct labels
+// actually applied, in first-appearance (file) order — what the caller writes
+// back as the "speakers:" frontmatter list (mirrors
+// syncSpeakersFrontmatterToBody()'s "only tags that really landed" rule).
+// Declared here (like spliceBodyChapters above) so the splicing logic is
+// unit-testable with synthetic turns, no real DiarizationEngine needed.
+QString spliceBodySpeakers(const QString &body, const QStringList &knownSpeakers,
+                            const std::vector<DiarizedTurn> &turns, double totalSeconds,
+                            QStringList *appliedSpeakersOut = nullptr);
+
 // Orchestrates: ffmpeg decode -> WhisperCppEngine -> vault sidecar files.
 // Owns a dedicated QThread; transcription (and its file IO) NEVER runs on
 // the GUI thread (see CLAUDE.md). Whole-file transcription only for now —
@@ -196,6 +240,15 @@ class TranscriptionController : public QObject {
     Q_PROPERTY(int tasksCompleted READ tasksCompleted NOTIFY queueChanged)
     Q_PROPERTY(QVariantList queuedFileUrls READ queuedFileUrls NOTIFY queueChanged)
     Q_PROPERTY(QVariantList jobs READ jobs NOTIFY queueChanged)
+    // Item 11: the SAME entries jobs() returns, but partitioned for display —
+    // Active first, then Queued in run order, then Paused, then finished
+    // (Done/Failed, most-recently-finished first). jobs() stays in raw
+    // append/insertion order (run order == append order — see startNext());
+    // this is the ordering the Tasks popup's ListView binds to so the
+    // currently-running/next-to-run work is always at the TOP and finished
+    // history sinks to the bottom. Everything else (queuedPositionOf(),
+    // moveQueuedJob(), etc.) keeps walking the raw jobs() order, unaffected.
+    Q_PROPERTY(QVariantList sortedJobs READ sortedJobs NOTIFY queueChanged)
     // Bumps once for each real new segment line written to the .md sidecar
     // during an in-progress transcription — throttled (see run()'s
     // liveUpdateTimer) so a burst of short segments still coalesces into at
@@ -228,6 +281,14 @@ class TranscriptionController : public QObject {
     // show a blank/placeholder value. Never populated for a relabel/rename/
     // merge/download job — none of those touch WhisperCppEngine.
     Q_PROPERTY(QString activeBackendName READ activeBackendName NOTIFY activeBackendNameChanged)
+    // Item 25: a coarser, user-facing reduction of activeBackendName — "gpu"
+    // for any real accelerator (CUDA/Vulkan/…), "cpu" for the CPU backend,
+    // empty (same as activeBackendName) until the first model finishes
+    // loading. Exposed as its own derived property so every display site can
+    // show just "gpu"/"cpu" (the user asked for exactly those two words,
+    // lowercase) off ONE mapping instead of each re-deriving it. QML hides
+    // its indicator on empty, same convention as activeBackendName.
+    Q_PROPERTY(QString activeBackendKind READ activeBackendKind NOTIFY activeBackendNameChanged)
 
 public:
     // Paused: only reached from Active during "loading" — whisper.cpp's
@@ -297,6 +358,21 @@ public:
     bool isActiveStopping() const { return m_pausingActiveAsRestart; }
     // See the activeBackendName Q_PROPERTY doc comment above.
     QString activeBackendName() const { return m_activeBackendName; }
+    // See the activeBackendKind Q_PROPERTY doc comment above.
+    QString activeBackendKind() const { return backendKind(m_activeBackendName); }
+    // Item 25: pure mapping "CUDA"/"Vulkan"/…/"CPU"/"" -> "gpu"/"cpu"/"".
+    // Static + public so it's unit-testable directly without a live backend
+    // load. Case-insensitive "CPU" match; anything else non-empty is "gpu".
+    static QString backendKind(const QString &backendName);
+    // Item P29 / item 58: the transcript-length-aware EFFECTIVE wordiness a
+    // label/prelude pass actually uses, given the user's base wordiness slider
+    // and the transcript's word count. Caps DOWN for short transcripts (a
+    // 3-sentence transcript shouldn't get a 5-paragraph prelude — P29) AND
+    // scales UP for very long ones (a 2-3 hour transcript earns a fuller
+    // prelude tier — item 58). Static + public so the length->tier mapping is
+    // unit-testable directly without spinning up a real label model (the
+    // relabelJob worker path that consumes it needs a ~2.5GB GGUF loaded).
+    static double effectiveWordinessForLength(double baseWordiness, int wordCount);
     // Wall-clock time the Active job has spent actually RUNNING, excluding
     // any time spent paused — this is what elapsed/duration display in the
     // UI, not finishedAt-startedAt (see pauseActive()'s doc comment for why
@@ -332,6 +408,20 @@ public:
     // speaker-rename/merge task in the same list (they all share this one
     // queue/worker thread).
     QVariantList jobs() const;
+
+    // Item 11: jobs() reordered for display — see the sortedJobs Q_PROPERTY
+    // doc comment. Delegates the partitioning to the pure static helper
+    // below so the ordering is unit-testable with synthetic entries.
+    QVariantList sortedJobs() const;
+    // Pure partition of a jobs()-shaped list (each entry a QVariantMap with a
+    // "status" key of "active"/"queued"/"paused"/"done"/"failed"): Active,
+    // then Queued, then Paused, then finished (done/failed) — the last group
+    // reversed so most-recently-appended (≈ most-recently-finished, since
+    // jobs run and finish in append order) is first. Relative order WITHIN
+    // the non-finished groups is preserved (stable), so Queued stays in run
+    // order. Static + public purely so tst_transcription_queue can assert the
+    // ordering deterministically without spinning up real jobs.
+    static QVariantList sortJobsForDisplay(const QVariantList &jobEntries);
 
     // Item P6: lets the sidebar's file tree query a single path's job status
     // directly, without walking the whole jobs() list itself. path must be an
@@ -380,6 +470,50 @@ public:
                                     bool restrictTagsToExisting = false, double tagReuseBias = 0.5,
                                     double wordiness = 0.5);
 
+    // Item 37: drag-and-drop / external audio import as a tracked, async
+    // task. sourceUrl is the external file the user dropped; destUrl is the
+    // in-vault destination VaultTreeModel::importDestinationFor() already
+    // validated (wrong-type / collision / no-vault are rejected there,
+    // synchronously, before this is ever called — so this method assumes a
+    // valid, non-colliding destination and only owns the slow part: the
+    // byte-copy). Queued through the SAME worker-thread job pipeline as
+    // transcribe()/download()/combine() (a large copy must never block the
+    // GUI thread — CLAUDE.md), so it shows up in jobs()/tasksTotal/the Tasks
+    // popup like any other task, with the same cancel/progress plumbing. The
+    // job's fileUrl is destUrl (so the Tasks row names the destination file
+    // and clicking it opens the imported file once done); a copy failure that
+    // happens on the worker (e.g. source vanished mid-copy, disk full)
+    // surfaces as a Failed job, mirroring every other kind. Dedup follows the
+    // same Queued/Active rule as transcribe() (keyed on destUrl).
+    Q_INVOKABLE void importAudio(const QUrl &sourceUrl, const QUrl &destUrl, const QUrl &vaultUrl);
+
+    // Item 52: standalone speaker diarization on an ALREADY-transcribed file
+    // — adds (or re-runs) speaker detection WITHOUT re-transcribing the audio.
+    // Reads the existing sibling .md's segment lines, decodes the audio,
+    // runs the SAME diarization core the inline transcribe-time speakerDetection
+    // path uses (TranscriptionWorker::runDiarizationPass()), assigns each
+    // existing segment its overlapping speaker, and splices the "[Speaker N]"
+    // tags + "speakerDetection: true"/"speakers:" frontmatter back into the .md
+    // in place (see spliceBodySpeakers()). Queued through the same one-worker
+    // job pipeline as transcribe()/relabel() ("diarize" kind), with the same
+    // dedup rule (a Queued/Active entry for fileUrl blocks a duplicate) and
+    // job-list visibility; emits finished(fileUrl, ok, error) like every other
+    // job so the sidebar/main panel refresh. A failure (models unavailable,
+    // file not transcribed yet, decode error) IS the job's result, reported via
+    // finished(ok=false). Cancel takes effect at the post-diarize checkpoint
+    // (diarization has no mid-pass abort hook — see the diarize() lambda in
+    // run()). The diarization models are queued as their own download job ahead
+    // of this one if not already on disk, same as transcribe()'s
+    // speakerDetection path.
+    Q_INVOKABLE void diarizeFile(const QUrl &fileUrl, const QUrl &vaultUrl);
+
+    // Bulk wrapper mirroring transcribeAll()/relabelAll(): calls diarizeFile()
+    // for each url. Dedup is entirely delegated to diarizeFile(). Added now so
+    // the OWED Sidebar ribbon / per-row "detect speakers" buttons (CLAUDE.md
+    // per-file-action parity — deferred this wave, another agent owns
+    // Sidebar.qml) only need wiring, no new controller method.
+    Q_INVOKABLE void diarizeFilesForPaths(const QVariantList &fileUrls, const QUrl &vaultUrl);
+
     // True if fileUrl currently has a Queued or Active entry.
     Q_INVOKABLE bool isQueued(const QUrl &fileUrl) const;
 
@@ -424,13 +558,81 @@ public:
     // line each chapter starts at. Queued through the same job pipeline as
     // relabel() — identical dedup-if-already-queued behavior (see its doc
     // comment) and job-list visibility. Regenerating (calling this again on
-    // an already-chaptered file) strips the old marker set first — never
-    // accumulates duplicates across repeated runs.
-    Q_INVOKABLE void generateChapters(const QUrl &fileUrl, const QUrl &vaultUrl);
+    // an already-chaptered file) strips the old AUTO marker set first — never
+    // accumulates duplicates across repeated runs — but PRESERVES any manual
+    // markers the user added/edited (see spliceBodyChapters() / addChapter()).
+    // Item 27: density (0.0-1.0, default 0.5) controls how many chapters to
+    // propose (see LabelingEngine::generateChapters()); the QML will pass an
+    // AppSettings value once its slider lands (owed, later wave) — defaulted
+    // here so existing call sites still compile.
+    Q_INVOKABLE void generateChapters(const QUrl &fileUrl, const QUrl &vaultUrl, double density = 0.5);
 
     // Bulk wrapper mirroring relabelAll(): calls generateChapters() for each
     // url. Dedup is entirely delegated to generateChapters().
-    Q_INVOKABLE void generateChaptersAll(const QVariantList &fileUrls, const QUrl &vaultUrl);
+    Q_INVOKABLE void generateChaptersAll(const QVariantList &fileUrls, const QUrl &vaultUrl, double density = 0.5);
+
+    // Items 24/53 ("run all jobs"): enqueues the FULL per-file pipeline for
+    // one file, IN ORDER — transcribe, then label (relabel), then chapters —
+    // as three separate queued jobs so the single background worker runs them
+    // strictly transcribe->label->chapters (FIFO, one at a time). Because the
+    // worker never starts job N+1 until job N finishes, the label job reads
+    // the .md the transcribe job just wrote and the chapters job reads the
+    // labeled .md — no explicit prerequisite tracking needed beyond queue
+    // order. Note this deliberately builds and inserts all three jobs itself
+    // rather than calling transcribe()/relabel()/generateChapters() in
+    // sequence: each of those inserts at the FRONT of the queue
+    // (frontOfQueueInsertIndex()), so three sequential calls would REVERSE the
+    // 2nd/3rd relative to the 1st; inserting here at one forward-advancing
+    // index keeps them contiguous and correctly ordered.
+    //
+    // Already-transcribed decision (documented per items 24/53): if fileUrl
+    // already has a sibling .md, the transcribe step is SKIPPED and only
+    // label+chapters are queued — re-transcribing a file that's already done
+    // is the surprising choice; "run all" on a done file just refreshes its
+    // derived label+chapters. An UNtranscribed file gets all three. (An
+    // orphaned .md — passed as its own path — is "already transcribed" by this
+    // rule, so it too gets label+chapters only, which is correct since there's
+    // no audio to transcribe.)
+    //
+    // Params mirror the union of transcribe()'s + generateChapters()' inputs
+    // (the QML call sites read them from AppSettings / the model combo /
+    // speaker-detection toggle, same as the individual actions do). No-op if
+    // fileUrl already has a Queued/Active entry, same dedup gate as the
+    // individual actions (checked once, up front, before any of the three
+    // jobs is inserted).
+    Q_INVOKABLE void runAllJobs(const QUrl &fileUrl, const QUrl &vaultUrl, const QString &modelId,
+                                 bool speakerDetection, bool restrictTagsToExisting = false,
+                                 double tagReuseBias = 0.5, double wordiness = 0.5, double chapterDensity = 0.5);
+
+    // Bulk wrapper mirroring transcribeAll()/relabelAll(): calls runAllJobs()
+    // for each url. Dedup + ordering are entirely delegated to runAllJobs();
+    // the caller (Sidebar's ribbon / search / multi-select) decides which
+    // files to run the full pipeline on.
+    Q_INVOKABLE void runAllJobsForPaths(const QVariantList &fileUrls, const QUrl &vaultUrl, const QString &modelId,
+                                         bool speakerDetection, bool restrictTagsToExisting = false,
+                                         double tagReuseBias = 0.5, double wordiness = 0.5,
+                                         double chapterDensity = 0.5);
+
+    // Item 17 (manual chapters). Inserts a MANUAL "## [timestamp] title" marker
+    // (carrying the manual sentinel — see spliceBodyChapters()'s doc comment)
+    // at timestampSeconds, in sorted position (before the first segment line
+    // at/after that time). A manual marker is preserved across later
+    // generateChapters() regeneration, unlike auto ones. Any existing marker
+    // at the same timestamp is replaced. Emits finished(fileUrl, ok, error)
+    // so the sidebar/main panel refresh, exactly like setPrelude()/setLabel().
+    Q_INVOKABLE void addChapter(const QUrl &fileUrl, double timestampSeconds, const QString &title);
+
+    // Item 17 / item 35 backend. Rewrites the title of the chapter marker at
+    // timestampSeconds in place (works for auto OR manual markers). Editing an
+    // AUTO chapter's title PROMOTES it to manual (adds the sentinel) so the
+    // next regeneration won't clobber the user's edit — the least-surprising
+    // behavior. finished ok=false if no marker exists at that timestamp. Emits
+    // finished(fileUrl, ok, error).
+    Q_INVOKABLE void setChapterTitle(const QUrl &fileUrl, double timestampSeconds, const QString &newTitle);
+
+    // Item 17. Removes the chapter marker at timestampSeconds (auto or manual).
+    // finished ok=false if none exists there. Emits finished(fileUrl, ok, error).
+    Q_INVOKABLE void deleteChapter(const QUrl &fileUrl, double timestampSeconds);
 
     // Reads the frontmatter (model/speakerDetection/transcribedAt/label/...)
     // out of a file's sibling .md, if one exists yet. Empty map if not
@@ -829,6 +1031,20 @@ public:
     Q_INVOKABLE void combineGroup(const QVariantList &rules, const QStringList &audioPaths,
                                    const QString &outputPath, const QUrl &vaultUrl, bool deleteOriginals);
 
+    // Item 44: manual combine — merges an EXPLICIT, user-selected ordered set
+    // of audio files (the sidebar's multi-selection, filtered to audio), NOT a
+    // regex-rule-detected group. `fileUrls` is a QVariantList of file:// QUrls
+    // (bare local-path strings also tolerated); non-audio entries (.md, dirs)
+    // are dropped and duplicates de-duped. Requires >= 2 audio files, else a
+    // silent no-op. Reuses the exact combine machinery combineGroup()/
+    // runCombineScan() use — builds a synthetic CombineGroup and calls the
+    // shared enqueueCombineJob()/TranscriptionWorker::combineJob(); only the
+    // file selection is supplied by the user instead of findCombineGroups().
+    // Order is mtime ascending (findCombineGroups()'s default, no-sort-
+    // differentiator order); output is "<earliest part's stem>.combined.<ext>"
+    // beside the earliest part. See the .cpp for the full rationale.
+    Q_INVOKABLE void combineSelected(const QVariantList &fileUrls, const QUrl &vaultUrl);
+
 signals:
     void busyChanged();
     void progressChanged();
@@ -858,6 +1074,20 @@ signals:
     // those synchronous, non-queued edit paths notify the sidebar the same
     // way the queued-job paths (relabel()/generateChapters()/etc, all
     // non-const) already do via onWorkerFinished().
+    //
+    // Bug fix ("label always delayed by one file in the file explorer"):
+    // every in-place sidecar .md rewrite this class does (auto-label,
+    // "regenerate label", "generate chapters", speaker rename/merge, and
+    // the setLabel()/setTags()/setPrelude()/setSentenceTexts() editors)
+    // already emits this, with fileUrl naming the file that changed — a
+    // listener wired to this signal is expected to call
+    // VaultTreeModel::refreshFile(fileUrl) so that file's row re-reads its
+    // now-current metadata immediately. Without that call, VaultTreeModel
+    // has no other way to learn about an in-place content rewrite:
+    // QFileSystemWatcher::directoryChanged (which VaultTreeModel::rebuild()
+    // is otherwise driven by) only fires on a directory's file add/remove/
+    // rename, never on an existing file's content changing — see
+    // VaultTreeModel::refreshFile()'s doc comment for the full explanation.
     void finished(const QUrl &fileUrl, bool ok, const QString &error) const;
     // Fired when a renameSpeaker() call's background rewrite completes — IN
     // ADDITION to the generic finished() above (a rename is queued through
@@ -908,9 +1138,13 @@ private:
         QString sourceSpeakerName;
         QString targetSpeakerName;
         // Feature 3a: see TranscriptionController::generateChapters()'s doc
-        // comment. Needs only fileUrl/vaultUrl (same as relabelOnly) — no
-        // extra fields of its own.
+        // comment. Needs only fileUrl/vaultUrl (same as relabelOnly) plus
+        // item 27's chapter density below.
         bool generateChaptersOnly = false;
+        // Item 27: 0.0-1.0 chapter-density slider for a generateChaptersOnly
+        // job (mirrors wordiness for a relabel job). Ignored by every other
+        // kind. Default 0.5 == the neutral tier this feature used before.
+        double chapterDensity = 0.5;
         // Split-recording combine (see findCombineGroups()'s doc comment):
         // fileUrl doubles as the combine job's OUTPUT path for this kind,
         // same "reuse fileUrl for whatever this kind's one file is" pattern
@@ -920,6 +1154,17 @@ private:
         bool combineOnly = false;
         QStringList combineSourcePaths;
         bool deleteOriginalsAfterCombine = false;
+        // Item 37: drag-and-drop / external audio import job — like combineOnly,
+        // fileUrl doubles as this kind's OUTPUT (the in-vault destination), and
+        // importSourcePath is the external file being copied in. See
+        // importAudio() and TranscriptionWorker::importJob().
+        bool importOnly = false;
+        QString importSourcePath;
+        // Item 52: standalone speaker-diarization job — re-runs speaker
+        // detection on an already-transcribed file (needs only fileUrl +
+        // vaultUrl, like relabelOnly). See diarizeFile() and
+        // TranscriptionWorker::diarizeJob().
+        bool diarizeOnly = false;
         bool restrictTagsToExisting = false;
         double tagReuseBias = 0.5;
         double wordiness = 0.5;
@@ -1057,6 +1302,20 @@ private:
 
     void startJob(int index);
     void onWorkerFinished(bool ok, const QString &error);
+
+    // Item 17: the three public chapter editors (addChapter/setChapterTitle/
+    // deleteChapter) all reopen the .md, carry frontmatter through untouched,
+    // mutate the body's "## [timestamp] title" marker set, and write back —
+    // the exact reopen/rewrite shape setPrelude() uses. Factored here so the
+    // three differ only by their body mutation (the enum). Runs synchronously
+    // on the calling (GUI) thread — a single small file read+write, no
+    // model/engine involvement, like setLabel()/setPrelude(). Returns false
+    // (errorOut set) without writing if the file isn't transcribed, the
+    // frontmatter is malformed, or the mutation found nothing to act on
+    // (SetTitle/Delete against a timestamp with no marker).
+    enum class ChapterEditOp { Add, SetTitle, Delete };
+    bool editChapterMarker(const QUrl &fileUrl, ChapterEditOp op, double timestampSeconds, const QString &title,
+                            QString *errorOut) const;
     // Wave N (task system, item 5): pushes a Queued "download" job for
     // whichever model file `target` names, UNLESS one is already
     // Queued/Active or the file is already on disk (checked fresh here, not

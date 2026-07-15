@@ -25,6 +25,14 @@ Item {
     // file's LOCAL path (fileUrl minus the "file://" prefix, same convention
     // Sidebar.qml's fileActivated uses), for the caller to open in MainPanel.
     signal taskActivated(string path)
+    // Item 42: clicking the current-file path label focuses the IN-APP file
+    // explorer (the Sidebar tree) and reveals `path` there, instead of
+    // shelling out to the OS file manager. `path` is the
+    // open file's LOCAL path, empty if none (then just focus the explorer).
+    // Routed up through Main.qml (which owns both panels), same as
+    // settingsRequested/taskActivated — BottomBar never reaches across to the
+    // Sidebar directly.
+    signal focusFileExplorerRequested(string path)
     // Percentage TEXT (item 6): this phase's own 0..1 (see
     // TranscriptionController::progress's doc comment for why it's phase-
     // relative, not blended across the whole job).
@@ -109,18 +117,33 @@ Item {
     // made the first click look like it did nothing (user report,
     // 2026-07-10).
     readonly property bool activeStopping: transcriptionController ? transcriptionController.activeStopping : false
-    function canPause(kind) { return kind === "transcribe" || kind === "download" || kind === "combine" }
+    function canPause(kind) { return kind === "transcribe" || kind === "download" || kind === "combine" || kind === "chapters" }
+    // Item 9: whether the pause/play button should be ENABLED right now
+    // (visibility is handled separately — the button is only SHOWN for a
+    // pausable kind or a resumable queue). Starting a queued job (idle) and
+    // resuming an already-paused job are always allowed; while a job is
+    // actively running, pausing is only honorable once it's past the
+    // uninterruptible "loading" phase (whisper.cpp's blocking model load has
+    // no pause hook — see TranscriptionController::togglePauseActive()). A
+    // greyed button during "loading" is deliberate: the OLD behavior turned a
+    // pause tap there into a silent cancel ("pause broken again").
+    function canPauseNow() {
+        if (!bottomBar.busy)
+            return true
+        if (bottomBar.activePaused)
+            return true
+        if (bottomBar.activeStopping)
+            return false
+        return bottomBar.currentPhase !== "loading"
+    }
     // Shared by the bottom bar's and the popup header's pause/play button —
     // kept in one place so the glyph and the tap behavior (see both
-    // TapHandlers) can never drift out of sync with each other.
-    // User correction (2026-07-09): a distinct "stop" glyph during
-    // "loading" (the click actually calls cancelActive() there — see the
-    // TapHandlers below — since real pause has no interruption point to
-    // pause AT) was rejected: cancelling doesn't remove the job from the
-    // queue/history any differently than a normal cancel does, so showing
-    // a visually distinct "stop" affordance overstated what the click
-    // actually does. Always shows the ordinary pause/play glyph now,
-    // regardless of phase.
+    // TapHandlers) can never drift out of sync with each other. Always the
+    // ordinary pause/play glyph regardless of phase: item 9 (2026-07-14)
+    // removed the old "loading = cancel-and-restart" behavior entirely, so
+    // the button never doubles as a stop — during a phase that can't be
+    // paused yet ("loading") it's simply greyed (see canPauseNow()), not
+    // shown with a distinct stop affordance.
     function playPauseGlyph() {
         if (!bottomBar.busy)
             return "▶"
@@ -227,6 +250,8 @@ Item {
         case "download": return qsTr("Download")
         case "chapters": return qsTr("Generate chapters")
         case "combine": return qsTr("Combine")
+        case "diarize": return qsTr("Detect speakers")
+        case "import": return qsTr("Import")
         default: return qsTr("Transcribe")
         }
     }
@@ -237,11 +262,14 @@ Item {
         switch (phase) {
         case "loading": return qsTr("loading model…")
         case "decoding": return qsTr("decoding audio…")
+        case "detecting-speakers": return qsTr("detecting speakers…")
         case "detecting-speakers-segmenting": return qsTr("finding speech…")
         case "detecting-speakers-identifying": return qsTr("identifying speakers…")
         case "transcribing": return qsTr("transcribing…")
         case "downloading": return qsTr("downloading…")
         case "combining": return qsTr("combining…")
+        case "chaptering": return qsTr("chaptering…")
+        case "importing": return qsTr("importing…")
         default: return ""
         }
     }
@@ -290,23 +318,32 @@ Item {
         width: Math.max(4, bottomBar.width * bottomBar.taskOverallProgress)
         height: AppSettings.progressGlowWidth + AppSettings.progressGlowRadius
 
-        // Outer halo — widest, most transparent.
-        Rectangle {
-            anchors.top: parent.top
-            anchors.left: parent.left
-            width: parent.width
-            height: AppSettings.progressGlowWidth + AppSettings.progressGlowRadius
-            color: AppSettings.progressGlowColor
-            opacity: 0.15
-        }
-        // Middle halo — narrower, more opaque.
-        Rectangle {
-            anchors.top: parent.top
-            anchors.left: parent.left
-            width: parent.width
-            height: AppSettings.progressGlowWidth + AppSettings.progressGlowRadius / 2
-            color: AppSettings.progressGlowColor
-            opacity: 0.35
+        // Halo layers — configurable count (AppSettings.progressGlowLayerCount),
+        // stacked outermost-first so each successive (inner) layer paints on
+        // top, with the opaque core line below drawn last of all. Each layer
+        // interpolates thickness and opacity across the count:
+        //   - spread (thickness beyond the core) runs from the full glow
+        //     radius at the outermost layer down toward the core at the
+        //     innermost, via (count - index) / count;
+        //   - opacity runs linearly from 0.15 (outermost, faintest) to 0.35
+        //     (innermost, strongest).
+        // At count == 2 this reproduces the original hand-written pair exactly
+        // (outer: radius*1.0 / 0.15, inner: radius*0.5 / 0.35); higher counts
+        // add intermediate layers for a smoother, deeper glow.
+        Repeater {
+            model: AppSettings.progressGlowLayerCount
+            Rectangle {
+                required property int index
+                readonly property int layerCount: AppSettings.progressGlowLayerCount
+                anchors.top: parent.top
+                anchors.left: parent.left
+                width: parent.width
+                height: AppSettings.progressGlowWidth
+                        + AppSettings.progressGlowRadius * (layerCount - index) / layerCount
+                color: AppSettings.progressGlowColor
+                opacity: 0.15 + (0.35 - 0.15)
+                         * (layerCount > 1 ? index / (layerCount - 1) : 1)
+            }
         }
         // Core line — the real thin, fully-opaque edge.
         Rectangle {
@@ -360,14 +397,10 @@ Item {
             }
             TapHandler {
                 enabled: bottomBar.vaultLocalPath !== ""
-                onTapped: {
-                    // Reveal the open file (selected) when there is one;
-                    // otherwise just open the vault folder itself.
-                    if (bottomBar.currentFilePath !== "" && bottomBar.vaultTreeModel)
-                        bottomBar.vaultTreeModel.revealInFileManager("file://" + bottomBar.currentFilePath)
-                    else
-                        Qt.openUrlExternally(bottomBar.vaultPath)
-                }
+                // Item 42: focus the in-app file explorer (Sidebar tree) and
+                // reveal the open file there, rather than shelling out to the
+                // OS file manager. Handled in Main.qml, which owns both panels.
+                onTapped: bottomBar.focusFileExplorerRequested(bottomBar.currentFilePath)
             }
             RowLayout {
                 id: vaultPathRow
@@ -457,11 +490,11 @@ Item {
             id: pauseButton
             visible: (bottomBar.busy && bottomBar.canPause(bottomBar.currentJobKind))
                 || (!bottomBar.busy && bottomBar.frontQueuedJob !== null)
-            // Disabled (not just visually dimmed) while a soft-cancel from
-            // an earlier click is still resolving — see activeStopping's
-            // doc comment for the state corruption a second click causes
-            // otherwise.
-            enabled: !bottomBar.activeStopping
+            // Item 9: greyed (not just hidden) while the current phase can't
+            // be paused — during "loading" the button is visible but disabled
+            // rather than silently reinterpreting the tap as a cancel. Also
+            // covers the activeStopping window (see canPauseNow()).
+            enabled: bottomBar.canPauseNow()
             opacity: enabled ? 1 : 0.4
             Layout.preferredWidth: 16
             Layout.preferredHeight: 16
@@ -501,37 +534,10 @@ Item {
             }
         }
 
-        // O17: abort the Active job directly from the collapsed bar,
-        // without opening the Tasks popup — same visibility gating as
-        // pauseButton right above (its sibling), and same small-target
-        // ReleaseWithinBounds gesture fix.
-        Item {
-            id: stopButton
-            visible: pauseButton.visible
-            enabled: !bottomBar.activeStopping
-            opacity: enabled ? 1 : 0.4
-            Layout.preferredWidth: 16
-            Layout.preferredHeight: 16
-
-            HoverHandler {
-                id: stopHover
-                cursorShape: Qt.PointingHandCursor
-            }
-            TapHandler {
-                gesturePolicy: TapHandler.ReleaseWithinBounds
-                onTapped: bottomBar.transcriptionController.cancelActive()
-            }
-            HoverBorder {
-                anchors.fill: parent
-                active: stopHover.hovered
-            }
-            Text {
-                anchors.centerIn: parent
-                text: "⏹"
-                color: "#dddddd"
-                font.pixelSize: 11
-            }
-        }
+        // Item 9: the bottom bar shows ONLY a pause/resume button now — the
+        // separate stop/cancel button was removed as redundant. Cancelling
+        // the active job still lives in the Tasks popup (per-row × button,
+        // and "Cancel all"), which is where per-job cancel belongs.
 
         ProgressBar {
             Layout.preferredWidth: 140
@@ -550,14 +556,18 @@ Item {
             // Only while something is ACTIVELY running — tasksTotal alone
             // would keep this visible (frozen, meaningless) after every job
             // finishes, since finished jobs stay listed until dismissed.
-            visible: bottomBar.busy
+            // Also yields to the glow when it's on and configured to take over
+            // (progressGlowHidesBar) — the glow then reports progress alone.
+            visible: bottomBar.busy && !(AppSettings.progressGlowEnabled && AppSettings.progressGlowHidesBar)
         }
 
-        // P22: which backend actually loaded the active model
-        // ("Vulkan"/"CUDA"/"CPU"/…) — mirrors MainPanel.qml's own O35
-        // indicator (same property, same visibility/style convention).
+        // P22 / item 25: which backend actually loaded the active model —
+        // reduced to just "gpu"/"cpu" (see TranscriptionController::
+        // activeBackendKind) rather than the raw "Vulkan"/"CUDA"/"CPU" name,
+        // per the user's request. Empty (hidden) until a model has loaded,
+        // same visibility convention as before.
         Label {
-            text: bottomBar.transcriptionController ? bottomBar.transcriptionController.activeBackendName : ""
+            text: bottomBar.transcriptionController ? bottomBar.transcriptionController.activeBackendKind : ""
             visible: text !== ""
             color: "#888888"
             font.pixelSize: 11
@@ -565,7 +575,9 @@ Item {
 
         Item {
             id: tasksButton
-            visible: bottomBar.tasksTotal > 0
+            // Item 36: always visible — the counter reads "0/0 tasks" when
+            // idle (fresh start / after Clear) rather than vanishing, so the
+            // Tasks popup stays reachable and the count is a stable fixture.
             Layout.preferredWidth: tasksLabel.implicitWidth
             Layout.preferredHeight: tasksLabel.implicitHeight
 
@@ -602,19 +614,24 @@ Item {
         // directly put the popup mostly off the right edge of the window.
         // Anchor to bottomBar's own right edge instead.
         x: bottomBar.width - width - 8
-        width: 360
-        // A larger floor than the content-derived height alone — with only
-        // one or two rows, the popup previously sized down tight enough
-        // that a row's hover/hightlight hover border could visually poke
-        // past the popup's own rounded bottom edge.
-        // P18: Math.max above was a FLOOR only — with many real tasks
-        // jobColumn.implicitHeight (header + unclipped ScrollView content)
-        // could exceed the window itself, pushing content below the
-        // popup's own visible bounds. Math.min adds a ceiling; the inner
-        // ScrollView's own Layout.preferredHeight cap (below) keeps its
-        // rows scrollable well before this outer cap is ever hit in
-        // practice, but the cap is still needed as a hard backstop.
-        height: Math.min(Math.max(jobColumn.implicitHeight + 16, 160), 500)
+        // Item 29: wide enough that a typical "kind + filename + status" row
+        // reads without the filename getting truncated mid-word — the kind
+        // badge (~62) and status label (~96) are fixed, so the earlier 360
+        // left the fillWidth filename too little room.
+        width: 480
+        // Item 21: one deliberate, symmetric inner padding used BOTH as the
+        // ColumnLayout's margin (below) AND in this height calc, so the gap
+        // below the task list is exactly the gap above the header/Clear-button
+        // row. The height now hugs the content (header + capped ScrollView) —
+        // no artificial min-height floor, which was the only thing that ever
+        // left uneven vertical slack below the list.
+        // P18: Math.min is a ceiling only — with many real tasks
+        // jobColumn.implicitHeight (header + capped ScrollView content) could
+        // exceed the window; the inner ScrollView's own Layout.preferredHeight
+        // cap (below) keeps rows scrollable well before this outer cap is hit
+        // in practice, but the cap is still a needed hard backstop.
+        readonly property int innerPadding: 8
+        height: Math.min(jobColumn.implicitHeight + 2 * innerPadding, 500)
         clip: true
         // O21: was modal:false, which gives Qt no dim rectangle and no real
         // block-plane — clicks/hover reached whatever was behind the popup
@@ -637,7 +654,9 @@ Item {
         ColumnLayout {
             id: jobColumn
             anchors.fill: parent
-            anchors.margins: 8
+            // Item 21: symmetric with the popup height's 2*innerPadding, so
+            // the padding below the list equals the padding above the header.
+            anchors.margins: jobListPopup.innerPadding
             spacing: 4
 
             RowLayout {
@@ -662,9 +681,10 @@ Item {
                     id: popupPauseButton
                     visible: (bottomBar.busy && bottomBar.canPause(bottomBar.currentJobKind))
                         || (!bottomBar.busy && bottomBar.frontQueuedJob !== null)
-                    // See the bottom bar's own pauseButton for why this is
-                    // disabled (not just dimmed) while activeStopping.
-                    enabled: !bottomBar.activeStopping
+                    // Item 9: same enable gating as the bottom bar's own
+                    // pauseButton (greyed during "loading"/stopping) — shared
+                    // via canPauseNow() so the two never drift apart.
+                    enabled: bottomBar.canPauseNow()
                     opacity: enabled ? 1 : 0.4
                     Layout.preferredWidth: 20
                     Layout.preferredHeight: 20
@@ -760,14 +780,18 @@ Item {
 
                 ListView {
                     id: jobListView
-                    // P9: jobs() (C++) returns entries oldest-first
-                    // (append/insertion order) — reverse ONLY this display
-                    // binding so the list reads newest-first. Nothing else
-                    // (queuedPositionOf(), the move-up/down handlers, etc.)
-                    // touches this model — they all recompute position by
-                    // walking transcriptionController.jobs forward from
-                    // scratch, so they're unaffected by this being reversed.
-                    model: bottomBar.transcriptionController ? bottomBar.transcriptionController.jobs.slice().reverse() : []
+                    // Items 10/11: bind to the pre-partitioned sortedJobs view
+                    // (see TranscriptionController::sortedJobs) — the
+                    // currently-running/next-to-run jobs sit at the TOP in
+                    // real run order, with finished (done/failed/cancelled)
+                    // history demoted to the bottom. The old blind reversal of
+                    // raw jobs() inverted run order (soonest-to-run at the
+                    // BOTTOM) and never separated finished from pending.
+                    // Nothing else (queuedPositionOf(), the move-up/down
+                    // handlers, etc.) touches this binding — they all recompute
+                    // position by walking transcriptionController.jobs (raw
+                    // append order) from scratch, so they're unaffected.
+                    model: bottomBar.transcriptionController ? bottomBar.transcriptionController.sortedJobs : []
                     spacing: 2
 
                     delegate: Item {

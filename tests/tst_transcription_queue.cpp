@@ -34,9 +34,25 @@
 #include <QStandardPaths>
 #include <QtTest>
 
+#include "DiarizationEngine.h" // DiarizedTurn for the spliceBodySpeakers test (item 52)
+#include "LabelingEngine.h" // kMaxChapterInputChars for the item-28 window test
 #include "TranscriptionController.h"
 
 namespace {
+
+// Writes a minimal transcribed sibling .md (frontmatter + `body`) for
+// audioName inside dirPath, and returns the AUDIO file's QUrl (the key every
+// chapter/prelude method takes). Never touches the real vault — dirPath is a
+// per-test QTemporaryDir.
+QUrl writeTranscribedFile(const QString &dirPath, const QString &audioName, const QString &body)
+{
+    QFile md(dirPath + QStringLiteral("/") + audioName + QStringLiteral(".md"));
+    const bool opened = md.open(QIODevice::WriteOnly | QIODevice::Text);
+    Q_ASSERT(opened);
+    md.write((QStringLiteral("---\nmodel: ggml-base.en.bin\nspeakerDetection: false\n---\n") + body).toUtf8());
+    md.close();
+    return QUrl::fromLocalFile(dirPath + QStringLiteral("/") + audioName);
+}
 
 // Temp vault with the fake (empty, unloadable) model already "downloaded",
 // so ensureModel is satisfied offline.
@@ -110,6 +126,50 @@ private slots:
     // QSettings/QStandardPaths lookup for the rest of this process into an
     // isolated "qttest" sandbox instead of the real ~/.config/suopTranscriber.
     void initTestCase() { QStandardPaths::setTestModeEnabled(true); }
+
+    // Item 11: sortedJobs partitions the raw (append-order) jobs() list for
+    // display — Active first, then Queued in run order, then Paused, then
+    // finished (done/failed) most-recently-appended first. Pure static
+    // helper, tested directly with synthetic entries (no real jobs needed).
+    void sortJobsForDisplay_partitionsActiveQueuedPausedFinished()
+    {
+        auto entry = [](int id, const char *status) {
+            QVariantMap m;
+            m[QStringLiteral("id")] = id;
+            m[QStringLiteral("status")] = QString::fromLatin1(status);
+            return QVariant(m);
+        };
+        // Deliberately interleaved / out of display order in the raw list.
+        QVariantList raw;
+        raw << entry(1, "done")     // finished (oldest)
+            << entry(2, "queued")   // run order 1
+            << entry(3, "active")   // the running one
+            << entry(4, "failed")   // finished (newer)
+            << entry(5, "queued")   // run order 2
+            << entry(6, "paused");
+
+        const QVariantList out = TranscriptionController::sortJobsForDisplay(raw);
+        QCOMPARE(out.size(), 6);
+        auto idAt = [&](int i) { return out.at(i).toMap().value(QStringLiteral("id")).toInt(); };
+        QCOMPARE(idAt(0), 3);            // Active first
+        QCOMPARE(idAt(1), 2);            // Queued, run (append) order
+        QCOMPARE(idAt(2), 5);
+        QCOMPARE(idAt(3), 6);            // Paused after queued
+        QCOMPARE(idAt(4), 4);            // finished, most-recently-appended first
+        QCOMPARE(idAt(5), 1);
+    }
+
+    // Item 25: backendKind maps CUDA/Vulkan/any-non-CPU -> "gpu", CPU -> "cpu"
+    // (case-insensitive), empty -> empty (so QML keeps its indicator hidden
+    // until a model loads).
+    void backendKind_mapsGpuCpuEmpty()
+    {
+        QCOMPARE(TranscriptionController::backendKind(QStringLiteral("CUDA")), QStringLiteral("gpu"));
+        QCOMPARE(TranscriptionController::backendKind(QStringLiteral("Vulkan")), QStringLiteral("gpu"));
+        QCOMPARE(TranscriptionController::backendKind(QStringLiteral("CPU")), QStringLiteral("cpu"));
+        QCOMPARE(TranscriptionController::backendKind(QStringLiteral("cpu")), QStringLiteral("cpu"));
+        QCOMPARE(TranscriptionController::backendKind(QString()), QString());
+    }
 
     // A job that can't run (here: unloadable model; a missing audio file
     // fails the same way one step later) ends as status "failed", and
@@ -288,6 +348,73 @@ private slots:
         QCOMPARE(statusOf(controller, fileB), QStringLiteral("failed"));
     }
 
+    // Item 37: drag-and-drop import runs its byte-copy on the SAME worker
+    // thread as every other job (CLAUDE.md "never on the GUI thread"), tagged
+    // as a distinct "import" kind. Enqueuing an import job copies the source
+    // into the vault and the job ends Done. Uses a real source file + a temp
+    // dest vault (never the user's real vault).
+    void importAudio_copiesFileIntoVault_andJobEndsDone()
+    {
+        QTemporaryDir vault;
+        QVERIFY(vault.isValid());
+        QTemporaryDir source;
+        QVERIFY(source.isValid());
+        const QString sourcePath = source.filePath("dropped.mp3");
+        {
+            QFile f(sourcePath);
+            QVERIFY(f.open(QIODevice::WriteOnly));
+            f.write(QByteArray(64 * 1024, 'a')); // >1 chunk exercises the copy loop
+            f.close();
+        }
+        const QUrl sourceUrl = QUrl::fromLocalFile(sourcePath);
+        const QString destPath = vault.path() + QStringLiteral("/dropped.mp3");
+        const QUrl destUrl = QUrl::fromLocalFile(destPath);
+        const QUrl vaultUrl = QUrl::fromLocalFile(vault.path());
+
+        TranscriptionController controller;
+        QSignalSpy finishedSpy(&controller, &TranscriptionController::finished);
+        controller.importAudio(sourceUrl, destUrl, vaultUrl);
+
+        // The job is an "import" kind, keyed on the destination.
+        QCOMPARE(controller.jobs().at(0).toMap().value("kind").toString(), QStringLiteral("import"));
+
+        QTRY_COMPARE(finishedSpy.count(), 1);
+        const QList<QVariant> args = finishedSpy.takeFirst();
+        QCOMPARE(args.at(0).toUrl(), destUrl);
+        QVERIFY2(args.at(1).toBool(), qPrintable(args.at(2).toString()));
+
+        QCOMPARE(statusOf(controller, destUrl), QStringLiteral("done"));
+        QVERIFY(QFileInfo::exists(destPath));
+        QVERIFY(QFileInfo::exists(sourcePath)); // a copy, not a move
+        QFile copied(destPath);
+        QVERIFY(copied.open(QIODevice::ReadOnly));
+        QCOMPARE(copied.readAll().size(), 64 * 1024); // bytes copied intact
+    }
+
+    // Item 37: a copy that can't proceed on the worker (here: the source file
+    // doesn't exist) surfaces as a Failed job with an error, exactly like any
+    // other job's failure — not a crash or a silent drop. (Wrong-type /
+    // collision / no-vault are rejected SYNCHRONOUSLY before enqueue, by
+    // VaultTreeModel::importDestinationFor — see tst_vaulttreemodel.)
+    void importAudio_missingSource_endsFailedWithError()
+    {
+        QTemporaryDir vault;
+        QVERIFY(vault.isValid());
+        const QUrl sourceUrl = QUrl::fromLocalFile(vault.path() + QStringLiteral("/nope.mp3"));
+        const QUrl destUrl = QUrl::fromLocalFile(vault.path() + QStringLiteral("/nope.mp3.dest.mp3"));
+        const QUrl vaultUrl = QUrl::fromLocalFile(vault.path());
+
+        TranscriptionController controller;
+        QSignalSpy finishedSpy(&controller, &TranscriptionController::finished);
+        controller.importAudio(sourceUrl, destUrl, vaultUrl);
+
+        QTRY_COMPARE(finishedSpy.count(), 1);
+        QCOMPARE(finishedSpy.first().at(1).toBool(), false);
+        QVERIFY(!finishedSpy.first().at(2).toString().isEmpty());
+        QCOMPARE(statusOf(controller, destUrl), QStringLiteral("failed"));
+        QVERIFY(!QFileInfo::exists(destUrl.toLocalFile())); // no partial file left behind
+    }
+
     // CLAUDE.md: "Never run transcription on the GUI thread." The worker
     // QThread is a private member (not a QObject child of the controller),
     // so it isn't reachable via findChildren(); the observable contract from
@@ -438,24 +565,20 @@ private slots:
         QCOMPARE(controller.currentJobKind(), QString());
     }
 
-    // 2026-07-07: transcribe(autoLabel=true) no longer runs labeling as a
-    // silent bonus step inside the SAME job, NOR does it wait for
-    // transcription to finish before even creating a label task — it queues
-    // a SEPARATE "relabel" job immediately, right alongside the transcribe
-    // job, in the SAME transcribe() call (see its doc comment) — both show
-    // up in tasksTotal()/jobs() together right away, the label entry
-    // starting life as "queued" until the transcribe job ahead of it
-    // finishes. It still runs (and, here, fails — nothing to label without a
-    // real model) even when the transcription it followed failed, rather
-    // than being silently dropped.
-    void autoLabel_queuesBothTasksImmediately()
+    // Item 23 (behavior change): a transcribe call now ONLY transcribes. It
+    // used to chain a SEPARATE "relabel" job alongside the transcribe job
+    // whenever autoLabel was true (silent auto-labeling on every "Transcribe"
+    // click) — that auto-chaining is removed. The autoLabel parameter is kept
+    // (QML call sites still pass AppSettings.autoLabelEnabled and the invokable
+    // signature must stay call-compatible) but is now a NO-OP: transcribe with
+    // autoLabel=true queues exactly ONE transcribe job, no relabel job. The
+    // dedicated "Regenerate label" action is the sole way to label.
+    void transcribe_autoLabelParamIsNoOp_onlyTranscribes()
     {
         VaultFixture vault;
-        // Fake (empty) label model already "downloaded" — same idea as
-        // VaultFixture's whisper model — so this test's transcribe(autoLabel)
-        // call queues exactly the transcribe+relabel pair it's actually
-        // testing, without ALSO queuing a Wave N "download" job ahead of the
-        // relabel job (that's its own concern, covered separately).
+        // A fake (empty) label model on disk — so that IF the old auto-chaining
+        // were still present it would queue a relabel job here (no download
+        // job masking it), making this test a real regression guard.
         QFile labelModel(vault.dir.path() + "/.transcriber/models/Qwen3-4B-Instruct-2507-Q4_K_M.gguf");
         QVERIFY(labelModel.open(QIODevice::WriteOnly));
         labelModel.close();
@@ -465,18 +588,83 @@ private slots:
 
         controller.transcribe(file, vault.vaultUrl, kModelId, false, /*autoLabel=*/true);
 
-        // Both present immediately — not one appended later.
-        QCOMPARE(controller.tasksTotal(), 2);
+        // Only the transcribe job — no chained relabel job.
+        QCOMPARE(controller.tasksTotal(), 1);
         QCOMPARE(controller.jobs().at(0).toMap().value("kind").toString(), QStringLiteral("transcribe"));
         QCOMPARE(controller.jobs().at(0).toMap().value("status").toString(), QStringLiteral("active"));
-        QCOMPARE(controller.jobs().at(1).toMap().value("kind").toString(), QStringLiteral("relabel"));
-        QCOMPARE(controller.jobs().at(1).toMap().value("status").toString(), QStringLiteral("queued"));
 
-        // The fake model fails the transcription fast; the label job then
-        // takes its turn and fails too (no transcript exists to label).
+        // No "relabel" kind ever appears (before or after the job completes).
+        QTRY_COMPARE(controller.tasksCompleted(), 1);
+        QCOMPARE(controller.tasksTotal(), 1);
+        for (const QVariant &v : controller.jobs())
+            QVERIFY(v.toMap().value("kind").toString() != QStringLiteral("relabel"));
+    }
+
+    // Items 24/53 ("run all jobs"): a single runAllJobs() on an UNtranscribed
+    // file must enqueue exactly three jobs, IN ORDER — transcribe, then label
+    // (relabel), then chapters — so the single FIFO worker runs the full
+    // pipeline sequentially. Both models are planted on disk (whisper via
+    // VaultFixture, label here) so no "download" job masks the ordering; the
+    // jobs' kinds/positions are stable in jobs() regardless of the worker's
+    // async progress (finished entries keep their kind + list position).
+    void runAllJobs_enqueuesTranscribeThenLabelThenChapters_inOrder()
+    {
+        VaultFixture vault;
+        // Fake (empty) label model on disk so relabel/chapters don't queue a
+        // real network download job ahead of them (same idiom as
+        // jobs_tagEachEntryWithItsKind above).
+        QFile labelModel(vault.dir.path() + "/.transcriber/models/Qwen3-4B-Instruct-2507-Q4_K_M.gguf");
+        QVERIFY(labelModel.open(QIODevice::WriteOnly));
+        labelModel.close();
+
+        TranscriptionController controller;
+        const QUrl file = vault.audioUrl("a.wav"); // no sibling .md -> untranscribed
+
+        controller.runAllJobs(file, vault.vaultUrl, kModelId, /*speakerDetection=*/false);
+
+        QCOMPARE(controller.tasksTotal(), 3);
+        QCOMPARE(controller.jobs().at(0).toMap().value("kind").toString(), QStringLiteral("transcribe"));
+        QCOMPARE(controller.jobs().at(1).toMap().value("kind").toString(), QStringLiteral("relabel"));
+        QCOMPARE(controller.jobs().at(2).toMap().value("kind").toString(), QStringLiteral("chapters"));
+        // All three name the same file, in the same queue.
+        for (int i = 0; i < 3; ++i)
+            QCOMPARE(controller.jobs().at(i).toMap().value("fileUrl").toUrl(), file);
+        // The transcribe job started synchronously (idle when enqueued); the
+        // label + chapters jobs wait their turn behind it.
+        QCOMPARE(controller.jobs().at(0).toMap().value("status").toString(), QStringLiteral("active"));
+        QCOMPARE(controller.jobs().at(1).toMap().value("status").toString(), QStringLiteral("queued"));
+        QCOMPARE(controller.jobs().at(2).toMap().value("status").toString(), QStringLiteral("queued"));
+
+        // Whole pipeline drains (each fails fast on the zero-byte models, but
+        // the ordering/kinds above are stable throughout — that's the point).
+        QTRY_COMPARE(controller.tasksCompleted(), 3);
+    }
+
+    // Items 24/53 already-transcribed decision: runAllJobs() on a file that
+    // already has a sibling .md SKIPS the transcribe step and enqueues only
+    // label -> chapters (the friendly "just refresh the derived passes"
+    // behavior documented on the method).
+    void runAllJobs_alreadyTranscribed_skipsTranscribe_labelThenChapters()
+    {
+        VaultFixture vault;
+        QFile labelModel(vault.dir.path() + "/.transcriber/models/Qwen3-4B-Instruct-2507-Q4_K_M.gguf");
+        QVERIFY(labelModel.open(QIODevice::WriteOnly));
+        labelModel.close();
+
+        const QUrl file = vault.audioUrl("a.wav");
+        QFile md(vault.dir.path() + "/a.wav.md"); // sibling .md == already transcribed
+        QVERIFY(md.open(QIODevice::WriteOnly));
+        md.write("---\nmodel: ggml-base.en.bin\n---\n\n[0] hello\n");
+        md.close();
+
+        TranscriptionController controller;
+        controller.runAllJobs(file, vault.vaultUrl, kModelId, /*speakerDetection=*/false);
+
+        QCOMPARE(controller.tasksTotal(), 2);
+        QCOMPARE(controller.jobs().at(0).toMap().value("kind").toString(), QStringLiteral("relabel"));
+        QCOMPARE(controller.jobs().at(1).toMap().value("kind").toString(), QStringLiteral("chapters"));
+
         QTRY_COMPARE(controller.tasksCompleted(), 2);
-        QCOMPARE(controller.jobs().at(0).toMap().value("status").toString(), QStringLiteral("failed"));
-        QCOMPARE(controller.jobs().at(1).toMap().value("status").toString(), QStringLiteral("failed"));
     }
 
     // Wave N (task system, item 5): transcribe() queues a "download" job
@@ -659,111 +847,38 @@ private slots:
         QCOMPARE(finishedSpy.at(1).at(1).toBool(), true);
     }
 
-    // User correction (2026-07-09, follow-up round): clicking pause during
-    // "loading"/"decoding" (no cooperative checkpoint to truly suspend at —
-    // see JobStatus::Paused's doc comment) must not present as a failure.
-    // It should read as Paused, with no error, resumable with one more
-    // click of the same button — unlike cancelActive()/cancelJob(), which
-    // are a real, intentional cancel and still end Failed.
-    void togglePauseActive_duringLoading_pausesNotFails_andIsResumable()
+    // Item 9 (2026-07-14, supersedes the earlier "loading pause = restart-as-
+    // Paused" behavior): clicking pause during "loading" must NOT reinterpret
+    // the tap as a cancel — that was the "pause broken again" report (a click
+    // that looked like it did nothing, and could latch a stray cancel that
+    // broke pause for the rest of the job). togglePauseActive() is now a safe
+    // NO-OP during "loading" (the bottom bar disables the button there — see
+    // BottomBar.qml's canPauseNow()): the job is neither cancelled nor flipped
+    // to the old restart-based Paused status, it simply keeps running. Proven
+    // deterministically with the zero-byte fake model, which stays in
+    // "loading" until it fails to LOAD on its own — the failure error is that
+    // load failure, never "Cancelled".
+    void togglePauseActive_duringLoading_isNoop_notReinterpretedAsCancel()
     {
-        const QString modelPath = locateRealModel();
-        if (modelPath.isEmpty())
-            QSKIP("no real ggml model available; set SUOP_TEST_MODEL or transcribe once in the app");
-        if (QStandardPaths::findExecutable(QStringLiteral("ffmpeg")).isEmpty())
-            QSKIP("ffmpeg not on PATH — needed to decode the sample");
-
-        QTemporaryDir vault;
-        QVERIFY(vault.isValid());
-        const QString modelsDir = vault.path() + "/.transcriber/models";
-        QVERIFY(QDir().mkpath(modelsDir));
-        QVERIFY(QFile::copy(modelPath, modelsDir + "/ggml-base.en.bin"));
-        const QString samplePath = vault.path() + "/a.wav";
-        QVERIFY(QFile::copy(QStringLiteral(SUOP_SAMPLES_DIR "/jfk.wav"), samplePath));
-
+        VaultFixture vault;
         TranscriptionController controller;
         QSignalSpy finishedSpy(&controller, &TranscriptionController::finished);
-
-        controller.transcribe(QUrl::fromLocalFile(samplePath), QUrl::fromLocalFile(vault.path()), kModelId, false);
+        controller.transcribe(vault.audioUrl("a.wav"), vault.vaultUrl, kModelId, false);
         QTRY_COMPARE(controller.currentPhase(), QStringLiteral("loading"));
 
-        controller.togglePauseActive();
-        QVERIFY(finishedSpy.wait(10000));
-        QCOMPARE(finishedSpy.at(0).at(1).toBool(), false);
-        QCOMPARE(finishedSpy.at(0).at(2).toString(), QStringLiteral("Cancelled"));
-        QVERIFY(!controller.isBusy());
-        QCOMPARE(controller.jobs().at(0).toMap().value("status").toString(), QStringLiteral("paused"));
-        QVERIFY(controller.jobs().at(0).toMap().value("error").toString().isEmpty());
-
-        // One more click of the same button (idle -> startNext()) resumes
-        // it — a full restart under the hood, but the job's identity/
-        // position is preserved, not a new entry.
-        controller.togglePauseActive();
-        QTRY_VERIFY(controller.isBusy());
-        QCOMPARE(controller.jobs().at(0).toMap().value("status").toString(), QStringLiteral("active"));
-
-        QVERIFY(finishedSpy.wait(10000));
-        QCOMPARE(finishedSpy.at(1).at(1).toBool(), true);
-        QCOMPARE(controller.jobs().at(0).toMap().value("status").toString(), QStringLiteral("done"));
-    }
-
-    // Bug report (2026-07-10): after pausing during "decoding", the user saw
-    // nothing happen for a while (expected — no checkpoint exists mid-decode,
-    // see JobStatus::Paused's doc comment), then found pause permanently
-    // broken once the job reached "finding speech" (the diarization phase).
-    // Root cause: nothing told the user the first click had registered, so a
-    // second click landed while the soft-cancel from the first was still
-    // unresolved — pauseActive()'s real requestPause() stacked on top of the
-    // still-pending cancel flag, and waitWhilePausedOrCancelled()'s wait loop
-    // never runs while cancelled, so the pause silently went inert. Fixed via
-    // activeStopping (pauseActive() now no-ops while it's true). Reproduces
-    // the race directly rather than via real timing: both calls happen
-    // back-to-back on the test thread, before the worker can possibly have
-    // observed the first cancel yet — deterministic, not a sleep-and-hope.
-    void pauseActive_duringStopWindow_isNoop_pauseStillWorksAfterResume()
-    {
-        const QString modelPath = locateRealModel();
-        if (modelPath.isEmpty())
-            QSKIP("no real ggml model available; set SUOP_TEST_MODEL or transcribe once in the app");
-        if (QStandardPaths::findExecutable(QStringLiteral("ffmpeg")).isEmpty())
-            QSKIP("ffmpeg not on PATH — needed to decode the sample");
-
-        QTemporaryDir vault;
-        QVERIFY(vault.isValid());
-        const QString modelsDir = vault.path() + "/.transcriber/models";
-        QVERIFY(QDir().mkpath(modelsDir));
-        QVERIFY(QFile::copy(modelPath, modelsDir + "/ggml-base.en.bin"));
-        const QString samplePath = vault.path() + "/a.wav";
-        QVERIFY(QFile::copy(QStringLiteral(SUOP_SAMPLES_DIR "/jfk.wav"), samplePath));
-
-        TranscriptionController controller;
-        QSignalSpy finishedSpy(&controller, &TranscriptionController::finished);
-
-        controller.transcribe(QUrl::fromLocalFile(samplePath), QUrl::fromLocalFile(vault.path()), kModelId, false);
-        QTRY_COMPARE(controller.currentPhase(), QStringLiteral("loading"));
-
-        // First click: initiates the soft-cancel.
-        controller.togglePauseActive();
-        QVERIFY(controller.isActiveStopping());
-        // Stray second click, landing before the first has resolved — must
-        // be a no-op, not a real pause request stacked on the pending cancel.
-        controller.pauseActive();
+        controller.togglePauseActive(); // Item 9: safe no-op during "loading".
         QVERIFY(!controller.isActivePaused());
-
-        QVERIFY(finishedSpy.wait(10000));
-        QCOMPARE(controller.jobs().at(0).toMap().value("status").toString(), QStringLiteral("paused"));
         QVERIFY(!controller.isActiveStopping());
 
-        // Resume, then confirm a NORMAL pause during a real phase still
-        // works — this is the actual regression: it used to go permanently
-        // inert after the sequence above.
-        controller.togglePauseActive();
-        QTRY_VERIFY_WITH_TIMEOUT(controller.currentPhase() == QStringLiteral("transcribing"), 10000);
-        controller.pauseActive();
-        QTRY_VERIFY_WITH_TIMEOUT(controller.isActivePaused(), 5000);
-        controller.resumeActive();
-        QVERIFY(finishedSpy.wait(10000));
-        QCOMPARE(finishedSpy.at(1).at(1).toBool(), true);
+        // The click never cancelled the job: it fails on its own because the
+        // fake model can't load, with the load error (not "Cancelled"), and
+        // is never presented as the removed restart-based Paused status.
+        QTRY_COMPARE(controller.tasksCompleted(), 1);
+        QVERIFY(!finishedSpy.isEmpty());
+        QCOMPARE(finishedSpy.at(0).at(1).toBool(), false);
+        QVERIFY(finishedSpy.at(0).at(2).toString() != QStringLiteral("Cancelled"));
+        QVERIFY(!finishedSpy.at(0).at(2).toString().isEmpty());
+        QCOMPARE(controller.jobs().at(0).toMap().value("status").toString(), QStringLiteral("failed"));
     }
 
     // User follow-up (2026-07-10): "why can we not do something similar [to
@@ -817,9 +932,9 @@ private slots:
     // User correction (2026-07-09): cancelActive() is a real, intentional
     // cancel of whichever job is Active (always ends Failed/"Cancelled") —
     // convenience over cancelJob() so QML doesn't need to look up the
-    // Active job's id itself. togglePauseActive() also uses it as a
-    // building block for the "loading" soft-pause path (see
-    // togglePauseActive_duringLoading_pausesNotFails_andIsResumable), but a
+    // Active job's id itself. Unlike togglePauseActive() (which is a plain
+    // no-op during "loading" now — see
+    // togglePauseActive_duringLoading_isNoop_notReinterpretedAsCancel), a
     // DIRECT cancelActive() call — as here — is unconditionally a real
     // cancel. Uses a "download" job as the Active job under test, same
     // reasoning as cancelJob_stopsActiveJob (a real transcribe job's fake
@@ -1009,33 +1124,42 @@ private slots:
         QTRY_COMPARE(fresh.tasksCompleted(), 1); // let the fake model's fast failure settle before teardown
     }
 
-    // Regression (2026-07-09 bug report): a transcribe(autoLabel=true) call
-    // persists BOTH a "transcribe" and a "relabel" entry for the SAME
-    // fileUrl (see autoLabel_queuesBothTasksImmediately). Replaying them on
-    // restart previously called relabel() directly, whose own isQueued()
-    // dedup guard saw the just-replayed transcribe entry already Queued/
-    // Active for that fileUrl and silently dropped the relabel entry — the
-    // label job never came back after a restart. enqueueReplayedJob() now
+    // Regression (2026-07-09 bug report): two persisted entries for the SAME
+    // fileUrl (a "transcribe" and a "relabel") must BOTH survive a restart.
+    // Replaying them previously called relabel() directly, whose own
+    // isQueued() dedup guard saw the just-replayed transcribe entry already
+    // Queued/Active for that fileUrl and silently dropped the relabel entry —
+    // the label job never came back after a restart. enqueueReplayedJob() now
     // bypasses that guard for replay (every persisted entry already passed
     // dedup once, when it was first queued live).
-    void persistedQueue_autoLabelPairForSameFile_bothSurviveRestart()
+    //
+    // Item 23 note: transcribe() no longer auto-chains a relabel job, so this
+    // same-file pair can no longer arise from a single transcribe(autoLabel)
+    // call — the persisted tasks.json is written directly here (its exact
+    // on-disk shape, see persistQueue()) to still exercise the replay-dedup
+    // bypass, which remains live defensive code.
+    void persistedQueue_sameFilePairBothSurviveRestart()
     {
         VaultFixture vault;
-        // Fake (empty) label model already "downloaded" — same idea as
-        // VaultFixture's whisper model — so replaying the "relabel" entry
-        // doesn't ALSO queue a download job, keeping this test focused on
-        // the dedup-during-replay bug specifically.
+        // Fake (empty) label model already "downloaded" so replaying the
+        // "relabel" entry doesn't ALSO queue a download job, keeping this test
+        // focused on the dedup-during-replay bypass specifically.
         QFile labelModel(vault.dir.path() + "/.transcriber/models/Qwen3-4B-Instruct-2507-Q4_K_M.gguf");
         QVERIFY(labelModel.open(QIODevice::WriteOnly));
         labelModel.close();
 
         const QUrl file = vault.audioUrl("a.wav");
-        {
-            TranscriptionController controller;
-            controller.loadPersistedQueue(vault.vaultUrl);
-            controller.transcribe(file, vault.vaultUrl, kModelId, false, /*autoLabel=*/true);
-            QCOMPARE(controller.tasksTotal(), 2);
-        }
+        // Hand-write a tasks.json with a transcribe + relabel pair for the
+        // SAME fileUrl — the exact persisted shape persistQueue() emits.
+        const QString tasksJson =
+            QStringLiteral("[{\"kind\":\"transcribe\",\"fileUrl\":\"%1\",\"vaultUrl\":\"%2\",\"modelId\":\"%3\","
+                           "\"speakerDetection\":false},"
+                           "{\"kind\":\"relabel\",\"fileUrl\":\"%1\",\"vaultUrl\":\"%2\"}]")
+                .arg(file.toString(), vault.vaultUrl.toString(), QString::fromLatin1(kModelId));
+        QFile tasks(vault.dir.path() + "/.transcriber/tasks.json");
+        QVERIFY(tasks.open(QIODevice::WriteOnly | QIODevice::Text));
+        tasks.write(tasksJson.toUtf8());
+        tasks.close();
 
         TranscriptionController fresh;
         fresh.loadPersistedQueue(vault.vaultUrl);
@@ -1147,6 +1271,218 @@ private slots:
         QVERIFY(settings.value(QStringLiteral("detecting-speakers|%1").arg(kModelId)).toList().isEmpty());
         QVERIFY(settings.value(QStringLiteral("detecting-speakers|%1|diar").arg(kModelId)).toList().isEmpty());
         settings.endGroup();
+    }
+
+    // Item 17: manual chapter add/edit/delete round-trips through the .md.
+    // addChapter() writes a MANUAL marker (sentinel on disk, stripped from the
+    // displayed title, "manual" flag set); setChapterTitle() rewrites it;
+    // deleteChapter() removes it. Each emits finished(fileUrl, ok, error).
+    void chapterManualEdits_addSetTitleDelete()
+    {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        const QUrl audio = writeTranscribedFile(dir.path(), QStringLiteral("a.wav"),
+                                                 QStringLiteral("[0] First segment.\n"
+                                                                "[5] Second segment.\n"
+                                                                "[10] Third segment.\n"));
+        TranscriptionController controller;
+        QSignalSpy finishedSpy(&controller, &TranscriptionController::finished);
+
+        controller.addChapter(audio, 5.0, QStringLiteral("My Chapter"));
+        QCOMPARE(finishedSpy.size(), 1);
+        QVERIFY(finishedSpy.at(0).at(1).toBool()); // ok
+
+        QVariantList chapters = controller.readChapters(audio);
+        QCOMPARE(chapters.size(), 1);
+        QCOMPARE(chapters[0].toMap().value("t0").toDouble(), 5.0);
+        QCOMPARE(chapters[0].toMap().value("title").toString(), QStringLiteral("My Chapter"));
+        QVERIFY(chapters[0].toMap().value("manual").toBool());
+        // The sentinel must not leak into the DISPLAYED title...
+        QVERIFY(!chapters[0].toMap().value("title").toString().contains(QStringLiteral("manual")));
+        // ...but must be present verbatim on disk (so regeneration preserves it).
+        QVERIFY(controller.readTranscriptBody(audio).contains(QStringLiteral("## [5] My Chapter <!-- manual -->")));
+
+        controller.setChapterTitle(audio, 5.0, QStringLiteral("Renamed"));
+        chapters = controller.readChapters(audio);
+        QCOMPARE(chapters.size(), 1);
+        QCOMPARE(chapters[0].toMap().value("title").toString(), QStringLiteral("Renamed"));
+        QVERIFY(chapters[0].toMap().value("manual").toBool());
+
+        controller.deleteChapter(audio, 5.0);
+        QVERIFY(controller.readChapters(audio).isEmpty());
+
+        // Deleting/editing a non-existent chapter reports failure (finished ok=false).
+        finishedSpy.clear();
+        controller.deleteChapter(audio, 99.0);
+        QCOMPARE(finishedSpy.size(), 1);
+        QVERIFY(!finishedSpy.at(0).at(1).toBool());
+    }
+
+    // Item 17 (the key test): regeneration must PRESERVE manual markers while
+    // replacing auto ones. Drives spliceBodyChapters() directly (the pure
+    // splice helper generateChaptersJob() writes through), no model needed.
+    void spliceBodyChapters_preservesManualReplacesAuto()
+    {
+        const QString body = QStringLiteral("## [0] Old Auto Intro\n"
+                                             "[0] seg zero.\n"
+                                             "## [5] Hand Written <!-- manual -->\n"
+                                             "[5] seg five.\n"
+                                             "[10] seg ten.\n");
+        // Regenerate with a fresh AUTO set at t=0 and t=10 (not 5).
+        const QList<ResolvedChapter> regen = {{0.0, QStringLiteral("New Auto Intro")},
+                                              {10.0, QStringLiteral("New Auto Later")}};
+        const QString out = spliceBodyChapters(body, regen);
+
+        QVERIFY(!out.contains(QStringLiteral("Old Auto Intro")));       // old auto stripped
+        QVERIFY(out.contains(QStringLiteral("## [0] New Auto Intro")));  // new auto in
+        QVERIFY(out.contains(QStringLiteral("## [10] New Auto Later")));
+        QVERIFY(out.contains(QStringLiteral("## [5] Hand Written <!-- manual -->"))); // manual survives
+        QCOMPARE(out.count(QStringLiteral("## [")), 3); // 2 new auto + 1 preserved manual
+
+        // An auto chapter coinciding with the manual timestamp is skipped —
+        // the manual one wins, no duplicate marker at the same time.
+        const QString out2 = spliceBodyChapters(body, {{5.0, QStringLiteral("Should Not Appear")}});
+        QVERIFY(out2.contains(QStringLiteral("## [5] Hand Written <!-- manual -->")));
+        QVERIFY(!out2.contains(QStringLiteral("Should Not Appear")));
+        QCOMPARE(out2.count(QStringLiteral("## [")), 1);
+    }
+
+    // Item 28 (concrete bug): a transcript spanning multiple windows must have
+    // EVERY window within kMaxChapterInputChars — otherwise
+    // LabelingEngine::generateChapters() silently truncates the oversized
+    // window and the folded-in tail gets zero chapters. Also verifies the
+    // windows cover through the final segment (the late portion isn't dropped).
+    void computeChapterWindows_everyWindowFitsBudgetAndCoversTail()
+    {
+        // ~200-char segments, ending in a small trailing chunk — the exact
+        // shape the old unconditional fold pushed back over budget.
+        QStringList segs;
+        const QString big(200, QLatin1Char('x'));
+        for (int i = 0; i < 165; ++i)
+            segs << big;
+
+        const QList<int> windows = computeChapterWindows(segs);
+        QVERIFY2(windows.size() >= 2, "expected a multi-window split for a long transcript");
+        QCOMPARE(windows.first(), 0);
+
+        for (int w = 0; w < windows.size(); ++w) {
+            const int start = windows.at(w);
+            const int end = (w + 1 < windows.size()) ? windows.at(w + 1) : segs.size();
+            qsizetype chars = 0;
+            for (int i = start; i < end; ++i)
+                chars += QString::number(i - start).size() + 2 + segs.at(i).size() + 1;
+            QVERIFY2(chars <= LabelingEngine::kMaxChapterInputChars,
+                     qPrintable(QStringLiteral("window %1 has %2 chars, over budget %3 — the item-28 fold bug")
+                                    .arg(w).arg(chars).arg(LabelingEngine::kMaxChapterInputChars)));
+        }
+        // Strictly increasing starts, last window reaches the final segments.
+        for (int w = 1; w < windows.size(); ++w)
+            QVERIFY(windows.at(w) > windows.at(w - 1));
+        QVERIFY2(windows.last() < segs.size(), "the last window must cover the transcript's tail");
+    }
+
+    // Item 58: prelude length scales with transcript size — capped DOWN for
+    // short transcripts (P29), scaled UP for long ones. Pure static mapping,
+    // testable without a model.
+    void effectiveWordinessForLength_capsShortScalesLong()
+    {
+        // Short: capped down regardless of a high base slider.
+        QVERIFY(TranscriptionController::effectiveWordinessForLength(1.0, 30) <= 0.15);
+        QVERIFY(TranscriptionController::effectiveWordinessForLength(1.0, 100) <= 0.35);
+
+        // Long: at the SAME modest base, a longer transcript yields a higher
+        // effective wordiness (fuller prelude tier) than a mid-length one.
+        const double base = 0.5;
+        const double midLen = TranscriptionController::effectiveWordinessForLength(base, 500);
+        const double longLen = TranscriptionController::effectiveWordinessForLength(base, 3000);
+        const double veryLong = TranscriptionController::effectiveWordinessForLength(base, 25000);
+        QCOMPARE(midLen, base);      // mid length: unchanged
+        QVERIFY2(longLen > midLen, "a long transcript should scale wordiness up");
+        QVERIFY2(veryLong > longLen, "a very long transcript should scale up further");
+        QVERIFY2(veryLong >= 0.9, "a multi-hour transcript should reach the top prelude tier");
+
+        // Upward scaling never LOWERS an already-high base.
+        QVERIFY(TranscriptionController::effectiveWordinessForLength(0.95, 3000) >= 0.95);
+    }
+
+    // Item 52: diarizeFile() enqueues a standalone "diarize" job on an
+    // already-transcribed file — a job of the right kind, keyed on that file,
+    // through the same queue/worker as every other action. The two diarization
+    // onnx models are pre-created (zero-byte, "downloaded") so no download job
+    // is queued ahead and the diarize job is the front-most entry.
+    void diarizeFile_enqueuesDiarizeJob()
+    {
+        VaultFixture vault;
+        // areDiarizationModelsDownloaded() only checks presence — zero-byte is
+        // enough to suppress the would-be-ahead download job here.
+        for (const QString &name :
+             {QStringLiteral("pyannote-segmentation-3.0-int8.onnx"), QStringLiteral("wespeaker-resnet293-lm.onnx")}) {
+            QFile f(vault.dir.path() + QStringLiteral("/.transcriber/models/") + name);
+            QVERIFY(f.open(QIODevice::WriteOnly));
+            f.close();
+        }
+        const QUrl file = writeTranscribedFile(vault.dir.path(), QStringLiteral("a.wav"),
+                                                QStringLiteral("[0] hello there\n[5] general kenobi\n"));
+
+        TranscriptionController controller;
+        QSignalSpy finishedSpy(&controller, &TranscriptionController::finished);
+        controller.diarizeFile(file, vault.vaultUrl);
+
+        // Enqueued synchronously (startJob runs inline in diarizeFile) with the
+        // right kind, keyed on the audio file.
+        QVERIFY(!controller.jobs().isEmpty());
+        QCOMPARE(controller.jobs().at(0).toMap().value("kind").toString(), QStringLiteral("diarize"));
+        QCOMPARE(controller.jobs().at(0).toMap().value("fileUrl").toUrl(), file);
+        QVERIFY(controller.isQueued(file));
+
+        // Dedup: a second diarizeFile() while one is Queued/Active is a no-op.
+        const int before = controller.jobs().size();
+        controller.diarizeFile(file, vault.vaultUrl);
+        QCOMPARE(controller.jobs().size(), before);
+
+        // Let it settle so teardown is clean — the job fails fast (no audio to
+        // decode / unloadable models), which is fine; we only assert enqueue.
+        QTRY_VERIFY(finishedSpy.count() >= 1);
+    }
+
+    // Item 52: spliceBodySpeakers() is the write-back half of a standalone
+    // diarize — given synthetic diarized turns (no real engine/models), it
+    // adds "[Speaker N]" tags to an already-transcribed body WITHOUT touching
+    // the timestamps or spoken text, and reports the applied speaker set. This
+    // is the file-level "writes speaker info back without a re-transcribe"
+    // proof the full diarizeJob() relies on.
+    void spliceBodySpeakers_addsTags_withoutRetranscribe()
+    {
+        // Two speakers plus a hallucinated non-speech line (never tagged).
+        const QString body = QStringLiteral("[0] hello there\n[5] general kenobi\n[8] [MUSIC PLAYING]\n");
+        const std::vector<DiarizedTurn> turns = {{0.0, 4.0, 0}, {4.0, 12.0, 1}};
+        QStringList applied;
+        const QString out = spliceBodySpeakers(body, /*knownSpeakers=*/{}, turns, /*totalSeconds=*/12.0, &applied);
+
+        QVERIFY2(out.contains(QStringLiteral("[0] [Speaker 1] hello there")), qPrintable(out));
+        QVERIFY2(out.contains(QStringLiteral("[5] [Speaker 2] general kenobi")), qPrintable(out));
+        // Non-speech annotation line is left untouched (no speaker tag).
+        QVERIFY2(out.contains(QStringLiteral("[8] [MUSIC PLAYING]")), qPrintable(out));
+        QCOMPARE(applied, (QStringList{QStringLiteral("Speaker 1"), QStringLiteral("Speaker 2")}));
+    }
+
+    // Item 52: re-diarizing a file that ALREADY has speaker tags replaces them
+    // in place (per its frontmatter "speakers:" allowlist) rather than
+    // doubling them up.
+    void spliceBodySpeakers_reDiarize_replacesExistingTags()
+    {
+        const QString body =
+            QStringLiteral("[0] [Speaker 1] hello there\n[5] [Speaker 1] general kenobi\n");
+        const QStringList known = {QStringLiteral("Speaker 1")};
+        const std::vector<DiarizedTurn> turns = {{0.0, 4.0, 0}, {4.0, 10.0, 1}};
+        QStringList applied;
+        const QString out = spliceBodySpeakers(body, known, turns, /*totalSeconds=*/10.0, &applied);
+
+        QVERIFY2(out.contains(QStringLiteral("[0] [Speaker 1] hello there")), qPrintable(out));
+        QVERIFY2(out.contains(QStringLiteral("[5] [Speaker 2] general kenobi")), qPrintable(out));
+        // No doubled tags introduced.
+        QVERIFY2(!out.contains(QStringLiteral("[Speaker 1] [Speaker")), qPrintable(out));
+        QCOMPARE(applied, (QStringList{QStringLiteral("Speaker 1"), QStringLiteral("Speaker 2")}));
     }
 };
 

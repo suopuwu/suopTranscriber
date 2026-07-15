@@ -11,6 +11,8 @@
 #include <QTextStream>
 
 #include <algorithm>
+#include <utility>
+#include <vector>
 
 namespace {
 
@@ -25,6 +27,24 @@ const QSet<QString> &audioExtensions()
 bool isAudioFile(const QFileInfo &info)
 {
     return audioExtensions().contains(info.suffix().toLower());
+}
+
+// Destructive delete for a user-triggered UI action (Item 2): prefer the
+// trash (recoverable) over a permanent remove, falling back to remove() only
+// if the platform/filesystem can't trash. Returns false if the path doesn't
+// exist to begin with (an absent optional sidecar isn't a failure — callers
+// ignore the result for those).
+bool trashOrRemove(const QString &path)
+{
+    if (!QFileInfo::exists(path))
+        return false;
+    QFile file(path);
+    if (file.moveToTrash())
+        return true;
+    // moveToTrash() can leave fileName() pointing at a partial trash path on
+    // failure; re-target the original before the permanent-remove fallback.
+    file.setFileName(path);
+    return file.remove();
 }
 
 } // namespace
@@ -448,12 +468,12 @@ bool VaultTreeModel::renameFile(const QUrl &fileUrl, const QString &newBaseName,
     return true;
 }
 
-bool VaultTreeModel::importFile(const QUrl &fileUrl, QString *errorOut)
+QString VaultTreeModel::importDestinationFor(const QUrl &fileUrl, QString *errorOut) const
 {
     auto fail = [&](const QString &msg) {
         if (errorOut)
             *errorOut = msg;
-        return false;
+        return QString();
     };
 
     const QString localPath = vaultLocalPath();
@@ -471,11 +491,284 @@ bool VaultTreeModel::importFile(const QUrl &fileUrl, QString *errorOut)
     if (QFileInfo::exists(destPath))
         return fail(QStringLiteral("\"%1\" already exists in the vault.").arg(sourceInfo.fileName()));
 
-    if (!QFile::copy(sourcePath, destPath))
-        return fail(QStringLiteral("Failed to copy \"%1\" into the vault.").arg(sourceInfo.fileName()));
+    // No copy here — the actual (potentially slow, on a large file) byte-copy
+    // runs on TranscriptionController's worker thread (see importAudio()), and
+    // the new file appearing in the watched vault dir fires
+    // QFileSystemWatcher::directoryChanged -> rebuild(), refreshing the tree
+    // without an explicit rebuild() on this (const) validation path.
+    if (errorOut)
+        errorOut->clear();
+    return destPath;
+}
+
+bool VaultTreeModel::createFolder(const QUrl &parentDirUrl, const QString &name)
+{
+    const QString trimmed = name.trimmed();
+    if (trimmed.isEmpty())
+        return false;
+
+    // Same invalid-character set renameFile() rejects — this also covers the
+    // path separators '/' and '\\', so `name` can never be a multi-segment
+    // path or escape parentDir.
+    static const QString invalidChars = QStringLiteral("/\\:*?\"<>|");
+    for (const QChar &c : name) {
+        if (invalidChars.contains(c))
+            return false;
+    }
+    // "." / ".." aren't separators but still name an existing dir rather than
+    // a new child — reject explicitly rather than rely on the collision check.
+    if (trimmed == QStringLiteral(".") || trimmed == QStringLiteral(".."))
+        return false;
+
+    const QString parentPath = parentDirUrl.toLocalFile();
+    if (parentPath.isEmpty())
+        return false;
+    const QFileInfo parentInfo(parentPath);
+    if (!parentInfo.exists() || !parentInfo.isDir())
+        return false;
+    if (!isPathInsideVault(parentPath))
+        return false;
+
+    const QString newPath = parentPath + '/' + trimmed;
+    if (QFileInfo::exists(newPath))
+        return false; // collision — never clobber an existing entry
+
+    if (!QDir().mkpath(newPath))
+        return false;
 
     rebuild();
     return true;
+}
+
+bool VaultTreeModel::deleteFolder(const QUrl &folderUrl)
+{
+    const QString path = folderUrl.toLocalFile();
+    if (path.isEmpty())
+        return false;
+
+    const QFileInfo info(path);
+    if (!info.exists() || !info.isDir())
+        return false;
+
+    const QString canonical = info.canonicalFilePath();
+    const QString vaultCanonical = QFileInfo(vaultLocalPath()).canonicalFilePath();
+    if (canonical.isEmpty() || vaultCanonical.isEmpty())
+        return false;
+    // Guard: never delete the vault root itself...
+    if (canonical == vaultCanonical)
+        return false;
+    // ...nor anything outside the vault (isPathInsideVault also accepts the
+    // root, hence the explicit equality guard above).
+    if (!isPathInsideVault(path))
+        return false;
+
+    if (!QDir(path).removeRecursively())
+        return false;
+
+    rebuild();
+    return true;
+}
+
+bool VaultTreeModel::moveFile(const QUrl &fileUrl, const QUrl &destDirUrl)
+{
+    const QString srcPath = fileUrl.toLocalFile();
+    const QString destDir = destDirUrl.toLocalFile();
+    if (srcPath.isEmpty() || destDir.isEmpty())
+        return false;
+
+    const QFileInfo srcInfo(srcPath);
+    if (!srcInfo.exists() || !srcInfo.isFile())
+        return false;
+
+    const QFileInfo destDirInfo(destDir);
+    if (!destDirInfo.exists() || !destDirInfo.isDir())
+        return false;
+
+    // Both ends must stay inside the vault.
+    if (!isPathInsideVault(srcPath) || !isPathInsideVault(destDir))
+        return false;
+
+    // No-op guard: destination is the file's current directory.
+    if (QFileInfo(srcInfo.absolutePath()).canonicalFilePath() == destDirInfo.canonicalFilePath())
+        return false;
+
+    // The set of files that move together: the file itself, plus — when it's
+    // an audio file — its <fileName>.md sidecar and, if present, its
+    // .<fileName>.partial.jsonl resume state (same full-filename convention as
+    // sidecarMdPath(); see item P7). A standalone .md moves alone.
+    std::vector<std::pair<QString, QString>> moves;
+    moves.emplace_back(srcPath, destDir + '/' + srcInfo.fileName());
+
+    if (isAudioFile(srcInfo)) {
+        const QString dirPath = srcInfo.absolutePath();
+        const QString mdFrom = dirPath + '/' + srcInfo.fileName() + ".md";
+        if (QFileInfo::exists(mdFrom))
+            moves.emplace_back(mdFrom, destDir + '/' + srcInfo.fileName() + ".md");
+        const QString partialFrom = dirPath + "/." + srcInfo.fileName() + ".partial.jsonl";
+        if (QFileInfo::exists(partialFrom))
+            moves.emplace_back(partialFrom, destDir + "/." + srcInfo.fileName() + ".partial.jsonl");
+    }
+
+    // Check every destination for a collision BEFORE moving anything, so a
+    // half-done move never splits the audio/.md pair across two folders.
+    for (const auto &m : moves) {
+        if (QFileInfo::exists(m.second))
+            return false;
+    }
+
+    std::vector<std::pair<QString, QString>> done;
+    for (const auto &m : moves) {
+        if (!QFile::rename(m.first, m.second)) {
+            for (const auto &d : done)
+                QFile::rename(d.second, d.first); // best-effort rollback
+            return false;
+        }
+        done.push_back(m);
+    }
+
+    rebuild();
+    return true;
+}
+
+bool VaultTreeModel::moveFolder(const QUrl &folderUrl, const QUrl &destParentUrl)
+{
+    const QString srcPath = folderUrl.toLocalFile();
+    const QString destParent = destParentUrl.toLocalFile();
+    if (srcPath.isEmpty() || destParent.isEmpty())
+        return false;
+
+    const QFileInfo srcInfo(srcPath);
+    if (!srcInfo.exists() || !srcInfo.isDir())
+        return false;
+    const QFileInfo destParentInfo(destParent);
+    if (!destParentInfo.exists() || !destParentInfo.isDir())
+        return false;
+
+    const QString srcCanonical = srcInfo.canonicalFilePath();
+    const QString destParentCanonical = destParentInfo.canonicalFilePath();
+    const QString vaultCanonical = QFileInfo(vaultLocalPath()).canonicalFilePath();
+    if (srcCanonical.isEmpty() || destParentCanonical.isEmpty() || vaultCanonical.isEmpty())
+        return false;
+
+    // Never move the vault root itself, and keep both ends inside the vault.
+    if (srcCanonical == vaultCanonical)
+        return false;
+    if (!isPathInsideVault(srcPath) || !isPathInsideVault(destParent))
+        return false;
+
+    // Refuse moving a folder into itself or one of its own descendants — that
+    // would orphan the subtree.
+    if (destParentCanonical == srcCanonical || destParentCanonical.startsWith(srcCanonical + '/'))
+        return false;
+
+    // No-op guard: already directly inside destParent.
+    if (QFileInfo(srcInfo.absolutePath()).canonicalFilePath() == destParentCanonical)
+        return false;
+
+    const QString destPath = destParent + '/' + srcInfo.fileName();
+    if (QFileInfo::exists(destPath))
+        return false; // collision
+
+    if (!QDir().rename(srcPath, destPath))
+        return false;
+
+    rebuild();
+    return true;
+}
+
+bool VaultTreeModel::deleteTranscript(const QUrl &fileUrl)
+{
+    const QString path = fileUrl.toLocalFile();
+    if (path.isEmpty())
+        return false;
+
+    const QFileInfo info(path);
+    if (!info.exists() || !info.isFile())
+        return false;
+    if (!isPathInsideVault(path))
+        return false;
+
+    // Which .md sidecar (+ resume-state partial) is this file's transcript?
+    // Same full-filename convention as sidecarMdPath()/moveFile() (item P7).
+    const QString dirPath = info.absolutePath();
+    QString mdPath;
+    QString partialPath;
+    if (isAudioFile(info)) {
+        mdPath = dirPath + '/' + info.fileName() + ".md";
+        partialPath = dirPath + "/." + info.fileName() + ".partial.jsonl";
+    } else if (info.suffix().toLower() == "md") {
+        // An orphaned .md passed directly: it IS the transcript.
+        mdPath = path;
+        partialPath = dirPath + "/." + info.fileName() + ".partial.jsonl";
+    } else {
+        return false;
+    }
+
+    if (!QFileInfo::exists(mdPath))
+        return false; // nothing transcribed here — no-op
+
+    if (!trashOrRemove(mdPath))
+        return false;
+    trashOrRemove(partialPath); // best-effort; an absent partial is fine
+
+    rebuild();
+    emit transcriptDeleted(fileUrl);
+    return true;
+}
+
+bool VaultTreeModel::deleteFile(const QUrl &fileUrl)
+{
+    const QString path = fileUrl.toLocalFile();
+    if (path.isEmpty())
+        return false;
+
+    const QFileInfo info(path);
+    // Only ever a real file — never a directory / the vault root (deleteFolder
+    // owns recursive directory deletion, with its own vault-root guard).
+    if (!info.exists() || !info.isFile())
+        return false;
+    if (!isPathInsideVault(path))
+        return false;
+
+    const QString dirPath = info.absolutePath();
+
+    if (!trashOrRemove(path))
+        return false;
+
+    // Carry the sidecars off with an audio file, mirroring moveFile()'s set.
+    // A standalone orphaned .md has none — it's already gone above.
+    if (isAudioFile(info)) {
+        trashOrRemove(dirPath + '/' + info.fileName() + ".md");
+        trashOrRemove(dirPath + "/." + info.fileName() + ".partial.jsonl");
+    }
+
+    rebuild();
+    emit fileDeleted(fileUrl);
+    return true;
+}
+
+QStringList VaultTreeModel::vaultFolders() const
+{
+    QStringList out;
+    const QString root = vaultLocalPath();
+    if (root.isEmpty() || !QFileInfo::exists(root))
+        return out;
+    out << root;
+    collectFolderPaths(root, out);
+    return out;
+}
+
+void VaultTreeModel::collectFolderPaths(const QString &dirPath, QStringList &out)
+{
+    // QDir::Dirs (without QDir::Hidden) skips dotdirs like .transcriber, same
+    // as the tree scan; walks the real filesystem rather than the pruned tree
+    // so empty folders are still offered as move destinations.
+    QDir dir(dirPath);
+    const QFileInfoList entries = dir.entryInfoList(QDir::Dirs | QDir::NoDotAndDotDot, QDir::Name);
+    for (const QFileInfo &entry : entries) {
+        out << entry.absoluteFilePath();
+        collectFolderPaths(entry.absoluteFilePath(), out);
+    }
 }
 
 bool VaultTreeModel::isPathInsideVault(const QString &candidatePath) const
@@ -704,6 +997,46 @@ void VaultTreeModel::collectSearchResults(const Node *node, const QString &query
 
     for (const auto &child : node->children)
         collectSearchResults(child.get(), queryLower, includeTranscriptions, out);
+}
+
+VaultTreeModel::Node *VaultTreeModel::findNodeByPath(Node *node, const QString &path)
+{
+    if (node->path == path)
+        return node;
+    for (const auto &child : node->children) {
+        if (Node *hit = findNodeByPath(child.get(), path))
+            return hit;
+    }
+    return nullptr;
+}
+
+QModelIndex VaultTreeModel::indexForNode(const Node *node) const
+{
+    if (!node || !node->parent)
+        return {};
+    const std::vector<std::unique_ptr<Node>> &siblings = node->parent->children;
+    for (size_t i = 0; i < siblings.size(); ++i) {
+        if (siblings[i].get() == node)
+            return createIndex(static_cast<int>(i), 0, const_cast<Node *>(node));
+    }
+    return {};
+}
+
+void VaultTreeModel::refreshFile(const QUrl &fileUrl)
+{
+    const QString path = fileUrl.toLocalFile();
+    if (path.isEmpty())
+        return;
+
+    Node *node = findNodeByPath(m_root.get(), path);
+    if (!node)
+        return;
+
+    const QModelIndex idx = indexForNode(node);
+    if (!idx.isValid())
+        return;
+
+    emit dataChanged(idx, idx);
 }
 
 void VaultTreeModel::revealInFileManager(const QUrl &fileUrl) const

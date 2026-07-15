@@ -584,6 +584,93 @@ QRegularExpression chapterMarkerPattern()
     return QRegularExpression(QStringLiteral("^## \\[([\\d:.]+)\\] (.*)$"), QRegularExpression::MultilineOption);
 }
 
+// Item 17: a MANUAL chapter marker carries this trailing HTML-comment sentinel
+// ("## [t] Title <!-- manual -->"). An HTML comment round-trips cleanly through
+// the chapterMarkerPattern (it's captured as part of group 2's title text, then
+// stripped for display by chapterDisplayTitle() below) and never renders as
+// literal text in a Markdown viewer, yet is preserved verbatim on disk — so
+// spliceBodyChapters()'s regeneration can tell a user's manual chapter apart
+// from an LLM-generated auto one and strip only the latter.
+const QString kManualChapterSentinel = QStringLiteral("<!-- manual -->");
+
+// True if a chapterMarkerPattern group-2 title capture belongs to a manual
+// marker (ends with the sentinel).
+bool chapterTitleCaptureIsManual(const QString &titleCapture)
+{
+    return titleCapture.trimmed().endsWith(kManualChapterSentinel);
+}
+
+// The DISPLAY title for a chapterMarkerPattern group-2 capture — the sentinel
+// (if any) removed and surrounding whitespace trimmed. Plain (auto) captures
+// pass through unchanged.
+QString chapterDisplayTitle(const QString &titleCapture)
+{
+    QString title = titleCapture.trimmed();
+    if (title.endsWith(kManualChapterSentinel)) {
+        title.chop(kManualChapterSentinel.size());
+        title = title.trimmed();
+    }
+    return title;
+}
+
+// Builds a marker LINE (no trailing newline) for timestamp tsText + title,
+// tagging it manual (sentinel appended) or auto.
+QString formatChapterMarker(const QString &tsText, const QString &title, bool manual)
+{
+    QString line = QStringLiteral("## [") + tsText + QStringLiteral("] ") + title.trimmed();
+    if (manual)
+        line += QLatin1Char(' ') + kManualChapterSentinel;
+    return line;
+}
+
+// Item 17 body mutators (used by TranscriptionController::editChapterMarker()).
+// A marker is matched by parsed-timestamp closeness rather than exact string
+// equality: formatTimestamp∘parseCompactTimestamp is identity on a stored
+// marker, but an epsilon compare is robust to any float drift in the double a
+// caller round-trips back through readChapters().
+
+// Finds the chapter marker whose timestamp is within ~1ms of ts. Returns
+// whether found; fills *out on success.
+bool findChapterMarkerAt(const QString &body, double ts, QRegularExpressionMatch *out)
+{
+    QRegularExpressionMatchIterator it = chapterMarkerPattern().globalMatch(body);
+    while (it.hasNext()) {
+        const QRegularExpressionMatch m = it.next();
+        if (qAbs(parseCompactTimestamp(m.captured(1)) - ts) < 0.0005) {
+            *out = m;
+            return true;
+        }
+    }
+    return false;
+}
+
+// The byte offset at which to insert a chapter marker for ts: right before the
+// first SEGMENT line ("[ts] ...") whose t0 >= ts, else at end of body — so a
+// manually added chapter lands in sorted (time) order. Chapter markers
+// ("## [") never match the "^\[" segment anchor, so they're naturally skipped.
+int chapterInsertOffset(const QString &body, double ts)
+{
+    static const QRegularExpression segLine(QStringLiteral("^\\[([\\d:.]+)\\]"),
+                                            QRegularExpression::MultilineOption);
+    QRegularExpressionMatchIterator it = segLine.globalMatch(body);
+    while (it.hasNext()) {
+        const QRegularExpressionMatch m = it.next();
+        if (parseCompactTimestamp(m.captured(1)) >= ts - 0.0005)
+            return static_cast<int>(m.capturedStart(0));
+    }
+    return static_cast<int>(body.size());
+}
+
+// Removes match m's whole marker line (and its trailing newline) from *body.
+void removeChapterMarkerLine(QString *body, const QRegularExpressionMatch &m)
+{
+    int start = m.capturedStart(0);
+    int length = m.capturedLength(0);
+    if (start + length < body->size() && body->at(start + length) == QLatin1Char('\n'))
+        ++length;
+    body->remove(start, length);
+}
+
 // Item 14 "auto-categorize" mode: the existing tag vocabulary for a vault,
 // scanned fresh per labeling job (vaults are small; no cache invalidation
 // to get wrong). Reads every .md's `tags:` frontmatter line directly rather
@@ -1019,6 +1106,83 @@ QString combineOutputPathFor(const QString &ruleName, const QString &key, const 
     return dir + QStringLiteral("/") + name + QStringLiteral(".combined.") + ext;
 }
 
+// Backstop audio-file check for combineSelected() (item 44): the sidebar only
+// offers manual combine over rows it already knows are audio, but the
+// controller re-validates the explicit selection so a stray .md (or anything
+// non-audio) is dropped rather than fed to ffmpeg. Suffix set intentionally
+// mirrors VaultTreeModel's audioExtensions() — the sidebar's own isAudio
+// source of truth; kept as a local copy rather than reaching across into that
+// unrelated model just for a guard (pre-stable, no cross-module coupling
+// wanted here).
+bool isAudioPath(const QString &path)
+{
+    static const QSet<QString> kAudioExts = {
+        QStringLiteral("mp3"),  QStringLiteral("wav"),  QStringLiteral("m4a"), QStringLiteral("flac"),
+        QStringLiteral("ogg"),  QStringLiteral("opus"), QStringLiteral("aac"), QStringLiteral("wma"),
+        QStringLiteral("aiff"), QStringLiteral("alac"),
+    };
+    return kAudioExts.contains(QFileInfo(path).suffix().toLower());
+}
+
+}
+
+// See this function's declaration doc comment in TranscriptionController.h.
+QString spliceBodySpeakers(const QString &body, const QStringList &knownSpeakers,
+                            const std::vector<DiarizedTurn> &turns, double totalSeconds,
+                            QStringList *appliedSpeakersOut)
+{
+    struct SegEdit {
+        bool hadTag = false;
+        int tagStart = 0;
+        int tagLen = 0;
+        int textStart = 0;
+        double t0 = 0.0;
+        QString text;
+    };
+    QVector<SegEdit> segs;
+    QRegularExpressionMatchIterator it = segmentLinePattern(knownSpeakers).globalMatch(body);
+    while (it.hasNext()) {
+        const QRegularExpressionMatch m = it.next();
+        SegEdit e;
+        e.hadTag = m.capturedLength(2) > 0;
+        e.tagStart = m.capturedStart(2);
+        e.tagLen = m.capturedLength(2);
+        e.textStart = m.capturedStart(3);
+        e.t0 = parseCompactTimestamp(m.captured(1));
+        e.text = m.captured(3).trimmed();
+        segs.append(e);
+    }
+
+    // Forward pass: resolve each segment's label (its end == the next
+    // segment's start; the last segment runs to the decoded audio length),
+    // collecting the distinct applied labels in first-appearance/file order.
+    QVector<QString> labels(segs.size());
+    QStringList applied;
+    for (int i = 0; i < segs.size(); ++i) {
+        const double t1 =
+            (i + 1 < segs.size()) ? segs[i + 1].t0 : std::max(totalSeconds, segs[i].t0);
+        const QString label =
+            isNonSpeechAnnotation(segs[i].text) ? QString() : labelForSegment(turns, segs[i].t0, t1);
+        labels[i] = label;
+        if (!label.isEmpty() && !applied.contains(label))
+            applied.append(label);
+    }
+
+    // Backward splice so earlier captured offsets stay valid as later ones
+    // are rewritten (same technique as renameSpeakerInFile()).
+    QString result = body;
+    for (int i = segs.size() - 1; i >= 0; --i) {
+        const QString &label = labels[i];
+        if (label.isEmpty())
+            continue; // non-speech line, or no turns — leave untouched
+        if (segs[i].hadTag)
+            result.replace(segs[i].tagStart, segs[i].tagLen, label);
+        else
+            result.insert(segs[i].textStart, QStringLiteral("[") + label + QStringLiteral("] "));
+    }
+    if (appliedSpeakersOut)
+        *appliedSpeakersOut = applied;
+    return result;
 }
 
 SegmentLineWriter::SegmentLineWriter(QFile &mdFile, int maxCycleLength)
@@ -1112,15 +1276,25 @@ QString spliceBodyChapters(const QString &body, const QList<ResolvedChapter> &ch
 {
     QString result = body;
 
-    // Strip every existing marker line first — offsets computed below are
-    // against this already-stripped string, so a chapter's target segment
-    // line is found at its TRUE (post-strip) position, not shifted by
-    // whatever marker set a previous "generate chapters" run left behind.
-    QVector<QRegularExpressionMatch> existingMarkers;
+    // Item 17: strip only AUTO markers; PRESERVE manual ones (they carry the
+    // sentinel — chapterTitleCaptureIsManual()). A user's hand-added/edited
+    // chapter survives regeneration; only the previous LLM-generated auto set
+    // is replaced. Offsets computed below are against this partially-stripped
+    // string, so a chapter's target segment line is found at its TRUE
+    // post-strip position. Manual markers left in place don't match
+    // segmentLinePattern()'s "^\[" anchor (they start "## "), so they never
+    // interfere with the anchor search below.
+    QVector<QRegularExpressionMatch> autoMarkers;
+    QSet<QString> manualTimestamps; // group-1 timestamp text a manual marker already occupies
     QRegularExpressionMatchIterator stripIt = chapterMarkerPattern().globalMatch(result);
-    while (stripIt.hasNext())
-        existingMarkers.append(stripIt.next());
-    for (auto matchIt = existingMarkers.crbegin(); matchIt != existingMarkers.crend(); ++matchIt) {
+    while (stripIt.hasNext()) {
+        const QRegularExpressionMatch m = stripIt.next();
+        if (chapterTitleCaptureIsManual(m.captured(2)))
+            manualTimestamps.insert(m.captured(1));
+        else
+            autoMarkers.append(m);
+    }
+    for (auto matchIt = autoMarkers.crbegin(); matchIt != autoMarkers.crend(); ++matchIt) {
         int start = matchIt->capturedStart(0);
         int length = matchIt->capturedLength(0);
         if (start + length < result.size() && result.at(start + length) == QLatin1Char('\n'))
@@ -1132,6 +1306,10 @@ QString spliceBodyChapters(const QString &body, const QList<ResolvedChapter> &ch
     // (post-strip) string — only then sort descending and insert, so each
     // insertion never invalidates an offset already computed for another
     // chapter still pending (see this function's doc comment in the header).
+    // An auto chapter whose timestamp coincides with a preserved manual
+    // marker is skipped — the manual one wins (re-sort by timestamp is
+    // automatic: every marker is anchored to its segment line, and segment
+    // lines are already in time order).
     struct PendingInsert {
         int offset;
         QString marker;
@@ -1139,15 +1317,17 @@ QString spliceBodyChapters(const QString &body, const QList<ResolvedChapter> &ch
     QList<PendingInsert> pending;
     pending.reserve(chapters.size());
     for (const ResolvedChapter &chapter : chapters) {
-        const QString anchor = QStringLiteral("[") + formatTimestamp(chapter.t0) + QStringLiteral("]");
+        const QString tsText = formatTimestamp(chapter.t0);
+        if (manualTimestamps.contains(tsText))
+            continue;
+        const QString anchor = QStringLiteral("[") + tsText + QStringLiteral("]");
         const QRegularExpression lineStart(QStringLiteral("^") + QRegularExpression::escape(anchor),
                                             QRegularExpression::MultilineOption);
         const QRegularExpressionMatch m = lineStart.match(result);
         if (!m.hasMatch())
             continue; // target segment not found — defensive, shouldn't happen for a caller-resolved t0
         pending.append({static_cast<int>(m.capturedStart(0)),
-                         QStringLiteral("## [") + formatTimestamp(chapter.t0) + QStringLiteral("] ") + chapter.title
-                             + QLatin1Char('\n')});
+                         formatChapterMarker(tsText, chapter.title, /*manual=*/false) + QLatin1Char('\n')});
     }
     std::sort(pending.begin(), pending.end(),
               [](const PendingInsert &a, const PendingInsert &b) { return a.offset > b.offset; });
@@ -1155,6 +1335,57 @@ QString spliceBodyChapters(const QString &body, const QList<ResolvedChapter> &ch
         result.insert(p.offset, p.marker);
 
     return result;
+}
+
+// Cost of one segment's "INDEX: text\n" formatting, matching
+// LabelingEngine::generateChapters()'s own formatting exactly (digit count of
+// the window-relative index, ": ", the text, '\n') so a window boundary lands
+// where that single call's truncation would have.
+static qsizetype chapterSegmentFormattedChars(int windowRelativeIndex, const QString &text)
+{
+    return QString::number(windowRelativeIndex).size() + 2 + text.size() + 1;
+}
+
+// See this function's doc comment in TranscriptionController.h.
+QList<int> computeChapterWindows(const QStringList &segmentTexts)
+{
+    QList<int> windowStarts; // segment index each window begins at
+    {
+        int windowStart = 0;
+        qsizetype windowChars = 0;
+        for (int i = 0; i < segmentTexts.size(); ++i) {
+            const qsizetype segChars = chapterSegmentFormattedChars(i - windowStart, segmentTexts.at(i));
+            if (i > windowStart && windowChars + segChars > LabelingEngine::kMaxChapterInputChars) {
+                windowStarts.append(windowStart);
+                windowStart = i;
+                windowChars = 0;
+            }
+            windowChars += segChars;
+        }
+        windowStarts.append(windowStart);
+    }
+    // Don't waste a whole extra LLM call on a pathologically small trailing
+    // window (e.g. one segment left over) — fold it into the previous window
+    // IF the combined window still fits kMaxChapterInputChars. Item 28 bug:
+    // the old code folded unconditionally, producing a merged window that
+    // exceeded the budget, which LabelingEngine::generateChapters() then
+    // silently truncated back down — dropping exactly the folded-in tail, so
+    // the final stretch of a long transcript got zero chapters. Now the fold
+    // only happens when it's safe; otherwise the small trailing window stays
+    // its own window and its segments still get proposed.
+    if (windowStarts.size() > 1) {
+        const qsizetype lastWindowSegCount = segmentTexts.size() - windowStarts.last();
+        const qsizetype avgWindowSegCount = segmentTexts.size() / windowStarts.size();
+        if (lastWindowSegCount < avgWindowSegCount / 4) {
+            const int mergedStart = windowStarts.at(windowStarts.size() - 2);
+            qsizetype mergedChars = 0;
+            for (int i = mergedStart; i < segmentTexts.size(); ++i)
+                mergedChars += chapterSegmentFormattedChars(i - mergedStart, segmentTexts.at(i));
+            if (mergedChars <= LabelingEngine::kMaxChapterInputChars)
+                windowStarts.removeLast();
+        }
+    }
+    return windowStarts;
 }
 
 // Lives on TranscriptionController's dedicated QThread; never touches the
@@ -1230,6 +1461,17 @@ public slots:
             return;
         }
 
+        // Item 50 (why "stop" can't be instant here): the model load below is
+        // a single blocking whisper.cpp call (whisper_init_from_file_with_params)
+        // with NO abort hook — unlike whisper_full()'s abort_callback (see
+        // onAbort further down) or ffmpeg decode (a real killable subprocess).
+        // There is simply no interruption point to check a pause/cancel flag
+        // AT during a load, so pause is a no-op during "loading" (see
+        // pauseActive()) and a cancel requested here only takes effect at the
+        // next real checkpoint after the load returns. This is a genuine hard
+        // limitation of the native call, not something this app can fix
+        // cooperatively — documented so it's discoverable rather than looking
+        // like a missing feature.
         if (!m_engine || m_engine->isValid() == false || m_modelPath != modelPath) {
             m_engine = std::make_unique<WhisperCppEngine>(modelPath);
             m_modelPath = modelPath;
@@ -1313,64 +1555,12 @@ public slots:
             // m_labelingEngine at the top of this job.
             m_engine.reset();
 
-            // "detecting-speakers": REAL progress, unlike "loading" above —
-            // DiarizationEngine forwards sherpa-onnx's own chunk-processed
-            // callback (see its doc comment).
-            emit phase(QStringLiteral("detecting-speakers"));
-            QString segPath, embedPath, diarizeError;
-            if (ModelManager::ensureDiarizationModels(QUrl::fromLocalFile(vaultPath), &segPath, &embedPath,
-                                                       &diarizeError)) {
-                if (!m_diarizationEngine || !m_diarizationEngine->isValid() || m_diarizationSegPath != segPath
-                    || m_diarizationEmbedPath != embedPath) {
-                    m_diarizationEngine = std::make_unique<DiarizationEngine>(segPath, embedPath);
-                    m_diarizationSegPath = segPath;
-                    m_diarizationEmbedPath = embedPath;
-                }
-                if (m_diarizationEngine->isValid()) {
-                    // Item 6 (Wave N): progress() is PHASE-relative (this
-                    // sub-phase's own 0->1) — TranscriptionController blends
-                    // it into overallProgress using this phase's rolling-
-                    // average share of the whole job (see
-                    // TranscriptionController::recomputeOverallProgress()'s
-                    // doc comment), not a fixed half.
-                    //
-                    // Sub-phase text: DiarizationEngine's fraction blends
-                    // sherpa-onnx's own internal segmentation/label-
-                    // conversion/embedding split (see the vendored patch's
-                    // kSegmentationProgressShare + kLabelConversionProgressShare
-                    // = 0.30 boundary) into one 0->1 number — 0.30 here is
-                    // that exact same boundary, not an approximation, so
-                    // the label switches right when the real work actually
-                    // moves from "found where speech is" to "whose voice is
-                    // it". Only emitted on an actual sub-phase change (not
-                    // every callback tick) to avoid redundant phase signals.
-                    //
-                    // Pause blocks right here (this callback fires often
-                    // enough — see DiarizationEngine's doc comment). Cancel
-                    // is NOT actionable mid-pass (no native sherpa-onnx abort
-                    // hook this wave — see the Wave N plan's Decisions): the
-                    // return value is deliberately ignored, and a cancel
-                    // requested during diarization takes effect right after
-                    // diarize() returns, below, instead of instantly.
-                    QString detectingSubPhase;
-                    diarizedTurns = m_diarizationEngine->diarize(*pcm, [this, &detectingSubPhase](double fraction) {
-                        waitWhilePausedOrCancelled();
-                        const QString subPhase = fraction < 0.30 ? QStringLiteral("detecting-speakers-segmenting")
-                                                                  : QStringLiteral("detecting-speakers-identifying");
-                        if (subPhase != detectingSubPhase) {
-                            detectingSubPhase = subPhase;
-                            emit phase(subPhase);
-                        }
-                        emit progress(fraction);
-                    });
-                    effectiveSpeakerDetection = true;
-                } else {
-                    speakerDetectionError = QStringLiteral("failed to load speaker diarization models");
-                }
-            } else {
-                speakerDetectionError =
-                    diarizeError.isEmpty() ? QStringLiteral("speaker diarization models unavailable") : diarizeError;
-            }
+            // Item 52: the diarization core is shared with the standalone
+            // diarizeJob() — see runDiarizationPass()'s doc comment for the
+            // phase/sub-phase reporting, pause-blocks/cancel-not-actionable
+            // semantics, and the never-misrepresent (effective/error) contract
+            // this branch relies on.
+            diarizedTurns = runDiarizationPass(*pcm, vaultPath, &effectiveSpeakerDetection, &speakerDetectionError);
         }
         // Diarization only contributes a rolling-average timing sample when
         // it actually ran successfully — a failed/unavailable-models attempt
@@ -1383,13 +1573,13 @@ public slots:
         if (effectiveSpeakerDetection)
             emit phaseDurationMs(QStringLiteral("detecting-speakers"), detectingSpeakersMs);
         // Diarization is a one-shot pass at the START of this job (above) —
-        // nothing from here to the end of run() touches it again, so free
-        // its GPU/CPU resources now rather than leaving them resident for no
-        // reason through the whole (often much longer) transcription phase
-        // that follows. Cheap to reload next time (~35MB of small onnx
-        // models), unlike the big whisper/label models above, so this is
-        // evicted unconditionally on every job rather than only on a
-        // model-path change.
+        // nothing from here to the end of run() touches it again, so its
+        // GPU/CPU resources are freed now rather than left resident through
+        // the whole (often much longer) transcription phase that follows.
+        // runDiarizationPass() already evicts on the speaker-detection path;
+        // this defensive reset also covers the speakerDetection==false path
+        // (where the helper never ran) — resetting an already-null pointer is
+        // a no-op.
         m_diarizationEngine.reset();
 
         // Reload whisper now that diarization's GPU footprint is gone (see
@@ -1669,7 +1859,7 @@ public slots:
     // second LabelingEngine instance. Mirrors relabelJob()'s shape closely:
     // same eviction, same "reopen the .md, read frontmatter+body, no audio
     // decode" approach, same "a failure here IS the job's result" contract.
-    void generateChaptersJob(const QString &filePath, const QString &vaultPath)
+    void generateChaptersJob(const QString &filePath, const QString &vaultPath, double density)
     {
         m_engine.reset();
         m_diarizationEngine.reset();
@@ -1731,59 +1921,52 @@ public slots:
         for (const ParsedSegment &segment : segments)
             segmentTexts.append(segment.text);
 
-        // Item P34: generateChapters() silently truncates (with a qWarning)
-        // any single call whose formatted "INDEX: text\n" input exceeds
-        // LabelingEngine::kMaxChapterInputChars — for a long file, one call
-        // over the whole transcript meant everything past ~20 minutes of
-        // speech never got proposed at all. Fix: split into multiple
-        // windows, each kept under that budget, call generateChapters()
-        // once per window, and offset each window's returned
-        // afterSegmentIndex (0-relative to THAT window's own segmentTexts
-        // slice) by the window's starting index in the full segments list
-        // before merging. A window's cost estimate mirrors generateChapters(
-        // )'s own "index: text\n" formatting exactly (digit count of i, ": ",
-        // text, '\n') so the window boundary lands at the same place the
-        // single-call truncation would have.
-        QList<int> windowStarts; // segment index each window begins at
-        {
-            int windowStart = 0;
-            qsizetype windowChars = 0;
-            for (int i = 0; i < segmentTexts.size(); ++i) {
-                const qsizetype segChars =
-                    QString::number(i - windowStart).size() + 2 + segmentTexts.at(i).size() + 1;
-                if (i > windowStart && windowChars + segChars > LabelingEngine::kMaxChapterInputChars) {
-                    windowStarts.append(windowStart);
-                    windowStart = i;
-                    windowChars = 0;
-                }
-                windowChars += segChars;
-            }
-            windowStarts.append(windowStart);
-        }
-        // Don't let a pathologically small trailing window (e.g. one
-        // segment left over) waste a whole extra LLM call on almost nothing
-        // — fold it into the previous window if it's under a quarter of the
-        // full transcript's average window size. Only meaningful once
-        // there's more than one window.
-        if (windowStarts.size() > 1) {
-            const qsizetype lastWindowSegCount = segmentTexts.size() - windowStarts.last();
-            const qsizetype avgWindowSegCount = segmentTexts.size() / windowStarts.size();
-            if (lastWindowSegCount < avgWindowSegCount / 4)
-                windowStarts.removeLast();
-        }
+        // Item P34 / item 28: generateChapters() silently truncates (with a
+        // qWarning) any single call whose formatted "INDEX: text\n" input
+        // exceeds LabelingEngine::kMaxChapterInputChars — for a long file, one
+        // call over the whole transcript meant everything past ~20 minutes of
+        // speech never got proposed at all. Split into multiple windows, each
+        // kept under that budget (see computeChapterWindows()), and offset
+        // each window's returned afterSegmentIndex (0-relative to THAT
+        // window's own slice) by its starting index in the full segments list
+        // before merging.
+        const QList<int> windowStarts = computeChapterWindows(segmentTexts);
+
+        // Items 26/31: drive the progress bar. Chapter generation is a
+        // per-window sequence of LLM calls with a known window count up front,
+        // so a determinate fraction (one window == one unit, plus a final unit
+        // for the merge/resolve/write tail) advances the bar smoothly instead
+        // of it sitting frozen at 0 until the whole job finishes. Treated like
+        // "combining" on the controller side (a single fraction assigned
+        // straight to overallProgress — see the progress() connection).
+        emit phase(QStringLiteral("chaptering"));
+        emit progress(0.0);
+        const int progressUnits = windowStarts.size() + 1; // +1 for the merge/resolve/write tail
 
         QList<Chapter> chapters;
         for (int w = 0; w < windowStarts.size(); ++w) {
+            // Items 30/50: cooperative cancel/pause checkpoint between windows.
+            // An in-flight single generateChapters() LLM call can't be
+            // interrupted (no llama.cpp abort hook for a single-shot decode),
+            // but checking here means a cancel takes effect promptly between
+            // windows rather than only after the ENTIRE job — a big
+            // improvement for a long, multi-window transcript.
+            if (waitWhilePausedOrCancelled()) {
+                emit finished(false, QStringLiteral("Cancelled"));
+                return;
+            }
+
             const int startIdx = windowStarts.at(w);
             const int endIdx = (w + 1 < windowStarts.size()) ? windowStarts.at(w + 1) : segmentTexts.size();
             const QStringList windowTexts = segmentTexts.mid(startIdx, endIdx - startIdx);
 
             QString genError;
-            const auto windowChapters = m_labelingEngine->generateChapters(windowTexts, &genError);
+            const auto windowChapters = m_labelingEngine->generateChapters(windowTexts, density, &genError);
             if (!windowChapters) {
                 emit finished(false, QStringLiteral("chapter generation failed: %1").arg(genError));
                 return;
             }
+            emit progress(static_cast<double>(w + 1) / progressUnits);
             // afterSegmentIndex is 0-relative to THIS window's own
             // windowTexts slice (see generateChapters()'s doc comment) —
             // offset by startIdx so it's relative to the full file's
@@ -1833,9 +2016,17 @@ public slots:
         // a failure here (e.g. a transient generation error) falls back to
         // the unmerged-but-sanitized chapters instead of failing the whole
         // job.
+        // Items 30/50: one more cancel/pause checkpoint before the merge pass
+        // (itself a run of LLM calls) — cancel takes effect here rather than
+        // after the whole merge finishes.
+        if (waitWhilePausedOrCancelled()) {
+            emit finished(false, QStringLiteral("Cancelled"));
+            return;
+        }
+
         QList<Chapter> finalChapters = sanitized;
         QString mergeError;
-        if (const auto merged = m_labelingEngine->mergeSimilarChapters(sanitized, segmentTexts, &mergeError))
+        if (const auto merged = m_labelingEngine->mergeSimilarChapters(sanitized, segmentTexts, density, &mergeError))
             finalChapters = *merged;
         else
             qWarning() << "generateChaptersJob: chapter-merge pass failed, keeping unmerged chapters:" << mergeError;
@@ -1847,6 +2038,130 @@ public slots:
 
         QString writeError;
         if (!writeChaptersField(mdPath, resolved, &writeError)) {
+            emit finished(false, writeError);
+            return;
+        }
+        emit progress(1.0);
+        emit finished(true, {});
+    }
+
+    // Item 52: standalone speaker diarization on an already-transcribed file —
+    // re-runs (or adds) speaker detection WITHOUT re-transcribing audio. Reads
+    // the existing .md's segment lines, decodes the sibling audio, runs the
+    // SAME diarization core run()'s inline speakerDetection path uses
+    // (runDiarizationPass()), assigns each existing segment its overlapping
+    // speaker (labelForSegment() via spliceBodySpeakers()), and writes the
+    // "[Speaker N]" tags + updated "speakerDetection: true"/"speakers:"
+    // frontmatter back into the .md in place (prelude/chapters/repeat markers
+    // preserved). A failure here IS the job's result (like relabelJob()).
+    // Cancel takes effect at the post-diarize checkpoint (diarization has no
+    // mid-pass abort hook — see runDiarizationPass()).
+    void diarizeJob(const QString &filePath, const QString &vaultPath)
+    {
+        // Needs neither the whisper nor the label model — free them now
+        // (GPU hygiene, mirrors relabelJob()'s eviction).
+        m_engine.reset();
+        m_labelingEngine.reset();
+
+        const QString mdPath = sidecarPath(filePath);
+        if (!QFileInfo::exists(mdPath)) {
+            emit finished(false, QStringLiteral("%1 has not been transcribed yet").arg(filePath));
+            return;
+        }
+
+        // Read frontmatter + body + the file's existing "speakers:" allowlist
+        // up front (before the slow decode) so a malformed/absent file fails
+        // fast — same parse the rename/merge paths use.
+        QStringList frontmatterLines;
+        QString body;
+        int speakersLineIndex = -1;
+        QStringList knownSpeakers;
+        QStringList distinctTags;
+        QString parseError;
+        if (!parseSpeakerTaggedFile(mdPath, &frontmatterLines, &body, &speakersLineIndex, &knownSpeakers,
+                                     &distinctTags, &parseError)) {
+            emit finished(false, parseError);
+            return;
+        }
+
+        // Decode the sibling audio (same 16k mono pass whisper uses) —
+        // pause/cancel honored between chunks, same as run()'s decode.
+        emit phase(QStringLiteral("decoding"));
+        bool decodePausedSignaled = false;
+        AudioDecoder::DecodeControl decodeControl;
+        decodeControl.paused = [this, &decodePausedSignaled] {
+            const bool p = m_pauseRequested.load();
+            if (p != decodePausedSignaled) {
+                decodePausedSignaled = p;
+                emit paused(p);
+            }
+            return p;
+        };
+        decodeControl.cancelled = [this] { return m_cancelRequested.load(); };
+        QString decodeError;
+        auto pcm = AudioDecoder::decodeTo16kMono(filePath, &decodeError, decodeControl);
+        if (!pcm) {
+            emit finished(false, decodeError.isEmpty() ? QStringLiteral("audio decode failed") : decodeError);
+            return;
+        }
+
+        bool effective = false;
+        QString diarError;
+        const std::vector<DiarizedTurn> turns = runDiarizationPass(*pcm, vaultPath, &effective, &diarError);
+        // Unlike run() (where a diarization failure degrades to ASR-only),
+        // detecting speakers IS this job's only purpose — so a failure here
+        // is the job's result.
+        if (!effective) {
+            emit finished(false, diarError.isEmpty() ? QStringLiteral("speaker detection failed") : diarError);
+            return;
+        }
+
+        // A cancel requested DURING diarization (no mid-pass abort hook — see
+        // runDiarizationPass()) takes effect here, before any file I/O.
+        if (waitWhilePausedOrCancelled()) {
+            emit finished(false, QStringLiteral("Cancelled"));
+            return;
+        }
+
+        const double totalSeconds = static_cast<double>(pcm->size()) / 16000.0;
+        QStringList appliedSpeakers;
+        const QString newBody = spliceBodySpeakers(body, knownSpeakers, turns, totalSeconds, &appliedSpeakers);
+
+        // Update the frontmatter to reflect that detection now ran: set
+        // speakerDetection true, replace/insert the "speakers:" allowlist with
+        // exactly the labels that actually landed on a body line (mirrors
+        // syncSpeakersFrontmatterToBody()), and drop any stale
+        // speakerDetectionError from an earlier failed attempt. Every other
+        // frontmatter key (model/vad/transcribedAt/label/tags/...) is left
+        // untouched.
+        const auto setKey = [&frontmatterLines](const QString &key, const QString &value) {
+            for (int i = 0; i < frontmatterLines.size(); ++i) {
+                const int c = frontmatterLines[i].indexOf(QLatin1Char(':'));
+                if (c >= 0 && frontmatterLines[i].left(c).trimmed() == key) {
+                    frontmatterLines[i] = key + QStringLiteral(": ") + value;
+                    return;
+                }
+            }
+            frontmatterLines.append(key + QStringLiteral(": ") + value);
+        };
+        const auto removeKey = [&frontmatterLines](const QString &key) {
+            for (int i = 0; i < frontmatterLines.size(); ++i) {
+                const int c = frontmatterLines[i].indexOf(QLatin1Char(':'));
+                if (c >= 0 && frontmatterLines[i].left(c).trimmed() == key) {
+                    frontmatterLines.removeAt(i);
+                    return;
+                }
+            }
+        };
+        setKey(QStringLiteral("speakerDetection"), QStringLiteral("true"));
+        removeKey(QStringLiteral("speakerDetectionError"));
+        if (appliedSpeakers.isEmpty())
+            removeKey(QStringLiteral("speakers"));
+        else
+            setKey(QStringLiteral("speakers"), appliedSpeakers.join(QStringLiteral(", ")));
+
+        QString writeError;
+        if (!writeFrontmatterBlock(mdPath, frontmatterLines, newBody, &writeError)) {
             emit finished(false, writeError);
             return;
         }
@@ -2021,6 +2336,79 @@ public slots:
         emit finished(true, QString());
     }
 
+    // Item 37: drag-and-drop / external audio import — copies sourcePath into
+    // destPath (the in-vault destination VaultTreeModel::importDestinationFor()
+    // already validated on the GUI thread) OFF the GUI thread, so a large file
+    // no longer freezes the UI. A chunked read/write loop (rather than a
+    // single blocking QFile::copy) is what lets this report byte progress and
+    // honor pause/cancel between chunks, same cooperative-checkpoint discipline
+    // combineJob()/download() use. Never touches m_engine/m_diarizationEngine/
+    // m_labelingEngine — nothing to evict/reload for a plain file copy.
+    void importJob(const QString &sourcePath, const QString &destPath)
+    {
+        emit phase(QStringLiteral("importing"));
+
+        QFile src(sourcePath);
+        if (!src.open(QIODevice::ReadOnly)) {
+            emit finished(false, QStringLiteral("could not open source file"));
+            return;
+        }
+        // Collision could have appeared between validation and now — never
+        // silently overwrite (same refusal as importDestinationFor()).
+        if (QFileInfo::exists(destPath)) {
+            emit finished(false, QStringLiteral("a file with that name already exists in the vault"));
+            return;
+        }
+        QFile dst(destPath);
+        if (!dst.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
+            emit finished(false, QStringLiteral("could not create destination file"));
+            return;
+        }
+
+        const qint64 total = src.size();
+        qint64 copied = 0;
+        constexpr qint64 kChunk = 1 << 20; // 1 MiB
+        bool wasPaused = false;
+        while (true) {
+            if (isCancelRequested()) {
+                dst.close();
+                dst.remove(); // don't leave a half-written file in the vault
+                emit finished(false, QStringLiteral("Cancelled"));
+                return;
+            }
+            if (m_pauseRequested.load()) {
+                // No subprocess to SIGSTOP (unlike combineJob/decode) — just
+                // block this worker between chunks until resumed/cancelled.
+                if (!wasPaused) {
+                    wasPaused = true;
+                    emit paused(true);
+                }
+                QThread::msleep(100);
+                continue;
+            }
+            if (wasPaused) {
+                wasPaused = false;
+                emit paused(false);
+            }
+            const QByteArray buf = src.read(kChunk);
+            if (buf.isEmpty())
+                break; // done (or read error — treated as EOF; size check below is implicit)
+            if (dst.write(buf) != buf.size()) {
+                dst.close();
+                dst.remove();
+                emit finished(false, QStringLiteral("write failed while copying into the vault"));
+                return;
+            }
+            copied += buf.size();
+            if (total > 0)
+                emit progress(std::clamp(static_cast<double>(copied) / static_cast<double>(total), 0.0, 1.0));
+        }
+        dst.flush();
+        dst.close();
+        emit progress(1.0);
+        emit finished(true, QString());
+    }
+
     // GPU memory hygiene, the idle case: run()/relabelJob() already evict
     // whichever engine THIS job doesn't need (see their doc comments), but
     // that leaves whichever engine the MOST RECENT job DID use warm
@@ -2083,6 +2471,67 @@ signals:
                          const QString &error);
 
 private:
+    // Item 52: the diarization core shared by BOTH the inline transcribe path
+    // (run(), gated by its speakerDetection toggle) and the standalone
+    // diarizeJob(). Ensures + loads the diarization models, emits the
+    // "detecting-speakers" phase and its two sub-phases with REAL progress
+    // (sherpa-onnx's own chunk-processed callback, split at the 0.30
+    // segmentation/embedding boundary — see the vendored patch), runs the
+    // whole pass over pcm, then evicts the engine (a one-shot pass — nothing
+    // reuses it; cheap ~35MB reload next time). Sets *effectiveOut true iff
+    // diarization actually ran; otherwise *errorOut carries why (models
+    // unavailable / failed to load) — the never-misrepresent contract
+    // writeFrontmatter() records. Pause BLOCKS inside the progress callback
+    // (it fires often enough); a cancel is NOT actionable mid-pass — the
+    // DiarizationProgressCallback is `void(double)` (see DiarizationEngine.h),
+    // so there's no channel to abort sherpa-onnx's current batch, and its
+    // return value is deliberately ignored here. A cancel requested during
+    // diarization therefore takes effect at the CALLER's post-diarize
+    // checkpoint (run()'s waitWhilePausedOrCancelled() before file I/O,
+    // diarizeJob()'s equivalent), not instantly — a hard sherpa-onnx
+    // limitation, not faked.
+    std::vector<DiarizedTurn> runDiarizationPass(const std::vector<float> &pcm, const QString &vaultPath,
+                                                 bool *effectiveOut, QString *errorOut)
+    {
+        *effectiveOut = false;
+        errorOut->clear();
+
+        emit phase(QStringLiteral("detecting-speakers"));
+        QString segPath, embedPath, diarizeError;
+        if (!ModelManager::ensureDiarizationModels(QUrl::fromLocalFile(vaultPath), &segPath, &embedPath,
+                                                    &diarizeError)) {
+            *errorOut =
+                diarizeError.isEmpty() ? QStringLiteral("speaker diarization models unavailable") : diarizeError;
+            return {};
+        }
+        if (!m_diarizationEngine || !m_diarizationEngine->isValid() || m_diarizationSegPath != segPath
+            || m_diarizationEmbedPath != embedPath) {
+            m_diarizationEngine = std::make_unique<DiarizationEngine>(segPath, embedPath);
+            m_diarizationSegPath = segPath;
+            m_diarizationEmbedPath = embedPath;
+        }
+        if (!m_diarizationEngine->isValid()) {
+            *errorOut = QStringLiteral("failed to load speaker diarization models");
+            m_diarizationEngine.reset();
+            return {};
+        }
+
+        QString detectingSubPhase;
+        std::vector<DiarizedTurn> turns = m_diarizationEngine->diarize(pcm, [this, &detectingSubPhase](double fraction) {
+            waitWhilePausedOrCancelled(); // see this method's doc comment (cancel not actionable mid-pass)
+            const QString subPhase = fraction < 0.30 ? QStringLiteral("detecting-speakers-segmenting")
+                                                      : QStringLiteral("detecting-speakers-identifying");
+            if (subPhase != detectingSubPhase) {
+                detectingSubPhase = subPhase;
+                emit phase(subPhase);
+            }
+            emit progress(fraction);
+        });
+        *effectiveOut = true;
+        m_diarizationEngine.reset();
+        return turns;
+    }
+
     // Used by relabelJob() — both a manual "regenerate label" request and an
     // automatic post-transcription follow-up (see
     // TranscriptionController::onWorkerFinished()) go through the SAME
@@ -2121,21 +2570,15 @@ private:
         // unrestricted mode, whereas before this scan only ran for the hard-
         // restrict case.
         const QStringList existingTags = collectVaultTags(vaultPath);
-        // Item P29: a short transcript shouldn't get a disproportionately
-        // long prelude just because the user's global wordiness slider is
-        // set high — cap the EFFECTIVE wordiness by transcript length (word
-        // count is a cheap, good-enough proxy for "how much is there to
-        // summarize"). Thresholds are deliberately coarse steps, not a
-        // precise formula — this only needs to stop the "3-sentence
-        // transcript, 5-paragraph prelude" case, not fine-tune prose length.
+        // Item P29 / item 58: the prelude's length should scale WITH the
+        // transcript — capped DOWN for a short one (no "3-sentence transcript,
+        // 5-paragraph prelude") and scaled UP for a very long one (a 2-3 hour
+        // recording earns a fuller prelude tier). Both live in the static
+        // helper so the length->tier mapping is unit-testable without a model.
         const int wordCount = transcriptText.split(QRegularExpression(QStringLiteral("\\s+")),
                                                      Qt::SkipEmptyParts)
                                    .size();
-        double effectiveWordiness = wordiness;
-        if (wordCount < 50)
-            effectiveWordiness = std::min(wordiness, 0.15);
-        else if (wordCount < 150)
-            effectiveWordiness = std::min(wordiness, 0.35);
+        const double effectiveWordiness = TranscriptionController::effectiveWordinessForLength(wordiness, wordCount);
         QString genError;
         const auto result = m_labelingEngine->label(transcriptText, existingTags, restrictTagsToExisting,
                                                      tagReuseBias, effectiveWordiness, &genError);
@@ -2209,13 +2652,14 @@ TranscriptionController::TranscriptionController(QObject *parent)
     connect(m_worker, &TranscriptionWorker::progress, this, [this](double fraction) {
         m_progress = fraction;
         emit progressChanged();
-        // A combine job's "combining" phase isn't one of
-        // recomputeOverallProgress()'s fixed transcribe-job phase buckets
-        // (loading/decoding/[detecting-speakers]/transcribing) — mirrors
-        // the downloadProgress connection below's direct assignment, since
-        // ffmpeg concat progress is likewise a single real fraction with no
-        // sub-phases to blend.
-        if (m_phase == QStringLiteral("combining")) {
+        // A combine job's "combining" phase, and (items 26/31) a chapter
+        // job's "chaptering" phase, aren't one of recomputeOverallProgress()'s
+        // fixed transcribe-job phase buckets (loading/decoding/[detecting-
+        // speakers]/transcribing) — each emits a single already-cumulative
+        // fraction, so mirror the downloadProgress connection below's direct
+        // assignment rather than trying to blend sub-phases.
+        if (m_phase == QStringLiteral("combining") || m_phase == QStringLiteral("chaptering")
+            || m_phase == QStringLiteral("importing")) {
             m_overallProgress = fraction;
             emit overallProgressChanged();
         } else {
@@ -2443,11 +2887,12 @@ double TranscriptionController::phaseRelativeSyntheticProgress() const
 
 void TranscriptionController::recomputeOverallProgress()
 {
-    // Empty (idle/relabel/rename/merge) or "downloading"/"combining" (both
-    // get their own direct m_overallProgress assignment — see the
-    // downloadProgress and progress() connections in the constructor)
+    // Empty (idle/relabel/rename/merge) or "downloading"/"combining"/
+    // "chaptering" (each gets its own direct m_overallProgress assignment —
+    // see the downloadProgress and progress() connections in the constructor)
     // aren't covered by this phase-weighting scheme.
-    if (m_phase.isEmpty() || m_phase == QStringLiteral("downloading") || m_phase == QStringLiteral("combining"))
+    if (m_phase.isEmpty() || m_phase == QStringLiteral("downloading") || m_phase == QStringLiteral("combining")
+        || m_phase == QStringLiteral("chaptering"))
         return;
 
     QStringList active = {QStringLiteral("loading"), QStringLiteral("decoding")};
@@ -2589,30 +3034,17 @@ void TranscriptionController::transcribe(const QUrl &fileUrl, const QUrl &vaultU
     m_jobs.insert(insertAt, job);
     ++insertAt;
 
-    // autoLabel's follow-up label pass is queued as its OWN job right NOW —
-    // both entries show up in the Tasks list together immediately, rather
-    // than the label task only appearing once transcription finishes. It
-    // naturally waits its turn behind the job above (only one job runs at a
-    // time — see startJob()/onWorkerFinished()'s queue advancement) and, if
-    // that job fails, this one still runs next and fails fast on its own
-    // (relabelJob() reports "not transcribed yet" — there's no .md yet) —
-    // it is NOT silently skipped just because its upstream job failed, so
-    // the Tasks list always reflects exactly what was requested.
-    if (autoLabel) {
-        if (maybeQueueDownloadJob(DownloadTarget::LabelModel, vaultUrl, QString(), insertAt) >= 0)
-            ++insertAt;
-        Job labelJob;
-        labelJob.id = m_nextJobId++;
-        labelJob.fileUrl = fileUrl;
-        labelJob.vaultUrl = vaultUrl;
-        labelJob.relabelOnly = true;
-        labelJob.skipIfAlreadyLabeled = true;
-        labelJob.restrictTagsToExisting = restrictTagsToExisting;
-        labelJob.tagReuseBias = tagReuseBias;
-        labelJob.wordiness = wordiness;
-        labelJob.status = JobStatus::Queued;
-        m_jobs.insert(insertAt, labelJob);
-    }
+    // Item 23: a transcribe call ONLY transcribes now. It used to chain a
+    // second relabel-only job whenever autoLabel was true, so clicking
+    // "Transcribe" silently also labeled — the dedicated "Regenerate label"
+    // action is the sole way to label. The autoLabel parameter is kept (QML
+    // call sites in Sidebar.qml/MainPanel.qml still pass
+    // AppSettings.autoLabelEnabled, and this invokable signature must stay
+    // call-compatible with them) but is now a NO-OP.
+    // TODO (later wave): drop the autoLabel parameter here and the
+    // AppSettings.autoLabelEnabled property + its wiring in the QML call
+    // sites, once those files are in scope to edit.
+    Q_UNUSED(autoLabel);
 
     emit queueChanged();
 
@@ -2627,6 +3059,68 @@ void TranscriptionController::transcribeAll(const QVariantList &fileUrls, const 
     for (const QVariant &v : fileUrls)
         transcribe(v.toUrl(), vaultUrl, modelId, speakerDetection, autoLabel, restrictTagsToExisting, tagReuseBias,
                    wordiness);
+}
+
+void TranscriptionController::importAudio(const QUrl &sourceUrl, const QUrl &destUrl, const QUrl &vaultUrl)
+{
+    // Same Queued/Active dedup rule as transcribe(), keyed on the destination
+    // (two drops resolving to the same in-vault file don't double-enqueue).
+    if (isQueued(destUrl))
+        return;
+
+    // Item O15: jump ahead of whatever's already Queued — see transcribe()'s
+    // frontOfQueueInsertIndex() use. No download job to queue first (a copy
+    // needs no model), so the import job itself is the front-most new entry.
+    const int insertAt = frontOfQueueInsertIndex();
+
+    Job job;
+    job.id = m_nextJobId++;
+    job.fileUrl = destUrl; // the in-vault destination (see Job::importOnly)
+    job.vaultUrl = vaultUrl;
+    job.importOnly = true;
+    job.importSourcePath = sourceUrl.toLocalFile();
+    job.status = JobStatus::Queued;
+    m_jobs.insert(insertAt, job);
+
+    emit queueChanged();
+
+    if (m_activeIndex < 0)
+        startJob(insertAt);
+}
+
+void TranscriptionController::diarizeFile(const QUrl &fileUrl, const QUrl &vaultUrl)
+{
+    // Same dedup rule as transcribe()/relabel(): a Queued/Active entry blocks
+    // a duplicate request.
+    if (isQueued(fileUrl))
+        return;
+
+    // Item O15: jump ahead of whatever's already Queued — see transcribe()'s
+    // frontOfQueueInsertIndex() use. The diarization models are queued as
+    // their own download job ahead of this one if not already on disk, same
+    // as transcribe()'s speakerDetection path.
+    int insertAt = frontOfQueueInsertIndex();
+    const int startIndex = insertAt;
+    if (maybeQueueDownloadJob(DownloadTarget::DiarizationModels, vaultUrl, QString(), insertAt) >= 0)
+        ++insertAt;
+
+    Job job;
+    job.id = m_nextJobId++;
+    job.fileUrl = fileUrl;
+    job.vaultUrl = vaultUrl;
+    job.diarizeOnly = true;
+    job.status = JobStatus::Queued;
+    m_jobs.insert(insertAt, job);
+    emit queueChanged();
+
+    if (m_activeIndex < 0)
+        startJob(startIndex);
+}
+
+void TranscriptionController::diarizeFilesForPaths(const QVariantList &fileUrls, const QUrl &vaultUrl)
+{
+    for (const QVariant &v : fileUrls)
+        diarizeFile(v.toUrl(), vaultUrl);
 }
 
 void TranscriptionController::relabel(const QUrl &fileUrl, const QUrl &vaultUrl, bool restrictTagsToExisting,
@@ -2667,7 +3161,7 @@ void TranscriptionController::relabelAll(const QVariantList &fileUrls, const QUr
         relabel(v.toUrl(), vaultUrl, restrictTagsToExisting, tagReuseBias, wordiness);
 }
 
-void TranscriptionController::generateChapters(const QUrl &fileUrl, const QUrl &vaultUrl)
+void TranscriptionController::generateChapters(const QUrl &fileUrl, const QUrl &vaultUrl, double density)
 {
     // Same dedup rule as relabel() — see its doc comment.
     if (isQueued(fileUrl))
@@ -2687,6 +3181,7 @@ void TranscriptionController::generateChapters(const QUrl &fileUrl, const QUrl &
     job.fileUrl = fileUrl;
     job.vaultUrl = vaultUrl;
     job.generateChaptersOnly = true;
+    job.chapterDensity = density;
     job.status = JobStatus::Queued;
     m_jobs.insert(insertAt, job);
     emit queueChanged();
@@ -2695,10 +3190,109 @@ void TranscriptionController::generateChapters(const QUrl &fileUrl, const QUrl &
         startJob(startIndex);
 }
 
-void TranscriptionController::generateChaptersAll(const QVariantList &fileUrls, const QUrl &vaultUrl)
+void TranscriptionController::generateChaptersAll(const QVariantList &fileUrls, const QUrl &vaultUrl, double density)
 {
     for (const QVariant &v : fileUrls)
-        generateChapters(v.toUrl(), vaultUrl);
+        generateChapters(v.toUrl(), vaultUrl, density);
+}
+
+void TranscriptionController::runAllJobs(const QUrl &fileUrl, const QUrl &vaultUrl, const QString &modelId,
+                                          bool speakerDetection, bool restrictTagsToExisting, double tagReuseBias,
+                                          double wordiness, double chapterDensity)
+{
+    // See this method's header doc comment for the full ordering /
+    // already-transcribed-skip / dedup contract. Same Queued/Active dedup gate
+    // as the individual actions — checked once, up front, so re-entrancy from
+    // the three inserts below (which make fileUrl "queued") can't matter.
+    if (isQueued(fileUrl))
+        return;
+
+    // Skip the transcribe step for a file that already has a sibling .md (the
+    // friendly, least-surprising "run all" on an already-done file — just
+    // refresh its label+chapters; see header doc comment). An orphaned .md's
+    // sidecarPath() is itself, so this is true for those too.
+    const bool alreadyTranscribed = QFileInfo::exists(sidecarPath(fileUrl.toLocalFile()));
+
+    // Item O15 (same as every other enqueue path): jump ahead of whatever's
+    // already Queued, but keep this file's three jobs CONTIGUOUS and IN ORDER
+    // by walking insertAt forward as each is inserted (rather than each new
+    // job re-jumping to the very front — which is exactly why this doesn't
+    // just call transcribe()/relabel()/generateChapters() in sequence).
+    int insertAt = frontOfQueueInsertIndex();
+    const int startIndex = insertAt;
+
+    // Models this pipeline needs, queued ahead as their own jobs if absent
+    // (mirrors transcribe()/relabel()). maybeQueueDownloadJob() dedups, so the
+    // single LabelModel request here covers BOTH the later label and chapters
+    // jobs.
+    if (!alreadyTranscribed) {
+        if (maybeQueueDownloadJob(DownloadTarget::WhisperModel, vaultUrl, modelId, insertAt) >= 0)
+            ++insertAt;
+        if (speakerDetection
+            && maybeQueueDownloadJob(DownloadTarget::DiarizationModels, vaultUrl, QString(), insertAt) >= 0)
+            ++insertAt;
+    }
+    if (maybeQueueDownloadJob(DownloadTarget::LabelModel, vaultUrl, QString(), insertAt) >= 0)
+        ++insertAt;
+
+    // (1) transcribe — skipped if already transcribed.
+    if (!alreadyTranscribed) {
+        Job job;
+        job.id = m_nextJobId++;
+        job.fileUrl = fileUrl;
+        job.vaultUrl = vaultUrl;
+        job.modelId = modelId;
+        job.speakerDetection = speakerDetection;
+        job.restrictTagsToExisting = restrictTagsToExisting;
+        job.tagReuseBias = tagReuseBias;
+        job.wordiness = wordiness;
+        job.status = JobStatus::Queued;
+        m_jobs.insert(insertAt, job);
+        ++insertAt;
+    }
+
+    // (2) label — reads the .md the transcribe job (if any) just wrote.
+    {
+        Job job;
+        job.id = m_nextJobId++;
+        job.fileUrl = fileUrl;
+        job.vaultUrl = vaultUrl;
+        job.relabelOnly = true;
+        job.restrictTagsToExisting = restrictTagsToExisting;
+        job.tagReuseBias = tagReuseBias;
+        job.wordiness = wordiness;
+        job.status = JobStatus::Queued;
+        m_jobs.insert(insertAt, job);
+        ++insertAt;
+    }
+
+    // (3) chapters — reads the labeled .md.
+    {
+        Job job;
+        job.id = m_nextJobId++;
+        job.fileUrl = fileUrl;
+        job.vaultUrl = vaultUrl;
+        job.generateChaptersOnly = true;
+        job.chapterDensity = chapterDensity;
+        job.status = JobStatus::Queued;
+        m_jobs.insert(insertAt, job);
+        ++insertAt;
+    }
+
+    emit queueChanged();
+
+    if (m_activeIndex < 0)
+        startJob(startIndex);
+}
+
+void TranscriptionController::runAllJobsForPaths(const QVariantList &fileUrls, const QUrl &vaultUrl,
+                                                  const QString &modelId, bool speakerDetection,
+                                                  bool restrictTagsToExisting, double tagReuseBias, double wordiness,
+                                                  double chapterDensity)
+{
+    for (const QVariant &v : fileUrls)
+        runAllJobs(v.toUrl(), vaultUrl, modelId, speakerDetection, restrictTagsToExisting, tagReuseBias, wordiness,
+                   chapterDensity);
 }
 
 void TranscriptionController::startJob(int index)
@@ -2726,10 +3320,12 @@ void TranscriptionController::startJob(int index)
     m_activeSegmentTimer.start();
     m_overallProgress = 0.0;
     emit overallProgressChanged();
-    // See recomputeOverallProgress()'s doc comment — only "transcribe" jobs
-    // ever set this true (via job.speakerDetection below); every other kind
-    // never emits phase() at all, so it's simply never read for them.
-    m_activeSpeakerDetection = job.speakerDetection;
+    // See recomputeOverallProgress()'s doc comment — a "transcribe" job sets
+    // this via job.speakerDetection, and a standalone "diarize" job (Item 52)
+    // always runs the detecting-speakers phase, so both make that phase count
+    // toward the progress bar's weighting. Every other kind never emits
+    // phase() at all, so this is simply never read for them.
+    m_activeSpeakerDetection = job.speakerDetection || job.diarizeOnly;
     m_phaseStartMs = 0;
     m_indeterminatePhaseTimer->stop();
 
@@ -2764,12 +3360,20 @@ void TranscriptionController::startJob(int index)
     } else if (job.generateChaptersOnly) {
         QMetaObject::invokeMethod(m_worker, "generateChaptersJob", Qt::QueuedConnection,
                                    Q_ARG(QString, job.fileUrl.toLocalFile()),
+                                   Q_ARG(QString, job.vaultUrl.toLocalFile()), Q_ARG(double, job.chapterDensity));
+    } else if (job.diarizeOnly) {
+        QMetaObject::invokeMethod(m_worker, "diarizeJob", Qt::QueuedConnection,
+                                   Q_ARG(QString, job.fileUrl.toLocalFile()),
                                    Q_ARG(QString, job.vaultUrl.toLocalFile()));
     } else if (job.combineOnly) {
         QMetaObject::invokeMethod(m_worker, "combineJob", Qt::QueuedConnection,
                                    Q_ARG(QStringList, job.combineSourcePaths),
                                    Q_ARG(QString, job.fileUrl.toLocalFile()),
                                    Q_ARG(bool, job.deleteOriginalsAfterCombine));
+    } else if (job.importOnly) {
+        QMetaObject::invokeMethod(m_worker, "importJob", Qt::QueuedConnection,
+                                   Q_ARG(QString, job.importSourcePath),
+                                   Q_ARG(QString, job.fileUrl.toLocalFile()));
     } else if (job.downloadTarget != DownloadTarget::None) {
         QString target;
         switch (job.downloadTarget) {
@@ -2931,8 +3535,12 @@ void TranscriptionController::pauseActive()
     // TranscriptionWorker::combineJob()), just as its ENTIRE job rather than
     // one phase of it.
     const QString kind = jobKind(m_jobs[m_activeIndex]);
+    // Items 30/50: "chapters" is pausable too — generateChaptersJob() checks
+    // waitWhilePausedOrCancelled() between windows and around the merge pass
+    // (an in-flight single LLM call still can't be interrupted, but between
+    // windows it's honored promptly).
     if (kind != QStringLiteral("transcribe") && kind != QStringLiteral("download")
-        && kind != QStringLiteral("combine"))
+        && kind != QStringLiteral("combine") && kind != QStringLiteral("chapters"))
         return;
     // See this method's header doc comment — "loading" is whisper.cpp's
     // in-process, unhookable model-load call (no interruption point at all),
@@ -2979,19 +3587,20 @@ void TranscriptionController::togglePauseActive()
     // stacking a second request on top of the still-pending cancel.
     if (m_pausingActiveAsRestart)
         return;
-    // "loading" has no cooperative checkpoint to truly suspend AT (see
-    // pauseActive()'s doc comment) — it's normally short, so instead of a
-    // real pause this kills the current attempt and presents it to the user
-    // as Paused (see JobStatus::Paused's doc comment), not Failed.
-    // onWorkerFinished() reads this flag to tell that apart from an actual
-    // cancel/failure using the exact same underlying mechanism. "decoding"
-    // no longer needs this — it gets a real pause via pauseActive() below.
-    if (m_phase == QStringLiteral("loading")) {
-        m_pausingActiveAsRestart = true;
-        emit activeStoppingChanged();
-        cancelActive();
-        return;
-    }
+    // Item 9 (2026-07-14): "loading" (whisper.cpp's blocking, unhookable
+    // model-load call) has no cooperative checkpoint to pause AT. It used to
+    // silently reinterpret the tap as cancelActive() + present the job as
+    // Paused-via-restart — the "pause broken again" report: a click that
+    // looked like it did nothing, and could latch a stray cancel that broke
+    // pause for the rest of the job. That reinterpretation is gone: the
+    // bottom bar now DISABLES the pause button during "loading" (see
+    // BottomBar.qml's pauseButton.enabled) so this is never reached from the
+    // UI during that phase, and pauseActive() below is a safe no-op for
+    // "loading" if it somehow is. A pause is never turned into a cancel here.
+    // (NOTE for a later wave — items 30/50: a genuine mid-loading pause would
+    // need a real interruption hook that whisper.cpp doesn't expose today;
+    // the JobStatus::Paused/activeStopping machinery is left dormant for
+    // whenever that lands, not removed.)
     pauseActive();
 }
 
@@ -3368,7 +3977,8 @@ bool TranscriptionController::maybeRedirectForCombine(int index)
 {
     Job &job = m_jobs[index];
     if (job.combineOnly || job.relabelOnly || job.generateChaptersOnly || job.renameSpeakerOnly
-        || job.mergeSpeakersOnly || job.downloadTarget != DownloadTarget::None || job.fileUrl.isEmpty())
+        || job.mergeSpeakersOnly || job.importOnly || job.diarizeOnly
+        || job.downloadTarget != DownloadTarget::None || job.fileUrl.isEmpty())
         return false;
 
     const QFileInfo info(job.fileUrl.toLocalFile());
@@ -3474,6 +4084,68 @@ void TranscriptionController::combineGroup(const QVariantList &rules, const QStr
     }
 }
 
+// Item 44: manual combine — the user explicitly selected N files in the
+// sidebar and asked to merge them, instead of a regex rule auto-detecting a
+// split-recording group. Everything downstream is SHARED with the auto path:
+// we build an ordered file list + a deterministic output path and hand a
+// synthetic CombineGroup to the SAME enqueueCombineJob() (and thus
+// TranscriptionWorker::combineJob()) that rule-driven runCombineScan()/
+// combineGroup() use — only the "which files" decision differs (an explicit
+// selection here vs. findCombineGroups()'s regex matching there). No second
+// concat mechanism, no duplicated ffmpeg logic.
+void TranscriptionController::combineSelected(const QVariantList &fileUrls, const QUrl &vaultUrl)
+{
+    // Collect local audio paths from the explicit selection, dropping anything
+    // that isn't an audio file (an orphaned .md, a directory) — the sidebar
+    // already filters to audio, this is the controller-side backstop.
+    QStringList audioPaths;
+    for (const QVariant &v : fileUrls) {
+        QString path = v.toUrl().toLocalFile();
+        if (path.isEmpty()) // tolerate a plain path passed as a bare string
+            path = v.toString();
+        if (!path.isEmpty() && isAudioPath(path) && !audioPaths.contains(path))
+            audioPaths << path;
+    }
+    // Concatenation needs at least two files; silently no-op otherwise. The UI
+    // only offers the action when 2+ audio files are selected, so this is the
+    // backstop — mirrors combineGroup()'s silent no-op on a stale selection.
+    if (audioPaths.size() < 2)
+        return;
+
+    // Combine order: mtime ascending — the exact default order
+    // findCombineGroups() uses for an auto group with no configured sort
+    // differentiator (see Candidate::mtime's doc comment there for WHY mtime
+    // and not creation/birth time). A manual selection has no rule and thus no
+    // sort differentiator, so this default is the right — and only — order to
+    // reuse; the concatenation is oldest-part-first, never selection/click
+    // order, which would be arbitrary.
+    std::sort(audioPaths.begin(), audioPaths.end(), [](const QString &a, const QString &b) {
+        return QFileInfo(a).lastModified() < QFileInfo(b).lastModified();
+    });
+
+    // Deterministic output path next to the earliest part, named from its
+    // stem — a manual combine has no (ruleName, key) to reuse
+    // findCombineGroups()'s derivation, so the earliest member's base name is
+    // the stable, human-readable stem. Same ".combined.<ext>" suffix and
+    // sibling-directory placement as the auto path (combineOutputPathFor()).
+    const QFileInfo firstInfo(audioPaths.first());
+    const QString outputPath = combineOutputPathFor(firstInfo.completeBaseName(), QString(),
+                                                     firstInfo.absolutePath(), firstInfo.suffix());
+    // Don't double-queue the same merge — mirrors runCombineScan()/
+    // combineGroup()'s isCombineQueued() dedup.
+    if (isCombineQueued(outputPath))
+        return;
+
+    CombineGroup group;
+    group.files = audioPaths;
+    group.outputPath = outputPath;
+    enqueueCombineJob(group, vaultUrl, /*deleteOriginals=*/false);
+    emit queueChanged();
+    // Live trigger, same as combineGroup()/runCombineScan(): auto-start when idle.
+    if (m_activeIndex < 0)
+        startNext();
+}
+
 QString TranscriptionController::tasksJsonPath(const QUrl &vaultUrl)
 {
     return vaultUrl.toLocalFile() + QStringLiteral("/.transcriber/tasks.json");
@@ -3494,6 +4166,15 @@ void TranscriptionController::persistQueue() const
         if (job.status != JobStatus::Queued && job.status != JobStatus::Active && job.status != JobStatus::Paused)
             continue;
 
+        // Item 37: import jobs are deliberately NOT persisted across a restart
+        // — importSourcePath names an EXTERNAL file (often on removable media)
+        // that may well be gone next session, and a half-done copy left a
+        // partial file the collision check would then refuse. A drag-and-drop
+        // import is inherently a live, in-session action; if it didn't finish
+        // before close, the user simply drags the file in again.
+        if (job.importOnly)
+            continue;
+
         QJsonObject obj;
         obj["kind"] = jobKind(job);
         obj["fileUrl"] = job.fileUrl.toString();
@@ -3503,6 +4184,7 @@ void TranscriptionController::persistQueue() const
         obj["restrictTagsToExisting"] = job.restrictTagsToExisting;
         obj["tagReuseBias"] = job.tagReuseBias;
         obj["wordiness"] = job.wordiness;
+        obj["chapterDensity"] = job.chapterDensity;
         obj["oldSpeakerName"] = job.oldSpeakerName;
         obj["newSpeakerName"] = job.newSpeakerName;
         obj["sourceSpeakerName"] = job.sourceSpeakerName;
@@ -3585,6 +4267,10 @@ void TranscriptionController::enqueueReplayedJob(const QString &kind, const QJso
         // Chapters use the same label model as relabel — see
         // LabelingEngine::generateChapters()'s doc comment.
         maybeQueueDownloadJob(DownloadTarget::LabelModel, jobVaultUrl, QString());
+    } else if (kind == QStringLiteral("diarize")) {
+        // Item 52: a standalone diarize job needs only the diarization models,
+        // no whisper model.
+        maybeQueueDownloadJob(DownloadTarget::DiarizationModels, jobVaultUrl, QString());
     } else if (kind != QStringLiteral("rename") && kind != QStringLiteral("merge")
                && kind != QStringLiteral("combine")) {
         // "transcribe"
@@ -3613,6 +4299,9 @@ void TranscriptionController::enqueueReplayedJob(const QString &kind, const QJso
         job.targetSpeakerName = obj.value("targetSpeakerName").toString();
     } else if (kind == QStringLiteral("chapters")) {
         job.generateChaptersOnly = true;
+        job.chapterDensity = obj.value("chapterDensity").toDouble(0.5);
+    } else if (kind == QStringLiteral("diarize")) {
+        job.diarizeOnly = true;
     } else if (kind == QStringLiteral("combine")) {
         job.combineOnly = true;
         for (const QJsonValue &v : obj.value("combineSourcePaths").toArray())
@@ -3795,7 +4484,11 @@ bool TranscriptionController::setLabel(const QUrl &fileUrl, const QString &label
     // Item P19: this manual (non-queued) rewrite otherwise leaves the
     // sidebar's cached per-row metadata stale until an unrelated job
     // finishes or a full VaultTreeModel rebuild happens — see finished()'s
-    // doc comment.
+    // doc comment. A listener is expected to call
+    // VaultTreeModel::refreshFile(fileUrl) from this signal (see its doc
+    // comment for why rebuild()/the QFileSystemWatcher alone never catches
+    // an in-place rewrite of a file that already existed) rather than wait
+    // for the next unrelated directory event.
     emit finished(fileUrl, true, QString());
     return true;
 }
@@ -3875,7 +4568,8 @@ bool TranscriptionController::setTags(const QUrl &fileUrl, const QStringList &ta
     mdFile.flush();
     mdFile.close();
     // Item P19-style notification: sidebar's tag-derived display (if any)
-    // should refresh the same way a label edit does.
+    // should refresh the same way a label edit does — see setLabel()'s
+    // matching emit for why (VaultTreeModel::refreshFile(fileUrl)).
     emit finished(fileUrl, true, QString());
     return true;
 }
@@ -4031,7 +4725,8 @@ bool TranscriptionController::setPrelude(const QUrl &fileUrl, const QString &pre
     out.flush();
     mdFile.flush();
     mdFile.close();
-    // Item P19: see setLabel()'s matching emit for why.
+    // Item P19: see setLabel()'s matching emit for why
+    // (VaultTreeModel::refreshFile(fileUrl)).
     emit finished(fileUrl, true, QString());
     return true;
 }
@@ -4053,10 +4748,137 @@ QVariantList TranscriptionController::readChapters(const QUrl &fileUrl) const
         const QRegularExpressionMatch m = it.next();
         QVariantMap chapter;
         chapter["t0"] = parseCompactTimestamp(m.captured(1));
-        chapter["title"] = m.captured(2);
+        // Item 17: the manual sentinel is stripped from the DISPLAYED title
+        // but its presence is surfaced as a "manual" flag (so the TOC can
+        // show manual chapters distinctly / know editing an auto one promotes
+        // it). Plain (auto) titles pass through unchanged.
+        chapter["title"] = chapterDisplayTitle(m.captured(2));
+        chapter["manual"] = chapterTitleCaptureIsManual(m.captured(2));
         chapters.append(chapter);
     }
     return chapters;
+}
+
+bool TranscriptionController::editChapterMarker(const QUrl &fileUrl, ChapterEditOp op, double timestampSeconds,
+                                                 const QString &title, QString *errorOut) const
+{
+    const QFileInfo fi(fileUrl.toLocalFile());
+    const QString path = sidecarPath(fileUrl.toLocalFile());
+
+    QFile mdFile(path);
+    if (!mdFile.exists()) {
+        if (errorOut)
+            *errorOut = QStringLiteral("%1 has not been transcribed yet").arg(fi.fileName());
+        return false;
+    }
+    if (!mdFile.open(QIODevice::ReadOnly | QIODevice::Text)) {
+        if (errorOut)
+            *errorOut = QStringLiteral("could not open %1 for reading").arg(path);
+        return false;
+    }
+    QTextStream in(&mdFile);
+    if (in.readLine() != QStringLiteral("---")) {
+        mdFile.close();
+        if (errorOut)
+            *errorOut = QStringLiteral("%1 has no frontmatter block").arg(mdFile.fileName());
+        return false;
+    }
+    QStringList frontmatterLines;
+    QString line;
+    bool closed = false;
+    while (!(line = in.readLine()).isNull()) {
+        if (line == QStringLiteral("---")) {
+            closed = true;
+            break;
+        }
+        frontmatterLines.append(line);
+    }
+    if (!closed) {
+        mdFile.close();
+        if (errorOut)
+            *errorOut = QStringLiteral("%1 has a malformed frontmatter block").arg(mdFile.fileName());
+        return false;
+    }
+    QString body = in.readAll();
+    mdFile.close();
+
+    const QString tsText = formatTimestamp(timestampSeconds);
+    switch (op) {
+    case ChapterEditOp::Add: {
+        // Replace any existing marker at this exact timestamp, then insert the
+        // manual one in sorted position — so a re-add is idempotent and always
+        // ends up manual.
+        QRegularExpressionMatch existing;
+        if (findChapterMarkerAt(body, timestampSeconds, &existing))
+            removeChapterMarkerLine(&body, existing);
+        const int offset = chapterInsertOffset(body, timestampSeconds);
+        body.insert(offset, formatChapterMarker(tsText, title, /*manual=*/true) + QLatin1Char('\n'));
+        break;
+    }
+    case ChapterEditOp::SetTitle: {
+        QRegularExpressionMatch target;
+        if (!findChapterMarkerAt(body, timestampSeconds, &target)) {
+            if (errorOut)
+                *errorOut = QStringLiteral("no chapter at %1").arg(tsText);
+            return false;
+        }
+        // Editing an auto chapter's title PROMOTES it to manual (always write
+        // the sentinel) so the next regeneration won't clobber the edit —
+        // least-surprising. Reuse the marker's OWN stored timestamp text.
+        body.replace(target.capturedStart(0), target.capturedLength(0),
+                     formatChapterMarker(target.captured(1), title, /*manual=*/true));
+        break;
+    }
+    case ChapterEditOp::Delete: {
+        QRegularExpressionMatch target;
+        if (!findChapterMarkerAt(body, timestampSeconds, &target)) {
+            if (errorOut)
+                *errorOut = QStringLiteral("no chapter at %1").arg(tsText);
+            return false;
+        }
+        removeChapterMarkerLine(&body, target);
+        break;
+    }
+    }
+
+    if (!mdFile.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
+        if (errorOut)
+            *errorOut = QStringLiteral("could not open %1 for writing").arg(mdFile.fileName());
+        return false;
+    }
+    QTextStream out(&mdFile);
+    out << "---\n";
+    for (const QString &fmLine : frontmatterLines)
+        out << fmLine << '\n';
+    out << "---\n";
+    out << body;
+    out.flush();
+    mdFile.flush();
+    mdFile.close();
+    return true;
+}
+
+void TranscriptionController::addChapter(const QUrl &fileUrl, double timestampSeconds, const QString &title)
+{
+    QString error;
+    const bool ok = editChapterMarker(fileUrl, ChapterEditOp::Add, timestampSeconds, title, &error);
+    // Mirror setPrelude()/setLabel(): notify listeners so the sidebar/main
+    // panel refresh this file's chapters immediately (item P19).
+    emit finished(fileUrl, ok, error);
+}
+
+void TranscriptionController::setChapterTitle(const QUrl &fileUrl, double timestampSeconds, const QString &newTitle)
+{
+    QString error;
+    const bool ok = editChapterMarker(fileUrl, ChapterEditOp::SetTitle, timestampSeconds, newTitle, &error);
+    emit finished(fileUrl, ok, error);
+}
+
+void TranscriptionController::deleteChapter(const QUrl &fileUrl, double timestampSeconds)
+{
+    QString error;
+    const bool ok = editChapterMarker(fileUrl, ChapterEditOp::Delete, timestampSeconds, QString(), &error);
+    emit finished(fileUrl, ok, error);
 }
 
 void TranscriptionController::renameSpeaker(const QUrl &fileUrl, const QString &oldName, const QString &newName)
@@ -4331,8 +5153,12 @@ QString TranscriptionController::jobKind(const Job &job)
         return QStringLiteral("relabel");
     if (job.generateChaptersOnly)
         return QStringLiteral("chapters");
+    if (job.diarizeOnly)
+        return QStringLiteral("diarize");
     if (job.combineOnly)
         return QStringLiteral("combine");
+    if (job.importOnly)
+        return QStringLiteral("import");
     return QStringLiteral("transcribe");
 }
 
@@ -4353,6 +5179,11 @@ QVariantList TranscriptionController::jobs() const
         entry["status"] = jobStatusToString(job.status);
         entry["error"] = job.error;
         entry["kind"] = jobKind(job);
+        // Ordered source parts of a "combine" job (empty for every other kind)
+        // — the exact concatenation order, so a caller/test can see WHICH files
+        // this merge covers and in what order. See combineSelected()/
+        // enqueueCombineJob().
+        entry["combineSourcePaths"] = job.combineSourcePaths;
         // -1 (QML sees it as a negative number) until Done/Failed — see
         // Job::durationMs's doc comment.
         entry["durationMs"] = job.durationMs;
@@ -4371,6 +5202,72 @@ QVariantList TranscriptionController::jobs() const
         list.append(entry);
     }
     return list;
+}
+
+QString TranscriptionController::backendKind(const QString &backendName)
+{
+    if (backendName.isEmpty())
+        return QString();
+    if (backendName.compare(QStringLiteral("CPU"), Qt::CaseInsensitive) == 0)
+        return QStringLiteral("cpu");
+    return QStringLiteral("gpu");
+}
+
+double TranscriptionController::effectiveWordinessForLength(double baseWordiness, int wordCount)
+{
+    // Coarse tiers, not a precise formula — this only needs to keep the prelude
+    // PROPORTIONATE to the transcript, not fine-tune prose length. Downward
+    // caps (item P29): a tiny transcript never gets a disproportionately long
+    // prelude no matter how high the slider. Upward floors (item 58): a long
+    // transcript is ALLOWED a fuller prelude even at a modest slider setting —
+    // a 2-3 hour recording (roughly 20k+ words at ~150 wpm) reaches
+    // labelPreludePhrasing()'s top >=0.9 "walk through each major topic" tier.
+    if (wordCount < 50)
+        return std::min(baseWordiness, 0.15);
+    if (wordCount < 150)
+        return std::min(baseWordiness, 0.35);
+    if (wordCount > 20000)
+        return std::max(baseWordiness, 0.9);
+    if (wordCount > 6000)
+        return std::max(baseWordiness, 0.75);
+    if (wordCount > 2000)
+        return std::max(baseWordiness, 0.6);
+    return baseWordiness;
+}
+
+QVariantList TranscriptionController::sortJobsForDisplay(const QVariantList &jobEntries)
+{
+    QVariantList active;
+    QVariantList queued;
+    QVariantList paused;
+    QVariantList finished;
+    for (const QVariant &v : jobEntries) {
+        const QString status = v.toMap().value(QStringLiteral("status")).toString();
+        if (status == QStringLiteral("active"))
+            active.append(v);
+        else if (status == QStringLiteral("queued"))
+            queued.append(v);
+        else if (status == QStringLiteral("paused"))
+            paused.append(v);
+        else // "done" / "failed" (a cancel is a Failed/"Cancelled" — still finished)
+            finished.append(v);
+    }
+    // Finished group: most-recently-finished first. jobs() is append order and
+    // jobs run/finish in that order, so reversing this group alone gives
+    // newest-finished-on-top without needing a separate finishedAt timestamp.
+    std::reverse(finished.begin(), finished.end());
+    QVariantList out;
+    out.reserve(jobEntries.size());
+    out += active;
+    out += queued;
+    out += paused;
+    out += finished;
+    return out;
+}
+
+QVariantList TranscriptionController::sortedJobs() const
+{
+    return sortJobsForDisplay(jobs());
 }
 
 QVariantList TranscriptionController::availableModels() const
