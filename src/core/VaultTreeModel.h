@@ -92,6 +92,23 @@ public:
     Q_INVOKABLE QVariantMap readVaultSettings() const;
     Q_INVOKABLE bool writeVaultSettings(const QVariantMap &settings, QString *errorOut = nullptr) const;
 
+    // USB Grabber: vault-scoped historical-grabs log
+    // (`.transcriber/usbGrabHistory.json`) — same `.transcriber/`-creates-if-
+    // missing behavior as readVaultSettings()/writeVaultSettings() above, but
+    // the JSON root is an array (one entry per past grab operation) rather
+    // than an object. Empty list if there's no vault open or the file
+    // doesn't exist yet (not an error — a vault simply hasn't had a grab
+    // performed against it yet).
+    Q_INVOKABLE QVariantList readUsbGrabHistory() const;
+
+    // Appends one entry to the history array and rewrites the whole file
+    // (read-whole-array, append, rewrite-whole-file — same whole-file-rewrite
+    // shape as writeVaultSettings(), fine at this scale). entry is persisted
+    // as given, without strict shape validation (same permissive/passthrough
+    // convention as writeVaultSettings()); callers are expected to supply
+    // timestamp/deviceSerial/deviceLabel/filesCopied/filesSkipped/errors.
+    Q_INVOKABLE bool appendUsbGrabHistoryEntry(const QVariantMap &entry, QString *errorOut = nullptr) const;
+
     // Every audio file's absolute path in the vault, transcribed or not —
     // walks the full tree rather than relying on which TreeView rows happen
     // to be realized (Sidebar's untranscribedPaths/transcribedPaths only

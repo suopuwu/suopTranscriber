@@ -13,11 +13,17 @@ Rectangle {
     property AudioRecorder audioRecorder
     property TranscriptionController transcriptionController
     property VaultTreeModel vaultTreeModel
+    property UsbGrabberController usbGrabberController
     // Set true/false only by TitleBar's record toggle (see Main.qml's
     // onRecordRequested) — gates the recorder page below and hides the
     // normal per-file content while it's showing (see the two `visible:`
     // bindings just above the recorder page block).
     property bool recording: false
+    // Set true/false only by TitleBar's USB grabber toggle (see Main.qml's
+    // onUsbGrabberRequested) — gates the USB grabber page below, mirroring
+    // `recording` above. `recording` wins if both happen to be true (see
+    // usbGrabberPage's own `visible:` binding).
+    property bool usbGrabberOpen: false
     property var storedMetadata: ({})
     readonly property bool hasStoredMetadata: Object.keys(mainPanel.storedMetadata).length > 0
     // Gates transcriptArea's editability below — mirrors
@@ -1376,7 +1382,7 @@ Rectangle {
 
     Item {
         anchors.fill: parent
-        visible: mainPanel.vaultPath.toString() === "" && !mainPanel.recording
+        visible: mainPanel.vaultPath.toString() === "" && !mainPanel.recording && !mainPanel.usbGrabberOpen
 
         Button {
             id: openVaultButton
@@ -1405,7 +1411,7 @@ Rectangle {
         anchors.fill: parent
         anchors.margins: 16
         spacing: 12
-        visible: mainPanel.vaultPath.toString() !== "" && !mainPanel.recording
+        visible: mainPanel.vaultPath.toString() !== "" && !mainPanel.recording && !mainPanel.usbGrabberOpen
 
         // Item 13: playback progress bar relocated to the very top, full
         // width, with a play/pause icon instead of a separate Play button.
@@ -3246,10 +3252,10 @@ Rectangle {
         }
     }
 
-    // Recorder page: sibling of the two content blocks above, gated on
-    // mainPanel.recording (toggled by TitleBar's record button, see
-    // Main.qml's onRecordRequested). Exactly one of the three top-level
-    // blocks is ever visible at once.
+    // Recorder page: sibling of the two content blocks above (and of
+    // usbGrabberPage below), gated on mainPanel.recording (toggled by
+    // TitleBar's record button, see Main.qml's onRecordRequested). Exactly
+    // one of these four top-level blocks is ever visible at once.
     Item {
         id: recorderPage
         anchors.fill: parent
@@ -3687,6 +3693,406 @@ Rectangle {
             const prefix = mainPanel.vaultLocalPath + "/"
             AppSettings.recordingOutputFolder = localPath === mainPanel.vaultLocalPath ? ""
                 : (localPath.startsWith(prefix) ? localPath.slice(prefix.length) : localPath)
+        }
+    }
+
+    // USB grabber page: sibling of the three content blocks above, gated on
+    // mainPanel.usbGrabberOpen (toggled by TitleBar's USB grabber button,
+    // see Main.qml's onUsbGrabberRequested) — also hidden while recording,
+    // for full mutual exclusivity across all four top-level blocks.
+    Item {
+        id: usbGrabberPage
+        anchors.fill: parent
+        visible: mainPanel.usbGrabberOpen && !mainPanel.recording
+
+        // Raw snapshots from UsbGrabberController — re-pulled by
+        // refreshDevices()/refreshHistory() rather than bound live, since the
+        // controller exposes plain Q_INVOKABLE getters (no per-device
+        // changed signals to bind against). deviceRows below derives the
+        // actual per-row display model from these two plus a fresh
+        // ruleForDevice() read per device, so it stays current every time
+        // either snapshot is refreshed.
+        property var mountedDevices: []
+        property var savedRules: []
+        property var catchAllRule: ({enabled: false, extensionFilter: [], preserveStructure: true, startFolder: "", deviceLabel: "", deviceSerial: "*"})
+        property var historyEntries: []
+
+        function refreshDevices() {
+            if (!mainPanel.usbGrabberController) {
+                usbGrabberPage.mountedDevices = []
+                usbGrabberPage.savedRules = []
+                usbGrabberPage.catchAllRule = ({enabled: false, extensionFilter: [], preserveStructure: true, startFolder: "", deviceLabel: "", deviceSerial: "*"})
+                return
+            }
+            usbGrabberPage.mountedDevices = mainPanel.usbGrabberController.mountedDevices()
+            usbGrabberPage.savedRules = mainPanel.usbGrabberController.allRules()
+            usbGrabberPage.catchAllRule = mainPanel.usbGrabberController.ruleForDevice("*")
+        }
+
+        // Newest first — the controller returns history in file-append
+        // (oldest-first) order.
+        function refreshHistory() {
+            usbGrabberPage.historyEntries = mainPanel.usbGrabberController
+                ? mainPanel.usbGrabberController.history().slice().reverse() : []
+        }
+
+        function formatTimestamp(iso) {
+            const d = new Date(iso)
+            return isNaN(d.getTime()) ? iso : Qt.formatDateTime(d, "yyyy-MM-dd hh:mm")
+        }
+
+        // Shared by every per-field commit below: re-reads the device's
+        // current rule (so fields this call doesn't touch are preserved),
+        // applies one field, saves, then re-derives deviceRows via
+        // refreshDevices() so the row reflects what was actually persisted.
+        function commitRuleField(serial, label, field, value) {
+            if (!mainPanel.usbGrabberController)
+                return
+            const rule = mainPanel.usbGrabberController.ruleForDevice(serial)
+            rule[field] = value
+            if (label)
+                rule.deviceLabel = label
+            mainPanel.usbGrabberController.saveRule(rule)
+            usbGrabberPage.refreshDevices()
+        }
+
+        // Union of currently-mounted devices and previously-configured ones
+        // (from savedRules, excluding the "*" catch-all — that has its own
+        // dedicated card below), deduped by serial, each row carrying a
+        // fresh ruleForDevice() read so toggling/editing one field doesn't
+        // require a full round-trip before the row reflects it.
+        property var deviceRows: {
+            if (!mainPanel.usbGrabberController)
+                return []
+            const bySerial = {}
+            for (const d of usbGrabberPage.mountedDevices) {
+                const label = ((d.vendor || "") + " " + (d.model || "")).trim()
+                bySerial[d.serial] = {serial: d.serial, label: label.length > 0 ? label : d.serial,
+                                       mounted: true, mountPath: d.mountPath}
+            }
+            for (const r of usbGrabberPage.savedRules) {
+                if (r.deviceSerial === "*" || bySerial[r.deviceSerial])
+                    continue
+                bySerial[r.deviceSerial] = {serial: r.deviceSerial, label: r.deviceLabel || r.deviceSerial,
+                                             mounted: false, mountPath: ""}
+            }
+            const rows = []
+            for (const serial in bySerial) {
+                const row = bySerial[serial]
+                const rule = mainPanel.usbGrabberController.ruleForDevice(serial)
+                row.enabled = rule.enabled
+                row.extensionFilterText = (rule.extensionFilter || []).join(", ")
+                row.preserveStructure = rule.preserveStructure
+                row.startFolder = rule.startFolder
+                rows.push(row)
+            }
+            return rows
+        }
+
+        onVisibleChanged: if (usbGrabberPage.visible) { usbGrabberPage.refreshDevices(); usbGrabberPage.refreshHistory() }
+        Component.onCompleted: { usbGrabberPage.refreshDevices(); usbGrabberPage.refreshHistory() }
+
+        // No live deviceAdded/deviceRemoved signal is exposed on
+        // UsbGrabberController itself (only the underlying UsbDeviceMonitor
+        // has those) — polling is simplest for a low-frequency, non-
+        // performance-sensitive utility page like this one, and only runs
+        // while the page is actually visible.
+        Timer {
+            interval: 2500
+            running: usbGrabberPage.visible
+            repeat: true
+            onTriggered: usbGrabberPage.refreshDevices()
+        }
+
+        // A grab (manual or hotplug-triggered) just finished — refresh both
+        // the history list and the device rows (a hotplug grab may have
+        // introduced a device this page hasn't seen before).
+        Connections {
+            target: mainPanel.usbGrabberController
+            function onGrabFinished() { usbGrabberPage.refreshHistory(); usbGrabberPage.refreshDevices() }
+        }
+
+        ScrollView {
+            id: usbScrollArea
+            anchors.fill: parent
+            anchors.margins: 16
+            clip: true
+            ScrollBar.horizontal.policy: ScrollBar.AlwaysOff
+
+            ColumnLayout {
+                // See SettingsPopup.qml's contentColumn doc comment for why
+                // this is bound to the ScrollView's own width (minus the
+                // overlay scrollbar's clearance) rather than parent.width.
+                width: usbScrollArea.width - 14
+                spacing: 16
+
+                Label {
+                    text: qsTr("USB Grabber")
+                    color: "white"
+                    font.bold: true
+                    font.pixelSize: 16
+                }
+
+                Label {
+                    Layout.fillWidth: true
+                    visible: mainPanel.usbGrabberController && mainPanel.usbGrabberController.lastError !== ""
+                    text: mainPanel.usbGrabberController ? mainPanel.usbGrabberController.lastError : ""
+                    color: "#e07a7a"
+                    font.pixelSize: 11
+                    wrapMode: Text.WordWrap
+                }
+
+                // "Any device" catch-all rule card — same shape as a
+                // per-device card below, minus the mounted/grab-now concept
+                // (it isn't tied to one physical device).
+                ColumnLayout {
+                    Layout.fillWidth: true
+                    spacing: 4
+
+                    Rectangle {
+                        Layout.fillWidth: true
+                        Layout.preferredHeight: 1
+                        color: "#3a3a3a"
+                    }
+
+                    RowLayout {
+                        Layout.fillWidth: true
+                        Label {
+                            Layout.fillWidth: true
+                            text: qsTr("Any USB device")
+                            color: "white"
+                        }
+                        Switch {
+                            id: catchAllEnabledSwitch
+                            checked: usbGrabberPage.catchAllRule.enabled
+                            hoverEnabled: true
+                            onToggled: usbGrabberPage.commitRuleField("*", "", "enabled", checked)
+                            HoverHandler { cursorShape: Qt.PointingHandCursor }
+                            HoverBorder { anchors.fill: parent; active: catchAllEnabledSwitch.hovered }
+                        }
+                    }
+
+                    RowLayout {
+                        Layout.fillWidth: true
+                        TextField {
+                            id: catchAllExtensionField
+                            Layout.fillWidth: true
+                            placeholderText: qsTr("Extensions (comma-separated, blank = all files)")
+                            text: (usbGrabberPage.catchAllRule.extensionFilter || []).join(", ")
+                            background: UnderlineField { focused: catchAllExtensionField.activeFocus }
+                            onEditingFinished: usbGrabberPage.commitRuleField("*", "", "extensionFilter",
+                                text.split(",").map(s => s.trim()).filter(s => s.length > 0))
+                        }
+                        Switch {
+                            id: catchAllPreserveSwitch
+                            text: qsTr("Preserve folders")
+                            checked: usbGrabberPage.catchAllRule.preserveStructure
+                            hoverEnabled: true
+                            onToggled: usbGrabberPage.commitRuleField("*", "", "preserveStructure", checked)
+                            HoverHandler { cursorShape: Qt.PointingHandCursor }
+                            HoverBorder { anchors.fill: parent; active: catchAllPreserveSwitch.hovered }
+                        }
+                    }
+
+                    TextField {
+                        id: catchAllStartFolderField
+                        Layout.fillWidth: true
+                        placeholderText: qsTr("Start folder (relative to device root, blank = root)")
+                        text: usbGrabberPage.catchAllRule.startFolder || ""
+                        background: UnderlineField { focused: catchAllStartFolderField.activeFocus }
+                        onEditingFinished: usbGrabberPage.commitRuleField("*", "", "startFolder", text)
+                    }
+                }
+
+                Label {
+                    text: qsTr("Devices")
+                    color: "#cccccc"
+                    font.pixelSize: 13
+                }
+
+                Label {
+                    Layout.fillWidth: true
+                    visible: usbGrabberPage.deviceRows.length === 0
+                    text: qsTr("No USB devices seen yet — plug one in, or rely on \"Any USB device\" above.")
+                    color: "#888888"
+                    font.pixelSize: 11
+                    wrapMode: Text.WordWrap
+                }
+
+                Repeater {
+                    model: usbGrabberPage.deviceRows
+
+                    delegate: ColumnLayout {
+                        id: deviceCard
+                        required property var modelData
+
+                        Layout.fillWidth: true
+                        spacing: 4
+
+                        Rectangle {
+                            Layout.fillWidth: true
+                            Layout.preferredHeight: 1
+                            color: "#3a3a3a"
+                        }
+
+                        RowLayout {
+                            Layout.fillWidth: true
+                            Label {
+                                Layout.fillWidth: true
+                                text: deviceCard.modelData.label
+                                color: "white"
+                                elide: Text.ElideRight
+                            }
+                            Label {
+                                text: deviceCard.modelData.mounted ? qsTr("connected") : qsTr("not connected")
+                                color: deviceCard.modelData.mounted ? "#7ac07a" : "#888888"
+                                font.pixelSize: 11
+                            }
+                            Switch {
+                                id: deviceEnabledSwitch
+                                checked: deviceCard.modelData.enabled
+                                hoverEnabled: true
+                                onToggled: usbGrabberPage.commitRuleField(deviceCard.modelData.serial,
+                                    deviceCard.modelData.label, "enabled", checked)
+                                HoverHandler { cursorShape: Qt.PointingHandCursor }
+                                HoverBorder { anchors.fill: parent; active: deviceEnabledSwitch.hovered }
+                            }
+                            Button {
+                                id: grabNowButton
+                                text: qsTr("Grab now")
+                                implicitHeight: 22
+                                enabled: deviceCard.modelData.mounted
+                                opacity: enabled ? 1 : 0.35
+                                hoverEnabled: enabled
+                                onClicked: mainPanel.usbGrabberController.triggerManualGrab(deviceCard.modelData.serial)
+                                background: Rectangle {
+                                    radius: AppSettings.borderRadius
+                                    color: "transparent"
+                                    border.width: 1
+                                    border.color: "#3a3a3a"
+                                }
+                                HoverHandler { cursorShape: Qt.PointingHandCursor; enabled: grabNowButton.enabled }
+                                HoverBorder { anchors.fill: parent; active: grabNowButton.hovered }
+                            }
+                            Button {
+                                id: forgetDeviceButton
+                                text: qsTr("Forget")
+                                implicitHeight: 22
+                                hoverEnabled: true
+                                onClicked: {
+                                    mainPanel.usbGrabberController.removeRule(deviceCard.modelData.serial)
+                                    usbGrabberPage.refreshDevices()
+                                }
+                                background: Rectangle {
+                                    radius: AppSettings.borderRadius
+                                    color: "transparent"
+                                    border.width: 1
+                                    border.color: "#3a3a3a"
+                                }
+                                HoverHandler { cursorShape: Qt.PointingHandCursor }
+                                HoverBorder { anchors.fill: parent; active: forgetDeviceButton.hovered }
+                            }
+                        }
+
+                        RowLayout {
+                            Layout.fillWidth: true
+                            TextField {
+                                id: deviceExtensionField
+                                Layout.fillWidth: true
+                                placeholderText: qsTr("Extensions (comma-separated, blank = all files)")
+                                text: deviceCard.modelData.extensionFilterText
+                                background: UnderlineField { focused: deviceExtensionField.activeFocus }
+                                onEditingFinished: usbGrabberPage.commitRuleField(deviceCard.modelData.serial,
+                                    deviceCard.modelData.label, "extensionFilter",
+                                    text.split(",").map(s => s.trim()).filter(s => s.length > 0))
+                            }
+                            Switch {
+                                id: devicePreserveSwitch
+                                text: qsTr("Preserve folders")
+                                checked: deviceCard.modelData.preserveStructure
+                                hoverEnabled: true
+                                onToggled: usbGrabberPage.commitRuleField(deviceCard.modelData.serial,
+                                    deviceCard.modelData.label, "preserveStructure", checked)
+                                HoverHandler { cursorShape: Qt.PointingHandCursor }
+                                HoverBorder { anchors.fill: parent; active: devicePreserveSwitch.hovered }
+                            }
+                        }
+
+                        TextField {
+                            id: deviceStartFolderField
+                            Layout.fillWidth: true
+                            placeholderText: qsTr("Start folder (relative to device root, blank = root)")
+                            text: deviceCard.modelData.startFolder || ""
+                            background: UnderlineField { focused: deviceStartFolderField.activeFocus }
+                            onEditingFinished: usbGrabberPage.commitRuleField(deviceCard.modelData.serial,
+                                deviceCard.modelData.label, "startFolder", text)
+                        }
+                    }
+                }
+
+                Label {
+                    text: qsTr("History")
+                    color: "#cccccc"
+                    font.pixelSize: 13
+                }
+
+                Label {
+                    Layout.fillWidth: true
+                    visible: usbGrabberPage.historyEntries.length === 0
+                    text: qsTr("No grabs yet.")
+                    color: "#888888"
+                    font.pixelSize: 11
+                }
+
+                Repeater {
+                    model: usbGrabberPage.historyEntries
+
+                    delegate: ColumnLayout {
+                        id: historyCard
+                        required property var modelData
+
+                        Layout.fillWidth: true
+                        spacing: 2
+
+                        Rectangle {
+                            Layout.fillWidth: true
+                            Layout.preferredHeight: 1
+                            color: "#2a2a2a"
+                        }
+
+                        RowLayout {
+                            Layout.fillWidth: true
+                            Label {
+                                text: usbGrabberPage.formatTimestamp(historyCard.modelData.timestamp)
+                                color: "#888888"
+                                font.pixelSize: 11
+                            }
+                            Label {
+                                Layout.fillWidth: true
+                                text: historyCard.modelData.deviceLabel || historyCard.modelData.deviceSerial
+                                color: "white"
+                                font.pixelSize: 11
+                                elide: Text.ElideRight
+                            }
+                            Label {
+                                text: qsTr("%1 copied, %2 skipped").arg(historyCard.modelData.filesCopied)
+                                    .arg(historyCard.modelData.filesSkipped)
+                                color: "#cccccc"
+                                font.pixelSize: 11
+                            }
+                        }
+
+                        Label {
+                            Layout.fillWidth: true
+                            visible: (historyCard.modelData.errors || []).length > 0
+                            text: (historyCard.modelData.errors || []).join("; ")
+                            color: "#e07a7a"
+                            font.pixelSize: 11
+                            wrapMode: Text.WordWrap
+                        }
+                    }
+                }
+            }
         }
     }
 }

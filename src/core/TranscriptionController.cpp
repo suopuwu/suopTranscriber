@@ -1798,15 +1798,19 @@ public slots:
 
         // See LabelingEngine::generateChapters()'s doc comment: the LLM only
         // ever returns which SEGMENT INDEX a chapter starts after — never
-        // trusted as a timestamp directly. Resolved here, against this
-        // job's own freshly-parsed `segments` (exact t0 values), before
-        // anything touches disk. Out-of-range or duplicate target indices
-        // (and an empty title, which would otherwise render as a bare
-        // "## [t] " marker line) are silently dropped, not treated as a job
-        // failure — the grammar only constrains JSON shape, never the
-        // semantic validity of the integer (a small model can still propose
-        // e.g. afterSegment=99999 on a 50-segment transcript).
-        QList<ResolvedChapter> resolved;
+        // trusted as a timestamp directly. Sanitized here, against this
+        // job's own freshly-parsed `segments`, before anything touches disk
+        // (including the merge pass below, which needs valid indices to
+        // pull excerpt text). Out-of-range or duplicate target indices (and
+        // an empty title, which would otherwise render as a bare "## [t] "
+        // marker line) are silently dropped, not treated as a job failure —
+        // the grammar only constrains JSON shape, never the semantic
+        // validity of the integer (a small model can still propose e.g.
+        // afterSegment=99999 on a 50-segment transcript). Sorted by
+        // afterSegmentIndex ascending: window offsets keep this roughly
+        // sorted already, but mergeSimilarChapters() below treats list order
+        // AS adjacency, so this makes that assumption actually hold.
+        QList<Chapter> sanitized;
         QSet<int> seenTargets;
         for (const Chapter &chapter : chapters) {
             const int targetIndex = chapter.afterSegmentIndex + 1;
@@ -1816,8 +1820,30 @@ public slots:
             if (seenTargets.contains(targetIndex))
                 continue;
             seenTargets.insert(targetIndex);
-            resolved.append({segments.at(targetIndex).t0, title});
+            sanitized.append({chapter.afterSegmentIndex, title});
         }
+        std::sort(sanitized.begin(), sanitized.end(),
+                  [](const Chapter &a, const Chapter &b) { return a.afterSegmentIndex < b.afterSegmentIndex; });
+
+        // Small instruct models over-propose boundaries in generateChapters()
+        // itself (see kChapterSystemPrompt's doc comment) — collapse
+        // over-eager adjacent chapters back down with a second, narrower
+        // pass rather than trying to prompt-tune that away. This is a
+        // refinement on an already-valid result, not a prerequisite for one:
+        // a failure here (e.g. a transient generation error) falls back to
+        // the unmerged-but-sanitized chapters instead of failing the whole
+        // job.
+        QList<Chapter> finalChapters = sanitized;
+        QString mergeError;
+        if (const auto merged = m_labelingEngine->mergeSimilarChapters(sanitized, segmentTexts, &mergeError))
+            finalChapters = *merged;
+        else
+            qWarning() << "generateChaptersJob: chapter-merge pass failed, keeping unmerged chapters:" << mergeError;
+
+        QList<ResolvedChapter> resolved;
+        resolved.reserve(finalChapters.size());
+        for (const Chapter &chapter : finalChapters)
+            resolved.append({segments.at(chapter.afterSegmentIndex + 1).t0, chapter.title});
 
         QString writeError;
         if (!writeChaptersField(mdPath, resolved, &writeError)) {

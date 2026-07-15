@@ -10,7 +10,7 @@ set(SUOP_CORE_DIR ${CMAKE_SOURCE_DIR}/src/core)
 # so the app target stays untouched. QML_ELEMENT headers compile outside the
 # qml module as long as Qt6::Qml is linked.
 function(suop_add_test name)
-    cmake_parse_arguments(ARG "LINK_WHISPER;LINK_LLAMA;LINK_SHERPA_ONNX;LINK_QUICK;LINK_MULTIMEDIA" "" "SOURCES" ${ARGN})
+    cmake_parse_arguments(ARG "LINK_WHISPER;LINK_LLAMA;LINK_SHERPA_ONNX;LINK_QUICK;LINK_MULTIMEDIA;LINK_DBUS" "" "SOURCES" ${ARGN})
     set(abs_sources "")
     foreach(src ${ARG_SOURCES})
         list(APPEND abs_sources ${SUOP_CORE_DIR}/${src})
@@ -24,6 +24,11 @@ function(suop_add_test name)
         # tst_sidebar_keynav.cpp's top-of-file comment for why this is
         # needed and what it does/doesn't cover.
         target_link_libraries(${name} PRIVATE Qt6::Quick Qt6::QuickControls2)
+    endif()
+    if(ARG_LINK_DBUS)
+        # For tests that compile UsbGrabberController.cpp, which transitively
+        # constructs a UsbDeviceMonitor (QDBusConnection::systemBus() usage).
+        target_link_libraries(${name} PRIVATE Qt6::DBus)
     endif()
     if(ARG_LINK_MULTIMEDIA)
         # For tests that compile AudioRecorder.cpp/AudioPlayer.cpp — those
@@ -75,3 +80,7 @@ suop_add_test(tst_diarizationengine LINK_SHERPA_ONNX SOURCES DiarizationEngine.c
 suop_add_test(tst_future_spec)
 suop_add_test(tst_styleguide)
 suop_add_test(tst_sidebar_keynav LINK_QUICK SOURCES VaultTreeModel.cpp VaultSearchProxyModel.cpp)
+suop_add_test(tst_usbrulestore SOURCES UsbRuleStore.cpp)
+suop_add_test(tst_usbgrabjob SOURCES UsbGrabJob.cpp UsbRuleStore.cpp VaultTreeModel.cpp)
+suop_add_test(tst_usbgrabbercontroller LINK_DBUS
+    SOURCES UsbGrabberController.cpp UsbDeviceMonitor.cpp UsbRuleStore.cpp UsbGrabJob.cpp VaultTreeModel.cpp)

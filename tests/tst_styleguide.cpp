@@ -440,6 +440,58 @@ private slots:
                  "moveNoteSelection must scroll searchResultsView to reveal the newly-selected row");
     }
 
+    // Both auto-label sliders (tag reuse bias, label wordiness) only ever
+    // drive 3-tier qualitative phrasing in LabelingEngine.cpp's
+    // buildSystemPrompt() (low/mid/high, thresholds at 0.34/0.67) — a
+    // continuous 0.0-1.0 drag implies finer control than the prompt actually
+    // has. They must snap to exactly those 3 positions (0, 0.5, 1) rather
+    // than free-dragging. No QQuickView in this suite to drive the actual
+    // Slider, so this is a source-scan guard that stepSize/snapMode are set.
+    void settingsPopup_autoLabelSlidersSnapToDiscreteTiers()
+    {
+        const QString src = readAll(QStringLiteral(SUOP_QML_DIR "/SettingsPopup.qml"));
+        QVERIFY2(!src.isEmpty(), "qml/SettingsPopup.qml must exist");
+
+        for (const QString &sliderId : {QStringLiteral("tagReuseBiasSlider"), QStringLiteral("wordinessSlider")}) {
+            const int idx = src.indexOf(QStringLiteral("id: %1").arg(sliderId));
+            QVERIFY2(idx >= 0, qPrintable(sliderId + QStringLiteral(" must exist")));
+            const QString block = src.mid(idx, 400);
+            QVERIFY2(block.contains(QStringLiteral("stepSize: 0.5")),
+                     qPrintable(sliderId
+                                + QStringLiteral(" must use stepSize: 0.5 to match the 3-tier prompt phrasing "
+                                                  "(low/mid/high) — no finer granularity actually exists")));
+            QVERIFY2(block.contains(QStringLiteral("snapMode: Slider.SnapAlways")),
+                     qPrintable(sliderId
+                                + QStringLiteral(" must use snapMode: Slider.SnapAlways so dragging actually "
+                                                  "lands on a tier instead of an intermediate value")));
+        }
+    }
+
+    // Each auto-label slider must show a live subtitle naming the actual
+    // system-prompt clause its current position selects — otherwise the
+    // 3-tier snap above just looks like an arbitrary low/mid/high knob with
+    // no visible effect. wordinessPhrasing()/tagReuseBiasPhrasing() are a
+    // manually-duplicated mirror of buildSystemPrompt()/labelPreludePhrasing()
+    // in LabelingEngine.cpp (QML can't call into that C++ string table), so
+    // this also guards that the preview functions still exist and are wired
+    // to the right slider's live value, not a stale/disconnected one.
+    void settingsPopup_autoLabelSlidersShowPromptPreview()
+    {
+        const QString src = readAll(QStringLiteral(SUOP_QML_DIR "/SettingsPopup.qml"));
+        QVERIFY2(!src.isEmpty(), "qml/SettingsPopup.qml must exist");
+
+        QVERIFY2(src.contains(QStringLiteral("function wordinessPhrasing(value)")),
+                 "wordinessPhrasing() must exist to preview the label/prelude verbosity clause");
+        QVERIFY2(src.contains(QStringLiteral("function tagReuseBiasPhrasing(value)")),
+                 "tagReuseBiasPhrasing() must exist to preview the tag-reuse clause");
+
+        QVERIFY2(src.contains(QStringLiteral("settingsPopup.wordinessPhrasing(wordinessSlider.value)")),
+                 "the wordiness subtitle must read wordinessSlider's own live value, not AppSettings.wordiness "
+                 "(which would lag a drag until onMoved commits it)");
+        QVERIFY2(src.contains(QStringLiteral("settingsPopup.tagReuseBiasPhrasing(tagReuseBiasSlider.value)")),
+                 "the tag-reuse subtitle must read tagReuseBiasSlider's own live value");
+    }
+
 };
 
 QTEST_GUILESS_MAIN(TstStyleGuide)

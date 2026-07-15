@@ -29,6 +29,11 @@ ApplicationWindow {
         id: transcriptionController
     }
 
+    UsbGrabberController {
+        id: usbGrabberController
+        vaultTreeModel: vaultModel
+    }
+
     // Bug report (2026-07-09): closing the window must never leave a
     // transcription silently running in the background — see
     // TranscriptionController::terminateApplicationImmediately()'s doc
@@ -287,6 +292,7 @@ ApplicationWindow {
                 onSettingsRequested: settingsPopup.open()
                 onForceRetranscribeAllRequested: sidebar.forceRetranscribeAll()
                 onRecordRequested: mainPanel.recording = !mainPanel.recording
+                onUsbGrabberRequested: mainPanel.usbGrabberOpen = !mainPanel.usbGrabberOpen
             }
 
             SplitView {
@@ -336,6 +342,7 @@ ApplicationWindow {
                     audioRecorder: audioRecorder
                     transcriptionController: transcriptionController
                     vaultTreeModel: vaultModel
+                    usbGrabberController: usbGrabberController
                     onOpenVaultRequested: window.openVaultDialog()
                     onTagActivated: (tag) => sidebar.applyTagFilter(tag)
                     onSpeakerActivated: (name) => sidebar.applySpeakerFilter(name)

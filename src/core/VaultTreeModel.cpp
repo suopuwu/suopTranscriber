@@ -3,6 +3,7 @@
 #include <QDir>
 #include <QFile>
 #include <QFileInfo>
+#include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QProcess>
@@ -559,6 +560,64 @@ bool VaultTreeModel::writeVaultSettings(const QVariantMap &settings, QString *er
 
     const QJsonDocument doc(QJsonObject::fromVariantMap(settings));
     file.write(doc.toJson(QJsonDocument::Indented));
+    return true;
+}
+
+QVariantList VaultTreeModel::readUsbGrabHistory() const
+{
+    QVariantList result;
+    const QString localPath = vaultLocalPath();
+    if (localPath.isEmpty())
+        return result;
+
+    QFile file(localPath + QStringLiteral("/.transcriber/usbGrabHistory.json"));
+    if (!file.open(QIODevice::ReadOnly))
+        return result;
+
+    const QJsonDocument doc = QJsonDocument::fromJson(file.readAll());
+    if (!doc.isArray())
+        return result;
+    return doc.array().toVariantList();
+}
+
+bool VaultTreeModel::appendUsbGrabHistoryEntry(const QVariantMap &entry, QString *errorOut) const
+{
+    const QString localPath = vaultLocalPath();
+    if (localPath.isEmpty()) {
+        if (errorOut)
+            *errorOut = QStringLiteral("no vault open");
+        return false;
+    }
+
+    const QDir configDir(localPath + QStringLiteral("/.transcriber"));
+    if (!configDir.mkpath(QStringLiteral("."))) {
+        if (errorOut)
+            *errorOut = QStringLiteral("could not create %1").arg(configDir.path());
+        return false;
+    }
+
+    const QString historyPath = configDir.filePath(QStringLiteral("usbGrabHistory.json"));
+
+    QJsonArray history;
+    QFile readFile(historyPath);
+    if (readFile.open(QIODevice::ReadOnly)) {
+        const QJsonDocument existingDoc = QJsonDocument::fromJson(readFile.readAll());
+        readFile.close();
+        if (existingDoc.isArray())
+            history = existingDoc.array();
+    }
+
+    history.append(QJsonObject::fromVariantMap(entry));
+
+    QFile writeFile(historyPath);
+    if (!writeFile.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
+        if (errorOut)
+            *errorOut = QStringLiteral("could not open %1 for writing").arg(writeFile.fileName());
+        return false;
+    }
+
+    const QJsonDocument doc(history);
+    writeFile.write(doc.toJson(QJsonDocument::Indented));
     return true;
 }
 

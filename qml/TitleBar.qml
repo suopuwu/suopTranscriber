@@ -10,6 +10,7 @@ Item {
     signal settingsRequested()
     signal forceRetranscribeAllRequested()
     signal recordRequested()
+    signal usbGrabberRequested()
 
     // Inline confirm state for the "Force retranscribe all" menu row (see
     // MainPanel.qml's speaker-merge confirm row for the same swap-in-place
@@ -94,12 +95,39 @@ Item {
         }
     }
 
+    Item {
+        id: usbGrabberButton
+        anchors.left: recordButton.right
+        anchors.leftMargin: 4
+        anchors.verticalCenter: parent.verticalCenter
+        width: 24
+        height: 24
+
+        HoverHandler {
+            id: usbGrabberHover
+            cursorShape: Qt.PointingHandCursor
+        }
+        TapHandler {
+            onTapped: titleBar.usbGrabberRequested()
+        }
+        HoverBorder {
+            anchors.fill: parent
+            active: usbGrabberHover.hovered
+        }
+        Text {
+            anchors.centerIn: parent
+            text: "🔌"
+            color: "white"
+            font.pixelSize: 14
+        }
+    }
+
     // Infrequently used actions (currently just "force retranscribe all")
     // that don't warrant a spot in Settings — kept out of the way next to
     // the gear rather than cluttering the per-row/bulk sidebar controls.
     Item {
         id: moreActionsButton
-        anchors.left: recordButton.right
+        anchors.left: usbGrabberButton.right
         anchors.leftMargin: 4
         anchors.verticalCenter: parent.verticalCenter
         width: 24

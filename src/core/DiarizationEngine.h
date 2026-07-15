@@ -61,3 +61,11 @@ public:
 private:
     sherpa_onnx::cxx::OfflineSpeakerDiarization m_sd;
 };
+
+// Exposed (out of DiarizationEngine.cpp's anonymous namespace) purely so
+// tst_diarizationengine.cpp can exercise the singleton-cluster merge policy
+// directly with hand-built segments — real sherpa-onnx clustering output
+// isn't controllable enough from a test to hit specific merge scenarios
+// (see mergeMinorSpeakersIntoNearestMajor's doc comment in the .cpp for why
+// singleton turn count, not duration share, is the merge criterion).
+void mergeMinorSpeakersIntoNearestMajor(std::vector<sherpa_onnx::cxx::OfflineSpeakerDiarizationSegment> &segments);

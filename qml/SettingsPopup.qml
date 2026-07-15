@@ -37,6 +37,29 @@ Popup {
                 ? settingsPopup.computeRuleOverlaps(AppSettings.combineRules, settingsPopup.vaultTreeModel.allAudioPaths())
                 : []
     }
+
+    // Live previews of the exact system-prompt clause each slider currently
+    // selects, shown as a subtitle under the slider so the 3-tier snap
+    // (settingsPopup_autoLabelSlidersSnapToDiscreteTiers, tst_styleguide.cpp)
+    // doesn't read as an arbitrary position — the user sees the actual
+    // wording it produces. Mirrors labelPreludePhrasing() and the
+    // tagReuseBias tiers in buildSystemPrompt() (LabelingEngine.cpp) at the
+    // same 0.34/0.67 thresholds; keep both in sync if those wordings change.
+    function wordinessPhrasing(value) {
+        if (value >= 0.67)
+            return qsTr("a descriptive label (up to a short phrase), a detailed multi-sentence prelude")
+        if (value >= 0.34)
+            return qsTr("a short display label (a few words), a one-paragraph prelude")
+        return qsTr("a very short label (1-3 words), a single concise prelude sentence")
+    }
+    function tagReuseBiasPhrasing(value) {
+        if (value >= 0.67)
+            return qsTr("strongly prefer reusing an existing tag, even if only an approximate fit")
+        if (value >= 0.34)
+            return qsTr("reuse an existing tag if it reasonably fits, otherwise invent a new one")
+        return qsTr("prefer inventing a new, precise tag unless an existing one is a very close match")
+    }
+
     // Bug 50: detectCombineGroups() itself is fully live (QFileInfo::exists() checked fresh
     // every call, no C++-side caching) — but each ruleCard's own previewGroups is a cached JS
     // property only recomputed on Component.onCompleted (once, ever, since this popup is a
@@ -96,7 +119,7 @@ Popup {
     // slider's mouse grab isn't interrupted mid-drag.
     property bool anyPressed: radiusSlider.pressed || sidebarOpacitySlider.pressed
                                || mainOpacitySlider.pressed || rimWidthSlider.pressed
-                               || highlightRadiusSlider.pressed || tagReuseBiasSlider.pressed
+                               || highlightRadiusSlider.pressed
                                || timestampDecimalPlacesSlider.pressed
                                || progressGlowWidthSlider.pressed || progressGlowRadiusSlider.pressed
                                || sidebarEdgeLeftMarginSlider.pressed || sidebarContentLeftMarginSlider.pressed
@@ -3042,6 +3065,8 @@ Popup {
                     Layout.minimumWidth: 80
                     from: 0
                     to: 1
+                    stepSize: 0.5
+                    snapMode: Slider.SnapAlways
                     value: AppSettings.tagReuseBias
                     hoverEnabled: true
                     onMoved: AppSettings.tagReuseBias = value
@@ -3093,6 +3118,17 @@ Popup {
                 font.pixelSize: 11
             }
 
+            Label {
+                visible: autoLabelEnabledSwitch.checked && !restrictTagsToExistingSwitch.checked
+                Layout.fillWidth: true
+                wrapMode: Text.WordWrap
+                text: qsTr("Current prompt: “%1”")
+                        .arg(settingsPopup.tagReuseBiasPhrasing(tagReuseBiasSlider.value))
+                color: "#666666"
+                font.italic: true
+                font.pixelSize: 11
+            }
+
             RowLayout {
                 Layout.fillWidth: true
                 visible: autoLabelEnabledSwitch.checked
@@ -3107,6 +3143,8 @@ Popup {
                     Layout.minimumWidth: 80
                     from: 0
                     to: 1
+                    stepSize: 0.5
+                    snapMode: Slider.SnapAlways
                     value: AppSettings.wordiness
                     hoverEnabled: true
                     onMoved: AppSettings.wordiness = value
@@ -3154,6 +3192,16 @@ Popup {
                 text: qsTr("How verbose the AI-generated label and prelude are. Low: terse. High: "
                            + "descriptive.")
                 color: "#888888"
+                font.pixelSize: 11
+            }
+
+            Label {
+                visible: autoLabelEnabledSwitch.checked
+                Layout.fillWidth: true
+                wrapMode: Text.WordWrap
+                text: qsTr("Current prompt: “%1”").arg(settingsPopup.wordinessPhrasing(wordinessSlider.value))
+                color: "#666666"
+                font.italic: true
                 font.pixelSize: 11
             }
 

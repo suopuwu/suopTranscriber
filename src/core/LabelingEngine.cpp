@@ -38,6 +38,19 @@ constexpr int kMaxOutputTokens = 700;
 // below to silently drop everything past one window.
 constexpr int kMaxChapterOutputTokens = 3072;
 
+// Chapter-merge follow-up pass (mergeSimilarChapters() below): output is
+// just "yes"/"no", so a tiny budget — a couple tokens is normally enough,
+// this just leaves slack for an odd tokenization.
+constexpr int kChapterMergeOutputTokens = 8;
+// How much of each chapter's actual content to show the model when deciding
+// whether two ADJACENT chapters should merge — titles alone can't tell two
+// differently-worded takes on the same topic from two similarly-worded but
+// distinct ones apart. Small and fixed rather than "until the next chapter
+// boundary": keeps each pairwise call cheap regardless of how long the
+// chapters themselves are (a merge decision only needs a taste of the
+// content, not the whole thing).
+constexpr int kChapterMergeExcerptChars = 220;
+
 // Fixed key order, not a generic JSON-object grammar — a narrow, schema-exact
 // grammar is far more reliable for a small model to satisfy every time than
 // a fully generic one. The `string` rule is llama.cpp's own proven one from
@@ -76,14 +89,34 @@ const char *kSystemPromptSuffix =
 const char *kChapterSystemPrompt =
     "You divide an audio transcript into chapters. You are given the transcript as a "
     "numbered list of its segments, one per line, formatted \"INDEX: text\". Propose chapter "
-    "boundaries for it — roughly one chapter every few minutes of spoken content, up to about "
-    "20 chapters for a long transcript and fewer for a short one; a short transcript covering "
-    "one continuous topic may need zero. For each chapter boundary (skip the very first "
-    "chapter — it always starts at segment 0 implicitly), return \"afterSegment\": the index of "
-    "the LAST segment of the PREVIOUS chapter, so the new chapter begins right after it; and "
-    "\"title\": a short (a few words) descriptive title for the chapter that STARTS there. "
-    "Respond with ONLY a JSON array of these objects, ordered by afterSegment ascending, "
-    "nothing else.";
+    "boundaries only where the topic or subject actually changes — do not add a boundary just "
+    "because time has passed. A transcript covering one continuous topic throughout may need "
+    "zero boundaries; do not force chapters into it. Up to about 20 chapters for a very long, "
+    "multi-topic transcript. For each chapter boundary (skip the very first chapter — it "
+    "always starts at segment 0 implicitly), return \"afterSegment\": the index of the LAST "
+    "segment of the PREVIOUS chapter, so the new chapter begins right after it; and \"title\": "
+    "a short (a few words) descriptive title for the chapter that STARTS there. Respond with "
+    "ONLY a JSON array of these objects, ordered by afterSegment ascending, nothing else.";
+
+// mergeSimilarChapters() follow-up pass: a plain yes/no decision, not a JSON
+// object — there's nothing else to constrain the shape of.
+constexpr auto kChapterMergeGrammar = R"GBNF(
+root ::= "yes" | "no"
+)GBNF";
+
+// Companion to kChapterSystemPrompt: rather than tuning that prompt further
+// to make the model more conservative about proposing boundaries in the
+// first place (small instruct models are unreliable at open-ended "how many
+// boundaries does this need" judgment calls), this runs a SEPARATE, much
+// narrower pass afterward — a single bounded yes/no per adjacent pair — to
+// collapse over-eager chapters back down. See
+// LabelingEngine::mergeSimilarChapters()'s doc comment for the scan shape.
+const char *kChapterMergeSystemPrompt =
+    "You are shown two ADJACENT chapters from an audio transcript, each as a title and a short "
+    "excerpt of its actual content. Decide whether they are close enough in topic that they "
+    "should be merged into a single chapter, rather than kept as two separate ones — err toward "
+    "merging unless they are clearly about different things. Respond with ONLY \"yes\" or "
+    "\"no\", nothing else.";
 
 // Feature 1: 0.0-1.0 slider controlling how verbose the generated label and
 // prelude are, independent of the tag-related options below. 3-tier phrasing
@@ -151,6 +184,25 @@ QString buildSystemPrompt(const QStringList &existingTags, bool restrictToExisti
                       .arg(tagList);
     }
     return prompt;
+}
+
+// mergeSimilarChapters() helper: a short taste of a chapter's actual content
+// for the merge-comparison prompt, starting at startSegmentIndex and
+// concatenating segments forward until kChapterMergeExcerptChars is reached
+// or segmentTexts runs out. Deliberately not bounded by the NEXT chapter's
+// start (a one-segment chapter would then show almost nothing to compare
+// against) — a fixed character budget is what keeps each pairwise call
+// cheap, not the excerpt tracking the chapter's real extent.
+QString chapterExcerpt(const QStringList &segmentTexts, int startSegmentIndex)
+{
+    QString excerpt;
+    for (int i = startSegmentIndex; i < segmentTexts.size() && excerpt.size() < kChapterMergeExcerptChars; ++i) {
+        if (!excerpt.isEmpty())
+            excerpt += QLatin1Char(' ');
+        excerpt += segmentTexts.at(i);
+    }
+    excerpt.truncate(kChapterMergeExcerptChars);
+    return excerpt;
 }
 
 }
@@ -365,4 +417,47 @@ std::optional<QList<Chapter>> LabelingEngine::generateChapters(const QStringList
         chapters.append(chapter);
     }
     return chapters;
+}
+
+std::optional<QList<Chapter>> LabelingEngine::mergeSimilarChapters(const QList<Chapter> &chapters,
+                                                                     const QStringList &segmentTexts,
+                                                                     QString *errorOut)
+{
+    if (chapters.size() < 2)
+        return chapters;
+
+    // Single greedy left-to-right scan, not repeated full passes: `merged`
+    // only ever grows by comparing its OWN last (kept) entry against the
+    // next candidate. A run of 3+ over-eagerly-split chapters about the same
+    // topic still collapses into one — each accepted merge just drops the
+    // candidate and leaves the kept entry's title/afterSegmentIndex (and so
+    // its excerpt, which is keyed off afterSegmentIndex) untouched, ready to
+    // be compared against whatever comes next.
+    QList<Chapter> merged;
+    merged.reserve(chapters.size());
+    merged.append(chapters.first());
+
+    for (int i = 1; i < chapters.size(); ++i) {
+        const Chapter &kept = merged.last();
+        const Chapter &candidate = chapters.at(i);
+
+        const QString userText = QStringLiteral("Chapter A\ntitle: %1\nexcerpt: %2\n\n"
+                                                  "Chapter B\ntitle: %3\nexcerpt: %4")
+                                      .arg(kept.title, chapterExcerpt(segmentTexts, kept.afterSegmentIndex + 1),
+                                           candidate.title,
+                                           chapterExcerpt(segmentTexts, candidate.afterSegmentIndex + 1));
+
+        const auto response = runGrammarConstrained(QString::fromUtf8(kChapterMergeSystemPrompt), userText,
+                                                      kChapterMergeGrammar, kChapterMergeOutputTokens, errorOut);
+        if (!response)
+            return std::nullopt;
+
+        // kChapterMergeGrammar only ever produces exactly "yes" or "no", so
+        // this is just picking between the two rather than general parsing.
+        if (response->trimmed() != QStringLiteral("yes"))
+            merged.append(candidate);
+        // else: candidate absorbed into `kept` — drop its boundary/title and
+        // move on to comparing `kept` against the segment after next.
+    }
+    return merged;
 }

@@ -137,39 +137,45 @@ sc::OfflineSpeakerDiarization createSafely(const QString &segmentationModelPath,
 // growing with recording length regardless of threshold — a single
 // distance cutoff can't compensate for an algorithm that gets more
 // fragile as more (noisy) data accumulates.
-//
-// Fix (applied here, not inside sherpa-onnx's clustering, which is
-// compiled code we don't control): a real recurring speaker accumulates
-// substantial total TALK TIME over a long recording; a noise-driven
-// micro-cluster does not. So any cluster whose total duration is under
-// kMinorSpeakerDurationFraction of the LARGEST cluster's total duration is
-// treated as "minor" and every one of its turns is reassigned to whichever
-// "major" cluster has the temporally NEAREST turn — i.e. "this was
-// probably actually the person talking right around then, misattributed."
-// 5% was chosen empirically against the real recording above: it reduced
-// 29 raw clusters (10-minute excerpt) to 6, and 59 raw clusters
-// (30-minute excerpt) to 10 — both plausible speaker counts for that
-// recording's actual content, and the reduction held up consistently
-// across both excerpt lengths (not just a fluke at one length).
-constexpr double kMinorSpeakerDurationFraction = 0.05;
 
+}
+
+// Fix (applied here, not inside sherpa-onnx's clustering, which is
+// compiled code we don't control): the original version of this function
+// judged a cluster "minor" (noise) by total TALK TIME — under 5% of the
+// largest cluster's duration got folded into the nearest major cluster.
+// That worked for the 4.8-hour recording it was tuned against, but proved
+// wrong in general: a genuine, recurring second speaker whose turns
+// happen to land across MANY small raw clusters (the same fragmentation
+// this function exists to clean up) can have every one of those clusters
+// individually fall under a duration cutoff even though their combined
+// talk time is substantial — silently erasing a real speaker down to
+// "everyone is Speaker 1" on long/imbalanced recordings (confirmed: a
+// 68-minute real two-person conversation collapsed entirely to one
+// speaker this way).
+//
+// Fixed criterion, from the SAME 4.8-hour analysis that motivated this
+// function in the first place: what actually distinguished noise from
+// real speakers there wasn't a duration ratio, it was TURN COUNT — 367 of
+// 533 raw clusters (69%) had EXACTLY ONE turn (an isolated, non-recurring
+// blip — cross-talk or a one-off noisy embedding), while every real
+// speaker, including the least active one, recurred across multiple
+// turns. So only true singleton (exactly one turn) clusters are treated
+// as minor and reassigned to the nearest major cluster by temporal
+// proximity; any cluster with more than one turn is kept as its own
+// speaker regardless of how little it talked in total.
 void mergeMinorSpeakersIntoNearestMajor(std::vector<sc::OfflineSpeakerDiarizationSegment> &segments)
 {
     if (segments.empty())
         return;
 
-    std::map<int, double> totalDuration;
+    std::map<int, int> turnCount;
     for (const auto &seg : segments)
-        totalDuration[seg.speaker] += (seg.end - seg.start);
-
-    double maxDuration = 0.0;
-    for (const auto &kv : totalDuration)
-        maxDuration = std::max(maxDuration, kv.second);
-    const double cutoff = maxDuration * kMinorSpeakerDurationFraction;
+        ++turnCount[seg.speaker];
 
     std::set<int> majorSpeakers;
-    for (const auto &kv : totalDuration) {
-        if (kv.second >= cutoff)
+    for (const auto &kv : turnCount) {
+        if (kv.second > 1)
             majorSpeakers.insert(kv.first);
     }
 
@@ -182,7 +188,7 @@ void mergeMinorSpeakersIntoNearestMajor(std::vector<sc::OfflineSpeakerDiarizatio
             majorIndices.push_back(i);
     }
     if (majorIndices.empty())
-        return; // degenerate (e.g. every cluster exactly ties) — nothing to merge into
+        return; // degenerate (every cluster is a singleton, e.g. a very short clip) — nothing to merge into
 
     for (auto &seg : segments) {
         if (majorSpeakers.count(seg.speaker))
@@ -200,8 +206,6 @@ void mergeMinorSpeakersIntoNearestMajor(std::vector<sc::OfflineSpeakerDiarizatio
         }
         seg.speaker = segments[best].speaker;
     }
-}
-
 }
 
 DiarizationEngine::DiarizationEngine(const QString &segmentationModelPath, const QString &embeddingModelPath)

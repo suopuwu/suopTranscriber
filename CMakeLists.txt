@@ -9,7 +9,7 @@ option(SUOP_ENABLE_VULKAN "Build whisper.cpp with Vulkan backend (cross-vendor G
 option(SUOP_ENABLE_CUDA "Build whisper.cpp with CUDA backend (NVIDIA fast path)" OFF)
 option(SUOP_ENABLE_LABELING "Build with llama.cpp for AI auto-labeling" ON)
 
-find_package(Qt6 6.7 REQUIRED COMPONENTS Core Gui Qml Quick QuickControls2 Multimedia Core5Compat)
+find_package(Qt6 6.7 REQUIRED COMPONENTS Core Gui Qml Quick QuickControls2 Multimedia Core5Compat DBus)
 find_package(KF6WindowSystem REQUIRED)
 
 qt_standard_project_setup(REQUIRES 6.7)
@@ -195,6 +195,14 @@ qt_add_qml_module(suopTranscriber
         src/core/AudioPlayer.cpp
         src/core/AudioRecorder.h
         src/core/AudioRecorder.cpp
+        src/core/UsbDeviceMonitor.h
+        src/core/UsbDeviceMonitor.cpp
+        src/core/UsbRuleStore.h
+        src/core/UsbRuleStore.cpp
+        src/core/UsbGrabJob.h
+        src/core/UsbGrabJob.cpp
+        src/core/UsbGrabberController.h
+        src/core/UsbGrabberController.cpp
         src/core/WindowEffects.h
         src/core/WindowEffects.cpp
         src/core/AudioDecoder.h
@@ -225,6 +233,7 @@ target_link_libraries(suopTranscriber PRIVATE
     Qt6::QuickControls2
     Qt6::Multimedia
     Qt6::Core5Compat
+    Qt6::DBus
     KF6::WindowSystem
     whisper
     llama

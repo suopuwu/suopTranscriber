@@ -732,6 +732,105 @@ private slots:
         QCOMPARE(readBack.value(QStringLiteral("recordingSystemGain")).toDouble(), 0.75);
     }
 
+    // --- USB grab history (.transcriber/usbGrabHistory.json, array-root JSON) ---
+
+    // appendUsbGrabHistoryEntry() then readUsbGrabHistory() round-trips a
+    // grab-history entry through an array-root JSON file inside the vault's
+    // hidden .transcriber/ dir — same "created on demand" mechanism as
+    // vaultSettings_roundTripsThroughHiddenJsonFile above, but an array root
+    // (one entry per past grab) rather than an object root.
+    void usbGrabHistory_roundTripsThroughHiddenJsonFile()
+    {
+        QTemporaryDir vault;
+        QVERIFY(vault.isValid());
+
+        VaultTreeModel model;
+        model.setVaultPath(QUrl::fromLocalFile(vault.path()));
+
+        QVariantMap entry;
+        entry[QStringLiteral("timestamp")] = QStringLiteral("2026-07-14T12:00:00Z");
+        entry[QStringLiteral("deviceSerial")] = QStringLiteral("ABC123");
+        entry[QStringLiteral("deviceLabel")] = QStringLiteral("Zoom H1n");
+        entry[QStringLiteral("filesCopied")] = 3;
+        entry[QStringLiteral("filesSkipped")] = 1;
+        entry[QStringLiteral("errors")] = QStringList();
+
+        QString error;
+        QVERIFY2(model.appendUsbGrabHistoryEntry(entry, &error), qPrintable(error));
+        QVERIFY(QFileInfo::exists(vault.filePath(".transcriber/usbGrabHistory.json")));
+
+        const QVariantList history = model.readUsbGrabHistory();
+        QCOMPARE(history.size(), 1);
+        const QVariantMap readBack = history.first().toMap();
+        QCOMPARE(readBack.value(QStringLiteral("deviceSerial")).toString(), QStringLiteral("ABC123"));
+        QCOMPARE(readBack.value(QStringLiteral("deviceLabel")).toString(), QStringLiteral("Zoom H1n"));
+        QCOMPARE(readBack.value(QStringLiteral("filesCopied")).toInt(), 3);
+        QCOMPARE(readBack.value(QStringLiteral("filesSkipped")).toInt(), 1);
+    }
+
+    // Multiple grabs accumulate in append order (oldest first) rather than
+    // each append overwriting the last — UsbGrabberController reverses this
+    // client-side for newest-first display.
+    void usbGrabHistory_multipleAppendsAccumulateInOrder()
+    {
+        QTemporaryDir vault;
+        QVERIFY(vault.isValid());
+
+        VaultTreeModel model;
+        model.setVaultPath(QUrl::fromLocalFile(vault.path()));
+
+        for (const QString &serial : {QStringLiteral("FIRST"), QStringLiteral("SECOND"), QStringLiteral("THIRD")}) {
+            QVariantMap entry;
+            entry[QStringLiteral("deviceSerial")] = serial;
+            entry[QStringLiteral("filesCopied")] = 0;
+            entry[QStringLiteral("filesSkipped")] = 0;
+            entry[QStringLiteral("errors")] = QStringList();
+            QVERIFY(model.appendUsbGrabHistoryEntry(entry));
+        }
+
+        const QVariantList history = model.readUsbGrabHistory();
+        QCOMPARE(history.size(), 3);
+        QCOMPARE(history.at(0).toMap().value(QStringLiteral("deviceSerial")).toString(), QStringLiteral("FIRST"));
+        QCOMPARE(history.at(1).toMap().value(QStringLiteral("deviceSerial")).toString(), QStringLiteral("SECOND"));
+        QCOMPARE(history.at(2).toMap().value(QStringLiteral("deviceSerial")).toString(), QStringLiteral("THIRD"));
+    }
+
+    // No vault open, or a vault that's never had a grab performed against it:
+    // an empty list, not an error — the file simply doesn't exist yet.
+    void usbGrabHistory_noHistoryYet_returnsEmptyListNotError()
+    {
+        QTemporaryDir vault;
+        QVERIFY(vault.isValid());
+
+        VaultTreeModel model;
+        model.setVaultPath(QUrl::fromLocalFile(vault.path()));
+        QVERIFY(model.readUsbGrabHistory().isEmpty());
+
+        VaultTreeModel noVaultModel;
+        QVERIFY(noVaultModel.readUsbGrabHistory().isEmpty());
+
+        QString error;
+        QVERIFY(!noVaultModel.appendUsbGrabHistoryEntry({{QStringLiteral("deviceSerial"), QStringLiteral("X")}}, &error));
+        QVERIFY(!error.isEmpty());
+    }
+
+    // The history file lives inside .transcriber/, same hidden-dotdir
+    // exclusion as settings.json — never appears as a tree node.
+    void usbGrabHistoryFile_neverAppearsAsATreeNode()
+    {
+        QTemporaryDir vault;
+        QVERIFY(vault.isValid());
+        QVERIFY(touch(vault.filePath("song.mp3")));
+
+        VaultTreeModel model;
+        model.setVaultPath(QUrl::fromLocalFile(vault.path()));
+        QVERIFY(model.appendUsbGrabHistoryEntry({{QStringLiteral("deviceSerial"), QStringLiteral("X")}}));
+
+        QCOMPARE(model.rowCount(), 1);
+        QVERIFY(findByName(model, "song.mp3").isValid());
+        QVERIFY(!findByName(model, ".transcriber").isValid());
+    }
+
     // --- isPathInsideVault() (recording feature: output-folder validation) -------
 
     // The vault root itself, and any subdirectory (nested or not), count as

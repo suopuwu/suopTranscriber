@@ -59,13 +59,6 @@ private slots:
               "JSONL wire protocol itself is tracked in tst_engine_contract.");
     }
 
-    void usbImport_grabNewAudio()
-    {
-        QSKIP("DESIGN.md 'USB import': enumerate removable drives via "
-              "QStorageInfo::mountedVolumes(), persist chosen device identifiers, and on 'grab "
-              "new' diff by filename + hash and copy only new audio into the vault. NOT BUILT.");
-    }
-
     void modelManagement_uiAndRegistry()
     {
         QSKIP("DESIGN.md 'Model management': a model download/management UI backed by a registry "
@@ -80,9 +73,12 @@ private slots:
               "appearance/behavior settings now round-trip through <vault>/.transcriber/settings.json "
               "(JSON), see VaultTreeModel::readVaultSettings/writeVaultSettings and "
               "AppSettings.qml's loadFromVault/saveToVault (tested: "
-              "tst_vaulttreemodel.cpp's vaultSettings_* cases). STILL DIVERGENT: a USB device "
-              "allowlist and a model registry are not implemented anywhere yet (no code to "
-              "test against) — that part of this placeholder remains accurate.");
+              "tst_vaulttreemodel.cpp's vaultSettings_* cases). RESOLVED for the USB device "
+              "allowlist too (USB Grabber feature) — app-scoped via UsbRuleStore/QSettings, "
+              "tested in tst_usbrulestore.cpp/tst_usbgrabbercontroller.cpp, deliberately NOT "
+              "vault-scoped JSON (same physical device is used across multiple vaults). STILL "
+              "DIVERGENT: a model registry is not implemented anywhere yet (no code to test "
+              "against) — that part of this placeholder remains accurate.");
     }
 
     void noRetranscription_mdPresenceMeansDone()

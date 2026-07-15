@@ -118,6 +118,44 @@ public:
     // Returns std::nullopt on failure (errorOut set if given).
     std::optional<QList<Chapter>> generateChapters(const QStringList &segmentTexts, QString *errorOut = nullptr);
 
+    // Follow-up to generateChapters() above: small instruct models are
+    // unreliable at the open-ended "how many boundaries does this transcript
+    // need" judgment generateChapters() makes in one shot, and tend to
+    // over-propose. Rather than tuning that prompt further, this runs a
+    // SEPARATE pass over its own output — a much narrower, more reliable
+    // per-pair decision ("are these two ADJACENT chapters close enough in
+    // topic to merge?") — to collapse runs of over-eager chapters back down.
+    // Shares the same resident model/context as label()/generateChapters(),
+    // same reason as generateChapters()'s own doc comment.
+    //
+    // A single greedy left-to-right scan (not repeated full passes until the
+    // count stabilizes): each accepted merge keeps the earlier chapter's
+    // title/afterSegmentIndex and drops the later one, then keeps comparing
+    // that same (still-open) chapter forward — so a run of 3+ similar
+    // chapters collapses into one within a single O(n) scan of pairwise
+    // calls, without a separate pass-count or fixed-point loop.
+    //
+    // chapters MUST already be bounds-checked, deduped, and sorted by
+    // afterSegmentIndex ascending (see TranscriptionController::
+    // generateChaptersJob(), which does this before calling in) — adjacency
+    // here means list order, not a resort. segmentTexts is the SAME full
+    // per-file list generateChapters() callers already build; only used to
+    // pull a short excerpt for each chapter's comparison (titles alone can't
+    // tell two differently-worded takes on one topic from two
+    // similarly-worded but distinct ones apart), keyed off each chapter's
+    // own afterSegmentIndex (already validated by the caller, so no separate
+    // bounds check here). Fewer than 2 chapters is returned unchanged —
+    // nothing to compare.
+    //
+    // Returns std::nullopt on failure (errorOut set if given) — same shared-
+    // context/single-shot-generation error surface as label()/
+    // generateChapters(). Callers that would rather keep an unmerged result
+    // than fail the whole job on a transient generation error should treat
+    // that as non-fatal and fall back to the input list.
+    std::optional<QList<Chapter>> mergeSimilarChapters(const QList<Chapter> &chapters,
+                                                         const QStringList &segmentTexts,
+                                                         QString *errorOut = nullptr);
+
     // Item P34: the same limit generateChapters() truncates to internally
     // (see its doc comment above and the .cpp definition site), exposed so
     // TranscriptionController::generateChaptersJob() can split a long

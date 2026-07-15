@@ -250,6 +250,80 @@ private slots:
             QVERIFY2(!chapter.title.isEmpty(), "chapter title must be non-empty");
         }
     }
+
+    // Follow-up to generateChapters()'s over-eager-boundary problem: see
+    // LabelingEngine::mergeSimilarChapters()'s doc comment. Fewer than 2
+    // input chapters is returned unchanged, with no model query — doesn't
+    // need a real model, so no QSKIP guard.
+    void mergeSimilarChapters_returnsInputUnchangedBelowTwoChapters()
+    {
+        LabelingEngine engine{QString()};
+        const QList<Chapter> oneChapter = {{5, QStringLiteral("Solo chapter")}};
+
+        QString error;
+        const auto result = engine.mergeSimilarChapters(oneChapter, {}, &error);
+        QVERIFY2(result.has_value(), qPrintable(error));
+        QCOMPARE(result->size(), 1);
+        QCOMPARE(result->first().title, QStringLiteral("Solo chapter"));
+
+        const auto emptyResult = engine.mergeSimilarChapters({}, {}, &error);
+        QVERIFY2(emptyResult.has_value(), qPrintable(error));
+        QVERIFY(emptyResult->isEmpty());
+    }
+
+    // Core behavior: a single greedy left-to-right scan (see
+    // mergeSimilarChapters()'s doc comment) must collapse a run of adjacent
+    // chapters that are really the same topic — split only because
+    // generateChapters() over-proposed — into one, keeping the FIRST
+    // chapter's title/afterSegmentIndex, not a later one's. An adjacent
+    // chapter on a clearly different topic must survive unmerged. Three
+    // input chapters (two over-split marketing ones, one genuinely distinct
+    // office-lease one) covers both the merge and the non-merge case in one
+    // pass, like the chain-collapse the doc comment describes.
+    void mergeSimilarChapters_collapsesSameTopicRunButKeepsDistinctTopicSeparate()
+    {
+        const QString modelPath = locateRealLabelModel();
+        if (modelPath.isEmpty())
+            QSKIP("no real label GGUF model available; set SUOP_TEST_LABEL_MODEL to a "
+                  "Qwen3-4B-Instruct-2507 (or compatible) .gguf file to run this test");
+
+        LabelingEngine engine(modelPath);
+        QVERIFY(engine.isValid());
+
+        const QStringList segmentTexts = {
+            QStringLiteral("Let's kick off today's meeting with the quarterly marketing budget review."),
+            QStringLiteral("The trade show booth accounted for the largest single marketing expense this "
+                            "quarter, coming in just under budget."),
+            QStringLiteral("Digital ad spend for marketing was also reviewed and came in under the allocated "
+                            "budget."),
+            QStringLiteral("The conference sponsorship line item within the marketing budget ran slightly over "
+                            "what was planned."),
+            QStringLiteral("Switching gears entirely, let's discuss the office lease renewal for company "
+                            "headquarters."),
+            QStringLiteral("The landlord has proposed a three-year lease renewal at a five percent higher "
+                            "annual rate."),
+        };
+        // Segment 0 is the implicit first chapter (not represented here, see
+        // generateChapters()'s doc comment). The first two entries both
+        // start chapters that are still about the marketing budget — an
+        // over-eager split of one real chapter — while the third starts a
+        // genuinely different topic (the office lease).
+        const QList<Chapter> overSplit = {
+            {0, QStringLiteral("Trade show marketing costs")},
+            {2, QStringLiteral("Marketing sponsorship overage")},
+            {3, QStringLiteral("Office lease renewal")},
+        };
+
+        QString error;
+        const auto result = engine.mergeSimilarChapters(overSplit, segmentTexts, &error);
+        QVERIFY2(result.has_value(), qPrintable(error));
+
+        QCOMPARE(result->size(), 2);
+        QCOMPARE(result->at(0).afterSegmentIndex, 0);
+        QCOMPARE(result->at(0).title, QStringLiteral("Trade show marketing costs"));
+        QCOMPARE(result->at(1).afterSegmentIndex, 3);
+        QCOMPARE(result->at(1).title, QStringLiteral("Office lease renewal"));
+    }
 };
 
 QTEST_GUILESS_MAIN(TstLabelingEngine)
