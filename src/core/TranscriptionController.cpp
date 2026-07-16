@@ -672,23 +672,51 @@ void removeChapterMarkerLine(QString *body, const QRegularExpressionMatch &m)
     body->remove(start, length);
 }
 
-// Item 14 "auto-categorize" mode: the existing tag vocabulary for a vault,
-// scanned fresh per labeling job (vaults are small; no cache invalidation
-// to get wrong). Reads every .md's `tags:` frontmatter line directly rather
-// than going through readMetadata()'s full parse, since that's all that's
-// needed here. Returns a de-duplicated, sorted list of individual tags.
-QStringList collectVaultTags(const QString &vaultLocalPath)
+// Item 14 "auto-categorize" mode: the existing tag vocabulary for a vault.
+// Reads every .md's `tags:` frontmatter line directly rather than going
+// through readMetadata()'s full parse, since that's all that's needed here.
+// Returns a de-duplicated, sorted list of individual tags.
+//
+// `cache` (optional, per-file, keyed by absolute path) skips the open+parse
+// for any file whose mtime+size is unchanged since the last call; the
+// directory walk and its one stat per file still happen every time, which is
+// what makes the mtime check possible in the first place. Pass nullptr for a
+// guaranteed-fresh scan.
+//
+// The labeling job passes nullptr: it runs once per job, on the worker
+// thread, and must not touch the GUI thread's cache. existingVaultTags()
+// passes its cache, because it is called from a QML binding on every
+// keystroke — see its doc comment in the header.
+QStringList collectVaultTags(const QString &vaultLocalPath,
+                             QHash<QString, TranscriptionController::CachedFileTags> *cache)
 {
     QSet<QString> tags;
     QDirIterator it(vaultLocalPath, {QStringLiteral("*.md")}, QDir::Files,
                      QDirIterator::Subdirectories);
     while (it.hasNext()) {
-        QFile mdFile(it.next());
+        const QString mdPath = it.next();
+
+        if (cache) {
+            const QFileInfo info(mdPath);
+            const qint64 mtimeMs = info.lastModified().toMSecsSinceEpoch();
+            const qint64 size = info.size();
+            const auto cached = cache->constFind(mdPath);
+            if (cached != cache->constEnd() && cached->mtimeMs == mtimeMs && cached->size == size) {
+                for (const QString &tag : cached->tags)
+                    tags.insert(tag);
+                continue;
+            }
+        }
+
+        QFile mdFile(mdPath);
         if (!mdFile.open(QIODevice::ReadOnly | QIODevice::Text))
             continue;
         QTextStream in(&mdFile);
         if (in.readLine() != QStringLiteral("---"))
             continue;
+        // This file's own tags, collected separately from the vault-wide set
+        // so they can be cached per file.
+        QStringList fileTags;
         QString line;
         while (!(line = in.readLine()).isNull() && line != QStringLiteral("---")) {
             const int colon = line.indexOf(':');
@@ -698,8 +726,19 @@ QStringList collectVaultTags(const QString &vaultLocalPath)
             for (const QString &tag : value.split(QLatin1Char(','), Qt::SkipEmptyParts)) {
                 const QString trimmed = tag.trimmed();
                 if (!trimmed.isEmpty())
-                    tags.insert(trimmed);
+                    fileTags.append(trimmed);
             }
+        }
+        for (const QString &tag : fileTags)
+            tags.insert(tag);
+        if (cache) {
+            // Re-stat rather than reuse the values read above: the file could
+            // have been rewritten between that stat and the read just done,
+            // which would otherwise cache the OLD mtime against NEW content
+            // and never re-read it.
+            const QFileInfo info(mdPath);
+            cache->insert(mdPath, TranscriptionController::CachedFileTags{
+                                      info.lastModified().toMSecsSinceEpoch(), info.size(), fileTags});
         }
     }
     QStringList sorted = tags.values();
@@ -2570,7 +2609,9 @@ private:
         // tagReuseBias needs a vocabulary to bias toward even in
         // unrestricted mode, whereas before this scan only ran for the hard-
         // restrict case.
-        const QStringList existingTags = collectVaultTags(vaultPath);
+        // nullptr = no cache: this runs on the worker thread (must not touch
+        // existingVaultTags()' GUI-thread cache) and only once per job.
+        const QStringList existingTags = collectVaultTags(vaultPath, nullptr);
         // Item P29 / item 58: the prelude's length should scale WITH the
         // transcript — capped DOWN for a short one (no "3-sentence transcript,
         // 5-paragraph prelude") and scaled UP for a very long one (a 2-3 hour
@@ -5129,7 +5170,9 @@ int TranscriptionController::activeSentenceIndex(const QVariantList &sentences, 
 
 QStringList TranscriptionController::existingVaultTags(const QUrl &vaultUrl) const
 {
-    return collectVaultTags(vaultUrl.toLocalFile());
+    // See the header doc comment: GUI thread only, cached per file because
+    // QML calls this from a binding on every keystroke.
+    return collectVaultTags(vaultUrl.toLocalFile(), &m_vaultTagFileCache);
 }
 
 int TranscriptionController::tasksTotal() const

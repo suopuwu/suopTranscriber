@@ -863,7 +863,27 @@ Rectangle {
         }
         function onJobStatusesChanged() {
             sidebar.jobStatusRevision += 1
-            sidebar.refreshTreeOrdering()
+            // Deliberately does NOT call refreshTreeOrdering() (it used to).
+            // Job status is queue state (queued/active/paused/...); tree
+            // ORDER is a pure function of the filesystem + settings —
+            // allAudioPaths(), detectCombineGroups() (whose g.status is a
+            // combine-group status read off disk, NOT a queue status),
+            // audioLastModified() and AppSettings.sortMode. No queue
+            // transition can change any of those, so the call could only ever
+            // recompute an identical answer.
+            //
+            // It was not cheap: a full vault walk + a QFileInfo stat per rule
+            // per audio file inside findCombineGroups(), + audioLastModified()
+            // re-statting every file, + a JS sort, and then fileSortKeys =
+            // ... invalidates the proxy, re-running its whole O(n log n) sort.
+            // All of that fired on EVERY status tick, i.e. repeatedly
+            // throughout any transcription queue run — the one time the app is
+            // already busy.
+            //
+            // The genuine triggers remain: onFinished above (a job's write
+            // really can change ordering — e.g. a group becoming
+            // alreadyTranscribed) and onModelReset (the watcher saw the
+            // directory change).
         }
     }
 
@@ -3312,6 +3332,17 @@ Rectangle {
             // #aaaaaa at ~20% alpha).
             readonly property color guideColor: "#33aaaaaa"
 
+            // True while THIS row is the one being renamed inline — see
+            // sidebar.renamingPath for why the gate is that explicit property
+            // and never the editor's activeFocus. Every hover-revealed overlay
+            // on the row keys off this to stay hidden for the duration of the
+            // edit (see rowActionsRevealed below, groupMergeButton,
+            // combineOrderBadge), since they all paint ON TOP of the row's
+            // content rather than reserving layout space: a rename is the one
+            // time the row's full width is the user's to read and type in, and
+            // the icons were covering the tail of a long name (user report).
+            readonly property bool renamingThisRow: sidebar.renamingPath === treeDelegate.path
+
             // Item 41: the per-row action cluster is hover-only, EXCEPT while
             // the keyboard is actually inside this row's cluster (currentPath
             // + a focused button, which only Left/Right can establish) — then
@@ -3321,12 +3352,17 @@ Rectangle {
             // (user report), so entering the cluster is an explicit Right
             // press. tree.activeFocus mirrors the nav Shortcuts' own gating,
             // so focus leaving the tree re-hides them rather than stranding
-            // the icons on a row the arrows no longer drive.
+            // the icons on a row the arrows no longer drive. An open rename on
+            // this row suppresses the whole cluster regardless — the mouse
+            // necessarily sits on the row it just clicked to start the edit, so
+            // without this the icons are always up for exactly the gesture that
+            // needs the width most.
             // (rowHover is declared further down the delegate; QML resolves id
             // references regardless of textual order.)
-            readonly property bool rowActionsRevealed: rowHover.hovered
-                    || (tree.activeFocus && treeDelegate.path === sidebar.currentPath
-                        && sidebar.actionButtonFocus !== "")
+            readonly property bool rowActionsRevealed: !treeDelegate.renamingThisRow
+                    && (rowHover.hovered
+                        || (tree.activeFocus && treeDelegate.path === sidebar.currentPath
+                            && sidebar.actionButtonFocus !== ""))
 
             // Item 51: true iff this row is a member of a "ready" (would-
             // combine-if-run) split-recording group per
@@ -3533,9 +3569,18 @@ Rectangle {
                 }
             }
 
-            // A plain click on the NAME of an already-solely-selected note
-            // starts an inline rename (file-manager convention) — the second
-            // way in, alongside the context menu's "Rename".
+            // A plain click on the NAME starts an inline rename — on a note
+            // that's already the sole selection (file-manager convention), or
+            // on a FOLDER outright. Second way in, alongside the context menu's
+            // "Rename".
+            //
+            // A folder needs no already-selected first click because it has no
+            // selected state to reach: directories never enter
+            // sidebar.selectedPaths (they aren't openable files), so the
+            // note gesture's "click once to select, again to rename" has no
+            // first click to offer. Its name-click is unambiguous instead —
+            // expand/collapse moved off the row and onto the glyph alone (see
+            // tapIsOnExpandGlyph), so a folder's name has no competing job.
             //
             // Decided inside treeRowTap rather than by a TapHandler of its own
             // on rowNameText: overlapping TapHandlers aren't mutually exclusive
@@ -3554,6 +3599,40 @@ Rectangle {
                 const textWidth = Math.min(rowNameText.width, rowNameText.implicitWidth)
                 return local.x >= 0 && local.x <= textWidth
                         && local.y >= 0 && local.y <= rowNameText.height
+            }
+
+            // Expand/collapse is the GLYPH's gesture, not the row's — that's
+            // what frees the folder's name to mean "rename" instead (see
+            // tapIsOnRowName). The rest of a folder row is deliberately inert:
+            // its empty right-hand space toggling the folder is what made the
+            // name unclickable in the first place.
+            //
+            // The painted glyph is only 10x11px — too small to ask a real
+            // cursor to land inside. So the hit box isn't the glyph's bounds:
+            // horizontally it's padded by 4px (which stops exactly at the
+            // name's left edge, the RowLayout's own spacing, so the two regions
+            // still can't overlap), and vertically it's the WHOLE row. Hence
+            // the two coordinate spaces below — x is tested against the glyph,
+            // y against the row.
+            function tapIsOnExpandGlyph(pos) {
+                if (!treeDelegate.isDir)
+                    return false
+                const pad = 4
+                const localX = expandGlyph.mapFromItem(treeDelegate, pos.x, pos.y).x
+                return localX >= -pad && localX <= expandGlyph.width + pad
+                        && pos.y >= 0 && pos.y <= treeDelegate.height
+            }
+
+            // Toggles this dir row, via whichever of the two expanded-states is
+            // actually authoritative for it. An empty folder must NOT go
+            // through toggleExpanded(): TreeView won't expand a childless node,
+            // but the attempt still latches treeDelegate.expanded to true
+            // permanently. See sidebar.collapsedEmptyDirs.
+            function toggleThisDir() {
+                if (treeDelegate.hasChildren)
+                    treeDelegate.treeView.toggleExpanded(treeDelegate.row)
+                else
+                    sidebar.toggleEmptyDirCollapsed(treeDelegate.path)
             }
 
             TapHandler {
@@ -3577,15 +3656,16 @@ Rectangle {
                     // unaffected; clicking into MainPanel afterward moves
                     // activeFocus away exactly as it always has.
                     treeDelegate.treeView.forceActiveFocus()
+                    const plainTap = (treeRowTap.point.modifiers
+                                      & (Qt.ShiftModifier | Qt.ControlModifier)) === 0
                     if (treeDelegate.isDir) {
-                        // An empty folder must NOT go through toggleExpanded():
-                        // TreeView won't expand a childless node, but the
-                        // attempt still latches treeDelegate.expanded to true
-                        // permanently. See sidebar.collapsedEmptyDirs.
-                        if (treeDelegate.hasChildren)
-                            treeDelegate.treeView.toggleExpanded(treeDelegate.row)
-                        else
-                            sidebar.toggleEmptyDirCollapsed(treeDelegate.path)
+                        // Glyph expands, name renames, everything else on the
+                        // row does nothing — see tapIsOnExpandGlyph.
+                        if (treeDelegate.tapIsOnExpandGlyph(treeRowTap.point.position))
+                            treeDelegate.toggleThisDir()
+                        else if (plainTap
+                                 && treeDelegate.tapIsOnRowName(treeRowTap.point.position))
+                            sidebar.beginRename(treeDelegate.path, true, "")
                     } else if (treeDelegate.isAudio || treeDelegate.isOrphanedMd) {
                         // Click the name of a row that's ALREADY the sole
                         // selection -> rename it, rather than re-opening the
@@ -3593,11 +3673,9 @@ Rectangle {
                         // no modifiers and a selection of exactly this row, so
                         // it can never fire while a Shift/Ctrl multi-selection
                         // is being built.
-                        const plain = (treeRowTap.point.modifiers
-                                       & (Qt.ShiftModifier | Qt.ControlModifier)) === 0
                         const soleSelection = sidebar.selectedPaths.length === 1
                                 && sidebar.selectedPaths[0] === treeDelegate.path
-                        if (plain && soleSelection
+                        if (plainTap && soleSelection
                                 && treeDelegate.tapIsOnRowName(treeRowTap.point.position)) {
                             sidebar.beginRename(treeDelegate.path, false,
                                                 treeDelegate.metadata ? treeDelegate.metadata.label : "")
@@ -3989,6 +4067,7 @@ Rectangle {
                         // An empty folder's state comes from the sidebar, NOT
                         // from treeDelegate.expanded, which is a one-way latch
                         // for childless nodes — see sidebar.collapsedEmptyDirs.
+                        id: expandGlyph
                         objectName: "expandGlyph"
                         Layout.alignment: Qt.AlignVCenter
                         Layout.preferredWidth: treeDelegate.isDir ? 10 : 0
@@ -4040,11 +4119,12 @@ Rectangle {
                         id: rowNameText
                         objectName: "rowNameText"
                         Layout.alignment: Qt.AlignVCenter
-                        // Hidden only while THIS row is being renamed inline —
+                        // Hidden only while THIS row is being renamed inline (see
+                        // treeDelegate.renamingThisRow) —
                         // rowRenameField below takes its place in the layout.
                         // Gated on sidebar.renamingPath, never on the field's
                         // activeFocus (see sidebar.renamingPath's doc comment).
-                        visible: sidebar.renamingPath !== treeDelegate.path
+                        visible: !treeDelegate.renamingThisRow
                         // Item 1 (Wave D): sidebar previously always showed the
                         // raw filename — AppSettings.useLabelsSidebar lets it
                         // show the stored label instead, when one exists. That
@@ -4112,7 +4192,7 @@ Rectangle {
                         objectName: "rowRenameField"
                         Layout.alignment: Qt.AlignVCenter
                         Layout.fillWidth: true
-                        visible: sidebar.renamingPath === treeDelegate.path
+                        visible: treeDelegate.renamingThisRow
                         color: "white"
                         font.pixelSize: rowNameText.font.pixelSize
                         padding: 0
@@ -4548,7 +4628,8 @@ Rectangle {
                 width: 20
                 height: 20
                 visible: treeDelegate.combineEligible && !treeDelegate.combineTopMerged
-                opacity: sidebar.hoveredCombineGroup === treeDelegate.combineOutputPath ? 1 : 0
+                opacity: (!treeDelegate.renamingThisRow
+                          && sidebar.hoveredCombineGroup === treeDelegate.combineOutputPath) ? 1 : 0
                 enabled: opacity > 0
 
                 Behavior on opacity {
@@ -4617,7 +4698,8 @@ Rectangle {
                 width: 20
                 height: 20
                 visible: treeDelegate.combineEligible
-                opacity: sidebar.hoveredCombineGroup === treeDelegate.combineOutputPath ? 1 : 0
+                opacity: (!treeDelegate.renamingThisRow
+                          && sidebar.hoveredCombineGroup === treeDelegate.combineOutputPath) ? 1 : 0
 
                 Behavior on opacity {
                     NumberAnimation { duration: AppSettings.animationsEnabled ? 120 : 0 }

@@ -350,13 +350,32 @@ private:
     void collectSearchResults(const Node *node, const QString &queryLower, bool includeTranscriptions,
                                QVariantList &out) const;
 
-    // Backing for LabelRole/TagsRole/TranscriptBodyRole: read fresh from the
-    // sidecar .md on every call rather than cached on Node/at rebuild() time,
-    // since these are only needed on-demand (search sort/highlight, Item 9)
-    // and staying lazy avoids re-parsing every .md file on every directory
-    // change the QFileSystemWatcher reports.
+    // Backing for LabelRole/TagsRole/TranscriptBodyRole: read lazily from the
+    // sidecar .md rather than cached on Node/at rebuild() time, since these
+    // are only needed on-demand (search sort/highlight, Item 9) and staying
+    // lazy avoids re-parsing every .md file on every directory change the
+    // QFileSystemWatcher reports.
     static QString sidecarMdPath(const Node *node);
-    static QString frontmatterField(const QString &mdPath, const QString &key);
+    // Cached per mdPath by mtime+size, exactly like transcriptBody() below —
+    // this read is on far hotter paths than the body one and was the last
+    // uncached file open left in data().
+    //
+    // It used to re-open + re-scan the sidecar on EVERY call, and data()
+    // calls it once each for LabelRole/TagsRole/SpeakersRole — three separate
+    // opens per row. VaultSearchProxyModel::matchesDirect() reads two of
+    // those roles per row, inside lessThan()/filterAcceptsRow(), i.e. inside
+    // an O(n log n) sort that setSearchQuery()/setTagFilter()/
+    // setFileSortKeys() invalidate on every search keystroke — and
+    // matchesSearch() recurses over a directory's whole subtree, re-opening
+    // files at every level. So one keystroke was O(vault files x log n x 3)
+    // synchronous file opens on the GUI thread.
+    //
+    // The cache holds the WHOLE parsed frontmatter map, not one key, so the
+    // three roles now share a single parse instead of forcing three. Same
+    // mtime+size correctness argument as transcriptBody(): an in-place
+    // relabel/retag rewrite fires no watcher signal, but does change
+    // mtime/size, which is checked on every call regardless of trigger.
+    QString frontmatterField(const QString &mdPath, const QString &key) const;
     // Item P12: transcriptBody() backs search's transcript-content matching
     // (VaultSearchProxyModel::matchesDirect) — before this cache, every
     // keystroke re-opened and re-read every transcribed file's ENTIRE body
@@ -376,6 +395,14 @@ private:
         QString body;
     };
 
+    // All of a sidecar's frontmatter keys, parsed in one pass — see
+    // frontmatterField()'s doc comment.
+    struct CachedFrontmatter {
+        qint64 mtimeMs = 0;
+        qint64 size = -1;
+        QHash<QString, QString> fields;
+    };
+
     QUrl m_vaultPath;
     std::unique_ptr<Node> m_root;
     QFileSystemWatcher m_watcher;
@@ -383,4 +410,7 @@ private:
     // comment. mutable so transcriptBody() can stay callable from data()
     // const.
     mutable QHash<QString, CachedBody> m_transcriptBodyCache;
+    // Keyed by sidecar .md path — see frontmatterField()'s doc comment.
+    // mutable for the same reason as m_transcriptBodyCache.
+    mutable QHash<QString, CachedFrontmatter> m_frontmatterCache;
 };

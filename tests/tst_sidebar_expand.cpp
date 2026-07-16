@@ -142,6 +142,19 @@ private:
         return row->mapToScene(QPointF(row->width() / 2, row->height() / 2)).toPoint();
     }
 
+    // A point on the row's expand glyph — the only part of a dir row that
+    // toggles it. The row at large deliberately does not: its name starts an
+    // inline rename instead, and the space past the name is inert (see
+    // Sidebar.qml's tapIsOnExpandGlyph, and tst_sidebar_rename's
+    // clickFolderName_/clickFolderPastName_ tests).
+    static QPoint glyphCenter(QQuickItem *treeItem, int row)
+    {
+        QQuickItem *glyph = glyphOfRow(treeItem, row);
+        if (!glyph)
+            return {};
+        return glyph->mapToScene(QPointF(glyph->width() / 2, glyph->height() / 2)).toPoint();
+    }
+
     // Builds the view + returns the located TreeView, or fails the test.
     QQuickItem *openVault(QQuickView *view, const QString &vaultPath,
                           QQuickItem **sidebarOut = nullptr, QObject **modelOut = nullptr)
@@ -268,11 +281,11 @@ private slots:
         QVERIFY2(glyph->width() > 0, "glyph column collapsed to 0 width on an empty folder");
     }
 
-    // The behavior the glyph exists for: clicking an empty folder toggles it
-    // BOTH WAYS, repeatedly. Round-tripping twice is the whole point — the
-    // naive implementation (reading treeDelegate.expanded) passes a single
-    // flip and then sticks forever, because TreeView latches `expanded` true on
-    // a childless node and never clears it.
+    // The behavior the glyph exists for: clicking an empty folder's glyph
+    // toggles it BOTH WAYS, repeatedly. Round-tripping twice is the whole point
+    // — the naive implementation (reading treeDelegate.expanded) passes a
+    // single flip and then sticks forever, because TreeView latches `expanded`
+    // true on a childless node and never clears it.
     void emptyFolder_clickTogglesGlyphBothWays()
     {
         QTemporaryDir vault;
@@ -292,7 +305,7 @@ private slots:
         // the sidebar's API directly — the click path is what users have.
         for (int i = 0; i < 2; ++i) {
             QTest::mouseClick(&view, Qt::LeftButton, Qt::NoModifier,
-                              rowCenter(rowItem(treeItem, row)));
+                              glyphCenter(treeItem, row));
             QTest::qWait(50);
             QCOMPARE(glyphName(treeItem, row), QStringLiteral("expand"));
             // Collapsing/expanding an empty folder reveals nothing either way —
@@ -301,7 +314,7 @@ private slots:
             QCOMPARE(treeItem->property("rows").toInt(), 1);
 
             QTest::mouseClick(&view, Qt::LeftButton, Qt::NoModifier,
-                              rowCenter(rowItem(treeItem, row)));
+                              glyphCenter(treeItem, row));
             QTest::qWait(50);
             QCOMPARE(glyphName(treeItem, row), QStringLiteral("collapse"));
             QCOMPARE(treeItem->property("rows").toInt(), 1);
@@ -336,7 +349,7 @@ private slots:
         int row = rowForPath(treeItem, vault.filePath(QStringLiteral("Empty")));
         QVERIFY(row >= 0);
         QTest::mouseClick(&view, Qt::LeftButton, Qt::NoModifier,
-                          rowCenter(rowItem(treeItem, row)));
+                          glyphCenter(treeItem, row));
         QTest::qWait(50);
         QCOMPARE(glyphName(treeItem, row), QStringLiteral("expand"));
 
@@ -351,9 +364,9 @@ private slots:
         QTRY_COMPARE(glyphName(treeItem, row), QStringLiteral("collapse"));
     }
 
-    // Clicking an empty folder must stay a pure expand/collapse gesture: it is
-    // NOT a note, so it must never enter the selection (Sidebar's contract:
-    // "directories are never selectable").
+    // Clicking an empty folder's glyph must stay a pure expand/collapse
+    // gesture: it is NOT a note, so it must never enter the selection
+    // (Sidebar's contract: "directories are never selectable").
     void emptyFolder_clickDoesNotSelect()
     {
         QTemporaryDir vault;
@@ -369,11 +382,40 @@ private slots:
         const int row = rowForPath(treeItem, vault.filePath(QStringLiteral("Empty")));
         QVERIFY(row >= 0);
         QTest::mouseClick(&view, Qt::LeftButton, Qt::NoModifier,
-                          rowCenter(rowItem(treeItem, row)));
+                          glyphCenter(treeItem, row));
         QTest::qWait(50);
 
         QVERIFY(sidebarItem);
         QCOMPARE(sidebarItem->property("selectedPaths").toStringList().size(), 0);
+    }
+
+    // The row at large is NOT a toggle — only the glyph is, which is what frees
+    // a folder's name to start a rename instead. Worth asserting separately
+    // from the populated-folder case (tst_sidebar_rename's
+    // clickFolderPastName_doesNothing): an empty folder toggles through an
+    // entirely different path (sidebar.collapsedEmptyDirs, not TreeView's own
+    // expanded state), so it can regress on its own.
+    void emptyFolder_clickPastGlyph_doesNotToggle()
+    {
+        QTemporaryDir vault;
+        QVERIFY(vault.isValid());
+        QVERIFY(QDir().mkpath(vault.filePath(QStringLiteral("Empty"))));
+
+        QQuickView view;
+        QQuickItem *treeItem = openVault(&view, vault.path());
+        QVERIFY2(treeItem, "could not load Sidebar.qml / locate its TreeView");
+        QTRY_VERIFY(treeItem->property("rows").toInt() > 0);
+
+        const int row = rowForPath(treeItem, vault.filePath(QStringLiteral("Empty")));
+        QVERIFY(row >= 0);
+        QCOMPARE(glyphName(treeItem, row), QStringLiteral("collapse"));
+
+        // The row's centre is well past the painted name ("Empty" in a 320px
+        // sidebar), i.e. the row's dead space.
+        QTest::mouseClick(&view, Qt::LeftButton, Qt::NoModifier,
+                          rowCenter(rowItem(treeItem, row)));
+        QTest::qWait(50);
+        QCOMPARE(glyphName(treeItem, row), QStringLiteral("collapse"));
     }
 
     // The glyph is a FOLDER affordance, not a "has stuff in it" hint: a

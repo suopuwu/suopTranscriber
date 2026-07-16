@@ -360,6 +360,92 @@ private slots:
                                   int(VaultTreeModel::TranscribedStatus), 10000);
     }
 
+    // --- frontmatterField() caching (perf fix: UI lag) -------------------------
+
+    // frontmatterField() backs LabelRole/TagsRole/SpeakersRole and used to
+    // re-open + re-scan the sidecar .md on EVERY data() call — three separate
+    // file opens per row, inside VaultSearchProxyModel's O(n log n) sort,
+    // which is invalidated on every search keystroke. It is now cached per
+    // path, invalidated by mtime+size (same scheme as transcriptBody()).
+    //
+    // The cache must be completely invisible from the outside: this pins the
+    // three roles' values across repeated reads (a stale cache would show up
+    // as a wrong value on the SECOND read) and across an in-place edit of each
+    // field. Reading all three roles also covers the one-parse-serves-every-key
+    // change — they share a single cache entry now, so a bug where one key's
+    // value leaked into another's lookup would surface here.
+    void frontmatterRoles_areCached_butNeverReturnStaleValues()
+    {
+        QTemporaryDir vault;
+        QVERIFY(vault.isValid());
+        QVERIFY(touch(vault.filePath("talk.wav")));
+        QVERIFY(touch(vault.filePath("talk.wav.md"),
+                      "---\nmodel: base\nlabel: First Title\ntags: alpha, beta\n"
+                      "speakers: Ann, Bob\n---\n\n[0] hi\n"));
+
+        VaultTreeModel model;
+        model.setVaultPath(QUrl::fromLocalFile(vault.path()));
+
+        const int labelRole = roleByName(model, "label");
+        const int tagsRole = roleByName(model, "tags");
+        const int speakersRole = roleByName(model, "speakers");
+        QVERIFY(labelRole >= 0 && tagsRole >= 0 && speakersRole >= 0);
+
+        const QModelIndex idx = findByName(model, "talk.wav");
+        QVERIFY(idx.isValid());
+
+        // Read every role twice — the second read is served from the cache and
+        // must agree with the first.
+        for (int pass = 0; pass < 2; ++pass) {
+            QCOMPARE(model.data(idx, labelRole).toString(), QStringLiteral("First Title"));
+            QCOMPARE(model.data(idx, tagsRole).toString(), QStringLiteral("alpha, beta"));
+            QCOMPARE(model.data(idx, speakersRole).toString(), QStringLiteral("Ann, Bob"));
+        }
+
+        // In-place rewrite changing ALL THREE fields at once — the next read
+        // must see every one of them, not the cached entry.
+        QVERIFY(touch(vault.filePath("talk.wav.md"),
+                      "---\nmodel: base\nlabel: Second Title Entirely\ntags: gamma\n"
+                      "speakers: Cleo, Dan, Eve\n---\n\n[0] hi\n"));
+
+        const QModelIndex after = findByName(model, "talk.wav");
+        QVERIFY(after.isValid());
+        QCOMPARE(model.data(after, labelRole).toString(), QStringLiteral("Second Title Entirely"));
+        QCOMPARE(model.data(after, tagsRole).toString(), QStringLiteral("gamma"));
+        QCOMPARE(model.data(after, speakersRole).toString(), QStringLiteral("Cleo, Dan, Eve"));
+    }
+
+    // A key absent from the frontmatter reads as empty, and stays empty on the
+    // cached second read — the cache stores the whole parsed map, so a missing
+    // key must resolve to "not present", never to some other key's value or to
+    // a re-parse attempt that finds nothing and mistakenly caches nothing.
+    void frontmatterField_missingKey_isEmptyOnEveryRead()
+    {
+        QTemporaryDir vault;
+        QVERIFY(vault.isValid());
+        QVERIFY(touch(vault.filePath("bare.wav")));
+        // Has model:, but no label:/tags:/speakers: at all.
+        QVERIFY(touch(vault.filePath("bare.wav.md"), "---\nmodel: base\n---\n\n[0] hi\n"));
+
+        VaultTreeModel model;
+        model.setVaultPath(QUrl::fromLocalFile(vault.path()));
+        const QModelIndex idx = findByName(model, "bare.wav");
+        QVERIFY(idx.isValid());
+
+        for (int pass = 0; pass < 2; ++pass) {
+            QVERIFY(model.data(idx, roleByName(model, "label")).toString().isEmpty());
+            QVERIFY(model.data(idx, roleByName(model, "tags")).toString().isEmpty());
+            QVERIFY(model.data(idx, roleByName(model, "speakers")).toString().isEmpty());
+        }
+
+        // Adding the field later must still be picked up (the empty reads above
+        // cached an entry for this file).
+        QVERIFY(touch(vault.filePath("bare.wav.md"),
+                      "---\nmodel: base\nlabel: Now I Have One\n---\n\n[0] hi\n"));
+        QCOMPARE(model.data(findByName(model, "bare.wav"), roleByName(model, "label")).toString(),
+                 QStringLiteral("Now I Have One"));
+    }
+
     // --- refreshFile() (bug fix: label always delayed by one file) -------------
 
     // Bug report: an in-place rewrite of an ALREADY-EXISTING sidecar .md
@@ -367,9 +453,11 @@ private slots:
     // QFileSystemWatcher::directoryChanged — that only fires on a
     // directory's file add/remove/rename, not on an existing file's content
     // changing — so nothing tells the tree view to re-query this row's
-    // LabelRole. The value itself is never stale (frontmatterField() reads
-    // fresh off disk on every data() call, no caching), but without an
-    // explicit notification the view has no reason to call data() again, so
+    // LabelRole. The value itself is never stale (frontmatterField()'s cache
+    // is invalidated by the file's own mtime+size, which an in-place rewrite
+    // changes, so a re-query always sees the new value regardless of what
+    // triggered it), but without an explicit notification the view has no
+    // reason to call data() again, so
     // the new label sits correctly on disk yet stays invisible until some
     // LATER, unrelated directory event (typically the next file's .md being
     // created) forces a full rebuild(). This reproduces exactly that gap:
@@ -405,8 +493,10 @@ private slots:
         QCOMPARE(dataChangedSpy.count(), 0);
         QCOMPARE(resetSpy.count(), 0);
 
-        // The label IS already correct if read directly (no caching on
-        // LabelRole) — the row just was never told to re-query it.
+        // The label IS already correct if read directly — the row just was
+        // never told to re-query it. (This read also covers frontmatterField()'s
+        // cache invalidating correctly: the empty-label read at the top of this
+        // test populated the cache entry, and this one must NOT return it.)
         const QModelIndex stillTheSameIndex = findByName(model, "session.wav");
         QCOMPARE(model.data(stillTheSameIndex, roleByName(model, "label")).toString(),
                  QStringLiteral("My Auto Title"));

@@ -50,11 +50,56 @@ bool touch(const QString &path, const QByteArray &content = "x")
     return true;
 }
 
-// See tst_sidebar_dragmove.cpp's identical stub: Sidebar.qml guards every
-// transcriptionController use site on it being non-null, and this harness never
-// assigns one — the property only needs its TYPE to resolve.
+// Sidebar.qml guards every transcriptionController use site on it being
+// non-null, so most tests here assign none and this only needs its TYPE to
+// resolve (see tst_sidebar_dragmove.cpp's identical stub).
+//
+// The label-rename test is the exception: a row shows — and therefore renames —
+// its stored LABEL only when the controller hands one over, so that test needs
+// a controller that actually answers. Hence the real implementations below.
+// They're minimal by design: readMetadata()/setLabel() are the two the gesture
+// runs through, and the rest exist only because Sidebar.qml's load-time
+// bindings call them the moment this stops being null (bulkEligible ->
+// matchesExistingTranscription, refreshJobStatus -> jobStatusForPath,
+// refreshTreeOrdering -> detectCombineGroups) and an unresolved call would
+// break those bindings rather than fail visibly. The two signals are here for
+// the same reason: Sidebar's Connections block declares handlers for them, and
+// Qt errors on a handler with no matching signal.
 class TranscriptionControllerStub : public QObject {
     Q_OBJECT
+public:
+    // What readMetadata() reports as this vault's label, for every path.
+    QString label;
+    // What setLabel() was last asked to write — the assertion target.
+    QUrl setLabelUrl;
+    QString setLabelValue;
+    int setLabelCalls = 0;
+
+    Q_INVOKABLE QVariantMap readMetadata(const QUrl &) const
+    {
+        return QVariantMap{{QStringLiteral("label"), label}};
+    }
+    Q_INVOKABLE bool setLabel(const QUrl &fileUrl, const QString &newLabel)
+    {
+        setLabelUrl = fileUrl;
+        setLabelValue = newLabel;
+        ++setLabelCalls;
+        return true;
+    }
+    Q_INVOKABLE bool matchesExistingTranscription(const QUrl &, const QString &, bool) const
+    {
+        return false;
+    }
+    Q_INVOKABLE int jobStatusForPath(const QString &) const { return -1; }
+    Q_INVOKABLE QVariantList detectCombineGroups(const QVariantList &, const QStringList &) const
+    {
+        return {};
+    }
+    Q_INVOKABLE QStringList existingVaultTags(const QUrl &) const { return {}; }
+
+signals:
+    void finished(const QUrl &fileUrl, bool ok, const QString &error);
+    void jobStatusesChanged();
 };
 
 } // namespace
@@ -66,6 +111,11 @@ class TstSidebarRename : public QObject
 private:
     QTemporaryDir m_moduleDir;
     QString m_driverQmlPath;
+    // Assigned into the Sidebar by openVault(), and NULL for every test that
+    // doesn't set it — which is the point. Sidebar.qml behaves differently the
+    // moment a controller exists (rows start showing labels), so tests about
+    // the plain filename gesture must keep seeing no controller at all.
+    TranscriptionControllerStub *m_controller = nullptr;
 
     static QQuickItem *findByClassNamePrefix(QQuickItem *root, const QByteArray &prefix)
     {
@@ -139,6 +189,27 @@ private:
         return nameText->mapToScene(QPointF(qMax(qreal(2), w / 2), nameText->height() / 2)).toPoint();
     }
 
+    // A point on the folder row's expand/collapse glyph — the ONLY part of a
+    // dir row that toggles it now that the name means "rename".
+    static QPoint expandGlyphPoint(QQuickItem *row)
+    {
+        QQuickItem *glyph = row->findChild<QQuickItem *>(QStringLiteral("expandGlyph"));
+        if (!glyph)
+            return {};
+        return glyph->mapToScene(QPointF(glyph->width() / 2, glyph->height() / 2)).toPoint();
+    }
+
+    // A point on the row but past the end of its painted name — the row's dead
+    // space, which used to toggle the folder and now must do nothing at all.
+    static QPoint pastNameTextPoint(QQuickItem *row)
+    {
+        QQuickItem *nameText = row->findChild<QQuickItem *>(QStringLiteral("rowNameText"));
+        if (!nameText)
+            return {};
+        const qreal painted = qMin(nameText->width(), nameText->property("implicitWidth").toReal());
+        return nameText->mapToScene(QPointF(painted + 20, nameText->height() / 2)).toPoint();
+    }
+
     static QQuickItem *renameFieldFor(QQuickItem *row)
     {
         return row->findChild<QQuickItem *>(QStringLiteral("rowRenameField"));
@@ -175,6 +246,8 @@ private:
                                           new IconImageProvider);
         view->rootContext()->setContextProperty(QStringLiteral("vaultUrl"),
                                                  QUrl::fromLocalFile(vaultPath));
+        view->rootContext()->setContextProperty(
+            QStringLiteral("controllerStub"), static_cast<QObject *>(m_controller));
         view->setSource(QUrl::fromLocalFile(m_driverQmlPath));
         if (view->status() != QQuickView::Ready) {
             QString msg;
@@ -202,6 +275,10 @@ private:
     }
 
 private slots:
+    // The stub is stack-allocated inside the one test that wants it, so it must
+    // not stay pointed-at once that test's frame is gone.
+    void cleanup() { m_controller = nullptr; }
+
     void initTestCase()
     {
         QVERIFY(m_moduleDir.isValid());
@@ -248,6 +325,7 @@ private slots:
             "        objectName: \"sidebar\"\n"
             "        anchors.fill: parent\n"
             "        model: vaultModel\n"
+            "        transcriptionController: controllerStub\n"
             "        currentPath: root.openPath\n"
             "        onFileActivated: (path) => root.openPath = path\n"
             "        onOrphanedMdActivated: (path) => root.openPath = path\n"
@@ -310,6 +388,68 @@ private slots:
                  "the transcript sidecar must follow the audio's new name");
         QVERIFY(!QFileInfo::exists(vault.filePath(QStringLiteral("talk.mp3"))));
         QVERIFY(!QFileInfo::exists(vault.filePath(QStringLiteral("talk.mp3.md"))));
+    }
+
+    // The per-row hover icons paint ON TOP of the row (they reserve no layout
+    // space — see rowNameText's doc comment), so while the inline editor is
+    // open they cover the tail of a long name being typed. The gesture that
+    // opens the editor is a click on the row, which necessarily leaves the
+    // mouse hovering it, so "hover-only" alone never hides them here (user
+    // report). Drives a REAL hover -> rename -> Escape cycle rather than
+    // poking renamingPath: the whole point is that hover and rename are
+    // simultaneous, which only the real gesture reproduces.
+    void openRename_hidesTheRowsHoverActionIcons()
+    {
+        QTemporaryDir vault;
+        QVERIFY(vault.isValid());
+        QVERIFY(touch(vault.filePath(QStringLiteral("talk.mp3"))));
+
+        QQuickView view;
+        QQuickItem *treeItem = openVault(&view, vault.path());
+        QVERIFY2(treeItem, "could not load Sidebar.qml / locate its TreeView");
+        QTRY_VERIFY(treeItem->property("rows").toInt() > 0);
+        expandEverything(treeItem);
+
+        const int row = rowForPath(treeItem, vault.filePath(QStringLiteral("talk.mp3")));
+        QVERIFY2(row >= 0, "talk.mp3 must be a visible row");
+        QQuickItem *item = rowItem(treeItem, row);
+        QVERIFY(item);
+        QQuickItem *icon = item->findChild<QQuickItem *>(QStringLiteral("rowTranscribeButton"));
+        QVERIFY2(icon, "an audio row must carry the transcribe icon");
+
+        // The hover must be driven by a real mouseMove: QTest::mouseClick
+        // sends only press/release, so clicking a row never activates its
+        // HoverHandler. Prime the pointer off the rows first — see
+        // tst_sidebar_dragmove's identical note: a move to the coordinates the
+        // pointer already occupies (carried over from an earlier test, these
+        // run in one process) delivers no event at all.
+        QTest::mouseMove(&view, QPoint(5, view.height() - 5));
+        QTest::qWait(20);
+
+        // Baseline: hovering the row reveals the icons. Without this the
+        // opacity-0 assert below would also pass if they never showed at all.
+        const QPoint namePoint = nameTextPoint(item);
+        QTest::mouseMove(&view, namePoint);
+        QTRY_VERIFY2(icon->opacity() > 0.99,
+                     "hovering a row must reveal its action icons when no rename is open");
+
+        // First click selects + opens; the pointer never leaves the row, so
+        // the icons stay up. Second click on the name opens the editor — same
+        // unbroken hover, icons must go.
+        clickAt(&view, namePoint);
+        clickAt(&view, namePoint);
+        QTRY_VERIFY(renameFieldVisibleOn(item));
+        QTRY_VERIFY2(icon->opacity() < 0.01,
+                     "the row's hover icons must hide while its inline rename is open");
+        QVERIFY2(!icon->isEnabled(),
+                 "a faded-out icon must not stay clickable over the rename editor");
+
+        // ...and come back once the edit is over: the gate is the rename, not
+        // a one-way teardown of the hover reveal.
+        QTest::keyClick(&view, Qt::Key_Escape);
+        QTRY_VERIFY(!renameFieldVisibleOn(item));
+        QTRY_VERIFY2(icon->opacity() > 0.99,
+                     "closing the editor must restore the icons for the still-hovered row");
     }
 
     // Escape abandons the edit: nothing is written, and the editor closes
@@ -485,10 +625,9 @@ private slots:
     }
 
     // Folder rows rename too (VaultTreeModel::renameFolder), keeping their
-    // contents. Driven through beginRename() — a folder is never part of
-    // selectedPaths, so the click-the-selected-name gesture can't reach it;
-    // the context menu's "Rename" is its only entry point, and that's the
-    // function that entry calls.
+    // contents. Driven here through beginRename() — the function BOTH of a
+    // folder's entry points (the context menu's "Rename", and clicking its
+    // name — see clickFolderName_* below) call.
     void beginRename_onFolder_renamesFolderKeepingContents()
     {
         QTemporaryDir vault;
@@ -524,6 +663,158 @@ private slots:
         QVERIFY2(QFileInfo::exists(vault.filePath(QStringLiteral("Talks/seed.mp3"))),
                  "the folder must be renamed with its contents intact");
         QVERIFY(!QFileInfo::exists(vault.filePath(QStringLiteral("Interviews"))));
+    }
+
+    // You rename what you can SEE. With AppSettings.useLabelsSidebar on (the
+    // default), a transcribed row displays its stored label instead of its
+    // filename — so the gesture must edit that LABEL, writing it back through
+    // the controller and leaving the file on disk alone. Seeding the editor
+    // with the filename here would be the visible bug: the editor would open
+    // showing text the row never displayed.
+    void renameOfLabelledRow_editsLabelNotFilename()
+    {
+        QTemporaryDir vault;
+        QVERIFY(vault.isValid());
+        QVERIFY(touch(vault.filePath(QStringLiteral("talk.mp3"))));
+        QVERIFY(touch(vault.filePath(QStringLiteral("talk.mp3.md")),
+                      "---\nmodel: x\nlabel: Board meeting\n---\n[0] hi\n"));
+
+        TranscriptionControllerStub controller;
+        controller.label = QStringLiteral("Board meeting");
+        m_controller = &controller;
+
+        QQuickView view;
+        QQuickItem *treeItem = openVault(&view, vault.path());
+        QVERIFY2(treeItem, "could not load Sidebar.qml / locate its TreeView");
+        QTRY_VERIFY(treeItem->property("rows").toInt() > 0);
+        expandEverything(treeItem);
+
+        QQuickItem *item = rowItem(treeItem, rowForPath(treeItem, vault.filePath(QStringLiteral("talk.mp3"))));
+        QVERIFY(item);
+        QQuickItem *nameText = item->findChild<QQuickItem *>(QStringLiteral("rowNameText"));
+        QVERIFY(nameText);
+        QTRY_COMPARE_WITH_TIMEOUT(nameText->property("text").toString(),
+                                  QStringLiteral("Board meeting"), 2000);
+
+        clickAt(&view, nameTextPoint(item)); // select
+        clickAt(&view, nameTextPoint(item)); // rename
+        QTRY_VERIFY(renameFieldVisibleOn(item));
+        QQuickItem *field = renameFieldFor(item);
+        QVERIFY(field);
+        QTRY_VERIFY(field->hasActiveFocus());
+        QCOMPARE(field->property("text").toString(), QStringLiteral("Board meeting"));
+
+        typeText(&view, QStringLiteral("Standup"));
+        QTest::keyClick(&view, Qt::Key_Return);
+        QTest::qWait(150);
+
+        QCOMPARE(controller.setLabelCalls, 1);
+        QCOMPARE(controller.setLabelValue, QStringLiteral("Standup"));
+        QCOMPARE(controller.setLabelUrl, QUrl::fromLocalFile(vault.filePath(QStringLiteral("talk.mp3"))));
+        QVERIFY2(QFileInfo::exists(vault.filePath(QStringLiteral("talk.mp3"))),
+                 "editing a displayed label must NOT rename the file on disk");
+        QVERIFY(QFileInfo::exists(vault.filePath(QStringLiteral("talk.mp3.md"))));
+    }
+
+    // Expand/collapse is the GLYPH's gesture. This is the half that pays for
+    // the folder-name rename below: the row used to toggle from anywhere, so
+    // its name could never mean anything else.
+    void clickFolderGlyph_togglesExpanded()
+    {
+        QTemporaryDir vault;
+        QVERIFY(vault.isValid());
+        QVERIFY(touch(vault.filePath(QStringLiteral("Interviews/seed.mp3"))));
+
+        QQuickView view;
+        QQuickItem *treeItem = openVault(&view, vault.path());
+        QVERIFY2(treeItem, "could not load Sidebar.qml / locate its TreeView");
+        QTRY_VERIFY(treeItem->property("rows").toInt() > 0);
+        expandEverything(treeItem);
+
+        const QString folderPath = vault.filePath(QStringLiteral("Interviews"));
+        const QString childPath = vault.filePath(QStringLiteral("Interviews/seed.mp3"));
+        QQuickItem *item = rowItem(treeItem, rowForPath(treeItem, folderPath));
+        QVERIFY(item);
+        // The child's visibility IS the expanded state, read off the model
+        // rather than off the delegate's own `expanded` (a one-way latch for
+        // childless nodes — see Sidebar.qml's collapsedEmptyDirs).
+        QVERIFY2(rowForPath(treeItem, childPath) >= 0, "precondition: the folder starts expanded");
+
+        clickAt(&view, expandGlyphPoint(item));
+        QTRY_VERIFY2(rowForPath(treeItem, childPath) < 0,
+                     "clicking the expand glyph must collapse the folder");
+
+        clickAt(&view, expandGlyphPoint(item));
+        QTRY_VERIFY2(rowForPath(treeItem, childPath) >= 0,
+                     "clicking the expand glyph again must re-expand the folder");
+    }
+
+    // Clicking a folder's NAME renames it — no already-selected first click
+    // needed, because a folder never enters selectedPaths and so has no
+    // selected state to reach. It must NOT also toggle the folder.
+    void clickFolderName_startsRenameAndDoesNotToggleExpanded()
+    {
+        QTemporaryDir vault;
+        QVERIFY(vault.isValid());
+        QVERIFY(touch(vault.filePath(QStringLiteral("Interviews/seed.mp3"))));
+
+        QQuickView view;
+        QQuickItem *treeItem = openVault(&view, vault.path());
+        QVERIFY2(treeItem, "could not load Sidebar.qml / locate its TreeView");
+        QTRY_VERIFY(treeItem->property("rows").toInt() > 0);
+        expandEverything(treeItem);
+
+        const QString folderPath = vault.filePath(QStringLiteral("Interviews"));
+        const QString childPath = vault.filePath(QStringLiteral("Interviews/seed.mp3"));
+        QQuickItem *item = rowItem(treeItem, rowForPath(treeItem, folderPath));
+        QVERIFY(item);
+
+        clickAt(&view, nameTextPoint(item));
+        QTRY_VERIFY2(renameFieldVisibleOn(item),
+                     "clicking a folder's name must open the inline rename editor on the first click");
+        QVERIFY2(rowForPath(treeItem, childPath) >= 0,
+                 "the name-click must not ALSO collapse the folder — the glyph owns that now");
+
+        QQuickItem *field = renameFieldFor(item);
+        QVERIFY(field);
+        QTRY_VERIFY(field->hasActiveFocus());
+        QCOMPARE(field->property("text").toString(), QStringLiteral("Interviews"));
+
+        typeText(&view, QStringLiteral("Talks"));
+        QTest::keyClick(&view, Qt::Key_Return);
+        QTest::qWait(150);
+
+        QVERIFY2(QFileInfo::exists(vault.filePath(QStringLiteral("Talks/seed.mp3"))),
+                 "the folder gesture must rename the folder on disk, contents intact");
+        QVERIFY(!QFileInfo::exists(folderPath));
+    }
+
+    // The rest of a folder row is inert — the empty space right of the name is
+    // where a stray click lands, and it must neither rename nor toggle.
+    void clickFolderPastName_doesNothing()
+    {
+        QTemporaryDir vault;
+        QVERIFY(vault.isValid());
+        QVERIFY(touch(vault.filePath(QStringLiteral("Interviews/seed.mp3"))));
+
+        QQuickView view;
+        QQuickItem *sidebarItem = nullptr;
+        QQuickItem *treeItem = openVault(&view, vault.path(), &sidebarItem);
+        QVERIFY2(treeItem, "could not load Sidebar.qml / locate its TreeView");
+        QTRY_VERIFY(treeItem->property("rows").toInt() > 0);
+        expandEverything(treeItem);
+
+        const QString folderPath = vault.filePath(QStringLiteral("Interviews"));
+        const QString childPath = vault.filePath(QStringLiteral("Interviews/seed.mp3"));
+        QQuickItem *item = rowItem(treeItem, rowForPath(treeItem, folderPath));
+        QVERIFY(item);
+
+        clickAt(&view, pastNameTextPoint(item));
+        QVERIFY2(!renameFieldVisibleOn(item),
+                 "a click past the folder's name must not start a rename");
+        QCOMPARE(sidebarItem->property("renamingPath").toString(), QString());
+        QVERIFY2(rowForPath(treeItem, childPath) >= 0,
+                 "a click past the folder's name must not toggle it — only the glyph does");
     }
 
     // A rename the model refuses (name already taken) must leave the file

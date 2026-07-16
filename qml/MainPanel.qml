@@ -1140,7 +1140,7 @@ Rectangle {
         // collapse all key off the real t0, never the clamped one).
         function pushHeading(chapter, displayT0) {
             const headingStart = text.length
-            list.push({t0: displayT0, chapterT0: chapter.t0, speaker: "", text: "", start: headingStart, length: 0,
+            list.push({idx: list.length, t0: displayT0, chapterT0: chapter.t0, speaker: "", text: "", start: headingStart, length: 0,
                        showGutter: false, isChapterHeading: true, chapterTitle: chapter.title,
                        chapterManual: !!chapter.manual})
             text += "\n"
@@ -1179,7 +1179,7 @@ Rectangle {
             // highlightable/selectable "spoken words" range (same treatment
             // as gutter timestamps/speaker names — decoration, not content).
             const displayText = s.repeatCount > 1 ? s.text + " (" + s.repeatCount + "x)" : s.text
-            list.push({t0: s.t0, speaker: speaker, text: displayText, start: start, length: s.text.length,
+            list.push({idx: list.length, t0: s.t0, speaker: speaker, text: displayText, start: start, length: s.text.length,
                        showGutter: showGutter, isChapterHeading: false, chapterTitle: "",
                        chapterT0: currentChapterT0, chapterManual: false})
             previousSpeaker = speaker
@@ -1198,6 +1198,51 @@ Rectangle {
     }
     readonly property string displayText: mainPanel.displayData.text
     readonly property var displaySentences: mainPanel.displayData.sentences
+
+    // The four overlay Repeaters below (timestamp gutter, speaker gutter,
+    // speaker-dim, chapter headings) used to take displaySentences DIRECTLY
+    // as their model and hide the entries they don't want with `visible:`.
+    // That instantiated 4 delegates per sentence — 16k QQuickItems on a 4k-
+    // sentence transcript — synchronously on the GUI thread the moment a file
+    // opened, and `visible: false` doesn't save any of that: a Repeater builds
+    // every delegate regardless, `visible` only skips the painting.
+    //
+    // Measured (offscreen QQuickView reproduction of this exact structure, 4k
+    // sentences, cold open): 661ms with the raw model vs 130ms with these
+    // filtered ones — ~88% of a large note's open cost was delegate
+    // instantiation, and most of it was for items that could never be seen:
+    //   - speakerDim is gated on gutterSpeakerFilter, which resets to "" on
+    //     every file open (see onSourceChanged/onOrphanedMdPathChanged) — so
+    //     it built N Rectangles that were ALL invisible, every single open.
+    //   - chapterHeading showed only the handful of real chapter markers, but
+    //     built a full RowLayout+AppIcon+TextEdit for every sentence.
+    //   - speakerGutter needs speaker !== "", so on a transcript with no
+    //     speaker detection it built N TextEdits that were all invisible.
+    // Only the timestamp gutter was ever genuinely one-per-sentence.
+    //
+    // NOTE this is emphatically NOT something a worker thread could have
+    // fixed — QQuickItems can only be created on the GUI thread. The file
+    // read + regex parse were already moved off-thread (see item P23 /
+    // loadTranscriptAsync); this was the rest of the cost.
+    //
+    // Each entry carries `idx` (its own index into displaySentences, assigned
+    // in displayData above) so a filtered delegate can still look up
+    // transcriptArea.gutterLineRects[modelData.idx] — the delegate's own
+    // `index` is its position in the FILTERED list and must never be used for
+    // that lookup. Every filter condition below is exactly the `visible:`
+    // expression the corresponding delegate used to carry.
+    readonly property var gutterTimestampModel:
+        mainPanel.displaySentences.filter(s => s.showGutter)
+    readonly property var gutterSpeakerModel:
+        mainPanel.displaySentences.filter(s => s.showGutter && s.speaker !== "")
+    // Recomputes when the user toggles a speaker filter (empty model while no
+    // filter is active, which is the state every file open starts in).
+    readonly property var speakerDimModel:
+        mainPanel.gutterSpeakerFilter === "" ? []
+            : mainPanel.displaySentences.filter(
+                s => !s.isChapterHeading && s.speaker !== mainPanel.gutterSpeakerFilter)
+    readonly property var chapterHeadingModel:
+        mainPanel.displaySentences.filter(s => s.isChapterHeading)
     // transcriptArea is always-editable (see its doc comment) — its
     // `text: mainPanel.displayText` binding is a one-shot, severed the
     // moment the user types (same caveat as titleField/preludeArea above).
@@ -3886,13 +3931,12 @@ Rectangle {
                 // of a defensive guess.
                 Repeater {
                     id: timestampGutterRepeater
-                    model: mainPanel.displaySentences
+                    model: mainPanel.gutterTimestampModel
 
                     Text {
                         required property var modelData
-                        required property int index
-                        visible: modelData.showGutter
-                        readonly property rect lineRect: transcriptArea.gutterLineRects[index] || Qt.rect(0, 0, 0, 0)
+                        readonly property rect lineRect:
+                            transcriptArea.gutterLineRects[modelData.idx] || Qt.rect(0, 0, 0, 0)
                         x: 0
                         y: lineRect.y
                         // Match the corresponding line's own height and
@@ -3932,13 +3976,12 @@ Rectangle {
                 // in practice.
                 Repeater {
                     id: speakerGutterRepeater
-                    model: mainPanel.displaySentences
+                    model: mainPanel.gutterSpeakerModel
 
                     TextEdit {
                         required property var modelData
-                        required property int index
-                        visible: modelData.showGutter && modelData.speaker !== ""
-                        readonly property rect lineRect: transcriptArea.gutterLineRects[index] || Qt.rect(0, 0, 0, 0)
+                        readonly property rect lineRect:
+                            transcriptArea.gutterLineRects[modelData.idx] || Qt.rect(0, 0, 0, 0)
                         x: mainPanel.timestampGutterWidth + mainPanel.gutterSpacing
                         y: lineRect.y
                         height: lineRect.height
@@ -3984,14 +4027,12 @@ Rectangle {
                 // underlying sentence data is unaffected either way).
                 Repeater {
                     id: speakerDimOverlayRepeater
-                    model: mainPanel.displaySentences
+                    model: mainPanel.speakerDimModel
 
                     Rectangle {
                         required property var modelData
-                        required property int index
-                        readonly property rect lineRect: transcriptArea.gutterLineRects[index] || Qt.rect(0, 0, 0, 0)
-                        visible: mainPanel.gutterSpeakerFilter !== "" && !modelData.isChapterHeading
-                                 && modelData.speaker !== mainPanel.gutterSpeakerFilter
+                        readonly property rect lineRect:
+                            transcriptArea.gutterLineRects[modelData.idx] || Qt.rect(0, 0, 0, 0)
                         x: transcriptArea.leftPadding
                         y: lineRect.y
                         width: transcriptArea.width - transcriptArea.leftPadding
@@ -4004,7 +4045,7 @@ Rectangle {
                 // into displaySentences by displayData above (see its own
                 // doc comment) — each heading pseudo-entry reserved a real
                 // blank line in transcriptArea's own text, so
-                // gutterLineRects[index] (same lookup the two gutter
+                // gutterLineRects[modelData.idx] (same lookup the two gutter
                 // Repeaters above use) gives it a genuine row of its own to
                 // render into, rather than overlapping an adjacent
                 // sentence's line. Spans the full transcript width
@@ -4012,16 +4053,15 @@ Rectangle {
                 // applies to the whole turn, not one speaker's column.
                 Repeater {
                     id: chapterHeadingRepeater
-                    model: mainPanel.displaySentences
+                    model: mainPanel.chapterHeadingModel
 
                     RowLayout {
                         id: chapterHeadingRow
                         required property var modelData
-                        required property int index
                         readonly property bool collapsed:
                             !!mainPanel.collapsedChapters[String(chapterHeadingRow.modelData.chapterT0)]
-                        visible: chapterHeadingRow.modelData.isChapterHeading
-                        readonly property rect lineRect: transcriptArea.gutterLineRects[index] || Qt.rect(0, 0, 0, 0)
+                        readonly property rect lineRect:
+                            transcriptArea.gutterLineRects[chapterHeadingRow.modelData.idx] || Qt.rect(0, 0, 0, 0)
                         x: 0
                         y: lineRect.y
                         width: transcriptArea.width

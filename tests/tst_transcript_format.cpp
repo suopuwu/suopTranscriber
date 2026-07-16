@@ -140,6 +140,77 @@ private slots:
         QCOMPARE(meta.value("transcribedAt").toString(), QStringLiteral("2026-07-06T10:12:13"));
     }
 
+    // --- existingVaultTags() + its per-file cache (perf fix: UI lag) ----------
+
+    // Item 17: existingVaultTags() is the vault-wide tag vocabulary behind the
+    // sidebar's tag autocomplete. Sidebar.qml's tagSuggestions() calls it from
+    // a BINDING, so it re-runs on every keystroke in the tag filter — and the
+    // underlying scan (collectVaultTags) walks every .md in the vault. It is
+    // now backed by a per-file mtime+size cache so a keystroke re-parses
+    // nothing that hasn't changed.
+    //
+    // The cache must be externally invisible. This pins the full contract:
+    // de-duplicated across files, sorted case-insensitively, split on commas,
+    // stable across repeated calls (the 2nd is cache-served), and — the part a
+    // cache can actually break — correct after an in-place tags: rewrite, after
+    // a brand-new .md appears, and after one is deleted.
+    void existingVaultTags_dedupesAndSorts_andSurvivesVaultEdits()
+    {
+        QTemporaryDir vault;
+        QVERIFY(vault.isValid());
+        QVERIFY(!writeFixture(vault.path(), "a.wav.md",
+                              QStringLiteral("---\nmodel: base\ntags: zebra, apple\n---\n\n[0] hi\n")).isEmpty());
+        // Overlapping tag ("apple") — must be de-duplicated across files.
+        QVERIFY(!writeFixture(vault.path(), "b.wav.md",
+                              QStringLiteral("---\nmodel: base\ntags: apple, Mango\n---\n\n[0] hi\n")).isEmpty());
+
+        TranscriptionController controller;
+        const QUrl vaultUrl = QUrl::fromLocalFile(vault.path());
+
+        const QStringList expected{QStringLiteral("apple"), QStringLiteral("Mango"), QStringLiteral("zebra")};
+        // Twice: the second call is served from the cache and must agree.
+        QCOMPARE(controller.existingVaultTags(vaultUrl), expected);
+        QCOMPARE(controller.existingVaultTags(vaultUrl), expected);
+
+        // In-place rewrite of an already-scanned file: mtime+size change, so
+        // the cached entry for a.wav.md must be discarded.
+        QVERIFY(!writeFixture(vault.path(), "a.wav.md",
+                              QStringLiteral("---\nmodel: base\ntags: quokka\n---\n\n[0] hi\n")).isEmpty());
+        QCOMPARE(controller.existingVaultTags(vaultUrl),
+                 (QStringList{QStringLiteral("apple"), QStringLiteral("Mango"), QStringLiteral("quokka")}));
+
+        // A brand-new .md has no cache entry at all — the directory walk still
+        // has to find and parse it.
+        QVERIFY(!writeFixture(vault.path(), "c.wav.md",
+                              QStringLiteral("---\nmodel: base\ntags: banana\n---\n\n[0] hi\n")).isEmpty());
+        QCOMPARE(controller.existingVaultTags(vaultUrl),
+                 (QStringList{QStringLiteral("apple"), QStringLiteral("banana"),
+                              QStringLiteral("Mango"), QStringLiteral("quokka")}));
+
+        // A deleted file's tags must vanish — a stale cache entry must never
+        // resurrect a tag for a file that no longer exists (the walk, not the
+        // cache, decides which files count).
+        QVERIFY(QFile::remove(vault.path() + "/b.wav.md"));
+        QCOMPARE(controller.existingVaultTags(vaultUrl),
+                 (QStringList{QStringLiteral("banana"), QStringLiteral("quokka")}));
+    }
+
+    // A vault whose .md files have no tags: at all yields an empty vocabulary
+    // rather than a list of empty strings — and stays empty on the cached
+    // second call.
+    void existingVaultTags_noTagsAnywhere_isEmpty()
+    {
+        QTemporaryDir vault;
+        QVERIFY(vault.isValid());
+        QVERIFY(!writeFixture(vault.path(), "plain.wav.md",
+                              QStringLiteral("---\nmodel: base\n---\n\n[0] hi\n")).isEmpty());
+
+        TranscriptionController controller;
+        const QUrl vaultUrl = QUrl::fromLocalFile(vault.path());
+        QVERIFY(controller.existingVaultTags(vaultUrl).isEmpty());
+        QVERIFY(controller.existingVaultTags(vaultUrl).isEmpty());
+    }
+
     // Spec (this feature — see WhisperCppEngine::setVadModelPath()/
     // VadChunker.h): writeFrontmatter()'s new `vad`/`vadError` keys round-trip
     // through readMetadata() with the SAME generic key:value parsing every

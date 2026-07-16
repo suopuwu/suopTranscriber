@@ -224,27 +224,42 @@ QString VaultTreeModel::sidecarMdPath(const Node *node)
     return {};
 }
 
-// Mirrors TranscriptionController::readMetadata()'s frontmatter scan, but
-// reads a single key rather than the whole map, since LabelRole/TagsRole
-// only ever need one field each.
-QString VaultTreeModel::frontmatterField(const QString &mdPath, const QString &key)
+// Mirrors TranscriptionController::readMetadata()'s frontmatter scan. Parses
+// every key in one pass and caches the lot per mdPath, invalidated by
+// mtime+size — see this function's doc comment in the header for why the old
+// read-fresh-one-key-per-call version was a hot-path problem.
+QString VaultTreeModel::frontmatterField(const QString &mdPath, const QString &key) const
 {
+    const QFileInfo info(mdPath);
+    const qint64 mtimeMs = info.lastModified().toMSecsSinceEpoch();
+    const qint64 size = info.size();
+
+    const auto cached = m_frontmatterCache.constFind(mdPath);
+    if (cached != m_frontmatterCache.constEnd() && cached->mtimeMs == mtimeMs && cached->size == size)
+        return cached->fields.value(key);
+
     QFile mdFile(mdPath);
     if (!mdFile.open(QIODevice::ReadOnly | QIODevice::Text))
-        return {};
+        return {}; // deliberately not cached — same as transcriptBody()
 
     QTextStream in(&mdFile);
     if (in.readLine() != QStringLiteral("---"))
         return {};
 
+    QHash<QString, QString> fields;
     QString line;
     while (!(line = in.readLine()).isNull() && line != QStringLiteral("---")) {
         const int colon = line.indexOf(':');
-        if (colon < 0 || line.left(colon).trimmed() != key)
+        if (colon < 0)
             continue;
-        return line.mid(colon + 1).trimmed();
+        const QString name = line.left(colon).trimmed();
+        // First occurrence wins, matching the old early-return-on-first-match
+        // scan (a duplicate key must not shadow the one callers used to get).
+        if (!fields.contains(name))
+            fields.insert(name, line.mid(colon + 1).trimmed());
     }
-    return {};
+    m_frontmatterCache[mdPath] = CachedFrontmatter{mtimeMs, size, fields};
+    return fields.value(key);
 }
 
 // Mirrors TranscriptionController::readTranscriptBody(). Item P12: cached

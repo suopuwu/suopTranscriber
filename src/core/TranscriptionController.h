@@ -966,7 +966,31 @@ public:
     // LabelingEngine's "restrict to existing tags" mode already uses
     // internally (collectVaultTags, TranscriptionController.cpp); exposed
     // here so QML doesn't need its own duplicate frontmatter-scanning logic.
+    //
+    // GUI THREAD ONLY — it consults m_vaultTagFileCache, which is not
+    // mutex-guarded (unlike the transcript caches). The labeling job's own
+    // call to collectVaultTags() runs on the worker thread and deliberately
+    // passes no cache, so the two never share state.
+    //
+    // Backed by that per-file cache because Sidebar.qml's tagSuggestions()
+    // calls this from a BINDING (the suggestion ListView's `model`), so it
+    // re-runs on every keystroke in the tag filter field — and the underlying
+    // scan opens and frontmatter-parses every .md in the vault. The cache
+    // keeps the directory walk (a stat per file, cheap) but skips the open +
+    // parse for any file whose mtime+size is unchanged, the same correctness
+    // argument VaultTreeModel's two caches use.
     Q_INVOKABLE QStringList existingVaultTags(const QUrl &vaultUrl) const;
+
+    // One .md file's parsed `tags:` values plus the stat they were read at.
+    // Public only so the file-local collectVaultTags() helper can name it;
+    // the cache itself (m_vaultTagFileCache) is private. Per-path, unlike the
+    // three single-slot transcript caches below, since existingVaultTags()
+    // touches every .md in the vault on each call.
+    struct CachedFileTags {
+        qint64 mtimeMs = 0;
+        qint64 size = -1;
+        QStringList tags;
+    };
 
     // Split-recording combine: matches vault audio filenames against
     // user-authored regex rules (AppSettings.combineRules) to find groups of
@@ -1567,4 +1591,9 @@ private:
     // readTranscriptBody()/readMetadata(), which each lock it again on the
     // SAME thread — a plain QMutex would deadlock there.
     mutable QRecursiveMutex m_transcriptCacheMutex;
+
+    // Per-.md-file parsed `tags:` values, keyed by absolute path — backs
+    // existingVaultTags() only; see its doc comment for why it exists and why
+    // it needs no mutex (GUI thread only).
+    mutable QHash<QString, CachedFileTags> m_vaultTagFileCache;
 };

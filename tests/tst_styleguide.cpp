@@ -50,7 +50,111 @@ class TstStyleGuide : public QObject
         return src.mid(open);
     }
 
+    // `src` with its // line comments removed, so a "does the code do X" scan
+    // can't be satisfied (or defeated) by prose merely MENTIONING X.
+    //
+    // This bites both ways and both have happened here: a guard asserting a
+    // call is ABSENT fails the moment someone documents why it's absent (the
+    // comment contains the call text), and a guard asserting a call is PRESENT
+    // passes on a comment alone. Skips '//' inside double-quoted strings so
+    // literals like "file://" survive intact.
+    static QString stripComments(const QString &src)
+    {
+        QString out;
+        out.reserve(src.size());
+        bool inString = false;
+        for (int i = 0; i < src.size(); ++i) {
+            const QChar c = src.at(i);
+            if (inString) {
+                if (c == QLatin1Char('\\') && i + 1 < src.size()) {
+                    out += c;
+                    out += src.at(++i); // escaped char, never ends the string
+                    continue;
+                }
+                if (c == QLatin1Char('"'))
+                    inString = false;
+                out += c;
+                continue;
+            }
+            if (c == QLatin1Char('"')) {
+                inString = true;
+                out += c;
+                continue;
+            }
+            if (c == QLatin1Char('/') && i + 1 < src.size() && src.at(i + 1) == QLatin1Char('/')) {
+                while (i < src.size() && src.at(i) != QLatin1Char('\n'))
+                    ++i;
+                if (i < src.size())
+                    out += QLatin1Char('\n'); // keep line structure intact
+                continue;
+            }
+            out += c;
+        }
+        return out;
+    }
+
+    // The body of the JS function whose declaration is `signature`, brace-
+    // matched FORWARD from the brace that opens it.
+    //
+    // enclosingBlock() above must not be used for this: it scans BACKWARD for
+    // the nearest preceding '{', which for a `function foo() {` anchor is
+    // whatever block came before — for a function that isn't the first in its
+    // parent, that's the PREVIOUS SIBLING function's brace, so it silently
+    // returns the wrong function's body. That's not hypothetical: it made
+    // sidebar_jobStatusTicksDoNotRebuildTreeOrdering() assert against
+    // onFinished()'s body while claiming to test onJobStatusesChanged(), and
+    // it's the same silently-wrong-direction rot enclosingBlock()'s own doc
+    // comment warns about. A function's brace comes AFTER its name, so search
+    // forward. Returns an empty string if `signature` isn't found.
+    static QString functionBody(const QString &src, const QString &signature)
+    {
+        const int anchorIdx = src.indexOf(signature);
+        if (anchorIdx < 0)
+            return QString();
+        const int open = src.indexOf(QLatin1Char('{'), anchorIdx);
+        if (open < 0)
+            return QString();
+        int depth = 0;
+        for (int i = open; i < src.size(); ++i) {
+            if (src.at(i) == QLatin1Char('{')) {
+                ++depth;
+            } else if (src.at(i) == QLatin1Char('}')) {
+                if (--depth == 0)
+                    return src.mid(open, i - open + 1);
+            }
+        }
+        return src.mid(open);
+    }
+
 private slots:
+    // Guards functionBody() itself — it is the thing standing between
+    // "onJobStatusesChanged is clean" and a test that silently asserts against
+    // the wrong function's body. Pins that it returns THIS function's body and
+    // not a neighbour's, using two adjacent Sidebar.qml handlers whose bodies
+    // are known to differ (onFinished calls refreshTreeOrdering(),
+    // onJobStatusesChanged deliberately does not).
+    void functionBodyHelper_selectsTheRightFunction()
+    {
+        // Stripped first, as the real guard does — a stray brace inside a
+        // comment would otherwise throw off the brace matching.
+        const QString src = stripComments(readAll(QStringLiteral(SUOP_QML_DIR "/Sidebar.qml")));
+        QVERIFY2(!src.isEmpty(), "qml/Sidebar.qml must exist");
+
+        const QString second = functionBody(src, QStringLiteral("function onJobStatusesChanged()"));
+        QVERIFY2(!second.isEmpty(), "onJobStatusesChanged must exist");
+        QVERIFY2(second.contains(QStringLiteral("jobStatusRevision")),
+                 "functionBody() must return onJobStatusesChanged's OWN body");
+        QVERIFY2(!second.contains(QStringLiteral("metadataRevision")),
+                 "functionBody() must not bleed into the preceding onFinished's body");
+
+        const QString first = functionBody(src, QStringLiteral("function onFinished(fileUrl, ok, error)"));
+        QVERIFY2(!first.isEmpty(), "onFinished must exist");
+        QVERIFY2(first.contains(QStringLiteral("metadataRevision")),
+                 "functionBody() must return onFinished's own body");
+        QVERIFY2(!first.contains(QStringLiteral("jobStatusRevision")),
+                 "functionBody() must stop at onFinished's close, not run on into its sibling");
+    }
+
     // Regression: Sidebar.qml's treeDelegate (a TreeView row) recycles a
     // fixed pool of delegate Items as rows scroll in/out of view — required
     // properties like path/isAudio get reassigned to the recycled Item for
@@ -266,6 +370,114 @@ private slots:
         const QString transcriptAreaBlock = src.mid(transcriptAreaIdx, 600);
         QVERIFY2(!transcriptAreaBlock.contains(QStringLiteral("readOnly: true")),
                  "transcriptArea must be conditionally editable, not hardcoded readOnly: true");
+    }
+
+    // Perf (UI lag fix): job-status ticks must NOT trigger refreshTreeOrdering().
+    //
+    // Tree ORDER is a pure function of the filesystem + settings
+    // (allAudioPaths / detectCombineGroups / audioLastModified /
+    // AppSettings.sortMode); job status is queue state (queued/active/
+    // paused/...) and cannot change any of them, so the call only ever
+    // recomputed an identical answer. It was expensive — a full vault walk, a
+    // QFileInfo stat per combine-rule per audio file inside
+    // findCombineGroups(), another stat sweep from audioLastModified(), a JS
+    // sort, and then a fileSortKeys assignment that invalidates the proxy's
+    // whole O(n log n) sort — and it fired on every status tick, i.e.
+    // constantly during a transcription queue run, exactly when the app is
+    // already busy.
+    //
+    // The legitimate triggers must stay: onFinished (a job's write really can
+    // change ordering, e.g. a combine group becoming alreadyTranscribed) and
+    // onModelReset (the watcher saw a directory change).
+    void sidebar_jobStatusTicksDoNotRebuildTreeOrdering()
+    {
+        // Comments stripped FIRST: this handler's body deliberately documents
+        // at length why it does NOT call refreshTreeOrdering(), so a raw scan
+        // would find the call text in that very explanation and fail.
+        const QString src = stripComments(readAll(QStringLiteral(SUOP_QML_DIR "/Sidebar.qml")));
+        QVERIFY2(!src.isEmpty(), "qml/Sidebar.qml must exist");
+
+        const QString handler = functionBody(src, QStringLiteral("function onJobStatusesChanged()"));
+        QVERIFY2(!handler.isEmpty(), "Sidebar.qml must have an onJobStatusesChanged handler");
+        QVERIFY2(handler.contains(QStringLiteral("jobStatusRevision += 1")),
+                 "onJobStatusesChanged must still nudge delegates via jobStatusRevision");
+        QVERIFY2(!handler.contains(QStringLiteral("refreshTreeOrdering()")),
+                 "onJobStatusesChanged must NOT call refreshTreeOrdering() — tree order does not "
+                 "depend on queue status, and the call re-walks + re-stats the whole vault and "
+                 "re-runs the proxy's sort on every status tick");
+
+        // The real triggers must survive.
+        const QString finished = functionBody(src, QStringLiteral("function onFinished(fileUrl, ok, error)"));
+        QVERIFY2(!finished.isEmpty(), "Sidebar.qml must have an onFinished handler");
+        QVERIFY2(finished.contains(QStringLiteral("refreshTreeOrdering()")),
+                 "onFinished must still call refreshTreeOrdering() — a finished write can change ordering");
+    }
+
+    // Perf convention (UI lag fix): the transcript's four overlay Repeaters
+    // must take a PRE-FILTERED model, never raw displaySentences with the
+    // unwanted entries hidden by `visible:`.
+    //
+    // A Repeater instantiates every delegate its model has; `visible: false`
+    // only skips painting one that already exists. Pointing all four at
+    // displaySentences built 4 delegates per sentence — 16k QQuickItems on a
+    // 4k-sentence transcript, synchronously on the GUI thread, the instant a
+    // file was opened — and three of the four were near-100% waste (the dim
+    // overlay is gated on gutterSpeakerFilter, which resets to "" on every
+    // open; chapter headings show only at real markers; the speaker gutter
+    // needs speaker !== ""). Measured on an offscreen reproduction of this
+    // exact structure: 661ms -> 130ms for a 4k-sentence cold open.
+    //
+    // This is NOT fixable by threading — QQuickItems can only be created on
+    // the GUI thread (the file read + parse were already moved off it by item
+    // P23 / loadTranscriptAsync). So the only lever is not creating them, and
+    // a regression here is invisible until someone opens a big file. Hence a
+    // source guard.
+    void mainPanel_transcriptOverlayRepeatersUsePreFilteredModels()
+    {
+        // Comments stripped: the models carry a long explanation of the very
+        // anti-patterns asserted against below, so these must scan code only.
+        const QString src = stripComments(readAll(QStringLiteral(SUOP_QML_DIR "/MainPanel.qml")));
+        QVERIFY2(!src.isEmpty(), "qml/MainPanel.qml must exist");
+
+        // Each overlay Repeater -> the filtered model property it must use.
+        const QList<QPair<QString, QString>> repeaterModels{
+            {QStringLiteral("id: timestampGutterRepeater"), QStringLiteral("mainPanel.gutterTimestampModel")},
+            {QStringLiteral("id: speakerGutterRepeater"), QStringLiteral("mainPanel.gutterSpeakerModel")},
+            {QStringLiteral("id: speakerDimOverlayRepeater"), QStringLiteral("mainPanel.speakerDimModel")},
+            {QStringLiteral("id: chapterHeadingRepeater"), QStringLiteral("mainPanel.chapterHeadingModel")},
+        };
+        for (const auto &[anchor, expectedModel] : repeaterModels) {
+            const QString block = enclosingBlock(src, anchor);
+            QVERIFY2(!block.isEmpty(), qPrintable(QStringLiteral("%1 must exist in MainPanel.qml").arg(anchor)));
+            QVERIFY2(block.contains(QStringLiteral("model: ") + expectedModel),
+                     qPrintable(QStringLiteral("%1 must use the pre-filtered `model: %2` — a Repeater builds a "
+                                               "delegate for EVERY model entry, so a raw displaySentences model "
+                                               "instantiates one per sentence no matter what `visible:` says")
+                                    .arg(anchor, expectedModel)));
+            QVERIFY2(!block.contains(QStringLiteral("model: mainPanel.displaySentences")),
+                     qPrintable(QStringLiteral("%1 must not take raw displaySentences as its model").arg(anchor)));
+        }
+
+        // The four filtered models must actually exist and each narrow
+        // displaySentences down, rather than alias it.
+        for (const QString &prop : {QStringLiteral("gutterTimestampModel"), QStringLiteral("gutterSpeakerModel"),
+                                    QStringLiteral("speakerDimModel"), QStringLiteral("chapterHeadingModel")}) {
+            const QString decl = QStringLiteral("readonly property var ") + prop;
+            QVERIFY2(src.contains(decl), qPrintable(QStringLiteral("MainPanel.qml must declare %1").arg(decl)));
+        }
+        QVERIFY2(src.count(QStringLiteral("displaySentences.filter(")) >= 3,
+                 "the filtered overlay models must genuinely filter displaySentences");
+
+        // Filtered delegates index gutterLineRects by the source index carried
+        // on the entry (modelData.idx), never by the delegate's own `index` —
+        // that is now its position in the FILTERED list, so using it would
+        // silently misalign every gutter with the wrong transcript line.
+        QVERIFY2(src.contains(QStringLiteral("gutterLineRects[modelData.idx]"))
+                     || src.contains(QStringLiteral("gutterLineRects[chapterHeadingRow.modelData.idx]")),
+                 "overlay delegates must look up gutterLineRects by modelData.idx");
+        QVERIFY2(!src.contains(QStringLiteral("gutterLineRects[index]")),
+                 "gutterLineRects must never be indexed by a filtered delegate's own `index` — "
+                 "use the entry's own modelData.idx (assigned in displayData)");
     }
 
     // StyleGuide.md: one global AppSettings.borderRadius, used everywhere a
@@ -642,8 +854,16 @@ private slots:
 
         const QString fieldBlock = enclosingBlock(src, QStringLiteral("id: rowRenameField"));
         QVERIFY2(!fieldBlock.isEmpty(), "could not locate the rowRenameField block");
-        QVERIFY2(fieldBlock.contains(QStringLiteral("visible: sidebar.renamingPath === treeDelegate.path")),
-                 "the rename editor's presence must be gated on renamingPath, not on activeFocus");
+        // The gate reads through treeDelegate.renamingThisRow, which must
+        // itself be nothing but the renamingPath comparison — checking both
+        // keeps this guard about renamingPath-vs-activeFocus rather than about
+        // where the comparison is spelled.
+        QVERIFY2(fieldBlock.contains(QStringLiteral("visible: treeDelegate.renamingThisRow")),
+                 "the rename editor's presence must be gated on renamingThisRow, not on activeFocus");
+        QVERIFY2(src.contains(QStringLiteral(
+                     "readonly property bool renamingThisRow: sidebar.renamingPath === treeDelegate.path")),
+                 "renamingThisRow must be defined as the explicit renamingPath comparison — it is what "
+                 "the rename editor and the row's hover overlays are all gated on");
         QVERIFY2(fieldBlock.contains(QStringLiteral("background: UnderlineField")),
                  "StyleGuide.md \"Text fields\": the rename editor must use the UnderlineField background");
         // Blur commits, but only after the field actually held focus —
@@ -1579,9 +1799,16 @@ private slots:
 
         const int idx = src.indexOf(QStringLiteral("property bool rowActionsRevealed:"));
         QVERIFY2(idx >= 0, "treeDelegate must expose rowActionsRevealed for the per-row action cluster");
-        const QString block = src.mid(idx, 240);
+        const QString block = src.mid(idx, 400);
         QVERIFY2(block.contains(QStringLiteral("rowHover.hovered")),
                  "rowActionsRevealed must still reveal on mouse hover");
+        // An open inline rename beats every reveal path: the icons overlay the
+        // row (no reserved layout space), so they cover the tail of the name
+        // being typed — and the click that opens the editor leaves the mouse
+        // hovering, so hover-only would never hide them. See
+        // tst_sidebar_rename's openRename_hidesTheRowsHoverActionIcons.
+        QVERIFY2(block.contains(QStringLiteral("!treeDelegate.renamingThisRow")),
+                 "rowActionsRevealed must suppress the cluster while this row's inline rename is open");
         QVERIFY2(block.contains(QStringLiteral("treeDelegate.path === sidebar.currentPath")),
                  "rowActionsRevealed must reveal the current row's cluster while the keyboard is in it");
         // The crux: currentPath alone must NOT reveal the cluster — the icons
