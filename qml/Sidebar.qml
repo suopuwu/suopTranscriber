@@ -1184,6 +1184,14 @@ Rectangle {
         return searchProxy.data(tree.index(row, 0), VaultTreeModel.PathRole) || ""
     }
 
+    // The nesting depth at a given TreeView row, or -1 out of range. Same
+    // rowCount-as-genuine-argument idiom as pathAtTreeRow above — tree.depth()
+    // is a plain invokable with no dependency of its own, so a binding calling
+    // this must take its row-count dependency through the argument.
+    function depthAtTreeRow(row, rowCount) {
+        return (row < 0 || row >= rowCount) ? -1 : tree.depth(row)
+    }
+
     // path -> true, populated/depopulated by delegates as they realize/
     // destroy — used on-demand by "transcribe all" (item 15) to avoid
     // needing raw numeric model roles from QML for a manual tree walk.
@@ -3096,6 +3104,18 @@ Rectangle {
                     && sidebar.isUnderFolder(sidebar.pathAtTreeRow(treeDelegate.row + 1, tree.rows),
                                               treeDelegate.folderHighlightRoot)
 
+            // Nesting-guide inputs (see the guide Rectangles below): the next
+            // display row's depth decides whether this row is the LAST row of
+            // its parent's expanded block (nextRowDepth < depth — anything
+            // still inside the block, including this row's own children, is
+            // deeper). -1 out of range, so the tree's final row counts as a
+            // block end too.
+            readonly property int nextRowDepth: sidebar.depthAtTreeRow(treeDelegate.row + 1, tree.rows)
+            // Dim on purpose — the guides are containment texture behind the
+            // rows' real content, not content themselves (the expand glyphs'
+            // #aaaaaa at ~20% alpha).
+            readonly property color guideColor: "#33aaaaaa"
+
             // Item 41: the per-row action cluster is hover-only, EXCEPT while
             // the keyboard is actually inside this row's cluster (currentPath
             // + a focused button, which only Left/Right can establish) — then
@@ -3608,6 +3628,59 @@ Rectangle {
                 cornerRadius: AppSettings.borderRadius
                 topRounded: !treeDelegate.combineTopMerged
                 bottomRounded: !treeDelegate.combineBottomMerged
+            }
+
+            // Nesting guides: indentation alone was the only thing separating
+            // a folder's contents from the rows around it. One 1px vertical
+            // line per ancestor level, at that level's expand-glyph center;
+            // each row draws its own full-height segment, so consecutive
+            // rows' segments join into one continuous line down the folder's
+            // whole expanded block (VSCode-style: the line runs through
+            // nested sub-blocks too, rather than stopping at the folder's
+            // last DIRECT child — the classic Explorer style needs an
+            // "is my level-N ancestor a last sibling" model walk per row for
+            // a distinction that reads no clearer).
+            Repeater {
+                model: treeDelegate.depth
+                Rectangle {
+                    id: nestingGuide
+                    required property int index
+                    objectName: "nestingGuide"
+                    // Center of the depth-`index` ancestor's 10px-wide
+                    // expand-glyph column (treeColumn.x below is where a
+                    // row's content starts; a dir's glyph is its first 10px).
+                    x: nestingGuide.index * 16 + AppSettings.sidebarEdgeLeftMargin
+                       + AppSettings.sidebarContentLeftMargin + 5
+                    width: 1
+                    // The deepest line — this row's own parent's — closes
+                    // into a "└" at the connector tick when this is the last
+                    // row of the parent's block, instead of overshooting half
+                    // a row past its last child.
+                    height: (nestingGuide.index === treeDelegate.depth - 1
+                             && treeDelegate.nextRowDepth < treeDelegate.depth)
+                            ? guideTick.y + 1 : treeDelegate.height
+                    color: treeDelegate.guideColor
+                }
+            }
+            // The horizontal connector: visibly hangs each child off its
+            // parent's vertical guide, stopping 3px short of where this row's
+            // own content begins so it points at the row without touching it.
+            Rectangle {
+                id: guideTick
+                objectName: "guideTick"
+                visible: treeDelegate.depth > 0
+                x: (treeDelegate.depth - 1) * 16 + AppSettings.sidebarEdgeLeftMargin
+                   + AppSettings.sidebarContentLeftMargin + 5
+                // The title line's vertical center: the row header is 28px
+                // tall in both row shapes (see implicitHeight above), with
+                // the expand glyph centered in it.
+                y: 14
+                // From the parent guide across the remaining indent step
+                // (16px), minus the 5px to the glyph center behind it and the
+                // 3px stand-off before the content.
+                width: 16 - 5 - 3
+                height: 1
+                color: treeDelegate.guideColor
             }
 
             Column {

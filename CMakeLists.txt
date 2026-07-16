@@ -18,21 +18,25 @@ qt_standard_project_setup(REQUIRES 6.7)
 # cross-vendor floor, GGML_CUDA is an opt-in NVIDIA fast path.
 set(GGML_VULKAN ${SUOP_ENABLE_VULKAN} CACHE BOOL "" FORCE)
 set(GGML_CUDA ${SUOP_ENABLE_CUDA} CACHE BOOL "" FORCE)
-set(WHISPER_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
-set(WHISPER_BUILD_TESTS OFF CACHE BOOL "" FORCE)
-set(WHISPER_BUILD_SERVER OFF CACHE BOOL "" FORCE)
-add_subdirectory(third_party/whisper.cpp)
 
 # llama.cpp (AI auto-labeling, see DESIGN.md "Model management"). Vendored
-# after whisper.cpp so its CMakeLists' `if (NOT TARGET ggml)` guard finds the
-# `ggml` target whisper.cpp already defined and reuses it, instead of trying
-# to build a second copy (both projects otherwise vendor their own ggml).
+# BEFORE whisper.cpp so the shared `ggml` target comes from llama.cpp's copy:
+# both projects guard with `if (NOT TARGET ggml)` and reuse an existing
+# target, and llama.cpp tracks ggml more closely (whisper.cpp's periodic ggml
+# sync lags, so building llama.cpp against whisper's older ggml breaks on new
+# ggml ops; the additive ggml API means the older whisper.cpp compiles fine
+# against the newer copy).
 if(SUOP_ENABLE_LABELING)
     set(LLAMA_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
     set(LLAMA_BUILD_TESTS OFF CACHE BOOL "" FORCE)
     set(LLAMA_BUILD_SERVER OFF CACHE BOOL "" FORCE)
     add_subdirectory(third_party/llama.cpp)
 endif()
+
+set(WHISPER_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+set(WHISPER_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+set(WHISPER_BUILD_SERVER OFF CACHE BOOL "" FORCE)
+add_subdirectory(third_party/whisper.cpp)
 
 # sherpa-onnx (speaker diarization — pyannote segmentation + CAM++ embedding
 # pipeline, see DESIGN.md "Speaker diarization"). Vendored whole rather than
