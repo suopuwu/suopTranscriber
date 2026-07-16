@@ -987,6 +987,217 @@ private slots:
         QVERIFY(QFileInfo::exists(outside.filePath("victim.mp3.md")));
     }
 
+    // --- deleteFiles (multi-select delete from the sidebar context menu) --------
+
+    // The batch carries every selected file's sidecars off with it, exactly as
+    // a per-file deleteFile() would, and reports how many it deleted.
+    void deleteFiles_removesEverySelectedFileWithItsSidecars()
+    {
+        QTemporaryDir vault;
+        QVERIFY(vault.isValid());
+        QVERIFY(touch(vault.filePath("a.mp3"), "audio"));
+        QVERIFY(touch(vault.filePath("a.mp3.md"), "transcript"));
+        QVERIFY(touch(vault.filePath(".a.mp3.partial.jsonl"), "resume"));
+        QVERIFY(touch(vault.filePath("b.wav"), "audio"));
+        QVERIFY(touch(vault.filePath("stray.md"), "note"));
+        QVERIFY(touch(vault.filePath("keep.mp3"), "audio")); // unselected — must survive
+
+        VaultTreeModel model;
+        model.setVaultPath(QUrl::fromLocalFile(vault.path()));
+
+        const QList<QUrl> selection = {
+            QUrl::fromLocalFile(vault.filePath("a.mp3")),
+            QUrl::fromLocalFile(vault.filePath("b.wav")),
+            QUrl::fromLocalFile(vault.filePath("stray.md")),
+        };
+        QCOMPARE(model.deleteFiles(selection), 3);
+
+        QVERIFY(!QFileInfo::exists(vault.filePath("a.mp3")));
+        QVERIFY(!QFileInfo::exists(vault.filePath("a.mp3.md")));
+        QVERIFY(!QFileInfo::exists(vault.filePath(".a.mp3.partial.jsonl")));
+        QVERIFY(!QFileInfo::exists(vault.filePath("b.wav")));
+        QVERIFY(!QFileInfo::exists(vault.filePath("stray.md")));
+        QVERIFY(QFileInfo::exists(vault.filePath("keep.mp3")));
+        QVERIFY(!findByName(model, "a.mp3").isValid());
+        QVERIFY(findByName(model, "keep.mp3").isValid());
+    }
+
+    // fileDeleted is per-file, not per-batch — MainPanel matches each emission
+    // against the file it currently has open.
+    void deleteFiles_emitsFileDeletedOncePerFile()
+    {
+        QTemporaryDir vault;
+        QVERIFY(vault.isValid());
+        QVERIFY(touch(vault.filePath("a.mp3"), "audio"));
+        QVERIFY(touch(vault.filePath("b.mp3"), "audio"));
+
+        VaultTreeModel model;
+        model.setVaultPath(QUrl::fromLocalFile(vault.path()));
+
+        QSignalSpy spy(&model, &VaultTreeModel::fileDeleted);
+        QCOMPARE(model.deleteFiles({QUrl::fromLocalFile(vault.filePath("a.mp3")),
+                                    QUrl::fromLocalFile(vault.filePath("b.mp3"))}),
+                 2);
+        QCOMPARE(spy.count(), 2);
+    }
+
+    // One guard-failing entry (here: outside the vault, and a directory) must
+    // not strand the valid files alongside it — they're deleted, it's skipped,
+    // and the count reports the difference.
+    void deleteFiles_skipsGuardFailuresWithoutAbortingTheBatch()
+    {
+        QTemporaryDir vault;
+        QVERIFY(vault.isValid());
+        QTemporaryDir outside;
+        QVERIFY(outside.isValid());
+        QVERIFY(touch(outside.filePath("victim.mp3"), "audio"));
+        QVERIFY(touch(vault.filePath("good.mp3"), "audio"));
+        QVERIFY(QDir().mkpath(vault.filePath("adir")));
+
+        VaultTreeModel model;
+        model.setVaultPath(QUrl::fromLocalFile(vault.path()));
+
+        const QList<QUrl> selection = {
+            QUrl::fromLocalFile(outside.filePath("victim.mp3")), // outside the vault
+            QUrl::fromLocalFile(vault.filePath("good.mp3")),
+            QUrl::fromLocalFile(vault.filePath("adir")),         // a directory, never a file
+            QUrl::fromLocalFile(vault.filePath("ghost.mp3")),    // doesn't exist
+        };
+        QCOMPARE(model.deleteFiles(selection), 1);
+
+        QVERIFY(!QFileInfo::exists(vault.filePath("good.mp3")));
+        QVERIFY(QFileInfo::exists(outside.filePath("victim.mp3")));
+        QVERIFY(QFileInfo::exists(vault.filePath("adir")));
+    }
+
+    // An all-invalid batch is a no-op: nothing deleted, nothing emitted.
+    void deleteFiles_emptyAndAllInvalidBatchesAreNoOps()
+    {
+        QTemporaryDir vault;
+        QVERIFY(vault.isValid());
+        QVERIFY(touch(vault.filePath("keep.mp3"), "audio"));
+
+        VaultTreeModel model;
+        model.setVaultPath(QUrl::fromLocalFile(vault.path()));
+
+        QSignalSpy spy(&model, &VaultTreeModel::fileDeleted);
+        QCOMPARE(model.deleteFiles({}), 0);
+        QCOMPARE(model.deleteFiles({QUrl::fromLocalFile(vault.filePath("ghost.mp3"))}), 0);
+        QCOMPARE(spy.count(), 0);
+        QVERIFY(QFileInfo::exists(vault.filePath("keep.mp3")));
+    }
+
+    // --- renameFolder (inline rename of a folder row) ---------------------------
+
+    // The folder keeps its place and its contents; only the name changes.
+    void renameFolder_renamesInPlaceKeepingContents()
+    {
+        QTemporaryDir vault;
+        QVERIFY(vault.isValid());
+        QVERIFY(touch(vault.filePath("parent/old name/talk.mp3"), "audio"));
+
+        VaultTreeModel model;
+        model.setVaultPath(QUrl::fromLocalFile(vault.path()));
+
+        QVERIFY(model.renameFolder(QUrl::fromLocalFile(vault.filePath("parent/old name")), "new name"));
+
+        QVERIFY(!QFileInfo::exists(vault.filePath("parent/old name")));
+        QVERIFY(QFileInfo::exists(vault.filePath("parent/new name/talk.mp3")));
+        // Still inside the same parent — a rename never reparents.
+        QVERIFY(findByName(model, "new name").isValid());
+        QVERIFY(!findByName(model, "old name").isValid());
+    }
+
+    // The name is trimmed before use, matching createFolder().
+    void renameFolder_trimsWhitespace()
+    {
+        QTemporaryDir vault;
+        QVERIFY(vault.isValid());
+        QVERIFY(QDir().mkpath(vault.filePath("interviews")));
+
+        VaultTreeModel model;
+        model.setVaultPath(QUrl::fromLocalFile(vault.path()));
+
+        QVERIFY(model.renameFolder(QUrl::fromLocalFile(vault.filePath("interviews")), "  talks  "));
+        QVERIFY(QFileInfo::exists(vault.filePath("talks")));
+    }
+
+    // Renaming to the name it already has is a no-op success, not a
+    // self-collision failure.
+    void renameFolder_sameNameIsANoOpSuccess()
+    {
+        QTemporaryDir vault;
+        QVERIFY(vault.isValid());
+        QVERIFY(touch(vault.filePath("interviews/talk.mp3"), "audio"));
+
+        VaultTreeModel model;
+        model.setVaultPath(QUrl::fromLocalFile(vault.path()));
+
+        QVERIFY(model.renameFolder(QUrl::fromLocalFile(vault.filePath("interviews")), "interviews"));
+        QVERIFY(QFileInfo::exists(vault.filePath("interviews/talk.mp3")));
+    }
+
+    // Never clobbers an existing sibling folder.
+    void renameFolder_refusesCollision()
+    {
+        QTemporaryDir vault;
+        QVERIFY(vault.isValid());
+        QVERIFY(touch(vault.filePath("a/keep.mp3"), "audio"));
+        QVERIFY(touch(vault.filePath("b/other.mp3"), "audio"));
+
+        VaultTreeModel model;
+        model.setVaultPath(QUrl::fromLocalFile(vault.path()));
+
+        QString error;
+        QVERIFY(!model.renameFolder(QUrl::fromLocalFile(vault.filePath("a")), "b", &error));
+        QVERIFY(!error.isEmpty());
+        QVERIFY(QFileInfo::exists(vault.filePath("a/keep.mp3")));
+        QVERIFY(QFileInfo::exists(vault.filePath("b/other.mp3")));
+    }
+
+    // Same guards as deleteFolder(): never the vault root, never outside it.
+    void renameFolder_refusesVaultRootAndPathsOutsideVault()
+    {
+        QTemporaryDir vault;
+        QVERIFY(vault.isValid());
+        QTemporaryDir outside;
+        QVERIFY(outside.isValid());
+        QVERIFY(QDir().mkpath(outside.filePath("victim")));
+
+        VaultTreeModel model;
+        model.setVaultPath(QUrl::fromLocalFile(vault.path()));
+
+        QVERIFY(!model.renameFolder(QUrl::fromLocalFile(vault.path()), "hijacked"));
+        QVERIFY(!model.renameFolder(QUrl::fromLocalFile(outside.filePath("victim")), "hijacked"));
+        QVERIFY(QFileInfo::exists(outside.filePath("victim")));
+        QVERIFY(!QFileInfo::exists(outside.filePath("hijacked")));
+    }
+
+    // A name can never carry a path separator (or other invalid character), so
+    // a rename can't reparent or escape the vault via "../".
+    void renameFolder_refusesInvalidNames()
+    {
+        QTemporaryDir vault;
+        QVERIFY(vault.isValid());
+        QVERIFY(touch(vault.filePath("interviews/talk.mp3"), "audio"));
+
+        VaultTreeModel model;
+        model.setVaultPath(QUrl::fromLocalFile(vault.path()));
+
+        const QUrl folder = QUrl::fromLocalFile(vault.filePath("interviews"));
+        QVERIFY(!model.renameFolder(folder, ""));
+        QVERIFY(!model.renameFolder(folder, "   "));
+        QVERIFY(!model.renameFolder(folder, "."));
+        QVERIFY(!model.renameFolder(folder, ".."));
+        QVERIFY(!model.renameFolder(folder, "../escaped"));
+        QVERIFY(!model.renameFolder(folder, "sub/dir"));
+        QVERIFY(!model.renameFolder(folder, "a*b"));
+
+        // Nothing moved, nothing created.
+        QVERIFY(QFileInfo::exists(vault.filePath("interviews/talk.mp3")));
+        QVERIFY(!QFileInfo::exists(vault.filePath("escaped")));
+    }
+
     // --- importDestinationFor (drag-and-drop import validation) ----------------
     //
     // Item 37: the drag-and-drop import copy is now an async worker-thread job

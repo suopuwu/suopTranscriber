@@ -20,6 +20,36 @@ class TstStyleGuide : public QObject
         return QString::fromUtf8(f.readAll());
     }
 
+    // The source of the QML element enclosing `anchor` (typically its
+    // "id: foo" line), brace-matched from that element's opening brace to its
+    // close.
+    //
+    // Prefer this to a fixed-width src.mid(anchorIdx, N) window: N rots the
+    // moment the block grows past it, and it rots SILENTLY IN THE WRONG
+    // DIRECTION — the assertion stops finding what it's looking for and reports
+    // a missing feature that's actually right there, so the failure blames the
+    // code instead of the test. That's already happened twice on this file's
+    // rowRenameField guard. Returns an empty string if `anchor` isn't found.
+    static QString enclosingBlock(const QString &src, const QString &anchor)
+    {
+        const int anchorIdx = src.indexOf(anchor);
+        if (anchorIdx < 0)
+            return QString();
+        const int open = src.lastIndexOf(QLatin1Char('{'), anchorIdx);
+        if (open < 0)
+            return QString();
+        int depth = 0;
+        for (int i = open; i < src.size(); ++i) {
+            if (src.at(i) == QLatin1Char('{')) {
+                ++depth;
+            } else if (src.at(i) == QLatin1Char('}')) {
+                if (--depth == 0)
+                    return src.mid(open, i - open + 1);
+            }
+        }
+        return src.mid(open);
+    }
+
 private slots:
     // Regression: Sidebar.qml's treeDelegate (a TreeView row) recycles a
     // fixed pool of delegate Items as rows scroll in/out of view — required
@@ -538,6 +568,128 @@ private slots:
         // Deleting a folder is destructive — must go through a confirmation.
         QVERIFY2(src.contains(QStringLiteral("id: deleteConfirmPopup")),
                  "deleting a folder (recursive) must require a confirmation Popup");
+
+        // The empty-area handler must bail when the tap landed on a real cell.
+        // Nested TapHandlers are NOT mutually exclusive, so both fire on a row
+        // right-click and this one fires LAST — without the guard it overwrote
+        // the row's ctx* state with the empty-area's, leaving every row's menu
+        // showing only "New folder". tst_sidebar_rename's
+        // rightClickRow_menuOffersRenameAndNamesTheSelectionCount proves the
+        // behavior against a real view; this guards the mechanism.
+        const QString emptyTapBlock = enclosingBlock(src, QStringLiteral("id: treeEmptyContextTap"));
+        QVERIFY2(!emptyTapBlock.isEmpty(), "could not locate the treeEmptyContextTap block");
+        QVERIFY2(emptyTapBlock.contains(QStringLiteral("cellAtPosition")),
+                 "the empty-area right-click must check it didn't land on a row (cellAtPosition) — nested "
+                 "TapHandlers both fire, and this one runs last, so it would clobber the row's menu state");
+    }
+
+    // Multi-select delete: "Delete file" must act on the whole selection when
+    // the right-clicked row is part of one, and must SAY so rather than
+    // silently deleting more rows than the menu names. No QQuickView harness
+    // for TreeView context menus, so this is a source-scan guard.
+    void sidebar_deleteFileActsOnWholeSelection()
+    {
+        const QString src = readAll(QStringLiteral(SUOP_QML_DIR "/Sidebar.qml"));
+        QVERIFY2(!src.isEmpty(), "qml/Sidebar.qml must exist");
+
+        // Drag-to-move and delete must read a multi-selection through the same
+        // shared rule, not each invent its own.
+        QVERIFY2(src.contains(QStringLiteral("function selectionPathsFor(")),
+                 "the \"row in a 2+ selection carries the whole selection\" rule must be one shared "
+                 "function (selectionPathsFor)");
+        const int beginDeleteIdx = src.indexOf(QStringLiteral("function beginDeleteFile("));
+        QVERIFY2(beginDeleteIdx >= 0, "beginDeleteFile() must exist");
+        QVERIFY2(src.mid(beginDeleteIdx, 200).contains(QStringLiteral("selectionPathsFor(")),
+                 "\"Delete file\" must target the whole multi-selection via selectionPathsFor()");
+
+        // The menu row must name the real count.
+        const int delRowIdx = src.indexOf(QStringLiteral("id: ctxDeleteFileRow"));
+        QVERIFY2(delRowIdx >= 0, "ctxDeleteFileRow must exist");
+        const QString delRowBlock = src.mid(delRowIdx, 1400);
+        QVERIFY2(delRowBlock.contains(QStringLiteral("Delete %1 items")),
+                 "with 2+ rows selected the menu must read \"Delete N items\", not a bare \"Delete file\" "
+                 "that hides how many rows it will take");
+
+        // The batch must go through the single-rebuild C++ invokable, not a
+        // QML loop over deleteFile() (one full vault rescan + model reset per
+        // file).
+        QVERIFY2(src.contains(QStringLiteral("sidebar.model.deleteFiles(")),
+                 "a multi-delete must call VaultTreeModel.deleteFiles() so the batch costs one rebuild()");
+
+        // Destructive, so still confirmed — and the confirmation must be
+        // count-aware too, not name a single file while deleting several.
+        const int confirmIdx = src.indexOf(QStringLiteral("id: fileDeleteConfirmPopup"));
+        QVERIFY2(confirmIdx >= 0, "fileDeleteConfirmPopup must exist");
+        QVERIFY2(src.mid(confirmIdx, 2000).contains(QStringLiteral("pendingDeletePaths.length > 1")),
+                 "the delete confirmation must state how many items it will delete");
+    }
+
+    // Inline rename (context menu "Rename" + clicking an already-selected row's
+    // name). StyleGuide.md "Always-editable text" carve-out: this is a
+    // deliberate display-vs-edit swap, but it must be gated on an explicit
+    // renamingPath — NEVER on activeFocus, which is what let a focus-steal hide
+    // the field out from under the user (MainPanel's old renamingTitle bug).
+    void sidebar_inlineRenameIsGatedOnRenamingPathNotFocus()
+    {
+        const QString src = readAll(QStringLiteral(SUOP_QML_DIR "/Sidebar.qml"));
+        QVERIFY2(!src.isEmpty(), "qml/Sidebar.qml must exist");
+
+        QVERIFY2(src.contains(QStringLiteral("property string renamingPath")),
+                 "inline rename must track which row is editing via a sidebar-level renamingPath — "
+                 "delegate-local state would retarget itself when TreeView recycles the row");
+        QVERIFY2(src.contains(QStringLiteral("id: rowRenameField")),
+                 "the tree row must have an inline rename editor (rowRenameField)");
+
+        const QString fieldBlock = enclosingBlock(src, QStringLiteral("id: rowRenameField"));
+        QVERIFY2(!fieldBlock.isEmpty(), "could not locate the rowRenameField block");
+        QVERIFY2(fieldBlock.contains(QStringLiteral("visible: sidebar.renamingPath === treeDelegate.path")),
+                 "the rename editor's presence must be gated on renamingPath, not on activeFocus");
+        QVERIFY2(fieldBlock.contains(QStringLiteral("background: UnderlineField")),
+                 "StyleGuide.md \"Text fields\": the rename editor must use the UnderlineField background");
+        // Blur commits, but only after the field actually held focus —
+        // otherwise the opening frame (or a modal menu releasing focus) reads
+        // as a blur and commits instantly.
+        QVERIFY2(fieldBlock.contains(QStringLiteral("everFocused")),
+                 "the blur-commit must be guarded so entering edit mode isn't itself read as a blur");
+        QVERIFY2(fieldBlock.contains(QStringLiteral("Keys.onEscapePressed")),
+                 "StyleGuide.md commit convention: Escape must abandon the rename without committing");
+
+        // Both entry points: the context-menu row and the click-the-name-of-an-
+        // already-selected-row gesture.
+        QVERIFY2(src.contains(QStringLiteral("id: ctxRenameRow")),
+                 "the context menu must offer a Rename row");
+        QVERIFY2(src.contains(QStringLiteral("function tapIsOnRowName(")),
+                 "clicking an already-selected row's name must start a rename — decided inside the row's "
+                 "own TapHandler (overlapping TapHandlers both fire, racing rename against open)");
+
+        // Renaming rebuilds the model, destroying the delegate whose handler is
+        // mid-execution — same hazard the drop handler defers for.
+        const int commitIdx = src.indexOf(QStringLiteral("function commitActiveRename("));
+        QVERIFY2(commitIdx >= 0, "commitActiveRename() must exist");
+        QVERIFY2(src.mid(commitIdx, 700).contains(QStringLiteral("Qt.callLater")),
+                 "the rename commit must be deferred (Qt.callLater) — renameFile()/renameFolder() rebuild "
+                 "the model and destroy the delegate the commit handler is running on");
+
+        // The editor's text must be mirrored onto the sidebar, because the
+        // commit can't always come from the editor: the TreeView is a
+        // FocusScope, so clicking another row hands activeFocus back to the
+        // editor instead of blurring it, and treeRowTap has to commit on its
+        // behalf. tst_sidebar_rename's blur_commitsRename proves the behavior;
+        // this guards the state design it depends on.
+        QVERIFY2(src.contains(QStringLiteral("property string renamingText")),
+                 "the editor's live text must be mirrored on the sidebar so a click on another row can "
+                 "commit a rename the editor itself never gets a blur for");
+        const int rowTapIdx2 = src.indexOf(QStringLiteral("id: treeRowTap"));
+        QVERIFY2(rowTapIdx2 >= 0, "treeRowTap must exist");
+        QVERIFY2(src.mid(rowTapIdx2, 1200).contains(QStringLiteral("commitActiveRename()")),
+                 "clicking a different row while an inline rename is open must commit it — that click "
+                 "never blurs the editor (FocusScope), so nothing else will");
+
+        // Folder rows rename through the folder-specific invokable.
+        QVERIFY2(src.contains(QStringLiteral("sidebar.model.renameFolder(")),
+                 "renaming a directory row must call VaultTreeModel.renameFolder()");
+        QVERIFY2(src.contains(QStringLiteral("sidebar.model.renameFile(")),
+                 "renaming a note row must call VaultTreeModel.renameFile()");
     }
 
     // Item 40 (drag-to-move): dragging a tree row must move the file/folder,
@@ -1954,8 +2106,13 @@ private slots:
         // Both route through the model's invokables (via a confirm popup).
         QVERIFY2(sidebar.contains(QStringLiteral(".deleteTranscript(")),
                  "Sidebar must call VaultTreeModel.deleteTranscript()");
-        QVERIFY2(sidebar.contains(QStringLiteral(".deleteFile(")),
-                 "Sidebar must call VaultTreeModel.deleteFile()");
+        // deleteFiles(), not deleteFile(): the sidebar's "Delete file" acts on
+        // a whole multi-selection, and a single row is just a one-element batch
+        // — one code path, not a count-dependent branch. (MainPanel still calls
+        // the singular deleteFile() below; it only ever has one open file.)
+        QVERIFY2(sidebar.contains(QStringLiteral(".deleteFiles(")),
+                 "Sidebar must delete through VaultTreeModel.deleteFiles(), which handles both a single "
+                 "row and a multi-selection in one rebuild");
         // Destructive => must be confirmed first.
         QVERIFY2(sidebar.contains(QStringLiteral("id: fileDeleteConfirmPopup")),
                  "a destructive file/transcript delete must be confirmed first");

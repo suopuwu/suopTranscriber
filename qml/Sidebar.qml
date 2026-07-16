@@ -788,6 +788,9 @@ Rectangle {
         sidebar.lastClickedPath = ""
         sidebar.selectionCursorPath = ""
         sidebar.actionButtonFocus = ""
+        // The tree swaps out for the flat results list (and back) on this
+        // change, destroying the row being renamed along with it.
+        sidebar.cancelRename()
     }
     onSearchIncludeTranscriptionsChanged: sidebar.refreshSearchResults()
     Connections {
@@ -821,6 +824,14 @@ Rectangle {
             // rowDragGhost stranded on screen with no handler left to end it.
             if (sidebar.rowDragActive)
                 sidebar.endRowDrag(false)
+            // Inline rename: a reset destroys the delegate holding the editor
+            // (and the half-typed text in it), so the gesture is over whether
+            // we like it or not — drop the state rather than leave renamingPath
+            // pointing at a row that may not even exist anymore. This is also
+            // the normal exit for a rename that SUCCEEDED: renameFile() /
+            // renameFolder() rebuild, and commitActiveRename() has already
+            // cleared the state by then, so this is a no-op in that case.
+            sidebar.cancelRename()
         }
     }
 
@@ -1275,19 +1286,25 @@ Rectangle {
     // directory is clicked, else the clicked note's parent dir, else the
     // vault root (empty-area right-click).
     property string ctxCreateInDir: ""
+    // The label the right-clicked row is displaying ("" if none / not showing
+    // one) — "Rename" edits what the row shows, so it has to know whether that
+    // was a label or a filename. Captured at right-click time like the rest of
+    // this state; the menu can't read the delegate's metadata itself.
+    property string ctxLabel: ""
     property real ctxMenuX: 0
     property real ctxMenuY: 0
     // Destinations for the "Move to…" picker (from VaultTreeModel.vaultFolders(),
     // minus the file's own current directory).
     property var moveFolderList: []
 
-    function openContextMenu(path, isDir, isNote, isAudio, status, createInDir, x, y) {
+    function openContextMenu(path, isDir, isNote, isAudio, status, createInDir, label, x, y) {
         sidebar.ctxPath = path
         sidebar.ctxIsDir = isDir
         sidebar.ctxIsNote = isNote
         sidebar.ctxIsAudio = isAudio
         sidebar.ctxStatus = status
         sidebar.ctxCreateInDir = createInDir
+        sidebar.ctxLabel = label ? label : ""
         sidebar.ctxMenuX = x
         sidebar.ctxMenuY = y
         contextMenu.open()
@@ -1316,6 +1333,125 @@ Rectangle {
             newFolderPopup.close()
         else
             newFolderError.text = qsTr("Couldn't create folder — invalid name, or it already exists.")
+    }
+
+    // Inline rename: which row is currently in edit mode ("" = none). Exactly
+    // one row can be, so this is a single path rather than per-delegate state
+    // — and it MUST live here rather than on the delegate, because TreeView
+    // recycles delegate Items as rows scroll (see treeDelegate.onPathChanged);
+    // an `editing` bool on the Item would silently retarget itself onto a
+    // different file. Keyed by path, the editor follows the file.
+    //
+    // StyleGuide.md's "Always-editable text" rule (one always-present editable
+    // control, never a display-vs-edit swap) deliberately does NOT apply here
+    // — see that doc's "Inline rename in a list/tree row" carve-out. A tree row
+    // can't be always-editable: a plain click on the name must open the file,
+    // not place a text cursor. What the rule actually guards against is the
+    // field vanishing under a focus steal, so the load-bearing half is kept:
+    // this is gated on an explicit renamingPath, NEVER on activeFocus, so the
+    // native right-click "Copy" menu can't dismiss the editor.
+    // The whole rename lives here, not just which row: the editor's live text
+    // and the two facts performRename() needs (is it a folder, was the row
+    // showing a label). Hoisted for the same reason rowDrag* above is —
+    // delegate-local state can't be reached from anywhere else, and a click on
+    // a DIFFERENT row has to be able to commit this one. That's not
+    // hypothetical: the editor keeps activeFocus through such a click (see
+    // treeRowTap), so the blur-commit never fires and the edit would be lost.
+    // The field is a view onto this state; this state is the authority.
+    property string renamingPath: ""
+    property bool renamingIsDir: false
+    property string renamingLabel: "" // the label the row displays, "" if none
+    property string renamingText: ""  // the editor's current text
+
+    function beginRename(path, isDir, label) {
+        if (path === "")
+            return
+        // Starting a rename elsewhere while one is open commits the open one,
+        // matching the blur convention.
+        if (sidebar.renamingPath !== "" && sidebar.renamingPath !== path)
+            sidebar.commitActiveRename()
+        sidebar.renamingIsDir = isDir === true
+        sidebar.renamingLabel = label ? label : ""
+        sidebar.renamingText = sidebar.renameInitialText(path, sidebar.renamingIsDir, sidebar.renamingLabel)
+        sidebar.renamingPath = path
+    }
+
+    function cancelRename() {
+        sidebar.renamingPath = ""
+        sidebar.renamingText = ""
+    }
+
+    // The text the editor opens with — always what renameFile()/renameFolder()
+    // actually consume, which is NOT always what the row displays:
+    //
+    // - A folder edits its own name.
+    // - A note showing a stored label (AppSettings.useLabelsSidebar) edits that
+    //   LABEL, not the filename — you rename what you can see, matching
+    //   MainPanel's titleField convention for the same toggle.
+    // - Any other note edits its BASE name, extension always stripped, even
+    //   when AppSettings.hideExtensionsSidebar is off and the row therefore
+    //   shows "talk.m4a". renameFile() takes a base name and re-appends the
+    //   real extension itself, so seeding "talk.m4a" here would rename the file
+    //   to "talk.m4a.m4a". The editor showing one fewer token than the row did
+    //   is the honest representation of what's being edited.
+    function renameInitialText(path, isDir, label) {
+        const base = path.substring(path.lastIndexOf("/") + 1)
+        if (isDir)
+            return base
+        if (AppSettings.useLabelsSidebar && label)
+            return label
+        const dot = base.lastIndexOf(".")
+        return dot > 0 ? base.substring(0, dot) : base
+    }
+
+    // Commits whatever rename is currently open, from the sidebar's own copy of
+    // the editor's text — so it works from the editor's Return/blur AND from a
+    // click on another row, which never blurs the editor at all.
+    //
+    // Leaves edit mode IMMEDIATELY (so the blur that follows can't re-enter
+    // this) and defers the actual write: renameFile()/renameFolder() call
+    // rebuild(), which destroys the very delegate whose handler is running
+    // right now — the same hazard the drag-drop handler defers for (see
+    // rowDropTarget's Qt.callLater).
+    function commitActiveRename() {
+        if (sidebar.renamingPath === "")
+            return // nothing open, or already committed/cancelled
+        const path = sidebar.renamingPath
+        const isDir = sidebar.renamingIsDir
+        const label = sidebar.renamingLabel
+        const newValue = sidebar.renamingText
+        sidebar.renamingPath = ""
+        sidebar.renamingText = ""
+        Qt.callLater(() => sidebar.performRename(path, isDir, label, newValue))
+    }
+
+    function performRename(path, isDir, label, newValue) {
+        const trimmed = newValue.trim()
+        if (trimmed === "" || trimmed === sidebar.renameInitialText(path, isDir, label))
+            return // empty or unchanged — silently keep the old name
+
+        if (isDir) {
+            if (sidebar.model && !sidebar.model.renameFolder("file://" + path, trimmed)) {
+                sidebar.rowActionError = qsTr("Couldn't rename folder — name taken or invalid.")
+                rowActionErrorClearTimer.restart()
+            }
+            return
+        }
+
+        // Editing a displayed label rewrites the .md's frontmatter, not the
+        // filename. setLabel() emits finished(), which already bumps
+        // metadataRevision and refreshes the row (see the Connections above) —
+        // no rebuild, so nothing extra to nudge here.
+        if (AppSettings.useLabelsSidebar && label) {
+            if (sidebar.transcriptionController)
+                sidebar.transcriptionController.setLabel("file://" + path, trimmed)
+            return
+        }
+
+        if (sidebar.model && !sidebar.model.renameFile("file://" + path, trimmed)) {
+            sidebar.rowActionError = qsTr("Couldn't rename — name taken or invalid.")
+            rowActionErrorClearTimer.restart()
+        }
     }
 
     function openMoveTo() {
@@ -1359,12 +1495,16 @@ Rectangle {
     property real rowDragX: 0
     property real rowDragY: 0
 
-    // A drag starting on a row that's part of a 2+ multi-selection carries the
-    // whole selection; anything else carries just that one row and leaves the
-    // existing selection alone. Directories are never part of selectedPaths
-    // (only notes are selectable — see handleNoteClick), so a folder drag is
-    // always the single folder.
-    function rowDragPathsFor(path, isDir) {
+    // Which paths a row-targeted action applies to: a row that's part of a 2+
+    // multi-selection carries the WHOLE selection; anything else carries just
+    // that one row and leaves the existing selection alone. Directories are
+    // never part of selectedPaths (only notes are selectable — see
+    // handleNoteClick), so a folder always acts on itself alone.
+    //
+    // Shared by the two row actions that can act on many rows at once —
+    // drag-to-move (beginRowDrag) and delete (beginDeleteFile) — so both read
+    // a multi-selection the same way rather than each inventing its own rule.
+    function selectionPathsFor(path, isDir) {
         if (!isDir && sidebar.selectedPaths.length > 1
                 && sidebar.selectedPaths.indexOf(path) >= 0)
             return sidebar.selectedPaths.slice()
@@ -1392,7 +1532,7 @@ Rectangle {
     }
 
     function beginRowDrag(path, isDir, scenePoint) {
-        sidebar.rowDragPaths = sidebar.rowDragPathsFor(path, isDir)
+        sidebar.rowDragPaths = sidebar.selectionPathsFor(path, isDir)
         sidebar.rowDragIsDir = isDir
         sidebar.rowDragDest = ""
         sidebar.rowDragActive = true
@@ -1454,17 +1594,23 @@ Rectangle {
         // Same transient-banner treatment as Main.qml's drag-and-drop import
         // failures, which this gesture is the in-vault sibling of.
         if (failed.length > 0) {
-            sidebar.moveError = qsTr("Couldn't move: %1").arg(failed.join(", "))
-            moveErrorClearTimer.restart()
+            sidebar.rowActionError = qsTr("Couldn't move: %1").arg(failed.join(", "))
+            rowActionErrorClearTimer.restart()
         }
     }
 
-    property string moveError: ""
+    // Transient failure feedback for any row-targeted action the model refuses
+    // — a move (drag/"Move to…"), an inline rename, or a delete. All of them
+    // are otherwise completely silent: the row just stays put / keeps its old
+    // name, with nothing to tell the user why. Shared rather than one banner
+    // per action: the placement and lifetime are identical, and only one of
+    // these gestures can be in flight at a time.
+    property string rowActionError: ""
 
     Timer {
-        id: moveErrorClearTimer
+        id: rowActionErrorClearTimer
         interval: 4000
-        onTriggered: sidebar.moveError = ""
+        onTriggered: sidebar.rowActionError = ""
     }
 
     function confirmDeleteFolder() {
@@ -1478,28 +1624,58 @@ Rectangle {
     // pendingDeleteMode. VaultTreeModel::deleteTranscript()/deleteFile()
     // move files to the trash (recoverable), but a confirm is still required
     // for a destructive user action.
-    property string pendingDeletePath: ""
+    //
+    // An ARRAY, not a single path: "Delete file" acts on the whole
+    // multi-selection when the right-clicked row is part of one (see
+    // selectionPathsFor, shared with drag-to-move). "Delete transcript" stays
+    // deliberately single-file — it's offered only for the one right-clicked
+    // transcribed audio row, so it always has exactly one target.
+    property var pendingDeletePaths: []
     property string pendingDeleteMode: "" // "transcript" | "file"
 
+    // The single filename a confirm message names, for the 1-target case.
+    function pendingDeleteName() {
+        if (sidebar.pendingDeletePaths.length !== 1)
+            return ""
+        const p = sidebar.pendingDeletePaths[0]
+        return p.substring(p.lastIndexOf("/") + 1)
+    }
+
     function beginDeleteTranscript(path) {
-        sidebar.pendingDeletePath = path
+        sidebar.pendingDeletePaths = [path]
         sidebar.pendingDeleteMode = "transcript"
         fileDeleteConfirmPopup.open()
     }
 
     function beginDeleteFile(path) {
-        sidebar.pendingDeletePath = path
+        sidebar.pendingDeletePaths = sidebar.selectionPathsFor(path, false)
         sidebar.pendingDeleteMode = "file"
         fileDeleteConfirmPopup.open()
     }
 
     function confirmFileDelete() {
-        if (sidebar.model && sidebar.pendingDeletePath !== "") {
-            if (sidebar.pendingDeleteMode === "transcript")
-                sidebar.model.deleteTranscript("file://" + sidebar.pendingDeletePath)
-            else
-                sidebar.model.deleteFile("file://" + sidebar.pendingDeletePath)
+        const paths = sidebar.pendingDeletePaths
+        if (sidebar.model && paths.length > 0) {
+            if (sidebar.pendingDeleteMode === "transcript") {
+                // Always exactly one target — see pendingDeletePaths.
+                sidebar.model.deleteTranscript("file://" + paths[0])
+            } else {
+                // One C++ call for the whole batch — deleteFiles() rebuilds the
+                // model once rather than once per file (see its doc comment).
+                const urls = paths.map((p) => "file://" + p)
+                const deleted = sidebar.model.deleteFiles(urls)
+                if (deleted < paths.length) {
+                    sidebar.rowActionError = qsTr("Couldn't delete %1 of %2 items.")
+                        .arg(paths.length - deleted).arg(paths.length)
+                    rowActionErrorClearTimer.restart()
+                }
+            }
         }
+        // Nothing clears the selection here: a delete that removed anything
+        // rebuilds the model, and the modelReset handler above already drops
+        // the selection defensively for exactly this reason (a stale entry
+        // pointing at a deleted file). A delete that removed NOTHING leaves the
+        // selection standing, which is correct — those files are still there.
         fileDeleteConfirmPopup.close()
     }
 
@@ -2792,19 +2968,19 @@ Rectangle {
         }
     }
 
-    // Item 40 (drag-to-move) failure feedback — a move VaultTreeModel refuses
-    // (most likely a same-named file already in the destination) is otherwise
-    // completely silent, the row just stays put. Same transient red banner as
-    // Main.qml's drag-and-drop import errors, which this gesture is the
-    // in-vault sibling of; a SUCCESSFUL move needs no banner, the row simply
-    // reappears in its new folder.
+    // Failure feedback for a row action VaultTreeModel refuses — a move (most
+    // likely a same-named file already in the destination), an inline rename
+    // (name taken / invalid), or a delete. Same transient red banner as
+    // Main.qml's drag-and-drop import errors, which these gestures are the
+    // in-vault siblings of; a SUCCESSFUL action needs no banner, the row simply
+    // reappears renamed / in its new folder / gone.
     Label {
         z: 101
         anchors.top: parent.top
         anchors.horizontalCenter: parent.horizontalCenter
         anchors.topMargin: 12
-        visible: sidebar.moveError !== ""
-        text: sidebar.moveError
+        visible: sidebar.rowActionError !== ""
+        text: sidebar.rowActionError
         color: "white"
         padding: 8
         background: Rectangle {
@@ -2856,17 +3032,37 @@ Rectangle {
 
         // Item 40: right-click on empty tree space (below the rows) opens the
         // context menu targeting the vault root — so "New folder" at the root
-        // is reachable even with no rows to right-click. A row's own
-        // treeRowContextTap (deeper in the hierarchy) takes the exclusive
-        // grab first, so this only fires for genuinely empty area.
+        // is reachable even with no rows to right-click.
+        //
+        // BUG FIX: this used to assume "a row's own treeRowContextTap (deeper
+        // in the hierarchy) takes the exclusive grab first, so this only fires
+        // for genuinely empty area." That is not how nested TapHandlers behave
+        // — they are not mutually exclusive (the same hazard StyleGuide.md's
+        // "Always-editable text" documents), so BOTH fired on every row
+        // right-click, and this one fired LAST. It therefore overwrote the
+        // row's captured ctx* state with the empty-area's, and the menu came up
+        // showing only "New folder": Move to…/Delete file/Delete transcript/
+        // Combine selected/Rename are all gated on ctxIsNote/ctxIsDir, which
+        // this had just reset to false. Every row right-click was affected.
+        // Verified against a real QQuickView in tst_sidebar_rename's
+        // rightClickRow_menuOffersRenameAndNamesTheSelectionCount.
+        //
+        // So: bail when the tap landed on a real cell, rather than assume it
+        // can't have. cellAtPosition() wants contentItem coordinates (the view
+        // scrolls under them), while a TapHandler's point.position is relative
+        // to its parent item — hence the map.
         TapHandler {
             id: treeEmptyContextTap
             acceptedButtons: Qt.RightButton
             onTapped: {
-                const p = tree.mapToItem(sidebar, treeEmptyContextTap.point.position.x,
-                                          treeEmptyContextTap.point.position.y)
+                const local = treeEmptyContextTap.point.position
+                const inContent = tree.mapToItem(tree.contentItem, local.x, local.y)
+                const cell = tree.cellAtPosition(inContent.x, inContent.y, true)
+                if (cell.y >= 0)
+                    return // a row — its own treeRowContextTap owns this click
+                const p = tree.mapToItem(sidebar, local.x, local.y)
                 sidebar.openContextMenu("", false, false, false, 0,
-                                         sidebar.model ? sidebar.model.vaultLocalPath : "", p.x, p.y)
+                                         sidebar.model ? sidebar.model.vaultLocalPath : "", "", p.x, p.y)
             }
         }
 
@@ -3331,13 +3527,49 @@ Rectangle {
                     sidebar.openContextMenu(treeDelegate.path, treeDelegate.isDir,
                                              treeDelegate.isAudio || treeDelegate.isOrphanedMd,
                                              treeDelegate.isAudio, treeDelegate.status,
-                                             createIn, p.x, p.y)
+                                             createIn,
+                                             treeDelegate.metadata ? treeDelegate.metadata.label : "",
+                                             p.x, p.y)
                 }
+            }
+
+            // A plain click on the NAME of an already-solely-selected note
+            // starts an inline rename (file-manager convention) — the second
+            // way in, alongside the context menu's "Rename".
+            //
+            // Decided inside treeRowTap rather than by a TapHandler of its own
+            // on rowNameText: overlapping TapHandlers aren't mutually exclusive
+            // in Qt Quick, so a tap on the name would fire BOTH and race
+            // rename against handleNoteClick (StyleGuide.md "Always-editable
+            // text" documents that exact bug). One handler, one decision.
+            //
+            // Bounded by the name's PAINTED width (implicitWidth), not the
+            // Text's laid-out width — it Layout.fillWidths the whole row, so
+            // the plain width would make empty space far right of a short name
+            // count as "on the name".
+            function tapIsOnRowName(pos) {
+                if (!rowNameText.visible)
+                    return false
+                const local = rowNameText.mapFromItem(treeDelegate, pos.x, pos.y)
+                const textWidth = Math.min(rowNameText.width, rowNameText.implicitWidth)
+                return local.x >= 0 && local.x <= textWidth
+                        && local.y >= 0 && local.y <= rowNameText.height
             }
 
             TapHandler {
                 id: treeRowTap
                 onTapped: {
+                    // Clicking a DIFFERENT row while an inline rename is open
+                    // must commit it (blur convention) — and nothing else will,
+                    // because this click never actually blurs the editor: the
+                    // TreeView is a FocusScope, so the forceActiveFocus() below
+                    // hands activeFocus straight back to its focused child (the
+                    // editor) rather than taking it away. The editor's own
+                    // blur-commit therefore never fires, and without this the
+                    // edit is silently dropped while the editor sits open on a
+                    // row that is no longer even selected.
+                    if (sidebar.renamingPath !== "" && sidebar.renamingPath !== treeDelegate.path)
+                        sidebar.commitActiveRename()
                     // Grabs keyboard focus so Up/Down (see the Shortcut
                     // items near Ctrl+F's) can move between notes right
                     // after a click — never touches sidebar.currentPath, so
@@ -3355,6 +3587,22 @@ Rectangle {
                         else
                             sidebar.toggleEmptyDirCollapsed(treeDelegate.path)
                     } else if (treeDelegate.isAudio || treeDelegate.isOrphanedMd) {
+                        // Click the name of a row that's ALREADY the sole
+                        // selection -> rename it, rather than re-opening the
+                        // file it already opened on the first click. Requires
+                        // no modifiers and a selection of exactly this row, so
+                        // it can never fire while a Shift/Ctrl multi-selection
+                        // is being built.
+                        const plain = (treeRowTap.point.modifiers
+                                       & (Qt.ShiftModifier | Qt.ControlModifier)) === 0
+                        const soleSelection = sidebar.selectedPaths.length === 1
+                                && sidebar.selectedPaths[0] === treeDelegate.path
+                        if (plain && soleSelection
+                                && treeDelegate.tapIsOnRowName(treeRowTap.point.position)) {
+                            sidebar.beginRename(treeDelegate.path, false,
+                                                treeDelegate.metadata ? treeDelegate.metadata.label : "")
+                            return
+                        }
                         // Item 3: Shift/Ctrl-click multi-select — see
                         // sidebar.handleNoteClick's doc comment. modifiers
                         // comes from this TapHandler's own point (Qt
@@ -3789,12 +4037,21 @@ Rectangle {
                     }
 
                     Text {
+                        id: rowNameText
+                        objectName: "rowNameText"
                         Layout.alignment: Qt.AlignVCenter
+                        // Hidden only while THIS row is being renamed inline —
+                        // rowRenameField below takes its place in the layout.
+                        // Gated on sidebar.renamingPath, never on the field's
+                        // activeFocus (see sidebar.renamingPath's doc comment).
+                        visible: sidebar.renamingPath !== treeDelegate.path
                         // Item 1 (Wave D): sidebar previously always showed the
-                        // raw filename — AppSettings.useLabelsSidebar (a
-                        // display-only toggle; Sidebar has no rename UI, unlike
-                        // MainPanel's useLabelsMainPanel) now lets it show the
-                        // stored label instead, when one exists.
+                        // raw filename — AppSettings.useLabelsSidebar lets it
+                        // show the stored label instead, when one exists. That
+                        // choice is load-bearing beyond display now: inline
+                        // rename edits whatever this shows, so with the toggle
+                        // on, a labelled row renames its LABEL, not its file
+                        // (see sidebar.renameInitialText/performRename).
                         // Item 9: when the query matches this text directly,
                         // the match is highlighted via rich text.
                         //
@@ -3843,6 +4100,76 @@ Rectangle {
                             return sidebar.searchQuery !== "" ? sidebar.highlightMatch(base, sidebar.searchQuery) : base
                         }
                         color: "white"
+                    }
+
+                    // Inline rename editor — present only for the one row being
+                    // renamed (sidebar.renamingPath). See that property's doc
+                    // comment for why this swap is a deliberate, documented
+                    // exception to StyleGuide.md's "Always-editable text" rule,
+                    // and why the gate is renamingPath rather than activeFocus.
+                    TextField {
+                        id: rowRenameField
+                        objectName: "rowRenameField"
+                        Layout.alignment: Qt.AlignVCenter
+                        Layout.fillWidth: true
+                        visible: sidebar.renamingPath === treeDelegate.path
+                        color: "white"
+                        font.pixelSize: rowNameText.font.pixelSize
+                        padding: 0
+                        // StyleGuide.md "Text fields": underline background, not
+                        // the default boxed one.
+                        background: UnderlineField { focused: rowRenameField.activeFocus }
+
+                        // Item 13: a QQC2 TextField gets no I-beam on its own.
+                        // Declared on the field itself so it wins over the whole
+                        // row's PointingHandCursor (rowHover) while editing —
+                        // the row still reads as clickable, this text as typable.
+                        HoverHandler {
+                            cursorShape: Qt.IBeamCursor
+                        }
+
+                        // Guards the blur-commit below. Entering edit mode
+                        // (visible -> true) happens a frame before focus lands,
+                        // and the context-menu path arrives while the modal
+                        // popup is still releasing focus — without this, that
+                        // initial focus-less state reads as a blur and commits
+                        // instantly, closing the editor the moment it opened.
+                        property bool everFocused: false
+
+                        onVisibleChanged: {
+                            if (!rowRenameField.visible)
+                                return
+                            rowRenameField.everFocused = false
+                            // Seeded by beginRename() — the sidebar decides what
+                            // is being edited (see renameInitialText), this just
+                            // shows it.
+                            rowRenameField.text = sidebar.renamingText
+                            rowRenameField.forceActiveFocus()
+                            rowRenameField.selectAll()
+                        }
+
+                        // Keeps the sidebar's authoritative copy live. onTextEdited
+                        // (user typing), not onTextChanged — the latter also fires
+                        // for the programmatic seed above, which would race it.
+                        onTextEdited: sidebar.renamingText = rowRenameField.text
+
+                        onActiveFocusChanged: {
+                            if (rowRenameField.activeFocus) {
+                                rowRenameField.everFocused = true
+                                return
+                            }
+                            // StyleGuide.md "Always-editable text" commit
+                            // convention for a single-line field: commit on blur
+                            // as well as on Return. Only reached for a REAL blur
+                            // (clicking into MainPanel, say) — a click on another
+                            // tree row leaves this field focused, and is committed
+                            // by treeRowTap instead.
+                            if (rowRenameField.everFocused && sidebar.renamingPath === treeDelegate.path)
+                                sidebar.commitActiveRename()
+                        }
+
+                        onAccepted: sidebar.commitActiveRename()
+                        Keys.onEscapePressed: sidebar.cancelRename()
                     }
                 }
 
@@ -4651,6 +4978,7 @@ Rectangle {
             // for an empty-area click).
             Item {
                 id: ctxNewFolderRow
+                objectName: "ctxNewFolderRow"
                 width: parent.width
                 height: 28
 
@@ -4711,6 +5039,53 @@ Rectangle {
                     anchors.leftMargin: 8
                     anchors.verticalCenter: parent.verticalCenter
                     text: qsTr("Combine selected (%1)").arg(sidebar.selectedAudioPaths().length)
+                    color: "white"
+                    font.pixelSize: 12
+                }
+            }
+
+            // "Rename" — any real row (note or folder), never the empty-area
+            // click (ctxPath ""). Drops the row into inline edit mode rather
+            // than opening a dialog; the same edit a click on an
+            // already-selected row's name starts (see treeRowTap).
+            //
+            // Deferred: contextMenu is modal, and closing it hands focus back
+            // before the editor could take it — forcing focus into a field
+            // while the popup is still tearing down loses it again immediately,
+            // which reads as the editor flashing open and shutting.
+            Item {
+                id: ctxRenameRow
+                objectName: "ctxRenameRow"
+                visible: sidebar.ctxIsNote || sidebar.ctxIsDir
+                width: parent.width
+                height: 28
+
+                HoverHandler {
+                    id: ctxRenameHover
+                    cursorShape: Qt.PointingHandCursor
+                }
+                TapHandler {
+                    onTapped: {
+                        // Captured before close(): the menu's ctx* state is
+                        // shared, and the deferred call below runs after it may
+                        // have been retargeted.
+                        const target = sidebar.ctxPath
+                        const isDir = sidebar.ctxIsDir
+                        const label = sidebar.ctxLabel
+                        contextMenu.close()
+                        Qt.callLater(() => sidebar.beginRename(target, isDir, label))
+                    }
+                }
+                Rectangle {
+                    anchors.fill: parent
+                    radius: AppSettings.borderRadius
+                    color: ctxRenameHover.hovered ? "#3a3a3a" : "transparent"
+                }
+                Text {
+                    anchors.left: parent.left
+                    anchors.leftMargin: 8
+                    anchors.verticalCenter: parent.verticalCenter
+                    text: qsTr("Rename")
                     color: "white"
                     font.pixelSize: 12
                 }
@@ -4821,9 +5196,18 @@ Rectangle {
             // Item 2: "Delete file" — for any note row (audio or orphaned .md):
             // deletes the file and all its sidecars (audio + .md + partial), or
             // just the orphaned .md alone.
+            //
+            // Acts on the whole multi-selection when the right-clicked row is
+            // part of one, and says so ("Delete 3 items") rather than silently
+            // deleting more than the one row named in the menu — same
+            // selectionPathsFor() rule drag-to-move uses.
             Item {
                 id: ctxDeleteFileRow
                 visible: sidebar.ctxIsNote
+                // Re-evaluates on selectedPaths/ctxPath change (both are
+                // properties), so the count is always the live selection's.
+                readonly property int targetCount: sidebar.ctxIsNote
+                    ? sidebar.selectionPathsFor(sidebar.ctxPath, false).length : 1
                 width: parent.width
                 height: 28
 
@@ -4843,10 +5227,13 @@ Rectangle {
                     color: ctxDeleteFileHover.hovered ? "#3a3a3a" : "transparent"
                 }
                 Text {
+                    objectName: "ctxDeleteFileLabel"
                     anchors.left: parent.left
                     anchors.leftMargin: 8
                     anchors.verticalCenter: parent.verticalCenter
-                    text: qsTr("Delete file")
+                    text: ctxDeleteFileRow.targetCount > 1
+                          ? qsTr("Delete %1 items").arg(ctxDeleteFileRow.targetCount)
+                          : qsTr("Delete file")
                     color: "#e07a7a"
                     font.pixelSize: 12
                 }
@@ -5148,11 +5535,16 @@ Rectangle {
             Label {
                 width: parent.width
                 wrapMode: Text.WordWrap
-                text: sidebar.pendingDeleteMode === "transcript"
-                      ? qsTr("Delete the transcript for “%1”? The audio file is kept. Moved to the trash.")
-                        .arg(sidebar.pendingDeletePath.substring(sidebar.pendingDeletePath.lastIndexOf("/") + 1))
-                      : qsTr("Delete “%1” and its transcript? Moved to the trash.")
-                        .arg(sidebar.pendingDeletePath.substring(sidebar.pendingDeletePath.lastIndexOf("/") + 1))
+                text: {
+                    if (sidebar.pendingDeleteMode === "transcript")
+                        return qsTr("Delete the transcript for “%1”? The audio file is kept. Moved to the trash.")
+                            .arg(sidebar.pendingDeleteName())
+                    return sidebar.pendingDeletePaths.length > 1
+                        ? qsTr("Delete %1 items and their transcripts? Moved to the trash.")
+                            .arg(sidebar.pendingDeletePaths.length)
+                        : qsTr("Delete “%1” and its transcript? Moved to the trash.")
+                            .arg(sidebar.pendingDeleteName())
+                }
                 color: "white"
                 font.pixelSize: 12
             }
@@ -5203,7 +5595,11 @@ Rectangle {
                     Text {
                         id: fileDeleteConfirmLabel
                         anchors.centerIn: parent
-                        text: sidebar.pendingDeleteMode === "transcript" ? qsTr("Delete transcript") : qsTr("Delete file")
+                        text: sidebar.pendingDeleteMode === "transcript"
+                              ? qsTr("Delete transcript")
+                              : (sidebar.pendingDeletePaths.length > 1
+                                 ? qsTr("Delete %1 items").arg(sidebar.pendingDeletePaths.length)
+                                 : qsTr("Delete file"))
                         color: "#e07a7a"
                         font.pixelSize: 12
                     }

@@ -114,6 +114,7 @@ suop_add_test(tst_icontheme LINK_QUICK LINK_SVG ICON_ASSETS SOURCES IconTheme.cp
 # "IconTheme is not defined" at load.
 suop_add_test(tst_sidebar_keynav LINK_QUICK LINK_SVG ICON_ASSETS SOURCES VaultTreeModel.cpp VaultSearchProxyModel.cpp IconTheme.cpp)
 suop_add_test(tst_sidebar_dragmove LINK_QUICK LINK_SVG ICON_ASSETS SOURCES VaultTreeModel.cpp VaultSearchProxyModel.cpp IconTheme.cpp)
+suop_add_test(tst_sidebar_rename LINK_QUICK LINK_SVG ICON_ASSETS SOURCES VaultTreeModel.cpp VaultSearchProxyModel.cpp IconTheme.cpp)
 suop_add_test(tst_sidebar_expand LINK_QUICK LINK_SVG ICON_ASSETS SOURCES VaultTreeModel.cpp VaultSearchProxyModel.cpp IconTheme.cpp)
 suop_add_test(tst_sidebar_guides LINK_QUICK LINK_SVG ICON_ASSETS SOURCES VaultTreeModel.cpp VaultSearchProxyModel.cpp IconTheme.cpp)
 suop_add_test(tst_usbdevicemonitor LINK_DBUS SOURCES UsbDeviceMonitor.cpp)

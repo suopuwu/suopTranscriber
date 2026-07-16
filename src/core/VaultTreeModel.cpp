@@ -29,6 +29,30 @@ bool isAudioFile(const QFileInfo &info)
     return audioExtensions().contains(info.suffix().toLower());
 }
 
+// Shared name validator for a single filesystem entry the user typed
+// (createFolder()'s new folder, renameFolder()'s new name). The invalid-char
+// set is the one renameFile() rejects — it includes both path separators, so a
+// validated name can never be multi-segment or escape its parent directory.
+// renameFile() keeps its own copy of this check rather than calling here: it
+// reports WHICH character was rejected through *errorOut, which this bool
+// can't express.
+bool isValidEntryName(const QString &name)
+{
+    const QString trimmed = name.trimmed();
+    if (trimmed.isEmpty())
+        return false;
+
+    static const QString invalidChars = QStringLiteral("/\\:*?\"<>|");
+    for (const QChar &c : name) {
+        if (invalidChars.contains(c))
+            return false;
+    }
+    // "." / ".." aren't separators but still name an existing directory rather
+    // than a new child — reject explicitly rather than rely on a collision
+    // check, which they'd pass.
+    return trimmed != QStringLiteral(".") && trimmed != QStringLiteral("..");
+}
+
 // Destructive delete for a user-triggered UI action (Item 2): prefer the
 // trash (recoverable) over a permanent remove, falling back to remove() only
 // if the platform/filesystem can't trash. Returns false if the path doesn't
@@ -490,22 +514,9 @@ QString VaultTreeModel::importDestinationFor(const QUrl &fileUrl, QString *error
 
 bool VaultTreeModel::createFolder(const QUrl &parentDirUrl, const QString &name)
 {
+    if (!isValidEntryName(name))
+        return false;
     const QString trimmed = name.trimmed();
-    if (trimmed.isEmpty())
-        return false;
-
-    // Same invalid-character set renameFile() rejects — this also covers the
-    // path separators '/' and '\\', so `name` can never be a multi-segment
-    // path or escape parentDir.
-    static const QString invalidChars = QStringLiteral("/\\:*?\"<>|");
-    for (const QChar &c : name) {
-        if (invalidChars.contains(c))
-            return false;
-    }
-    // "." / ".." aren't separators but still name an existing dir rather than
-    // a new child — reject explicitly rather than rely on the collision check.
-    if (trimmed == QStringLiteral(".") || trimmed == QStringLiteral(".."))
-        return false;
 
     const QString parentPath = parentDirUrl.toLocalFile();
     if (parentPath.isEmpty())
@@ -551,6 +562,54 @@ bool VaultTreeModel::deleteFolder(const QUrl &folderUrl)
 
     if (!QDir(path).removeRecursively())
         return false;
+
+    rebuild();
+    return true;
+}
+
+bool VaultTreeModel::renameFolder(const QUrl &folderUrl, const QString &newName, QString *errorOut)
+{
+    auto fail = [&](const QString &msg) {
+        if (errorOut)
+            *errorOut = msg;
+        return false;
+    };
+
+    if (!isValidEntryName(newName))
+        return fail(QStringLiteral("Invalid folder name."));
+    const QString trimmed = newName.trimmed();
+
+    const QString path = folderUrl.toLocalFile();
+    if (path.isEmpty())
+        return fail(QStringLiteral("Folder does not exist."));
+
+    const QFileInfo info(path);
+    if (!info.exists() || !info.isDir())
+        return fail(QStringLiteral("Folder does not exist."));
+
+    const QString canonical = info.canonicalFilePath();
+    const QString vaultCanonical = QFileInfo(vaultLocalPath()).canonicalFilePath();
+    if (canonical.isEmpty() || vaultCanonical.isEmpty())
+        return fail(QStringLiteral("Folder does not exist."));
+    // Same two guards as deleteFolder(): never the vault root itself (renaming
+    // it would move the whole vault out from under the open window), and never
+    // anything outside the vault. isPathInsideVault() also accepts the root,
+    // hence the explicit equality guard first.
+    if (canonical == vaultCanonical)
+        return fail(QStringLiteral("Can't rename the vault root."));
+    if (!isPathInsideVault(path))
+        return fail(QStringLiteral("Folder is outside the vault."));
+
+    // A pure rename in place — the parent never changes (moveFolder() owns
+    // reparenting), so a validated name can only ever land beside itself.
+    const QString newPath = info.absolutePath() + '/' + trimmed;
+    if (newPath == info.absoluteFilePath())
+        return true; // no-op: same name, not a failure worth reporting
+    if (QFileInfo::exists(newPath))
+        return fail(QStringLiteral("A folder with that name already exists."));
+
+    if (!QDir().rename(path, newPath))
+        return fail(QStringLiteral("Failed to rename folder."));
 
     rebuild();
     return true;
@@ -703,7 +762,7 @@ bool VaultTreeModel::deleteTranscript(const QUrl &fileUrl)
     return true;
 }
 
-bool VaultTreeModel::deleteFile(const QUrl &fileUrl)
+bool VaultTreeModel::deleteFileEntry(const QUrl &fileUrl)
 {
     const QString path = fileUrl.toLocalFile();
     if (path.isEmpty())
@@ -729,9 +788,44 @@ bool VaultTreeModel::deleteFile(const QUrl &fileUrl)
         trashOrRemove(dirPath + "/." + info.fileName() + ".partial.jsonl");
     }
 
+    return true;
+}
+
+bool VaultTreeModel::deleteFile(const QUrl &fileUrl)
+{
+    if (!deleteFileEntry(fileUrl))
+        return false;
+
     rebuild();
     emit fileDeleted(fileUrl);
     return true;
+}
+
+int VaultTreeModel::deleteFiles(const QList<QUrl> &fileUrls)
+{
+    // One rebuild() for the whole batch, not one per file: rebuild() rescans
+    // the vault recursively AND resets the model (destroying/recreating every
+    // realized delegate), so looping deleteFile() over a 20-file selection
+    // would pay both costs 20 times over for a single user action.
+    QList<QUrl> deleted;
+    deleted.reserve(fileUrls.size());
+    for (const QUrl &url : fileUrls) {
+        if (deleteFileEntry(url))
+            deleted.append(url);
+    }
+
+    if (deleted.isEmpty())
+        return 0;
+
+    rebuild();
+    // Emitted only after the single rebuild, so a listener that re-reads the
+    // tree (MainPanel closing the deleted file) never sees a model still
+    // advertising rows whose files are already gone. Per surviving file, not
+    // once for the batch — fileDeleted's contract is one file per emission,
+    // and MainPanel matches it against the file it has open.
+    for (const QUrl &url : deleted)
+        emit fileDeleted(url);
+    return deleted.size();
 }
 
 QStringList VaultTreeModel::vaultFolders() const

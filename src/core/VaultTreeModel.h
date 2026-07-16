@@ -2,6 +2,7 @@
 
 #include <QAbstractItemModel>
 #include <QFileSystemWatcher>
+#include <QList>
 #include <QStringList>
 #include <QUrl>
 #include <QVariantList>
@@ -113,6 +114,17 @@ public:
     // rolls back a partial move on failure. rebuild()s on success.
     Q_INVOKABLE bool moveFile(const QUrl &fileUrl, const QUrl &destDirUrl);
 
+    // Inline rename: renames folderUrl in place, keeping it in its current
+    // parent (moveFolder() below owns reparenting — this never changes where
+    // the folder sits). Guarded like deleteFolder(): refuses the vault root
+    // itself, anything outside the vault, a name that's empty/whitespace-only
+    // or holds a filesystem-invalid character (the shared isValidEntryName()
+    // check createFolder() uses — path separators included, so a name can
+    // never escape its parent), and a collision with an existing entry.
+    // Renaming to the name it already has is a no-op that returns true, not a
+    // collision failure. Returns false and sets *errorOut otherwise.
+    Q_INVOKABLE bool renameFolder(const QUrl &folderUrl, const QString &newName, QString *errorOut = nullptr);
+
     // Item 40: moves/renames a folder into destParentUrl (QDir::rename).
     // Guarded like deleteFolder() (never the vault root, never outside the
     // vault) plus: refuses to move a folder into itself or one of its own
@@ -143,6 +155,17 @@ public:
     // root); returns false if the named file doesn't exist. rebuild()s +
     // emits fileDeleted(fileUrl) on success.
     Q_INVOKABLE bool deleteFile(const QUrl &fileUrl);
+
+    // Multi-select delete: deleteFile() over a whole selection, but with a
+    // SINGLE rebuild() for the batch rather than one per file (rebuild()
+    // rescans the vault recursively AND resets the model, so that cost is paid
+    // once per user action, not once per file). Identical per-file guards and
+    // trash-first behavior to deleteFile(); a file that fails its guards is
+    // skipped rather than aborting the batch, so one bad entry in a selection
+    // can't strand the valid ones. Emits fileDeleted() once per file actually
+    // deleted, after the rebuild. Returns how many were deleted — callers
+    // compare against fileUrls.size() to detect partial failure.
+    Q_INVOKABLE int deleteFiles(const QList<QUrl> &fileUrls);
 
     // Item 40: every real directory inside the vault (walks the filesystem
     // directly, NOT the pruned tree — a freshly-created empty folder must be a
@@ -299,6 +322,11 @@ private:
     };
 
     void rebuild();
+    // The guards + trash of one deleteFile(), WITHOUT the rebuild()/
+    // fileDeleted() that must happen once for a whole batch — shared by
+    // deleteFile() (one file) and deleteFiles() (a selection). Returns whether
+    // the file itself was trashed; absent optional sidecars aren't failures.
+    bool deleteFileEntry(const QUrl &fileUrl);
     std::unique_ptr<Node> scanDirectory(const QString &dirPath, Node *parent) const;
     Node *nodeFromIndex(const QModelIndex &index) const;
     // Backs refreshFile() — plain depth-first search by absolute path (the

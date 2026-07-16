@@ -68,6 +68,18 @@ must show both:
   as everywhere else) and give the OTHER action its own small dedicated
   trigger icon (e.g. a `⇅` sort/filter `Text` + `TapHandler`) — never the
   field's own click.
+- **Carve-out — inline rename in a list/tree row** (`Sidebar.qml`'s
+  `rowRenameField`): a tree row genuinely can't be always-editable — a plain
+  click on a row's name must open the file, not place a text cursor — so it
+  IS a display-vs-edit swap. The rule's actual hazard (the field vanishing
+  under a focus steal) is still barred: gate the swap on an explicit
+  "which row is being renamed" property, **never on `activeFocus`**, so the
+  native right-click "Copy" menu can't dismiss the editor. Blur still
+  commits, but only once the field has actually held focus — entering edit
+  mode is a frame ahead of focus landing, and a modal context menu closing
+  releases focus later still; without that guard the opening frame reads as
+  a blur and commits instantly. Applies only to rows in a list/tree; a
+  panel field is always-editable per the rule above.
 - Commit convention:
   - Single-line fields (title, a name, a tag): commit on `Return`
     (`onAccepted`) AND on blur (`onActiveFocusChanged: if (!activeFocus)
