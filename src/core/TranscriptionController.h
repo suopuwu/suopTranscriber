@@ -1209,7 +1209,14 @@ private:
     // SEARCH semantics (not anchored unless the pattern itself has ^/$)
     // against the full filename (name+ext). A match's capture groups
     // (captured(1..N), concatenated, EXCLUDING the sortGroupIndex one if the
-    // rule has one — see below) are the group-identity "key" — an
+    // rule has one — see below) are the group-identity "key", together with
+    // the file's CONTAINING FOLDER: a rule only ever sees the bare filename,
+    // so identically-named parts sitting in two different folders are two
+    // separate groups, never one cross-folder group. They're unrelated
+    // recordings that merely share a naming scheme, and the vault tree can't
+    // draw one outline around rows that aren't siblings regardless. This also
+    // makes outputPath unambiguous — the merged file always lands in the
+    // group's own folder. An
     // uncaptured wildcard span (bare `.`, `\d{3}`, `.*`, ...) varies freely
     // between members without affecting grouping, matching the user's
     // stated model of "the rule gets the real string with the wildcard

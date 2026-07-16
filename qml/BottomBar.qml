@@ -144,10 +144,10 @@ Item {
     // the button never doubles as a stop — during a phase that can't be
     // paused yet ("loading") it's simply greyed (see canPauseNow()), not
     // shown with a distinct stop affordance.
-    function playPauseGlyph() {
+    function playPauseIconName() {
         if (!bottomBar.busy)
-            return "▶"
-        return bottomBar.activePaused ? "▶" : "⏸"
+            return "play"
+        return bottomBar.activePaused ? "play" : "pause"
     }
     // activeElapsedMs/estimatedRemainingMs are plain invokables (no NOTIFY
     // signal — see TranscriptionController::activeElapsedMs()'s doc
@@ -378,11 +378,11 @@ Item {
                 anchors.fill: parent
                 active: settingsHover.hovered
             }
-            Text {
+            AppIcon {
                 anchors.centerIn: parent
-                text: "⚙"
+                name: "settings"
+                iconSize: 12
                 color: "#aaaaaa"
-                font.pixelSize: 12
             }
         }
 
@@ -526,11 +526,11 @@ Item {
                 anchors.fill: parent
                 active: pauseHover.hovered
             }
-            Text {
+            AppIcon {
                 anchors.centerIn: parent
-                text: bottomBar.playPauseGlyph()
+                name: bottomBar.playPauseIconName()
+                iconSize: 11
                 color: "#dddddd"
-                font.pixelSize: 11
             }
         }
 
@@ -710,11 +710,11 @@ Item {
                         anchors.fill: parent
                         active: popupPauseHover.hovered
                     }
-                    Text {
+                    AppIcon {
                         anchors.centerIn: parent
-                        text: bottomBar.playPauseGlyph()
+                        name: bottomBar.playPauseIconName()
+                        iconSize: 12
                         color: "#dddddd"
-                        font.pixelSize: 12
                     }
                 }
                 // Item 3: cancels every Queued job, then the Active one too
@@ -975,11 +975,11 @@ Item {
                                         anchors.fill: parent
                                         active: moveUpHover.hovered
                                     }
-                                    Text {
+                                    AppIcon {
                                         anchors.centerIn: parent
-                                        text: "▲"
+                                        name: "move-up"
+                                        iconSize: 9
                                         color: "#dddddd"
-                                        font.pixelSize: 9
                                     }
                                 }
                                 Item {
@@ -1002,11 +1002,11 @@ Item {
                                         anchors.fill: parent
                                         active: moveDownHover.hovered
                                     }
-                                    Text {
+                                    AppIcon {
                                         anchors.centerIn: parent
-                                        text: "▼"
+                                        name: "move-down"
+                                        iconSize: 9
                                         color: "#dddddd"
-                                        font.pixelSize: 9
                                     }
                                 }
 
@@ -1040,11 +1040,11 @@ Item {
                                         anchors.fill: parent
                                         active: closeHover.hovered
                                     }
-                                    Text {
+                                    AppIcon {
                                         anchors.centerIn: parent
-                                        text: "×"
+                                        name: "close"
+                                        iconSize: 13
                                         color: "#dddddd"
-                                        font.pixelSize: 13
                                     }
                                 }
                             }

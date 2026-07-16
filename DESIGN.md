@@ -258,10 +258,87 @@ vault/
 
 ## USB import
 
-- Enumerate removable drives with `QStorageInfo::mountedVolumes()`.
-- User picks device(s); persist their identifiers in `config.json`.
-- On "grab new," diff by filename + hash against the vault and copy only new
-  audio in.
+- **Detection:** `UsbDeviceMonitor` (`src/core/UsbDeviceMonitor.h/.cpp`) watches
+  UDisks2 over D-Bus (`InterfacesAdded`/`InterfacesRemoved`) for mounted removable
+  volumes — not `QStorageInfo::mountedVolumes()` polling.
+- **External media only (safety-critical):** a mounted filesystem becomes a visible
+  device *only* if it passes `usbDeviceIsExternalMedia()` — UDisks2's
+  `Block.HintSystem` must be false **and** the backing `Drive` must be either
+  `Removable` or on a `usb`/`sdio` `ConnectionBus`. Both are required: `HintSystem`
+  is only a hint (udev's `UDISKS_SYSTEM` can set it on anything) so it can't be the
+  sole positive evidence, while `Removable`/`ConnectionBus` say nothing about
+  whether the OS considers the device its own. Unreadable properties fail closed.
+  This gate is load-bearing rather than cosmetic: "is it mounted?" alone makes `/`
+  and `/boot` ordinary grab targets that the `"*"` catch-all rule would recurse
+  into and copy wholesale into the vault. Internal drives are invisible to the
+  monitor, not merely deprioritised by its callers.
+- **Defence in depth:** independently of the above, `usbGrabRefusalReason()`
+  (`UsbGrabJob.h`) re-checks the concrete paths of each run and refuses a scan root
+  that canonicalises to `/`, one that doesn't exist, or a destination vault nested
+  inside the scan root (which would make the walk feed itself). Deliberately
+  redundant with the detection gate — a rule pointed somewhere catastrophic is
+  refused even if enumeration ever hands up something it shouldn't have.
+- **Devices vs. volumes (two identities, don't conflate):** a physical device can
+  mount several filesystems at once — a multi-LUN recorder exposing internal memory
+  and an SD card is one UDisks2 `Drive` (one Vendor/Model/Serial) behind two `Block`
+  objects. So `UsbDeviceInfo::serial` identifies the **device**, is stable across
+  replug, is the rule key, is shared by that device's volumes, and may be empty;
+  while `UsbDeviceInfo::id` identifies the **volume**, is the UDisks2 block-device
+  object path, is unique, is runtime-only (`/dev/sda` can return as `/dev/sdc`), and
+  must never be persisted or used as a rule key. `deviceAdded`/`deviceRemoved` and
+  the controller's in-flight job map are all per-volume, keyed by `id`. Keying
+  runtime state by `serial` is a shipped-and-fixed bug: it made unmounting one
+  volume report *both* as gone, let two concurrent jobs for one device evict each
+  other, and left a two-volume recorder's second volume permanently un-grabbed.
+- **Rules:** one `UsbGrabRule` (`src/core/UsbRuleStore.h`) per device, keyed by a
+  stable serial, plus a `"*"` catch-all rule that applies to any device without
+  its own enabled rule. One rule covers a device's every volume — the UI shows one
+  row per device (with a volume count), and a grab runs one job per mounted volume
+  under that single rule, so nothing is silently skipped. Per-volume rules are not
+  offered: volumes have no stable identity to key them by (the dev machine's
+  recorder reports an identical serial *and* an identical filesystem UUID for both
+  of its volumes). Rules are **app-scoped** (`QSettings`, not the vault's
+  `.transcriber/settings.json`) since the same physical device is reused across
+  vaults. Each rule carries: `enabled`, `extensionFilter` (empty = all files),
+  `preserveStructure` (mirror the device's subfolder layout vs. flatten),
+  `startFolder` (relative to the device root), and `destinationFolder` (relative
+  to the *vault* root; empty = vault root, created automatically on first grab if
+  it doesn't exist yet).
+- **Grab (`UsbGrabJob`/`UsbGrabJobWorker`, `src/core/UsbGrabJob.h/.cpp`):** runs on
+  its own worker thread (same QThread+moveToThread shape as `AudioRecorder`), never
+  the GUI thread — recursively walks the device, diffs against files already in the
+  destination folder by **rsync's quick-check: filename + size + mtime**, and copies
+  only files that are both filter-matching and not already present (never silently
+  overwrites a same-named-but-different file — appends a numeric suffix instead).
+  Triggered either manually (`UsbGrabberController::triggerManualGrab()`) or
+  automatically on hotplug when a device's own rule (or the catch-all) is enabled
+  and a vault is open — auto-grabs always target whichever vault is open at that
+  moment, never a pinned path.
+  - **Why not a content hash** (it was one, until it wasn't): hashing is O(bytes on
+    the device), and it's slowest in exactly the case it's asked about most — a
+    device whose files are *already* grabbed, where every candidate is byte-identical
+    so no size check can short-circuit and every file is read in full. Measured on a
+    13.8 GB recorder over USB at ~9 MB/s, a preview took **~25 minutes** and looked
+    hung. The quick-check reads no file content and answers instantly. The tradeoff
+    accepted: a file that keeps its name, size AND mtime while its bytes change is
+    wrongly skipped — recorders don't do that, and the cost is a visible missed
+    import, not data loss (nothing is ever overwritten).
+  - **The copy must stamp the source's mtime onto the copy** (`QFileDevice::
+    setFileTime`). `QFile::copy()` gives the copy a *fresh* mtime, so without the
+    stamp no grabbed file would ever match its source again and every grab would
+    re-copy the whole device under `_1`/`_2`/… suffixes. The quick-check is only
+    sound because of this.
+- **Preview:** `UsbGrabberController::requestGrabPreview()` runs the identical
+  scan/filter/quick-check logic in a dry-run mode (`UsbGrabJob::startPreview()`) —
+  no copying, no history entry — and returns a line-by-line classification of
+  every file the scan sees: `"grab"` (would be copied), `"duplicate"` (matches the
+  filter but a file with the same name, size and mtime is already present at the
+  destination), or `"filtered"` (extension doesn't match the rule). Async, like the
+  real grab: the walk still stats every file on an external device, which is too
+  slow for the GUI thread.
+- **History:** each completed grab appends one entry (timestamp, device, files
+  copied/skipped, errors) to the vault-scoped `.transcriber/usbGrabHistory.json`
+  via `VaultTreeModel::appendUsbGrabHistoryEntry()`.
 
 ## Model management
 
@@ -281,9 +358,56 @@ vault/
   speaker-detection tdrz override above, which is an intentional, always-on
   substitution rather than a fallback for bad input.
 
+## Iconography (swappable icon packs)
+
+Icons are a **pack system**, not hardcoded glyphs. The whole UI names icons
+semantically (`AppIcon { name: "transcribe" }`); which pack draws them is a
+setting.
+
+- **A pack is a directory** under `assets/icons/<id>/`: a `pack.json` manifest
+  plus, for svg packs, the SVG files it names. Packs are **discovered** by
+  scanning that tree in the Qt resource system (`IconTheme::loadPacksFrom`) —
+  there is no hardcoded pack list, so loading packs from a user directory
+  later is the same loader over a different root (deliberately the only thing
+  that changes). The CMake glob that bundles the assets is `RELATIVE` so each
+  resource alias matches `IconTheme`'s `kIconRoot`.
+- **Two built-in packs.** `material` (default) — Google Material Symbols
+  Rounded, one SVG per icon, fills stripped so the app owns tint. `classic` —
+  the app's original hand-rolled set (Unicode glyphs + two drawn shapes),
+  kept as an opt-in pack. `material` is also the **fallback**: it must define
+  every name any pack defines, so resolution can't bottom out at nothing
+  (asserted by `tst_icontheme`).
+- **Three icon kinds**, so one pack can mix them: `glyph` (a Unicode char in
+  a `Text`), `svg` (rastered + tinted by `IconImageProvider`), and `builtin`
+  (a small drawn `Canvas` component — `PlayGlyph`/`PauseGlyph`, which exist
+  because a font `▶` can't be reliably centered on its triangle). `AppIcon`
+  routes to the right renderer; its `builtins` map is closed, never an
+  arbitrary URL a pack could name.
+- **Resolution order:** per-icon override → active pack → fallback pack, each
+  step skipped (not terminal) if that pack lacks the name, so a partial pack
+  degrades per-icon. `IconTheme::resolve(name, packId, overrides)` is a
+  **pure function** of its args — `AppIcon` binds it to both
+  `AppSettings.iconPack` and `AppSettings.iconOverrides`, so switching packs
+  or overriding one icon re-resolves every icon in the app with no
+  change-signal plumbing.
+- **Two vault-scoped settings** (`AppSettings`, persisted like all
+  appearance prefs): `iconPack` (the default pack) and `iconOverrides` (a
+  `name → packId` map letting the user pull individual icons from another
+  pack). Both are editable from Settings → Appearance (a pack-picker chip row
+  plus a per-icon override grid).
+- **Rendering cost:** `IconImageProvider` tints each svg once into a QImage
+  cached by `(pack, file, color, size)` — chosen over per-call-site
+  `MultiEffect { colorization }` because the app instantiates 100+ icons
+  (the sidebar's per-row clusters exist for every row, opacity-0 until
+  hover); that many live offscreen render passes would be wasteful for what
+  are static monochrome images.
+- Call-site conventions live in StyleGuide.md "Iconography".
+
 ## Licensing
 
 - whisper.cpp MIT; faster-whisper/CTranslate2 MIT; NeMo Apache-2.0.
+- **Google Material Symbols** (the default icon pack, vendored under
+  `assets/icons/material/`) is Apache-2.0 — `LICENSE` ships beside the SVGs.
 - **Qt: dynamically link** (LGPL) if distributing closed-source.
 - ffmpeg: **LGPL build** (audio-only needs nothing GPL).
 - Out-of-process engines keep any GPL-ish Python deps behind a process boundary,

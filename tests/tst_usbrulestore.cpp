@@ -50,6 +50,7 @@ private slots:
         QCOMPARE(rule.preserveStructure, true);
         QVERIFY(rule.extensionFilter.isEmpty());
         QVERIFY(rule.startFolder.isEmpty());
+        QVERIFY(rule.destinationFolder.isEmpty());
     }
 
     void saveRule_roundTripsEveryField()
@@ -62,6 +63,7 @@ private slots:
         rule.preserveStructure = false;
         rule.startFolder = QStringLiteral("Recordings/Voice");
         rule.deviceLabel = QStringLiteral("Zoom H1n");
+        rule.destinationFolder = QStringLiteral("Interviews/USB");
         store.saveRule(rule);
 
         const UsbGrabRule loaded = store.ruleForSerial(QStringLiteral("ABC123"));
@@ -71,6 +73,7 @@ private slots:
         QCOMPARE(loaded.preserveStructure, rule.preserveStructure);
         QCOMPARE(loaded.startFolder, rule.startFolder);
         QCOMPARE(loaded.deviceLabel, rule.deviceLabel);
+        QCOMPARE(loaded.destinationFolder, rule.destinationFolder);
     }
 
     void saveRule_upsertsRatherThanDuplicating()

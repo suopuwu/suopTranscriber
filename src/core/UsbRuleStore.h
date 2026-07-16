@@ -15,6 +15,7 @@ struct UsbGrabRule {
     bool preserveStructure = true;
     QString startFolder;         // relative path from device root to start recursive search; "" = device root
     QString deviceLabel;         // human-readable vendor/model string, for display purposes only, not identity
+    QString destinationFolder;   // relative path from vault root to grab into; "" = vault root, created if missing
 };
 
 // Persists UsbGrabRule entries APP-SCOPED via QSettings (NOT vault-scoped

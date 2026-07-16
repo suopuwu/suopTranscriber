@@ -218,6 +218,47 @@ Rectangle {
     // sliding the anchor to wherever the previous Shift-click landed).
     property string lastClickedPath: ""
 
+    // Expand/collapse state for EMPTY directories only — populated ones use
+    // TreeView's own expanded state, which is the single source of truth for
+    // them. This exists because QQuickTreeView flatly refuses to expand a
+    // childless node: toggleExpanded()/expand() leave isExpanded(row) false
+    // forever (verified against the live view in tst_sidebar_expand.cpp), and
+    // yet the delegate's `expanded` property still latches to true on the
+    // attempt and never clears — so reading `expanded` for an empty folder
+    // gives a glyph that flips to "−" once and sticks there. The delegate
+    // therefore never calls toggleExpanded() on a childless dir, and reads
+    // this instead.
+    //
+    // Nothing is revealed either way (an empty folder has nothing to reveal),
+    // so this is purely the glyph's state — kept because a folder that can't
+    // be toggled at all reads as broken next to siblings that can.
+    //
+    // Tracks the COLLAPSED ones, not the expanded ones, because the default is
+    // expanded: tree.expandAll() runs on every model reset, so every populated
+    // folder shows "−" by default and an empty one defaulting to "+" would look
+    // arbitrary. expandAll() clears this for the same reason — it already blows
+    // away a user's collapse of a POPULATED folder, so empty folders forgetting
+    // theirs at the same moment is parity, not data loss.
+    property var collapsedEmptyDirs: ({})
+
+    function isEmptyDirCollapsed(path) {
+        return sidebar.collapsedEmptyDirs[path] === true
+    }
+
+    // Reassigns rather than mutates: a `var` property holding an object emits
+    // no change signal when you poke a key into it, so the delegates' glyph
+    // bindings would never re-evaluate.
+    function toggleEmptyDirCollapsed(path) {
+        const next = {}
+        for (const k in sidebar.collapsedEmptyDirs)
+            next[k] = true
+        if (next[path])
+            delete next[path]
+        else
+            next[path] = true
+        sidebar.collapsedEmptyDirs = next
+    }
+
     // Item 41: the moving end of a keyboard range gesture (Shift+Up/Down) —
     // distinct from lastClickedPath, which is the fixed anchor the range is
     // measured FROM. A plain click/plain arrow/group-jump collapses both to
@@ -590,7 +631,14 @@ Rectangle {
     // Right/Left move keyboard focus into and along the current row's action-
     // button cluster; Left off the first button (direction -1 from index 0)
     // returns to the row. currentRowActionButtons() lists exactly the buttons
-    // the treeDelegate renders for currentPath, in the same declaration order.
+    // the treeDelegate renders for currentPath, in VISUAL left-to-right order
+    // — actionButtonRow is layoutDirection: Qt.RightToLeft, so its declaration
+    // order (transcribe first) runs RIGHT-to-left on screen and this function
+    // reverses it at the end. That reversal is what makes Right actually move
+    // right: the cluster is anchored to the row's right edge, so walking
+    // rightward from the label enters at the cluster's LEFTMOST button and
+    // ends on transcribe (rightmost), and Left off the leftmost drops back to
+    // the row — one continuous left-to-right axis from the filename outward.
     function currentRowActionButtons() {
         if (sidebar.currentPath === "" || sidebar.searchQuery !== "")
             return []
@@ -618,7 +666,11 @@ Rectangle {
             // (any note — audio or orphaned .md).
             if (isAudio || isOrphanedMd)
                 list.push("runAll")
-            return list
+            // Built above in actionButtonRow's declaration order (so the
+            // eligibility rules read alongside the buttons they mirror);
+            // reversed here into the on-screen left-to-right order Left/Right
+            // navigate along — see this function's doc comment.
+            return list.reverse()
         }
         return []
     }
@@ -761,6 +813,14 @@ Rectangle {
             sidebar.lastClickedPath = ""
             sidebar.selectionCursorPath = ""
             sidebar.actionButtonFocus = ""
+            // Item 40 (drag-to-move): a reset recreates every delegate,
+            // including the one whose DragHandler is driving an in-flight
+            // drag. The vault watcher fires on any vault change (a
+            // transcription finishing mid-drag, say), so this isn't only the
+            // drag's own move landing — abandon the gesture rather than leave
+            // rowDragGhost stranded on screen with no handler left to end it.
+            if (sidebar.rowDragActive)
+                sidebar.endRowDrag(false)
         }
     }
 
@@ -958,23 +1018,52 @@ Rectangle {
                 groupRankOf[key] = rank
         }
 
+        // Three elements, compared in order: groupRank (where the whole
+        // cluster sits among everything else), then the cluster's own
+        // IDENTITY, then the member's position within it.
+        //
+        // Bug: this used to be just [groupRank, memberOrderRank], which
+        // silently stopped clustering whenever two DIFFERENT groups computed
+        // the same groupRank — not a contrived case, it's the norm for this
+        // app's own "acme mic 3" rule. That rule keys on date+edit/orig, and
+        // the recorder writes each pair's edit and orig files at the same
+        // instant, so both groups have byte-identical mtimes and therefore
+        // an identical min-mtime groupRank. With element 0 tied, element 1
+        // tied too (each pair's edit and orig are both member #1 of their
+        // own group), so every comparison fell through to the proxy's
+        // row()-order default — i.e. plain alphabetical, which interleaves
+        // edit/orig one row apart. Nothing was adjacent, so every member
+        // also drew its own isolated CombineGroupOutline box instead of one
+        // merged run (that outline reads adjacency off displayOrder below,
+        // so it was consistently wrong in the same way, not separately
+        // broken). Making cluster identity its own tier means a tie on
+        // groupRank orders the two clusters arbitrarily-but-consistently
+        // rather than shuffling their members together.
+        //
+        // Ungrouped files use their own path as the identity — unique per
+        // file, so a lone file whose ownRank happens to tie a group's
+        // groupRank lands cleanly before or after that whole group instead
+        // of inside it.
         const sortKeys = {}
         for (const path of audioPaths) {
             const key = clusterKeyOf[path]
             sortKeys[path] = [key !== undefined ? groupRankOf[key] : ownRank(path),
+                               key !== undefined ? key : path,
                                key !== undefined ? memberOrderRank(path) : ownRank(path)]
         }
 
         // Adjacency (combineTopMerged/combineBottomMerged) has to be
         // computed from the SAME order the tree actually ends up displaying
         // — see this property's doc comment above for the bug that bit when
-        // this used allAudioPaths()'s raw order instead.
+        // this used allAudioPaths()'s raw order instead. Must compare every
+        // element VaultSearchProxyModel::lessThan() does, in the same order,
+        // for exactly that reason.
         const displayOrder = audioPaths.slice().sort((a, b) => {
             const ka = sortKeys[a], kb = sortKeys[b]
-            if (ka[0] !== kb[0])
-                return ka[0] < kb[0] ? -1 : 1
-            if (ka[1] !== kb[1])
-                return ka[1] < kb[1] ? -1 : 1
+            for (let i = 0; i < 3; i++) {
+                if (ka[i] !== kb[i])
+                    return ka[i] < kb[i] ? -1 : 1
+            }
             return 0
         })
         const topMerged = {}
@@ -1049,6 +1138,50 @@ Rectangle {
             if (sidebar.hoveredCombineGroup === outputPath)
                 sidebar.hoveredCombineGroup = ""
         }
+    }
+
+    // Which directory row the pointer is inside right now ("" = none). Pushed
+    // by each directory row's own HoverHandler, because a folder highlight
+    // covers the folder AND its contents (see treeDelegate.inFolderHighlight)
+    // and a descendant row has no way to see an ANCESTOR's hover state from
+    // its own handlers.
+    //
+    // Guarded clear rather than an unconditional one: moving the pointer
+    // straight from folder A to folder B can deliver B's enter before A's
+    // leave, and clearing unconditionally on A's leave would then wipe B's
+    // highlight — the same last-write-wins trap hoveredCombineGroup documents
+    // above. Only one directory row can be hovered at a time (rows don't
+    // overlap), so unlike hoveredCombineGroup this needs no reference count.
+    property string hoveredFolderPath: ""
+    function enterFolderHover(path) {
+        sidebar.hoveredFolderPath = path
+    }
+    function leaveFolderHover(path) {
+        if (sidebar.hoveredFolderPath === path)
+            sidebar.hoveredFolderPath = ""
+    }
+
+    // Is `path` the folder `folderPath` itself, or anything inside it? The
+    // vault tree IS the directory structure, so containment is a pure path
+    // prefix test — no model walk needed. The trailing "/" matters: without
+    // it "Interviews2/x.mp3" would count as being inside "Interviews".
+    function isUnderFolder(path, folderPath) {
+        return folderPath !== "" && path !== ""
+                && (path === folderPath || path.startsWith(folderPath + "/"))
+    }
+
+    // The path at a given TreeView row, or "" out of range. rowCount is passed
+    // in rather than read off tree.rows in here so that a BINDING calling this
+    // takes a real dependency on the row count: tree.index()/searchProxy.data()
+    // are plain function calls that create no dependency of their own, so a
+    // binding that didn't mention rows would go stale the moment an
+    // expand/collapse inserted or removed rows underneath it (rowCount is used
+    // for the bounds check, so it's a genuine argument, not a dummy dependency
+    // that a QML compiler could optimize away).
+    function pathAtTreeRow(row, rowCount) {
+        if (row < 0 || row >= rowCount)
+            return ""
+        return searchProxy.data(tree.index(row, 0), VaultTreeModel.PathRole) || ""
     }
 
     // path -> true, populated/depopulated by delegates as they realize/
@@ -1188,6 +1321,142 @@ Rectangle {
         if (sidebar.model)
             sidebar.model.moveFile("file://" + sidebar.ctxPath, "file://" + destDir)
         moveToPopup.close()
+    }
+
+    // Item 40 (drag-to-move): left-press-and-drag a tree row onto a folder to
+    // move it — the same VaultTreeModel::moveFile()/moveFolder() the "Move to…"
+    // context menu calls, reachable as a direct gesture. Rows had no drag
+    // gesture at all before, so a left-drag fell through to the TreeView's own
+    // flick-to-scroll (user report: "dragging files in the side panel merely
+    // drags the whole thing, not allowing you to do any operations"). Drag also
+    // reaches moveFolder(), which no UI called until now — "Move to…" is
+    // note-only (ctxMoveRow's `visible: sidebar.ctxIsNote`).
+    //
+    // Drag state lives on the sidebar, not the delegate: TreeView RECYCLES
+    // delegates as the view scrolls (see treeDelegate.onPathChanged), so state
+    // anchored to the pressed delegate would silently retarget itself onto a
+    // different file mid-gesture if the source row scrolled out of the
+    // viewport — which the drag autoscroll below makes routine, not a corner
+    // case.
+    property bool rowDragActive: false
+    property var rowDragPaths: []      // one path, or the whole multi-selection
+    property bool rowDragIsDir: false
+    // Destination directory under the cursor right now ("" = none). Pushed by
+    // whichever row's DropArea the ghost is over: a directory row means itself,
+    // a note row means its PARENT dir (dropping onto a file drops into that
+    // file's folder — standard file-manager behavior), and the tree's empty
+    // space below the last row means the vault root (rootDropArea).
+    property string rowDragDest: ""
+    // Ghost position, in sidebar coordinates.
+    property real rowDragX: 0
+    property real rowDragY: 0
+
+    // A drag starting on a row that's part of a 2+ multi-selection carries the
+    // whole selection; anything else carries just that one row and leaves the
+    // existing selection alone. Directories are never part of selectedPaths
+    // (only notes are selectable — see handleNoteClick), so a folder drag is
+    // always the single folder.
+    function rowDragPathsFor(path, isDir) {
+        if (!isDir && sidebar.selectedPaths.length > 1
+                && sidebar.selectedPaths.indexOf(path) >= 0)
+            return sidebar.selectedPaths.slice()
+        return [path]
+    }
+
+    // Cheap synchronous pre-check deciding whether a destination highlights and
+    // accepts at all. The C++ guards in moveFile()/moveFolder() remain the real
+    // authority (vault containment, collisions, sidecar integrity) — this only
+    // covers the two rejections a user causes by AIMING, so the drop target
+    // simply refuses to light up instead of taking the drop and failing: a
+    // no-op move into the row's own current directory, and a folder into itself
+    // or one of its own descendants.
+    function canDropRowsOn(destDir) {
+        if (!sidebar.rowDragActive || destDir === "")
+            return false
+        for (let i = 0; i < sidebar.rowDragPaths.length; i++) {
+            const p = sidebar.rowDragPaths[i]
+            if (p.substring(0, p.lastIndexOf("/")) === destDir)
+                return false
+            if (sidebar.rowDragIsDir && (destDir === p || destDir.startsWith(p + "/")))
+                return false
+        }
+        return true
+    }
+
+    function beginRowDrag(path, isDir, scenePoint) {
+        sidebar.rowDragPaths = sidebar.rowDragPathsFor(path, isDir)
+        sidebar.rowDragIsDir = isDir
+        sidebar.rowDragDest = ""
+        sidebar.rowDragActive = true
+        sidebar.updateRowDrag(scenePoint)
+        // Imperative Drag.start()/drop()/cancel() rather than binding
+        // Drag.active to rowDragActive: the drop has to be DELIVERED before the
+        // state clears (dropping active first cancels the drag instead), and
+        // Drag.drop() assigns active internally, which would break such a
+        // binding permanently on the first drag anyway.
+        rowDragGhost.Drag.start()
+    }
+
+    function updateRowDrag(scenePoint) {
+        // mapFromItem(null, …) maps from SCENE coordinates — the drag handler's
+        // centroid is scene-relative, while the ghost is a child of sidebar.
+        const p = sidebar.mapFromItem(null, scenePoint.x, scenePoint.y)
+        sidebar.rowDragX = p.x
+        sidebar.rowDragY = p.y
+    }
+
+    function endRowDrag(dropIt) {
+        if (!sidebar.rowDragActive)
+            return
+        if (dropIt && sidebar.canDropRowsOn(sidebar.rowDragDest))
+            rowDragGhost.Drag.drop()   // → the accepting DropArea's onDropped
+        else
+            rowDragGhost.Drag.cancel()
+        sidebar.rowDragActive = false
+        sidebar.rowDragPaths = []
+        sidebar.rowDragDest = ""
+    }
+
+    // Runs the moves a drop asked for. paths/isDir/destDir are passed in rather
+    // than read off the sidebar's own drag state because endRowDrag() clears
+    // that state in the same tick the drop is delivered.
+    //
+    // Deferred by its caller (see rowDropTarget's onDropped): a successful move
+    // calls VaultTreeModel::rebuild(), which destroys and recreates every tree
+    // delegate — including the very delegate whose DragHandler/DropArea callback
+    // is mid-execution. This codebase has already been bitten by exactly that
+    // (a delegate array rebuilt underneath an in-flight click), so the move is
+    // pushed to the next event-loop turn, after the gesture has fully unwound.
+    function performRowMove(paths, isDir, destDir) {
+        if (!sidebar.model || destDir === "")
+            return
+        const failed = []
+        for (let i = 0; i < paths.length; i++) {
+            // Model paths are raw local paths; a Q_INVOKABLE QUrl param needs
+            // the file:// scheme or QUrl::toLocalFile() comes back empty (same
+            // as confirmNewFolder()/moveNoteTo() above).
+            const ok = isDir
+                ? sidebar.model.moveFolder("file://" + paths[i], "file://" + destDir)
+                : sidebar.model.moveFile("file://" + paths[i], "file://" + destDir)
+            if (!ok)
+                failed.push(paths[i].split("/").pop())
+        }
+        // A refused move (most likely a same-named file already in the
+        // destination) is otherwise completely silent — the row just stays put.
+        // Same transient-banner treatment as Main.qml's drag-and-drop import
+        // failures, which this gesture is the in-vault sibling of.
+        if (failed.length > 0) {
+            sidebar.moveError = qsTr("Couldn't move: %1").arg(failed.join(", "))
+            moveErrorClearTimer.restart()
+        }
+    }
+
+    property string moveError: ""
+
+    Timer {
+        id: moveErrorClearTimer
+        interval: 4000
+        onTriggered: sidebar.moveError = ""
     }
 
     function confirmDeleteFolder() {
@@ -1381,11 +1650,11 @@ Rectangle {
                     anchors.fill: parent
                     active: transcribeAllHover.hovered
                 }
-                Text {
+                AppIcon {
                     anchors.centerIn: parent
-                    text: "⤒"
+                    name: "transcribe"
                     color: "#dddddd"
-                    font.pixelSize: 15
+                    iconSize: 15
                 }
 
                 ToolTip.visible: transcribeAllHover.hovered
@@ -1422,11 +1691,11 @@ Rectangle {
                     anchors.fill: parent
                     active: relabelAllButton.enabled && relabelAllHover.hovered
                 }
-                Text {
+                AppIcon {
                     anchors.centerIn: parent
-                    text: "↻"
+                    name: "relabel"
                     color: relabelAllButton.enabled ? "#dddddd" : "#666666"
-                    font.pixelSize: 15
+                    iconSize: 15
                 }
 
                 ToolTip.visible: relabelAllHover.hovered
@@ -1464,11 +1733,11 @@ Rectangle {
                     anchors.fill: parent
                     active: chaptersAllButton.enabled && chaptersAllHover.hovered
                 }
-                Text {
+                AppIcon {
                     anchors.centerIn: parent
-                    text: "≡"
+                    name: "chapters"
                     color: chaptersAllButton.enabled ? "#dddddd" : "#666666"
-                    font.pixelSize: 15
+                    iconSize: 15
                 }
 
                 ToolTip.visible: chaptersAllHover.hovered
@@ -1506,11 +1775,11 @@ Rectangle {
                     anchors.fill: parent
                     active: detectSpeakersAllButton.enabled && detectSpeakersAllHover.hovered
                 }
-                Text {
+                AppIcon {
                     anchors.centerIn: parent
-                    text: "☻"
+                    name: "speakers"
                     color: detectSpeakersAllButton.enabled ? "#dddddd" : "#666666"
-                    font.pixelSize: 14
+                    iconSize: 14
                 }
 
                 ToolTip.visible: detectSpeakersAllHover.hovered
@@ -1555,11 +1824,11 @@ Rectangle {
                     anchors.fill: parent
                     active: runAllButton.enabled && runAllHover.hovered
                 }
-                Text {
+                AppIcon {
                     anchors.centerIn: parent
-                    text: "»"
+                    name: "run-all"
                     color: runAllButton.enabled ? "#dddddd" : "#666666"
-                    font.pixelSize: 15
+                    iconSize: 15
                 }
 
                 ToolTip.visible: runAllHover.hovered
@@ -1597,11 +1866,11 @@ Rectangle {
                     anchors.fill: parent
                     active: combineButton.enabled && combineHover.hovered
                 }
-                Text {
+                AppIcon {
                     anchors.centerIn: parent
-                    text: "⛓"
+                    name: "combine"
                     color: combineButton.enabled ? "#dddddd" : "#666666"
-                    font.pixelSize: 15
+                    iconSize: 15
                 }
 
                 ToolTip.visible: combineHover.hovered
@@ -1631,11 +1900,11 @@ Rectangle {
                     anchors.fill: parent
                     active: sortModeHover.hovered
                 }
-                Text {
+                AppIcon {
                     anchors.centerIn: parent
-                    text: "⇅"
+                    name: "sort"
                     color: "#dddddd"
-                    font.pixelSize: 15
+                    iconSize: 15
                 }
 
                 ToolTip.visible: sortModeHover.hovered
@@ -1729,11 +1998,11 @@ Rectangle {
                     anchors.fill: parent
                     active: searchToggleHover.hovered
                 }
-                Text {
+                AppIcon {
                     anchors.centerIn: parent
-                    text: "⌕"
+                    name: "search"
                     color: "#dddddd"
-                    font.pixelSize: 15
+                    iconSize: 15
                 }
             }
 
@@ -1880,11 +2149,11 @@ Rectangle {
                     anchors.fill: parent
                     active: searchCloseHover.hovered
                 }
-                Text {
+                AppIcon {
                     anchors.centerIn: parent
-                    text: "×"
+                    name: "close"
                     color: "#dddddd"
-                    font.pixelSize: 15
+                    iconSize: 15
                 }
             }
         }
@@ -1931,11 +2200,11 @@ Rectangle {
                     anchors.fill: parent
                     active: tagFilterClearHover.hovered
                 }
-                Text {
+                AppIcon {
                     anchors.centerIn: parent
-                    text: "×"
+                    name: "close"
                     color: "#dddddd"
-                    font.pixelSize: 15
+                    iconSize: 15
                 }
             }
         }
@@ -1998,11 +2267,11 @@ Rectangle {
                                     sidebar.tagFilterText = remaining.join(", ")
                                 }
                             }
-                            Text {
+                            AppIcon {
                                 anchors.centerIn: parent
-                                text: "×"
+                                name: "close"
                                 color: tagChipRemoveHover.hovered ? "white" : "#999999"
-                                font.pixelSize: 12
+                                iconSize: 12
                             }
                         }
                     }
@@ -2053,11 +2322,11 @@ Rectangle {
                     anchors.fill: parent
                     active: speakerFilterClearHover.hovered
                 }
-                Text {
+                AppIcon {
                     anchors.centerIn: parent
-                    text: "×"
+                    name: "close"
                     color: "#dddddd"
-                    font.pixelSize: 15
+                    iconSize: 15
                 }
             }
         }
@@ -2114,11 +2383,11 @@ Rectangle {
                                     sidebar.speakerFilterText = remaining.join(", ")
                                 }
                             }
-                            Text {
+                            AppIcon {
                                 anchors.centerIn: parent
-                                text: "×"
+                                name: "close"
                                 color: speakerChipRemoveHover.hovered ? "white" : "#999999"
-                                font.pixelSize: 12
+                                iconSize: 12
                             }
                         }
                     }
@@ -2176,11 +2445,11 @@ Rectangle {
                     anchors.fill: parent
                     active: searchTranscribeButton.enabled && searchTranscribeHover.hovered
                 }
-                Text {
+                AppIcon {
                     anchors.centerIn: parent
-                    text: "⤒"
+                    name: "transcribe"
                     color: searchTranscribeButton.enabled ? "#dddddd" : "#666666"
-                    font.pixelSize: 15
+                    iconSize: 15
                 }
 
                 ToolTip.visible: searchTranscribeHover.hovered
@@ -2214,11 +2483,11 @@ Rectangle {
                     anchors.fill: parent
                     active: searchRelabelButton.enabled && searchRelabelHover.hovered
                 }
-                Text {
+                AppIcon {
                     anchors.centerIn: parent
-                    text: "↻"
+                    name: "relabel"
                     color: searchRelabelButton.enabled ? "#dddddd" : "#666666"
-                    font.pixelSize: 15
+                    iconSize: 15
                 }
 
                 ToolTip.visible: searchRelabelHover.hovered
@@ -2251,11 +2520,11 @@ Rectangle {
                     anchors.fill: parent
                     active: searchChaptersButton.enabled && searchChaptersHover.hovered
                 }
-                Text {
+                AppIcon {
                     anchors.centerIn: parent
-                    text: "≡"
+                    name: "chapters"
                     color: searchChaptersButton.enabled ? "#dddddd" : "#666666"
-                    font.pixelSize: 15
+                    iconSize: 15
                 }
 
                 ToolTip.visible: searchChaptersHover.hovered
@@ -2291,11 +2560,11 @@ Rectangle {
                     anchors.fill: parent
                     active: searchDetectSpeakersButton.enabled && searchDetectSpeakersHover.hovered
                 }
-                Text {
+                AppIcon {
                     anchors.centerIn: parent
-                    text: "☻"
+                    name: "speakers"
                     color: searchDetectSpeakersButton.enabled ? "#dddddd" : "#666666"
-                    font.pixelSize: 14
+                    iconSize: 14
                 }
 
                 ToolTip.visible: searchDetectSpeakersHover.hovered
@@ -2337,11 +2606,11 @@ Rectangle {
                     anchors.fill: parent
                     active: searchRunAllButton.enabled && searchRunAllHover.hovered
                 }
-                Text {
+                AppIcon {
                     anchors.centerIn: parent
-                    text: "»"
+                    name: "run-all"
                     color: searchRunAllButton.enabled ? "#dddddd" : "#666666"
-                    font.pixelSize: 15
+                    iconSize: 15
                 }
 
                 ToolTip.visible: searchRunAllHover.hovered
@@ -2411,6 +2680,131 @@ Rectangle {
         }
     }
 
+    // Item 40 (drag-to-move): the tree's empty space below the last row stands
+    // in for the vault root as a drop target — the root isn't itself a row, so
+    // without this there'd be no gesture for dragging a file back OUT of a
+    // subfolder. Deliberately declared BEFORE the tree, so it stacks underneath
+    // and every row's own DropArea sits on top of it: Qt delivers a drag to the
+    // topmost accepting DropArea only, which leaves this one reached exactly
+    // where no row is. (Same "empty tree space means the vault root" mapping
+    // treeEmptyContextTap already uses for right-click → New folder.)
+    DropArea {
+        id: rootDropTarget
+        anchors.fill: tree
+        // A hidden DropArea is skipped by drag delivery, so this must track the
+        // tree's own visibility — under an active text search the tree is
+        // replaced by searchResultsView and there is nothing to drop onto.
+        visible: tree.visible
+        keys: ["suopVaultRow"]
+        readonly property string destDir: sidebar.model ? sidebar.model.vaultLocalPath : ""
+
+        onEntered: (drag) => {
+            if (!sidebar.canDropRowsOn(rootDropTarget.destDir)) {
+                drag.accepted = false
+                return
+            }
+            sidebar.rowDragDest = rootDropTarget.destDir
+        }
+        onExited: {
+            if (sidebar.rowDragDest === rootDropTarget.destDir)
+                sidebar.rowDragDest = ""
+        }
+        onDropped: {
+            const paths = sidebar.rowDragPaths.slice()
+            const isDir = sidebar.rowDragIsDir
+            const dest = rootDropTarget.destDir
+            // Deferred — see performRowMove's doc comment.
+            Qt.callLater(() => sidebar.performRowMove(paths, isDir, dest))
+        }
+
+        // The root's "row" is the whole tree, so that's what highlights. Same
+        // stroke as the per-folder drop highlight in treeDelegate.
+        Rectangle {
+            anchors.fill: parent
+            visible: rootDropTarget.destDir !== "" && sidebar.rowDragActive
+                     && sidebar.rowDragDest === rootDropTarget.destDir
+            color: "transparent"
+            radius: AppSettings.borderRadius
+            border.width: 1
+            border.color: AppSettings.highlightColor
+        }
+    }
+
+    // Item 40 (drag-to-move): the thing that follows the cursor during a row
+    // drag and, through its Drag attached property, IS the drag source Qt
+    // hit-tests against the DropAreas. Parented to the sidebar rather than to
+    // the dragged row: the row itself must stay put (TreeView owns its layout),
+    // and a source item hanging off a recyclable delegate could be destroyed
+    // mid-gesture. Driven imperatively (Drag.start()/drop()/cancel()) from
+    // sidebar.beginRowDrag()/endRowDrag() — see beginRowDrag for why it isn't a
+    // Drag.active binding.
+    Item {
+        id: rowDragGhost
+        z: 100
+        visible: sidebar.rowDragActive
+        width: rowDragGhostBg.width
+        height: rowDragGhostBg.height
+        // This item's top-left tracks the pointer and Drag.hotSpot is (0, 0),
+        // so Qt hit-tests drop targets at exactly the cursor — the visible
+        // ghost body is offset off the pointer separately (below) so it never
+        // covers the row being aimed at.
+        x: sidebar.rowDragX
+        y: sidebar.rowDragY
+        Drag.keys: ["suopVaultRow"]
+        Drag.hotSpot.x: 0
+        Drag.hotSpot.y: 0
+
+        Rectangle {
+            id: rowDragGhostBg
+            x: 12
+            y: 12
+            width: rowDragGhostLabel.implicitWidth + 12
+            height: rowDragGhostLabel.implicitHeight + 8
+            color: "#242424"
+            radius: AppSettings.borderRadius
+            border.width: 1
+            // Doubles as the "will this drop do anything" readout, so the
+            // answer travels with the cursor instead of only living in the
+            // (possibly far-away) highlighted target row.
+            border.color: sidebar.canDropRowsOn(sidebar.rowDragDest)
+                ? AppSettings.highlightColor : "#3a3a3a"
+            opacity: 0.9
+
+            Text {
+                id: rowDragGhostLabel
+                anchors.centerIn: parent
+                color: "white"
+                font.pixelSize: 11
+                text: sidebar.rowDragPaths.length > 1
+                    ? qsTr("%1 items").arg(sidebar.rowDragPaths.length)
+                    : (sidebar.rowDragPaths.length === 1
+                       ? sidebar.rowDragPaths[0].split("/").pop()
+                       : "")
+            }
+        }
+    }
+
+    // Item 40 (drag-to-move) failure feedback — a move VaultTreeModel refuses
+    // (most likely a same-named file already in the destination) is otherwise
+    // completely silent, the row just stays put. Same transient red banner as
+    // Main.qml's drag-and-drop import errors, which this gesture is the
+    // in-vault sibling of; a SUCCESSFUL move needs no banner, the row simply
+    // reappears in its new folder.
+    Label {
+        z: 101
+        anchors.top: parent.top
+        anchors.horizontalCenter: parent.horizontalCenter
+        anchors.topMargin: 12
+        visible: sidebar.moveError !== ""
+        text: sidebar.moveError
+        color: "white"
+        padding: 8
+        background: Rectangle {
+            color: "#c0392b"
+            radius: AppSettings.borderRadius
+        }
+    }
+
     TreeView {
         id: tree
         model: searchProxy
@@ -2473,35 +2867,97 @@ Rectangle {
             // after it, so earlier (lower) indices stay valid.
             for (let r = rows - 1; r >= 0; r--)
                 expandRecursively(r, -1)
+            // Empty folders aren't reachable by expandRecursively (TreeView
+            // won't expand a childless node at all) — expand them the only way
+            // they can be: by dropping their collapsed flags.
+            sidebar.collapsedEmptyDirs = ({})
         }
 
-        // rows isn't populated synchronously with modelReset — the
-        // view's row mapping updates on a later event-loop pass, so
-        // poll briefly until it shows up rather than racing it.
+        // A model reset invalidates every QModelIndex, so TreeView drops its
+        // whole expansion state and falls back to root-level rows — every
+        // folder's contents vanish and everything below them slides up. The
+        // tree therefore has to be re-expanded after any reset, and WHEN that
+        // happens is the whole story: this used to run off a 16ms polling
+        // Timer, i.e. ~1 frame at 60Hz, so the collapsed tree was genuinely
+        // rendered and the rows visibly jumped up and back. That was the
+        // "flash" after a drag-to-move drop (user report) — measured at ~22
+        // consecutive frames/samples of collapsed tree in tst_sidebar_dragmove.
+        //
+        // expandPending/expanding drive the recovery instead:
+        property bool expandPending: false
+        property bool expanding: false
+
+        // insideLayout: true when the caller is itself running inside
+        // TableView's layout pass (onRowsChanged is), which changes only how
+        // the trailing forceLayout() is scheduled — see below.
+        function expandAllNow(insideLayout) {
+            // Re-entrancy: expandAll() inserts rows, which re-fires
+            // onRowsChanged below while this is still running.
+            if (tree.expanding || tree.rows <= 0)
+                return
+            tree.expanding = true
+            tree.expandAll()
+            // P13(a): expandAll() re-inserts every previously-expanded
+            // directory's children synchronously, but the ALREADY pending
+            // Qt.callLater(forceLayout) from relayoutForSearchStateChange()
+            // (triggered by the same model reset) can fire before this point,
+            // caching stale/partial row positions with nothing to re-trigger a
+            // layout afterward — so a layout has to follow this expansion.
+            //
+            // It just can't always be an IMMEDIATE one: forceLayout() refuses
+            // to re-enter an ongoing layout ("Cannot do an immediate re-layout
+            // during an ongoing layout!"), and that refusal is a warning plus a
+            // silent no-op, not an exception — so calling it from
+            // onRowsChanged would log on every single vault change AND leave
+            // the very stale positions P13(a) is about. Defer to the next event
+            // loop turn in that case. Nothing visual depends on the timing: the
+            // row INSERTIONS above are what kill the flash and they've already
+            // happened synchronously; this only refreshes cached positions.
+            if (insideLayout)
+                Qt.callLater(tree.forceLayout)
+            else
+                tree.forceLayout()
+            tree.expanding = false
+            tree.expandPending = false
+            expandRetryTimer.stop()
+        }
+
+        // The view has NOT processed the reset when this runs — a QML
+        // Connections on the proxy can be invoked before TreeView's own
+        // internal handler, so rows/expansion state here are still the old
+        // ones and expanding now would no-op against stale indexes and then be
+        // thrown away by the reset that follows (tried; it left the tree
+        // permanently collapsed, see tst_sidebar_dragmove). So only arm the
+        // flag, and let onRowsChanged below do the work at the first moment
+        // it's actually possible.
+        Connections {
+            target: searchProxy
+            function onModelReset() {
+                tree.expandPending = true
+                expandRetryTimer.start()
+            }
+        }
+
+        // The moment the view publishes its post-reset (collapsed) row count,
+        // which happens during its own layout pass — before the frame is
+        // rendered. Re-expanding here means the collapsed tree is never
+        // painted, so there is nothing to flash.
+        onRowsChanged: {
+            if (tree.expandPending)
+                tree.expandAllNow(true)   // fired from inside TableView's layout
+        }
+
+        // Backstop only, for a reset whose row count happens to be unchanged
+        // (so onRowsChanged never fires) or that lands before the view has any
+        // rows at all — e.g. an empty vault, where there's nothing on screen to
+        // flash anyway. This is the path that used to run every time.
         Timer {
             id: expandRetryTimer
             interval: 16
             repeat: true
             onTriggered: {
-                if (tree.rows > 0) {
-                    tree.expandAll()
-                    // P13(a): expandAll() re-inserts every previously-expanded
-                    // directory's children synchronously, but the ALREADY
-                    // pending Qt.callLater(forceLayout) from
-                    // relayoutForSearchStateChange() (triggered by the same
-                    // model reset) can fire before this point, caching stale/
-                    // partial row positions with nothing to re-trigger a
-                    // layout afterward — force one now, after expansion is done.
-                    tree.forceLayout()
-                    stop()
-                }
-            }
-        }
-
-        Connections {
-            target: searchProxy
-            function onModelReset() {
-                expandRetryTimer.start()
+                if (tree.rows > 0)
+                    tree.expandAllNow(false)   // plain timer callback, no layout in progress
             }
         }
 
@@ -2603,15 +3059,58 @@ Rectangle {
             readonly property bool chaptersEligible: treeDelegate.relabelEligible || treeDelegate.isOrphanedMd
             onChaptersEligibleChanged: sidebar.setChaptersEligible(treeDelegate.path, treeDelegate.chaptersEligible)
 
-            // Item 41: the per-row action cluster is normally hover-only, but
-            // the keyboard-current/open row (currentPath) keeps its buttons
-            // revealed without a mouse hover, so Left/Right into the cluster
-            // has a visible target and the selected file's actions are always
-            // reachable. Non-selected rows still reveal on hover only.
+            // A folder highlight covers the folder AND everything inside it,
+            // so what's about to be acted on reads as one whole container
+            // rather than a single lit row whose contents are left ambiguous.
+            // This is the root of the run this row belongs to, or "".
+            //
+            // A drag's destination folder wins over a plain mouse hover: mid-
+            // drag the pointer is necessarily over SOME row, and the drop is
+            // the thing the user is deciding about (the sibling
+            // rowHoverBorder suppresses itself mid-drag for the same reason).
+            //
+            // The vault ROOT is deliberately excluded — every row is "under"
+            // it, so it would light the entire tree; a drop targeting the root
+            // is marked by rootDropTarget's own border around the whole view
+            // instead.
+            readonly property string folderHighlightRoot: {
+                const candidate = sidebar.rowDragActive ? sidebar.rowDragDest : sidebar.hoveredFolderPath
+                const vaultRoot = sidebar.model ? sidebar.model.vaultLocalPath : ""
+                return (candidate === "" || candidate === vaultRoot) ? "" : candidate
+            }
+            readonly property bool inFolderHighlight:
+                    sidebar.isUnderFolder(treeDelegate.path, treeDelegate.folderHighlightRoot)
+
+            // The run's shape at this row. A folder's descendants are
+            // contiguous with it in display order (the tree IS the directory
+            // structure, and children render directly beneath their parent),
+            // so only two facts are needed: every row in the run except the
+            // folder itself has an in-run row directly above it, and a row's
+            // bottom is an internal seam iff the NEXT display row is in the
+            // run too. Both feed CombineGroupOutline's per-edge suppression
+            // below, so the whole subtree draws as ONE perimeter rather than a
+            // stack of separate boxes.
+            readonly property bool folderHighlightTopMerged: treeDelegate.inFolderHighlight
+                    && treeDelegate.path !== treeDelegate.folderHighlightRoot
+            readonly property bool folderHighlightBottomMerged: treeDelegate.inFolderHighlight
+                    && sidebar.isUnderFolder(sidebar.pathAtTreeRow(treeDelegate.row + 1, tree.rows),
+                                              treeDelegate.folderHighlightRoot)
+
+            // Item 41: the per-row action cluster is hover-only, EXCEPT while
+            // the keyboard is actually inside this row's cluster (currentPath
+            // + a focused button, which only Left/Right can establish) — then
+            // it stays revealed without a mouse hover so the focused button
+            // has a visible target. Merely selecting/opening a row does NOT
+            // reveal its icons: they'd then sit permanently on the open file
+            // (user report), so entering the cluster is an explicit Right
+            // press. tree.activeFocus mirrors the nav Shortcuts' own gating,
+            // so focus leaving the tree re-hides them rather than stranding
+            // the icons on a row the arrows no longer drive.
             // (rowHover is declared further down the delegate; QML resolves id
             // references regardless of textual order.)
             readonly property bool rowActionsRevealed: rowHover.hovered
-                    || treeDelegate.path === sidebar.currentPath
+                    || (tree.activeFocus && treeDelegate.path === sidebar.currentPath
+                        && sidebar.actionButtonFocus !== "")
 
             // Item 51: true iff this row is a member of a "ready" (would-
             // combine-if-run) split-recording group per
@@ -2641,10 +3140,12 @@ Rectangle {
             // sidebar.combineTopMergedPaths/combineBottomMergedPaths (see
             // refreshTreeOrdering()'s doc comment for why those are computed
             // from the tree's actual display order, not from which rows
-            // TreeView happens to have realized). Non-adjacent members of
-            // the same group (rare — e.g. files split across folders) simply
-            // get their own separate merged run; still correct, just not a
-            // single perimeter in that case.
+            // TreeView happens to have realized). A group's members are
+            // always siblings in one folder (findCombineGroups() keys group
+            // identity on the containing folder too, so a cross-folder group
+            // can't exist), and the sortKeys triple gives cluster identity
+            // its own tier — so members are contiguous both in that display
+            // order and on screen, and a group draws as one perimeter.
             readonly property bool combineTopMerged: treeDelegate.combineEligible
                     && sidebar.combineTopMergedPaths[treeDelegate.path] === true
             readonly property bool combineBottomMerged: treeDelegate.combineEligible
@@ -2780,6 +3281,16 @@ Rectangle {
                         sidebar.leaveCombineGroupHover(treeDelegate.activeHoverGroupPath)
                         treeDelegate.activeHoverGroupPath = ""
                     }
+                    // Hovering a folder lights the folder AND its contents —
+                    // publish which folder that is, since the descendant rows
+                    // lighting up can't see this row's hover state themselves
+                    // (see sidebar.hoveredFolderPath).
+                    if (treeDelegate.isDir) {
+                        if (rowHover.hovered)
+                            sidebar.enterFolderHover(treeDelegate.path)
+                        else
+                            sidebar.leaveFolderHover(treeDelegate.path)
+                    }
                 }
             }
 
@@ -2815,7 +3326,14 @@ Rectangle {
                     // activeFocus away exactly as it always has.
                     treeDelegate.treeView.forceActiveFocus()
                     if (treeDelegate.isDir) {
-                        treeDelegate.treeView.toggleExpanded(treeDelegate.row)
+                        // An empty folder must NOT go through toggleExpanded():
+                        // TreeView won't expand a childless node, but the
+                        // attempt still latches treeDelegate.expanded to true
+                        // permanently. See sidebar.collapsedEmptyDirs.
+                        if (treeDelegate.hasChildren)
+                            treeDelegate.treeView.toggleExpanded(treeDelegate.row)
+                        else
+                            sidebar.toggleEmptyDirCollapsed(treeDelegate.path)
                     } else if (treeDelegate.isAudio || treeDelegate.isOrphanedMd) {
                         // Item 3: Shift/Ctrl-click multi-select — see
                         // sidebar.handleNoteClick's doc comment. modifiers
@@ -2827,16 +3345,192 @@ Rectangle {
                 }
             }
 
+            // Item 40 (drag-to-move): press-and-drag this row to move it into a
+            // folder. All the state (including WHICH paths are moving) lives on
+            // the sidebar — see sidebar.beginRowDrag's doc comment.
+            DragHandler {
+                id: rowDragHandler
+                // The row itself never moves — rowDragGhost follows the cursor
+                // instead, so the tree's own layout stays untouched and there's
+                // no torn-out row to put back if the drag is abandoned.
+                target: null
+                acceptedButtons: Qt.LeftButton
+                enabled: treeDelegate.isDir || treeDelegate.isAudio || treeDelegate.isOrphanedMd
+                // grabPermissions is deliberately left at the DEFAULT. The
+                // obvious worry is that the enclosing TreeView (a Flickable)
+                // steals the grab once the stroke passes its own flick
+                // threshold, turning the drag back into the "merely drags the
+                // whole thing" scroll this replaces — but that doesn't happen:
+                // this handler's exclusive grab alone is enough, verified in
+                // tst_sidebar_dragmove's dragDoesNotFlickTheTree (which DOES
+                // reproduce the flick when this handler is disabled, so it's
+                // genuinely testing for it). Tightening this to
+                // CanTakeOverFromAnything would fix nothing and cost something:
+                // it drops ApprovesCancellation, and this drag depends on being
+                // cancellable when the delegate is destroyed under it (see
+                // onActiveChanged below).
+                //
+                // Holding the grab for the whole stroke also keeps the source
+                // delegate alive: TreeView only recycles delegates that leave
+                // the viewport, and the tree can't scroll while this handler
+                // has the pointer. (Plain clicks are unaffected — treeRowTap's
+                // default DragThreshold gesturePolicy gives ITS grab up once
+                // the pointer moves, so click-to-open still wins for a click.)
+                onActiveChanged: {
+                    if (rowDragHandler.active) {
+                        sidebar.beginRowDrag(treeDelegate.path, treeDelegate.isDir,
+                                             rowDragHandler.centroid.scenePosition)
+                        return
+                    }
+                    // Deactivating means either the button came up (drop it) or
+                    // the grab was taken/cancelled — e.g. this delegate being
+                    // destroyed under an in-flight drag by a VaultTreeModel
+                    // rebuild. A real release has already cleared the button
+                    // from the centroid; a cancellation still shows it held, and
+                    // must abandon the drag rather than silently move files the
+                    // user never dropped.
+                    sidebar.endRowDrag(rowDragHandler.centroid.pressedButtons === Qt.NoButton)
+                }
+                onCentroidChanged: {
+                    if (rowDragHandler.active)
+                        sidebar.updateRowDrag(rowDragHandler.centroid.scenePosition)
+                }
+            }
+
+            // Item 40 (drag-to-move): every row is a drop target. A directory
+            // row takes the drop itself; a note row forwards it to the note's
+            // own parent directory, so dropping onto a file means "into the
+            // folder that file lives in" (standard file-manager behavior)
+            // rather than being a dead zone the user has to aim around.
+            DropArea {
+                id: rowDropTarget
+                anchors.fill: parent
+                // Matches rowDragGhost's Drag.keys — scopes this target to the
+                // sidebar's own row drags, so Main.qml's whole-window
+                // audio-file import DropArea and this one can never both claim
+                // the same drop.
+                keys: ["suopVaultRow"]
+                readonly property string destDir: treeDelegate.isDir
+                    ? treeDelegate.path
+                    : treeDelegate.path.substring(0, treeDelegate.path.lastIndexOf("/"))
+                onEntered: (drag) => {
+                    // Refusing here (rather than taking the drop and letting
+                    // the C++ guard fail it) is what makes an impossible target
+                    // stay dark and drop nothing: a rejected DropArea gets no
+                    // onDropped.
+                    if (!sidebar.canDropRowsOn(rowDropTarget.destDir)) {
+                        drag.accepted = false
+                        return
+                    }
+                    sidebar.rowDragDest = rowDropTarget.destDir
+                }
+                onExited: {
+                    // Guarded because sibling rows in the same folder share a
+                    // destDir: Qt delivers the old target's exit before the new
+                    // target's enter, so an unguarded clear here would blank the
+                    // destination the row we just moved onto had already set.
+                    if (sidebar.rowDragDest === rowDropTarget.destDir)
+                        sidebar.rowDragDest = ""
+                }
+                onDropped: {
+                    const paths = sidebar.rowDragPaths.slice()
+                    const isDir = sidebar.rowDragIsDir
+                    const dest = rowDropTarget.destDir
+                    // Deferred — see performRowMove's doc comment (the move
+                    // rebuilds the model, destroying this very delegate).
+                    Qt.callLater(() => sidebar.performRowMove(paths, isDir, dest))
+                }
+            }
+
+            // Item 40 (drag-to-move): the fill for the folder a drop would land
+            // in — covering the destination folder AND every row inside it (see
+            // treeDelegate.inFolderHighlight), so the drop's whole landing zone
+            // is what lights up. Keyed off sidebar.rowDragDest rather than this
+            // row's own rowDropTarget.containsDrag so the highlight always
+            // marks the destination FOLDER's region: dragging over a note
+            // inside "Interviews" lights the whole "Interviews" subtree, not
+            // the single note under the cursor (dropping ONTO a file isn't a
+            // containment the vault has any concept of).
+            Rectangle {
+                objectName: "rowDropHighlight"
+                anchors.fill: parent
+                // An internal seam (a boundary shared with the next/previous
+                // row of the same run) collapses its inset to 0 so the fill is
+                // continuous down the run, instead of showing a 2px gutter
+                // across every row boundary. The run's real outer edges keep
+                // the 1px inset the rest of the row's outlines use.
+                anchors.topMargin: treeDelegate.folderHighlightTopMerged ? 0 : 1
+                anchors.bottomMargin: treeDelegate.folderHighlightBottomMerged ? 0 : 1
+                anchors.leftMargin: AppSettings.sidebarEdgeLeftMargin
+                visible: sidebar.rowDragActive && treeDelegate.inFolderHighlight
+                color: AppSettings.sidebarSelectionColor
+                // Per-corner, so only the run's genuine outer corners round and
+                // the seams stay square. No border property here: a Rectangle's
+                // border draws all four sides, which would put a line straight
+                // across every internal seam — the run's perimeter is drawn as
+                // one shape by the CombineGroupOutline below instead.
+                topLeftRadius: treeDelegate.folderHighlightTopMerged ? 0 : AppSettings.borderRadius
+                topRightRadius: treeDelegate.folderHighlightTopMerged ? 0 : AppSettings.borderRadius
+                bottomLeftRadius: treeDelegate.folderHighlightBottomMerged ? 0 : AppSettings.borderRadius
+                bottomRightRadius: treeDelegate.folderHighlightBottomMerged ? 0 : AppSettings.borderRadius
+            }
+
+            // The perimeter around that same folder run — one unbroken outline
+            // around the folder + its contents, drawn by the same component the
+            // combine-group outline uses (its whole purpose is suppressing the
+            // seams between vertically adjacent rows of one run; a plain
+            // Rectangle border can't, see CombineGroupOutline.qml).
+            //
+            // Covers BOTH folder-highlight sources, since folderHighlightRoot
+            // already resolves drag-destination vs plain hover — only the color
+            // differs: the drag destination reuses the drop fill's highlight
+            // color, while a plain hover matches what a single row's own
+            // HoverBorder would have drawn (that HoverBorder suppresses itself
+            // for rows in this run — see its `active` below — so the two never
+            // double up).
+            CombineGroupOutline {
+                objectName: "folderHighlightOutline"
+                anchors.fill: parent
+                anchors.leftMargin: AppSettings.sidebarEdgeLeftMargin
+                anchors.topMargin: 1
+                anchors.bottomMargin: 1
+                // Must match anchors.topMargin/bottomMargin above — see this
+                // property's doc comment in CombineGroupOutline.qml.
+                edgeMargin: 1
+                visible: treeDelegate.inFolderHighlight
+                strokeColor: sidebar.rowDragActive ? AppSettings.highlightColor : AppSettings.accentColor
+                // Matches the sibling combine outline's weight, and for the
+                // same reason — see its own strokeWidth comment below.
+                strokeWidth: 1.5
+                cornerRadius: AppSettings.borderRadius
+                topRounded: !treeDelegate.folderHighlightTopMerged
+                bottomRounded: !treeDelegate.folderHighlightBottomMerged
+            }
+
             // Note: no anchors.rightMargin here — tree.columnWidthProvider
             // already subtracts the FULL AppSettings.sidebarRightMargin from
             // this row's own width, so this Item's right edge already sits
             // at that inset; adding it again here would double it.
+            //
+            // Suppressed for the duration of a row drag: an outline tracking the
+            // pointer from row to row while a ghost is in flight reads as "drop
+            // this file ONTO that one" — a containment the vault has no concept
+            // of. Mid-drag, the drop highlight above is the only row feedback,
+            // so the one thing lit is the folder the drop actually lands in.
+            //
+            // Also suppressed for any row inside a folder highlight run: that
+            // run's own perimeter (folderHighlightOutline above) already
+            // outlines this row as part of the folder, and hovering a FOLDER
+            // would otherwise draw this single-row box on top of the run's
+            // outline — two outlines over the same row.
             HoverBorder {
+                objectName: "rowHoverBorder"
                 anchors.fill: parent
                 anchors.topMargin: 1
                 anchors.bottomMargin: 1
                 anchors.leftMargin: AppSettings.sidebarEdgeLeftMargin
-                active: rowHover.hovered
+                active: rowHover.hovered && !sidebar.rowDragActive
+                        && !treeDelegate.inFolderHighlight
             }
 
             // O7: persistent highlight for whatever MainPanel currently has
@@ -2952,24 +3646,38 @@ Rectangle {
                     width: treeDelegate.width - treeColumn.x
                     spacing: 4
 
-                    Text {
+                    AppIcon {
                         // Collapses to 0 width for the common case (a leaf
                         // row, no expand glyph to show) instead of always
                         // reserving a fixed column — that reservation was
                         // the dominant contributor to a left margin much
                         // bigger than the row's own vertical centering gap
-                        // (user report). Expandable dir rows still get their
-                        // glyph; only ITS OWN name shifts right relative to
-                        // sibling file rows now, which reads fine since a
-                        // dir's children are already indented a further
-                        // level below it anyway.
+                        // (user report). Dir rows still get their glyph; only
+                        // ITS OWN name shifts right relative to sibling file
+                        // rows now, which reads fine since a dir's children
+                        // are already indented a further level below it
+                        // anyway.
+                        //
+                        // Gated on isDir ALONE, not isDir && hasChildren: an
+                        // empty folder is a real folder (VaultTreeModel no
+                        // longer prunes them) and reads as one only if it
+                        // carries the same glyph column as its siblings —
+                        // without it, it renders name-aligned with the FILES
+                        // around it.
+                        //
+                        // An empty folder's state comes from the sidebar, NOT
+                        // from treeDelegate.expanded, which is a one-way latch
+                        // for childless nodes — see sidebar.collapsedEmptyDirs.
+                        objectName: "expandGlyph"
                         Layout.alignment: Qt.AlignVCenter
-                        Layout.preferredWidth: (treeDelegate.isDir && treeDelegate.hasChildren) ? 10 : 0
-                        horizontalAlignment: Text.AlignHCenter
-                        text: (treeDelegate.isDir && treeDelegate.hasChildren)
-                              ? (treeDelegate.expanded ? "−" : "+")
-                              : ""
+                        Layout.preferredWidth: treeDelegate.isDir ? 10 : 0
+                        name: !treeDelegate.isDir
+                              ? ""
+                              : (treeDelegate.hasChildren
+                                 ? (treeDelegate.expanded ? "collapse" : "expand")
+                                 : (sidebar.isEmptyDirCollapsed(treeDelegate.path) ? "expand" : "collapse"))
                         color: "#aaaaaa"
+                        iconSize: 11
                     }
 
                     Rectangle {
@@ -3131,6 +3839,12 @@ Rectangle {
 
                 Item {
                     id: rowTranscribeButton
+                    // objectName (here and on the four buttons below): lets
+                    // tst_sidebar_keynav find these by name and read their
+                    // real x, so it can check Left/Right against actual
+                    // on-screen order instead of trusting
+                    // currentRowActionButtons()'s own list order.
+                    objectName: "rowTranscribeButton"
                     // Always available for any audio row, transcribed or
                     // not — a manual, explicit re-run should never be
                     // blocked (only "transcribe all"/bulkEligible above
@@ -3183,11 +3897,11 @@ Rectangle {
                                 || (tree.activeFocus && treeDelegate.path === sidebar.currentPath
                                     && sidebar.actionButtonFocus === "transcribe")
                     }
-                    Text {
+                    AppIcon {
                         anchors.centerIn: parent
-                        text: "⤒"
+                        name: "transcribe"
                         color: "#dddddd"
-                        font.pixelSize: 13
+                        iconSize: 13
                     }
                 }
 
@@ -3196,6 +3910,7 @@ Rectangle {
                 // already-transcribed rows.
                 Item {
                     id: rowRelabelButton
+                    objectName: "rowRelabelButton"
                     visible: treeDelegate.relabelEligible
                     width: 20
                     height: 20
@@ -3234,11 +3949,11 @@ Rectangle {
                                 || (tree.activeFocus && treeDelegate.path === sidebar.currentPath
                                     && sidebar.actionButtonFocus === "relabel")
                     }
-                    Text {
+                    AppIcon {
                         anchors.centerIn: parent
-                        text: "↻"
+                        name: "relabel"
                         color: "#dddddd"
-                        font.pixelSize: 13
+                        iconSize: 13
                     }
                 }
 
@@ -3249,6 +3964,7 @@ Rectangle {
                 // chaptersEligible's doc comment above).
                 Item {
                     id: rowChaptersButton
+                    objectName: "rowChaptersButton"
                     visible: treeDelegate.chaptersEligible
                     width: 20
                     height: 20
@@ -3285,11 +4001,11 @@ Rectangle {
                                 || (tree.activeFocus && treeDelegate.path === sidebar.currentPath
                                     && sidebar.actionButtonFocus === "chapters")
                     }
-                    Text {
+                    AppIcon {
                         anchors.centerIn: parent
-                        text: "≡"
+                        name: "chapters"
                         color: "#dddddd"
-                        font.pixelSize: 13
+                        iconSize: 13
                     }
                 }
 
@@ -3300,6 +4016,7 @@ Rectangle {
                 // like MainPanel's detectSpeakersButton.
                 Item {
                     id: rowDetectSpeakersButton
+                    objectName: "rowDetectSpeakersButton"
                     visible: treeDelegate.relabelEligible
                     width: 20
                     height: 20
@@ -3336,11 +4053,11 @@ Rectangle {
                                 || (tree.activeFocus && treeDelegate.path === sidebar.currentPath
                                     && sidebar.actionButtonFocus === "detectSpeakers")
                     }
-                    Text {
+                    AppIcon {
                         anchors.centerIn: parent
-                        text: "☻"
+                        name: "speakers"
                         color: "#dddddd"
-                        font.pixelSize: 13
+                        iconSize: 13
                     }
                 }
 
@@ -3351,6 +4068,7 @@ Rectangle {
                 // orphaned .md), so it's the right action regardless of status.
                 Item {
                     id: rowRunAllButton
+                    objectName: "rowRunAllButton"
                     visible: treeDelegate.isAudio || treeDelegate.isOrphanedMd
                     width: 20
                     height: 20
@@ -3389,11 +4107,11 @@ Rectangle {
                                 || (tree.activeFocus && treeDelegate.path === sidebar.currentPath
                                     && sidebar.actionButtonFocus === "runAll")
                     }
-                    Text {
+                    AppIcon {
                         anchors.centerIn: parent
-                        text: "»"
+                        name: "run-all"
                         color: "#dddddd"
-                        font.pixelSize: 13
+                        iconSize: 13
                     }
                 }
             }
@@ -3470,11 +4188,11 @@ Rectangle {
                         NumberAnimation { duration: AppSettings.animationsEnabled ? 100 : 0 }
                     }
                 }
-                Text {
+                AppIcon {
                     anchors.centerIn: parent
-                    text: "⊕"
+                    name: "group-merge"
                     color: treeDelegate.combineGroupColor
-                    font.pixelSize: 13
+                    iconSize: 13
                 }
             }
 

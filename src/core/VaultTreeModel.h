@@ -11,8 +11,11 @@
 #include <memory>
 #include <vector>
 
-// Sidebar tree over a vault root: directories that contain no audio anywhere
-// in their subtree are hidden. Each audio file's status reflects whether a
+// Sidebar tree over a vault root. Every directory is shown, including empty
+// ones and ones holding only unrelated files — the tree mirrors the vault's
+// real folder structure so a folder you make is somewhere you can see and
+// drop into. Only leaf FILES are filtered: audio, plus orphaned .md files
+// (a .md with no audio sibling). Each audio file's status reflects whether a
 // sibling .md exists yet (see DESIGN.md "Vault / file layout").
 class VaultTreeModel : public QAbstractItemModel {
     Q_OBJECT
@@ -87,9 +90,7 @@ public:
     // isn't inside the open vault, and a name that would collide with an
     // existing entry — returning false rather than clobbering or escaping the
     // vault. rebuild()s on success so the watcher starts watching the new
-    // folder (note: an empty folder stays hidden from the tree by the same
-    // no-audio-content pruning DESIGN.md describes — it becomes visible once a
-    // file is moved into it).
+    // folder and the (still empty) folder appears in the tree right away.
     Q_INVOKABLE bool createFolder(const QUrl &parentDirUrl, const QString &name);
 
     // Item 40: recursively deletes folderUrl and everything under it

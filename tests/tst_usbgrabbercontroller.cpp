@@ -9,6 +9,7 @@
 #include <QtTest>
 
 #include <QCoreApplication>
+#include <QSignalSpy>
 #include <QStandardPaths>
 #include <QTemporaryDir>
 #include <QUrl>
@@ -66,6 +67,42 @@ private slots:
         QVERIFY(!controller.lastError().isEmpty());
     }
 
+    void requestGrabPreview_noVaultOpen_emitsErrorAndEmptyList()
+    {
+        UsbGrabberController controller;
+        QSignalSpy previewSpy(&controller, &UsbGrabberController::grabPreviewReady);
+
+        controller.requestGrabPreview(QStringLiteral("SOME-SERIAL"));
+
+        QVERIFY(!controller.lastError().isEmpty());
+        QCOMPARE(previewSpy.count(), 1);
+        QCOMPARE(previewSpy.first().at(0).toString(), QStringLiteral("SOME-SERIAL"));
+        QVERIFY(previewSpy.first().at(1).toList().isEmpty());
+        QVERIFY(!previewSpy.first().at(2).toString().isEmpty());
+    }
+
+    void requestGrabPreview_deviceNotConnected_emitsErrorAndEmptyList()
+    {
+        QTemporaryDir vault;
+        QVERIFY(vault.isValid());
+        VaultTreeModel vaultModel;
+        vaultModel.setVaultPath(QUrl::fromLocalFile(vault.path()));
+
+        UsbGrabberController controller;
+        controller.setVaultTreeModel(&vaultModel);
+        QSignalSpy previewSpy(&controller, &UsbGrabberController::grabPreviewReady);
+
+        // Same fabricated-serial approach as vaultOpenButDeviceNotConnected_
+        // triggerManualGrab_setsLastError() above — no real D-Bus/UDisks2
+        // device will ever match it.
+        controller.requestGrabPreview(QStringLiteral("DEFINITELY-NOT-A-REAL-DEVICE-SERIAL"));
+
+        QVERIFY(!controller.lastError().isEmpty());
+        QCOMPARE(previewSpy.count(), 1);
+        QVERIFY(previewSpy.first().at(1).toList().isEmpty());
+        QVERIFY(!previewSpy.first().at(2).toString().isEmpty());
+    }
+
     void ruleForDevice_neverConfigured_returnsPopulatedDefaultMap()
     {
         UsbGrabberController controller;
@@ -87,6 +124,7 @@ private slots:
         rule[QStringLiteral("preserveStructure")] = false;
         rule[QStringLiteral("startFolder")] = QStringLiteral("Recordings");
         rule[QStringLiteral("deviceLabel")] = QStringLiteral("Zoom H1n");
+        rule[QStringLiteral("destinationFolder")] = QStringLiteral("Interviews/USB");
 
         controller.saveRule(rule);
 
@@ -97,6 +135,7 @@ private slots:
         QCOMPARE(loaded.value(QStringLiteral("preserveStructure")).toBool(), false);
         QCOMPARE(loaded.value(QStringLiteral("startFolder")).toString(), QStringLiteral("Recordings"));
         QCOMPARE(loaded.value(QStringLiteral("deviceLabel")).toString(), QStringLiteral("Zoom H1n"));
+        QCOMPARE(loaded.value(QStringLiteral("destinationFolder")).toString(), QStringLiteral("Interviews/USB"));
     }
 
     void removeRule_removesIt()
@@ -133,6 +172,41 @@ private slots:
             serials << r.toMap().value(QStringLiteral("deviceSerial")).toString();
         QVERIFY(serials.contains(QStringLiteral("DEV-1")));
         QVERIFY(serials.contains(QStringLiteral("*")));
+    }
+
+    // A multi-LUN device (the real Acme Mic Tx exposes /dev/sda + /dev/sdb under
+    // one Drive, hence one serial) must yield EVERY one of its mounted volumes.
+    // Returning only the first is the bug this replaced: "Grab now" grabbed one
+    // volume and the other's files were silently never imported.
+    void usbVolumesForSerial_returnsEveryVolumeSharingTheSerial()
+    {
+        QVariantList mounted;
+        mounted.append(QVariantMap {{QStringLiteral("id"), QStringLiteral("/block_devices/sda")},
+                                     {QStringLiteral("serial"), QStringLiteral("20200101.1")},
+                                     {QStringLiteral("mountPath"), QStringLiteral("/run/media/user/1234-ABCD")}});
+        mounted.append(QVariantMap {{QStringLiteral("id"), QStringLiteral("/block_devices/sdb")},
+                                     {QStringLiteral("serial"), QStringLiteral("20200101.1")},
+                                     {QStringLiteral("mountPath"), QStringLiteral("/run/media/user/1234-ABCD1")}});
+        mounted.append(QVariantMap {{QStringLiteral("id"), QStringLiteral("/block_devices/sdc")},
+                                     {QStringLiteral("serial"), QStringLiteral("OTHER-DEVICE")},
+                                     {QStringLiteral("mountPath"), QStringLiteral("/run/media/user/OTHER")}});
+
+        const QVariantList volumes = usbVolumesForSerial(mounted, QStringLiteral("20200101.1"));
+
+        QCOMPARE(volumes.size(), 2);
+        QCOMPARE(volumes.at(0).toMap().value(QStringLiteral("mountPath")).toString(),
+                 QStringLiteral("/run/media/user/1234-ABCD"));
+        QCOMPARE(volumes.at(1).toMap().value(QStringLiteral("mountPath")).toString(),
+                 QStringLiteral("/run/media/user/1234-ABCD1"));
+    }
+
+    void usbVolumesForSerial_ignoresOtherDevices()
+    {
+        QVariantList mounted;
+        mounted.append(QVariantMap {{QStringLiteral("serial"), QStringLiteral("OTHER-DEVICE")}});
+
+        QVERIFY(usbVolumesForSerial(mounted, QStringLiteral("20200101.1")).isEmpty());
+        QVERIFY(usbVolumesForSerial(QVariantList(), QStringLiteral("20200101.1")).isEmpty());
     }
 
     void history_noVaultOpen_returnsEmptyList()

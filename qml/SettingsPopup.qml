@@ -25,6 +25,11 @@ Popup {
                                       qsTr("Transcription & AI"), qsTr("Combine")]
     property int currentPage: 0
 
+    // Whether the (long) per-icon override grid is expanded. Collapsed by
+    // default — the default-pack picker is the common choice; overriding
+    // individual icons is the power-user tail.
+    property bool iconOverridesExpanded: false
+
     // Rule-list-level overlap warnings (see computeRuleOverlaps()'s doc
     // comment). Deliberately NOT a plain `property var x: <binding>` —
     // vaultTreeModel.allAudioPaths() is a Q_INVOKABLE with no NOTIFY
@@ -68,6 +73,29 @@ Popup {
         if (value >= 0.34)
             return qsTr("reuse an existing tag if it reasonably fits, otherwise invent a new one")
         return qsTr("prefer inventing a new, precise tag unless an existing one is a very close match")
+    }
+
+    // Icon-pack settings (DESIGN.md "Iconography"). iconOverrides is a
+    // name->packId map; QML only fires onIconOverridesChanged when the
+    // property is REASSIGNED (mutating the existing object in place is
+    // invisible to it), so both writers copy, edit, then assign the whole
+    // object — same discipline combineRules uses.
+    function setIconOverride(name, packId) {
+        const o = Object.assign({}, AppSettings.iconOverrides)
+        if (packId === "")   // "" = follow the default pack, i.e. no override
+            delete o[name]
+        else
+            o[name] = packId
+        AppSettings.iconOverrides = o
+    }
+    // Click-cycles one icon through: auto (follow default pack) -> each pack
+    // in turn -> auto. A compact alternative to a per-row combo box for the
+    // ~40-icon grid. An override naming a now-removed pack lands at index -1,
+    // so the +1 wraps it back to "auto" — a self-healing reset.
+    function cycleIconOverride(name) {
+        const seq = [""].concat(IconTheme.packIds())
+        const cur = AppSettings.iconOverrides[name] || ""
+        settingsPopup.setIconOverride(name, seq[(seq.indexOf(cur) + 1) % seq.length])
     }
 
     // Bug 50: detectCombineGroups() itself is fully live (QFileInfo::exists() checked fresh
@@ -1128,6 +1156,194 @@ Popup {
                 font.bold: true
             }
 
+            // --- Icon pack -------------------------------------------------
+            // Default pack picker: a segmented chip row (there are only a
+            // couple of packs, so this reads clearer than a combo box). Each
+            // chip previews the pack by rendering a few of its own icons.
+            RowLayout {
+                Layout.fillWidth: true
+                Label {
+                    Layout.preferredWidth: 90
+                    elide: Text.ElideRight
+                    color: "white"
+                    text: qsTr("Icon pack")
+                }
+                Flow {
+                    Layout.fillWidth: true
+                    spacing: 6
+                    Repeater {
+                        model: IconTheme.packIds()
+                        Item {
+                            id: packChip
+                            required property string modelData
+                            readonly property bool current: AppSettings.iconPack === packChip.modelData
+                            implicitWidth: packChipRow.implicitWidth + 20
+                            implicitHeight: 30
+
+                            ToolTip.visible: packChipHover.hovered
+                            ToolTip.text: IconTheme.packDescription(packChip.modelData)
+                            ToolTip.delay: 500
+
+                            HoverHandler { id: packChipHover; cursorShape: Qt.PointingHandCursor }
+                            TapHandler { onTapped: AppSettings.iconPack = packChip.modelData }
+
+                            Rectangle {
+                                anchors.fill: parent
+                                radius: AppSettings.borderRadius
+                                color: packChip.current ? "#33ffffff"
+                                       : (packChipHover.hovered ? "#3a3a3a" : "#2a2a2a")
+                                border.width: 1
+                                border.color: packChip.current ? AppSettings.accentColor : "#3a3a3a"
+                            }
+                            RowLayout {
+                                id: packChipRow
+                                anchors.centerIn: parent
+                                spacing: 6
+                                // A few sample icons rendered in THIS pack, so
+                                // the chip previews the look, not just names it.
+                                Repeater {
+                                    model: ["transcribe", "chapters", "search"]
+                                    AppIcon {
+                                        required property string modelData
+                                        name: modelData
+                                        iconSize: 14
+                                        color: "#dddddd"
+                                        // Preview THIS chip's pack, not the
+                                        // active one.
+                                        packOverride: packChip.modelData
+                                    }
+                                }
+                                Label {
+                                    text: IconTheme.packName(packChip.modelData)
+                                    color: packChip.current ? "white" : "#bbbbbb"
+                                    font.pixelSize: 12
+                                }
+                            }
+                        }
+                    }
+                }
+                Button {
+                    id: iconPackResetButton
+                    contentItem: AppIcon { name: "reset"; iconSize: 14; color: "#dddddd"; anchors.centerIn: parent }
+                    implicitWidth: 22
+                    implicitHeight: 22
+                    background: Rectangle {
+                        radius: AppSettings.borderRadius
+                        color: "transparent"
+                        border.width: 1
+                        border.color: "#3a3a3a"
+                    }
+                    enabled: !AppSettings.isDefault("iconPack")
+                    opacity: enabled ? 1 : 0.35
+                    hoverEnabled: enabled
+                    onClicked: AppSettings.resetProperty("iconPack")
+                    HoverHandler { cursorShape: Qt.PointingHandCursor; enabled: iconPackResetButton.enabled }
+                    HoverBorder { anchors.fill: parent; active: iconPackResetButton.enabled && iconPackResetButton.hovered }
+                }
+            }
+
+            // Per-icon overrides — collapsible. Each cell click-cycles that
+            // one icon through auto -> each pack -> auto (see
+            // cycleIconOverride). The label under the icon shows where it
+            // currently comes from ("auto" = the default pack above).
+            RowLayout {
+                Layout.fillWidth: true
+                Item {
+                    id: overridesDisclosure
+                    implicitWidth: overridesDisclosureRow.implicitWidth
+                    implicitHeight: 24
+                    HoverHandler { id: overridesDisclosureHover; cursorShape: Qt.PointingHandCursor }
+                    TapHandler { onTapped: settingsPopup.iconOverridesExpanded = !settingsPopup.iconOverridesExpanded }
+                    RowLayout {
+                        id: overridesDisclosureRow
+                        anchors.verticalCenter: parent.verticalCenter
+                        spacing: 6
+                        AppIcon {
+                            name: settingsPopup.iconOverridesExpanded ? "chapter-collapse" : "chapter-expand"
+                            iconSize: 12
+                            color: overridesDisclosureHover.hovered ? "#dddddd" : "#aaaaaa"
+                        }
+                        Label {
+                            text: {
+                                const n = Object.keys(AppSettings.iconOverrides).length
+                                return n > 0 ? qsTr("Per-icon overrides (%1)").arg(n) : qsTr("Per-icon overrides")
+                            }
+                            color: overridesDisclosureHover.hovered ? "#dddddd" : "#aaaaaa"
+                            font.pixelSize: 12
+                        }
+                    }
+                }
+                Item { Layout.fillWidth: true }
+                // Clear-all shortcut, only when at least one override is set.
+                Label {
+                    visible: Object.keys(AppSettings.iconOverrides).length > 0
+                    text: qsTr("Reset all")
+                    color: clearOverridesHover.hovered ? "#e07a7a" : "#888888"
+                    font.pixelSize: 11
+                    HoverHandler { id: clearOverridesHover; cursorShape: Qt.PointingHandCursor }
+                    TapHandler { onTapped: AppSettings.iconOverrides = ({}) }
+                }
+            }
+
+            Flow {
+                Layout.fillWidth: true
+                visible: settingsPopup.iconOverridesExpanded
+                spacing: 8
+                Repeater {
+                    model: IconTheme.iconNames()
+                    Item {
+                        id: overrideCell
+                        required property string modelData
+                        readonly property string source: AppSettings.iconOverrides[overrideCell.modelData] || ""
+                        implicitWidth: 76
+                        implicitHeight: 58
+
+                        ToolTip.visible: overrideCellHover.hovered
+                        ToolTip.text: qsTr("%1 — from %2. Click to change pack.")
+                                      .arg(overrideCell.modelData)
+                                      .arg(overrideCell.source === "" ? qsTr("default pack") : overrideCell.source)
+                        ToolTip.delay: 500
+
+                        HoverHandler { id: overrideCellHover; cursorShape: Qt.PointingHandCursor }
+                        TapHandler { onTapped: settingsPopup.cycleIconOverride(overrideCell.modelData) }
+
+                        Rectangle {
+                            anchors.fill: parent
+                            radius: AppSettings.borderRadius
+                            color: overrideCellHover.hovered ? "#3a3a3a" : "#2a2a2a"
+                            border.width: 1
+                            // Overridden cells get an accent border so the
+                            // handful in a large grid are easy to spot.
+                            border.color: overrideCell.source === "" ? "#3a3a3a" : AppSettings.accentColor
+                        }
+                        ColumnLayout {
+                            anchors.centerIn: parent
+                            spacing: 3
+                            AppIcon {
+                                Layout.alignment: Qt.AlignHCenter
+                                name: overrideCell.modelData
+                                iconSize: 16
+                                color: "#dddddd"
+                            }
+                            Label {
+                                Layout.alignment: Qt.AlignHCenter
+                                Layout.maximumWidth: 68
+                                text: overrideCell.modelData
+                                color: "#999999"
+                                font.pixelSize: 8
+                                elide: Text.ElideRight
+                            }
+                            Label {
+                                Layout.alignment: Qt.AlignHCenter
+                                text: overrideCell.source === "" ? qsTr("auto") : overrideCell.source
+                                color: overrideCell.source === "" ? "#777777" : AppSettings.accentColor
+                                font.pixelSize: 8
+                            }
+                        }
+                    }
+                }
+            }
+
             RowLayout {
                 Layout.fillWidth: true
                 Label {
@@ -1186,7 +1402,7 @@ Popup {
                 }
                 Button {
                     id: radiusResetButton
-                    text: "↺"
+                    contentItem: AppIcon { name: "reset"; iconSize: 14; color: "#dddddd"; anchors.centerIn: parent }
                     implicitWidth: 22
                     implicitHeight: 22
 
@@ -1235,7 +1451,7 @@ Popup {
                 }
                 Button {
                     id: titlebarResetButton
-                    text: "↺"
+                    contentItem: AppIcon { name: "reset"; iconSize: 14; color: "#dddddd"; anchors.centerIn: parent }
                     implicitWidth: 22
                     implicitHeight: 22
 
@@ -1304,7 +1520,7 @@ Popup {
                 }
                 Button {
                     id: sidebarColorResetButton
-                    text: "↺"
+                    contentItem: AppIcon { name: "reset"; iconSize: 14; color: "#dddddd"; anchors.centerIn: parent }
                     implicitWidth: 22
                     implicitHeight: 22
 
@@ -1388,7 +1604,7 @@ Popup {
                 }
                 Button {
                     id: sidebarOpacityResetButton
-                    text: "↺"
+                    contentItem: AppIcon { name: "reset"; iconSize: 14; color: "#dddddd"; anchors.centerIn: parent }
                     implicitWidth: 22
                     implicitHeight: 22
 
@@ -1437,7 +1653,7 @@ Popup {
                 }
                 Button {
                     id: sidebarBlurResetButton
-                    text: "↺"
+                    contentItem: AppIcon { name: "reset"; iconSize: 14; color: "#dddddd"; anchors.centerIn: parent }
                     implicitWidth: 22
                     implicitHeight: 22
 
@@ -1492,7 +1708,7 @@ Popup {
                 }
                 Button {
                     id: sidebarSelectionColorResetButton
-                    text: "↺"
+                    contentItem: AppIcon { name: "reset"; iconSize: 14; color: "#dddddd"; anchors.centerIn: parent }
                     implicitWidth: 22
                     implicitHeight: 22
 
@@ -1547,7 +1763,7 @@ Popup {
                 }
                 Button {
                     id: sidebarSelectionBorderColorResetButton
-                    text: "↺"
+                    contentItem: AppIcon { name: "reset"; iconSize: 14; color: "#dddddd"; anchors.centerIn: parent }
                     implicitWidth: 22
                     implicitHeight: 22
 
@@ -1631,7 +1847,7 @@ Popup {
                 }
                 Button {
                     id: sidebarEdgeLeftMarginResetButton
-                    text: "↺"
+                    contentItem: AppIcon { name: "reset"; iconSize: 14; color: "#dddddd"; anchors.centerIn: parent }
                     implicitWidth: 22
                     implicitHeight: 22
 
@@ -1715,7 +1931,7 @@ Popup {
                 }
                 Button {
                     id: sidebarContentLeftMarginResetButton
-                    text: "↺"
+                    contentItem: AppIcon { name: "reset"; iconSize: 14; color: "#dddddd"; anchors.centerIn: parent }
                     implicitWidth: 22
                     implicitHeight: 22
 
@@ -1799,7 +2015,7 @@ Popup {
                 }
                 Button {
                     id: sidebarRightMarginResetButton
-                    text: "↺"
+                    contentItem: AppIcon { name: "reset"; iconSize: 14; color: "#dddddd"; anchors.centerIn: parent }
                     implicitWidth: 22
                     implicitHeight: 22
 
@@ -1868,7 +2084,7 @@ Popup {
                 }
                 Button {
                     id: mainColorResetButton
-                    text: "↺"
+                    contentItem: AppIcon { name: "reset"; iconSize: 14; color: "#dddddd"; anchors.centerIn: parent }
                     implicitWidth: 22
                     implicitHeight: 22
 
@@ -1952,7 +2168,7 @@ Popup {
                 }
                 Button {
                     id: mainOpacityResetButton
-                    text: "↺"
+                    contentItem: AppIcon { name: "reset"; iconSize: 14; color: "#dddddd"; anchors.centerIn: parent }
                     implicitWidth: 22
                     implicitHeight: 22
 
@@ -2001,7 +2217,7 @@ Popup {
                 }
                 Button {
                     id: mainBlurResetButton
-                    text: "↺"
+                    contentItem: AppIcon { name: "reset"; iconSize: 14; color: "#dddddd"; anchors.centerIn: parent }
                     implicitWidth: 22
                     implicitHeight: 22
 
@@ -2064,7 +2280,7 @@ Popup {
                 }
                 Button {
                     id: rimEnabledResetButton
-                    text: "↺"
+                    contentItem: AppIcon { name: "reset"; iconSize: 14; color: "#dddddd"; anchors.centerIn: parent }
                     implicitWidth: 22
                     implicitHeight: 22
 
@@ -2148,7 +2364,7 @@ Popup {
                 }
                 Button {
                     id: rimWidthResetButton
-                    text: "↺"
+                    contentItem: AppIcon { name: "reset"; iconSize: 14; color: "#dddddd"; anchors.centerIn: parent }
                     implicitWidth: 22
                     implicitHeight: 22
 
@@ -2203,7 +2419,7 @@ Popup {
                 }
                 Button {
                     id: rimColorResetButton
-                    text: "↺"
+                    contentItem: AppIcon { name: "reset"; iconSize: 14; color: "#dddddd"; anchors.centerIn: parent }
                     implicitWidth: 22
                     implicitHeight: 22
 
@@ -2275,7 +2491,7 @@ Popup {
                 }
                 Button {
                     id: accentColorResetButton
-                    text: "↺"
+                    contentItem: AppIcon { name: "reset"; iconSize: 14; color: "#dddddd"; anchors.centerIn: parent }
                     implicitWidth: 22
                     implicitHeight: 22
 
@@ -2344,7 +2560,7 @@ Popup {
                 }
                 Button {
                     id: highlightColorResetButton
-                    text: "↺"
+                    contentItem: AppIcon { name: "reset"; iconSize: 14; color: "#dddddd"; anchors.centerIn: parent }
                     implicitWidth: 22
                     implicitHeight: 22
 
@@ -2431,7 +2647,7 @@ Popup {
                 }
                 Button {
                     id: highlightRadiusResetButton
-                    text: "↺"
+                    contentItem: AppIcon { name: "reset"; iconSize: 14; color: "#dddddd"; anchors.centerIn: parent }
                     implicitWidth: 22
                     implicitHeight: 22
 
@@ -2502,7 +2718,7 @@ Popup {
                 }
                 Button {
                     id: progressGlowEnabledResetButton
-                    text: "↺"
+                    contentItem: AppIcon { name: "reset"; iconSize: 14; color: "#dddddd"; anchors.centerIn: parent }
                     implicitWidth: 22
                     implicitHeight: 22
 
@@ -2567,7 +2783,7 @@ Popup {
                 }
                 Button {
                     id: progressGlowColorResetButton
-                    text: "↺"
+                    contentItem: AppIcon { name: "reset"; iconSize: 14; color: "#dddddd"; anchors.centerIn: parent }
                     implicitWidth: 22
                     implicitHeight: 22
 
@@ -2652,7 +2868,7 @@ Popup {
                 }
                 Button {
                     id: progressGlowWidthResetButton
-                    text: "↺"
+                    contentItem: AppIcon { name: "reset"; iconSize: 14; color: "#dddddd"; anchors.centerIn: parent }
                     implicitWidth: 22
                     implicitHeight: 22
 
@@ -2737,7 +2953,7 @@ Popup {
                 }
                 Button {
                     id: progressGlowRadiusResetButton
-                    text: "↺"
+                    contentItem: AppIcon { name: "reset"; iconSize: 14; color: "#dddddd"; anchors.centerIn: parent }
                     implicitWidth: 22
                     implicitHeight: 22
 
@@ -2824,7 +3040,7 @@ Popup {
                 }
                 Button {
                     id: progressGlowLayerCountResetButton
-                    text: "↺"
+                    contentItem: AppIcon { name: "reset"; iconSize: 14; color: "#dddddd"; anchors.centerIn: parent }
                     implicitWidth: 22
                     implicitHeight: 22
 
@@ -2874,7 +3090,7 @@ Popup {
                 }
                 Button {
                     id: progressGlowHidesBarResetButton
-                    text: "↺"
+                    contentItem: AppIcon { name: "reset"; iconSize: 14; color: "#dddddd"; anchors.centerIn: parent }
                     implicitWidth: 22
                     implicitHeight: 22
 
@@ -2983,7 +3199,7 @@ Popup {
                 }
                 Button {
                     id: timestampDecimalPlacesResetButton
-                    text: "↺"
+                    contentItem: AppIcon { name: "reset"; iconSize: 14; color: "#dddddd"; anchors.centerIn: parent }
                     implicitWidth: 22
                     implicitHeight: 22
 
@@ -3054,7 +3270,7 @@ Popup {
                 }
                 Button {
                     id: useLabelsMainPanelResetButton
-                    text: "↺"
+                    contentItem: AppIcon { name: "reset"; iconSize: 14; color: "#dddddd"; anchors.centerIn: parent }
                     implicitWidth: 22
                     implicitHeight: 22
 
@@ -3112,7 +3328,7 @@ Popup {
                 }
                 Button {
                     id: useLabelsSidebarResetButton
-                    text: "↺"
+                    contentItem: AppIcon { name: "reset"; iconSize: 14; color: "#dddddd"; anchors.centerIn: parent }
                     implicitWidth: 22
                     implicitHeight: 22
 
@@ -3161,7 +3377,7 @@ Popup {
                 }
                 Button {
                     id: hideExtensionsSidebarResetButton
-                    text: "↺"
+                    contentItem: AppIcon { name: "reset"; iconSize: 14; color: "#dddddd"; anchors.centerIn: parent }
                     implicitWidth: 22
                     implicitHeight: 22
 
@@ -3210,7 +3426,7 @@ Popup {
                 }
                 Button {
                     id: hideExtensionsMainPanelResetButton
-                    text: "↺"
+                    contentItem: AppIcon { name: "reset"; iconSize: 14; color: "#dddddd"; anchors.centerIn: parent }
                     implicitWidth: 22
                     implicitHeight: 22
 
@@ -3273,7 +3489,7 @@ Popup {
                 }
                 Button {
                     id: autoLabelEnabledResetButton
-                    text: "↺"
+                    contentItem: AppIcon { name: "reset"; iconSize: 14; color: "#dddddd"; anchors.centerIn: parent }
                     implicitWidth: 22
                     implicitHeight: 22
 
@@ -3333,7 +3549,7 @@ Popup {
                 }
                 Button {
                     id: restrictTagsToExistingResetButton
-                    text: "↺"
+                    contentItem: AppIcon { name: "reset"; iconSize: 14; color: "#dddddd"; anchors.centerIn: parent }
                     implicitWidth: 22
                     implicitHeight: 22
 
@@ -3404,7 +3620,7 @@ Popup {
                 }
                 Button {
                     id: tagReuseBiasResetButton
-                    text: "↺"
+                    contentItem: AppIcon { name: "reset"; iconSize: 14; color: "#dddddd"; anchors.centerIn: parent }
                     implicitWidth: 22
                     implicitHeight: 22
 
@@ -3483,7 +3699,7 @@ Popup {
                 }
                 Button {
                     id: wordinessResetButton
-                    text: "↺"
+                    contentItem: AppIcon { name: "reset"; iconSize: 14; color: "#dddddd"; anchors.centerIn: parent }
                     implicitWidth: 22
                     implicitHeight: 22
 
@@ -3574,7 +3790,7 @@ Popup {
                 }
                 Button {
                     id: chapterDensityResetButton
-                    text: "↺"
+                    contentItem: AppIcon { name: "reset"; iconSize: 14; color: "#dddddd"; anchors.centerIn: parent }
                     implicitWidth: 22
                     implicitHeight: 22
 
@@ -3658,7 +3874,7 @@ Popup {
                 }
                 Button {
                     id: deleteOriginalsAfterCombineResetButton
-                    text: "↺"
+                    contentItem: AppIcon { name: "reset"; iconSize: 14; color: "#dddddd"; anchors.centerIn: parent }
                     implicitWidth: 22
                     implicitHeight: 22
 

@@ -1,0 +1,59 @@
+{
+  "id": "material",
+  "name": "Google Material Symbols",
+  "description": "Material Symbols Rounded, vendored from google/material-design-icons (Apache-2.0, see LICENSE). Fills are stripped from the SVGs so IconImageProvider's tint owns color.",
+  "kind": "svg",
+  "//scale": "Global compensation: an SVG fills its box edge-to-edge, but the glyphs these icons replace floated smaller inside a padded font em-box. Without scaling down, a call site passing the old font.pixelSize as iconSize would render Material visibly larger than the classic glyph it stands in for. Tuned against the app's real clusters.",
+  "scale": 0.85,
+  "icons": {
+    "transcribe": "transcribe.svg",
+    "run-all": "run-all.svg",
+    "relabel": "relabel.svg",
+    "chapters": "chapters.svg",
+    "speakers": "speakers.svg",
+    "combine": "combine.svg",
+    "group-merge": "group-merge.svg",
+
+    "delete-transcript": "delete-transcript.svg",
+    "delete-file": "delete-file.svg",
+
+    "search": "search.svg",
+    "regex": "regex.svg",
+    "match-case": "match-case.svg",
+
+    "filter": "filter.svg",
+    "sort": "sort.svg",
+
+    "check": "check.svg",
+    "cancel": "cancel.svg",
+    "close": "close.svg",
+
+    "expand": "expand.svg",
+    "collapse": "collapse.svg",
+    "chapter-expand": "chapter-expand.svg",
+    "chapter-collapse": "chapter-collapse.svg",
+    "add": "add.svg",
+    "edit": "edit.svg",
+
+    "play": "play.svg",
+    "pause": "pause.svg",
+    "record": "record.svg",
+    "stop": "stop.svg",
+    "move-up": "move-up.svg",
+    "move-down": "move-down.svg",
+
+    "settings": "settings.svg",
+    "folder": "folder.svg",
+    "usb": "usb.svg",
+    "more": "more.svg",
+    "freeze": "freeze.svg",
+    "reset": "reset.svg",
+
+    "warning": "warning.svg",
+    "invalid": "invalid.svg",
+
+    "window-minimize": "window-minimize.svg",
+    "window-maximize": "window-maximize.svg",
+    "window-close": "window-close.svg"
+  }
+}

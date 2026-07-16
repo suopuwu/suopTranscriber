@@ -324,10 +324,11 @@ private slots:
 
     // --- fileSortKeys (Sidebar.qml sort mode + combine-candidate clustering) ---
 
-    // Two paths sharing groupRank (element 0) but differing in ownRank
-    // (element 1) sort adjacently, ordered by ownRank within the pair — the
-    // "cluster then order within the cluster" composite key Sidebar.qml
-    // builds (see refreshTreeOrdering()'s doc comment).
+    // Two paths sharing groupRank (element 0) and clusterKey (element 1) but
+    // differing in memberRank (element 2) sort adjacently, ordered by
+    // memberRank within the pair — the "cluster then order within the
+    // cluster" composite key Sidebar.qml builds (see refreshTreeOrdering()'s
+    // doc comment).
     void fileSortKeys_sameGroupRank_ordersByOwnRankAndStaysAdjacent()
     {
         QTemporaryDir vault;
@@ -343,12 +344,56 @@ private slots:
         proxy.setSourceModel(&source);
 
         QVariantMap keys;
-        keys.insert(vault.filePath("a.mp3"), QVariantList() << "group1" << "a");
-        keys.insert(vault.filePath("b.mp3"), QVariantList() << "group1" << "b");
-        keys.insert(vault.filePath("z.mp3"), QVariantList() << "group0" << "z");
+        keys.insert(vault.filePath("a.mp3"), QVariantList() << "group1" << "g1" << "a");
+        keys.insert(vault.filePath("b.mp3"), QVariantList() << "group1" << "g1" << "b");
+        keys.insert(vault.filePath("z.mp3"), QVariantList() << "group0" << "g0" << "z");
         proxy.setFileSortKeys(keys);
 
         QCOMPARE(siblingNamesInOrder(proxy), QStringList({"z.mp3", "a.mp3", "b.mp3"}));
+    }
+
+    // Bug: two DIFFERENT clusters that compute the SAME groupRank used to
+    // interleave their members instead of staying clustered — with only
+    // [groupRank, memberRank] to compare, element 0 tied and element 1 tied
+    // too (each cluster's first member is #1 of its own cluster), so every
+    // comparison fell through to the row()-order default, i.e. plain
+    // alphabetical.
+    //
+    // This is the real shape of this app's own "acme mic 3" combine rule: it
+    // keys on date+edit/orig, and the recorder writes each pair's edit and
+    // orig at the same instant, so the two clusters have byte-identical
+    // mtimes and therefore an identical min-mtime groupRank. Alphabetically
+    // the members alternate edit/orig, so nothing in either cluster ended up
+    // adjacent and every row drew its own isolated combine outline.
+    // clusterKey (element 1) is what keeps the two apart.
+    void fileSortKeys_distinctClustersSharingGroupRank_dontInterleave()
+    {
+        QTemporaryDir vault;
+        QVERIFY(vault.isValid());
+        QVERIFY(touch(vault.filePath("mic1_edit.wav")));
+        QVERIFY(touch(vault.filePath("mic1_orig.wav")));
+        QVERIFY(touch(vault.filePath("mic2_edit.wav")));
+        QVERIFY(touch(vault.filePath("mic2_orig.wav")));
+
+        VaultTreeModel source;
+        source.setVaultPath(QUrl::fromLocalFile(vault.path()));
+
+        VaultSearchProxyModel proxy;
+        proxy.setSourceModel(&source);
+
+        // Both clusters share groupRank "r" (identical mtimes); each file is
+        // member #1/#2 of its own cluster.
+        QVariantMap keys;
+        keys.insert(vault.filePath("mic1_edit.wav"), QVariantList() << "r" << "edit" << "1");
+        keys.insert(vault.filePath("mic2_edit.wav"), QVariantList() << "r" << "edit" << "2");
+        keys.insert(vault.filePath("mic1_orig.wav"), QVariantList() << "r" << "orig" << "1");
+        keys.insert(vault.filePath("mic2_orig.wav"), QVariantList() << "r" << "orig" << "2");
+        proxy.setFileSortKeys(keys);
+
+        // Each cluster contiguous, in member order — NOT the alphabetical
+        // mic1_edit, mic1_orig, mic2_edit, mic2_orig this used to produce.
+        QCOMPARE(siblingNamesInOrder(proxy),
+                 QStringList({"mic1_edit.wav", "mic2_edit.wav", "mic1_orig.wav", "mic2_orig.wav"}));
     }
 
     // Directories always sort ahead of files regardless of fileSortKeys —
@@ -368,7 +413,7 @@ private slots:
         proxy.setSourceModel(&source);
 
         QVariantMap keys;
-        keys.insert(vault.filePath("aaa.mp3"), QVariantList() << "aaa.mp3" << "aaa.mp3");
+        keys.insert(vault.filePath("aaa.mp3"), QVariantList() << "aaa.mp3" << "aaa.mp3" << "aaa.mp3");
         proxy.setFileSortKeys(keys);
 
         QCOMPARE(siblingNamesInOrder(proxy), QStringList({"zzz_dir", "aaa.mp3"}));
@@ -398,7 +443,7 @@ private slots:
         proxy.setSourceModel(&source);
 
         QVariantMap keys;
-        keys.insert(vault.filePath("aaa.mp3"), QVariantList() << "zzz" << "zzz");
+        keys.insert(vault.filePath("aaa.mp3"), QVariantList() << "zzz" << "zzz" << "zzz");
         proxy.setFileSortKeys(keys);
 
         QCOMPARE(siblingNamesInOrder(proxy), QStringList({"aaa.mp3", "orphaned.md"}));

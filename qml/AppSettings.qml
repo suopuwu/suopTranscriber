@@ -208,6 +208,27 @@ Item {
     property real recordingMicGain: 1.0
     property real recordingSystemGain: 1.0
 
+    // Which icon pack supplies icons by default — a pack id from
+    // IconTheme::packIds() (packs are directories under assets/icons/, see
+    // DESIGN.md "Iconography"). "material" (Google Material Symbols) is the
+    // default; "classic" is the app's original hand-rolled glyph set, kept
+    // as an opt-in pack. Per-icon exceptions go in iconOverrides below.
+    property string iconPack: "material"
+
+    // Per-icon pack exceptions: maps a semantic icon name to the pack id it
+    // should come from, overriding iconPack for that one icon (e.g.
+    // {"play": "classic"} to keep the hand-drawn triangle while everything
+    // else stays Material). IconTheme::resolve() applies this first, then
+    // iconPack, then its own fallback pack.
+    //
+    // Deliberately NOT part of `defaults`/isDefault()/resetProperty() below,
+    // for the same reason combineRules isn't (see its comment): that
+    // machinery is single-value reset-to-default semantics compared with
+    // `===`, which can't compare a map. Empty ({}) is its own "default" and
+    // the Settings UI manages entries directly. Loaded/saved explicitly in
+    // loadFromVault()/saveToVault() instead.
+    property var iconOverrides: ({})
+
     // Split-recording combine rules — a list of {name, pattern, enabled,
     // sortGroupIndex, sortGroupText, sortGroupOccurrence} maps, each a
     // QRegularExpression matched against a filename (see
@@ -268,6 +289,7 @@ Item {
         defaultModel: "base.en",
         defaultSpeakerDetection: true,
         sortMode: "name",
+        iconPack: "material",
         progressGlowEnabled: true,
         progressGlowColor: "#ffffff",
         progressGlowWidth: 2,
@@ -318,9 +340,10 @@ Item {
         const loaded = vaultModel ? vaultModel.readVaultSettings() : {}
         for (const key in appSettings.defaults)
             appSettings[key] = (key in loaded) ? loaded[key] : appSettings.defaults[key]
-        // combineRules isn't in `defaults` (see its own doc comment above) —
-        // loaded explicitly here instead.
+        // Neither combineRules nor iconOverrides is in `defaults` (see their
+        // own doc comments above) — loaded explicitly here instead.
         appSettings.combineRules = loaded.combineRules || []
+        appSettings.iconOverrides = loaded.iconOverrides || ({})
         appSettings.suppressSave = false
     }
 
@@ -333,6 +356,7 @@ Item {
             data[key] = isColorValue(value) ? String(value) : value
         }
         data.combineRules = appSettings.combineRules
+        data.iconOverrides = appSettings.iconOverrides
         appSettings.activeVaultModel.writeVaultSettings(data)
     }
 
@@ -386,6 +410,7 @@ Item {
         function onDefaultModelChanged() { appSettings.scheduleSave() }
         function onDefaultSpeakerDetectionChanged() { appSettings.scheduleSave() }
         function onSortModeChanged() { appSettings.scheduleSave() }
+        function onIconPackChanged() { appSettings.scheduleSave() }
         function onProgressGlowEnabledChanged() { appSettings.scheduleSave() }
         function onProgressGlowColorChanged() { appSettings.scheduleSave() }
         function onProgressGlowWidthChanged() { appSettings.scheduleSave() }
@@ -396,9 +421,10 @@ Item {
         function onRecordingOutputFolderChanged() { appSettings.scheduleSave() }
         function onRecordingMicGainChanged() { appSettings.scheduleSave() }
         function onRecordingSystemGainChanged() { appSettings.scheduleSave() }
-        // combineRules isn't in `defaults` (see its own doc comment) but
-        // still needs the same debounced-save-on-change wiring as every
-        // other persisted key.
+        // combineRules/iconOverrides aren't in `defaults` (see their own doc
+        // comments) but still need the same debounced-save-on-change wiring
+        // as every other persisted key.
         function onCombineRulesChanged() { appSettings.scheduleSave() }
+        function onIconOverridesChanged() { appSettings.scheduleSave() }
     }
 }

@@ -9,7 +9,7 @@ option(SUOP_ENABLE_VULKAN "Build whisper.cpp with Vulkan backend (cross-vendor G
 option(SUOP_ENABLE_CUDA "Build whisper.cpp with CUDA backend (NVIDIA fast path)" OFF)
 option(SUOP_ENABLE_LABELING "Build with llama.cpp for AI auto-labeling" ON)
 
-find_package(Qt6 6.7 REQUIRED COMPONENTS Core Gui Qml Quick QuickControls2 Multimedia Core5Compat DBus)
+find_package(Qt6 6.7 REQUIRED COMPONENTS Core Gui Qml Quick QuickControls2 Multimedia Core5Compat DBus Svg)
 find_package(KF6WindowSystem REQUIRED)
 
 qt_standard_project_setup(REQUIRES 6.7)
@@ -169,6 +169,29 @@ qt_add_executable(suopTranscriber
 # property — it does not scan file contents for `pragma Singleton`.
 set_source_files_properties(qml/AppSettings.qml PROPERTIES QT_QML_SINGLETON_TYPE TRUE)
 
+# Icon packs (see DESIGN.md "Iconography"): each assets/icons/<id>/ directory
+# holds a pack.json manifest plus, for svg packs, the SVGs it names.
+# IconTheme DISCOVERS packs by scanning this tree in the resource system
+# rather than reading a hardcoded list, so globbing here (rather than naming
+# 40+ files) keeps "a pack is just a directory" true on the build side too.
+# CONFIGURE_DEPENDS re-runs the glob on rebuild, so adding an icon doesn't
+# need a manual cmake re-run. The vendored LICENSE is deliberately not
+# globbed in — it must ship in the repo beside the SVGs it covers, but
+# nothing reads it at runtime.
+#
+# RELATIVE is load-bearing, not tidiness: qt_add_qml_module's RESOURCES uses
+# each path verbatim as the resource ALIAS and hard-errors on an absolute one
+# ("Please set the QT_RESOURCE_ALIAS property..."). Relative-to-source-dir
+# paths are what make the aliases come out as assets/icons/<pack>/... under
+# the module's /qt/qml/SuopTranscriber/ prefix — i.e. exactly IconTheme.cpp's
+# kIconRoot.
+file(GLOB_RECURSE SUOP_ICON_ASSETS
+    RELATIVE "${CMAKE_CURRENT_SOURCE_DIR}"
+    CONFIGURE_DEPENDS
+    "${CMAKE_CURRENT_SOURCE_DIR}/assets/icons/*.json"
+    "${CMAKE_CURRENT_SOURCE_DIR}/assets/icons/*.svg"
+)
+
 qt_add_qml_module(suopTranscriber
     URI SuopTranscriber
     VERSION 1.0
@@ -178,12 +201,19 @@ qt_add_qml_module(suopTranscriber
         qml/HoverBorder.qml
         qml/CombineGroupOutline.qml
         qml/UnderlineField.qml
+        qml/AppIcon.qml
+        qml/PlayGlyph.qml
+        qml/PauseGlyph.qml
         qml/TitleBar.qml
         qml/Sidebar.qml
         qml/MainPanel.qml
         qml/BottomBar.qml
         qml/SettingsPopup.qml
+    RESOURCES
+        ${SUOP_ICON_ASSETS}
     SOURCES
+        src/core/IconTheme.h
+        src/core/IconTheme.cpp
         src/core/Segment.h
         src/core/RollingAverage.h
         src/core/TranscriptionEngine.h
@@ -234,6 +264,8 @@ target_link_libraries(suopTranscriber PRIVATE
     Qt6::Multimedia
     Qt6::Core5Compat
     Qt6::DBus
+    # QSvgRenderer, for IconImageProvider's rastering of svg icon packs.
+    Qt6::Svg
     KF6::WindowSystem
     whisper
     llama

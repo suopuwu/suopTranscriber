@@ -37,7 +37,11 @@ private slots:
     {
         const QString src = readAll(QStringLiteral(SUOP_QML_DIR "/Sidebar.qml"));
         QVERIFY2(!src.isEmpty(), "qml/Sidebar.qml must exist");
-        const int idx = src.indexOf(QStringLiteral("onPathChanged"));
+        // Match the handler's declaration, not the bare name: the recycling
+        // hazard this guards is referenced by name in doc comments elsewhere in
+        // the file (and one of those now sits ABOVE the handler), which a
+        // name-only search would land on instead.
+        const int idx = src.indexOf(QStringLiteral("onPathChanged: {"));
         QVERIFY2(idx >= 0,
                  "treeDelegate must refresh metadata/jobStatus onPathChanged — TreeView recycles "
                  "delegate Items across rows, so a Component.onCompleted-only push goes stale on reuse");
@@ -111,6 +115,79 @@ private slots:
                  "hardcoded \"white\"");
         QVERIFY2(src.contains(QStringLiteral("Behavior on opacity")),
                  "hover outline must fade, not pop (StyleGuide.md)");
+    }
+
+    // Iconography (DESIGN.md "Iconography"): AppIcon is THE way this app draws
+    // an icon. Call sites name an icon semantically and never mention a glyph,
+    // file, or pack — which pack supplies it is IconTheme's decision, bound to
+    // AppSettings.iconPack + AppSettings.iconOverrides so it re-resolves live.
+    // This contract is what makes packs swappable; the render-path tests live
+    // in tst_icontheme.cpp (real QQuickView), these are the source guards.
+    void appIcon_componentContract()
+    {
+        const QString src = readAll(QStringLiteral(SUOP_QML_DIR "/AppIcon.qml"));
+        QVERIFY2(!src.isEmpty(), "qml/AppIcon.qml must exist (the single icon-drawing component)");
+        // Resolution must be the pure-function form reading BOTH settings, or
+        // switching packs / per-icon overrides won't re-resolve every icon.
+        QVERIFY2(src.contains(QStringLiteral("IconTheme.resolve(")),
+                 "AppIcon must resolve via IconTheme.resolve(), not hardcode any glyph/file");
+        QVERIFY(src.contains(QStringLiteral("AppSettings.iconPack")));
+        QVERIFY(src.contains(QStringLiteral("AppSettings.iconOverrides")));
+        // All three render paths must be present (glyph packs, svg packs, and
+        // the builtin drawn shapes that keep classic's play/pause alive).
+        QVERIFY2(src.contains(QStringLiteral("\"svg\"")) && src.contains(QStringLiteral("\"glyph\""))
+                     && src.contains(QStringLiteral("\"builtin\"")),
+                 "AppIcon must handle all three icon kinds: glyph, svg, builtin");
+        // The builtin set must be a closed map, never an arbitrary URL a pack
+        // could name (see AppIcon.qml's comment).
+        QVERIFY2(src.contains(QStringLiteral("PlayGlyph")) && src.contains(QStringLiteral("PauseGlyph")),
+                 "AppIcon's builtins map must list the drawn play/pause shapes");
+    }
+
+    // Every UI surface draws its icons through AppIcon — nobody hand-rolls a
+    // one-off glyph Text or Canvas icon anymore (that drift, plus the
+    // system-font-dependent glyph fragility, is exactly what the pack system
+    // replaced). Count-based like the HoverBorder convention guard below, so
+    // it stays robust as icons are added/removed.
+    void iconography_appIconUsedOnEveryIconSurface()
+    {
+        for (const QString &file : {QStringLiteral("MainPanel.qml"), QStringLiteral("Sidebar.qml"),
+                                    QStringLiteral("TitleBar.qml"), QStringLiteral("BottomBar.qml"),
+                                    QStringLiteral("SettingsPopup.qml")}) {
+            const QString src = readAll(QStringLiteral(SUOP_QML_DIR "/") + file);
+            QVERIFY2(src.contains(QStringLiteral("AppIcon")),
+                     qPrintable(file + " draws icons and so must use AppIcon (see DESIGN.md Iconography)"));
+        }
+        // The play/pause icon that used to be a bespoke Canvas in MainPanel is
+        // now an AppIcon resolving to the PlayGlyph/PauseGlyph builtins — the
+        // hand-drawn shapes moved into their own reusable components.
+        const QString mainPanel = readAll(QStringLiteral(SUOP_QML_DIR "/MainPanel.qml"));
+        QVERIFY2(mainPanel.contains(QStringLiteral("? \"pause\" : \"play\"")),
+                 "MainPanel's play/pause must be an AppIcon selecting the pause/play name, not a Canvas");
+        for (const QString &comp : {QStringLiteral("PlayGlyph.qml"), QStringLiteral("PauseGlyph.qml")}) {
+            const QString src = readAll(QStringLiteral(SUOP_QML_DIR "/") + comp);
+            QVERIFY2(src.contains(QStringLiteral("Canvas")),
+                     qPrintable(comp + " must be the drawn-shape builtin (a Canvas)"));
+        }
+    }
+
+    // The two settings that drive icon resolution must round-trip through the
+    // vault like every other appearance setting: iconPack in `defaults`,
+    // iconOverrides handled explicitly (a map, so it can't use the single-
+    // value reset machinery — same carve-out as combineRules).
+    void iconography_settingsPersisted()
+    {
+        const QString src = readAll(QStringLiteral(SUOP_QML_DIR "/AppSettings.qml"));
+        QVERIFY2(src.contains(QStringLiteral("property string iconPack")),
+                 "AppSettings must expose iconPack");
+        QVERIFY2(src.contains(QStringLiteral("property var iconOverrides")),
+                 "AppSettings must expose iconOverrides");
+        QVERIFY2(src.contains(QStringLiteral("iconPack:")),
+                 "iconPack must be in the defaults map so it resets/persists");
+        QVERIFY2(src.contains(QStringLiteral("iconOverrides = loaded.iconOverrides")),
+                 "iconOverrides must be loaded explicitly from the vault (like combineRules)");
+        QVERIFY2(src.contains(QStringLiteral("data.iconOverrides")),
+                 "iconOverrides must be saved back to the vault");
     }
 
     // Always-editable fields with no other visual cue that they're a text
@@ -461,6 +538,64 @@ private slots:
         // Deleting a folder is destructive — must go through a confirmation.
         QVERIFY2(src.contains(QStringLiteral("id: deleteConfirmPopup")),
                  "deleting a folder (recursive) must require a confirmation Popup");
+    }
+
+    // Item 40 (drag-to-move): dragging a tree row must move the file/folder,
+    // not flick the TreeView (user report: "dragging files in the side panel
+    // merely drags the whole thing, not allowing you to do any operations").
+    // No QQuickView harness exists for TreeView delegate gestures, so this is a
+    // source-scan guard per CLAUDE.md.
+    void sidebar_dragToMoveRows()
+    {
+        const QString src = readAll(QStringLiteral(SUOP_QML_DIR "/Sidebar.qml"));
+        QVERIFY2(!src.isEmpty(), "qml/Sidebar.qml must exist");
+
+        // The gesture itself: a per-row DragHandler.
+        const int dragIdx = src.indexOf(QStringLiteral("id: rowDragHandler"));
+        QVERIFY2(dragIdx >= 0, "each tree row must have a DragHandler so a row can be dragged to move it");
+        const QString dragBlock = src.mid(dragIdx, 2000);
+
+        // Whether the drag survives the TreeView's flick isn't source-scannable
+        // — tst_sidebar_dragmove's dragDoesNotFlickTheTree covers that against
+        // a real QQuickView instead.
+        //
+        // target: null — the row stays in the tree's layout; rowDragGhost is
+        // what follows the cursor.
+        QVERIFY2(dragBlock.contains(QStringLiteral("target: null")),
+                 "the row DragHandler must not move the row itself (target: null) — the ghost follows "
+                 "the cursor instead");
+
+        // The drag source item + matching keys on both ends, so a row drag and
+        // Main.qml's window-wide file-import DropArea can't claim each other's
+        // drops.
+        QVERIFY2(src.contains(QStringLiteral("id: rowDragGhost")),
+                 "a drag-source/ghost item (rowDragGhost) must exist");
+        QVERIFY2(src.contains(QStringLiteral("Drag.keys: [\"suopVaultRow\"]")),
+                 "the drag ghost must key its drag so only the sidebar's own row DropAreas accept it");
+        QVERIFY2(src.contains(QStringLiteral("id: rowDropTarget")),
+                 "each tree row must be a DropArea (rowDropTarget) so a row can be dropped onto a folder");
+        QVERIFY2(src.contains(QStringLiteral("id: rootDropTarget")),
+                 "the tree's empty space must be a DropArea targeting the vault root — the only way to "
+                 "drag a file back out of a subfolder");
+        QVERIFY2(src.count(QStringLiteral("keys: [\"suopVaultRow\"]")) >= 2,
+                 "both the row and root DropAreas must match the ghost's Drag.keys");
+
+        // A drop must go through the same C++ invokables the "Move to…" menu
+        // uses — including moveFolder(), which no other UI reaches (ctxMoveRow
+        // is note-only).
+        QVERIFY2(src.contains(QStringLiteral("sidebar.model.moveFolder(")),
+                 "dragging a directory row must call VaultTreeModel.moveFolder()");
+        QVERIFY2(src.contains(QStringLiteral("sidebar.performRowMove(")),
+                 "drops must route through performRowMove()");
+
+        // The move must be deferred out of the drop callback: it rebuilds the
+        // model, destroying the very delegate whose handler is mid-execution
+        // (this codebase has been bitten by a delegate rebuilt under an
+        // in-flight click before).
+        const int dropIdx = src.indexOf(QStringLiteral("id: rowDropTarget"));
+        QVERIFY2(src.mid(dropIdx, 2600).contains(QStringLiteral("Qt.callLater(() => sidebar.performRowMove(")),
+                 "the drop handler must defer the move (Qt.callLater) — it rebuilds the model and "
+                 "destroys the delegate the handler is running on");
     }
 
     // CLAUDE.md load-bearing constraint: Qt Multimedia only *plays* audio and
@@ -1149,7 +1284,7 @@ private slots:
         // invalid pattern flags rather than throwing.
         const int reIdx = src.indexOf(QStringLiteral("function buildFindRegex("));
         QVERIFY2(reIdx >= 0, "buildFindRegex() must compile the pattern (item 7)");
-        const QString reBlock = src.mid(reIdx, 700);
+        const QString reBlock = src.mid(reIdx, 900);
         QVERIFY2(reBlock.contains(QStringLiteral("new RegExp(")),
                  "regex mode must use JS RegExp (item 7)");
         QVERIFY2(reBlock.contains(QStringLiteral("catch")) && src.contains(QStringLiteral("findReplaceError")),
@@ -1164,11 +1299,57 @@ private slots:
                  "replace must route through commitTranscriptEdits() (its line-count safety check), "
                  "not a parallel persistence path (item 7)");
 
-        // The UI must be reachable (a toggle bool + a shortcut).
-        QVERIFY2(src.contains(QStringLiteral("findReplaceExpanded")),
-                 "a findReplaceExpanded toggle must gate the find/replace bar (item 7)");
+        // The UI must be reachable: find lives on the search bar (Ctrl+F),
+        // and Ctrl+H is the shortcut that arms replace there.
+        QVERIFY2(src.contains(QStringLiteral("searchExpanded")),
+                 "the find/replace bar must be the search bar (searchExpanded), item 7");
         QVERIFY2(src.contains(QStringLiteral("Ctrl+H")),
-                 "Ctrl+H must toggle the find/replace bar (item 7)");
+                 "Ctrl+H must reach the replace row (item 7)");
+    }
+
+    // Item 7: find and replace are ONE bar — the search field is the find
+    // pattern, and replace is armed by a checkbox rather than a second
+    // toggle/icon of its own. Source-scan guard (no QQuickView here to drive
+    // the UI) over the three invariants that keep that true.
+    void mainPanel_replaceRidesOnTheSearchBar()
+    {
+        const QString src = readAll(QStringLiteral(SUOP_QML_DIR "/MainPanel.qml"));
+        QVERIFY2(!src.isEmpty(), "qml/MainPanel.qml must exist");
+
+        // 1. No separate find state or find/replace bar toggle — searchQuery
+        // is the one pattern, so a stray findText/findReplaceExpanded means
+        // the two fields have drifted apart again.
+        QVERIFY2(!src.contains(QStringLiteral("findText")),
+                 "there must be no separate find pattern — searchQuery IS the find pattern (item 7)");
+        QVERIFY2(!src.contains(QStringLiteral("findReplaceExpanded")),
+                 "the find/replace bar must not have its own expanded bool — it is the search bar (item 7)");
+        QVERIFY2(!src.contains(QStringLiteral("\"find-replace\"")),
+                 "the standalone find-replace icon button is gone — replace is a checkbox on the "
+                 "search bar (item 7)");
+
+        // 2. The checkbox gates the actual mutation, not merely the row's
+        // visibility: replaceNext()/replaceAll() must each bail when it's
+        // off, so nothing can edit the transcript through an unarmed bar.
+        for (const QString &fn : {QStringLiteral("function replaceNext("),
+                                  QStringLiteral("function replaceAll(")}) {
+            const int idx = src.indexOf(fn);
+            QVERIFY2(idx >= 0, qPrintable(fn + " must exist (item 7)"));
+            const QString body = src.mid(idx, 260);
+            QVERIFY2(body.contains(QStringLiteral("if (!mainPanel.replaceEnabled)")),
+                     qPrintable(fn + " must no-op unless the Replace checkbox is checked (item 7)"));
+        }
+
+        // 3. The search now runs through the SAME compiled pattern replace
+        // does — otherwise the "a/b" count could describe different matches
+        // than Replace all would touch.
+        const int locIdx = src.indexOf(QStringLiteral("function locateMatch("));
+        QVERIFY2(locIdx >= 0, "locateMatch() must exist");
+        const QString locBlock = src.mid(locIdx, 900);
+        QVERIFY2(locBlock.contains(QStringLiteral("findMatches(")),
+                 "search must locate matches via findMatches()/buildFindRegex(), not its own "
+                 "literal indexOf scan — one pattern for both search and replace (item 7)");
+        QVERIFY2(!locBlock.contains(QStringLiteral("indexOf(q")),
+                 "locateMatch() must not fall back to a literal indexOf scan (item 7)");
     }
 
     // Item 41: full keyboard navigation in the focused file panel. No
@@ -1210,6 +1391,19 @@ private slots:
         QVERIFY2(rightBlock.contains(QStringLiteral("focusActionButton(1)")), "Right must move into/forward");
         QVERIFY2(leftBlock.contains(QStringLiteral("focusActionButton(-1)")), "Left must move backward/out");
 
+        // focusActionButton walks currentRowActionButtons() by index, so that
+        // list must be in ON-SCREEN left-to-right order or Right moves left
+        // (the actual bug this guards). actionButtonRow is RightToLeft, so the
+        // declaration order the list is built in runs right-to-left and has to
+        // be reversed. tst_sidebar_keynav proves the resulting direction
+        // against real button geometry; this just keeps the two coupled.
+        QVERIFY2(src.contains(QStringLiteral("layoutDirection: Qt.RightToLeft")),
+                 "actionButtonRow is expected to lay out RightToLeft — if that changed, "
+                 "currentRowActionButtons()'s reverse() below is now backwards");
+        QVERIFY2(src.contains(QStringLiteral("return list.reverse()")),
+                 "currentRowActionButtons() must reverse its declaration-order list into visual "
+                 "left-to-right order (actionButtonRow lays out RightToLeft), else Right moves left");
+
         // Enter/Return/Space activate the focused button, only while one is
         // actually focused (so they don't shadow other uses otherwise).
         const int actIdx = src.indexOf(QStringLiteral("sequences: [\"Return\", \"Enter\", \"Space\"]"));
@@ -1222,9 +1416,10 @@ private slots:
                  "the activate shortcut must call activateFocusedActionButton()");
     }
 
-    // The current/selected row keeps its action buttons revealed without a
-    // mouse hover (so keyboard Left/Right has a visible target); non-selected
-    // rows still reveal on hover only, and the focused button shows an outline.
+    // The action cluster is hover-only, EXCEPT while the keyboard is actually
+    // inside this row's cluster (Left/Right established a focused button) — so
+    // the focused button has a visible target. Selecting a row alone must NOT
+    // reveal its icons. The focused button also shows an outline.
     void sidebar_selectedRowRevealsActionButtons()
     {
         const QString src = readAll(QStringLiteral(SUOP_QML_DIR "/Sidebar.qml"));
@@ -1232,11 +1427,20 @@ private slots:
 
         const int idx = src.indexOf(QStringLiteral("property bool rowActionsRevealed:"));
         QVERIFY2(idx >= 0, "treeDelegate must expose rowActionsRevealed for the per-row action cluster");
-        const QString block = src.mid(idx, 160);
+        const QString block = src.mid(idx, 240);
         QVERIFY2(block.contains(QStringLiteral("rowHover.hovered")),
                  "rowActionsRevealed must still reveal on mouse hover");
         QVERIFY2(block.contains(QStringLiteral("treeDelegate.path === sidebar.currentPath")),
-                 "rowActionsRevealed must ALSO reveal for the current/selected row (not just on hover)");
+                 "rowActionsRevealed must reveal the current row's cluster while the keyboard is in it");
+        // The crux: currentPath alone must NOT reveal the cluster — the icons
+        // may only appear once Left/Right actually focused a button in it
+        // (otherwise they sit permanently on the open file).
+        QVERIFY2(block.contains(QStringLiteral("sidebar.actionButtonFocus !== \"\"")),
+                 "rowActionsRevealed must gate the current row's reveal on a keyboard-focused action "
+                 "button (arrow-key entry), not reveal for the selected row unconditionally");
+        QVERIFY2(block.contains(QStringLiteral("tree.activeFocus")),
+                 "the current row's keyboard reveal must be gated on tree focus, matching the Left/Right "
+                 "Shortcuts' own gating (focus leaving the tree re-hides the icons)");
 
         // The action buttons' opacity must be driven by rowActionsRevealed,
         // not the old hover-only expression.

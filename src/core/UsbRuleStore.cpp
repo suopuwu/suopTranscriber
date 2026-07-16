@@ -35,6 +35,7 @@ QVariantMap ruleToVariantMap(const UsbGrabRule &rule)
     map.insert(QStringLiteral("preserveStructure"), rule.preserveStructure);
     map.insert(QStringLiteral("startFolder"), rule.startFolder);
     map.insert(QStringLiteral("deviceLabel"), rule.deviceLabel);
+    map.insert(QStringLiteral("destinationFolder"), rule.destinationFolder);
     return map;
 }
 
@@ -47,6 +48,7 @@ UsbGrabRule ruleFromVariantMap(const QString &deviceSerial, const QVariantMap &m
     rule.preserveStructure = map.value(QStringLiteral("preserveStructure"), true).toBool();
     rule.startFolder = map.value(QStringLiteral("startFolder")).toString();
     rule.deviceLabel = map.value(QStringLiteral("deviceLabel")).toString();
+    rule.destinationFolder = map.value(QStringLiteral("destinationFolder")).toString();
     return rule;
 }
 

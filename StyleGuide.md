@@ -96,6 +96,35 @@ must show both:
   (either automatically, e.g. a timer, or the next time the underlying state
   it reports on changes).
 
+## Iconography
+
+- **Every icon is an `AppIcon`.** Never a bare glyph `Text`, a `Canvas`, an
+  `icon.source`, or an `Image` at a call site. `AppIcon { name: "transcribe";
+  iconSize: 15; color: "#dddddd" }` — name it semantically; which pack draws
+  it is `IconTheme`'s decision (enforced by `tst_styleguide.cpp`'s
+  `iconography_appIconUsedOnEveryIconSurface`).
+- **Name the meaning, never the glyph.** `name: "delete-file"`, not a `⌦`.
+  The semantic names are the keys in `assets/icons/<pack>/pack.json` — see
+  `IconTheme::iconNames()`. Adding a UI action means adding its name to the
+  pack manifests, not picking a character.
+- **`iconSize` is the icon's box, not a font size.** Per-glyph optical
+  correction belongs in a pack manifest's per-icon `scale`, never at the call
+  site. Pass one canonical size per cluster (15 for the 22×22 ribbon buttons,
+  13 for the 20×20 per-row hover clusters).
+- **Color via the `color` property**, same enabled/hover expressions as
+  before (`enabled ? "#dddddd" : "#666666"`; `#e07a7a` for destructive). The
+  provider tints svg packs to it; glyph packs set `Text.color`.
+- **Wrapper unchanged.** An icon still lives inside its `Item` +
+  `HoverHandler` + `TapHandler` + `HoverBorder` (hover convention above) —
+  only the inner icon element is an `AppIcon`.
+- **Not every symbol is an icon.** Status dots (a `Rectangle` circle), a
+  `✓`/`⚠` glyph used as a text *prefix* inside a larger label, and genuinely
+  multi-glyph mode toggles (`.*`, `Aa`) stay as they are.
+- New drawn (non-font, non-svg) icons are `builtin` pack entries pointing at
+  a small `Canvas` component (see `PlayGlyph.qml`), registered in `AppIcon`'s
+  closed `builtins` map — never an arbitrary component URL a pack names.
+- Full architecture: DESIGN.md "Iconography".
+
 ## Extending this doc
 
 This file is the place for future UI convention rules (spacing, typography,

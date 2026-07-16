@@ -1,12 +1,14 @@
 // Spec under test — split-recording combine (see DESIGN.md's vault
 // layout section and TranscriptionController::findCombineGroups()'s doc
 // comment): user-authored regex rules matched against vault filenames,
-// grouped by their CAPTURED text (not just "the rule matched"), ordered by
-// mtime by default — or by one designated, numeric-aware "sort
-// differentiator" capture group instead, which is then EXCLUDED from the
-// grouping key (it can't be both) — with the merged output filename derived
-// from (ruleName, key) alone so it's re-derivable even after the original
-// parts are gone.
+// grouped by their CAPTURED text (not just "the rule matched") AND their
+// containing folder (a rule only sees the bare filename, so same-named parts
+// in two folders are two groups, never one), ordered by mtime by default — or
+// by one designated, numeric-aware "sort differentiator" capture group
+// instead, which is then EXCLUDED from the grouping key (it can't be both) —
+// with the merged output FILENAME derived from (ruleName, key) alone so it's
+// re-derivable even after the original parts are gone, and placed in the
+// group's own folder.
 //
 // detectCombineGroups() is pure over its (rules, audioPaths) inputs (only
 // touches disk via QFileInfo stats on the paths given), so these tests never
@@ -14,7 +16,9 @@
 // touched files with controlled mtimes.
 
 #include <QDateTime>
+#include <QDir>
 #include <QFile>
+#include <QFileInfo>
 #include <QStandardPaths>
 #include <QTemporaryDir>
 #include <QtTest>
@@ -196,6 +200,87 @@ private slots:
         QCOMPARE(groups.size(), 1);
         QCOMPARE(groups.first().toMap().value("key").toString(), QString());
         QCOMPARE(groups.first().toMap().value("status").toString(), QStringLiteral("ready"));
+    }
+
+    // Group identity includes the containing folder, so identically-named
+    // parts in two folders are two separate groups — never one cross-folder
+    // group. A rule only ever sees the bare filename, so without the folder
+    // in the bucket key these four files would collapse into one group whose
+    // members aren't siblings in the vault tree (which then can't draw a
+    // single outline around them, since folder rows sit between them and they
+    // render at different indent depths).
+    void sameKeyInDifferentFolders_areSeparateGroups()
+    {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        QVERIFY(QDir(dir.path()).mkpath("interviews"));
+        QVERIFY(QDir(dir.path()).mkpath("lectures"));
+        const QString a1 = touchFile(dir.path() + "/interviews", "TX02_PART1.wav", 60);
+        const QString a2 = touchFile(dir.path() + "/interviews", "TX02_PART2.wav", 50);
+        const QString b1 = touchFile(dir.path() + "/lectures", "TX02_PART1.wav", 40);
+        const QString b2 = touchFile(dir.path() + "/lectures", "TX02_PART2.wav", 30);
+
+        TranscriptionController controller;
+        const QVariantList rules = {rule("parts", "^(TX\\d{2})_PART\\d+\\.wav$")};
+        const QVariantList groups = controller.detectCombineGroups(rules, {a1, a2, b1, b2});
+
+        QCOMPARE(groups.size(), 2);
+        // Both groups share (ruleName, key) — only the folder separates them,
+        // and outputPath is the deterministic-sort tiebreaker that orders them.
+        for (const QVariant &g : groups)
+            QCOMPARE(g.toMap().value("key").toString(), QStringLiteral("TX02"));
+        QCOMPARE(groups.at(0).toMap().value("files").toStringList(), QStringList({a1, a2}));
+        QCOMPARE(groups.at(1).toMap().value("files").toStringList(), QStringList({b1, b2}));
+
+        // Each merged file lands in its OWN group's folder, not in whichever
+        // folder held the first-in-combine-order member of a merged blob.
+        QCOMPARE(QFileInfo(groups.at(0).toMap().value("outputPath").toString()).absolutePath(),
+                 QDir(dir.path() + "/interviews").absolutePath());
+        QCOMPARE(QFileInfo(groups.at(1).toMap().value("outputPath").toString()).absolutePath(),
+                 QDir(dir.path() + "/lectures").absolutePath());
+    }
+
+    // The folder is part of group identity, but it is NOT part of the key or
+    // the merged filename — a group in a subfolder keys and names itself
+    // exactly as the same group would at the vault root.
+    void folderScoping_doesNotLeakIntoKeyOrOutputName()
+    {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        QVERIFY(QDir(dir.path()).mkpath("nested/deeper"));
+        const QString p1 = touchFile(dir.path() + "/nested/deeper", "TX02_PART1.wav", 60);
+        const QString p2 = touchFile(dir.path() + "/nested/deeper", "TX02_PART2.wav", 50);
+
+        TranscriptionController controller;
+        const QVariantList rules = {rule("parts", "^(TX\\d{2})_PART\\d+\\.wav$")};
+        const QVariantList groups = controller.detectCombineGroups(rules, {p1, p2});
+
+        const QVariantMap group = findGroup(groups, "parts");
+        QCOMPARE(group.value("key").toString(), QStringLiteral("TX02"));
+        QCOMPARE(group.value("status").toString(), QStringLiteral("ready"));
+        QCOMPARE(QFileInfo(group.value("outputPath").toString()).absolutePath(),
+                 QDir(dir.path() + "/nested/deeper").absolutePath());
+    }
+
+    // A singleton stays a singleton even when a same-key file exists in
+    // another folder — the classic cross-folder false pairing, from the
+    // status side rather than the grouping side.
+    void loneMemberPerFolder_areBothSingletons()
+    {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        QVERIFY(QDir(dir.path()).mkpath("a"));
+        QVERIFY(QDir(dir.path()).mkpath("b"));
+        const QString pa = touchFile(dir.path() + "/a", "TX02_PART1.wav", 60);
+        const QString pb = touchFile(dir.path() + "/b", "TX02_PART2.wav", 50);
+
+        TranscriptionController controller;
+        const QVariantList rules = {rule("parts", "^(TX\\d{2})_PART\\d+\\.wav$")};
+        const QVariantList groups = controller.detectCombineGroups(rules, {pa, pb});
+
+        QCOMPARE(groups.size(), 2);
+        for (const QVariant &g : groups)
+            QCOMPARE(g.toMap().value("status").toString(), QStringLiteral("singleton"));
     }
 
     void onlyOneMatch_isSingleton()

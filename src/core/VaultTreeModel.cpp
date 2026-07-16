@@ -109,10 +109,9 @@ void VaultTreeModel::rebuild()
 
         for (const QFileInfo &entry : entries) {
             if (entry.isDir()) {
-                if (auto child = scanDirectory(entry.absoluteFilePath(), m_root.get())) {
-                    watchedDirs << child->path;
-                    m_root->children.push_back(std::move(child));
-                }
+                auto child = scanDirectory(entry.absoluteFilePath(), m_root.get());
+                watchedDirs << child->path;
+                m_root->children.push_back(std::move(child));
             } else if (isAudioFile(entry)) {
                 auto leaf = std::make_unique<Node>();
                 leaf->name = entry.fileName();
@@ -148,11 +147,6 @@ std::unique_ptr<VaultTreeModel::Node> VaultTreeModel::scanDirectory(const QStrin
     node->isDir = true;
     node->parent = parent;
 
-    // "hasContent" keeps this directory in the tree if it has audio, an
-    // orphaned .md leaf, or a subdirectory that itself was kept for either
-    // reason — not literally "has audio", so a directory containing only an
-    // orphaned .md isn't incorrectly pruned.
-    bool hasContent = false;
     QDir dir(dirPath);
     const QFileInfoList entries = dir.entryInfoList(QDir::AllEntries | QDir::NoDotAndDotDot, QDir::DirsFirst | QDir::Name);
 
@@ -167,10 +161,7 @@ std::unique_ptr<VaultTreeModel::Node> VaultTreeModel::scanDirectory(const QStrin
 
     for (const QFileInfo &entry : entries) {
         if (entry.isDir()) {
-            if (auto child = scanDirectory(entry.absoluteFilePath(), node.get())) {
-                node->children.push_back(std::move(child));
-                hasContent = true;
-            }
+            node->children.push_back(scanDirectory(entry.absoluteFilePath(), node.get()));
         } else if (isAudioFile(entry)) {
             auto leaf = std::make_unique<Node>();
             leaf->name = entry.fileName();
@@ -180,7 +171,6 @@ std::unique_ptr<VaultTreeModel::Node> VaultTreeModel::scanDirectory(const QStrin
             leaf->status = QFileInfo::exists(mdPath) ? TranscribedStatus : UntranscribedStatus;
             leaf->parent = node.get();
             node->children.push_back(std::move(leaf));
-            hasContent = true;
         } else if (entry.suffix().toLower() == "md" && !audioBaseNames.contains(entry.completeBaseName())) {
             auto leaf = std::make_unique<Node>();
             leaf->name = entry.fileName();
@@ -190,12 +180,9 @@ std::unique_ptr<VaultTreeModel::Node> VaultTreeModel::scanDirectory(const QStrin
             leaf->status = OrphanedMdStatus;
             leaf->parent = node.get();
             node->children.push_back(std::move(leaf));
-            hasContent = true;
         }
     }
 
-    if (!hasContent)
-        return nullptr;
     return node;
 }
 

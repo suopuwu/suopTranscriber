@@ -27,6 +27,7 @@
 #include <QTemporaryDir>
 #include <QUrl>
 
+#include "IconTheme.h"
 #include "VaultSearchProxyModel.h"
 #include "VaultTreeModel.h"
 
@@ -133,6 +134,9 @@ private slots:
                       "singleton AppSettings 1.0 qml/AppSettings.qml\n"
                       "HoverBorder 1.0 qml/HoverBorder.qml\n"
                       "CombineGroupOutline 1.0 qml/CombineGroupOutline.qml\n"
+                      "AppIcon 1.0 qml/AppIcon.qml\n"
+                      "PlayGlyph 1.0 qml/PlayGlyph.qml\n"
+                      "PauseGlyph 1.0 qml/PauseGlyph.qml\n"
                       "Sidebar 1.0 qml/Sidebar.qml\n");
         qmldir.close();
 
@@ -141,6 +145,11 @@ private slots:
         // — registering them here is exactly what qt_add_qml_module's
         // generated init function does for the real app, just scoped to
         // only the two types this harness actually needs.
+        // Sidebar.qml's AppIcon usages bind IconTheme.resolve(...); register
+        // the singleton so they resolve instead of throwing at load.
+        qmlRegisterSingletonType<IconTheme>(
+            "SuopTranscriber", 1, 0, "IconTheme",
+            [](QQmlEngine *, QJSEngine *) -> QObject * { return new IconTheme; });
         qmlRegisterType<VaultTreeModel>("SuopTranscriber", 1, 0, "VaultTreeModel");
         qmlRegisterType<VaultSearchProxyModel>("SuopTranscriber", 1, 0, "VaultSearchProxyModel");
         qmlRegisterUncreatableType<TranscriptionControllerStub>(
@@ -195,6 +204,11 @@ private slots:
 
         QQuickView view;
         view.engine()->addImportPath(m_moduleDir.path());
+        // AppIcon (used throughout Sidebar.qml) resolves svg packs through
+        // this provider; without it the default material pack's icons can't
+        // raster.
+        view.engine()->addImageProvider(QString::fromLatin1(IconImageProvider::kProviderId),
+                                        new IconImageProvider);
         view.rootContext()->setContextProperty(QStringLiteral("vaultUrl"),
                                                 QUrl::fromLocalFile(vault.path()));
         view.setSource(QUrl::fromLocalFile(m_driverQmlPath));
@@ -297,6 +311,158 @@ private slots:
         QTest::keyClick(&view, Qt::Key_Down);
         QTest::qWait(20);
         QCOMPARE(root->property("openPath").toString(), firstPath);
+    }
+
+    // Left/Right walk the current row's action-button cluster in ON-SCREEN
+    // order (Right moves right), and the cluster's icons stay hidden until an
+    // arrow actually enters it. The direction half is checked against each
+    // focused button's real mapped x rather than against
+    // currentRowActionButtons()'s own list order — the bug being guarded
+    // against was exactly a list order that disagreed with the layout
+    // (actionButtonRow is layoutDirection: Qt.RightToLeft, so declaration
+    // order runs right-to-left), which a list-order assertion would have
+    // happily confirmed as correct.
+    void leftRightWalkActionClusterInVisualOrder()
+    {
+        QTemporaryDir vault;
+        QVERIFY(vault.isValid());
+        // Untranscribed .mp3s: isAudio (transcribe + runAll eligible), no
+        // sibling .md so not relabel/chapters-eligible — a 2-button cluster,
+        // the minimum that can expose a reversal.
+        for (int i = 0; i < 3; ++i)
+            QVERIFY(touch(vault.filePath(QStringLiteral("note%1.mp3").arg(i))));
+
+        QQuickView view;
+        view.engine()->addImportPath(m_moduleDir.path());
+        view.engine()->addImageProvider(QString::fromLatin1(IconImageProvider::kProviderId),
+                                        new IconImageProvider);
+        view.rootContext()->setContextProperty(QStringLiteral("vaultUrl"),
+                                                QUrl::fromLocalFile(vault.path()));
+        view.setSource(QUrl::fromLocalFile(m_driverQmlPath));
+        if (view.status() != QQuickView::Ready) {
+            QString msg;
+            for (const auto &e : view.errors())
+                msg += e.toString() + QStringLiteral("\n");
+            QFAIL(qPrintable(msg.isEmpty() ? QStringLiteral("QML failed to load, no error text") : msg));
+        }
+        view.show();
+        QVERIFY(QTest::qWaitForWindowExposed(&view));
+
+        QQuickItem *root = view.rootObject();
+        QVERIFY(root);
+        QQuickItem *sidebarItem = root->findChild<QQuickItem *>(QStringLiteral("sidebar"));
+        QVERIFY(sidebarItem);
+        QQuickItem *treeItem = findByClassNamePrefix(sidebarItem, "QQuickTreeView");
+        QVERIFY(treeItem);
+        QTRY_VERIFY(treeItem->property("rows").toInt() > 0);
+
+        QQuickItem *row0 = nullptr;
+        QMetaObject::invokeMethod(treeItem, "itemAtCell", Qt::DirectConnection,
+                                   Q_RETURN_ARG(QQuickItem *, row0), Q_ARG(QPoint, QPoint(0, 0)));
+        QVERIFY2(row0, "itemAtCell(0,0) returned null — row 0 delegate not realized");
+        QTest::mouseClick(&view, Qt::LeftButton, Qt::NoModifier,
+                          row0->mapToScene(QPointF(row0->width() / 2, row0->height() / 2)).toPoint());
+        QTest::qWait(20);
+        QVERIFY(treeItem->property("activeFocus").toBool());
+        QVERIFY(!root->property("openPath").toString().isEmpty());
+
+        // Selecting the row must NOT reveal its cluster (the ask: icons only
+        // appear once an arrow enters). The click leaves the mouse resting on
+        // row 0, so rowHover legitimately reveals it — read the underlying
+        // keyboard-reveal condition instead: no button is focused yet.
+        QCOMPARE(sidebarItem->property("actionButtonFocus").toString(), QString());
+
+        // Maps actionButtonFocus's name to the live button Item, so its real
+        // x can be read.
+        const QHash<QString, QString> objectNameFor = {
+            {QStringLiteral("transcribe"), QStringLiteral("rowTranscribeButton")},
+            {QStringLiteral("relabel"), QStringLiteral("rowRelabelButton")},
+            {QStringLiteral("chapters"), QStringLiteral("rowChaptersButton")},
+            {QStringLiteral("detectSpeakers"), QStringLiteral("rowDetectSpeakersButton")},
+            {QStringLiteral("runAll"), QStringLiteral("rowRunAllButton")},
+        };
+        auto focusedButtonX = [&]() -> qreal {
+            const QString name = sidebarItem->property("actionButtonFocus").toString();
+            if (name.isEmpty())
+                return -1;
+            QQuickItem *btn = row0->findChild<QQuickItem *>(objectNameFor.value(name));
+            if (!btn)
+                return -1;
+            return btn->mapToItem(row0, QPointF(0, 0)).x();
+        };
+
+        // Right from the row enters the cluster; each further Right must land
+        // on a button strictly further RIGHT than the previous one.
+        QTest::keyClick(&view, Qt::Key_Right);
+        QTest::qWait(20);
+        const QString firstFocused = sidebarItem->property("actionButtonFocus").toString();
+        QVERIFY2(!firstFocused.isEmpty(), "Right from the row must enter the action cluster");
+        qreal prevX = focusedButtonX();
+        QVERIFY2(prevX >= 0, qPrintable(QStringLiteral("focused button '%1' not found in the row 0 delegate")
+                                            .arg(firstFocused)));
+
+        // Entering the cluster reveals the icons (the button now has a
+        // visible target) — checked via opacity, which is what
+        // rowActionsRevealed actually drives.
+        QQuickItem *firstBtn = row0->findChild<QQuickItem *>(objectNameFor.value(firstFocused));
+        QVERIFY(firstBtn);
+        QTRY_VERIFY2(firstBtn->property("opacity").toReal() > 0.9,
+                     "entering the cluster with Right must reveal the action icons");
+
+        int steps = 0;
+        for (int i = 0; i < 4; ++i) {
+            const QString before = sidebarItem->property("actionButtonFocus").toString();
+            QTest::keyClick(&view, Qt::Key_Right);
+            QTest::qWait(20);
+            const QString after = sidebarItem->property("actionButtonFocus").toString();
+            if (after == before)
+                break;    // clamped at the last (rightmost) button
+            const qreal x = focusedButtonX();
+            QVERIFY2(x > prevX,
+                     qPrintable(QStringLiteral("Right moved focus from '%1' (x=%2) to '%3' (x=%4) — "
+                                                "that is LEFTWARD on screen; Left/Right are reversed")
+                                    .arg(before).arg(prevX).arg(after).arg(x)));
+            prevX = x;
+            ++steps;
+        }
+        QVERIFY2(steps > 0, "expected a multi-button cluster to walk — an untranscribed .mp3 row should "
+                            "offer at least transcribe + runAll; test fixture assumption is stale");
+        // The rightmost button is transcribe (actionButtonRow declares it
+        // first under layoutDirection: Qt.RightToLeft).
+        QCOMPARE(sidebarItem->property("actionButtonFocus").toString(), QStringLiteral("transcribe"));
+
+        // ...and Left walks symmetrically back leftward, exiting to the row.
+        for (int i = 0; i <= steps; ++i) {
+            const qreal xBefore = focusedButtonX();
+            QTest::keyClick(&view, Qt::Key_Left);
+            QTest::qWait(20);
+            const QString after = sidebarItem->property("actionButtonFocus").toString();
+            if (after.isEmpty())
+                break;
+            const qreal x = focusedButtonX();
+            QVERIFY2(x < xBefore,
+                     qPrintable(QStringLiteral("Left moved focus to '%1' at x=%2, not leftward of x=%3")
+                                    .arg(after).arg(x).arg(xBefore)));
+        }
+        QVERIFY2(sidebarItem->property("actionButtonFocus").toString().isEmpty(),
+                 "Left off the leftmost button must drop back to the row itself");
+
+        // Leaving the cluster re-hides the icons. The mouse still rests on
+        // row 0 from the click above, so move it off first — otherwise
+        // rowHover keeps them legitimately revealed and this asserts nothing.
+        QTest::mouseMove(&view, QPoint(int(row0->width() / 2), view.height() - 1));
+        QTest::qWait(20);
+        QTRY_VERIFY2(firstBtn->property("opacity").toReal() < 0.1,
+                     "with no button focused and no mouse hover, the row's action icons must be hidden");
+
+        // Moving to another row must also drop out of the cluster.
+        QTest::keyClick(&view, Qt::Key_Right);
+        QTest::qWait(20);
+        QVERIFY(!sidebarItem->property("actionButtonFocus").toString().isEmpty());
+        QTest::keyClick(&view, Qt::Key_Down);
+        QTest::qWait(20);
+        QVERIFY2(sidebarItem->property("actionButtonFocus").toString().isEmpty(),
+                 "moving to a different row must drop out of the previous row's action cluster");
     }
 };
 

@@ -260,25 +260,38 @@ private slots:
         QVERIFY(!findByName(model, "lecture.wav.md").isValid());
     }
 
-    // --- Directory pruning (DESIGN.md: dirs with no relevant content are hidden)
+    // --- Directory visibility (the tree mirrors the vault's real folders)
 
-    // A directory whose subtree contains no audio and no orphaned .md is
-    // pruned from the tree entirely, even if it contains other files.
-    void directoryWithNoAudioAndNoOrphanedMd_isHidden()
+    // Every directory is shown, whatever it does or doesn't contain: an empty
+    // one, one holding only unrelated files, and one nesting only empty dirs.
+    // Filtering applies to leaf files, not folders — so "prune/readme.txt"
+    // itself is still not a node even though its folder is.
+    void directoryWithNoAudioAndNoOrphanedMd_isShown()
     {
         QTemporaryDir vault;
         QVERIFY(vault.isValid());
         QVERIFY(touch(vault.filePath("keep/song.mp3")));
         QVERIFY(touch(vault.filePath("prune/readme.txt")));
         QVERIFY(QDir().mkpath(vault.filePath("empty")));
+        QVERIFY(QDir().mkpath(vault.filePath("outer/inner")));
 
         VaultTreeModel model;
         model.setVaultPath(QUrl::fromLocalFile(vault.path()));
 
-        QCOMPARE(model.rowCount(), 1);
+        QCOMPARE(model.rowCount(), 4);
         QVERIFY(findByName(model, "keep").isValid());
-        QVERIFY(!findByName(model, "prune").isValid());
-        QVERIFY(!findByName(model, "empty").isValid());
+        QVERIFY(findByName(model, "empty").isValid());
+
+        const QModelIndex prune = findByName(model, "prune");
+        QVERIFY(prune.isValid());
+        QCOMPARE(model.data(prune, roleByName(model, "isDir")).toBool(), true);
+        QCOMPARE(model.rowCount(prune), 0); // the .txt is still filtered out
+
+        // Pruning used to propagate transitively; nested empty dirs now survive.
+        const QModelIndex outer = findByName(model, "outer");
+        QVERIFY(outer.isValid());
+        QCOMPARE(model.rowCount(outer), 1);
+        QCOMPARE(model.data(model.index(0, 0, outer), roleByName(model, "name")).toString(), QString("inner"));
     }
 
     // A directory whose only content is an orphaned .md is kept — pruning is

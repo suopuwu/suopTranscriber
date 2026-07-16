@@ -14,6 +14,19 @@
 
 class UsbGrabJob;
 
+// Every entry of mountedVolumes (the per-volume shape
+// UsbDeviceMonitor::currentlyMountedDevices() returns) whose "serial" is
+// deviceSerial — ALL of them, since one physical device can present several
+// mounted volumes under a single serial (see UsbDeviceInfo's doc comment).
+//
+// Free function over a plain list so tst_usbgrabbercontroller can pin the
+// returns-every-volume contract without a live UDisks2 session or multi-LUN
+// hardware: the controller owns its UsbDeviceMonitor internally, so there's no
+// seam to inject fake devices through. Matching only the first volume is exactly
+// the bug this replaced — it left a two-volume recorder's second volume
+// permanently un-grabbed.
+QVariantList usbVolumesForSerial(const QVariantList &mountedVolumes, const QString &deviceSerial);
+
 // QML-facing coordinator for the USB Grabber feature (see CLAUDE.md) — the
 // single entry point QML binds against, mirroring TranscriptionController's
 // role for transcription (see Main.qml's `TranscriptionController { id:
@@ -85,13 +98,27 @@ public:
     Q_INVOKABLE QVariantList allRules() const;
 
     // Looks up deviceSerial's rule (falling back to the "*" catch-all rule
-    // if the device-specific one isn't enabled) and the device's current
-    // mountPath (matched by "serial" against
-    // UsbDeviceMonitor::currentlyMountedDevices()), then starts a
-    // UsbGrabJob against the currently-open vault. No-op (with lastError
-    // set) if: no vault is open, the device isn't currently mounted, or
-    // neither the device-specific nor the catch-all rule is enabled.
+    // if the device-specific one isn't enabled), then starts one UsbGrabJob
+    // per currently-mounted VOLUME of that device against the currently-open
+    // vault — a device with two mounted volumes runs two jobs under its single
+    // rule, and so emits grabFinished (and writes a history entry) twice.
+    // No-op (with lastError set) if: no vault is open, the device isn't
+    // currently mounted, or neither the device-specific nor the catch-all rule
+    // is enabled.
     Q_INVOKABLE void triggerManualGrab(const QString &deviceSerial);
+
+    // Runs the same scan + extension-filter + quick-check dedup logic a real
+    // grab would (via UsbGrabJob::startPreview(), a dry-run mode that never
+    // calls QFile::copy()), so the result is exactly what "Grab now" would do
+    // without actually doing it. Unlike triggerManualGrab(), this does NOT
+    // require the resolved rule to be enabled — a preview is useful precisely
+    // when deciding whether to enable a rule. No-op (with lastError set, and
+    // grabPreviewReady emitted with an empty list) if no vault is open or the
+    // device isn't currently mounted. Async: result arrives via
+    // grabPreviewReady() — the walk itself still stats every file on an
+    // external device, which is too slow for the GUI thread (mirrors why the
+    // real grab itself runs on UsbGrabJob's worker thread).
+    Q_INVOKABLE void requestGrabPreview(const QString &deviceSerial);
 
     // Proxies vaultTreeModel->readUsbGrabHistory(), or an empty list if no
     // vault is open.
@@ -105,6 +132,16 @@ signals:
     // ordering guarantee). QML may surface this as a toast/notification —
     // that's Step G's decision, not this one.
     void grabFinished(const QString &deviceSerial, int filesCopied, int filesSkipped, const QStringList &errors);
+    // Emitted ONCE per requestGrabPreview() call, after every mounted volume of
+    // the device has been previewed — entries is their combined result, so this
+    // covers exactly what triggerManualGrab() would do. entries is a list of
+    // {path, status} maps (status: "grab"/"duplicate"/"filtered" — see
+    // UsbGrabJob::startPreview()'s doc comment); paths are relative to each
+    // volume's scan root, prefixed with the volume's mount-point folder name
+    // when the device has more than one mounted volume (otherwise the same
+    // filename on two volumes would render as two identical rows). error is
+    // non-empty only on a guard-check failure, in which case entries is empty.
+    void grabPreviewReady(const QString &deviceSerial, const QVariantList &entries, const QString &error);
 
 private slots:
     // Bound to m_deviceMonitor's deviceAdded signal at construction — see
@@ -122,14 +159,27 @@ private:
     // before using it for anything.
     UsbGrabRule resolveEffectiveRule(const QString &deviceSerial, const QVariantMap &deviceInfo) const;
 
-    // Finds deviceSerial's entry in currentlyMountedDevices() (matched
-    // against each entry's "serial" key) — empty map if not currently
-    // mounted.
-    QVariantMap findMountedDeviceBySerial(const QString &deviceSerial) const;
+    // vaultLocalPath() + rule.destinationFolder (if non-empty) — the actual
+    // directory a grab under this rule copies into. Doesn't need to exist yet:
+    // UsbGrabJobWorker's copy loop already mkpath()s its destination directory
+    // per file (see UsbGrabJob.cpp), so a not-yet-existing destinationFolder is
+    // created lazily on the first real copy, same as AudioRecorder's
+    // recordingOutputFolder.
+    QString resolveDestinationPath(const UsbGrabRule &rule) const;
+
+    // Every currently-mounted VOLUME belonging to deviceSerial (matched against
+    // each entry's "serial" key in currentlyMountedDevices()) — empty if the
+    // device isn't connected. Returns a list, not a single entry, because one
+    // physical device can present several mounted volumes under one serial (see
+    // UsbDeviceInfo's doc comment); taking only the first is how the first
+    // volume-aware bug got in.
+    QVariantList findMountedVolumesBySerial(const QString &deviceSerial) const;
 
     // Constructs and starts a UsbGrabJob against the currently-open vault,
-    // keyed into m_inFlightJobs by deviceId so it isn't garbage-collected
-    // mid-run. deviceRemoved is deliberately never connected to anything
+    // keyed into m_inFlightJobs by deviceId — which is the VOLUME's id
+    // (UsbDeviceInfo::id), never its serial: a device's volumes share a serial,
+    // so keying by that let two concurrent jobs for one device evict each other
+    // from the map. deviceRemoved is deliberately never connected to anything
     // here: an unplug mid-grab just accumulates copy errors in the job's
     // own per-file error handling and finishes naturally (per the confirmed
     // product decision — no early-abort-on-unmount logic).
@@ -142,8 +192,9 @@ private:
     VaultTreeModel *m_vaultTreeModel = nullptr;
     QString m_lastError;
 
-    // In-flight grab jobs keyed by device id (see startGrabJob()'s doc
+    // In-flight grab jobs keyed by VOLUME id (see startGrabJob()'s doc
     // comment). Entries are removed (and the job deleteLater()'d) once its
-    // finished() signal fires.
+    // finished() signal fires. One entry per mounted volume, so a two-volume
+    // device legitimately has two concurrent entries.
     QHash<QString, UsbGrabJob *> m_inFlightJobs;
 };

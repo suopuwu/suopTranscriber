@@ -2,6 +2,13 @@
 
 #include "VaultTreeModel.h"
 
+namespace {
+// Length of a well-formed fileSortKeys entry (groupRank, cluster identity,
+// position within the cluster) — Sidebar.qml's refreshTreeOrdering() builds
+// them; anything else is treated as "no key" by lessThan() below.
+constexpr int kFileSortKeyElements = 3;
+}
+
 VaultSearchProxyModel::VaultSearchProxyModel(QObject *parent)
     : QSortFilterProxyModel(parent)
 {
@@ -274,19 +281,22 @@ bool VaultSearchProxyModel::lessThan(const QModelIndex &left, const QModelIndex 
         // comparison consistent with every other, at the cost of keyless
         // files (orphaned .md) always landing after every audio file in the
         // same folder instead of interleaving at their old alphabetical spot.
-        const bool leftHasKey = leftKey.size() == 2;
-        const bool rightHasKey = rightKey.size() == 2;
+        const bool leftHasKey = leftKey.size() == kFileSortKeyElements;
+        const bool rightHasKey = rightKey.size() == kFileSortKeyElements;
         if (leftHasKey != rightHasKey)
             return leftHasKey;
         if (leftHasKey) {
-            const QString leftGroup = leftKey.at(0).toString();
-            const QString rightGroup = rightKey.at(0).toString();
-            if (leftGroup != rightGroup)
-                return leftGroup < rightGroup;
-            const QString leftOwn = leftKey.at(1).toString();
-            const QString rightOwn = rightKey.at(1).toString();
-            if (leftOwn != rightOwn)
-                return leftOwn < rightOwn;
+            // Element order is Sidebar.qml's, not this file's: groupRank,
+            // then cluster identity, then position within the cluster — see
+            // refreshTreeOrdering()'s sortKeys comment for why identity is
+            // its own tier (without it, two groups with an equal groupRank
+            // interleave their members instead of staying clustered).
+            for (int i = 0; i < kFileSortKeyElements; ++i) {
+                const QString leftElement = leftKey.at(i).toString();
+                const QString rightElement = rightKey.at(i).toString();
+                if (leftElement != rightElement)
+                    return leftElement < rightElement;
+            }
         }
     }
 

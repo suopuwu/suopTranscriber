@@ -10,7 +10,7 @@ set(SUOP_CORE_DIR ${CMAKE_SOURCE_DIR}/src/core)
 # so the app target stays untouched. QML_ELEMENT headers compile outside the
 # qml module as long as Qt6::Qml is linked.
 function(suop_add_test name)
-    cmake_parse_arguments(ARG "LINK_WHISPER;LINK_LLAMA;LINK_SHERPA_ONNX;LINK_QUICK;LINK_MULTIMEDIA;LINK_DBUS" "" "SOURCES" ${ARGN})
+    cmake_parse_arguments(ARG "LINK_WHISPER;LINK_LLAMA;LINK_SHERPA_ONNX;LINK_QUICK;LINK_MULTIMEDIA;LINK_DBUS;LINK_SVG;ICON_ASSETS" "" "SOURCES" ${ARGN})
     set(abs_sources "")
     foreach(src ${ARG_SOURCES})
         list(APPEND abs_sources ${SUOP_CORE_DIR}/${src})
@@ -26,8 +26,11 @@ function(suop_add_test name)
         target_link_libraries(${name} PRIVATE Qt6::Quick Qt6::QuickControls2)
     endif()
     if(ARG_LINK_DBUS)
-        # For tests that compile UsbGrabberController.cpp, which transitively
-        # constructs a UsbDeviceMonitor (QDBusConnection::systemBus() usage).
+        # For tests that compile UsbDeviceMonitor.cpp (QDBusConnection::systemBus()
+        # usage) — either directly, or transitively via UsbGrabberController.cpp,
+        # which constructs one. Needed even for tests that only exercise
+        # usbDeviceIsExternalMedia(), a plain function over property maps: the TU
+        # around it still references QtDBus and has to link.
         target_link_libraries(${name} PRIVATE Qt6::DBus)
     endif()
     if(ARG_LINK_MULTIMEDIA)
@@ -36,6 +39,31 @@ function(suop_add_test name)
         # only exercises hardware-free helper functions (see
         # tst_audiorecorder.cpp), so the TU still needs Qt6::Multimedia to link.
         target_link_libraries(${name} PRIVATE Qt6::Multimedia)
+    endif()
+    if(ARG_LINK_SVG)
+        # For tests that compile IconTheme.cpp — IconImageProvider uses
+        # QSvgRenderer to raster svg icon packs.
+        target_link_libraries(${name} PRIVATE Qt6::Svg)
+    endif()
+    if(ARG_ICON_ASSETS)
+        # IconTheme discovers packs by scanning
+        # :/qt/qml/SuopTranscriber/assets/icons, a path the app's
+        # qt_add_qml_module RESOURCES block normally provides. Tests don't
+        # link that module (see this file's header comment), so mirror the
+        # same files into the test binary at the SAME resource path — BASE
+        # makes each alias relative to the repo root, so they land at
+        # assets/icons/... under the prefix, exactly as in the app.
+        # SUOP_ICON_ASSETS is the parent CMakeLists' glob, and is relative to
+        # CMAKE_SOURCE_DIR.
+        set(icon_abs "")
+        foreach(rel ${SUOP_ICON_ASSETS})
+            list(APPEND icon_abs "${CMAKE_SOURCE_DIR}/${rel}")
+        endforeach()
+        qt_add_resources(${name} "suop_icons_${name}"
+            PREFIX "/qt/qml/SuopTranscriber"
+            BASE "${CMAKE_SOURCE_DIR}"
+            FILES ${icon_abs}
+        )
     endif()
     if(ARG_LINK_WHISPER)
         target_link_libraries(${name} PRIVATE whisper)
@@ -79,7 +107,15 @@ suop_add_test(tst_labelingengine LINK_LLAMA SOURCES LabelingEngine.cpp)
 suop_add_test(tst_diarizationengine LINK_SHERPA_ONNX SOURCES DiarizationEngine.cpp AudioDecoder.cpp)
 suop_add_test(tst_future_spec)
 suop_add_test(tst_styleguide)
-suop_add_test(tst_sidebar_keynav LINK_QUICK SOURCES VaultTreeModel.cpp VaultSearchProxyModel.cpp)
+suop_add_test(tst_icontheme LINK_QUICK LINK_SVG ICON_ASSETS SOURCES IconTheme.cpp)
+# The sidebar QQuickView harnesses load the real Sidebar.qml, which now uses
+# AppIcon — so they need IconTheme (its singleton + image provider) and the
+# icon-pack resources, exactly as the app does, or AppIcon.qml throws
+# "IconTheme is not defined" at load.
+suop_add_test(tst_sidebar_keynav LINK_QUICK LINK_SVG ICON_ASSETS SOURCES VaultTreeModel.cpp VaultSearchProxyModel.cpp IconTheme.cpp)
+suop_add_test(tst_sidebar_dragmove LINK_QUICK LINK_SVG ICON_ASSETS SOURCES VaultTreeModel.cpp VaultSearchProxyModel.cpp IconTheme.cpp)
+suop_add_test(tst_sidebar_expand LINK_QUICK LINK_SVG ICON_ASSETS SOURCES VaultTreeModel.cpp VaultSearchProxyModel.cpp IconTheme.cpp)
+suop_add_test(tst_usbdevicemonitor LINK_DBUS SOURCES UsbDeviceMonitor.cpp)
 suop_add_test(tst_usbrulestore SOURCES UsbRuleStore.cpp)
 suop_add_test(tst_usbgrabjob SOURCES UsbGrabJob.cpp UsbRuleStore.cpp VaultTreeModel.cpp)
 suop_add_test(tst_usbgrabbercontroller LINK_DBUS

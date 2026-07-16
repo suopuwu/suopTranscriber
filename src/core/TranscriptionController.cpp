@@ -30,6 +30,7 @@
 #include <limits>
 #include <memory>
 #include <optional>
+#include <tuple>
 
 #include "AudioDecoder.h"
 #include "DiarizationEngine.h"
@@ -3777,6 +3778,13 @@ TranscriptionController::findCombineGroups(const QVariantList &rules, const QStr
     struct Candidate {
         QString path;
         QString ruleName;
+        // The containing folder, part of the group identity below. A rule
+        // matches on bare filename, so without this two same-named parts in
+        // different folders would group together — which is never what the
+        // user means (they're separate recordings that happen to share a
+        // naming scheme), and the tree can't draw one outline around rows
+        // that aren't siblings anyway.
+        QString dir;
         QString key;
         // Same capture groups as `key`, un-concatenated — every member of a
         // group shares identical values here by construction (that's what
@@ -3812,13 +3820,14 @@ TranscriptionController::findCombineGroups(const QVariantList &rules, const QStr
             QStringList capturedValues;
             std::optional<QString> sortValue;
             if (const auto key = matchRuleCapturedKey(rule, info.fileName(), &capturedValues, &sortValue))
-                candidates.append(Candidate{path, ruleName, *key, capturedValues, sortValue, info.lastModified()});
+                candidates.append(Candidate{path, ruleName, info.absolutePath(), *key, capturedValues,
+                                            sortValue, info.lastModified()});
         }
     }
 
-    QMap<QPair<QString, QString>, QList<Candidate>> buckets;
+    QMap<std::tuple<QString, QString, QString>, QList<Candidate>> buckets;
     for (const Candidate &c : candidates)
-        buckets[qMakePair(c.ruleName, c.key)].append(c);
+        buckets[std::make_tuple(c.ruleName, c.dir, c.key)].append(c);
 
     const QDateTime now = QDateTime::currentDateTime();
     QList<CombineGroup> groups;
@@ -3856,15 +3865,17 @@ TranscriptionController::findCombineGroups(const QVariantList &rules, const QStr
         }
 
         CombineGroup group;
-        group.ruleName = it.key().first;
-        group.key = it.key().second;
+        group.ruleName = std::get<0>(it.key());
+        group.key = std::get<2>(it.key());
         group.capturedValues = members.first().capturedValues;
         for (const Candidate &c : members)
             group.files << c.path;
 
-        const QFileInfo firstInfo(members.first().path);
-        group.outputPath =
-            combineOutputPathFor(group.ruleName, group.key, firstInfo.absolutePath(), firstInfo.suffix());
+        // Every member shares the bucket's folder by construction, so the
+        // merged file lands beside its own inputs rather than in whichever
+        // folder happened to hold the first-in-combine-order member.
+        group.outputPath = combineOutputPathFor(group.ruleName, group.key, std::get<1>(it.key()),
+                                                QFileInfo(members.first().path).suffix());
 
         if (members.size() < 2) {
             group.status = QStringLiteral("singleton");
@@ -3897,10 +3908,15 @@ TranscriptionController::findCombineGroups(const QVariantList &rules, const QStr
 
     // Deterministic ordering — callers (tests, the Settings preview) don't
     // have to guess QMap's iteration order.
+    // outputPath is the tiebreaker, not decoration: (ruleName, key) alone
+    // stopped being unique once folder joined the group identity — the same
+    // rule and key in two folders are now two distinct groups.
     std::sort(groups.begin(), groups.end(), [](const CombineGroup &a, const CombineGroup &b) {
         if (a.ruleName != b.ruleName)
             return a.ruleName < b.ruleName;
-        return a.key < b.key;
+        if (a.key != b.key)
+            return a.key < b.key;
+        return a.outputPath < b.outputPath;
     });
     return groups;
 }

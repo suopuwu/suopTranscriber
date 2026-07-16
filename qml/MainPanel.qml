@@ -107,11 +107,16 @@ Rectangle {
     property int searchMatchStart: -1
     property int searchMatchLength: 0
 
-    // Item 7: find & replace state (distinct from the read-only search above)
-    // — a regex/literal find pattern, a replacement string, mode toggles,
-    // and an inline-banner backing string for an invalid regex.
-    property bool findReplaceExpanded: false
-    property string findText: ""
+    // Item 7: replace state. There is no separate find pattern — searchQuery
+    // above IS the pattern, so the one search field drives both
+    // search-as-you-type and replace and the two can never disagree about
+    // what "the match" is. Consequently the mode toggles below govern search
+    // too: search is a regex when findRegexEnabled and case-SENSITIVE unless
+    // findCaseInsensitive (it used to be an unconditionally case-insensitive
+    // literal). replaceEnabled is the checkbox that arms replace — while it's
+    // false the replace row is hidden AND replaceNext()/replaceAll() no-op,
+    // so the bar is a pure find until you ask for more.
+    property bool replaceEnabled: false
     property string replaceText: ""
     property bool findRegexEnabled: false
     property bool findCaseInsensitive: false
@@ -1384,40 +1389,31 @@ Rectangle {
         return {clean: clean, map: map}
     }
 
-    // Item 13: total non-overlapping occurrences of q in clean — feeds the
-    // "a/b" display alongside jumpToNextMatch's own forward-scan logic.
-    function countMatches(clean, q) {
-        if (q === "")
-            return 0
-        const lower = clean.toLowerCase()
-        let count = 0
-        let pos = 0
-        while (true) {
-            const idx = lower.indexOf(q, pos)
-            if (idx === -1)
-                break
-            count++
-            pos = idx + q.length
+    // Item 13/7: every non-overlapping match of the current pattern in the
+    // clean corpus, left to right, as {index, length}. One global-RegExp scan
+    // now answers the "a/b" count, the current match's ordinal, AND the match
+    // range itself — the three separate indexOf scans this used before the
+    // search field became the find pattern can't work anymore, because a
+    // regex match's length varies per match instead of always being
+    // searchQuery.length.
+    //
+    // Returns [] for an empty query, an empty corpus, or an invalid regex —
+    // all three mean "nothing to highlight". buildFindRegex() is what
+    // clears/sets the inline error banner, so every caller gets that for free.
+    function findMatches(clean) {
+        const re = mainPanel.buildFindRegex(true)
+        if (!re || clean === "")
+            return []
+        const out = []
+        let m
+        while ((m = re.exec(clean)) !== null) {
+            out.push({index: m.index, length: m[0].length})
+            // A zero-length match (regex mode, e.g. "a*") leaves lastIndex
+            // parked, so exec() would return it forever — step past it.
+            if (m[0].length === 0)
+                re.lastIndex++
         }
-        return count
-    }
-
-    // 1-based ordinal of the match STARTING at matchIdx, among all matches
-    // in left-to-right order (matches countMatches' same non-overlapping scan).
-    function ordinalOfMatch(clean, q, matchIdx) {
-        const lower = clean.toLowerCase()
-        let count = 0
-        let pos = 0
-        while (true) {
-            const idx = lower.indexOf(q, pos)
-            if (idx === -1)
-                break
-            count++
-            if (idx === matchIdx)
-                break
-            pos = idx + q.length
-        }
-        return count
+        return out
     }
 
     function resetSearchMatch() {
@@ -1436,23 +1432,22 @@ Rectangle {
     // then updates all the match-state properties and select()s the raw
     // range.
     function locateMatch(fromIndex) {
-        if (mainPanel.searchQuery === "")
-            return
         const corpus = mainPanel.searchCorpus()
-        if (corpus.clean === "")
-            return
-        const q = mainPanel.searchQuery.toLowerCase()
-        const lower = corpus.clean.toLowerCase()
-        let idx = lower.indexOf(q, Math.max(0, fromIndex))
-        if (idx === -1)
-            idx = lower.indexOf(q, 0) // wrap around
-        mainPanel.searchMatchIndex = idx
-        if (idx === -1) {
+        const matches = mainPanel.findMatches(corpus.clean)
+        if (matches.length === 0) {
             mainPanel.resetSearchMatch()
             return
         }
-        mainPanel.searchMatchCount = mainPanel.countMatches(corpus.clean, q)
-        mainPanel.searchMatchOrdinal = mainPanel.ordinalOfMatch(corpus.clean, q, idx)
+        // First match starting at or after fromIndex, wrapping to the first
+        // overall — the list is already in left-to-right order, so its own
+        // position in the list IS the 1-based ordinal, no second scan.
+        let ord = matches.findIndex(m => m.index >= Math.max(0, fromIndex))
+        if (ord === -1)
+            ord = 0
+        const idx = matches[ord].index
+        mainPanel.searchMatchIndex = idx
+        mainPanel.searchMatchCount = matches.length
+        mainPanel.searchMatchOrdinal = ord + 1
 
         // Translate [idx, matchEnd) in the clean corpus back to a raw
         // select() range (into displayText) — spanning every sentence the
@@ -1460,7 +1455,7 @@ Rectangle {
         // highlights correctly (the intervening newline/"[Speaker N]" text
         // between two sentences ends up included in the raw selection too —
         // there's no single contiguous range that would exclude it).
-        const matchEnd = idx + q.length
+        const matchEnd = idx + matches[ord].length
         let firstEntry = null
         let lastEntry = null
         for (const entry of corpus.map) {
@@ -1523,16 +1518,20 @@ Rectangle {
         mainPanel.locateMatch(mainPanel.searchMatchIndex < 0 ? 0 : mainPanel.searchMatchIndex + 1)
     }
 
-    // Item 7: compiles findText into a JS RegExp — treated as literal text
+    // Item 7: compiles searchQuery into a JS RegExp — treated as literal text
     // (special chars escaped) unless findRegexEnabled, always with "g" when
     // `global`, plus "i" when findCaseInsensitive. An invalid pattern sets
     // the inline findReplaceError banner and returns null instead of
     // throwing, so a half-typed regex never crashes the binding.
+    //
+    // This is the SINGLE place the pattern is compiled — the live search (via
+    // findMatches) and replaceNext()/replaceAll() all go through it, which is
+    // what keeps the "a/b" count honest about what Replace all would touch.
     function buildFindRegex(global) {
         mainPanel.findReplaceError = ""
-        if (mainPanel.findText === "")
+        if (mainPanel.searchQuery === "")
             return null
-        let pattern = mainPanel.findText
+        let pattern = mainPanel.searchQuery
         if (!mainPanel.findRegexEnabled)
             pattern = pattern.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
         let flags = global ? "g" : ""
@@ -1563,7 +1562,14 @@ Rectangle {
 
     // Replace only the FIRST match: a non-global RegExp makes String.replace
     // hit just the first occurrence, honoring $1/$& backreferences.
+    //
+    // The replaceEnabled gate here is the real one, not just UI polish: the
+    // bar is a find bar until the Replace checkbox is ticked, so nothing may
+    // mutate the transcript while it's unticked, no matter how the call was
+    // reached.
     function replaceNext() {
+        if (!mainPanel.replaceEnabled)
+            return
         const re = mainPanel.buildFindRegex(false)
         if (!re)
             return
@@ -1577,8 +1583,11 @@ Rectangle {
         mainPanel.applyTranscriptReplacement(result)
     }
 
-    // Replace every match (global RegExp).
+    // Replace every match (global RegExp). Same replaceEnabled gate as
+    // replaceNext() above.
     function replaceAll() {
+        if (!mainPanel.replaceEnabled)
+            return
         const re = mainPanel.buildFindRegex(true)
         if (!re)
             return
@@ -1683,6 +1692,20 @@ Rectangle {
         mainPanel.locateMatch(0)
     }
 
+    // Item 7: the mode toggles now feed the live search as well as replace
+    // (searchQuery is the pattern for both), so flipping one re-runs the
+    // search from the top the same way retyping the query does — otherwise
+    // the highlight and the "a/b" count would keep describing the OLD mode.
+    onFindRegexEnabledChanged: {
+        mainPanel.resetSearchMatch()
+        mainPanel.locateMatch(0)
+    }
+
+    onFindCaseInsensitiveChanged: {
+        mainPanel.resetSearchMatch()
+        mainPanel.locateMatch(0)
+    }
+
     // O1: on first open of an already-transcribed file, transcriptArea can
     // transiently compute a wrong (oversized) width for one frame right as
     // `visible` flips true and `text` is set in the same tick, leaving the
@@ -1782,16 +1805,19 @@ Rectangle {
         onActivated: mainPanel.redoLast()
     }
 
-    // Item 7: Ctrl+H toggles the find & replace bar (and focuses the find
-    // field when opening), same enable-gate as Ctrl+F's search.
+    // Item 7: Ctrl+H opens the SAME bar Ctrl+F does — there is only one now —
+    // but arms the replace row on the way in, so the old "jump straight to
+    // replace" muscle memory still lands somewhere useful. Same enable-gate
+    // as Ctrl+F. Not a toggle: it's "get me to replace", so pressing it twice
+    // shouldn't shut the bar you just opened.
     Shortcut {
         sequence: "Ctrl+H"
         enabled: mainPanel.activeFocus && (mainPanel.orphanedMdPath !== ""
                      || (mainPanel.player && mainPanel.player.source.toString() !== ""))
         onActivated: {
-            mainPanel.findReplaceExpanded = !mainPanel.findReplaceExpanded
-            if (mainPanel.findReplaceExpanded)
-                findField.forceActiveFocus()
+            mainPanel.searchExpanded = true
+            mainPanel.replaceEnabled = true
+            searchField.forceActiveFocus()
         }
     }
 
@@ -1891,52 +1917,16 @@ Rectangle {
                     anchors.fill: parent
                     active: playPauseButton.enabled && playPauseHover.hovered
                 }
-                // Drawn, not a font glyph: the "▶" Unicode character's em-box
-                // is never truly centered on its triangle (padding varies by
-                // font/system, so any fixed offset is a guess that breaks
-                // elsewhere) — a Canvas-drawn shape lets us control centering
-                // directly. Pause's two bars are bbox-symmetric so centerIn
-                // alone centers them correctly; play's triangle is not — its
-                // visual centroid (average of its 3 vertices) sits left of
-                // its bounding-box center, so it's drawn shifted right by a
-                // fixed offset to visually balance against the pause glyph.
-                Canvas {
+                // The play/pause icon. Under the classic pack these resolve
+                // to the hand-drawn PlayGlyph/PauseGlyph shapes (a font "▶"
+                // can't be reliably centered on its triangle — see
+                // PlayGlyph.qml); under material, to the play_arrow/pause SVGs.
+                AppIcon {
                     id: playPauseIcon
                     anchors.centerIn: parent
-                    width: 14
-                    height: 14
-
-                    property bool playing: mainPanel.player && mainPanel.player.playing
-                    property color iconColor: playPauseButton.enabled ? "white" : "#666666"
-                    onPlayingChanged: requestPaint()
-                    onIconColorChanged: requestPaint()
-
-                    onPaint: {
-                        const ctx = getContext("2d")
-                        ctx.reset()
-                        ctx.fillStyle = playPauseIcon.iconColor
-                        if (playPauseIcon.playing) {
-                            const barWidth = width * 0.3
-                            ctx.fillRect(0, 0, barWidth, height)
-                            ctx.fillRect(width - barWidth, 0, barWidth, height)
-                        } else {
-                            // Item P24: the tip used to sit at width+xOffset,
-                            // 2px past this 14x14 canvas's own raster — it
-                            // got silently clipped, reading as a blunt/cut
-                            // triangle. Capping the tip at `width` instead
-                            // (the offset now only shifts the LEFT edge in,
-                            // shrinking the triangle's span rather than
-                            // pushing it past the canvas bounds) keeps the
-                            // whole shape on-canvas.
-                            const xOffset = 2
-                            ctx.beginPath()
-                            ctx.moveTo(xOffset, 0)
-                            ctx.lineTo(width, height / 2)
-                            ctx.lineTo(xOffset, height)
-                            ctx.closePath()
-                            ctx.fill()
-                        }
-                    }
+                    name: (mainPanel.player && mainPanel.player.playing) ? "pause" : "play"
+                    iconSize: 14
+                    color: playPauseButton.enabled ? "white" : "#666666"
                 }
             }
 
@@ -2191,11 +2181,11 @@ Rectangle {
                     anchors.fill: parent
                     active: transcribeIconButton.enabled && transcribeIconHover.hovered
                 }
-                Text {
+                AppIcon {
                     anchors.centerIn: parent
-                    text: "⤒"
+                    name: "transcribe"
+                    iconSize: 13
                     color: transcribeIconButton.enabled ? "#dddddd" : "#666666"
-                    font.pixelSize: 13
                 }
             }
 
@@ -2244,11 +2234,11 @@ Rectangle {
                     anchors.fill: parent
                     active: runAllIconButton.enabled && runAllIconHover.hovered
                 }
-                Text {
+                AppIcon {
                     anchors.centerIn: parent
-                    text: "»"
+                    name: "run-all"
+                    iconSize: 15
                     color: runAllIconButton.enabled ? "#dddddd" : "#666666"
-                    font.pixelSize: 15
                 }
             }
 
@@ -2289,11 +2279,11 @@ Rectangle {
                     anchors.fill: parent
                     active: regenerateLabelButton.enabled && regenerateLabelHover.hovered
                 }
-                Text {
+                AppIcon {
                     anchors.centerIn: parent
-                    text: "↻"
+                    name: "relabel"
+                    iconSize: 14
                     color: regenerateLabelButton.enabled ? "#dddddd" : "#666666"
-                    font.pixelSize: 14
                 }
             }
 
@@ -2334,11 +2324,11 @@ Rectangle {
                     anchors.fill: parent
                     active: generateChaptersButton.enabled && generateChaptersHover.hovered
                 }
-                Text {
+                AppIcon {
                     anchors.centerIn: parent
-                    text: "≡"
+                    name: "chapters"
+                    iconSize: 15
                     color: generateChaptersButton.enabled ? "#dddddd" : "#666666"
-                    font.pixelSize: 15
                 }
             }
 
@@ -2383,11 +2373,11 @@ Rectangle {
                     anchors.fill: parent
                     active: detectSpeakersButton.enabled && detectSpeakersHover.hovered
                 }
-                Text {
+                AppIcon {
                     anchors.centerIn: parent
-                    text: "☻"
+                    name: "speakers"
+                    iconSize: 14
                     color: detectSpeakersButton.enabled ? "#dddddd" : "#666666"
-                    font.pixelSize: 14
                 }
             }
 
@@ -2424,11 +2414,11 @@ Rectangle {
                     anchors.fill: parent
                     active: deleteTranscriptButton.enabled && deleteTranscriptHover.hovered
                 }
-                Text {
+                AppIcon {
                     anchors.centerIn: parent
-                    text: "⌫"
+                    name: "delete-transcript"
+                    iconSize: 14
                     color: deleteTranscriptButton.enabled ? "#e07a7a" : "#666666"
-                    font.pixelSize: 14
                 }
             }
 
@@ -2464,11 +2454,11 @@ Rectangle {
                     anchors.fill: parent
                     active: deleteFileButton.enabled && deleteFileHover.hovered
                 }
-                Text {
+                AppIcon {
                     anchors.centerIn: parent
-                    text: "⌦"
+                    name: "delete-file"
+                    iconSize: 14
                     color: deleteFileButton.enabled ? "#e07a7a" : "#666666"
-                    font.pixelSize: 14
                 }
             }
 
@@ -2476,6 +2466,9 @@ Rectangle {
             // the main panel has focus. Searches title/tags (via
             // storedMetadata, already loaded) + the transcript body
             // (jumpToNextMatch() selects/scrolls the next match below).
+            // Item 7: this field is ALSO the find pattern for replace — the
+            // .*/Aa toggles and the Replace checkbox sit right after it, and
+            // the replace row unfolds below the whole title row.
             Item {
                 id: searchToggleButton
                 visible: !mainPanel.searchExpanded
@@ -2496,11 +2489,11 @@ Rectangle {
                     anchors.fill: parent
                     active: searchToggleHover.hovered
                 }
-                Text {
+                AppIcon {
                     anchors.centerIn: parent
-                    text: "⌕"
+                    name: "search"
+                    iconSize: 15
                     color: "#dddddd"
-                    font.pixelSize: 15
                 }
             }
 
@@ -2508,15 +2501,66 @@ Rectangle {
                 id: searchField
                 visible: mainPanel.searchExpanded
                 Layout.preferredWidth: 200
-                placeholderText: qsTr("Search transcript, title, tags…")
+                // Item 7: the placeholder tracks the mode, since the same
+                // field means a literal string or a regex depending on ".*".
+                placeholderText: mainPanel.findRegexEnabled
+                                 ? qsTr("Pattern in transcript, title, tags…")
+                                 : qsTr("Search transcript, title, tags…")
                 text: mainPanel.searchQuery
                 onTextChanged: mainPanel.searchQuery = text
                 onAccepted: mainPanel.jumpToNextMatch()
+                // Item 7: an invalid regex reddens the text it's invalid in
+                // (the banner below spells out why).
+                color: mainPanel.findReplaceError !== "" ? "#e07a7a" : "#dddddd"
 
                 background: UnderlineField { focused: searchField.activeFocus }
 
                 HoverHandler {
                     cursorShape: Qt.IBeamCursor
+                }
+            }
+
+            // Item 7: regex mode toggle (.*) — active state uses the app
+            // accent so it reads as a mode, not a one-shot button. Governs
+            // the live search as well as replace (see findRegexEnabled).
+            Item {
+                id: regexToggle
+                visible: mainPanel.searchExpanded
+                Layout.preferredWidth: 26
+                Layout.preferredHeight: 22
+                ToolTip.visible: regexToggleHover.hovered
+                ToolTip.text: qsTr("Regular expression")
+                ToolTip.delay: 500
+                HoverHandler { id: regexToggleHover; cursorShape: Qt.PointingHandCursor }
+                TapHandler { onTapped: mainPanel.findRegexEnabled = !mainPanel.findRegexEnabled }
+                HoverBorder { anchors.fill: parent; active: regexToggleHover.hovered }
+                Text {
+                    anchors.centerIn: parent
+                    text: ".*"
+                    color: mainPanel.findRegexEnabled ? AppSettings.accentColor : "#888888"
+                    font.pixelSize: 13
+                    font.bold: mainPanel.findRegexEnabled
+                }
+            }
+
+            // Item 7: case-sensitivity toggle (Aa) — on means case-INsensitive.
+            Item {
+                id: caseToggle
+                visible: mainPanel.searchExpanded
+                Layout.preferredWidth: 26
+                Layout.preferredHeight: 22
+                ToolTip.visible: caseToggleHover.hovered
+                ToolTip.text: qsTr("Ignore case")
+                ToolTip.delay: 500
+                HoverHandler { id: caseToggleHover; cursorShape: Qt.PointingHandCursor }
+                TapHandler { onTapped: mainPanel.findCaseInsensitive = !mainPanel.findCaseInsensitive }
+                HoverBorder { anchors.fill: parent; active: caseToggleHover.hovered }
+                Text {
+                    anchors.centerIn: parent
+                    text: "Aa"
+                    color: mainPanel.findCaseInsensitive ? AppSettings.accentColor : "#888888"
+                    font.pixelSize: 12
+                    font.bold: mainPanel.findCaseInsensitive
                 }
             }
 
@@ -2529,6 +2573,40 @@ Rectangle {
                       : qsTr("0/0")
                 color: "#888888"
                 font.pixelSize: 11
+            }
+
+            // Item 7: the checkbox that arms replace. Minimal pill toggle
+            // (same idiom as speakerDetectionToggle below and Sidebar.qml's
+            // search-scope toggle) rather than a QQC2 CheckBox — which would
+            // also steal focus from searchField on press, per the
+            // focusable-control-beside-a-TextField hazard this file already
+            // avoids everywhere else.
+            Item {
+                id: replaceToggle
+                visible: mainPanel.searchExpanded
+                Layout.preferredWidth: replaceToggleLabel.implicitWidth + 16
+                Layout.preferredHeight: 22
+
+                HoverHandler { id: replaceToggleHover; cursorShape: Qt.PointingHandCursor }
+                TapHandler { onTapped: mainPanel.replaceEnabled = !mainPanel.replaceEnabled }
+                Rectangle {
+                    anchors.fill: parent
+                    radius: AppSettings.borderRadius
+                    color: mainPanel.replaceEnabled
+                           ? (replaceToggleHover.hovered ? "#2ecc71" : "#25a25a")
+                           : (replaceToggleHover.hovered ? "#3a3a3a" : "#2a2a2a")
+                    border.width: 1
+                    border.color: mainPanel.replaceEnabled ? "#2ecc71" : "#4a4a4a"
+
+                    Behavior on color { ColorAnimation { duration: AppSettings.animationsEnabled ? 100 : 0 } }
+                }
+                Label {
+                    id: replaceToggleLabel
+                    anchors.centerIn: parent
+                    text: qsTr("Replace")
+                    color: mainPanel.replaceEnabled ? "white" : "#aaaaaa"
+                    font.pixelSize: 11
+                }
             }
 
             Item {
@@ -2546,139 +2624,49 @@ Rectangle {
                         searchField.text = ""
                         mainPanel.searchQuery = ""
                         mainPanel.searchExpanded = false
+                        // Item 7: closing disarms replace and drops the
+                        // banner, so the bar can't reopen mid-edit already
+                        // armed with a stale pattern.
+                        mainPanel.replaceEnabled = false
+                        mainPanel.findReplaceError = ""
                     }
                 }
                 HoverBorder {
                     anchors.fill: parent
                     active: searchCloseHover.hovered
                 }
-                Text {
+                AppIcon {
                     anchors.centerIn: parent
-                    text: "×"
+                    name: "close"
+                    iconSize: 15
                     color: "#dddddd"
-                    font.pixelSize: 15
-                }
-            }
-
-            // Item 7: find & replace toggle — opens the replace bar below
-            // (the same bar Ctrl+H toggles). Its own icon so the feature is
-            // discoverable without knowing the shortcut. Item+TapHandler (no
-            // focusable QQC2 control) so it never steals focus.
-            Item {
-                id: findReplaceToggleButton
-                Layout.preferredWidth: 22
-                Layout.preferredHeight: 22
-                visible: mainPanel.orphanedMdPath !== ""
-                         || (mainPanel.player && mainPanel.player.source.toString() !== "")
-
-                HoverHandler { id: findReplaceToggleHover; cursorShape: Qt.PointingHandCursor }
-                TapHandler {
-                    onTapped: {
-                        mainPanel.findReplaceExpanded = !mainPanel.findReplaceExpanded
-                        if (mainPanel.findReplaceExpanded)
-                            findField.forceActiveFocus()
-                    }
-                }
-                HoverBorder {
-                    anchors.fill: parent
-                    active: findReplaceToggleHover.hovered
-                }
-                Text {
-                    anchors.centerIn: parent
-                    text: "⇄"
-                    color: mainPanel.findReplaceExpanded ? AppSettings.accentColor : "#dddddd"
-                    font.pixelSize: 14
                 }
             }
         }
 
-        // Item 7: find & replace bar — sticky, right under the title/search
-        // row, shown on the findReplaceExpanded bool (same show/hide idiom as
-        // searchField). Regex mode uses JS RegExp (see buildFindRegex); an
-        // invalid pattern shows the inline error banner below rather than
-        // throwing. Replace routes through commitTranscriptEdits() via
-        // replaceNext()/replaceAll(), so it inherits that path's per-sentence
-        // line-count safety check.
+        // Item 7: the replace row — sticky, right under the title/search row.
+        // The find half of this bar is the search row above (searchField IS
+        // the pattern, .*/Aa are its modes), so all that lives here is the
+        // replacement string, the two actions, and the shared error banner.
+        // The row appears only once the Replace checkbox arms it; the banner
+        // does not, since an invalid regex is worth reporting while you're
+        // merely searching. Regex mode uses JS RegExp (see buildFindRegex);
+        // an invalid pattern shows the banner rather than throwing. Replace
+        // routes through commitTranscriptEdits() via replaceNext()/
+        // replaceAll(), so it inherits that path's per-sentence line-count
+        // safety check.
         ColumnLayout {
             Layout.fillWidth: true
-            visible: mainPanel.findReplaceExpanded
+            visible: mainPanel.searchExpanded
             spacing: 4
 
             RowLayout {
                 Layout.fillWidth: true
+                visible: mainPanel.replaceEnabled
                 spacing: 8
 
                 Label {
-                    text: qsTr("Find")
-                    color: "#888888"
-                    font.pixelSize: 11
-                }
-
-                TextField {
-                    id: findField
-                    Layout.preferredWidth: 180
-                    placeholderText: mainPanel.findRegexEnabled ? qsTr("pattern…") : qsTr("text…")
-                    text: mainPanel.findText
-                    onTextChanged: {
-                        mainPanel.findText = text
-                        // Live-validate so an invalid regex flags immediately
-                        // (buildFindRegex sets/clears findReplaceError).
-                        mainPanel.buildFindRegex(false)
-                    }
-                    color: mainPanel.findReplaceError !== "" ? "#e07a7a" : "#dddddd"
-                    background: UnderlineField { focused: findField.activeFocus }
-                    HoverHandler { cursorShape: Qt.IBeamCursor }
-                }
-
-                // Regex mode toggle (.*) — active state uses the app accent
-                // so it reads as a mode, not a one-shot button.
-                Item {
-                    id: regexToggle
-                    Layout.preferredWidth: 26
-                    Layout.preferredHeight: 22
-                    HoverHandler { id: regexToggleHover; cursorShape: Qt.PointingHandCursor }
-                    TapHandler {
-                        onTapped: {
-                            mainPanel.findRegexEnabled = !mainPanel.findRegexEnabled
-                            mainPanel.buildFindRegex(false) // re-validate under the new mode
-                        }
-                    }
-                    HoverBorder { anchors.fill: parent; active: regexToggleHover.hovered }
-                    Text {
-                        anchors.centerIn: parent
-                        text: ".*"
-                        color: mainPanel.findRegexEnabled ? AppSettings.accentColor : "#888888"
-                        font.pixelSize: 13
-                        font.bold: mainPanel.findRegexEnabled
-                    }
-                }
-
-                // Case-insensitive toggle (Aa).
-                Item {
-                    id: caseToggle
-                    Layout.preferredWidth: 26
-                    Layout.preferredHeight: 22
-                    HoverHandler { id: caseToggleHover; cursorShape: Qt.PointingHandCursor }
-                    TapHandler { onTapped: mainPanel.findCaseInsensitive = !mainPanel.findCaseInsensitive }
-                    HoverBorder { anchors.fill: parent; active: caseToggleHover.hovered }
-                    Text {
-                        anchors.centerIn: parent
-                        text: "Aa"
-                        color: mainPanel.findCaseInsensitive ? AppSettings.accentColor : "#888888"
-                        font.pixelSize: 12
-                        font.bold: mainPanel.findCaseInsensitive
-                    }
-                }
-
-                Item { Layout.fillWidth: true }
-            }
-
-            RowLayout {
-                Layout.fillWidth: true
-                spacing: 8
-
-                Label {
-                    text: qsTr("Replace")
+                    text: qsTr("Replace with")
                     color: "#888888"
                     font.pixelSize: 11
                 }
@@ -2746,24 +2734,24 @@ Rectangle {
 
                 Item { Layout.fillWidth: true }
 
-                // Close the bar (mirrors searchCloseButton's "×").
+                // Item 7: disarms replace, folding this row away and leaving
+                // the find bar (and your pattern) intact — the "×" on the
+                // search row above is what closes the whole thing.
                 Item {
-                    id: findReplaceCloseButton
+                    id: replaceCollapseButton
                     Layout.preferredWidth: 20
                     Layout.preferredHeight: 20
-                    HoverHandler { id: findReplaceCloseHover; cursorShape: Qt.PointingHandCursor }
-                    TapHandler {
-                        onTapped: {
-                            mainPanel.findReplaceExpanded = false
-                            mainPanel.findReplaceError = ""
-                        }
-                    }
-                    HoverBorder { anchors.fill: parent; active: findReplaceCloseHover.hovered }
-                    Text {
+                    ToolTip.visible: replaceCollapseHover.hovered
+                    ToolTip.text: qsTr("Hide replace")
+                    ToolTip.delay: 500
+                    HoverHandler { id: replaceCollapseHover; cursorShape: Qt.PointingHandCursor }
+                    TapHandler { onTapped: mainPanel.replaceEnabled = false }
+                    HoverBorder { anchors.fill: parent; active: replaceCollapseHover.hovered }
+                    AppIcon {
                         anchors.centerIn: parent
-                        text: "×"
+                        name: "close"
+                        iconSize: 15
                         color: "#dddddd"
-                        font.pixelSize: 15
                     }
                 }
             }
@@ -2924,12 +2912,12 @@ Rectangle {
                                 // tap on the icon fire BOTH the sidebar
                                 // filter and (via tagField's own click-to-
                                 // edit) a text edit at once.
-                                Text {
+                                AppIcon {
                                     id: tagSortIcon
                                     Layout.alignment: Qt.AlignVCenter
-                                    text: "▽"
+                                    name: "filter"
+                                    iconSize: 10
                                     color: tagSortIconHover.hovered ? "#dddddd" : "#888888"
-                                    font.pixelSize: 10
 
                                     HoverHandler {
                                         id: tagSortIconHover
@@ -2945,11 +2933,11 @@ Rectangle {
                                 // predictable/discoverable, same treatment
                                 // as searchCloseButton's "x" elsewhere in
                                 // this file.
-                                Text {
+                                AppIcon {
                                     id: tagRemoveIcon
-                                    text: "×"
+                                    name: "close"
+                                    iconSize: 12
                                     color: tagRemoveHover.hovered ? "#e07a7a" : "#888888"
-                                    font.pixelSize: 12
 
                                     HoverHandler {
                                         id: tagRemoveHover
@@ -3176,12 +3164,12 @@ Rectangle {
                                 // which fired both the rename focus AND (via
                                 // the pill-body tap) the sidebar filter off a
                                 // single tap.
-                                Text {
+                                AppIcon {
                                     id: speakerSortIcon
                                     anchors.verticalCenter: parent.verticalCenter
-                                    text: "⇅"
+                                    name: "sort"
+                                    iconSize: 10
                                     color: speakerSortIconHover.hovered ? "#dddddd" : "#888888"
-                                    font.pixelSize: 10
 
                                     HoverHandler {
                                         id: speakerSortIconHover
@@ -3209,19 +3197,17 @@ Rectangle {
                                     color: "#dddddd"
                                     font.pixelSize: 11
                                 }
-                                Label {
-                                    text: "✓"
+                                AppIcon {
+                                    name: "check"
+                                    iconSize: 12
                                     color: "#8fdf9f"
-                                    font.pixelSize: 12
-                                    font.bold: true
                                     HoverHandler { cursorShape: Qt.PointingHandCursor }
                                     TapHandler { onTapped: mainPanel.confirmSpeakerMerge(true) }
                                 }
-                                Label {
-                                    text: "✕"
+                                AppIcon {
+                                    name: "cancel"
+                                    iconSize: 12
                                     color: "#e07a7a"
-                                    font.pixelSize: 12
-                                    font.bold: true
                                     HoverHandler { cursorShape: Qt.PointingHandCursor }
                                     TapHandler { onTapped: mainPanel.confirmSpeakerMerge(false) }
                                 }
@@ -3352,10 +3338,10 @@ Rectangle {
                         Layout.fillWidth: true
                         spacing: 6
 
-                        Text {
-                            text: mainPanel.chaptersExpanded ? "−" : "+"
+                        AppIcon {
+                            name: mainPanel.chaptersExpanded ? "collapse" : "expand"
+                            iconSize: 11
                             color: "#aaaaaa"
-                            font.pixelSize: 11
 
                             HoverHandler { cursorShape: Qt.PointingHandCursor }
                             TapHandler { onTapped: mainPanel.chaptersExpanded = !mainPanel.chaptersExpanded }
@@ -3398,11 +3384,11 @@ Rectangle {
                                 anchors.fill: parent
                                 active: addChapterHover.hovered
                             }
-                            Text {
+                            AppIcon {
                                 anchors.centerIn: parent
-                                text: "+"
+                                name: "add"
+                                iconSize: 14
                                 color: "#8fdf9f"
-                                font.pixelSize: 14
                             }
                         }
                     }
@@ -3442,11 +3428,11 @@ Rectangle {
                                 // -edited) get a subtle pencil marker,
                                 // distinguishing them from auto-generated ones
                                 // via readChapters()' `manual` bool.
-                                Text {
+                                AppIcon {
                                     visible: !!chapterRow.modelData.manual
-                                    text: "✎"
+                                    name: "edit"
+                                    iconSize: 10
                                     color: "#8fdf9f"
-                                    font.pixelSize: 10
                                 }
 
                                 // Item 34/35: click-to-edit chapter title. NOT
@@ -3552,11 +3538,11 @@ Rectangle {
                                         anchors.fill: parent
                                         active: deleteChapterHover.hovered
                                     }
-                                    Text {
+                                    AppIcon {
                                         anchors.centerIn: parent
-                                        text: "×"
+                                        name: "close"
+                                        iconSize: 13
                                         color: "#c07a7a"
-                                        font.pixelSize: 13
                                     }
                                 }
                             }
@@ -4048,11 +4034,11 @@ Rectangle {
                         // SEPARATE from the title (which is click-to-edit, item
                         // 35) so the two gestures never collide — a triangle is
                         // the least ambiguous collapse affordance (task note).
-                        Text {
+                        AppIcon {
                             Layout.alignment: Qt.AlignVCenter
-                            text: chapterHeadingRow.collapsed ? "▸" : "▾"
+                            name: chapterHeadingRow.collapsed ? "chapter-expand" : "chapter-collapse"
+                            iconSize: 10
                             color: "#8fdf9f"
-                            font.pixelSize: 10
 
                             HoverHandler { cursorShape: Qt.PointingHandCursor }
                             TapHandler {
@@ -4687,11 +4673,11 @@ Rectangle {
                     ToolTip.visible: recordToggleHover.hovered
                     ToolTip.text: mainPanel.audioRecorder.recording ? qsTr("Stop recording") : qsTr("Start recording")
                     ToolTip.delay: 500
-                    Text {
+                    AppIcon {
                         anchors.centerIn: parent
-                        text: mainPanel.audioRecorder.recording ? "⏹" : "⏺"
+                        name: mainPanel.audioRecorder.recording ? "stop" : "record"
+                        iconSize: 16
                         color: mainPanel.audioRecorder.recording ? "#e07a7a" : "#6fdf9f"
-                        font.pixelSize: 16
                     }
                 }
 
@@ -4723,11 +4709,11 @@ Rectangle {
                     ToolTip.visible: animationsToggleHover.hovered
                     ToolTip.text: AppSettings.animationsEnabled ? qsTr("Disable animations") : qsTr("Enable animations")
                     ToolTip.delay: 500
-                    Text {
+                    AppIcon {
                         anchors.centerIn: parent
-                        text: "❄"
+                        name: "freeze"
+                        iconSize: 15
                         color: AppSettings.animationsEnabled ? "#dddddd" : "#6fdf9f"
-                        font.pixelSize: 15
                     }
                 }
 
@@ -4770,10 +4756,11 @@ Rectangle {
                     ToolTip.visible: changeFolderHover.hovered
                     ToolTip.text: qsTr("Change output folder")
                     ToolTip.delay: 500
-                    Text {
+                    AppIcon {
                         anchors.centerIn: parent
-                        text: "📁"
-                        font.pixelSize: 15
+                        name: "folder"
+                        iconSize: 15
+                        color: "#dddddd"
                     }
                 }
             }
@@ -4880,14 +4867,14 @@ Rectangle {
         // either snapshot is refreshed.
         property var mountedDevices: []
         property var savedRules: []
-        property var catchAllRule: ({enabled: false, extensionFilter: [], preserveStructure: true, startFolder: "", deviceLabel: "", deviceSerial: "*"})
+        property var catchAllRule: ({enabled: false, extensionFilter: [], preserveStructure: true, startFolder: "", deviceLabel: "", deviceSerial: "*", destinationFolder: ""})
         property var historyEntries: []
 
         function refreshDevices() {
             if (!mainPanel.usbGrabberController) {
                 usbGrabberPage.mountedDevices = []
                 usbGrabberPage.savedRules = []
-                usbGrabberPage.catchAllRule = ({enabled: false, extensionFilter: [], preserveStructure: true, startFolder: "", deviceLabel: "", deviceSerial: "*"})
+                usbGrabberPage.catchAllRule = ({enabled: false, extensionFilter: [], preserveStructure: true, startFolder: "", deviceLabel: "", deviceSerial: "*", destinationFolder: ""})
                 return
             }
             usbGrabberPage.mountedDevices = mainPanel.usbGrabberController.mountedDevices()
@@ -4907,6 +4894,91 @@ Rectangle {
             return isNaN(d.getTime()) ? iso : Qt.formatDateTime(d, "yyyy-MM-dd hh:mm")
         }
 
+        // Grab preview: which device's preview is currently shown (only one
+        // at a time, rendered inline under that device's own card — see the
+        // Repeater delegate below), its raw {path,status} entries once
+        // requestGrabPreview()'s async scan completes, and a running/error
+        // flag for the interim "Scanning…" state. Cleared/reset on every new
+        // Preview click, not on every refreshDevices() poll tick, so an
+        // in-flight or just-finished preview survives the 2.5s device poll.
+        property string previewDeviceSerial: ""
+        property var previewEntries: []
+        property bool previewRunning: false
+        property string previewError: ""
+
+        // Destination-folder picker rejection (see usbDestinationFolderDialog
+        // below) — StyleGuide.md's warning-banner convention (inline Label,
+        // driven by a non-empty backing string, no dismiss button).
+        property string destinationFolderError: ""
+
+        function requestPreview(serial) {
+            if (!mainPanel.usbGrabberController)
+                return
+            usbGrabberPage.previewDeviceSerial = serial
+            usbGrabberPage.previewEntries = []
+            usbGrabberPage.previewError = ""
+            usbGrabberPage.previewRunning = true
+            mainPanel.usbGrabberController.requestGrabPreview(serial)
+        }
+
+        // Same three-state palette across color/label/summary — "will grab"
+        // reuses the same green the "connected" status label already uses
+        // (see deviceCard's mounted Label below), so the preview's meaning
+        // ("this device is eligible and this file will move") reads
+        // consistently with the rest of the page.
+        function previewStatusColor(status) {
+            switch (status) {
+            case "grab": return "#7ac07a"
+            case "duplicate": return "#888888"
+            case "filtered": return "#666666"
+            default: return "#888888"
+            }
+        }
+
+        function previewStatusLabel(status) {
+            switch (status) {
+            case "grab": return qsTr("will grab")
+            case "duplicate": return qsTr("skip — already grabbed")
+            case "filtered": return qsTr("skip — filtered out")
+            default: return status
+            }
+        }
+
+        function previewSummary(entries) {
+            let grabCount = 0, dupCount = 0, filteredCount = 0
+            for (const e of entries) {
+                if (e.status === "grab") ++grabCount
+                else if (e.status === "duplicate") ++dupCount
+                else if (e.status === "filtered") ++filteredCount
+            }
+            return qsTr("%1 will be grabbed, %2 already grabbed, %3 filtered out")
+                    .arg(grabCount).arg(dupCount).arg(filteredCount)
+        }
+
+        function escapePreviewHtml(s) {
+            return String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+        }
+
+        function previewHtml(entries) {
+            return entries.map(function (e) {
+                return "<span style=\"color:" + usbGrabberPage.previewStatusColor(e.status) + ";\">"
+                        + usbGrabberPage.previewStatusLabel(e.status) + " — "
+                        + usbGrabberPage.escapePreviewHtml(e.path) + "</span>"
+            }).join("<br>")
+        }
+
+        // Resolves a FolderDialog's selectedFolder into a vault-relative
+        // string suitable for a rule's destinationFolder field ("" = vault
+        // root), or null if the chosen folder is outside the vault — same
+        // shape as recordingFolderDialog's onAccepted below.
+        function relativeToVault(localPath) {
+            if (!mainPanel.vaultTreeModel || !mainPanel.vaultTreeModel.isPathInsideVault(localPath))
+                return null
+            const prefix = mainPanel.vaultLocalPath + "/"
+            return localPath === mainPanel.vaultLocalPath ? ""
+                : (localPath.startsWith(prefix) ? localPath.slice(prefix.length) : localPath)
+        }
+
         // Shared by every per-field commit below: re-reads the device's
         // current rule (so fields this call doesn't touch are preserved),
         // applies one field, saves, then re-derives deviceRows via
@@ -4924,23 +4996,37 @@ Rectangle {
 
         // Union of currently-mounted devices and previously-configured ones
         // (from savedRules, excluding the "*" catch-all — that has its own
-        // dedicated card below), deduped by serial, each row carrying a
+        // dedicated card below), GROUPED by serial, each row carrying a
         // fresh ruleForDevice() read so toggling/editing one field doesn't
         // require a full round-trip before the row reflects it.
+        //
+        // One row per physical device, not per volume: rules are keyed by
+        // serial, so a device's volumes necessarily share one rule and showing
+        // them as separate rows would render one rule as several independently-
+        // toggleable-looking switches. mountedDevices is per-VOLUME though (see
+        // UsbDeviceMonitor::currentlyMountedDevices()), so volumes sharing a
+        // serial are collected into mountPaths rather than overwriting each
+        // other — the row's volume count comes from that, and "Grab now" grabs
+        // all of them via triggerManualGrab().
         property var deviceRows: {
             if (!mainPanel.usbGrabberController)
                 return []
             const bySerial = {}
             for (const d of usbGrabberPage.mountedDevices) {
+                const existing = bySerial[d.serial]
+                if (existing) {
+                    existing.mountPaths.push(d.mountPath)
+                    continue
+                }
                 const label = ((d.vendor || "") + " " + (d.model || "")).trim()
                 bySerial[d.serial] = {serial: d.serial, label: label.length > 0 ? label : d.serial,
-                                       mounted: true, mountPath: d.mountPath}
+                                       mounted: true, mountPaths: [d.mountPath]}
             }
             for (const r of usbGrabberPage.savedRules) {
                 if (r.deviceSerial === "*" || bySerial[r.deviceSerial])
                     continue
                 bySerial[r.deviceSerial] = {serial: r.deviceSerial, label: r.deviceLabel || r.deviceSerial,
-                                             mounted: false, mountPath: ""}
+                                             mounted: false, mountPaths: []}
             }
             const rows = []
             for (const serial in bySerial) {
@@ -4950,6 +5036,7 @@ Rectangle {
                 row.extensionFilterText = (rule.extensionFilter || []).join(", ")
                 row.preserveStructure = rule.preserveStructure
                 row.startFolder = rule.startFolder
+                row.destinationFolder = rule.destinationFolder
                 rows.push(row)
             }
             return rows
@@ -4976,6 +5063,13 @@ Rectangle {
         Connections {
             target: mainPanel.usbGrabberController
             function onGrabFinished() { usbGrabberPage.refreshHistory(); usbGrabberPage.refreshDevices() }
+            function onGrabPreviewReady(serial, entries, error) {
+                if (serial !== usbGrabberPage.previewDeviceSerial)
+                    return
+                usbGrabberPage.previewRunning = false
+                usbGrabberPage.previewEntries = entries
+                usbGrabberPage.previewError = error
+            }
         }
 
         ScrollView {
@@ -5003,6 +5097,15 @@ Rectangle {
                     Layout.fillWidth: true
                     visible: mainPanel.usbGrabberController && mainPanel.usbGrabberController.lastError !== ""
                     text: mainPanel.usbGrabberController ? mainPanel.usbGrabberController.lastError : ""
+                    color: "#e07a7a"
+                    font.pixelSize: 11
+                    wrapMode: Text.WordWrap
+                }
+
+                Label {
+                    Layout.fillWidth: true
+                    visible: usbGrabberPage.destinationFolderError !== ""
+                    text: usbGrabberPage.destinationFolderError
                     color: "#e07a7a"
                     font.pixelSize: 11
                     wrapMode: Text.WordWrap
@@ -5072,6 +5175,44 @@ Rectangle {
                         // Item 13: editable text needs an I-beam.
                         HoverHandler { cursorShape: Qt.IBeamCursor }
                     }
+
+                    RowLayout {
+                        Layout.fillWidth: true
+                        Label {
+                            Layout.fillWidth: true
+                            text: qsTr("Destination: %1").arg(
+                                usbGrabberPage.catchAllRule.destinationFolder || qsTr("vault root"))
+                            color: "#888888"
+                            font.pixelSize: 11
+                            elide: Text.ElideMiddle
+                        }
+                        Item {
+                            id: catchAllDestinationButton
+                            Layout.preferredWidth: 28
+                            Layout.preferredHeight: 28
+                            HoverHandler { id: catchAllDestinationHover; cursorShape: Qt.PointingHandCursor }
+                            TapHandler {
+                                onTapped: {
+                                    const sub = usbGrabberPage.catchAllRule.destinationFolder
+                                    usbDestinationFolderDialog.targetSerial = "*"
+                                    usbDestinationFolderDialog.targetLabel = ""
+                                    usbDestinationFolderDialog.currentFolder =
+                                        "file://" + mainPanel.vaultLocalPath + (sub ? "/" + sub : "")
+                                    usbDestinationFolderDialog.open()
+                                }
+                            }
+                            Rectangle {
+                                anchors.fill: parent
+                                radius: AppSettings.borderRadius
+                                color: catchAllDestinationHover.hovered ? "#3a3a3a" : "#2a2a2a"
+                            }
+                            HoverBorder { anchors.fill: parent; active: catchAllDestinationHover.hovered }
+                            ToolTip.visible: catchAllDestinationHover.hovered
+                            ToolTip.text: qsTr("Choose destination folder")
+                            ToolTip.delay: 500
+                            AppIcon { anchors.centerIn: parent; name: "folder"; iconSize: 13; color: "#dddddd" }
+                        }
+                    }
                 }
 
                 Label {
@@ -5114,7 +5255,15 @@ Rectangle {
                                 elide: Text.ElideRight
                             }
                             Label {
-                                text: deviceCard.modelData.mounted ? qsTr("connected") : qsTr("not connected")
+                                // A multi-LUN device (e.g. a recorder exposing internal
+                                // memory and an SD card) mounts several volumes under one
+                                // serial and one rule — say so, since "connected" alone
+                                // would hide that "Grab now" is about to walk more than
+                                // one of them.
+                                text: !deviceCard.modelData.mounted ? qsTr("not connected")
+                                    : deviceCard.modelData.mountPaths.length > 1
+                                        ? qsTr("%1 volumes connected").arg(deviceCard.modelData.mountPaths.length)
+                                        : qsTr("connected")
                                 color: deviceCard.modelData.mounted ? "#7ac07a" : "#888888"
                                 font.pixelSize: 11
                             }
@@ -5143,6 +5292,23 @@ Rectangle {
                                 }
                                 HoverHandler { cursorShape: Qt.PointingHandCursor; enabled: grabNowButton.enabled }
                                 HoverBorder { anchors.fill: parent; active: grabNowButton.hovered }
+                            }
+                            Button {
+                                id: previewGrabButton
+                                text: qsTr("Preview")
+                                implicitHeight: 22
+                                enabled: deviceCard.modelData.mounted
+                                opacity: enabled ? 1 : 0.35
+                                hoverEnabled: enabled
+                                onClicked: usbGrabberPage.requestPreview(deviceCard.modelData.serial)
+                                background: Rectangle {
+                                    radius: AppSettings.borderRadius
+                                    color: "transparent"
+                                    border.width: 1
+                                    border.color: "#3a3a3a"
+                                }
+                                HoverHandler { cursorShape: Qt.PointingHandCursor; enabled: previewGrabButton.enabled }
+                                HoverBorder { anchors.fill: parent; active: previewGrabButton.hovered }
                             }
                             Button {
                                 id: forgetDeviceButton
@@ -5200,6 +5366,114 @@ Rectangle {
                                 deviceCard.modelData.label, "startFolder", text)
                             // Item 13: editable text needs an I-beam.
                             HoverHandler { cursorShape: Qt.IBeamCursor }
+                        }
+
+                        RowLayout {
+                            Layout.fillWidth: true
+                            Label {
+                                Layout.fillWidth: true
+                                text: qsTr("Destination: %1").arg(
+                                    deviceCard.modelData.destinationFolder || qsTr("vault root"))
+                                color: "#888888"
+                                font.pixelSize: 11
+                                elide: Text.ElideMiddle
+                            }
+                            Item {
+                                id: deviceDestinationButton
+                                Layout.preferredWidth: 28
+                                Layout.preferredHeight: 28
+                                HoverHandler { id: deviceDestinationHover; cursorShape: Qt.PointingHandCursor }
+                                TapHandler {
+                                    onTapped: {
+                                        const sub = deviceCard.modelData.destinationFolder
+                                        usbDestinationFolderDialog.targetSerial = deviceCard.modelData.serial
+                                        usbDestinationFolderDialog.targetLabel = deviceCard.modelData.label
+                                        usbDestinationFolderDialog.currentFolder =
+                                            "file://" + mainPanel.vaultLocalPath + (sub ? "/" + sub : "")
+                                        usbDestinationFolderDialog.open()
+                                    }
+                                }
+                                Rectangle {
+                                    anchors.fill: parent
+                                    radius: AppSettings.borderRadius
+                                    color: deviceDestinationHover.hovered ? "#3a3a3a" : "#2a2a2a"
+                                }
+                                HoverBorder { anchors.fill: parent; active: deviceDestinationHover.hovered }
+                                ToolTip.visible: deviceDestinationHover.hovered
+                                ToolTip.text: qsTr("Choose destination folder")
+                                ToolTip.delay: 500
+                                AppIcon { anchors.centerIn: parent; name: "folder"; iconSize: 13; color: "#dddddd" }
+                            }
+                        }
+
+                        // Grab preview — rendered right under whichever device's
+                        // "Preview" button was last clicked (see
+                        // usbGrabberPage.requestPreview()/previewDeviceSerial),
+                        // styled like SettingsPopup.qml's combine-rule preview
+                        // cards (dark card, rich-text lines, per-status color).
+                        ColumnLayout {
+                            Layout.fillWidth: true
+                            spacing: 4
+                            visible: deviceCard.modelData.serial === usbGrabberPage.previewDeviceSerial
+
+                            Label {
+                                visible: usbGrabberPage.previewRunning
+                                text: qsTr("Scanning…")
+                                color: "#888888"
+                                font.pixelSize: 11
+                            }
+                            Label {
+                                Layout.fillWidth: true
+                                visible: !usbGrabberPage.previewRunning && usbGrabberPage.previewError !== ""
+                                text: usbGrabberPage.previewError
+                                color: "#e07a7a"
+                                font.pixelSize: 11
+                                wrapMode: Text.WordWrap
+                            }
+                            Label {
+                                visible: !usbGrabberPage.previewRunning && usbGrabberPage.previewError === ""
+                                        && usbGrabberPage.previewEntries.length === 0
+                                text: qsTr("No files found.")
+                                color: "#888888"
+                                font.pixelSize: 11
+                            }
+                            Rectangle {
+                                Layout.fillWidth: true
+                                Layout.preferredHeight: previewCardColumn.implicitHeight + 12
+                                visible: !usbGrabberPage.previewRunning && usbGrabberPage.previewEntries.length > 0
+                                radius: AppSettings.borderRadius
+                                color: "#1e1e1e"
+                                border.width: 1
+                                border.color: "#3a3a3a"
+
+                                ColumnLayout {
+                                    id: previewCardColumn
+                                    anchors.fill: parent
+                                    anchors.margins: 6
+                                    spacing: 2
+
+                                    Label {
+                                        Layout.fillWidth: true
+                                        text: usbGrabberPage.previewSummary(usbGrabberPage.previewEntries)
+                                        color: "#dddddd"
+                                        font.pixelSize: 11
+                                        wrapMode: Text.WordWrap
+                                    }
+                                    TextEdit {
+                                        Layout.fillWidth: true
+                                        wrapMode: Text.WordWrap
+                                        readOnly: true
+                                        selectByMouse: true
+                                        selectionColor: Qt.rgba(0.35, 0.55, 0.85, 0.5)
+                                        color: "#dddddd"
+                                        font.pixelSize: 10
+                                        textFormat: Text.RichText
+                                        text: usbGrabberPage.previewHtml(usbGrabberPage.previewEntries)
+                                        // Item 13: selectable text needs an I-beam.
+                                        HoverHandler { cursorShape: Qt.IBeamCursor }
+                                    }
+                                }
+                            }
                         }
                     }
                 }
@@ -5266,6 +5540,28 @@ Rectangle {
                         }
                     }
                 }
+            }
+        }
+
+        // Shared by both the catch-all card and every per-device card's
+        // destination-folder button above — targetSerial/targetLabel record
+        // which rule to commit into on accept (mirrors recordingFolderDialog's
+        // single-shared-dialog shape further below).
+        FolderDialog {
+            id: usbDestinationFolderDialog
+            property string targetSerial: ""
+            property string targetLabel: ""
+            onAccepted: {
+                const localPath = usbDestinationFolderDialog.selectedFolder.toString().replace("file://", "")
+                const relative = usbGrabberPage.relativeToVault(localPath)
+                if (relative === null) {
+                    usbGrabberPage.destinationFolderError =
+                        qsTr("That folder is outside the vault — pick a location inside it.")
+                    return
+                }
+                usbGrabberPage.destinationFolderError = ""
+                usbGrabberPage.commitRuleField(usbDestinationFolderDialog.targetSerial,
+                    usbDestinationFolderDialog.targetLabel, "destinationFolder", relative)
             }
         }
     }

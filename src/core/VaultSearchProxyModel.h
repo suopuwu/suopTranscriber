@@ -51,8 +51,10 @@ public:
 
     // Sidebar.qml's file-tree sort feature (Name / Date Modified asc-desc,
     // plus keeping combine-candidate groups tree-adjacent): path -> a
-    // 2-element [groupRank, ownRank] string list, precomputed in QML (it
-    // already has both AppSettings.combineRules and
+    // 3-element [groupRank, clusterKey, memberRank] string list, compared in
+    // that order (clusterKey is what keeps two groups sharing a groupRank
+    // from interleaving — see refreshTreeOrdering()'s own comment),
+    // precomputed in QML (it already has both AppSettings.combineRules and
     // TranscriptionController::detectCombineGroups() available) and pushed
     // here as one map so lessThan() only ever does a plain QString compare —
     // same "QML computes, proxy just compares" shape as MatchesSearchRole

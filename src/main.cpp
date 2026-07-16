@@ -7,6 +7,8 @@
 
 #include <unistd.h>
 
+#include "core/IconTheme.h"
+
 int main(int argc, char *argv[])
 {
     // Qt Multimedia's gstreamer backend is flaky with arbitrary formats on
@@ -82,6 +84,11 @@ int main(int argc, char *argv[])
     QCoreApplication::setApplicationName("suopTranscriber");
 
     QQmlApplicationEngine engine;
+    // Serves AppIcon.qml's "image://suopicons/..." sources — SVG icons
+    // rastered at device pixels and tinted, then cached. The engine takes
+    // ownership. Must be added before any QML loads, since the first
+    // AppIcon to instantiate resolves its source immediately.
+    engine.addImageProvider(QString::fromLatin1(IconImageProvider::kProviderId), new IconImageProvider);
     QObject::connect(
         &engine, &QQmlApplicationEngine::objectCreationFailed, &app,
         []() { QCoreApplication::exit(-1); }, Qt::QueuedConnection);

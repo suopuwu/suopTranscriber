@@ -1,0 +1,58 @@
+{
+  "id": "classic",
+  "name": "Classic",
+  "description": "The app's original hand-rolled icon set: Unicode glyphs plus two drawn shapes (play/pause, kind 'builtin'). Kept as an opt-in pack so the pre-Material look stays available. Glyphs resolve against whatever system font supplies the codepoint, so rendering varies by machine — that fragility is inherent to the set, and is why `material` is the default.",
+  "kind": "glyph",
+  "scale": 1.0,
+  "icons": {
+    "transcribe": "⤒",
+    "run-all": "»",
+    "relabel": "↻",
+    "chapters": "≡",
+    "speakers": "☻",
+    "combine": "⛓",
+    "group-merge": "⊕",
+
+    "delete-transcript": "⌫",
+    "delete-file": "⌦",
+
+    "search": "⌕",
+    "regex": ".*",
+    "match-case": "Aa",
+
+    "filter": "▽",
+    "sort": "⇅",
+
+    "check": "✓",
+    "cancel": "✕",
+    "close": "×",
+
+    "expand": "+",
+    "collapse": "−",
+    "chapter-expand": "▸",
+    "chapter-collapse": "▾",
+    "add": "+",
+    "edit": "✎",
+
+    "play": { "kind": "builtin", "value": "PlayGlyph" },
+    "pause": { "kind": "builtin", "value": "PauseGlyph" },
+    "record": "⏺",
+    "stop": "⏹",
+    "move-up": "▲",
+    "move-down": "▼",
+
+    "settings": "⚙",
+    "folder": "📁",
+    "usb": "🔌",
+    "more": "⋯",
+    "freeze": "❄",
+    "reset": "↺",
+
+    "warning": "⚠",
+    "invalid": "✗",
+
+    "window-minimize": "−",
+    "window-maximize": "□",
+    "window-close": "×"
+  }
+}

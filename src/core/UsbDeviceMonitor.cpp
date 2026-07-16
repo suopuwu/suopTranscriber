@@ -31,6 +31,49 @@ const QString kPropertiesInterface = QStringLiteral("org.freedesktop.DBus.Proper
 
 } // namespace
 
+bool usbDeviceIsExternalMedia(const QVariantMap &blockProps, const QVariantMap &driveProps)
+{
+    // Default true: a device whose HintSystem we couldn't read is treated as the
+    // machine's own hardware and refused. See the header for why this can't be the
+    // only check.
+    if (blockProps.value(QStringLiteral("HintSystem"), true).toBool())
+        return false;
+
+    if (driveProps.value(QStringLiteral("Removable"), false).toBool())
+        return true;
+
+    // A drive can be non-Removable yet still genuinely external (some USB SSDs and
+    // enclosures report Removable=false, since the MEDIA isn't removable from the
+    // drive even though the drive is removable from the machine), so the connection
+    // bus gets its own say. "sdio" covers internal card readers, which is worth
+    // honouring here because field recorders routinely present their storage that
+    // way; both are still gated behind HintSystem above.
+    const QString connectionBus = driveProps.value(QStringLiteral("ConnectionBus")).toString();
+    return connectionBus.compare(QStringLiteral("usb"), Qt::CaseInsensitive) == 0
+        || connectionBus.compare(QStringLiteral("sdio"), Qt::CaseInsensitive) == 0;
+}
+
+std::optional<UsbDeviceInfo> usbVolumeFromProperties(const QString &objectPath, const QString &mountPath,
+                                                      const QVariantMap &blockProps,
+                                                      const QVariantMap &driveProps)
+{
+    if (!usbDeviceIsExternalMedia(blockProps, driveProps))
+        return std::nullopt;
+
+    UsbDeviceInfo info;
+    info.mountPath = mountPath;
+    info.vendor = driveProps.value(QStringLiteral("Vendor")).toString().trimmed();
+    info.model = driveProps.value(QStringLiteral("Model")).toString().trimmed();
+    // Per PHYSICAL DEVICE, so volumes of a multi-LUN device share it (they share one
+    // Drive object) and it may be empty. It is the rule key, never a runtime key.
+    info.serial = driveProps.value(QStringLiteral("Serial")).toString().trimmed();
+    // Per VOLUME, and unique by construction: UDisks2 gives every block device its
+    // own object path. Deliberately NOT derived from the serial — see UsbDeviceInfo's
+    // doc comment for what that conflation broke.
+    info.id = objectPath;
+    return info;
+}
+
 UsbDeviceMonitor::UsbDeviceMonitor(QObject *parent)
     : QObject(parent)
 {
@@ -70,30 +113,20 @@ std::optional<UsbDeviceInfo> UsbDeviceMonitor::readMountedFilesystem(const QDBus
     // wire format; fromUtf8(const char *) stops at that terminator on its own.
     const QString mountPath = QString::fromUtf8(mountPoints.first().constData());
 
-    QDBusObjectPath drivePath;
-    if (interfaces.contains(kBlockInterface))
-        drivePath = interfaces.value(kBlockInterface).value(QStringLiteral("Drive")).value<QDBusObjectPath>();
+    // Every UDisks2 Filesystem sits on a Block object, and only the Block object
+    // names the backing Drive whose Removable/ConnectionBus decide whether this is
+    // external media. So a mount with no reachable Block/Drive can't be shown to be
+    // external and is refused rather than assumed safe — that's what rules out
+    // things like zram0, whose Block.Drive is the placeholder "/".
+    const QVariantMap blockProps = interfaces.value(kBlockInterface);
+    const QDBusObjectPath drivePath = blockProps.value(QStringLiteral("Drive")).value<QDBusObjectPath>();
+    if (drivePath.path().isEmpty() || drivePath.path() == QStringLiteral("/"))
+        return std::nullopt;
 
-    QString vendor, model, serial;
-    if (!drivePath.path().isEmpty() && drivePath.path() != QStringLiteral("/")) {
-        const QVariantMap drive = driveProperties(drivePath);
-        vendor = drive.value(QStringLiteral("Vendor")).toString().trimmed();
-        model = drive.value(QStringLiteral("Model")).toString().trimmed();
-        serial = drive.value(QStringLiteral("Serial")).toString().trimmed();
-    }
-
-    UsbDeviceInfo info;
-    info.mountPath = mountPath;
-    info.vendor = vendor;
-    info.model = model;
-    info.serial = serial;
-    // Serial is the stable identity UDisks2 exposes; some drives (cheap USB flash in
-    // particular) report it empty, so fall back to a best-effort synthetic id from
-    // vendor+model+object path rather than leaving the device unidentifiable — not
-    // guaranteed unique across two identical-model drives that both have blank
-    // serials, but that's a rare edge case not worth more machinery here.
-    info.id = !serial.isEmpty() ? serial : (vendor + model + objectPath.path());
-    return info;
+    // Everything that DECIDES anything lives in usbVolumeFromProperties(); this
+    // function's remaining job is only to obtain the inputs it can't (the decoded
+    // mount point above, and the Drive object's properties over D-Bus below).
+    return usbVolumeFromProperties(objectPath.path(), mountPath, blockProps, driveProperties(drivePath));
 }
 
 QVariantMap UsbDeviceMonitor::driveProperties(const QDBusObjectPath &drivePath) const
@@ -119,7 +152,7 @@ QVariantList UsbDeviceMonitor::currentlyMountedDevices() const
         const std::optional<UsbDeviceInfo> info = readMountedFilesystem(it.key(), it.value());
         if (!info)
             continue;
-        m_knownObjectPaths.insert(it.key().path(), info->id);
+        m_knownObjectPaths.insert(it.key().path());
         result.append(toVariantMap(*info));
     }
     return result;
@@ -129,7 +162,7 @@ void UsbDeviceMonitor::handleInterfacesAdded(const QDBusObjectPath &objectPath, 
 {
     const std::optional<UsbDeviceInfo> info = readMountedFilesystem(objectPath, interfaces);
     if (info) {
-        m_knownObjectPaths.insert(objectPath.path(), info->id);
+        m_knownObjectPaths.insert(objectPath.path());
         emit deviceAdded(toVariantMap(*info));
         return;
     }
@@ -157,7 +190,7 @@ void UsbDeviceMonitor::rescanForNewlyMountedDevices()
         const std::optional<UsbDeviceInfo> info = readMountedFilesystem(it.key(), it.value());
         if (!info)
             continue;
-        m_knownObjectPaths.insert(it.key().path(), info->id);
+        m_knownObjectPaths.insert(it.key().path());
         emit deviceAdded(toVariantMap(*info));
     }
 }
@@ -166,7 +199,11 @@ void UsbDeviceMonitor::handleInterfacesRemoved(const QDBusObjectPath &objectPath
 {
     if (!interfaces.contains(kFilesystemInterface))
         return;
-    const QString id = m_knownObjectPaths.take(objectPath.path());
-    if (!id.isEmpty())
-        emit deviceRemoved(id);
+    // Reports exactly the volume that went away, never its siblings: the id emitted
+    // is this object path alone, so unmounting one LUN of a multi-LUN device leaves
+    // the others' ids untouched. remove() returning false means this path was never
+    // one we reported (an internal drive, or a volume that never mounted) — stay
+    // silent rather than announce the removal of something the consumer never saw.
+    if (m_knownObjectPaths.remove(objectPath.path()))
+        emit deviceRemoved(objectPath.path());
 }

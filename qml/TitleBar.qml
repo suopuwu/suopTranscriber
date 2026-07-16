@@ -60,11 +60,11 @@ Item {
             anchors.fill: parent
             active: settingsHover.hovered
         }
-        Text {
+        AppIcon {
             anchors.centerIn: parent
-            text: "⚙"
+            name: "settings"
+            iconSize: 14
             color: "white"
-            font.pixelSize: 14
         }
     }
 
@@ -87,11 +87,11 @@ Item {
             anchors.fill: parent
             active: recordHover.hovered
         }
-        Text {
+        AppIcon {
             anchors.centerIn: parent
-            text: "⏺"
+            name: "record"
+            iconSize: 14
             color: "white"
-            font.pixelSize: 14
         }
     }
 
@@ -114,11 +114,11 @@ Item {
             anchors.fill: parent
             active: usbGrabberHover.hovered
         }
-        Text {
+        AppIcon {
             anchors.centerIn: parent
-            text: "🔌"
+            name: "usb"
+            iconSize: 14
             color: "white"
-            font.pixelSize: 14
         }
     }
 
@@ -144,11 +144,11 @@ Item {
             anchors.fill: parent
             active: moreActionsHover.hovered
         }
-        Text {
+        AppIcon {
             anchors.centerIn: parent
-            text: "⋯"
+            name: "more"
+            iconSize: 14
             color: "white"
-            font.pixelSize: 14
         }
     }
 
@@ -218,12 +218,11 @@ Item {
                     color: "#dddddd"
                     font.pixelSize: 11
                 }
-                Text {
+                AppIcon {
                     anchors.verticalCenter: parent.verticalCenter
-                    text: "✓"
+                    name: "check"
+                    iconSize: 12
                     color: "#8fdf9f"
-                    font.pixelSize: 12
-                    font.bold: true
                     HoverHandler { cursorShape: Qt.PointingHandCursor }
                     TapHandler {
                         onTapped: {
@@ -233,12 +232,11 @@ Item {
                         }
                     }
                 }
-                Text {
+                AppIcon {
                     anchors.verticalCenter: parent.verticalCenter
-                    text: "✕"
+                    name: "cancel"
+                    iconSize: 12
                     color: "#e07a7a"
-                    font.pixelSize: 12
-                    font.bold: true
                     HoverHandler { cursorShape: Qt.PointingHandCursor }
                     TapHandler { onTapped: titleBar.forceRetranscribeConfirming = false }
                 }
@@ -262,7 +260,7 @@ Item {
 
         component TitleBarButton: Item {
             id: tbButton
-            property string glyph: ""
+            property string iconName: ""
             signal clicked()
             width: 46
             height: parent.height
@@ -280,23 +278,24 @@ Item {
                 radius: AppSettings.borderRadius
                 color: hover.hovered ? "#3a3a3a" : "transparent"
             }
-            Text {
+            AppIcon {
                 anchors.centerIn: parent
-                text: tbButton.glyph
+                name: tbButton.iconName
+                iconSize: 14
                 color: "white"
             }
         }
 
         TitleBarButton {
-            glyph: "−"
+            iconName: "window-minimize"
             onClicked: titleBar.window.showMinimized()
         }
         TitleBarButton {
-            glyph: "□"
+            iconName: "window-maximize"
             onClicked: titleBar.window.visibility = titleBar.window.visibility === Window.Maximized ? Window.Windowed : Window.Maximized
         }
         TitleBarButton {
-            glyph: "×"
+            iconName: "window-close"
             onClicked: titleBar.window.close()
         }
     }

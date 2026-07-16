@@ -3,30 +3,52 @@
 #include "VaultTreeModel.h"
 
 #include <QCoreApplication>
-#include <QCryptographicHash>
 #include <QDateTime>
 #include <QDir>
 #include <QDirIterator>
 #include <QFile>
 #include <QFileInfo>
 #include <QHash>
+#include <QList>
 #include <QVariantMap>
 
 namespace {
 
-// SHA-256 of a whole file's contents, streamed through QCryptographicHash's
-// QIODevice overload rather than QFile::readAll() so this never buffers an
-// entire (potentially huge) media file into memory just to hash it. Returns
-// an empty QByteArray if the file can't be opened for reading.
-QByteArray hashFile(const QString &path)
+// One already-in-the-vault file, reduced to just what the quick-check compares.
+// Cheap by construction: every field comes from the directory entry's stat, so
+// indexing the whole destination vault never reads a byte of file content.
+struct DestFile {
+    qint64 size;
+    QDateTime lastModified;
+};
+
+// Does `candidates` (every vault file sharing the source's basename) already
+// contain this exact source file? "Exact" here is rsync's quick-check — same
+// basename, same size, same modification time — NOT a content comparison.
+//
+// This deliberately does not hash. Content hashing is O(bytes on the device),
+// and the case it has to answer is precisely the one where the answer is "yes,
+// already grabbed": every candidate is a byte-identical copy, so a size check
+// can't short-circuit and every file gets read in full. Measured on a 13.8 GB
+// recorder over USB at ~9 MB/s, that made a preview take ~25 minutes — the scan
+// looked hung. The quick-check reads nothing and answers instantly.
+//
+// The tradeoff: a file that kept its name, size AND mtime while its bytes
+// changed is wrongly skipped. Recorders don't do that (a re-recording changes
+// size and stamps a new mtime), and the mtime is what makes this much stronger
+// than name+size alone. The cost of being wrong is a missed import the user can
+// see in the preview, not data loss — nothing is ever overwritten.
+//
+// Only sound because the copy side stamps the source's mtime onto the copy (see
+// the QFile::copy() branch below); QFile::copy() gives the copy a fresh mtime of
+// its own, which would make every grabbed file miss here forever after.
+bool alreadyPresentAtDestination(const QFileInfo &sourceInfo, const QList<DestFile> &candidates)
 {
-    QFile file(path);
-    if (!file.open(QIODevice::ReadOnly))
-        return QByteArray();
-    QCryptographicHash hash(QCryptographicHash::Sha256);
-    if (!hash.addData(&file))
-        return QByteArray();
-    return hash.result();
+    for (const DestFile &candidate : candidates) {
+        if (candidate.size == sourceInfo.size() && candidate.lastModified == sourceInfo.lastModified())
+            return true;
+    }
+    return false;
 }
 
 // Empty filter means "all files" (not zero files) — see UsbGrabRule::
@@ -47,6 +69,47 @@ bool extensionMatches(const QFileInfo &info, const QStringList &extensionFilter)
     return false;
 }
 
+QVariantMap makePreviewEntry(const QString &relativePath, const QString &status)
+{
+    QVariantMap entry;
+    entry.insert(QStringLiteral("path"), relativePath);
+    entry.insert(QStringLiteral("status"), status);
+    return entry;
+}
+
+// Symlink-resolved absolute path, falling back to a lexically cleaned absolute
+// path when nothing exists at `path` yet. The fallback exists for the
+// destination vault specifically: a rule's destinationFolder is created lazily
+// (mkpath at copy time), so it legitimately may not exist when the containment
+// check below runs, and treating "not there yet" as "no path" would skip the
+// check entirely. The fallback can't resolve symlinks, so containment via a
+// symlinked not-yet-created destination folder isn't caught — an acceptable gap,
+// since the source side (the dangerous one) is always fully canonical.
+QString canonicalOrCleaned(const QString &path)
+{
+    const QFileInfo info(path);
+    const QString canonical = info.canonicalFilePath();
+    return canonical.isEmpty() ? QDir::cleanPath(info.absoluteFilePath()) : canonical;
+}
+
+}
+
+QString usbGrabRefusalReason(const QString &scanRoot, const QString &destinationVaultPath)
+{
+    const QString source = QFileInfo(scanRoot).canonicalFilePath();
+    if (source.isEmpty())
+        return QStringLiteral("Source folder \"%1\" does not exist.").arg(scanRoot);
+    if (source == QStringLiteral("/"))
+        return QStringLiteral("Refusing to grab from the filesystem root \"/\".");
+
+    const QString destination = canonicalOrCleaned(destinationVaultPath);
+    // The '/' suffix keeps this a path-component test: without it, a source of
+    // "/mnt/rec" would falsely "contain" a destination of "/mnt/recordings".
+    if (destination == source || destination.startsWith(source + QLatin1Char('/'))) {
+        return QStringLiteral("Refusing to grab from \"%1\": the destination vault is inside it.")
+            .arg(source);
+    }
+    return QString();
 }
 
 // Lives on UsbGrabJob's dedicated QThread; never touches the GUI thread.
@@ -62,8 +125,15 @@ public:
     using QObject::QObject;
 
 public slots:
+    // dryRun classifies every file the scan sees (matched-and-copied,
+    // matched-but-already-present, or filtered-out-by-extension) without
+    // touching the filesystem at all — no mkpath, no QFile::copy, no
+    // destFilesByBasename mutation — emitting previewCompleted() instead of
+    // scanCompleted(). Everything else (extension filter, quick-check dedup
+    // index, cancel support) is identical between the two modes, written
+    // once here rather than duplicated across a separate preview method.
     void start(const QString &mountPath, const QString &startFolder, const QStringList &extensionFilter,
-               bool preserveStructure, const QString &destinationVaultPath)
+               bool preserveStructure, const QString &destinationVaultPath, bool dryRun)
     {
         m_cancelRequested = false;
 
@@ -71,56 +141,58 @@ public slots:
         if (!startFolder.isEmpty())
             scanRoot += QLatin1Char('/') + startFolder;
 
-        // Index every file already in the destination vault by basename, up
-        // front, so each source file's basename+hash diff (per DESIGN.md's
-        // stated intent) doesn't need to re-walk the vault per source file.
-        // Hashes are computed lazily via hashOf() below and cached, since
-        // most indexed basenames will never actually need hashing (no
-        // matching basename shows up on the device at all).
-        QHash<QString, QStringList> destPathsByBasename;
-        QDirIterator destIt(destinationVaultPath, QDir::Files, QDirIterator::Subdirectories);
-        while (destIt.hasNext()) {
-            const QString path = destIt.next();
-            destPathsByBasename[QFileInfo(path).fileName()].append(path);
+        // Before ANY filesystem work — no destination indexing, no walk, and in
+        // particular no copying. See usbGrabRefusalReason()'s doc comment.
+        const QString refusal = usbGrabRefusalReason(scanRoot, destinationVaultPath);
+        if (!refusal.isEmpty()) {
+            if (dryRun)
+                emit previewCompleted(QVariantList(), refusal);
+            else
+                emit scanCompleted(0, 0, QStringList { refusal });
+            return;
         }
 
-        QHash<QString, QByteArray> hashCache;
-        auto hashOf = [&hashCache](const QString &path) -> QByteArray {
-            const auto it = hashCache.constFind(path);
-            if (it != hashCache.constEnd())
-                return it.value();
-            const QByteArray computed = hashFile(path);
-            hashCache.insert(path, computed);
-            return computed;
-        };
+        // Index every file already in the destination vault by basename, up
+        // front, so each source file's quick-check doesn't need to re-walk the
+        // vault per source file. Only stat data is collected (see DestFile), so
+        // this stays cheap no matter how large the vault's audio is.
+        QHash<QString, QList<DestFile>> destFilesByBasename;
+        QDirIterator destIt(destinationVaultPath, QDir::Files, QDirIterator::Subdirectories);
+        while (destIt.hasNext()) {
+            const QFileInfo info(destIt.next());
+            destFilesByBasename[info.fileName()].append({info.size(), info.lastModified()});
+        }
 
         int filesCopied = 0;
         int filesSkipped = 0;
         QStringList errors;
         int filesProcessed = 0;
+        QVariantList previewEntries;
 
         QDirIterator it(scanRoot, QDir::Files, QDirIterator::Subdirectories);
         while (it.hasNext()) {
             const QString sourcePath = it.next();
             const QFileInfo sourceInfo(sourcePath);
 
-            if (extensionMatches(sourceInfo, extensionFilter)) {
+            if (!extensionMatches(sourceInfo, extensionFilter)) {
+                if (dryRun)
+                    previewEntries.append(makePreviewEntry(QDir(scanRoot).relativeFilePath(sourcePath),
+                                                            QStringLiteral("filtered")));
+            } else {
                 ++filesProcessed;
                 emit progressed(filesProcessed);
 
-                const QByteArray sourceHash = hashOf(sourcePath);
-
-                bool alreadyPresent = false;
-                const QStringList candidates = destPathsByBasename.value(sourceInfo.fileName());
-                for (const QString &candidatePath : candidates) {
-                    if (hashOf(candidatePath) == sourceHash) {
-                        alreadyPresent = true;
-                        break;
-                    }
-                }
+                const bool alreadyPresent = alreadyPresentAtDestination(
+                    sourceInfo, destFilesByBasename.value(sourceInfo.fileName()));
 
                 if (alreadyPresent) {
                     ++filesSkipped;
+                    if (dryRun)
+                        previewEntries.append(makePreviewEntry(QDir(scanRoot).relativeFilePath(sourcePath),
+                                                                QStringLiteral("duplicate")));
+                } else if (dryRun) {
+                    previewEntries.append(
+                        makePreviewEntry(QDir(scanRoot).relativeFilePath(sourcePath), QStringLiteral("grab")));
                 } else {
                     QString relativeDir;
                     if (preserveStructure) {
@@ -134,7 +206,7 @@ public slots:
                     QDir().mkpath(destDir);
 
                     // Same basename already sitting at this exact spot, but
-                    // ruled out above as a hash match (i.e. a genuinely
+                    // ruled out above by the quick-check (i.e. a genuinely
                     // different file) — don't silently overwrite it; append
                     // a short numeric suffix before the extension until we
                     // land on a name that isn't taken (mirrors
@@ -156,11 +228,30 @@ public slots:
 
                     if (QFile::copy(sourcePath, destPath)) {
                         ++filesCopied;
+
+                        // Load-bearing, not a nicety: QFile::copy() stamps the
+                        // copy with the time of the copy, so without this the
+                        // grabbed file would never match its source's mtime
+                        // again and EVERY subsequent grab would re-copy the
+                        // whole device under _1/_2/... suffixes. This is what
+                        // makes alreadyPresentAtDestination() work at all.
+                        // Best-effort: a destination that won't reopen still
+                        // copied fine, and the worst case is that one file
+                        // looks new next time rather than a failed grab.
+                        QFile copied(destPath);
+                        if (copied.open(QIODevice::ReadWrite)) {
+                            copied.setFileTime(sourceInfo.lastModified(),
+                                                QFileDevice::FileModificationTime);
+                            copied.close();
+                        }
+
                         // Keep the index current so a later source file in
                         // this same run that shares this basename also diffs
                         // correctly against what this run has already copied.
-                        destPathsByBasename[sourceInfo.fileName()].append(destPath);
-                        hashCache.insert(destPath, sourceHash);
+                        // Indexed under the SOURCE's size/mtime — which, thanks
+                        // to the stamp above, is exactly what's now on disk.
+                        destFilesByBasename[sourceInfo.fileName()].append(
+                            {sourceInfo.size(), sourceInfo.lastModified()});
                     } else {
                         errors.append(QStringLiteral("Failed to copy \"%1\"").arg(sourceInfo.fileName()));
                     }
@@ -175,7 +266,10 @@ public slots:
                 break;
         }
 
-        emit scanCompleted(filesCopied, filesSkipped, errors);
+        if (dryRun)
+            emit previewCompleted(previewEntries, QString());
+        else
+            emit scanCompleted(filesCopied, filesSkipped, errors);
     }
 
     void requestCancel() { m_cancelRequested = true; }
@@ -183,6 +277,7 @@ public slots:
 signals:
     void progressed(int filesProcessedSoFar);
     void scanCompleted(int filesCopied, int filesSkipped, const QStringList &errors);
+    void previewCompleted(const QVariantList &entries, const QString &error);
 
 private:
     bool m_cancelRequested = false;
@@ -197,6 +292,7 @@ UsbGrabJob::UsbGrabJob(QObject *parent)
 
     connect(m_worker, &UsbGrabJobWorker::progressed, this, &UsbGrabJob::progressed);
     connect(m_worker, &UsbGrabJobWorker::scanCompleted, this, &UsbGrabJob::handleWorkerFinished);
+    connect(m_worker, &UsbGrabJobWorker::previewCompleted, this, &UsbGrabJob::previewReady);
 
     m_thread.start();
 }
@@ -226,7 +322,19 @@ void UsbGrabJob::start(const UsbGrabRule &rule, const QString &mountPath, const 
 
     QMetaObject::invokeMethod(m_worker, "start", Qt::QueuedConnection, Q_ARG(QString, mountPath),
                                Q_ARG(QString, rule.startFolder), Q_ARG(QStringList, rule.extensionFilter),
-                               Q_ARG(bool, rule.preserveStructure), Q_ARG(QString, destinationVaultPath));
+                               Q_ARG(bool, rule.preserveStructure), Q_ARG(QString, destinationVaultPath),
+                               Q_ARG(bool, false));
+}
+
+void UsbGrabJob::startPreview(const UsbGrabRule &rule, const QString &mountPath, const QString &destinationVaultPath)
+{
+    // No history entry is ever written for a preview, so m_destinationVaultTreeModel/
+    // m_deviceSerial/m_deviceLabel (only consulted by handleWorkerFinished(), which
+    // scanCompleted() — not previewCompleted() — triggers) are deliberately left unset.
+    QMetaObject::invokeMethod(m_worker, "start", Qt::QueuedConnection, Q_ARG(QString, mountPath),
+                               Q_ARG(QString, rule.startFolder), Q_ARG(QStringList, rule.extensionFilter),
+                               Q_ARG(bool, rule.preserveStructure), Q_ARG(QString, destinationVaultPath),
+                               Q_ARG(bool, true));
 }
 
 void UsbGrabJob::handleWorkerFinished(int filesCopied, int filesSkipped, const QStringList &errors)
