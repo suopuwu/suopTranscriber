@@ -2792,16 +2792,37 @@ private:
         }
 
         QString detectingSubPhase;
-        std::vector<DiarizedTurn> turns = m_diarizationEngine->diarize(pcm, [this, &detectingSubPhase](double fraction) {
-            waitWhilePausedOrCancelled(); // see this method's doc comment (cancel not actionable mid-pass)
-            const QString subPhase = fraction < 0.30 ? QStringLiteral("detecting-speakers-segmenting")
-                                                      : QStringLiteral("detecting-speakers-identifying");
-            if (subPhase != detectingSubPhase) {
-                detectingSubPhase = subPhase;
-                emit phase(subPhase);
-            }
-            emit progress(fraction);
-        });
+        // sherpa-onnx fires this callback once per internal ONNX chunk — the
+        // segmentation pass alone runs the model roughly once per ~1s audio
+        // hop (see cpuThreadCount()'s doc comment in DiarizationEngine.cpp),
+        // so a long recording means hundreds to thousands of calls, easily
+        // faster than the GUI thread can drain progress()'s queued
+        // connection (progressChanged() + recomputeOverallProgress() +
+        // overallProgressChanged() per tick — see the connect() in this
+        // controller's ctor). Unthrottled, that backlog starves repaints for
+        // the whole diarization pass, LOOKING like a GUI-thread freeze even
+        // though the actual inference is correctly running on this worker
+        // thread. Throttled to kLiveUpdateThrottleMs, same as run()'s live
+        // segment-write path — but the fraction==1.0 tail call always gets
+        // through so the bar actually reaches 100%.
+        QElapsedTimer progressThrottle;
+        progressThrottle.start();
+        qint64 lastProgressTickMs = -kLiveUpdateThrottleMs;
+        std::vector<DiarizedTurn> turns = m_diarizationEngine->diarize(
+            pcm, [this, &detectingSubPhase, &progressThrottle, &lastProgressTickMs](double fraction) {
+                waitWhilePausedOrCancelled(); // see this method's doc comment (cancel not actionable mid-pass)
+                const QString subPhase = fraction < 0.30 ? QStringLiteral("detecting-speakers-segmenting")
+                                                          : QStringLiteral("detecting-speakers-identifying");
+                if (subPhase != detectingSubPhase) {
+                    detectingSubPhase = subPhase;
+                    emit phase(subPhase);
+                }
+                const qint64 nowMs = progressThrottle.elapsed();
+                if (fraction >= 1.0 || nowMs - lastProgressTickMs >= kLiveUpdateThrottleMs) {
+                    lastProgressTickMs = nowMs;
+                    emit progress(fraction);
+                }
+            });
         *effectiveOut = true;
         m_diarizationEngine.reset();
         return turns;

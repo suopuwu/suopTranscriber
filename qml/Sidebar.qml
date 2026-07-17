@@ -285,6 +285,20 @@ Rectangle {
         return paths
     }
 
+    // Ribbon's prepended selectAllButton, and its Ctrl+A shortcut mirror
+    // below: select every note currently visible (whichever mode —
+    // tree or search results — is showing), anchored top-to-bottom like a
+    // top-to-bottom Shift-click so a following Shift+Up shrinks from the
+    // bottom instead of the top.
+    function selectAllVisible() {
+        const order = sidebar.visibleNotePaths()
+        if (order.length === 0)
+            return
+        sidebar.selectedPaths = order
+        sidebar.lastClickedPath = order[0]
+        sidebar.selectionCursorPath = order[order.length - 1]
+    }
+
     // Single entry point for both treeDelegate's and searchResultsView's
     // TapHandlers (see each's onTapped below) — modifiers come from
     // TapHandler.point.modifiers (QQuickHandlerPoint's own property, not
@@ -329,16 +343,16 @@ Rectangle {
         }
     }
 
-    // transcribeAllButton/relabelAllButton/chaptersAllButton (see the ribbon
-    // below) each pass their own eligibility map (untranscribedPaths/
-    // transcribedPaths/chaptersPaths) here — with 2+ rows selected, bulk
-    // narrows to that selection (intersected with eligibility); with 0 or 1
-    // selected, bulk keeps its original "everything eligible" behavior so
-    // single-file workflows (no selection ever made) are unaffected.
+    // transcribeAllButton/relabelAllButton/chaptersAllButton/
+    // detectSpeakersAllButton/runAllButton (see the ribbon below) each pass
+    // their own eligibility map (untranscribedPaths/transcribedPaths/
+    // chaptersPaths) here — the ribbon always narrows to the CURRENT
+    // SELECTION (intersected with eligibility), never "everything eligible".
+    // An empty selection means an empty target set, so the buttons dim; that
+    // pairs with the ribbon's prepended selectAllButton (and its Ctrl+A
+    // mirror) for the old "act on everything" workflow.
     function bulkTargetPaths(eligibleMap) {
         const eligible = Object.keys(eligibleMap)
-        if (sidebar.selectedPaths.length < 2)
-            return eligible
         return eligible.filter((p) => sidebar.selectedPaths.indexOf(p) >= 0)
     }
 
@@ -1670,6 +1684,16 @@ Rectangle {
         onActivated: sidebar.jumpToGroupBoundary(1)
     }
 
+    // Mirrors the ribbon's prepended selectAllButton. Same focus gating as
+    // the other note-selection shortcuts above — inert while a TextField
+    // elsewhere has focus, so it never fights a text field's own native
+    // Ctrl+A (select-all-text).
+    Shortcut {
+        sequence: "Ctrl+A"
+        enabled: tree.activeFocus || searchResultsView.activeFocus
+        onActivated: sidebar.selectAllVisible()
+    }
+
     Item {
         id: ribbon
         anchors.top: parent.top
@@ -1691,26 +1715,72 @@ Rectangle {
             spacing: 4
             visible: !sidebar.searchExpanded
 
+            // Prepended select-all: mirrors the Ctrl+A shortcut above, and
+            // is what makes the bulk buttons to its right ("apply to the
+            // current selection", see bulkTargetPaths()) able to reach
+            // "everything" again without requiring a manual Shift-click
+            // drag across the whole tree.
+            Item {
+                id: selectAllButton
+                Layout.preferredWidth: 22
+                Layout.preferredHeight: 22
+                enabled: sidebar.visibleNotePaths().length > 0
+
+                HoverHandler {
+                    id: selectAllHover
+                    cursorShape: Qt.PointingHandCursor
+                    enabled: selectAllButton.enabled
+                }
+                TapHandler {
+                    enabled: selectAllButton.enabled
+                    onTapped: sidebar.selectAllVisible()
+                }
+                HoverBorder {
+                    anchors.fill: parent
+                    active: selectAllButton.enabled && selectAllHover.hovered
+                }
+                AppIcon {
+                    anchors.centerIn: parent
+                    name: "select-all"
+                    color: selectAllButton.enabled ? "#dddddd" : "#666666"
+                    iconSize: 15
+                }
+
+                ToolTip.visible: selectAllHover.hovered
+                ToolTip.text: qsTr("Select all (Ctrl+A)")
+                ToolTip.delay: 500
+            }
+
+            // Separates select-all from the bulk action buttons it feeds —
+            // same border color as the rest of the app's thin-line dividers
+            // (e.g. sortModeMenu's Popup border below).
+            Rectangle {
+                id: ribbonDivider
+                Layout.preferredWidth: 1
+                Layout.preferredHeight: 18
+                Layout.alignment: Qt.AlignVCenter
+                color: "#3a3a3a"
+            }
+
             Item {
                 id: transcribeAllButton
                 Layout.preferredWidth: 22
                 Layout.preferredHeight: 22
+                // Item 3 (reworked): the ribbon always narrows to the
+                // current selection now (see bulkTargetPaths()'s comment) —
+                // an empty selection means nothing to transcribe, so dim
+                // like the other bulk buttons rather than silently no-op.
+                enabled: sidebar.transcriptionController && sidebar.bulkTargetPaths(sidebar.untranscribedPaths).length > 0
 
                 HoverHandler {
                     id: transcribeAllHover
                     cursorShape: Qt.PointingHandCursor
+                    enabled: transcribeAllButton.enabled
                 }
                 TapHandler {
+                    enabled: transcribeAllButton.enabled
                     onTapped: {
-                        if (!sidebar.transcriptionController)
-                            return
-                        // Item 3: with 2+ rows selected, narrow to the
-                        // selection (intersected with eligibility) —
-                        // otherwise (0 or 1 selected) keep acting on every
-                        // untranscribed file, same as before this item.
                         const paths = sidebar.bulkTargetPaths(sidebar.untranscribedPaths)
-                        if (paths.length === 0)
-                            return
                         // Model paths are raw local paths, not file:// URLs
                         // (see VaultTreeModel's PathRole) — Q_INVOKABLE
                         // QUrl params need the scheme or QUrl::toLocalFile()
@@ -1724,17 +1794,17 @@ Rectangle {
                 }
                 HoverBorder {
                     anchors.fill: parent
-                    active: transcribeAllHover.hovered
+                    active: transcribeAllButton.enabled && transcribeAllHover.hovered
                 }
                 AppIcon {
                     anchors.centerIn: parent
                     name: "transcribe"
-                    color: "#dddddd"
+                    color: transcribeAllButton.enabled ? "#dddddd" : "#666666"
                     iconSize: 15
                 }
 
                 ToolTip.visible: transcribeAllHover.hovered
-                ToolTip.text: qsTr("Transcribe all untranscribed audio")
+                ToolTip.text: qsTr("Transcribe selected untranscribed audio")
                 ToolTip.delay: 500
             }
 
@@ -1745,7 +1815,8 @@ Rectangle {
                 id: relabelAllButton
                 Layout.preferredWidth: 22
                 Layout.preferredHeight: 22
-                // Item 3: same selected-vs-all narrowing as transcribeAllButton.
+                // Item 3 (reworked): same bulkTargetPaths narrowing as
+                // transcribeAllButton above.
                 enabled: sidebar.transcriptionController && sidebar.bulkTargetPaths(sidebar.transcribedPaths).length > 0
 
                 HoverHandler {
@@ -1775,7 +1846,7 @@ Rectangle {
                 }
 
                 ToolTip.visible: relabelAllHover.hovered
-                ToolTip.text: qsTr("Regenerate all auto-titles")
+                ToolTip.text: qsTr("Regenerate titles for selected files")
                 ToolTip.delay: 500
             }
 
@@ -1788,7 +1859,8 @@ Rectangle {
                 id: chaptersAllButton
                 Layout.preferredWidth: 22
                 Layout.preferredHeight: 22
-                // Item 3: same selected-vs-all narrowing as transcribeAllButton.
+                // Item 3 (reworked): same bulkTargetPaths narrowing as
+                // transcribeAllButton above.
                 enabled: sidebar.transcriptionController && sidebar.bulkTargetPaths(sidebar.chaptersPaths).length > 0
 
                 HoverHandler {
@@ -1817,7 +1889,7 @@ Rectangle {
                 }
 
                 ToolTip.visible: chaptersAllHover.hovered
-                ToolTip.text: qsTr("Regenerate all chapters")
+                ToolTip.text: qsTr("Regenerate chapters for selected files")
                 ToolTip.delay: 500
             }
 
@@ -1830,7 +1902,7 @@ Rectangle {
                 id: detectSpeakersAllButton
                 Layout.preferredWidth: 22
                 Layout.preferredHeight: 22
-                // Same selected-vs-all narrowing as the other ribbon buttons.
+                // Same bulkTargetPaths narrowing as the other ribbon buttons.
                 enabled: sidebar.transcriptionController && sidebar.bulkTargetPaths(sidebar.transcribedPaths).length > 0
 
                 HoverHandler {
@@ -1858,7 +1930,7 @@ Rectangle {
                 }
 
                 ToolTip.visible: detectSpeakersAllHover.hovered
-                ToolTip.text: qsTr("Detect speakers for all transcribed audio")
+                ToolTip.text: qsTr("Detect speakers for selected files")
                 ToolTip.delay: 500
             }
 
@@ -1907,7 +1979,7 @@ Rectangle {
                 }
 
                 ToolTip.visible: runAllHover.hovered
-                ToolTip.text: qsTr("Run all jobs (transcribe, label, chapters)")
+                ToolTip.text: qsTr("Run all jobs on selected files (transcribe, label, chapters)")
                 ToolTip.delay: 500
             }
 

@@ -1330,8 +1330,8 @@ private slots:
     // this suite to actually deliver a modified click to a TreeView
     // delegate, so this is a source-scan guard that the selection state,
     // the Shift-range/Ctrl-toggle logic, both TapHandlers' wiring, and the
-    // three bulk-ribbon buttons' "selected-set-when-2+-else-everything"
-    // narrowing all still exist.
+    // bulk-ribbon buttons' "always narrow to the current selection" (never
+    // "everything eligible") behavior all still exist.
     void sidebar_multiSelectShiftCtrlClick()
     {
         const QString src = readAll(QStringLiteral(SUOP_QML_DIR "/Sidebar.qml"));
@@ -1370,17 +1370,42 @@ private slots:
                  "searchResultsView's resultDelegate TapHandler must pass its own point.modifiers into "
                  "handleNoteClick");
 
-        // Bulk ribbon buttons: with 2+ selected, narrow to the selection
-        // (intersected with eligibility); with 0/1 selected, keep acting on
-        // everything eligible (existing pre-item-3 behavior).
+        // Bulk ribbon buttons always narrow to the current selection
+        // (intersected with eligibility) — an empty selection means an
+        // empty target set, not "everything eligible".
         QVERIFY2(src.contains(QStringLiteral("function bulkTargetPaths(eligibleMap)")),
-                 "must define one shared helper for the selected-vs-everything-eligible narrowing");
+                 "must define one shared helper for narrowing eligibility to the current selection");
+        const int bulkFnIdx = src.indexOf(QStringLiteral("function bulkTargetPaths(eligibleMap)"));
+        QVERIFY(bulkFnIdx >= 0);
+        const QString bulkFnBody = src.mid(bulkFnIdx, 300);
+        QVERIFY2(!bulkFnBody.contains(QStringLiteral("selectedPaths.length < 2")),
+                 "bulkTargetPaths must no longer fall back to \"everything eligible\" for 0/1 "
+                 "selected — the ribbon's selectAllButton/Ctrl+A now cover that case explicitly");
         QVERIFY2(src.contains(QStringLiteral("sidebar.bulkTargetPaths(sidebar.untranscribedPaths)")),
                  "transcribeAllButton must narrow to the selection via bulkTargetPaths");
         QVERIFY2(src.contains(QStringLiteral("sidebar.bulkTargetPaths(sidebar.transcribedPaths)")),
                  "relabelAllButton must narrow to the selection via bulkTargetPaths");
         QVERIFY2(src.contains(QStringLiteral("sidebar.bulkTargetPaths(sidebar.chaptersPaths)")),
                  "chaptersAllButton must narrow to the selection via bulkTargetPaths");
+
+        // Ribbon's prepended select-all button + divider, and its Ctrl+A
+        // shortcut mirror.
+        QVERIFY2(src.contains(QStringLiteral("function selectAllVisible()")),
+                 "must define a selectAllVisible() helper shared by the ribbon button and Ctrl+A");
+        const int selectAllBtnIdx = src.indexOf(QStringLiteral("id: selectAllButton"));
+        QVERIFY2(selectAllBtnIdx >= 0, "ribbon must have a prepended selectAllButton");
+        const int dividerIdx = src.indexOf(QStringLiteral("id: ribbonDivider"));
+        QVERIFY2(dividerIdx >= 0, "ribbon must have a divider between selectAllButton and the "
+                                   "bulk action buttons");
+        QVERIFY2(dividerIdx > selectAllBtnIdx && dividerIdx < src.indexOf(QStringLiteral("id: transcribeAllButton")),
+                 "the divider must sit between selectAllButton and transcribeAllButton");
+        QVERIFY2(src.contains(QStringLiteral("sequence: \"Ctrl+A\"")),
+                 "must bind a Ctrl+A Shortcut");
+        const int ctrlAIdx = src.indexOf(QStringLiteral("sequence: \"Ctrl+A\""));
+        QVERIFY(ctrlAIdx >= 0);
+        const QString ctrlABlock = src.mid(ctrlAIdx, 200);
+        QVERIFY2(ctrlABlock.contains(QStringLiteral("sidebar.selectAllVisible()")),
+                 "Ctrl+A must call selectAllVisible()");
 
         // "N selected" indicator, only for a genuine multi-selection (2+).
         QVERIFY2(src.contains(QStringLiteral("id: multiSelectCountLabel")),

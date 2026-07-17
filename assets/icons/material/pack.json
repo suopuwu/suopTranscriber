@@ -6,6 +6,7 @@
   "//scale": "Global compensation: an SVG fills its box edge-to-edge, but the glyphs these icons replace floated smaller inside a padded font em-box. Without scaling down, a call site passing the old font.pixelSize as iconSize would render Material visibly larger than the classic glyph it stands in for. Tuned against the app's real clusters.",
   "scale": 0.85,
   "icons": {
+    "select-all": "select-all.svg",
     "transcribe": "transcribe.svg",
     "run-all": "run-all.svg",
     "relabel": "relabel.svg",

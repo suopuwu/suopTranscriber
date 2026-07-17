@@ -5,6 +5,7 @@
   "kind": "glyph",
   "scale": 1.0,
   "icons": {
+    "select-all": "☑",
     "transcribe": "⤒",
     "run-all": "»",
     "relabel": "↻",
