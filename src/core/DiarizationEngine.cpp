@@ -35,17 +35,18 @@ int cpuThreadCount()
 // helper builds the config that Create() needs, ahead of that call.
 // provider: "cuda" or "cpu" (see createSafely()'s try-CUDA-then-CPU logic).
 sc::OfflineSpeakerDiarizationConfig buildConfig(const QString &segmentationModelPath, const QString &embeddingModelPath,
-                                                 const char *provider)
+                                                 float threshold, const char *provider)
 {
     sc::OfflineSpeakerDiarizationConfig config;
     config.segmentation.pyannote.model = segmentationModelPath.toStdString();
     config.embedding.model = embeddingModelPath.toStdString();
     // Speaker count is always auto-detected (see class doc) — num_clusters
-    // stays 0 (its default), so the threshold below is what actually governs
-    // clustering. 0.5 is sherpa-onnx's own documented default for this exact
+    // stays 0 (its default), so the threshold is what actually governs
+    // clustering. It's now the user-facing "sensitivity" (DiarizationEngine's
+    // ctor doc); 0.5 is sherpa-onnx's own documented default for this exact
     // clustering algorithm (cosine distance, complete linkage).
     config.clustering.num_clusters = 0;
-    config.clustering.threshold = 0.5f;
+    config.clustering.threshold = threshold;
     config.segmentation.provider = provider;
     config.embedding.provider = provider;
     // Relevant for the "cpu" attempt (and any CPU-side ops even under
@@ -95,12 +96,13 @@ constexpr bool kTryCuda = true;
 // file fails the SAME way under both providers, so this fallback costs
 // nothing in that case — it just repeats the same (fast, local) failure
 // once more before giving up for real.
-sc::OfflineSpeakerDiarization createSafely(const QString &segmentationModelPath, const QString &embeddingModelPath)
+sc::OfflineSpeakerDiarization createSafely(const QString &segmentationModelPath, const QString &embeddingModelPath,
+                                            float threshold)
 {
     if constexpr (kTryCuda) {
         try {
             sc::OfflineSpeakerDiarization sd = sc::OfflineSpeakerDiarization::Create(
-                buildConfig(segmentationModelPath, embeddingModelPath, "cuda"));
+                buildConfig(segmentationModelPath, embeddingModelPath, threshold, "cuda"));
             if (sd.Get() != nullptr)
                 return sd;
             qWarning() << "DiarizationEngine: CUDA init returned no handle — falling back to CPU";
@@ -110,7 +112,8 @@ sc::OfflineSpeakerDiarization createSafely(const QString &segmentationModelPath,
     }
 
     try {
-        return sc::OfflineSpeakerDiarization::Create(buildConfig(segmentationModelPath, embeddingModelPath, "cpu"));
+        return sc::OfflineSpeakerDiarization::Create(
+            buildConfig(segmentationModelPath, embeddingModelPath, threshold, "cpu"));
     } catch (const std::exception &e) {
         qWarning() << "DiarizationEngine: failed to load models (corrupt or invalid ONNX?):" << e.what();
         sc::OfflineSpeakerDiarizationConfig invalid;
@@ -208,8 +211,9 @@ void mergeMinorSpeakersIntoNearestMajor(std::vector<sc::OfflineSpeakerDiarizatio
     }
 }
 
-DiarizationEngine::DiarizationEngine(const QString &segmentationModelPath, const QString &embeddingModelPath)
-    : m_sd(createSafely(segmentationModelPath, embeddingModelPath))
+DiarizationEngine::DiarizationEngine(const QString &segmentationModelPath, const QString &embeddingModelPath,
+                                     float threshold)
+    : m_sd(createSafely(segmentationModelPath, embeddingModelPath, threshold))
 {
 }
 

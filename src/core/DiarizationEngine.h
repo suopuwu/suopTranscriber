@@ -42,7 +42,14 @@ public:
     // cuDNN installed, not just the driver), falling back to CPU
     // automatically if CUDA isn't usable on this machine (see the .cpp's
     // createSafely()) — never a hard requirement.
-    DiarizationEngine(const QString &segmentationModelPath, const QString &embeddingModelPath);
+    //
+    // threshold is the clustering distance cutoff (the user-facing
+    // "sensitivity", see AppSettings.diarizationSensitivity) — LOWER = stricter
+    // = MORE speakers, HIGHER = more merging = FEWER speakers. Speaker COUNT is
+    // still auto-detected (num_clusters stays 0); this only tunes that
+    // auto-detection, it is NOT a fixed speaker count. 0.5 is sherpa-onnx's own
+    // documented default (cosine distance, complete linkage).
+    DiarizationEngine(const QString &segmentationModelPath, const QString &embeddingModelPath, float threshold = 0.5f);
 
     bool isValid() const { return m_sd.Get() != nullptr; }
 

@@ -221,6 +221,7 @@ qt_add_qml_module(suopTranscriber
         qml/BottomBar.qml
         qml/SettingsPopup.qml
         qml/BenchmarkPage.qml
+        qml/ModelsPage.qml
         qml/MiddleDragScroll.qml
     RESOURCES
         ${SUOP_ICON_ASSETS}

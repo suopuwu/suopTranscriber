@@ -68,6 +68,10 @@ struct VaultFixture {
         const bool opened = model.open(QIODevice::WriteOnly); // zero bytes: exists, whisper can't load it
         Q_ASSERT(opened);
         model.close();
+        // Models moved to an app-global store (ModelManager) — point it at this
+        // fixture's per-vault models dir so the planted fakes are still found
+        // offline without touching the real store.
+        qputenv("SUOP_MODELS_DIR", modelsDir.toLocal8Bit());
         vaultUrl = QUrl::fromLocalFile(dir.path());
     }
 
@@ -118,6 +122,14 @@ class TstTranscriptionQueue : public QObject
 {
     Q_OBJECT
 
+    // Fresh empty store/bundled dirs per test so a test resolves models ONLY
+    // through what it plants (VaultFixture / manual sites override
+    // SUOP_MODELS_DIR). Without this, a "model missing" test would fall through
+    // to the process-wide test-mode default store, which a real-model test can
+    // leave populated — leaking a "present" model in.
+    QScopedPointer<QTemporaryDir> m_emptyStore;
+    QScopedPointer<QTemporaryDir> m_emptyBundled;
+
 private slots:
     // The model benchmark (benchmarkJob) is display-only: it must NEVER write a
     // transcript .md or otherwise mutate the vault (that's the whole point —
@@ -157,6 +169,20 @@ private slots:
     // QSettings/QStandardPaths lookup for the rest of this process into an
     // isolated "qttest" sandbox instead of the real ~/.config/suopTranscriber.
     void initTestCase() { QStandardPaths::setTestModeEnabled(true); }
+
+    // Each test starts pointed at fresh EMPTY store + bundled dirs, so a model
+    // is "missing" unless the test itself plants it (VaultFixture / a manual
+    // site then overrides SUOP_MODELS_DIR at its own temp models dir). Pointing
+    // at empty dirs — rather than unsetting — is what keeps a "model missing"
+    // test from resolving to the shared test-mode default store, which another
+    // test can leave holding a real model.
+    void init()
+    {
+        m_emptyStore.reset(new QTemporaryDir);
+        m_emptyBundled.reset(new QTemporaryDir);
+        qputenv("SUOP_MODELS_DIR", m_emptyStore->path().toLocal8Bit());
+        qputenv("SUOP_BUNDLED_MODELS_DIR", m_emptyBundled->path().toLocal8Bit());
+    }
 
     // Item 11: sortedJobs partitions the raw (append-order) jobs() list for
     // display — Active first, then Queued in run order, then Paused, then
@@ -832,6 +858,7 @@ private slots:
         QVERIFY(vault.isValid());
         const QString modelsDir = vault.path() + "/.transcriber/models";
         QVERIFY(QDir().mkpath(modelsDir));
+        qputenv("SUOP_MODELS_DIR", modelsDir.toLocal8Bit()); // app-global store -> this test's dir
         QVERIFY(QFile::copy(modelPath, modelsDir + "/ggml-base.en.bin"));
         const QString samplePath = vault.path() + "/jfk.wav";
         QVERIFY(QFile::copy(QStringLiteral(SUOP_SAMPLES_DIR "/jfk.wav"), samplePath));
@@ -876,6 +903,7 @@ private slots:
         QVERIFY(vault.isValid());
         const QString modelsDir = vault.path() + "/.transcriber/models";
         QVERIFY(QDir().mkpath(modelsDir));
+        qputenv("SUOP_MODELS_DIR", modelsDir.toLocal8Bit()); // app-global store -> this test's dir
         QVERIFY(QFile::copy(modelPath, modelsDir + "/ggml-base.en.bin"));
         const QString sampleA = vault.path() + "/a.wav";
         const QString sampleB = vault.path() + "/b.wav";
@@ -976,6 +1004,7 @@ private slots:
         QVERIFY(vault.isValid());
         const QString modelsDir = vault.path() + "/.transcriber/models";
         QVERIFY(QDir().mkpath(modelsDir));
+        qputenv("SUOP_MODELS_DIR", modelsDir.toLocal8Bit()); // app-global store -> this test's dir
         QVERIFY(QFile::copy(modelPath, modelsDir + "/ggml-base.en.bin"));
 
         const QString samplePath = vault.path() + "/a.wav";
@@ -1302,6 +1331,7 @@ private slots:
         QVERIFY(vault.isValid());
         const QString modelsDir = vault.path() + "/.transcriber/models";
         QVERIFY(QDir().mkpath(modelsDir));
+        qputenv("SUOP_MODELS_DIR", modelsDir.toLocal8Bit()); // app-global store -> this test's dir
         QVERIFY(QFile::copy(modelPath, modelsDir + "/ggml-base.en.bin"));
         const QString samplePath = vault.path() + "/jfk.wav";
         QVERIFY(QFile::copy(QStringLiteral(SUOP_SAMPLES_DIR "/jfk.wav"), samplePath));
@@ -1519,6 +1549,65 @@ private slots:
         // Let it settle so teardown is clean — the job fails fast (no audio to
         // decode / unloadable models), which is fine; we only assert enqueue.
         QTRY_VERIFY(finishedSpy.count() >= 1);
+    }
+
+    // The chosen segmentation/embedding models + sensitivity are carried on the
+    // diarize job, persisted to tasks.json, and restored by loadPersistedQueue()
+    // (so a queued speaker-detection job resumes with the same tuning after a
+    // restart). Deliberately does NOT spin the event loop: persistQueue() writes
+    // synchronously on the enqueue's queueChanged, before the worker can run the
+    // job to failure (fake audio) and de-persist it — so we read/replay the
+    // just-written tasks.json rather than waiting.
+    void diarizeFile_carriesTuning_andPersists()
+    {
+        VaultFixture vault;
+        // Plant the CHOSEN pair (not the defaults) zero-byte so no download job
+        // jumps ahead and the diarize job is front-most.
+        for (const QString &name : {QStringLiteral("reverb-diarization-v1-int8.onnx"),
+                                    QStringLiteral("nemo-titanet-large.onnx")}) {
+            QFile f(vault.dir.path() + QStringLiteral("/.transcriber/models/") + name);
+            QVERIFY(f.open(QIODevice::WriteOnly));
+            f.close();
+        }
+        const QUrl file = writeTranscribedFile(vault.dir.path(), QStringLiteral("a.wav"),
+                                               QStringLiteral("[0] hello there\n[5] general kenobi\n"));
+
+        TranscriptionController controller;
+        controller.loadPersistedQueue(vault.vaultUrl); // records the vault for persistQueue()
+        controller.diarizeFile(file, vault.vaultUrl, QStringLiteral("reverb-diarization-v1"),
+                               QStringLiteral("nemo-titanet-large"), 0.35);
+
+        // Carried on the live job (jobs() exposes the diarization fields).
+        const QVariantMap job = controller.jobs().at(0).toMap();
+        QCOMPARE(job.value("kind").toString(), QStringLiteral("diarize"));
+        QCOMPARE(job.value("segmentationModelId").toString(), QStringLiteral("reverb-diarization-v1"));
+        QCOMPARE(job.value("embeddingModelId").toString(), QStringLiteral("nemo-titanet-large"));
+        QCOMPARE(job.value("diarizationThreshold").toDouble(), 0.35);
+
+        // Written to tasks.json synchronously (read the raw file before any event
+        // loop lets the worker fail the job and rewrite without it).
+        QFile tasks(vault.dir.path() + QStringLiteral("/.transcriber/tasks.json"));
+        QVERIFY(tasks.open(QIODevice::ReadOnly));
+        const QString json = QString::fromUtf8(tasks.readAll());
+        tasks.close();
+        QVERIFY2(json.contains(QStringLiteral("reverb-diarization-v1")), qPrintable(json));
+        QVERIFY2(json.contains(QStringLiteral("nemo-titanet-large")), qPrintable(json));
+
+        // Restored by a fresh controller with the tuning intact (synchronous —
+        // no QTRY, so the first controller's worker can't rewrite in between).
+        TranscriptionController fresh;
+        fresh.loadPersistedQueue(vault.vaultUrl);
+        bool found = false;
+        for (const QVariant &v : fresh.jobs()) {
+            const QVariantMap replayed = v.toMap();
+            if (replayed.value("kind").toString() == QStringLiteral("diarize")) {
+                QCOMPARE(replayed.value("segmentationModelId").toString(), QStringLiteral("reverb-diarization-v1"));
+                QCOMPARE(replayed.value("embeddingModelId").toString(), QStringLiteral("nemo-titanet-large"));
+                QCOMPARE(replayed.value("diarizationThreshold").toDouble(), 0.35);
+                found = true;
+            }
+        }
+        QVERIFY2(found, "diarize job did not survive the persist/replay round-trip");
     }
 
     // Item 52: spliceBodySpeakers() is the write-back half of a standalone

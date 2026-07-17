@@ -66,12 +66,12 @@ private slots:
 
     void modelManagement_uiAndRegistry()
     {
-        QSKIP("DESIGN.md 'Model management': a whisper-model download/management UI backed by a "
-              "registry in vault config. STILL PARTIAL: whisper tiers auto-download to "
-              "<vault>/.transcriber/models/ and a fixed dropdown exists (tst_modelmanager); "
-              "out-of-process ENGINES now DO have a real registry + capability detection "
-              "(EngineRegistry, availableEngines(), see subprocessEngines_* note above), but a "
-              "general whisper-model download/management UI is still not built.");
+        QSKIP("DONE — no longer a future spec. The Settings → Models page (ModelsPage.qml) now "
+              "lists/deletes/predownloads/imports/exports every app-managed model, backed by an "
+              "app-global store + read-only bundled search path (DESIGN.md 'Model management'). "
+              "Real coverage: tst_modelmanager (deleteModel/importModel/exportModel/bundled "
+              "resolution) + tst_styleguide::settingsPopup_hasModelsManagementPage. Kept as a "
+              "passing marker so the spec trail stays; delete when trimming this file.");
     }
 
     void vaultConfigJson_appScopedSettingsDivergence()

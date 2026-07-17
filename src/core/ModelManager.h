@@ -1,13 +1,21 @@
 #pragma once
 
 #include <QString>
-#include <QUrl>
 
 #include <functional>
 #include <vector>
 
-// Ensures a whisper.cpp ggml model is present at <vault>/.transcriber/models/,
-// downloading it if missing (see DESIGN.md "Model management" / vault layout).
+// Ensures a whisper.cpp ggml model is present in the shared, app-global model
+// store, downloading it if missing (see DESIGN.md "Model management").
+//
+// Storage (2026-07-16): models live in ONE app-global store shared across all
+// vaults — NOT per-vault — so a multi-GB model is downloaded once and reused
+// everywhere, and there is a single directory to back up / import / export.
+// The store is the writable data dir (see modelsStoreDir()); a read-only
+// "bundled" directory shipped next to the binary (see below) is also searched
+// so a distributor can pre-place models. Resolution for every presence check
+// and path lookup is store-first, then bundled; downloads/imports/deletes only
+// ever touch the writable store.
 //
 // If modelId is not one of availableModels()'s ids (e.g. a stale
 // AppSettings.lastModel from a removed model tier), ensureModel silently
@@ -32,6 +40,22 @@ const std::vector<ModelInfo> &availableModels();
 
 constexpr auto kDefaultModelId = "base.en";
 
+// The app-global, writable model store — all downloads/imports land here and
+// deletes remove from here. Default: the writable generic-data location
+// (~/.local/share on Linux) + "/suopTranscriber/models". Overridden by the
+// SUOP_MODELS_DIR env var (used by tests to redirect to a temp dir so they
+// never touch the real store — see CLAUDE.md's "never touch the user's real
+// vault or app config"). The directory is created lazily on first write.
+QString modelsStoreDir();
+
+// The read-only "bundled" model directory searched AFTER the writable store
+// for every presence check / path lookup, so a distributor can ship model
+// files beside the binary and the app finds them without a download. Default:
+// applicationDirPath() + "/models"; overridden by SUOP_BUNDLED_MODELS_DIR (for
+// tests exercising the bundled-fallback path). May not exist — a missing
+// bundled dir simply contributes no models.
+QString bundledModelsDir();
+
 // In-process NVIDIA Parakeet-TDT, run via sherpa-onnx's OfflineRecognizer (see
 // ParakeetEngine) — NOT whisper ggml and NOT an out-of-process subprocess
 // engine. It appears in availableModels() like the whisper tiers, but its
@@ -52,9 +76,12 @@ struct ParakeetModelPaths {
     bool isComplete() const;
 };
 
-// Absolute paths to the Parakeet bundle's files for this vault (whether or not
-// they exist yet). isComplete() is true iff all four are present on disk.
-ParakeetModelPaths parakeetModelPaths(const QUrl &vaultPath);
+// Absolute paths to the Parakeet bundle's four files, resolved store-first
+// then bundled: if a complete bundle exists in either location its paths are
+// returned; otherwise the writable-store paths (the download target) are
+// returned even though they don't exist yet. isComplete() is true iff all four
+// of the returned paths are present on disk.
+ParakeetModelPaths parakeetModelPaths();
 
 // Wave N (task system, item 5): resolves modelId to its ggml file name
 // without touching disk/network — lets a caller check "is this already
@@ -64,17 +91,16 @@ ParakeetModelPaths parakeetModelPaths(const QUrl &vaultPath);
 // function's — this one never substitutes kDefaultModelId).
 QString modelFileName(const QString &modelId);
 
-// True if modelFileName(modelId)'s file already exists at
-// <vault>/.transcriber/models/ — never downloads. False (not a fallback
-// check) for an unrecognized modelId, same as modelFileName()'s empty
-// result.
-bool isModelDownloaded(const QUrl &vaultPath, const QString &modelId);
+// True if modelFileName(modelId)'s file is present in the store or bundled
+// dir — never downloads. False (not a fallback check) for an unrecognized
+// modelId, same as modelFileName()'s empty result.
+bool isModelDownloaded(const QString &modelId);
 // Mirrors isModelDownloaded() for the AI-auto-labeling model (kLabelModelFileName).
-bool isLabelModelDownloaded(const QUrl &vaultPath);
+bool isLabelModelDownloaded();
 // Mirrors isModelDownloaded() for BOTH speaker-diarization models — true
 // only if both are present, matching ensureDiarizationModels()'s
 // never-partially-succeeds contract.
-bool areDiarizationModelsDownloaded(const QUrl &vaultPath);
+bool areDiarizationModelsDownloaded();
 
 // Progress callback for the download functions below: bytesDone/bytesTotal
 // from polling the growing .part file's size against a Content-Length
@@ -100,13 +126,13 @@ struct DownloadControl {
 // already downloaded (the common case once item 5's separate download job
 // has already run), since this function returns immediately without
 // touching either callback when the file already exists.
-QString ensureModel(const QUrl &vaultPath, const QString &modelId, QString *errorOut = nullptr,
+QString ensureModel(const QString &modelId, QString *errorOut = nullptr,
                      bool *usedFallback = nullptr, const DownloadProgressCallback &onProgress = {},
                      const DownloadControl &control = {});
 
 // The GGUF model used for AI auto-labeling (see DESIGN.md "Model management" —
 // LabelingEngine's second pass after transcription). One hardcoded model for
-// now, same vault-scoped storage/download pattern as ensureModel() above, no
+// now, same app-global storage/download pattern as ensureModel() above, no
 // per-size picker — auto-labeling is a single opt-in setting, not a dropdown.
 constexpr auto kLabelModelFileName = "Qwen3-4B-Instruct-2507-Q4_K_M.gguf";
 
@@ -114,89 +140,157 @@ constexpr auto kLabelModelFileName = "Qwen3-4B-Instruct-2507-Q4_K_M.gguf";
 // given). Downloads on first use (~2.5 GB); Q_INVOKABLE callers must run this
 // off the GUI thread, same as ensureModel(). onProgress/control: see
 // ensureModel()'s doc comment.
-QString ensureLabelModel(const QUrl &vaultPath, QString *errorOut = nullptr,
+QString ensureLabelModel(QString *errorOut = nullptr,
                           const DownloadProgressCallback &onProgress = {}, const DownloadControl &control = {});
 
 // Silero VAD (ggml-converted), used to (a) gate whisper.cpp's own per-window
 // inference away from silence (hallucination/silence robustness) and (b)
 // find VAD-aligned window boundaries for chunking a long file (see DESIGN.md
 // "Durable / resumable transcription" — chunking half only, no
-// checkpoint/resume yet). ~2 MB, same vault-scoped storage/download pattern
+// checkpoint/resume yet). ~2 MB, same app-global storage/download pattern
 // as the models above. Unlike ensureModel(), a failure here must NOT block
 // transcription — caller degrades gracefully (ASR without VAD gating/
 // windowing, single whole-file chunk, recorded honestly in frontmatter),
 // same contract as ensureDiarizationModels().
 constexpr auto kVadModelFileName = "ggml-silero-v5.1.2.bin";
 
-// Whether an out-of-process engine's model is present for this vault (see
+// Whether an out-of-process engine's model is present (app-global) (see
 // DESIGN.md "Pluggable engines" capability detection). True when the engine
 // ships no app-managed model file — i.e. its runtime fetches its own weights
 // (Parakeet via NeMo's from_pretrained/HF cache), so a missing file never
 // gates it here; its availability is instead gated by its dependencies. Never
 // downloads.
-bool isEngineModelPresent(const QUrl &vaultPath, const QString &engineId);
+bool isEngineModelPresent(const QString &engineId);
 
 // Returns true if kVadModelFileName already exists — never downloads.
-bool isVadModelDownloaded(const QUrl &vaultPath);
+bool isVadModelDownloaded();
 
 // Returns the local VAD model path, or empty on failure (errorOut set if
 // given). onProgress/control: see ensureModel()'s doc comment.
-QString ensureVadModel(const QUrl &vaultPath, QString *errorOut = nullptr,
+QString ensureVadModel(QString *errorOut = nullptr,
                         const DownloadProgressCallback &onProgress = {}, const DownloadControl &control = {});
 
 // Speaker diarization (see DESIGN.md "Speaker diarization" / DiarizationEngine):
-// pyannote-segmentation-3.0, int8-quantized (local speaker-activity
-// segmentation) + WeSpeaker ResNet293-LM (speaker embedding), both ONNX,
-// ~116 MB combined — same vault-scoped storage/download pattern as the
-// models above. Unlike ensureModel(), a failure here is NOT meant to block
-// transcription: the caller is expected to degrade gracefully (run ASR
-// without diarization, record why in frontmatter) rather than fail the
-// whole job — see TranscriptionController.
+// a SEGMENTATION model (local speaker-activity segmentation) + an EMBEDDING
+// model (speaker voice fingerprint), both ONNX, run by sherpa-onnx. Unlike
+// ensureModel(), a failure here is NOT meant to block transcription: the
+// caller degrades gracefully (run ASR without diarization, record why in
+// frontmatter) rather than fail the whole job — see TranscriptionController.
 //
-// Embedding model choice (2026-07-07): swapped from 3D-Speaker's CAM++
-// (en_voxceleb, ~30 MB) to WeSpeaker's ResNet293-LM (en_voxceleb, ~115 MB) —
-// the largest English/VoxCeleb speaker-embedding checkpoint sherpa-onnx's
-// speaker-recongition-models release ships (full list: `gh`/GitHub API
-// against that release tag). ResNet293-LM is WeSpeaker's own best-performing
-// released checkpoint (0.447% EER on VoxCeleb1-O after large-margin
-// finetuning) — the intent is a more discriminative embedding space to
-// reduce the over-splitting seen on real recordings (one speaker's voice
-// fragmenting into multiple clusters, see DiarizationEngine's
-// kMinorSpeakerDurationFraction doc comment). Trade-off: ~4x the download
-// size and a slower per-segment forward pass than CAM++ — acceptable here
-// since the whole diarization pass already runs on CPU specifically because
-// it's dominated by hundreds of small sequential calls rather than one long
-// batched one (see DiarizationEngine's kTryCuda doc comment), so a somewhat
-// heavier per-call model doesn't change that shape, just its constant
-// factor. Filename changed (not just the URL) so a vault with the OLD cached
-// file re-downloads the new one automatically rather than silently keeping
-// stale weights.
-//
-// Segmentation model choice (2026-07-07, same day): switched to the int8-
-// quantized export inside the SAME sherpa-onnx pyannote-segmentation-3.0
-// release archive (still MIT-licensed, still the exact same trained
-// weights, just quantized — not a different model) — ~4x smaller (1.5 MB vs
-// 6 MB) and faster on CPU, which is what matters since segmentation (not
-// embedding) is the per-call-count-dominated half of the pipeline (see
-// kTryCuda's doc comment in DiarizationEngine.cpp). sherpa-onnx also offers
-// genuinely different segmentation models (Rev.ai's "reverb-diarization"
-// v1/v2) in that same release, but those are non-commercial-licensed and
-// unevidenced to help the specific over-splitting problem here, so
-// deliberately not used.
+// Both halves are USER-SELECTABLE from small catalogs (the two
+// availableSegmentationModels()/availableEmbeddingModels() below) — same
+// {id,fileName,label} dropdown shape as availableModels(), but each entry also
+// carries its own download recipe (ModelInfo has no URL). The defaults
+// (kDefaultSegmentationModelId / kDefaultEmbeddingModelId) reproduce the prior
+// fixed pair: pyannote-segmentation-3.0 int8 (MIT) + WeSpeaker ResNet293-LM
+// (~115 MB, the most discriminative English/VoxCeleb embedding sherpa-onnx
+// ships, 0.447% EER on VoxCeleb1-O). Alternatives exist for A/B-ing hard
+// recordings — notably far-field group audio where the default clusters
+// everyone into one speaker: Rev.ai's reverb-diarization-v1 segmentation
+// (trained on messy conversational audio — NON-COMMERCIAL licensed, surfaced
+// as such in the Models page), plus 3D-Speaker CAM++ (~28 MB, fast) and NVIDIA
+// NeMo TitaNet-large embeddings. The clustering SENSITIVITY (distance
+// threshold) is a separate DiarizationEngine ctor argument, not a model choice.
+struct DiarizationModelInfo {
+    QString id;                 // stable id: AppSettings value AND manageable-model id
+    QString fileName;           // canonical local name in the store
+    QString label;              // human-readable, shown in the picker
+    QString url;                // full download URL (a direct .onnx, or a .tar.bz2 archive)
+    QString archiveInnerPath;   // non-empty ⇒ url is a .tar.bz2; extract this inner path. Empty ⇒ direct file.
+    bool nonCommercial = false; // license note surfaced in the Models page download UI
+};
+
+// Ordered default-first — dropdown display order. Every entry is downloadable
+// and appears as its own manageable model (see TranscriptionController::
+// manageableModels()).
+const std::vector<DiarizationModelInfo> &availableSegmentationModels();
+const std::vector<DiarizationModelInfo> &availableEmbeddingModels();
+
+constexpr auto kDefaultSegmentationModelId = "pyannote-segmentation-3.0";
+constexpr auto kDefaultEmbeddingModelId = "wespeaker-resnet293-lm";
+
+// Local store filenames of the DEFAULT pair — kept as named constants because
+// modelLayout()/a few call sites still special-case them. Equal to the default
+// catalog entries' fileName.
 constexpr auto kDiarizationSegmentationFileName = "pyannote-segmentation-3.0-int8.onnx";
 constexpr auto kDiarizationEmbeddingFileName = "wespeaker-resnet293-lm.onnx";
 
-// Returns true and fills both *_PathOut params if both files are present or
-// were downloaded successfully; false (errorOut set) if either fails. Never
-// partially succeeds without reporting it — either both paths are valid or
-// neither is (callers shouldn't have to handle a "half available" state).
-// onProgress/control: see ensureModel()'s doc comment — spans BOTH files
-// when both need downloading (bytesDone/bytesTotal cover whichever one is
-// currently transferring, resetting between them; a caller wanting one
-// smooth 0..1 across both must track that itself, same as any multi-file
-// download).
-bool ensureDiarizationModels(const QUrl &vaultPath, QString *segmentationPathOut, QString *embeddingPathOut,
-                              QString *errorOut = nullptr, const DownloadProgressCallback &onProgress = {},
-                              const DownloadControl &control = {});
+// Resolve a chosen sub-model's DiarizationModelInfo by id; *usedFallback
+// (optional) is set true iff id was unrecognized and the default was
+// substituted (never silently misrepresent the model — same contract as
+// ensureModel()). The returned reference is to a static catalog entry.
+const DiarizationModelInfo &segmentationModelInfo(const QString &id, bool *usedFallback = nullptr);
+const DiarizationModelInfo &embeddingModelInfo(const QString &id, bool *usedFallback = nullptr);
+
+// True iff the chosen sub-model's file is present (store or bundled). An
+// unrecognized id checks the default (matching *ModelInfo()'s fallback).
+bool isSegmentationModelDownloaded(const QString &id);
+bool isEmbeddingModelDownloaded(const QString &id);
+
+// Ensure a single chosen sub-model is on disk (download if missing), returning
+// its local path or empty on failure (errorOut set). usedFallback: as
+// segmentationModelInfo(). onProgress/control: see ensureModel()'s doc comment.
+QString ensureSegmentationModel(const QString &id, QString *errorOut = nullptr, bool *usedFallback = nullptr,
+                                const DownloadProgressCallback &onProgress = {}, const DownloadControl &control = {});
+QString ensureEmbeddingModel(const QString &id, QString *errorOut = nullptr, bool *usedFallback = nullptr,
+                             const DownloadProgressCallback &onProgress = {}, const DownloadControl &control = {});
+
+// True iff BOTH chosen models are present; unrecognized ids fall back to
+// defaults. The no-arg overload checks the default pair (used where no
+// selection is in scope).
+bool areDiarizationModelsDownloaded(const QString &segmentationModelId, const QString &embeddingModelId);
+bool areDiarizationModelsDownloaded();
+
+// Ensure both chosen models are present, filling *_PathOut. false (errorOut
+// set) if either fails — never partially succeeds without reporting it.
+// *usedFallback set true iff EITHER id was unrecognized (default substituted).
+// onProgress/control: see ensureModel()'s doc comment — spans both files when
+// both need downloading (progress resets between them).
+bool ensureDiarizationModels(const QString &segmentationModelId, const QString &embeddingModelId,
+                             QString *segmentationPathOut, QString *embeddingPathOut, QString *errorOut = nullptr,
+                             bool *usedFallback = nullptr, const DownloadProgressCallback &onProgress = {},
+                             const DownloadControl &control = {});
+
+// --- Model management (Settings → Models) --------------------------------
+//
+// The "support" models above (label / VAD / diarization) have no dropdown
+// entry and thus no ModelInfo id. These stable pseudo-ids let the Models
+// management page list/delete/import/export/predownload them through the same
+// id-keyed API as the whisper tiers + parakeet. The ops below accept any
+// whisper tier id, kParakeetModelId, OR one of these three.
+constexpr auto kLabelModelId = "label";
+constexpr auto kVadModelId = "vad";
+constexpr auto kDiarizationModelId = "diarization";
+
+// Total on-disk size (bytes) of the file(s) that model id occupies, resolved
+// store-first then bundled; 0 if absent or the id is unknown.
+qint64 modelSizeOnDisk(const QString &id);
+
+// True iff id's file(s) resolve ONLY in the read-only bundled dir (nothing in
+// the writable store) — the page must disable Delete for these (a shipped
+// model can't be removed). False when not downloaded at all, or present in the
+// writable store.
+bool isModelBundledOnly(const QString &id);
+
+// Removes id's file(s) from the WRITABLE store only (never the bundled dir).
+// Permanent (models are large + re-downloadable — no trash). Returns false
+// (errorOut set) for an unknown id or when nothing was in the store to remove.
+bool deleteModel(const QString &id, QString *errorOut = nullptr);
+
+// Copies user-supplied model file(s) into the store under their canonical
+// name(s), so id then resolves as downloaded with no network fetch. sourcePath
+// is a FILE for single-file models (a whisper tier, label, or vad) or a
+// DIRECTORY containing the expected canonical files for multi-file models (the
+// parakeet bundle's four files; the diarization pair). Blocking (a multi-GB
+// copy) — call off the GUI thread. Returns false (errorOut set) on a bad id,
+// wrong source shape, or a missing expected file.
+bool importModel(const QString &id, const QString &sourcePath, QString *errorOut = nullptr);
+
+// Copies id's downloaded file(s) into destDir for backup / re-import: a single
+// file for single-file models, a <bundle>/ subdir for parakeet, both onnx
+// files for diarization — the exact shape importModel() expects back.
+// Blocking — call off the GUI thread. Returns false (errorOut set) if id isn't
+// downloaded, destDir is missing, or a copy fails.
+bool exportModel(const QString &id, const QString &destDir, QString *errorOut = nullptr);
 
 }

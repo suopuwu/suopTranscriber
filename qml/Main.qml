@@ -295,7 +295,16 @@ ApplicationWindow {
                 onSettingsRequested: settingsPopup.open()
                 onForceRetranscribeAllRequested: sidebar.forceRetranscribeAll()
                 onRecordRequested: mainPanel.recording = !mainPanel.recording
-                onUsbGrabberRequested: mainPanel.usbGrabberOpen = !mainPanel.usbGrabberOpen
+                onUsbGrabberRequested: {
+                    mainPanel.usbGrabberOpen = !mainPanel.usbGrabberOpen
+                    if (mainPanel.usbGrabberOpen)
+                        mainPanel.benchmarkOpen = false
+                }
+                onBenchmarkRequested: {
+                    mainPanel.benchmarkOpen = !mainPanel.benchmarkOpen
+                    if (mainPanel.benchmarkOpen)
+                        mainPanel.usbGrabberOpen = false
+                }
             }
 
             SplitView {

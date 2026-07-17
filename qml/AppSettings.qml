@@ -155,6 +155,17 @@ Item {
     // of podcast episodes). Matches ModelManager::kDefaultModelId.
     property string defaultModel: "base.en"
 
+    // Speaker-diarization tuning — vault-scoped like defaultModel. Which
+    // segmentation + embedding models to use (ids from
+    // TranscriptionController::availableSegmentationModels()/...Embedding...).
+    // diarizationSensitivity is the clustering distance threshold — a
+    // continuous knob like chapterDensity: LOWER = stricter = MORE speakers,
+    // HIGHER = more merging = FEWER speakers. It tunes the always-on
+    // auto-detection; it is NOT a fixed speaker count. See DiarizationEngine.
+    property string diarizationSegmentationModel: "pyannote-segmentation-3.0"
+    property string diarizationEmbeddingModel: "wespeaker-resnet293-lm"
+    property real diarizationSensitivity: 0.5
+
     // Sidebar file-tree order: "name" (default, alphabetical dirs-first —
     // matches this app's original/only behavior), "dateDesc" (Date Modified,
     // newest first), "dateAsc" (Date Modified, oldest first). Combine
@@ -274,6 +285,9 @@ Item {
         tagReuseBias: 0.5,
         wordiness: 0.5,
         chapterDensity: 0.5,
+        diarizationSegmentationModel: "pyannote-segmentation-3.0",
+        diarizationEmbeddingModel: "wespeaker-resnet293-lm",
+        diarizationSensitivity: 0.5,
         highlightColor: "#3a5a7a",
         highlightRadius: 8,
         sidebarSelectionColor: "#33ffffff",
@@ -403,6 +417,9 @@ Item {
         function onSidebarRightMarginChanged() { appSettings.scheduleSave() }
         function onTimestampDecimalPlacesChanged() { appSettings.scheduleSave() }
         function onDefaultModelChanged() { appSettings.scheduleSave() }
+        function onDiarizationSegmentationModelChanged() { appSettings.scheduleSave() }
+        function onDiarizationEmbeddingModelChanged() { appSettings.scheduleSave() }
+        function onDiarizationSensitivityChanged() { appSettings.scheduleSave() }
         function onSortModeChanged() { appSettings.scheduleSave() }
         function onIconPackChanged() { appSettings.scheduleSave() }
         function onProgressGlowEnabledChanged() { appSettings.scheduleSave() }

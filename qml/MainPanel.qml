@@ -24,6 +24,10 @@ Rectangle {
     // `recording` above. `recording` wins if both happen to be true (see
     // usbGrabberPage's own `visible:` binding).
     property bool usbGrabberOpen: false
+    // Set true/false only by TitleBar's benchmark toggle (see Main.qml's
+    // onBenchmarkRequested) — gates the benchmark page below, mirroring
+    // usbGrabberOpen. recording/usbGrabber win if several are true.
+    property bool benchmarkOpen: false
     property var storedMetadata: ({})
     readonly property bool hasStoredMetadata: Object.keys(mainPanel.storedMetadata).length > 0
     // Gates transcriptArea's editability below — mirrors
@@ -2136,6 +2140,7 @@ Rectangle {
     Item {
         anchors.fill: parent
         visible: mainPanel.vaultPath.toString() === "" && !mainPanel.recording && !mainPanel.usbGrabberOpen
+                 && !mainPanel.benchmarkOpen
 
         Button {
             id: openVaultButton
@@ -2165,6 +2170,7 @@ Rectangle {
         anchors.margins: 16
         spacing: 12
         visible: mainPanel.vaultPath.toString() !== "" && !mainPanel.recording && !mainPanel.usbGrabberOpen
+                 && !mainPanel.benchmarkOpen
 
         // Item 13: playback progress bar relocated to the very top, full
         // width, with a play/pause icon instead of a separate Play button.
@@ -2511,7 +2517,10 @@ Rectangle {
                                                                             AppSettings.restrictTagsToExisting,
                                                                             AppSettings.tagReuseBias,
                                                                             AppSettings.wordiness,
-                                                                            AppSettings.chapterDensity)
+                                                                            AppSettings.chapterDensity,
+                                                                            AppSettings.diarizationSegmentationModel,
+                                                                            AppSettings.diarizationEmbeddingModel,
+                                                                            AppSettings.diarizationSensitivity)
                 }
                 HoverBorder {
                     anchors.fill: parent
@@ -2650,7 +2659,10 @@ Rectangle {
                 TapHandler {
                     enabled: detectSpeakersButton.enabled
                     onTapped: mainPanel.transcriptionController.diarizeFile(detectSpeakersButton.targetUrl,
-                                                                            mainPanel.vaultPath)
+                                                                            mainPanel.vaultPath,
+                                                                            AppSettings.diarizationSegmentationModel,
+                                                                            AppSettings.diarizationEmbeddingModel,
+                                                                            AppSettings.diarizationSensitivity)
                 }
                 HoverBorder {
                     anchors.fill: parent
@@ -3912,7 +3924,9 @@ Rectangle {
                 }
 
                 RowLayout {
+                    id: modelRow
                     spacing: 12
+                    Layout.fillWidth: true
                     visible: mainPanel.orphanedMdPath === ""
 
                     // Speaker detection is no longer a transcribe-time toggle —
@@ -3944,7 +3958,11 @@ Rectangle {
                         // in either the closed box or a delegate row (both
                         // are sized to modelCombo.width).
                         property real cachedMaxLabelWidth: 0
-                        Layout.preferredWidth: Math.max(240, modelCombo.cachedMaxLabelWidth + 64)
+                        // The closed box takes half the row's width (leaving the
+                        // other half for a second selector to come). The label
+                        // elides here (full text stays in the tooltip) while the
+                        // popup below opens wider to show it in full.
+                        Layout.preferredWidth: modelRow.width / 2
                         model: mainPanel.transcriptionController ? mainPanel.transcriptionController.availableModels() : []
                         textRole: "label"
                         valueRole: "id"
@@ -3972,6 +3990,18 @@ Rectangle {
                             active: modelCombo.hovered
                         }
 
+                        // Custom eliding content: the default QQC2 ComboBox
+                        // contentItem clips (no ellipsis) when the box is
+                        // width-capped, so provide our own that elides.
+                        contentItem: Text {
+                            leftPadding: 12
+                            rightPadding: 28
+                            text: modelCombo.displayText
+                            color: "white"
+                            verticalAlignment: Text.AlignVCenter
+                            elide: Text.ElideRight
+                        }
+
                         // Item P2: closed-state box gets the app's own corner
                         // radius (QQC2's default box is square-cornered),
                         // matching the popup background below (same radius,
@@ -3990,7 +4020,9 @@ Rectangle {
                             id: modelDelegate
                             required property var modelData
                             required property int index
-                            width: modelCombo.width
+                            // Follow the popup's width (which is not capped like
+                            // the closed box) rather than modelCombo.width.
+                            width: ListView.view ? ListView.view.width : modelCombo.width
                             highlighted: modelCombo.highlightedIndex === index
 
                             contentItem: RowLayout {
@@ -3999,7 +4031,10 @@ Rectangle {
                                     text: modelDelegate.modelData.label
                                     color: "white"
                                     Layout.fillWidth: true
-                                    elide: Text.ElideRight
+                                    // Wrap instead of eliding: when the popup is
+                                    // clamped by the screen edge the label spills
+                                    // onto a second line rather than being cut.
+                                    wrapMode: Text.Wrap
                                 }
                                 Rectangle {
                                     width: 8
@@ -4023,10 +4058,24 @@ Rectangle {
                         // with our own background/padding instead of the
                         // style's.
                         popup: Popup {
+                            id: modelPopup
                             y: modelCombo.height
-                            width: modelCombo.width
-                            implicitHeight: Math.min(contentItem.implicitHeight, 320)
                             padding: 1
+
+                            // Unlike the closed box, the popup is not width-
+                            // capped — it opens as wide as the widest label
+                            // needs so nothing is clipped. It's only clamped to
+                            // the space left to the window's right edge; when
+                            // even that isn't enough, the delegate labels wrap.
+                            property real desiredWidth: Math.max(modelCombo.width, modelCombo.cachedMaxLabelWidth + 64)
+                            width: desiredWidth
+                            onAboutToShow: {
+                                const p = modelCombo.mapToItem(null, 0, 0)
+                                const avail = modelCombo.Window.width - p.x - 12
+                                width = Math.min(desiredWidth, Math.max(modelCombo.width, avail))
+                            }
+
+                            implicitHeight: Math.min(contentItem.implicitHeight, 320)
 
                             contentItem: ListView {
                                 clip: true
@@ -4597,7 +4646,7 @@ Rectangle {
             parent: mainPanel
             anchors.fill: parent
             visible: mainPanel.vaultPath.toString() !== "" && !mainPanel.recording
-                     && !mainPanel.usbGrabberOpen
+                     && !mainPanel.usbGrabberOpen && !mainPanel.benchmarkOpen
             flickable: transcriptScrollView.contentItem as Flickable
         }
 
@@ -5069,6 +5118,32 @@ Rectangle {
             const prefix = mainPanel.vaultLocalPath + "/"
             AppSettings.recordingOutputFolder = localPath === mainPanel.vaultLocalPath ? ""
                 : (localPath.startsWith(prefix) ? localPath.slice(prefix.length) : localPath)
+        }
+    }
+
+    // Benchmark page: another sibling top-level block (see the mutual-exclusion
+    // negations on the content/recorder/usb blocks). Promoted out of Settings to
+    // its own TitleBar button (see Main.qml's onBenchmarkRequested). Given lower
+    // precedence than recording/usbGrabber, same as those negate each other.
+    ScrollView {
+        id: benchmarkScroll
+        anchors.fill: parent
+        anchors.margins: 16
+        visible: mainPanel.benchmarkOpen && !mainPanel.recording && !mainPanel.usbGrabberOpen
+        contentWidth: availableWidth
+        clip: true
+
+        BenchmarkPage {
+            width: benchmarkScroll.availableWidth
+            active: benchmarkScroll.visible
+            transcriptionController: mainPanel.transcriptionController
+            vaultTreeModel: mainPanel.vaultTreeModel
+            // B2: default the benchmark to whatever file is open/highlighted in
+            // the left panel (the same "current file" expression Main.qml feeds
+            // the sidebar); empty ⇒ BenchmarkPage falls back to its picker.
+            currentFilePath: (mainPanel.player && mainPanel.player.source.toString() !== "")
+                             ? mainPanel.player.source.toString().replace("file://", "")
+                             : (mainPanel.orphanedMdPath !== "" ? mainPanel.orphanedMdPath : "")
         }
     }
 

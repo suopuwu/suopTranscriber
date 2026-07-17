@@ -131,6 +131,9 @@ private slots:
         QFile model(modelsDir + QStringLiteral("/ggml-base.en.bin"));
         QVERIFY(model.open(QIODevice::WriteOnly));
         model.close();
+        // Models moved to an app-global store (ModelManager) — redirect it to
+        // this class's single scratch vault models dir (persists for all tests).
+        qputenv("SUOP_MODELS_DIR", modelsDir.toLocal8Bit());
 
         const QString suopDir = m_moduleDir.filePath(QStringLiteral("SuopTranscriber"));
         QVERIFY(QDir().mkpath(suopDir));

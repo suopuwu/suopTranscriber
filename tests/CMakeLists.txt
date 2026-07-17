@@ -180,6 +180,7 @@ suop_add_test(tst_labelingengine LINK_LLAMA SOURCES LabelingEngine.cpp)
 suop_add_test(tst_diarizationengine LINK_SHERPA_ONNX SOURCES DiarizationEngine.cpp AudioDecoder.cpp)
 suop_add_test(tst_future_spec)
 suop_add_test(tst_styleguide)
+suop_add_test(tst_benchmark_combos)
 suop_add_test(tst_icontheme LINK_QUICK LINK_SVG ICON_ASSETS SOURCES IconTheme.cpp)
 # Renders the real Snackbar/SnackbarHost/Notifications in an ApplicationWindow
 # (not a QQuickView — SnackbarHost needs Overlay.overlay; see the test's
@@ -202,6 +203,7 @@ suop_add_test(tst_sidebar_dragmove LINK_QUICK LINK_SVG ICON_ASSETS SOURCES Vault
 suop_add_test(tst_sidebar_rename LINK_QUICK LINK_SVG ICON_ASSETS SOURCES VaultTreeModel.cpp VaultSearchProxyModel.cpp IconTheme.cpp)
 suop_add_test(tst_sidebar_expand LINK_QUICK LINK_SVG ICON_ASSETS SOURCES VaultTreeModel.cpp VaultSearchProxyModel.cpp IconTheme.cpp)
 suop_add_test(tst_sidebar_guides LINK_QUICK LINK_SVG ICON_ASSETS SOURCES VaultTreeModel.cpp VaultSearchProxyModel.cpp IconTheme.cpp)
+suop_add_test(tst_sidebar_selectall LINK_QUICK LINK_SVG ICON_ASSETS SOURCES VaultTreeModel.cpp VaultSearchProxyModel.cpp IconTheme.cpp)
 # The ONLY sidebar harness that renders inside a real ApplicationWindow (hence a
 # real Overlay + SnackbarHost), which is what the context menu's modal dimming
 # needs — the QQuickView harnesses above structurally cannot show it. See its

@@ -1498,10 +1498,9 @@ bool engineDepsPresent(const EngineDescriptor &desc)
 std::vector<EngineDescriptor> discoverEngines(const QString &vaultPath)
 {
     static const GpuStatus gpu = GpuProbe::probe();
-    const QUrl vaultUrl = QUrl::fromLocalFile(vaultPath);
     return EngineRegistry::discover(
         engineRootDirs(vaultPath), gpu, [](const EngineDescriptor &d) { return engineDepsPresent(d); },
-        [vaultUrl](const EngineDescriptor &d) { return ModelManager::isEngineModelPresent(vaultUrl, d.id); });
+        [](const EngineDescriptor &d) { return ModelManager::isEngineModelPresent(d.id); });
 }
 
 // Finds one engine by id for the transcribe path. Returns nullopt (with *error
@@ -1613,7 +1612,7 @@ public slots:
             modelPath = modelId;
             modelUsedName = desc->manifest.name;
         } else {
-            modelPath = ModelManager::ensureModel(QUrl::fromLocalFile(vaultPath), modelId, &error, &modelFallback);
+            modelPath = ModelManager::ensureModel(modelId, &error, &modelFallback);
             if (modelPath.isEmpty()) {
                 emit finished(false, error.isEmpty() ? QStringLiteral("model unavailable") : error);
                 return;
@@ -1639,7 +1638,7 @@ public slots:
                 m_engine = std::make_unique<SubprocessEngine>(engineDesc.manifest, engineDesc.dir);
             else if (useParakeet) {
                 const ModelManager::ParakeetModelPaths p =
-                    ModelManager::parakeetModelPaths(QUrl::fromLocalFile(vaultPath));
+                    ModelManager::parakeetModelPaths();
                 m_engine = std::make_unique<ParakeetEngine>(p.encoder, p.decoder, p.joiner, p.tokens);
             } else
                 m_engine = std::make_unique<WhisperCppEngine>(modelPath);
@@ -1741,7 +1740,7 @@ public slots:
             // feature and simply doesn't apply here.
             windows.push_back({0.0, static_cast<double>(pcm->size()) / 16000.0});
         } else {
-            const QString vadModelPath = ModelManager::ensureVadModel(QUrl::fromLocalFile(vaultPath), &vadError);
+            const QString vadModelPath = ModelManager::ensureVadModel(&vadError);
             if (!vadModelPath.isEmpty()) {
                 QString chunkingError;
                 windows = VadChunker::computeWindows(*pcm, vadModelPath, &chunkingError);
@@ -1939,6 +1938,93 @@ public slots:
         emit benchmarkFinished(run);
     }
 
+    // Diarization sweep: runs each {segmentation, embedding, threshold} combo
+    // over ONE decode of the file and reports, per combo, how many speakers it
+    // found plus timing — the point being to compare which combination actually
+    // separates a hard recording. Writes nothing to the vault (same as
+    // benchmarkJob). Each combo builds a fresh DiarizationEngine (the threshold
+    // is baked in at construction, and a big embedding model shouldn't hold VRAM
+    // across combos); cancellation takes effect between combos (diarize() has no
+    // mid-pass abort hook — see runDiarizationPass()).
+    void diarizationBenchmarkJob(const QString &filePath, const QVariantList &combos)
+    {
+        resetControl();
+
+        QString decodeError;
+        auto pcm = AudioDecoder::decodeTo16kMono(filePath, &decodeError);
+        if (!pcm) {
+            emit benchmarkFailed(decodeError.isEmpty() ? QStringLiteral("audio decode failed") : decodeError);
+            return;
+        }
+        const double audioSeconds = static_cast<double>(pcm->size()) / 16000.0;
+
+        m_diarizationEngine.reset(); // don't reuse a warm engine across a sweep
+        QVariantList results;
+        QElapsedTimer totalTimer;
+        totalTimer.start();
+
+        for (int i = 0; i < combos.size(); ++i) {
+            if (isCancelRequested())
+                break;
+            const QVariantMap combo = combos.at(i).toMap();
+            const QString segId = combo.value("segmentationModelId").toString();
+            const QString embedId = combo.value("embeddingModelId").toString();
+            const double threshold = combo.value("threshold").toDouble();
+            const QString label = combo.value("label").toString();
+            emit diarizationBenchmarkComboStarted(label, i, combos.size());
+
+            QVariantMap result;
+            result["label"] = label;
+            result["segmentationModelId"] = segId;
+            result["embeddingModelId"] = embedId;
+            result["threshold"] = threshold;
+
+            QString segPath, embedPath, error;
+            if (!ModelManager::ensureDiarizationModels(segId, embedId, &segPath, &embedPath, &error)) {
+                result["ok"] = false;
+                result["error"] = error.isEmpty() ? QStringLiteral("models unavailable") : error;
+                results.append(result);
+                emit diarizationBenchmarkComboDone(result);
+                continue;
+            }
+
+            DiarizationEngine engine(segPath, embedPath, static_cast<float>(threshold));
+            if (!engine.isValid()) {
+                result["ok"] = false;
+                result["error"] = QStringLiteral("failed to load models");
+                results.append(result);
+                emit diarizationBenchmarkComboDone(result);
+                continue;
+            }
+
+            QElapsedTimer comboTimer;
+            comboTimer.start();
+            const std::vector<DiarizedTurn> turns = engine.diarize(*pcm);
+            const qint64 runtimeMs = comboTimer.elapsed();
+            int maxSpeaker = -1;
+            for (const DiarizedTurn &turn : turns)
+                maxSpeaker = std::max(maxSpeaker, turn.speaker);
+            result["ok"] = true;
+            result["speakerCount"] = maxSpeaker + 1;
+            result["turnCount"] = static_cast<int>(turns.size());
+            result["runtimeMs"] = runtimeMs;
+            result["realtimeFactor"] = runtimeMs > 0 ? audioSeconds / (runtimeMs / 1000.0) : 0.0;
+            results.append(result);
+            emit diarizationBenchmarkComboDone(result);
+        }
+        m_diarizationEngine.reset();
+
+        QVariantMap run;
+        run["file"] = filePath;
+        run["fileName"] = QFileInfo(filePath).fileName();
+        run["audioSeconds"] = audioSeconds;
+        run["totalRuntimeMs"] = static_cast<qint64>(totalTimer.elapsed());
+        run["cancelled"] = isCancelRequested();
+        run["kind"] = QStringLiteral("diarization");
+        run["results"] = results;
+        emit diarizationBenchmarkFinished(run);
+    }
+
     // "Regenerate auto-title" (item 9): re-runs JUST the labeling pass on an
     // already-transcribed file — no audio decode, no whisper, no frontmatter
     // reset. Unlike the autoLabel branch above, a failure here IS the job's
@@ -2078,7 +2164,7 @@ public slots:
         }
 
         QString labelError;
-        const QString labelModelPath = ModelManager::ensureLabelModel(QUrl::fromLocalFile(vaultPath), &labelError);
+        const QString labelModelPath = ModelManager::ensureLabelModel(&labelError);
         if (labelModelPath.isEmpty()) {
             emit finished(false, QStringLiteral("auto-label model unavailable: %1").arg(labelError));
             return;
@@ -2232,7 +2318,8 @@ public slots:
     // preserved). A failure here IS the job's result (like relabelJob()).
     // Cancel takes effect at the post-diarize checkpoint (diarization has no
     // mid-pass abort hook — see runDiarizationPass()).
-    void diarizeJob(const QString &filePath, const QString &vaultPath)
+    void diarizeJob(const QString &filePath, const QString &vaultPath, const QString &segmentationModelId,
+                    const QString &embeddingModelId, double threshold)
     {
         // Needs neither the whisper nor the label model — free them now
         // (GPU hygiene, mirrors relabelJob()'s eviction).
@@ -2283,7 +2370,9 @@ public slots:
 
         bool effective = false;
         QString diarError;
-        const std::vector<DiarizedTurn> turns = runDiarizationPass(*pcm, vaultPath, &effective, &diarError);
+        const std::vector<DiarizedTurn> turns = runDiarizationPass(
+            *pcm, vaultPath, segmentationModelId, embeddingModelId, static_cast<float>(threshold), &effective,
+            &diarError);
         // Unlike run() (where a diarization failure degrades to ASR-only),
         // detecting speakers IS this job's only purpose — so a failure here
         // is the job's result.
@@ -2380,9 +2469,8 @@ public slots:
     // QString rather than the enum itself to cross the thread boundary
     // without needing a registered Qt metatype for a controller-private
     // enum).
-    void download(const QString &vaultPath, const QString &target, const QString &modelId)
+    void download(const QString &target, const QString &modelId)
     {
-        const QUrl vaultUrl = QUrl::fromLocalFile(vaultPath);
         const ModelManager::DownloadProgressCallback onProgress = [this](qint64 done, qint64 total) {
             emit downloadProgress(done, total);
         };
@@ -2393,12 +2481,15 @@ public slots:
         QString error;
         bool ok = false;
         if (target == QStringLiteral("model")) {
-            ok = !ModelManager::ensureModel(vaultUrl, modelId, &error, nullptr, onProgress, control).isEmpty();
+            ok = !ModelManager::ensureModel(modelId, &error, nullptr, onProgress, control).isEmpty();
         } else if (target == QStringLiteral("label")) {
-            ok = !ModelManager::ensureLabelModel(vaultUrl, &error, onProgress, control).isEmpty();
-        } else if (target == QStringLiteral("diarization")) {
-            QString segPath, embedPath;
-            ok = ModelManager::ensureDiarizationModels(vaultUrl, &segPath, &embedPath, &error, onProgress, control);
+            ok = !ModelManager::ensureLabelModel(&error, onProgress, control).isEmpty();
+        } else if (target == QStringLiteral("vad")) {
+            ok = !ModelManager::ensureVadModel(&error, onProgress, control).isEmpty();
+        } else if (target == QStringLiteral("segmentation")) {
+            ok = !ModelManager::ensureSegmentationModel(modelId, &error, nullptr, onProgress, control).isEmpty();
+        } else if (target == QStringLiteral("embedding")) {
+            ok = !ModelManager::ensureEmbeddingModel(modelId, &error, nullptr, onProgress, control).isEmpty();
         }
         emit finished(ok, error);
     }
@@ -2653,6 +2744,11 @@ signals:
     void benchmarkModelDone(const QVariantMap &result);
     void benchmarkFinished(const QVariantMap &run);
     void benchmarkFailed(const QString &error);
+    // Diarization sweep (diarizationBenchmarkJob) — mirrors the model-benchmark
+    // trio; a decode failure reuses benchmarkFailed.
+    void diarizationBenchmarkComboStarted(const QString &label, int index, int total);
+    void diarizationBenchmarkComboDone(const QVariantMap &result);
+    void diarizationBenchmarkFinished(const QVariantMap &run);
 
 private:
     // Runs one model/engine for benchmarkJob() and returns its result row. Never
@@ -2683,7 +2779,7 @@ private:
             row["kind"] = QStringLiteral("parakeet");
             row["label"] = modelId;
             const ModelManager::ParakeetModelPaths p =
-                ModelManager::parakeetModelPaths(QUrl::fromLocalFile(vaultPath));
+                ModelManager::parakeetModelPaths();
             if (!p.isComplete()) {
                 row["ok"] = false;
                 row["error"] = QStringLiteral("model not downloaded");
@@ -2702,7 +2798,7 @@ private:
             QString error;
             // Only downloaded tiers are passed in, so ensureModel() resolves the
             // existing file without a network fetch.
-            const QString modelPath = ModelManager::ensureModel(QUrl::fromLocalFile(vaultPath), modelId, &error);
+            const QString modelPath = ModelManager::ensureModel(modelId, &error);
             if (modelPath.isEmpty()) {
                 row["ok"] = false;
                 row["error"] = error.isEmpty() ? QStringLiteral("model unavailable") : error;
@@ -2766,24 +2862,29 @@ private:
     // diarizeJob()'s equivalent), not instantly — a hard sherpa-onnx
     // limitation, not faked.
     std::vector<DiarizedTurn> runDiarizationPass(const std::vector<float> &pcm, const QString &vaultPath,
-                                                 bool *effectiveOut, QString *errorOut)
+                                                 const QString &segmentationModelId, const QString &embeddingModelId,
+                                                 float threshold, bool *effectiveOut, QString *errorOut)
     {
+        Q_UNUSED(vaultPath);
         *effectiveOut = false;
         errorOut->clear();
 
         emit phase(QStringLiteral("detecting-speakers"));
         QString segPath, embedPath, diarizeError;
-        if (!ModelManager::ensureDiarizationModels(QUrl::fromLocalFile(vaultPath), &segPath, &embedPath,
+        if (!ModelManager::ensureDiarizationModels(segmentationModelId, embeddingModelId, &segPath, &embedPath,
                                                     &diarizeError)) {
             *errorOut =
                 diarizeError.isEmpty() ? QStringLiteral("speaker diarization models unavailable") : diarizeError;
             return {};
         }
+        // Rebuild when the resolved paths OR the sensitivity change — the
+        // threshold is baked into the sherpa config at construction.
         if (!m_diarizationEngine || !m_diarizationEngine->isValid() || m_diarizationSegPath != segPath
-            || m_diarizationEmbedPath != embedPath) {
-            m_diarizationEngine = std::make_unique<DiarizationEngine>(segPath, embedPath);
+            || m_diarizationEmbedPath != embedPath || m_diarizationThreshold != threshold) {
+            m_diarizationEngine = std::make_unique<DiarizationEngine>(segPath, embedPath, threshold);
             m_diarizationSegPath = segPath;
             m_diarizationEmbedPath = embedPath;
+            m_diarizationThreshold = threshold;
         }
         if (!m_diarizationEngine->isValid()) {
             *errorOut = QStringLiteral("failed to load speaker diarization models");
@@ -2839,7 +2940,7 @@ private:
                          QString *errorOut = nullptr)
     {
         QString labelError;
-        const QString labelModelPath = ModelManager::ensureLabelModel(QUrl::fromLocalFile(vaultPath), &labelError);
+        const QString labelModelPath = ModelManager::ensureLabelModel(&labelError);
         if (labelModelPath.isEmpty()) {
             const QString msg = QStringLiteral("auto-label model unavailable: %1").arg(labelError);
             if (errorOut)
@@ -2904,6 +3005,10 @@ private:
     std::unique_ptr<DiarizationEngine> m_diarizationEngine;
     QString m_diarizationSegPath;
     QString m_diarizationEmbedPath;
+    // Part of the warm-engine cache key alongside the two paths — a changed
+    // sensitivity must rebuild the engine (threshold is baked into the sherpa
+    // config at construction; see DiarizationEngine::buildConfig).
+    float m_diarizationThreshold = 0.5f;
 
     std::atomic<bool> m_pauseRequested{false};
     std::atomic<bool> m_cancelRequested{false};
@@ -3048,6 +3153,12 @@ TranscriptionController::TranscriptionController(QObject *parent)
             &TranscriptionController::benchmarkModelDone);
     connect(m_worker, &TranscriptionWorker::benchmarkFinished, this, &TranscriptionController::benchmarkFinished);
     connect(m_worker, &TranscriptionWorker::benchmarkFailed, this, &TranscriptionController::benchmarkFailed);
+    connect(m_worker, &TranscriptionWorker::diarizationBenchmarkComboStarted, this,
+            &TranscriptionController::diarizationBenchmarkComboStarted);
+    connect(m_worker, &TranscriptionWorker::diarizationBenchmarkComboDone, this,
+            &TranscriptionController::diarizationBenchmarkComboDone);
+    connect(m_worker, &TranscriptionWorker::diarizationBenchmarkFinished, this,
+            &TranscriptionController::diarizationBenchmarkFinished);
     m_thread.start();
 }
 
@@ -3409,20 +3520,33 @@ void TranscriptionController::importAudio(const QUrl &sourceUrl, const QUrl &des
         startJob(insertAt);
 }
 
-void TranscriptionController::diarizeFile(const QUrl &fileUrl, const QUrl &vaultUrl)
+void TranscriptionController::diarizeFile(const QUrl &fileUrl, const QUrl &vaultUrl,
+                                          const QString &segmentationModelId, const QString &embeddingModelId,
+                                          double sensitivity)
 {
     // Same dedup rule as transcribe()/relabel(): a Queued/Active entry blocks
     // a duplicate request.
     if (isQueued(fileUrl))
         return;
 
+    // Empty id ⇒ the ModelManager default (keeps the Job's recorded ids
+    // concrete for persistence + the download dedup key).
+    const QString segId = segmentationModelId.isEmpty()
+                              ? QString::fromLatin1(ModelManager::kDefaultSegmentationModelId)
+                              : segmentationModelId;
+    const QString embedId = embeddingModelId.isEmpty()
+                                ? QString::fromLatin1(ModelManager::kDefaultEmbeddingModelId)
+                                : embeddingModelId;
+
     // Item O15: jump ahead of whatever's already Queued — see transcribe()'s
-    // frontOfQueueInsertIndex() use. The diarization models are queued as
-    // their own download job ahead of this one if not already on disk (same
-    // pattern the runAllJobs() diarize step uses).
+    // frontOfQueueInsertIndex() use. The CHOSEN segmentation + embedding models
+    // are each queued as their own download job ahead of this one if not
+    // already on disk (same pattern the runAllJobs() diarize step uses).
     int insertAt = frontOfQueueInsertIndex();
     const int startIndex = insertAt;
-    if (maybeQueueDownloadJob(DownloadTarget::DiarizationModels, vaultUrl, QString(), insertAt) >= 0)
+    if (maybeQueueDownloadJob(DownloadTarget::SegmentationModel, vaultUrl, segId, insertAt) >= 0)
+        ++insertAt;
+    if (maybeQueueDownloadJob(DownloadTarget::EmbeddingModel, vaultUrl, embedId, insertAt) >= 0)
         ++insertAt;
 
     Job job;
@@ -3430,6 +3554,9 @@ void TranscriptionController::diarizeFile(const QUrl &fileUrl, const QUrl &vault
     job.fileUrl = fileUrl;
     job.vaultUrl = vaultUrl;
     job.diarizeOnly = true;
+    job.segmentationModelId = segId;
+    job.embeddingModelId = embedId;
+    job.diarizationThreshold = sensitivity;
     job.status = JobStatus::Queued;
     m_jobs.insert(insertAt, job);
     emit queueChanged();
@@ -3438,10 +3565,12 @@ void TranscriptionController::diarizeFile(const QUrl &fileUrl, const QUrl &vault
         startJob(startIndex);
 }
 
-void TranscriptionController::diarizeFilesForPaths(const QVariantList &fileUrls, const QUrl &vaultUrl)
+void TranscriptionController::diarizeFilesForPaths(const QVariantList &fileUrls, const QUrl &vaultUrl,
+                                                   const QString &segmentationModelId,
+                                                   const QString &embeddingModelId, double sensitivity)
 {
     for (const QVariant &v : fileUrls)
-        diarizeFile(v.toUrl(), vaultUrl);
+        diarizeFile(v.toUrl(), vaultUrl, segmentationModelId, embeddingModelId, sensitivity);
 }
 
 void TranscriptionController::relabel(const QUrl &fileUrl, const QUrl &vaultUrl, bool restrictTagsToExisting,
@@ -3519,7 +3648,8 @@ void TranscriptionController::generateChaptersAll(const QVariantList &fileUrls, 
 
 void TranscriptionController::runAllJobs(const QUrl &fileUrl, const QUrl &vaultUrl, const QString &modelId,
                                           bool restrictTagsToExisting, double tagReuseBias,
-                                          double wordiness, double chapterDensity)
+                                          double wordiness, double chapterDensity, const QString &segmentationModelId,
+                                          const QString &embeddingModelId, double sensitivity)
 {
     // See this method's header doc comment for the full ordering /
     // already-transcribed-skip / dedup contract. Same Queued/Active dedup gate
@@ -3527,6 +3657,14 @@ void TranscriptionController::runAllJobs(const QUrl &fileUrl, const QUrl &vaultU
     // the inserts below (which make fileUrl "queued") can't matter.
     if (isQueued(fileUrl))
         return;
+
+    // Empty ids ⇒ ModelManager defaults (see diarizeFile()).
+    const QString segId = segmentationModelId.isEmpty()
+                              ? QString::fromLatin1(ModelManager::kDefaultSegmentationModelId)
+                              : segmentationModelId;
+    const QString embedId = embeddingModelId.isEmpty()
+                                ? QString::fromLatin1(ModelManager::kDefaultEmbeddingModelId)
+                                : embeddingModelId;
 
     // Skip the transcribe step for a file that already has a sibling .md (the
     // friendly, least-surprising "run all" on an already-done file — just
@@ -3553,7 +3691,9 @@ void TranscriptionController::runAllJobs(const QUrl &fileUrl, const QUrl &vaultU
         if (maybeQueueDownloadJob(DownloadTarget::WhisperModel, vaultUrl, modelId, insertAt) >= 0)
             ++insertAt;
     }
-    if (maybeQueueDownloadJob(DownloadTarget::DiarizationModels, vaultUrl, QString(), insertAt) >= 0)
+    if (maybeQueueDownloadJob(DownloadTarget::SegmentationModel, vaultUrl, segId, insertAt) >= 0)
+        ++insertAt;
+    if (maybeQueueDownloadJob(DownloadTarget::EmbeddingModel, vaultUrl, embedId, insertAt) >= 0)
         ++insertAt;
     if (maybeQueueDownloadJob(DownloadTarget::LabelModel, vaultUrl, QString(), insertAt) >= 0)
         ++insertAt;
@@ -3582,6 +3722,9 @@ void TranscriptionController::runAllJobs(const QUrl &fileUrl, const QUrl &vaultU
         job.fileUrl = fileUrl;
         job.vaultUrl = vaultUrl;
         job.diarizeOnly = true;
+        job.segmentationModelId = segId;
+        job.embeddingModelId = embedId;
+        job.diarizationThreshold = sensitivity;
         job.status = JobStatus::Queued;
         m_jobs.insert(insertAt, job);
         ++insertAt;
@@ -3624,11 +3767,12 @@ void TranscriptionController::runAllJobs(const QUrl &fileUrl, const QUrl &vaultU
 void TranscriptionController::runAllJobsForPaths(const QVariantList &fileUrls, const QUrl &vaultUrl,
                                                   const QString &modelId,
                                                   bool restrictTagsToExisting, double tagReuseBias, double wordiness,
-                                                  double chapterDensity)
+                                                  double chapterDensity, const QString &segmentationModelId,
+                                                  const QString &embeddingModelId, double sensitivity)
 {
     for (const QVariant &v : fileUrls)
-        runAllJobs(v.toUrl(), vaultUrl, modelId, restrictTagsToExisting, tagReuseBias, wordiness,
-                   chapterDensity);
+        runAllJobs(v.toUrl(), vaultUrl, modelId, restrictTagsToExisting, tagReuseBias, wordiness, chapterDensity,
+                   segmentationModelId, embeddingModelId, sensitivity);
 }
 
 void TranscriptionController::startJob(int index)
@@ -3701,7 +3845,9 @@ void TranscriptionController::startJob(int index)
     } else if (job.diarizeOnly) {
         QMetaObject::invokeMethod(m_worker, "diarizeJob", Qt::QueuedConnection,
                                    Q_ARG(QString, job.fileUrl.toLocalFile()),
-                                   Q_ARG(QString, job.vaultUrl.toLocalFile()));
+                                   Q_ARG(QString, job.vaultUrl.toLocalFile()),
+                                   Q_ARG(QString, job.segmentationModelId), Q_ARG(QString, job.embeddingModelId),
+                                   Q_ARG(double, job.diarizationThreshold));
     } else if (job.combineOnly) {
         QMetaObject::invokeMethod(m_worker, "combineJob", Qt::QueuedConnection,
                                    Q_ARG(QStringList, job.combineSourcePaths),
@@ -3716,11 +3862,12 @@ void TranscriptionController::startJob(int index)
         switch (job.downloadTarget) {
         case DownloadTarget::WhisperModel: target = QStringLiteral("model"); break;
         case DownloadTarget::LabelModel: target = QStringLiteral("label"); break;
-        case DownloadTarget::DiarizationModels: target = QStringLiteral("diarization"); break;
+        case DownloadTarget::VadModel: target = QStringLiteral("vad"); break;
+        case DownloadTarget::SegmentationModel: target = QStringLiteral("segmentation"); break;
+        case DownloadTarget::EmbeddingModel: target = QStringLiteral("embedding"); break;
         case DownloadTarget::None: break;
         }
-        QMetaObject::invokeMethod(m_worker, "download", Qt::QueuedConnection,
-                                   Q_ARG(QString, job.vaultUrl.toLocalFile()), Q_ARG(QString, target),
+        QMetaObject::invokeMethod(m_worker, "download", Qt::QueuedConnection, Q_ARG(QString, target),
                                    Q_ARG(QString, job.modelId));
     } else {
         QMetaObject::invokeMethod(m_worker, "run", Qt::QueuedConnection,
@@ -3762,6 +3909,10 @@ void TranscriptionController::onWorkerFinished(bool ok, const QString &error)
             // this job's final duration, shown in the Tasks popup's history
             // rows. Left unset (-1) for a Paused job — it isn't finished.
             job.durationMs = activeElapsedMs();
+            // A predownload (or lazy download) that just landed changes the
+            // set of downloaded models — let the Models page refresh.
+            if (ok && job.downloadTarget != DownloadTarget::None)
+                emit modelsChanged();
         }
     }
     m_activeIndex = -1;
@@ -4046,7 +4197,9 @@ bool TranscriptionController::isDownloadQueued(DownloadTarget target, const QUrl
 {
     for (const Job &job : m_jobs) {
         if (job.downloadTarget == target && job.vaultUrl == vaultUrl
-            && (target != DownloadTarget::WhisperModel || job.modelId == modelId)
+            && ((target != DownloadTarget::WhisperModel && target != DownloadTarget::SegmentationModel
+                 && target != DownloadTarget::EmbeddingModel)
+                || job.modelId == modelId)
             && (job.status == JobStatus::Queued || job.status == JobStatus::Active))
             return true;
     }
@@ -4068,13 +4221,19 @@ int TranscriptionController::maybeQueueDownloadJob(DownloadTarget target, const 
         // still says the unrecognized id.
         if (ModelManager::modelFileName(modelId).isEmpty())
             return -1;
-        alreadyOnDisk = ModelManager::isModelDownloaded(vaultUrl, modelId);
+        alreadyOnDisk = ModelManager::isModelDownloaded(modelId);
         break;
     case DownloadTarget::LabelModel:
-        alreadyOnDisk = ModelManager::isLabelModelDownloaded(vaultUrl);
+        alreadyOnDisk = ModelManager::isLabelModelDownloaded();
         break;
-    case DownloadTarget::DiarizationModels:
-        alreadyOnDisk = ModelManager::areDiarizationModelsDownloaded(vaultUrl);
+    case DownloadTarget::VadModel:
+        alreadyOnDisk = ModelManager::isVadModelDownloaded();
+        break;
+    case DownloadTarget::SegmentationModel:
+        alreadyOnDisk = ModelManager::isSegmentationModelDownloaded(modelId);
+        break;
+    case DownloadTarget::EmbeddingModel:
+        alreadyOnDisk = ModelManager::isEmbeddingModelDownloaded(modelId);
         break;
     case DownloadTarget::None:
         return -1;
@@ -4470,6 +4629,9 @@ void TranscriptionController::persistQueue() const
         obj["tagReuseBias"] = job.tagReuseBias;
         obj["wordiness"] = job.wordiness;
         obj["chapterDensity"] = job.chapterDensity;
+        obj["segmentationModelId"] = job.segmentationModelId;
+        obj["embeddingModelId"] = job.embeddingModelId;
+        obj["diarizationThreshold"] = job.diarizationThreshold;
         obj["oldSpeakerName"] = job.oldSpeakerName;
         obj["newSpeakerName"] = job.newSpeakerName;
         obj["sourceSpeakerName"] = job.sourceSpeakerName;
@@ -4479,7 +4641,9 @@ void TranscriptionController::persistQueue() const
         switch (job.downloadTarget) {
         case DownloadTarget::WhisperModel: obj["downloadTarget"] = QStringLiteral("model"); break;
         case DownloadTarget::LabelModel: obj["downloadTarget"] = QStringLiteral("label"); break;
-        case DownloadTarget::DiarizationModels: obj["downloadTarget"] = QStringLiteral("diarization"); break;
+        case DownloadTarget::VadModel: obj["downloadTarget"] = QStringLiteral("vad"); break;
+        case DownloadTarget::SegmentationModel: obj["downloadTarget"] = QStringLiteral("segmentation"); break;
+        case DownloadTarget::EmbeddingModel: obj["downloadTarget"] = QStringLiteral("embedding"); break;
         case DownloadTarget::None: break;
         }
         array.append(obj);
@@ -4532,8 +4696,12 @@ void TranscriptionController::loadPersistedQueue(const QUrl &vaultUrl)
                 dt = DownloadTarget::WhisperModel;
             else if (target == QStringLiteral("label"))
                 dt = DownloadTarget::LabelModel;
-            else if (target == QStringLiteral("diarization"))
-                dt = DownloadTarget::DiarizationModels;
+            else if (target == QStringLiteral("vad"))
+                dt = DownloadTarget::VadModel;
+            else if (target == QStringLiteral("segmentation"))
+                dt = DownloadTarget::SegmentationModel;
+            else if (target == QStringLiteral("embedding"))
+                dt = DownloadTarget::EmbeddingModel;
             const QUrl jobVaultUrl(obj.value("vaultUrl").toString());
             if (maybeQueueDownloadJob(dt, jobVaultUrl, obj.value("modelId").toString()) >= 0)
                 emit queueChanged();
@@ -4553,16 +4721,23 @@ void TranscriptionController::enqueueReplayedJob(const QString &kind, const QJso
         // LabelingEngine::generateChapters()'s doc comment.
         maybeQueueDownloadJob(DownloadTarget::LabelModel, jobVaultUrl, QString());
     } else if (kind == QStringLiteral("diarize")) {
-        // Item 52: a standalone diarize job needs only the diarization models,
-        // no whisper model.
-        maybeQueueDownloadJob(DownloadTarget::DiarizationModels, jobVaultUrl, QString());
+        // Item 52: a standalone diarize job needs only its chosen diarization
+        // models (segmentation + embedding), no whisper model. Empty ids ⇒
+        // defaults (an entry persisted before this became selectable).
+        const QString segId = obj.value("segmentationModelId").toString().isEmpty()
+                                  ? QString::fromLatin1(ModelManager::kDefaultSegmentationModelId)
+                                  : obj.value("segmentationModelId").toString();
+        const QString embedId = obj.value("embeddingModelId").toString().isEmpty()
+                                    ? QString::fromLatin1(ModelManager::kDefaultEmbeddingModelId)
+                                    : obj.value("embeddingModelId").toString();
+        maybeQueueDownloadJob(DownloadTarget::SegmentationModel, jobVaultUrl, segId);
+        maybeQueueDownloadJob(DownloadTarget::EmbeddingModel, jobVaultUrl, embedId);
     } else if (kind != QStringLiteral("rename") && kind != QStringLiteral("merge")
                && kind != QStringLiteral("combine")) {
-        // "transcribe"
+        // "transcribe" — pure ASR now (a fresh transcribe is speaker-less; see
+        // DESIGN.md "Speaker diarization"), so no diarization models here.
         const QString modelId = obj.value("modelId").toString();
         maybeQueueDownloadJob(DownloadTarget::WhisperModel, jobVaultUrl, modelId);
-        if (obj.value("speakerDetection").toBool())
-            maybeQueueDownloadJob(DownloadTarget::DiarizationModels, jobVaultUrl, QString());
     }
 
     Job job;
@@ -4587,6 +4762,9 @@ void TranscriptionController::enqueueReplayedJob(const QString &kind, const QJso
         job.chapterDensity = obj.value("chapterDensity").toDouble(0.5);
     } else if (kind == QStringLiteral("diarize")) {
         job.diarizeOnly = true;
+        job.segmentationModelId = obj.value("segmentationModelId").toString();
+        job.embeddingModelId = obj.value("embeddingModelId").toString();
+        job.diarizationThreshold = obj.value("diarizationThreshold").toDouble(0.5);
     } else if (kind == QStringLiteral("combine")) {
         job.combineOnly = true;
         for (const QJsonValue &v : obj.value("combineSourcePaths").toArray())
@@ -5478,10 +5656,18 @@ QVariantList TranscriptionController::jobs() const
         // name to show; modelId (or a fixed label for the other two
         // download targets, which have no modelId concept) is that name.
         entry["modelId"] = job.modelId;
+        // Diarization tuning carried by a "diarize" kind entry (empty/0.5 for
+        // every other kind) — lets the Tasks UI / tests see which models + which
+        // sensitivity a queued speaker-detection job will use.
+        entry["segmentationModelId"] = job.segmentationModelId;
+        entry["embeddingModelId"] = job.embeddingModelId;
+        entry["diarizationThreshold"] = job.diarizationThreshold;
         switch (job.downloadTarget) {
         case DownloadTarget::WhisperModel: entry["downloadTarget"] = QStringLiteral("model"); break;
         case DownloadTarget::LabelModel: entry["downloadTarget"] = QStringLiteral("label"); break;
-        case DownloadTarget::DiarizationModels: entry["downloadTarget"] = QStringLiteral("diarization"); break;
+        case DownloadTarget::VadModel: entry["downloadTarget"] = QStringLiteral("vad"); break;
+        case DownloadTarget::SegmentationModel: entry["downloadTarget"] = QStringLiteral("segmentation"); break;
+        case DownloadTarget::EmbeddingModel: entry["downloadTarget"] = QStringLiteral("embedding"); break;
         case DownloadTarget::None: entry["downloadTarget"] = QString(); break;
         }
         list.append(entry);
@@ -5567,10 +5753,179 @@ QVariantList TranscriptionController::availableModels() const
         // loadPersistedQueue(), empty/false for every entry until then) —
         // lets the model dropdown show which tiers would need a fresh
         // download vs. start immediately.
-        entry["downloaded"] = ModelManager::isModelDownloaded(m_vaultUrl, info.id);
+        entry["downloaded"] = ModelManager::isModelDownloaded(info.id);
         list.append(entry);
     }
     return list;
+}
+
+QVariantList TranscriptionController::availableSegmentationModels() const
+{
+    QVariantList list;
+    for (const ModelManager::DiarizationModelInfo &info : ModelManager::availableSegmentationModels()) {
+        QVariantMap entry;
+        entry["id"] = info.id;
+        entry["label"] = info.label;
+        entry["downloaded"] = ModelManager::isSegmentationModelDownloaded(info.id);
+        entry["nonCommercial"] = info.nonCommercial;
+        list.append(entry);
+    }
+    return list;
+}
+
+QVariantList TranscriptionController::availableEmbeddingModels() const
+{
+    QVariantList list;
+    for (const ModelManager::DiarizationModelInfo &info : ModelManager::availableEmbeddingModels()) {
+        QVariantMap entry;
+        entry["id"] = info.id;
+        entry["label"] = info.label;
+        entry["downloaded"] = ModelManager::isEmbeddingModelDownloaded(info.id);
+        entry["nonCommercial"] = info.nonCommercial;
+        list.append(entry);
+    }
+    return list;
+}
+
+namespace {
+
+// Human-readable file size for the Models page (SI-ish, matches the "~148 MB"
+// style used in the model labels).
+QString humanSize(qint64 bytes)
+{
+    if (bytes <= 0)
+        return QString();
+    const double kb = bytes / 1024.0;
+    if (kb < 1024.0)
+        return QStringLiteral("%1 KB").arg(kb, 0, 'f', 0);
+    const double mb = kb / 1024.0;
+    if (mb < 1024.0)
+        return QStringLiteral("%1 MB").arg(mb, 0, 'f', mb < 10 ? 1 : 0);
+    return QStringLiteral("%1 GB").arg(mb / 1024.0, 0, 'f', 1);
+}
+
+QVariantMap manageableEntry(const QString &id, const QString &label, const QString &kind, bool downloaded)
+{
+    QVariantMap entry;
+    entry["id"] = id;
+    entry["label"] = label;
+    entry["kind"] = kind;
+    entry["downloaded"] = downloaded;
+    entry["bundledOnly"] = ModelManager::isModelBundledOnly(id);
+    // Import shape: only the parakeet bundle comes from a FOLDER; every other
+    // model (including each single-file diarization segmentation/embedding
+    // model) from a single FILE. Lets the page pick the right native dialog.
+    entry["multiFile"] = (id == QLatin1String(ModelManager::kParakeetModelId));
+    const qint64 size = ModelManager::modelSizeOnDisk(id);
+    entry["sizeBytes"] = static_cast<double>(size);
+    entry["sizeText"] = humanSize(size);
+    return entry;
+}
+
+} // namespace
+
+QVariantList TranscriptionController::manageableModels() const
+{
+    QVariantList list;
+    // Transcription models — the dropdown tiers + parakeet.
+    for (const ModelManager::ModelInfo &info : ModelManager::availableModels()) {
+        list.append(manageableEntry(info.id, info.label, QStringLiteral("transcription"),
+                                     ModelManager::isModelDownloaded(info.id)));
+    }
+    // Support models — no dropdown entry, keyed by their pseudo-ids.
+    list.append(manageableEntry(QString::fromLatin1(ModelManager::kLabelModelId),
+                                tr("AI auto-labeling (Qwen3-4B) — ~2.5 GB"), QStringLiteral("support"),
+                                ModelManager::isLabelModelDownloaded()));
+    list.append(manageableEntry(QString::fromLatin1(ModelManager::kVadModelId),
+                                tr("Voice-activity detection (Silero VAD) — ~2 MB"), QStringLiteral("support"),
+                                ModelManager::isVadModelDownloaded()));
+    // Diarization is now a per-model set (selectable segmentation + embedding),
+    // each its own downloadable/deletable entry rather than one lumped pair.
+    for (const ModelManager::DiarizationModelInfo &info : ModelManager::availableSegmentationModels()) {
+        list.append(manageableEntry(info.id, tr("Speaker segmentation — %1").arg(info.label),
+                                    QStringLiteral("support"), ModelManager::isSegmentationModelDownloaded(info.id)));
+    }
+    for (const ModelManager::DiarizationModelInfo &info : ModelManager::availableEmbeddingModels()) {
+        list.append(manageableEntry(info.id, tr("Speaker embedding — %1").arg(info.label),
+                                    QStringLiteral("support"), ModelManager::isEmbeddingModelDownloaded(info.id)));
+    }
+    return list;
+}
+
+void TranscriptionController::downloadModel(const QString &modelId)
+{
+    DownloadTarget target = DownloadTarget::WhisperModel; // whisper tiers + parakeet
+    if (modelId == QLatin1String(ModelManager::kLabelModelId)) {
+        target = DownloadTarget::LabelModel;
+    } else if (modelId == QLatin1String(ModelManager::kVadModelId)) {
+        target = DownloadTarget::VadModel;
+    } else {
+        for (const ModelManager::DiarizationModelInfo &info : ModelManager::availableSegmentationModels()) {
+            if (info.id == modelId) {
+                target = DownloadTarget::SegmentationModel;
+                break;
+            }
+        }
+        for (const ModelManager::DiarizationModelInfo &info : ModelManager::availableEmbeddingModels()) {
+            if (info.id == modelId) {
+                target = DownloadTarget::EmbeddingModel;
+                break;
+            }
+        }
+    }
+
+    // Same queue path used lazily before a transcribe — inserted at the tail so
+    // it doesn't jump ahead of in-flight work. No-op if already downloaded or
+    // already queued (maybeQueueDownloadJob returns -1).
+    if (maybeQueueDownloadJob(target, m_vaultUrl, modelId) >= 0) {
+        emit queueChanged();
+        startNext();
+    }
+}
+
+void TranscriptionController::deleteModel(const QString &modelId)
+{
+    QString error;
+    const bool ok = ModelManager::deleteModel(modelId, &error);
+    emit modelOperationFinished(QStringLiteral("delete"), modelId, ok, error);
+    if (ok)
+        emit modelsChanged();
+}
+
+void TranscriptionController::importModel(const QString &modelId, const QUrl &sourceUrl)
+{
+    const QString sourcePath = sourceUrl.toLocalFile();
+    // Copy (possibly multi-GB) off the GUI thread — same fire-and-forget
+    // QThread pattern as loadTranscriptAsync(); result marshaled back.
+    QThread *thread = QThread::create([this, modelId, sourcePath]() {
+        QString error;
+        const bool ok = ModelManager::importModel(modelId, sourcePath, &error);
+        QMetaObject::invokeMethod(
+            this,
+            [this, modelId, ok, error]() {
+                emit modelOperationFinished(QStringLiteral("import"), modelId, ok, error);
+                if (ok)
+                    emit modelsChanged();
+            },
+            Qt::QueuedConnection);
+    });
+    connect(thread, &QThread::finished, thread, &QObject::deleteLater);
+    thread->start();
+}
+
+void TranscriptionController::exportModel(const QString &modelId, const QUrl &destDirUrl)
+{
+    const QString destDir = destDirUrl.toLocalFile();
+    QThread *thread = QThread::create([this, modelId, destDir]() {
+        QString error;
+        const bool ok = ModelManager::exportModel(modelId, destDir, &error);
+        QMetaObject::invokeMethod(
+            this,
+            [this, modelId, ok, error]() { emit modelOperationFinished(QStringLiteral("export"), modelId, ok, error); },
+            Qt::QueuedConnection);
+    });
+    connect(thread, &QThread::finished, thread, &QObject::deleteLater);
+    thread->start();
 }
 
 void TranscriptionController::runBenchmark(const QUrl &fileUrl, const QStringList &modelIds)
@@ -5582,6 +5937,14 @@ void TranscriptionController::runBenchmark(const QUrl &fileUrl, const QStringLis
     QMetaObject::invokeMethod(m_worker, "benchmarkJob", Qt::QueuedConnection,
                               Q_ARG(QString, fileUrl.toLocalFile()), Q_ARG(QString, m_vaultUrl.toLocalFile()),
                               Q_ARG(QStringList, modelIds));
+}
+
+void TranscriptionController::runDiarizationBenchmark(const QUrl &fileUrl, const QVariantList &combos)
+{
+    // Same worker/serialization/cancel story as runBenchmark(); no queue entry,
+    // no file writes. Results arrive via the diarizationBenchmark* signals.
+    QMetaObject::invokeMethod(m_worker, "diarizationBenchmarkJob", Qt::QueuedConnection,
+                              Q_ARG(QString, fileUrl.toLocalFile()), Q_ARG(QVariantList, combos));
 }
 
 void TranscriptionController::cancelBenchmark()
@@ -5604,7 +5967,7 @@ QVariantList TranscriptionController::availableEngines() const
         // "downloaded" mirrors the model dropdown's own flag so the UI can
         // reuse the same treatment; for an engine it's specifically whether the
         // engine's model file is present for this vault.
-        entry["downloaded"] = ModelManager::isEngineModelPresent(m_vaultUrl, desc.id);
+        entry["downloaded"] = ModelManager::isEngineModelPresent(desc.id);
         list.append(entry);
     }
     return list;

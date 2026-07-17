@@ -907,6 +907,34 @@ private slots:
                  "(outside the paged content) so they stay reachable from every page (item 38)");
     }
 
+    // Settings → Models page: a dedicated "Models" nav page (ModelsPage.qml)
+    // must exist, mounted by SettingsPopup, wiring the model-management
+    // invokables (manageableModels / downloadModel / deleteModel / importModel
+    // / exportModel). No QQuickView here to click the page, so this is a
+    // source-scan guard that the page and its controller wiring all exist.
+    void settingsPopup_hasModelsManagementPage()
+    {
+        const QString settings = readAll(QStringLiteral(SUOP_QML_DIR "/SettingsPopup.qml"));
+        QVERIFY2(settings.contains(QStringLiteral("ModelsPage")),
+                 "SettingsPopup must mount the ModelsPage component");
+        QVERIFY2(settings.contains(QStringLiteral("qsTr(\"Models\")")),
+                 "the settings nav rail must include a \"Models\" page");
+
+        const QString page = readAll(QStringLiteral(SUOP_QML_DIR "/ModelsPage.qml"));
+        QVERIFY2(!page.isEmpty(), "qml/ModelsPage.qml must exist");
+        for (const char *invokable :
+             {"manageableModels(", "downloadModel(", "deleteModel(", "importModel(", "exportModel("}) {
+            QVERIFY2(page.contains(QString::fromLatin1(invokable)),
+                     qPrintable(QStringLiteral("ModelsPage must call transcriptionController.%1")
+                                    .arg(QString::fromLatin1(invokable))));
+        }
+        // Delete of a downloaded model is permanent (re-downloadable, not user
+        // content) — it must be confirmed (a model delete is one of the few
+        // deletes that IS prompted; see StyleGuide "Destructive actions").
+        QVERIFY2(page.contains(QStringLiteral("deleteConfirmPopup")),
+                 "deleting a model must go through a confirmation popup");
+    }
+
     // Item 40 (folder management): Sidebar.qml must expose a right-click
     // context menu that creates + deletes folders and moves a file into
     // another folder, wired to the new VaultTreeModel invokables

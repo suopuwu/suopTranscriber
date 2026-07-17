@@ -1722,6 +1722,7 @@ Rectangle {
             // drag across the whole tree.
             Item {
                 id: selectAllButton
+                objectName: "selectAllButton"
                 Layout.preferredWidth: 22
                 Layout.preferredHeight: 22
                 enabled: sidebar.visibleNotePaths().length > 0
@@ -1756,6 +1757,7 @@ Rectangle {
             // (e.g. sortModeMenu's Popup border below).
             Rectangle {
                 id: ribbonDivider
+                objectName: "ribbonDivider"
                 Layout.preferredWidth: 1
                 Layout.preferredHeight: 18
                 Layout.alignment: Qt.AlignVCenter
@@ -1764,6 +1766,7 @@ Rectangle {
 
             Item {
                 id: transcribeAllButton
+                objectName: "transcribeAllButton"
                 Layout.preferredWidth: 22
                 Layout.preferredHeight: 22
                 // Item 3 (reworked): the ribbon always narrows to the
@@ -1915,7 +1918,10 @@ Rectangle {
                     onTapped: {
                         const paths = sidebar.bulkTargetPaths(sidebar.transcribedPaths)
                         const urls = paths.map((p) => "file://" + p)
-                        sidebar.transcriptionController.diarizeFilesForPaths(urls, sidebar.vaultPath)
+                        sidebar.transcriptionController.diarizeFilesForPaths(urls, sidebar.vaultPath,
+                                                                            AppSettings.diarizationSegmentationModel,
+                                                                            AppSettings.diarizationEmbeddingModel,
+                                                                            AppSettings.diarizationSensitivity)
                     }
                 }
                 HoverBorder {
@@ -1964,7 +1970,10 @@ Rectangle {
                                                                             AppSettings.restrictTagsToExisting,
                                                                             AppSettings.tagReuseBias,
                                                                             AppSettings.wordiness,
-                                                                            AppSettings.chapterDensity)
+                                                                            AppSettings.chapterDensity,
+                                                                            AppSettings.diarizationSegmentationModel,
+                                                                            AppSettings.diarizationEmbeddingModel,
+                                                                            AppSettings.diarizationSensitivity)
                     }
                 }
                 HoverBorder {
@@ -2669,7 +2678,10 @@ Rectangle {
                     onTapped: {
                         const paths = sidebar.searchDetectSpeakersPaths()
                         const urls = paths.map((p) => "file://" + p)
-                        sidebar.transcriptionController.diarizeFilesForPaths(urls, sidebar.vaultPath)
+                        sidebar.transcriptionController.diarizeFilesForPaths(urls, sidebar.vaultPath,
+                                                                            AppSettings.diarizationSegmentationModel,
+                                                                            AppSettings.diarizationEmbeddingModel,
+                                                                            AppSettings.diarizationSensitivity)
                     }
                 }
                 HoverBorder {
@@ -2715,7 +2727,10 @@ Rectangle {
                                                                             AppSettings.restrictTagsToExisting,
                                                                             AppSettings.tagReuseBias,
                                                                             AppSettings.wordiness,
-                                                                            AppSettings.chapterDensity)
+                                                                            AppSettings.chapterDensity,
+                                                                            AppSettings.diarizationSegmentationModel,
+                                                                            AppSettings.diarizationEmbeddingModel,
+                                                                            AppSettings.diarizationSensitivity)
                     }
                 }
                 HoverBorder {

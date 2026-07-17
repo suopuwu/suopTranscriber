@@ -1,11 +1,13 @@
 #include "ModelManager.h"
 
+#include <QCoreApplication>
 #include <QDebug>
 #include <QDir>
 #include <QElapsedTimer>
 #include <QFile>
 #include <QFileInfo>
 #include <QProcess>
+#include <QStandardPaths>
 #include <QThread>
 
 #include <csignal>
@@ -31,19 +33,20 @@ constexpr auto kParakeetTokensFile = "tokens.txt";
 const std::vector<ModelInfo> &availableModels()
 {
     static const std::vector<ModelInfo> models = {
-        {"tiny.en", "ggml-tiny.en.bin", "Tiny (English) — ~75 MB, fastest"},
-        {"base.en", "ggml-base.en.bin", "Base (English) — ~148 MB, balanced"},
-        {"small.en", "ggml-small.en.bin", "Small (English) — ~488 MB, more accurate"},
-        {"medium.en", "ggml-medium.en.bin", "Medium (English) — ~1.5 GB, most accurate"},
+        {"tiny.en", "ggml-tiny.en.bin", "Tiny (English) — ~75 MB"},
+        {"base.en", "ggml-base.en.bin", "Base (English) — ~148 MB"},
+        {"small.en", "ggml-small.en.bin", "Small (English) — ~488 MB"},
+        {"medium.en", "ggml-medium.en.bin", "Medium (English) — ~1.5 GB"},
         // No English-only "large" ggml model exists upstream — large-v3 is
         // multilingual-only, so (unlike the four entries above) this one
         // must not claim "(English)".
-        {"large-v3", "ggml-large-v3.bin", "Large (multilingual, most accurate) — ~3.1 GB"},
+        {"large-v3", "ggml-large-v3.bin", "Large (multilingual) — ~3.1 GB"},
         // In-process NeMo Parakeet-TDT via sherpa-onnx (see ParakeetEngine).
         // fileName is the extracted bundle DIRECTORY (not a single ggml file) —
         // modelFileName()/isModelDownloaded()/ensureModel() special-case this id.
         {kParakeetModelId, kParakeetBundleDirName,
-         "Parakeet TDT 0.6B v2 (English, NVIDIA) — ~630 MB, fast + accurate"},
+         "Parakeet TDT 0.6B v2 (English, NVIDIA) — ~630 MB, fast + accurate, "
+         "avoids whisper's repetition hallucinations"},
     };
     return models;
 }
@@ -57,14 +60,51 @@ QString modelFileName(const QString &modelId)
     return {};
 }
 
-namespace {
-
-QDir modelsDirFor(const QUrl &vaultPath)
+QString modelsStoreDir()
 {
-    return QDir(vaultPath.toLocalFile() + "/.transcriber/models");
+    const QString override = qEnvironmentVariable("SUOP_MODELS_DIR");
+    if (!override.isEmpty())
+        return override;
+    return QStandardPaths::writableLocation(QStandardPaths::GenericDataLocation)
+        + QStringLiteral("/suopTranscriber/models");
 }
 
-// The single model file this app downloads into the vault for a given
+QString bundledModelsDir()
+{
+    const QString override = qEnvironmentVariable("SUOP_BUNDLED_MODELS_DIR");
+    if (!override.isEmpty())
+        return override;
+    return QCoreApplication::applicationDirPath() + QStringLiteral("/models");
+}
+
+namespace {
+
+QDir storeDir()
+{
+    return QDir(modelsStoreDir());
+}
+
+QDir bundledDir()
+{
+    return QDir(bundledModelsDir());
+}
+
+// Resolves a single model file to an existing absolute path, searching the
+// writable store first, then the read-only bundled dir. Empty if the file is
+// in neither (never downloads). This is the store-first-then-bundled rule that
+// every presence check / path lookup goes through.
+QString resolveModelFile(const QString &fileName)
+{
+    const QString storePath = storeDir().filePath(fileName);
+    if (QFileInfo::exists(storePath))
+        return storePath;
+    const QString bundledPath = bundledDir().filePath(fileName);
+    if (QFileInfo::exists(bundledPath))
+        return bundledPath;
+    return {};
+}
+
+// The single model file this app downloads into the store for a given
 // out-of-process engine, or empty if the engine's model is managed externally
 // by its own runtime. Parakeet is deliberately absent: NeMo's from_pretrained()
 // fetches and caches its own weights (the HF cache), so Parakeet's availability
@@ -84,15 +124,28 @@ bool isParakeetModelId(const QString &modelId)
     return modelId == QLatin1String(kParakeetModelId);
 }
 
-ParakeetModelPaths parakeetModelPaths(const QUrl &vaultPath)
+namespace {
+ParakeetModelPaths parakeetPathsIn(const QDir &modelsBase)
 {
-    const QDir bundle(modelsDirFor(vaultPath).filePath(QString::fromLatin1(kParakeetBundleDirName)));
+    const QDir bundle(modelsBase.filePath(QString::fromLatin1(kParakeetBundleDirName)));
     ParakeetModelPaths paths;
     paths.encoder = bundle.filePath(QString::fromLatin1(kParakeetEncoderFile));
     paths.decoder = bundle.filePath(QString::fromLatin1(kParakeetDecoderFile));
     paths.joiner = bundle.filePath(QString::fromLatin1(kParakeetJoinerFile));
     paths.tokens = bundle.filePath(QString::fromLatin1(kParakeetTokensFile));
     return paths;
+}
+} // namespace
+
+ParakeetModelPaths parakeetModelPaths()
+{
+    const ParakeetModelPaths store = parakeetPathsIn(storeDir());
+    if (store.isComplete())
+        return store;
+    const ParakeetModelPaths bundled = parakeetPathsIn(bundledDir());
+    if (bundled.isComplete())
+        return bundled;
+    return store; // neither complete — return the writable-store download target
 }
 
 bool ParakeetModelPaths::isComplete() const
@@ -101,41 +154,120 @@ bool ParakeetModelPaths::isComplete() const
         && QFileInfo::exists(tokens);
 }
 
-bool isModelDownloaded(const QUrl &vaultPath, const QString &modelId)
+bool isModelDownloaded(const QString &modelId)
 {
     // The Parakeet bundle is a directory of ONNX files, not a single file —
     // "downloaded" means all four are present (a half-extracted dir is not).
     if (isParakeetModelId(modelId))
-        return parakeetModelPaths(vaultPath).isComplete();
+        return parakeetModelPaths().isComplete();
     const QString fileName = modelFileName(modelId);
-    return !fileName.isEmpty() && QFileInfo::exists(modelsDirFor(vaultPath).filePath(fileName));
+    return !fileName.isEmpty() && !resolveModelFile(fileName).isEmpty();
 }
 
-bool isLabelModelDownloaded(const QUrl &vaultPath)
+bool isLabelModelDownloaded()
 {
-    return QFileInfo::exists(modelsDirFor(vaultPath).filePath(QString(kLabelModelFileName)));
+    return !resolveModelFile(QString(kLabelModelFileName)).isEmpty();
 }
 
-bool areDiarizationModelsDownloaded(const QUrl &vaultPath)
+bool areDiarizationModelsDownloaded()
 {
-    const QDir dir = modelsDirFor(vaultPath);
-    return QFileInfo::exists(dir.filePath(QString(kDiarizationSegmentationFileName)))
-        && QFileInfo::exists(dir.filePath(QString(kDiarizationEmbeddingFileName)));
+    return !resolveModelFile(QString(kDiarizationSegmentationFileName)).isEmpty()
+        && !resolveModelFile(QString(kDiarizationEmbeddingFileName)).isEmpty();
 }
 
-bool isEngineModelPresent(const QUrl &vaultPath, const QString &engineId)
+const std::vector<DiarizationModelInfo> &availableSegmentationModels()
+{
+    static const std::vector<DiarizationModelInfo> models = {
+        {kDefaultSegmentationModelId, kDiarizationSegmentationFileName, "pyannote 3.0 (default, MIT)",
+         "https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-segmentation-models/"
+         "sherpa-onnx-pyannote-segmentation-3-0.tar.bz2",
+         "sherpa-onnx-pyannote-segmentation-3-0/model.int8.onnx", false},
+        {"reverb-diarization-v1", "reverb-diarization-v1-int8.onnx", "Reverb v1 (Rev.ai — non-commercial)",
+         "https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-segmentation-models/"
+         "sherpa-onnx-reverb-diarization-v1.tar.bz2",
+         "sherpa-onnx-reverb-diarization-v1/model.int8.onnx", true},
+    };
+    return models;
+}
+
+const std::vector<DiarizationModelInfo> &availableEmbeddingModels()
+{
+    static const std::vector<DiarizationModelInfo> models = {
+        {kDefaultEmbeddingModelId, kDiarizationEmbeddingFileName, "WeSpeaker ResNet293-LM (default, ~115 MB)",
+         "https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-recongition-models/"
+         "wespeaker_en_voxceleb_resnet293_LM.onnx",
+         QString(), false},
+        {"3dspeaker-campplus-en", "3dspeaker-campplus-en.onnx", "3D-Speaker CAM++ (~28 MB, fast)",
+         "https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-recongition-models/"
+         "3dspeaker_speech_campplus_sv_en_voxceleb_16k.onnx",
+         QString(), false},
+        {"nemo-titanet-large", "nemo-titanet-large.onnx", "NVIDIA NeMo TitaNet-large (~100 MB)",
+         "https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-recongition-models/"
+         "nemo_en_titanet_large.onnx",
+         QString(), false},
+    };
+    return models;
+}
+
+namespace {
+// Catalog lookup with default-substitution (the default is always the first
+// entry). Sets *usedFallback true iff id was unrecognized — the caller records
+// it (never silently misrepresent which model ran; see ensureModel()).
+const DiarizationModelInfo &resolveDiarizationModel(const std::vector<DiarizationModelInfo> &catalog,
+                                                    const QString &id, bool *usedFallback)
+{
+    if (usedFallback)
+        *usedFallback = false;
+    for (const DiarizationModelInfo &info : catalog) {
+        if (info.id == id)
+            return info;
+    }
+    qWarning() << "ModelManager: unrecognized diarization model id" << id << "— falling back to"
+               << catalog.front().id;
+    if (usedFallback)
+        *usedFallback = true;
+    return catalog.front();
+}
+} // namespace
+
+const DiarizationModelInfo &segmentationModelInfo(const QString &id, bool *usedFallback)
+{
+    return resolveDiarizationModel(availableSegmentationModels(), id, usedFallback);
+}
+
+const DiarizationModelInfo &embeddingModelInfo(const QString &id, bool *usedFallback)
+{
+    return resolveDiarizationModel(availableEmbeddingModels(), id, usedFallback);
+}
+
+bool isSegmentationModelDownloaded(const QString &id)
+{
+    return !resolveModelFile(segmentationModelInfo(id).fileName).isEmpty();
+}
+
+bool isEmbeddingModelDownloaded(const QString &id)
+{
+    return !resolveModelFile(embeddingModelInfo(id).fileName).isEmpty();
+}
+
+bool areDiarizationModelsDownloaded(const QString &segmentationModelId, const QString &embeddingModelId)
+{
+    return isSegmentationModelDownloaded(segmentationModelId) && isEmbeddingModelDownloaded(embeddingModelId);
+}
+
+bool isEngineModelPresent(const QString &engineId)
 {
     const QString fileName = engineModelFileName(engineId);
     // No app-managed file for this engine ⇒ its model is externally managed
     // (e.g. NeMo/HF cache), so it never gates availability here.
     if (fileName.isEmpty())
         return true;
-    return QFileInfo::exists(modelsDirFor(vaultPath).filePath(fileName));
+    return !resolveModelFile(fileName).isEmpty();
 }
 
-bool isVadModelDownloaded(const QUrl &vaultPath)
+bool isVadModelDownloaded()
 {
-    return QFileInfo::exists(modelsDirFor(vaultPath).filePath(QString(kVadModelFileName)));
+    return !resolveModelFile(QString(kVadModelFileName)).isEmpty();
 }
 
 namespace {
@@ -163,7 +295,7 @@ qint64 probeContentLength(const QString &url)
 }
 
 // Shared by ensureModel()/ensureLabelModel(): download url to
-// <vault>/.transcriber/models/<fileName> via curl to a .part file, then
+// <modelsDir>/<fileName> via curl to a .part file, then
 // rename into place. Returns the final path, or empty on failure (errorOut
 // set if given). Assumes modelsDir already exists.
 //
@@ -326,26 +458,30 @@ QString downloadAndExtractBundle(const QDir &modelsDir, const QString &destDirNa
 
 }
 
-QString ensureModel(const QUrl &vaultPath, const QString &modelId, QString *errorOut, bool *usedFallback,
+QString ensureModel(const QString &modelId, QString *errorOut, bool *usedFallback,
                      const DownloadProgressCallback &onProgress, const DownloadControl &control)
 {
     if (usedFallback)
         *usedFallback = false;
 
-    // Parakeet is a multi-file ONNX bundle, not a single ggml file — download/
-    // extract it and return the bundle DIRECTORY (the caller resolves the four
-    // files via parakeetModelPaths()). Never falls back to a whisper default:
-    // an explicit Parakeet request must fail loudly if the bundle can't be had.
+    // Parakeet is a multi-file ONNX bundle, not a single ggml file — return the
+    // bundle DIRECTORY (the caller resolves the four files via
+    // parakeetModelPaths()). If a complete bundle already exists (store OR
+    // bundled), use it as-is; otherwise download/extract into the writable
+    // store. Never falls back to a whisper default: an explicit Parakeet
+    // request must fail loudly if the bundle can't be had.
     if (isParakeetModelId(modelId)) {
+        const ParakeetModelPaths resolved = parakeetModelPaths();
+        if (resolved.isComplete())
+            return QFileInfo(resolved.encoder).absolutePath(); // the bundle dir
         return downloadAndExtractBundle(
-            modelsDirFor(vaultPath), QString::fromLatin1(kParakeetBundleDirName),
+            storeDir(), QString::fromLatin1(kParakeetBundleDirName),
             QString::fromLatin1(kParakeetArchiveUrl),
             {QString::fromLatin1(kParakeetEncoderFile), QString::fromLatin1(kParakeetDecoderFile),
              QString::fromLatin1(kParakeetJoinerFile), QString::fromLatin1(kParakeetTokensFile)},
             errorOut, onProgress, control);
     }
 
-    const QDir modelsDir = modelsDirFor(vaultPath);
     QString modelName = modelFileName(modelId);
     if (modelName.isEmpty()) {
         // modelId isn't in availableModels() — never silently pretend the
@@ -356,11 +492,15 @@ QString ensureModel(const QUrl &vaultPath, const QString &modelId, QString *erro
         if (usedFallback)
             *usedFallback = true;
     }
-    const QString modelPath = modelsDir.filePath(modelName);
 
-    if (QFileInfo::exists(modelPath))
-        return modelPath;
+    // Already present in the store or shipped in the bundled dir — use it,
+    // never re-download (a bundled model is read-only, loaded straight from
+    // there).
+    const QString existing = resolveModelFile(modelName);
+    if (!existing.isEmpty())
+        return existing;
 
+    const QDir modelsDir = storeDir();
     if (!modelsDir.mkpath(".")) {
         if (errorOut)
             *errorOut = QStringLiteral("could not create %1").arg(modelsDir.path());
@@ -371,15 +511,14 @@ QString ensureModel(const QUrl &vaultPath, const QString &modelId, QString *erro
     return downloadToModelsDir(modelsDir, modelName, repoUrl.arg(modelName), errorOut, onProgress, control);
 }
 
-QString ensureLabelModel(const QUrl &vaultPath, QString *errorOut, const DownloadProgressCallback &onProgress,
+QString ensureLabelModel(QString *errorOut, const DownloadProgressCallback &onProgress,
                           const DownloadControl &control)
 {
-    const QDir modelsDir = modelsDirFor(vaultPath);
-    const QString modelPath = modelsDir.filePath(QString(kLabelModelFileName));
+    const QString existing = resolveModelFile(QString(kLabelModelFileName));
+    if (!existing.isEmpty())
+        return existing;
 
-    if (QFileInfo::exists(modelPath))
-        return modelPath;
-
+    const QDir modelsDir = storeDir();
     if (!modelsDir.mkpath(".")) {
         if (errorOut)
             *errorOut = QStringLiteral("could not create %1").arg(modelsDir.path());
@@ -391,15 +530,14 @@ QString ensureLabelModel(const QUrl &vaultPath, QString *errorOut, const Downloa
     return downloadToModelsDir(modelsDir, QString(kLabelModelFileName), url, errorOut, onProgress, control);
 }
 
-QString ensureVadModel(const QUrl &vaultPath, QString *errorOut, const DownloadProgressCallback &onProgress,
+QString ensureVadModel(QString *errorOut, const DownloadProgressCallback &onProgress,
                         const DownloadControl &control)
 {
-    const QDir modelsDir = modelsDirFor(vaultPath);
-    const QString modelPath = modelsDir.filePath(QString(kVadModelFileName));
+    const QString existing = resolveModelFile(QString(kVadModelFileName));
+    if (!existing.isEmpty())
+        return existing;
 
-    if (QFileInfo::exists(modelPath))
-        return modelPath;
-
+    const QDir modelsDir = storeDir();
     if (!modelsDir.mkpath(".")) {
         if (errorOut)
             *errorOut = QStringLiteral("could not create %1").arg(modelsDir.path());
@@ -411,59 +549,336 @@ QString ensureVadModel(const QUrl &vaultPath, QString *errorOut, const DownloadP
     return downloadToModelsDir(modelsDir, QString(kVadModelFileName), url, errorOut, onProgress, control);
 }
 
-bool ensureDiarizationModels(const QUrl &vaultPath, QString *segmentationPathOut, QString *embeddingPathOut,
-                              QString *errorOut, const DownloadProgressCallback &onProgress,
-                              const DownloadControl &control)
+namespace {
+// Ensure one diarization sub-model (a direct .onnx or a tar.bz2-extracted file)
+// is in the store, downloading if missing; returns its path or empty (errorOut
+// set). Resolves store-first-then-bundled and never re-downloads. See
+// downloadAndExtractFromTarBz2()'s doc comment for why a segmentation model
+// MUST come from sherpa-onnx's own archive (baked-in ONNX metadata).
+QString ensureDiarizationSubmodel(const DiarizationModelInfo &info, QString *errorOut,
+                                  const DownloadProgressCallback &onProgress, const DownloadControl &control)
 {
-    const QDir modelsDir = modelsDirFor(vaultPath);
+    const QString existing = resolveModelFile(info.fileName);
+    if (!existing.isEmpty())
+        return existing;
 
-    const QString segmentationPath = modelsDir.filePath(QString(kDiarizationSegmentationFileName));
-    const QString embeddingPath = modelsDir.filePath(QString(kDiarizationEmbeddingFileName));
-
-    if (QFileInfo::exists(segmentationPath) && QFileInfo::exists(embeddingPath)) {
-        if (segmentationPathOut)
-            *segmentationPathOut = segmentationPath;
-        if (embeddingPathOut)
-            *embeddingPathOut = embeddingPath;
-        return true;
-    }
-
+    const QDir modelsDir = storeDir();
     if (!modelsDir.mkpath(".")) {
         if (errorOut)
             *errorOut = QStringLiteral("could not create %1").arg(modelsDir.path());
+        return {};
+    }
+    if (!info.archiveInnerPath.isEmpty())
+        return downloadAndExtractFromTarBz2(modelsDir, info.fileName, info.url, info.archiveInnerPath, errorOut,
+                                            onProgress, control);
+    return downloadToModelsDir(modelsDir, info.fileName, info.url, errorOut, onProgress, control);
+}
+} // namespace
+
+QString ensureSegmentationModel(const QString &id, QString *errorOut, bool *usedFallback,
+                                const DownloadProgressCallback &onProgress, const DownloadControl &control)
+{
+    return ensureDiarizationSubmodel(segmentationModelInfo(id, usedFallback), errorOut, onProgress, control);
+}
+
+QString ensureEmbeddingModel(const QString &id, QString *errorOut, bool *usedFallback,
+                             const DownloadProgressCallback &onProgress, const DownloadControl &control)
+{
+    return ensureDiarizationSubmodel(embeddingModelInfo(id, usedFallback), errorOut, onProgress, control);
+}
+
+bool ensureDiarizationModels(const QString &segmentationModelId, const QString &embeddingModelId,
+                             QString *segmentationPathOut, QString *embeddingPathOut, QString *errorOut,
+                             bool *usedFallback, const DownloadProgressCallback &onProgress,
+                             const DownloadControl &control)
+{
+    if (usedFallback)
+        *usedFallback = false;
+    bool segFallback = false;
+    bool embedFallback = false;
+    const QString segPath = ensureSegmentationModel(segmentationModelId, errorOut, &segFallback, onProgress, control);
+    if (segPath.isEmpty())
+        return false;
+    const QString embedPath = ensureEmbeddingModel(embeddingModelId, errorOut, &embedFallback, onProgress, control);
+    if (embedPath.isEmpty())
+        return false;
+    if (usedFallback)
+        *usedFallback = segFallback || embedFallback;
+    if (segmentationPathOut)
+        *segmentationPathOut = segPath;
+    if (embeddingPathOut)
+        *embeddingPathOut = embedPath;
+    return true;
+}
+
+namespace {
+
+// The canonical on-disk shape of a manageable model id (whisper tier /
+// parakeet / one of the support pseudo-ids). bundleDirName is non-empty only
+// for the parakeet bundle; fileNames are the canonical file names (flat in the
+// store, or inside the bundle dir for parakeet). valid=false ⇒ unknown id.
+struct ModelLayout {
+    bool valid = false;
+    QString bundleDirName;
+    QStringList fileNames;
+};
+
+ModelLayout modelLayout(const QString &id)
+{
+    ModelLayout layout;
+    if (isParakeetModelId(id)) {
+        layout.valid = true;
+        layout.bundleDirName = QString::fromLatin1(kParakeetBundleDirName);
+        layout.fileNames = {QString::fromLatin1(kParakeetEncoderFile), QString::fromLatin1(kParakeetDecoderFile),
+                            QString::fromLatin1(kParakeetJoinerFile), QString::fromLatin1(kParakeetTokensFile)};
+        return layout;
+    }
+    if (id == QLatin1String(kLabelModelId)) {
+        layout.valid = true;
+        layout.fileNames = {QString(kLabelModelFileName)};
+        return layout;
+    }
+    if (id == QLatin1String(kVadModelId)) {
+        layout.valid = true;
+        layout.fileNames = {QString(kVadModelFileName)};
+        return layout;
+    }
+    // Each selectable diarization sub-model is its own single-file manageable
+    // id (download/delete/size/import/export), keyed by its catalog id.
+    for (const DiarizationModelInfo &info : availableSegmentationModels()) {
+        if (info.id == id) {
+            layout.valid = true;
+            layout.fileNames = {info.fileName};
+            return layout;
+        }
+    }
+    for (const DiarizationModelInfo &info : availableEmbeddingModels()) {
+        if (info.id == id) {
+            layout.valid = true;
+            layout.fileNames = {info.fileName};
+            return layout;
+        }
+    }
+    const QString fileName = modelFileName(id); // whisper tier (empty ⇒ unknown)
+    if (!fileName.isEmpty()) {
+        layout.valid = true;
+        layout.fileNames = {fileName};
+    }
+    return layout;
+}
+
+} // namespace
+
+qint64 modelSizeOnDisk(const QString &id)
+{
+    const ModelLayout layout = modelLayout(id);
+    if (!layout.valid)
+        return 0;
+    qint64 total = 0;
+    if (!layout.bundleDirName.isEmpty()) {
+        const ParakeetModelPaths p = parakeetModelPaths();
+        for (const QString &f : {p.encoder, p.decoder, p.joiner, p.tokens}) {
+            const QFileInfo fi(f);
+            if (fi.exists())
+                total += fi.size();
+        }
+        return total;
+    }
+    for (const QString &fileName : layout.fileNames) {
+        const QString path = resolveModelFile(fileName);
+        if (!path.isEmpty())
+            total += QFileInfo(path).size();
+    }
+    return total;
+}
+
+bool isModelBundledOnly(const QString &id)
+{
+    const ModelLayout layout = modelLayout(id);
+    if (!layout.valid)
+        return false;
+    if (!layout.bundleDirName.isEmpty()) {
+        const bool present = parakeetModelPaths().isComplete();
+        const bool inStore = parakeetPathsIn(storeDir()).isComplete();
+        return present && !inStore;
+    }
+    bool anyResolved = false;
+    bool anyInStore = false;
+    for (const QString &fileName : layout.fileNames) {
+        if (!resolveModelFile(fileName).isEmpty())
+            anyResolved = true;
+        if (QFileInfo::exists(storeDir().filePath(fileName)))
+            anyInStore = true;
+    }
+    return anyResolved && !anyInStore;
+}
+
+bool deleteModel(const QString &id, QString *errorOut)
+{
+    const ModelLayout layout = modelLayout(id);
+    if (!layout.valid) {
+        if (errorOut)
+            *errorOut = QStringLiteral("unknown model id: %1").arg(id);
         return false;
     }
-
-    // Remote file names/layouts differ from the local names above (upstream
-    // repos ship several variants each; these are the specific ones this
-    // app uses).
-    if (!QFileInfo::exists(segmentationPath)) {
-        const QString archiveUrl = QStringLiteral(
-            "https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-segmentation-models/"
-            "sherpa-onnx-pyannote-segmentation-3-0.tar.bz2");
-        // See kDiarizationSegmentationFileName's doc comment (ModelManager.h)
-        // for why this is the int8-quantized export, not model.onnx.
-        if (downloadAndExtractFromTarBz2(modelsDir, QString(kDiarizationSegmentationFileName), archiveUrl,
-                                          QStringLiteral("sherpa-onnx-pyannote-segmentation-3-0/model.int8.onnx"),
-                                          errorOut, onProgress, control)
-                .isEmpty())
+    const QDir store = storeDir();
+    if (!layout.bundleDirName.isEmpty()) {
+        QDir bundle(store.filePath(layout.bundleDirName));
+        if (!bundle.exists()) {
+            if (errorOut)
+                *errorOut = QStringLiteral("not present in the model store");
             return false;
-    }
-    if (!QFileInfo::exists(embeddingPath)) {
-        // See kDiarizationEmbeddingFileName's doc comment (ModelManager.h)
-        // for why this is WeSpeaker's ResNet293-LM rather than CAM++.
-        const QString url = QStringLiteral(
-            "https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-recongition-models/"
-            "wespeaker_en_voxceleb_resnet293_LM.onnx");
-        if (downloadToModelsDir(modelsDir, QString(kDiarizationEmbeddingFileName), url, errorOut, onProgress, control)
-                .isEmpty())
+        }
+        if (!bundle.removeRecursively()) {
+            if (errorOut)
+                *errorOut = QStringLiteral("could not remove %1").arg(bundle.path());
             return false;
+        }
+        return true;
+    }
+    bool removedAny = false;
+    for (const QString &fileName : layout.fileNames) {
+        const QString path = store.filePath(fileName);
+        if (QFileInfo::exists(path)) {
+            if (!QFile::remove(path)) {
+                if (errorOut)
+                    *errorOut = QStringLiteral("could not remove %1").arg(path);
+                return false;
+            }
+            removedAny = true;
+        }
+    }
+    if (!removedAny) {
+        if (errorOut)
+            *errorOut = QStringLiteral("not present in the model store");
+        return false;
+    }
+    return true;
+}
+
+bool importModel(const QString &id, const QString &sourcePath, QString *errorOut)
+{
+    const ModelLayout layout = modelLayout(id);
+    if (!layout.valid) {
+        if (errorOut)
+            *errorOut = QStringLiteral("unknown model id: %1").arg(id);
+        return false;
+    }
+    const QDir store = storeDir();
+    if (!store.mkpath(".")) {
+        if (errorOut)
+            *errorOut = QStringLiteral("could not create %1").arg(store.path());
+        return false;
+    }
+    const QFileInfo sourceInfo(sourcePath);
+
+    // A parakeet bundle or the diarization pair import from a DIRECTORY holding
+    // the canonical files; a single-file model imports from a FILE.
+    const bool multiFile = !layout.bundleDirName.isEmpty() || layout.fileNames.size() > 1;
+    if (multiFile) {
+        if (!sourceInfo.isDir()) {
+            if (errorOut)
+                *errorOut = QStringLiteral("expected a folder containing: %1").arg(layout.fileNames.join(", "));
+            return false;
+        }
+        const QDir sourceDir(sourcePath);
+        for (const QString &fileName : layout.fileNames) {
+            if (!QFileInfo::exists(sourceDir.filePath(fileName))) {
+                if (errorOut)
+                    *errorOut = QStringLiteral("folder is missing %1").arg(fileName);
+                return false;
+            }
+        }
+        QDir destDir = store;
+        if (!layout.bundleDirName.isEmpty()) {
+            if (!store.mkpath(layout.bundleDirName)) {
+                if (errorOut)
+                    *errorOut = QStringLiteral("could not create %1").arg(store.filePath(layout.bundleDirName));
+                return false;
+            }
+            destDir = QDir(store.filePath(layout.bundleDirName));
+        }
+        for (const QString &fileName : layout.fileNames) {
+            const QString dest = destDir.filePath(fileName);
+            QFile::remove(dest);
+            if (!QFile::copy(sourceDir.filePath(fileName), dest)) {
+                if (errorOut)
+                    *errorOut = QStringLiteral("could not copy %1 into the store").arg(fileName);
+                return false;
+            }
+        }
+        return true;
     }
 
-    if (segmentationPathOut)
-        *segmentationPathOut = segmentationPath;
-    if (embeddingPathOut)
-        *embeddingPathOut = embeddingPath;
+    if (!sourceInfo.isFile()) {
+        if (errorOut)
+            *errorOut = QStringLiteral("expected a file");
+        return false;
+    }
+    const QString dest = store.filePath(layout.fileNames.first());
+    QFile::remove(dest);
+    if (!QFile::copy(sourcePath, dest)) {
+        if (errorOut)
+            *errorOut = QStringLiteral("could not copy into the store");
+        return false;
+    }
+    return true;
+}
+
+bool exportModel(const QString &id, const QString &destDir, QString *errorOut)
+{
+    const ModelLayout layout = modelLayout(id);
+    if (!layout.valid) {
+        if (errorOut)
+            *errorOut = QStringLiteral("unknown model id: %1").arg(id);
+        return false;
+    }
+    const QDir dest(destDir);
+    if (!dest.exists()) {
+        if (errorOut)
+            *errorOut = QStringLiteral("destination folder does not exist");
+        return false;
+    }
+    if (!layout.bundleDirName.isEmpty()) {
+        const ParakeetModelPaths p = parakeetModelPaths();
+        if (!p.isComplete()) {
+            if (errorOut)
+                *errorOut = QStringLiteral("model is not downloaded");
+            return false;
+        }
+        if (!dest.mkpath(layout.bundleDirName)) {
+            if (errorOut)
+                *errorOut = QStringLiteral("could not create %1").arg(dest.filePath(layout.bundleDirName));
+            return false;
+        }
+        const QDir outBundle(dest.filePath(layout.bundleDirName));
+        const QString sources[4] = {p.encoder, p.decoder, p.joiner, p.tokens};
+        for (int i = 0; i < layout.fileNames.size() && i < 4; ++i) {
+            const QString out = outBundle.filePath(layout.fileNames.at(i));
+            QFile::remove(out);
+            if (!QFile::copy(sources[i], out)) {
+                if (errorOut)
+                    *errorOut = QStringLiteral("could not copy %1").arg(layout.fileNames.at(i));
+                return false;
+            }
+        }
+        return true;
+    }
+    for (const QString &fileName : layout.fileNames) {
+        const QString src = resolveModelFile(fileName);
+        if (src.isEmpty()) {
+            if (errorOut)
+                *errorOut = QStringLiteral("model is not downloaded");
+            return false;
+        }
+        const QString out = dest.filePath(fileName);
+        QFile::remove(out);
+        if (!QFile::copy(src, out)) {
+            if (errorOut)
+                *errorOut = QStringLiteral("could not copy %1").arg(fileName);
+            return false;
+        }
+    }
     return true;
 }
 

@@ -89,6 +89,25 @@ private slots:
         QVERIFY(engine.diarize(pcm).empty());
     }
 
+    // The clustering-sensitivity (threshold) ctor overload — the user-facing
+    // knob (AppSettings.diarizationSensitivity) is threaded into
+    // buildConfig()'s config.clustering.threshold. Its numeric EFFECT needs
+    // real models (the gated realModels_* test constructs with real weights);
+    // here we just prove the overload exists and stays inert-not-fatal for an
+    // unloadable model at a non-default threshold (num_clusters stays 0 — no
+    // fixed speaker count is ever set).
+    void thresholdCtorOverloadIsInertNotFatal()
+    {
+        DiarizationEngine strict(QStringLiteral("/nonexistent/segmentation.onnx"),
+                                 QStringLiteral("/nonexistent/embedding.onnx"), /*threshold=*/0.3f);
+        QVERIFY(!strict.isValid());
+        QVERIFY(strict.diarize(std::vector<float>(16000, 0.0f)).empty());
+
+        DiarizationEngine loose(QStringLiteral("/nonexistent/segmentation.onnx"),
+                                QStringLiteral("/nonexistent/embedding.onnx"), /*threshold=*/0.8f);
+        QVERIFY(!loose.isValid());
+    }
+
     // Full pipeline against the real ONNX models and a real (single-speaker)
     // sample: the segmentation+embedding+clustering pipeline must find at
     // least one speaker turn, with sane sorted, non-overlapping-in-order

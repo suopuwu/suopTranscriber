@@ -507,14 +507,22 @@ public:
     // run()). The diarization models are queued as their own download job ahead
     // of this one if not already on disk, same as transcribe()'s
     // speakerDetection path.
-    Q_INVOKABLE void diarizeFile(const QUrl &fileUrl, const QUrl &vaultUrl);
+    // segmentationModelId/embeddingModelId/sensitivity: the diarization tuning
+    // (from AppSettings — see availableSegmentationModels()/the sensitivity
+    // slider). Empty ids ⇒ ModelManager defaults; the matching download jobs
+    // queue the CHOSEN models ahead of this one.
+    Q_INVOKABLE void diarizeFile(const QUrl &fileUrl, const QUrl &vaultUrl,
+                                 const QString &segmentationModelId = QString(),
+                                 const QString &embeddingModelId = QString(), double sensitivity = 0.5);
 
     // Bulk wrapper mirroring transcribeAll()/relabelAll(): calls diarizeFile()
     // for each url. Dedup is entirely delegated to diarizeFile(). Added now so
     // the OWED Sidebar ribbon / per-row "detect speakers" buttons (CLAUDE.md
     // per-file-action parity — deferred this wave, another agent owns
     // Sidebar.qml) only need wiring, no new controller method.
-    Q_INVOKABLE void diarizeFilesForPaths(const QVariantList &fileUrls, const QUrl &vaultUrl);
+    Q_INVOKABLE void diarizeFilesForPaths(const QVariantList &fileUrls, const QUrl &vaultUrl,
+                                          const QString &segmentationModelId = QString(),
+                                          const QString &embeddingModelId = QString(), double sensitivity = 0.5);
 
     // True if fileUrl currently has a Queued or Active entry.
     Q_INVOKABLE bool isQueued(const QUrl &fileUrl) const;
@@ -610,7 +618,9 @@ public:
     // before any of the jobs is inserted).
     Q_INVOKABLE void runAllJobs(const QUrl &fileUrl, const QUrl &vaultUrl, const QString &modelId,
                                  bool restrictTagsToExisting = false,
-                                 double tagReuseBias = 0.5, double wordiness = 0.5, double chapterDensity = 0.5);
+                                 double tagReuseBias = 0.5, double wordiness = 0.5, double chapterDensity = 0.5,
+                                 const QString &segmentationModelId = QString(),
+                                 const QString &embeddingModelId = QString(), double sensitivity = 0.5);
 
     // Bulk wrapper mirroring transcribeAll()/relabelAll(): calls runAllJobs()
     // for each url. Dedup + ordering are entirely delegated to runAllJobs();
@@ -619,7 +629,8 @@ public:
     Q_INVOKABLE void runAllJobsForPaths(const QVariantList &fileUrls, const QUrl &vaultUrl, const QString &modelId,
                                          bool restrictTagsToExisting = false,
                                          double tagReuseBias = 0.5, double wordiness = 0.5,
-                                         double chapterDensity = 0.5);
+                                         double chapterDensity = 0.5, const QString &segmentationModelId = QString(),
+                                         const QString &embeddingModelId = QString(), double sensitivity = 0.5);
 
     // Item 17 (manual chapters). Inserts a MANUAL "## [timestamp] title" marker
     // (carrying the manual sentinel — see spliceBodyChapters()'s doc comment)
@@ -666,6 +677,45 @@ public:
     // {id, label} pairs for the model dropdown (see ModelManager).
     Q_INVOKABLE QVariantList availableModels() const;
 
+    // {id, label, downloaded, nonCommercial} for the diarization SEGMENTATION /
+    // EMBEDDING model pickers (Settings → Transcription & AI), and the
+    // benchmark's diarization combinations. Parallel to availableModels(); see
+    // ModelManager::availableSegmentationModels()/availableEmbeddingModels().
+    Q_INVOKABLE QVariantList availableSegmentationModels() const;
+    Q_INVOKABLE QVariantList availableEmbeddingModels() const;
+
+    // Settings → Models page: every app-managed model (the whisper tiers +
+    // parakeet, kind "transcription"; plus the label / VAD / diarization
+    // support models, kind "support"), each entry:
+    //   { id, label, kind, downloaded(bool), bundledOnly(bool),
+    //     sizeBytes(double), sizeText(string) }
+    // bundledOnly ⇒ present only in the read-only bundled dir (Delete must be
+    // disabled). Uses the app-global store (no vault dependency).
+    Q_INVOKABLE QVariantList manageableModels() const;
+
+    // Predownload a model ahead of use: queues a "download" job (same job kind
+    // used lazily before a transcribe) for modelId — a whisper tier,
+    // kParakeetModelId, or a support pseudo-id (ModelManager::kLabelModelId /
+    // kVadModelId / kDiarizationModelId). No-op if already downloaded/queued.
+    Q_INVOKABLE void downloadModel(const QString &modelId);
+
+    // Delete modelId's file(s) from the writable store (ModelManager::
+    // deleteModel). Synchronous (an unlink); emits modelOperationFinished
+    // ("delete", …) and, on success, modelsChanged().
+    Q_INVOKABLE void deleteModel(const QString &modelId);
+
+    // Import model file(s) the user supplied (a file for single-file models, a
+    // folder for the parakeet bundle / diarization pair) into the store, so
+    // modelId resolves as downloaded with no network. Runs the (possibly
+    // multi-GB) copy on a background thread; emits modelOperationFinished
+    // ("import", …) and, on success, modelsChanged().
+    Q_INVOKABLE void importModel(const QString &modelId, const QUrl &sourceUrl);
+
+    // Export modelId's downloaded file(s) into destDirUrl for backup /
+    // re-import (ModelManager::exportModel). Background copy; emits
+    // modelOperationFinished("export", …).
+    Q_INVOKABLE void exportModel(const QString &modelId, const QUrl &destDirUrl);
+
     // Capability-detected out-of-process engines (DESIGN.md "Pluggable
     // engines") for the currently-open vault. Each entry:
     //   { id, modelId ("engine:<id>"), label, available(bool),
@@ -687,6 +737,11 @@ public:
     // availableModels()/availableEngines(). cancelBenchmark() stops it between
     // models / mid-model.
     Q_INVOKABLE void runBenchmark(const QUrl &fileUrl, const QStringList &modelIds);
+    // Diarization sweep: combos is a list of {segmentationModelId, embeddingModelId,
+    // threshold, label} maps — each run over ONE decode of fileUrl, reporting how
+    // many speakers it found (see diarizationBenchmark* signals). Shares the same
+    // worker + cancel atomics as runBenchmark(); cancelBenchmark() stops both.
+    Q_INVOKABLE void runDiarizationBenchmark(const QUrl &fileUrl, const QVariantList &combos);
     Q_INVOKABLE void cancelBenchmark();
 
     // Removes one Done/Failed entry matching fileUrl from the job list. A
@@ -1097,6 +1152,21 @@ signals:
     void benchmarkModelDone(const QVariantMap &result);
     void benchmarkFinished(const QVariantMap &run);
     void benchmarkFailed(const QString &error);
+    // Diarization sweep (see runDiarizationBenchmark()) — per-combo start, per
+    // finished combo (result carries speakerCount/turnCount/runtimeMs/
+    // realtimeFactor + the combo's seg/embed/threshold), and once with the run.
+    // A decode failure before any combo reuses benchmarkFailed.
+    void diarizationBenchmarkComboStarted(const QString &label, int index, int total);
+    void diarizationBenchmarkComboDone(const QVariantMap &result);
+    void diarizationBenchmarkFinished(const QVariantMap &run);
+
+    // Settings → Models page: modelsChanged fires when the set of downloaded
+    // models changes (delete/import success, or a predownload job finishing) so
+    // the page re-queries manageableModels(). modelOperationFinished reports the
+    // result of a delete/import/export (operation is "delete"/"import"/
+    // "export"), letting the page show success or the error.
+    void modelsChanged();
+    void modelOperationFinished(const QString &operation, const QString &modelId, bool ok, const QString &error);
 
     void busyChanged();
     void progressChanged();
@@ -1161,7 +1231,11 @@ private:
     // Wave N (task system, item 5): which model file(s) a download job is
     // responsible for fetching — orthogonal to the four existing job-kind
     // flags below (a download job sets NONE of those; see jobKind()).
-    enum class DownloadTarget { None, WhisperModel, LabelModel, DiarizationModels };
+    // SegmentationModel/EmbeddingModel each carry their chosen sub-model id in
+    // Job::modelId (like WhisperModel) — a diarize job queues one of each ahead
+    // of itself for the currently-selected pair. (Replaced the old single
+    // DiarizationModels target now that both halves are user-selectable.)
+    enum class DownloadTarget { None, WhisperModel, LabelModel, VadModel, SegmentationModel, EmbeddingModel };
 
     struct Job {
         // Stable across the job's entire lifetime (Queued through Done/
@@ -1216,6 +1290,14 @@ private:
         // vaultUrl, like relabelOnly). See diarizeFile() and
         // TranscriptionWorker::diarizeJob().
         bool diarizeOnly = false;
+        // Diarization tuning for a diarizeOnly job (and the runAllJobs diarize
+        // step): which segmentation/embedding models to use and the clustering
+        // SENSITIVITY (threshold — see DiarizationEngine). Ignored by every
+        // other kind. Empty ids ⇒ ModelManager's defaults; 0.5 == the neutral
+        // default this feature used before it was tunable.
+        QString segmentationModelId;
+        QString embeddingModelId;
+        double diarizationThreshold = 0.5;
         bool restrictTagsToExisting = false;
         double tagReuseBias = 0.5;
         double wordiness = 0.5;

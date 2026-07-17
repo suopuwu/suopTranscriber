@@ -845,7 +845,9 @@ Item {
                                 switch (modelData.downloadTarget) {
                                 case "model": return modelData.modelId
                                 case "label": return qsTr("auto-label model")
-                                case "diarization": return qsTr("speaker detection models")
+                                case "vad": return qsTr("voice-activity model")
+                                case "segmentation": return qsTr("speaker segmentation model")
+                                case "embedding": return qsTr("speaker embedding model")
                                 default: return ""
                                 }
                             }

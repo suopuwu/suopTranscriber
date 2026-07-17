@@ -303,6 +303,7 @@ private slots:
 
         const QString modelsDir = m_vaultDir.filePath(QStringLiteral(".transcriber/models"));
         QVERIFY(QDir().mkpath(modelsDir));
+        qputenv("SUOP_MODELS_DIR", modelsDir.toLocal8Bit()); // app-global store -> this test's dir
         const QString modelDest = modelsDir + QStringLiteral("/ggml-base.en.bin");
         if (!QFileInfo::exists(modelDest))
             QVERIFY(QFile::link(model, modelDest));

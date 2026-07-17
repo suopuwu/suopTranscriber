@@ -47,6 +47,7 @@
     "settings": "settings.svg",
     "folder": "folder.svg",
     "usb": "usb.svg",
+    "benchmark": "benchmark.svg",
     "more": "more.svg",
     "freeze": "freeze.svg",
     "reset": "reset.svg",

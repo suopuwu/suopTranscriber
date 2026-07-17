@@ -135,17 +135,30 @@ This makes the out-of-process NeMo `engines/parakeet/` above the *fallback*
 route for Parakeet; the subprocess subsystem's real value is genuinely
 Python-only engines (faster-whisper, etc.).
 
-## Model benchmark (Settings → Benchmark)
+## Benchmark (top-level page)
 
-A display-only comparison harness: pick one vault audio file, and
-`TranscriptionController::runBenchmark()` runs every *already-downloaded* model
-plus every *available* engine over it sequentially (on the transcription worker
-thread, so it serializes with real jobs and never contends for the GPU),
-reporting per-model run time, realtime factor, and segment/word/char counts
-alongside each transcript. It writes **no** `.md` and touches no queue/vault
-state — its only footprint is `<vault>/.transcriber/benchmarkLastRun.json`
-(overwritten each run, reloaded when the page reopens). UI in
-`BenchmarkPage.qml`; persistence via `VaultTreeModel::read/writeBenchmarkLastRun`.
+A display-only comparison harness, its own **top-level page** (a TitleBar icon
+button next to the USB grabber, mounted by `MainPanel` in a `ScrollView` — no
+longer a Settings sub-page). It defaults to the file open in the left panel
+(`currentFilePath`), falling back to a vault-wide picker. Two sweeps, both on the
+transcription worker thread (so they serialize with real jobs and never contend
+for the GPU), writing **no** `.md`:
+
+- **Model benchmark** — `TranscriptionController::runBenchmark()` runs every
+  *already-downloaded* model plus every *available* engine over the file,
+  reporting per-model run time, realtime factor, and segment/word/char counts
+  alongside each transcript. Its only footprint is
+  `<vault>/.transcriber/benchmarkLastRun.json` (overwritten each run, reloaded on
+  show); persistence via `VaultTreeModel::read/writeBenchmarkLastRun`.
+- **Diarization sweep** — `runDiarizationBenchmark(fileUrl, combos)` runs a
+  cartesian product of chosen segmentation × embedding × sensitivity values over
+  ONE decode, reporting **how many speakers** each combo finds (plus turns /
+  runtime / realtime factor) — the money metric for "which combo actually splits
+  a hard far-field recording". Guarded by a confirm dialog above ~10 tests. Each
+  combo builds a fresh `DiarizationEngine` (threshold is baked in at
+  construction). Not persisted (session-only).
+
+UI in `BenchmarkPage.qml`.
 
 ## GPU: cross-vendor is not uniform across engines
 
@@ -191,11 +204,25 @@ Do not build that on day one.
 ## Speaker diarization
 
 Speaker detection is a **separate engine** from transcription — `DiarizationEngine`
-(`src/core/DiarizationEngine.h/.cpp`), sherpa-onnx's pyannote segmentation +
-WeSpeaker embedding + agglomerative clustering, independent of which whisper
-model is selected (unlike the old tdrz heuristic, it never constrains model
-choice). Speaker count is always auto-detected via a clustering distance
-threshold — no "number of speakers" UI.
+(`src/core/DiarizationEngine.h/.cpp`), sherpa-onnx's segmentation + embedding +
+agglomerative clustering, independent of which whisper model is selected (unlike
+the old tdrz heuristic, it never constrains model choice). Speaker count is
+always auto-detected via a clustering distance threshold — **no "number of
+speakers" UI**. That decision stands: a fixed speaker *count* (`num_clusters`)
+is still never exposed. What *is* exposed (added when the default collapsed
+far-field group recordings into one speaker) is the **clustering threshold
+itself**, as a continuous "sensitivity" knob (`AppSettings.diarizationSensitivity`
+→ `DiarizationEngine`'s ctor) — lower = more speakers, higher = fewer. It tunes
+the always-on auto-detection rather than replacing it with a count.
+
+Both models are **user-selectable** (`AppSettings.diarizationSegmentationModel` /
+`diarizationEmbeddingModel`, pickers in Settings → Transcription & AI): the
+default pair is pyannote-segmentation-3.0 + WeSpeaker ResNet293-LM, with
+Rev.ai reverb-diarization-v1 (segmentation), 3D-Speaker CAM++ and NeMo
+TitaNet-large (embedding) as alternatives, each its own downloadable/manageable
+model. The selection + sensitivity are carried on the `diarizeOnly` job and can
+be swept in the benchmark (see below) to compare combinations on a hard file.
+See `ModelManager::availableSegmentationModels()`/`availableEmbeddingModels()`.
 
 It runs one full pass over the same 16 kHz mono PCM whisper transcribes,
 producing `DiarizedTurn`s (`{start, end, speaker}`), and each segment is tagged
@@ -274,7 +301,9 @@ vault/
   .transcriber/
     settings.json                # vault-scoped settings (JSON) — see below
     engines/                    # engine manifests + scripts
-    models/                     # downloaded model files (large: 2–4 GB each)
+                                # (model files are NOT here — see "Model
+                                #  management": one app-global store, shared
+                                #  across vaults)
   interviews/2026-06-30.m4a
   interviews/2026-06-30.md              # human-readable transcript = "done" (green)
   interviews/.2026-06-30.partial.jsonl  # exists only mid-transcription (resume)
@@ -293,8 +322,9 @@ vault/
   (`AppSettings.saveToVault`). `lastVaultPath`/`lastModel` stay app-scoped
   (`QtCore.Settings`, `~/.config`) — they're last-used bootstrap state needed
   BEFORE a vault's own settings file can be read, not a vault-specific
-  preference. USB device allowlist and a model registry (below) are NOT part
-  of this file yet — still not implemented.
+  preference. The USB device allowlist is NOT part of this file yet — still
+  not implemented. (Models are no longer vault-scoped at all — see "Model
+  management": one app-global store.)
 
 - **Transcribed indicator:** sibling `.md` exists → green; missing → yellow;
   orphaned `.md` (no sibling audio file) → blue.
@@ -524,8 +554,39 @@ the overview, not a duplicate of it.
 
 ## Model management
 
-- Models are large (whisper large-v3 ≈ 3 GB, Parakeet ≈ 2–4 GB). Provide a
-  download/management UI and a `models/` dir; registry in config.
+- Models are large (whisper large-v3 ≈ 3 GB, Parakeet ≈ 2–4 GB).
+- **One app-global store, shared across every vault** (`ModelManager::
+  modelsStoreDir()` — the writable generic-data dir, `~/.local/share/
+  suopTranscriber/models`; `SUOP_MODELS_DIR` overrides it, which is how tests
+  redirect to a temp dir). A multi-GB model is downloaded once and reused
+  everywhere; there's a single directory to back up. This replaced the earlier
+  per-vault `<vault>/.transcriber/models/` layout (pre-stable, no migration).
+- **Bundled search path (durability escape hatch):** every presence check and
+  path lookup resolves store-first, then a read-only "bundled" dir shipped
+  beside the binary (`bundledModelsDir()` = `applicationDirPath()/models`;
+  `SUOP_BUNDLED_MODELS_DIR` overrides). No models ship by default, but a
+  distributor (or the user) can drop model files there so the app works even
+  if a download URL breaks. Downloads/imports/deletes only ever touch the
+  writable store; a bundled model is read-only (Delete is disabled for it).
+- **Settings → Models page** (`ModelsPage.qml`, a nav-rail page): lists every
+  app-managed model — the transcription tiers + Parakeet, plus the support
+  models (auto-label GGUF / Silero VAD / diarization pair) — with a
+  downloaded/size indicator and per-model actions:
+  - **Predownload** a model ahead of use (`downloadModel()` queues the same
+    `"download"` job kind used lazily before a transcribe — progress/pause via
+    the Tasks queue).
+  - **Delete** (`deleteModel()`) — removes from the writable store only;
+    permanent (models are large + re-downloadable, so NOT trashed), and IS
+    confirmed (unlike a reversible vault-file delete — a re-download can fail,
+    which is the risk this whole feature guards against).
+  - **Import** a user-supplied copy (`importModel()`) — a file for single-file
+    models, a folder for the Parakeet bundle / diarization pair — copied into
+    the store so it resolves as downloaded with no network.
+  - **Export** (`exportModel()`) — copies the file(s) to a chosen folder for
+    backup, in the exact shape `importModel()` expects back.
+  - Import/export run the (possibly multi-GB) copy on a background thread and
+    answer via `modelOperationFinished`; `modelsChanged` also fires when a
+    (pre)download job completes so the page refreshes.
 - Capability detection checks which model files are present, not just which engine
   binaries exist.
 - **Unrecognized model id → visible fallback, never a silent one.** If a

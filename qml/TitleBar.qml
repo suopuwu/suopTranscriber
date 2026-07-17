@@ -11,6 +11,7 @@ Item {
     signal forceRetranscribeAllRequested()
     signal recordRequested()
     signal usbGrabberRequested()
+    signal benchmarkRequested()
 
     // Inline confirm state for the "Force retranscribe all" menu row (see
     // MainPanel.qml's speaker-merge confirm row for the same swap-in-place
@@ -140,13 +141,42 @@ Item {
         }
     }
 
+    Item {
+        id: benchmarkButton
+        objectName: "titleBarBenchmarkButton"
+        anchors.left: usbGrabberButton.right
+        anchors.leftMargin: 4
+        anchors.verticalCenter: parent.verticalCenter
+        width: 24
+        height: 24
+
+        HoverHandler {
+            id: benchmarkHover
+            cursorShape: Qt.PointingHandCursor
+        }
+        TapHandler {
+            gesturePolicy: TapHandler.ReleaseWithinBounds
+            onTapped: titleBar.benchmarkRequested()
+        }
+        HoverBorder {
+            anchors.fill: parent
+            active: benchmarkHover.hovered
+        }
+        AppIcon {
+            anchors.centerIn: parent
+            name: "benchmark"
+            iconSize: 14
+            color: "white"
+        }
+    }
+
     // Infrequently used actions (currently just "force retranscribe all")
     // that don't warrant a spot in Settings — kept out of the way next to
     // the gear rather than cluttering the per-row/bulk sidebar controls.
     Item {
         id: moreActionsButton
         objectName: "titleBarMoreActionsButton"
-        anchors.left: usbGrabberButton.right
+        anchors.left: benchmarkButton.right
         anchors.leftMargin: 4
         anchors.verticalCenter: parent.verticalCenter
         width: 24

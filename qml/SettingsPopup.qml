@@ -22,7 +22,7 @@ Popup {
     // presentation reorg — every control/binding/save-hook is unchanged, only
     // grouped behind a page gate.
     readonly property var pageNames: [qsTr("Appearance"), qsTr("Sidebar & Layout"),
-                                      qsTr("Transcription & AI"), qsTr("Combine"), qsTr("Benchmark")]
+                                      qsTr("Transcription & AI"), qsTr("Combine"), qsTr("Models")]
     property int currentPage: 0
 
     // Whether the (long) per-icon override grid is expanded. Collapsed by
@@ -3454,6 +3454,218 @@ Popup {
 
             }
 
+            // Speaker detection (diarization) section (page 2)
+            ColumnLayout {
+                Layout.fillWidth: true
+                spacing: 10
+                visible: settingsPopup.currentPage === 2
+
+            Label {
+                text: qsTr("Speaker detection")
+                color: "white"
+                font.bold: true
+            }
+
+            Label {
+                Layout.fillWidth: true
+                wrapMode: Text.WordWrap
+                text: qsTr("Which models find and distinguish speakers. Chosen models download on "
+                           + "first use; manage them under Models. Far-field group recordings are hard — "
+                           + "try a different embedding model and a lower sensitivity if everyone collapses "
+                           + "into one speaker.")
+                color: "#888888"
+                font.pixelSize: 11
+            }
+
+            RowLayout {
+                Layout.fillWidth: true
+                Label {
+                    Layout.preferredWidth: 90
+                    elide: Text.ElideRight
+                    color: "white"
+                    text: qsTr("Segmentation")
+                }
+                ComboBox {
+                    id: segmentationModelCombo
+                    Layout.fillWidth: true
+                    Layout.minimumWidth: 80
+                    model: transcriptionController.availableSegmentationModels()
+                    textRole: "label"
+                    valueRole: "id"
+                    currentIndex: indexOfValue(AppSettings.diarizationSegmentationModel)
+                    hoverEnabled: true
+                    onActivated: AppSettings.diarizationSegmentationModel = currentValue
+
+                    HoverHandler {
+                        cursorShape: Qt.PointingHandCursor
+                    }
+                    HoverBorder {
+                        anchors.fill: parent
+                        active: segmentationModelCombo.hovered
+                    }
+                }
+                Button {
+                    id: segmentationModelResetButton
+                    contentItem: AppIcon { name: "reset"; iconSize: 14; color: "#dddddd"; anchors.centerIn: parent }
+                    implicitWidth: 22
+                    implicitHeight: 22
+
+                    background: Rectangle {
+                        radius: AppSettings.borderRadius
+                        color: "transparent"
+                        border.width: 1
+                        border.color: "#3a3a3a"
+                    }
+                    enabled: !AppSettings.isDefault("diarizationSegmentationModel")
+                    opacity: enabled ? 1 : 0.35
+                    hoverEnabled: enabled
+                    onClicked: AppSettings.resetProperty("diarizationSegmentationModel")
+
+                    HoverHandler {
+                        cursorShape: Qt.PointingHandCursor
+                        enabled: segmentationModelResetButton.enabled
+                    }
+                    HoverBorder {
+                        anchors.fill: parent
+                        active: segmentationModelResetButton.enabled && segmentationModelResetButton.hovered
+                    }
+                }
+            }
+
+            RowLayout {
+                Layout.fillWidth: true
+                Label {
+                    Layout.preferredWidth: 90
+                    elide: Text.ElideRight
+                    color: "white"
+                    text: qsTr("Embedding")
+                }
+                ComboBox {
+                    id: embeddingModelCombo
+                    Layout.fillWidth: true
+                    Layout.minimumWidth: 80
+                    model: transcriptionController.availableEmbeddingModels()
+                    textRole: "label"
+                    valueRole: "id"
+                    currentIndex: indexOfValue(AppSettings.diarizationEmbeddingModel)
+                    hoverEnabled: true
+                    onActivated: AppSettings.diarizationEmbeddingModel = currentValue
+
+                    HoverHandler {
+                        cursorShape: Qt.PointingHandCursor
+                    }
+                    HoverBorder {
+                        anchors.fill: parent
+                        active: embeddingModelCombo.hovered
+                    }
+                }
+                Button {
+                    id: embeddingModelResetButton
+                    contentItem: AppIcon { name: "reset"; iconSize: 14; color: "#dddddd"; anchors.centerIn: parent }
+                    implicitWidth: 22
+                    implicitHeight: 22
+
+                    background: Rectangle {
+                        radius: AppSettings.borderRadius
+                        color: "transparent"
+                        border.width: 1
+                        border.color: "#3a3a3a"
+                    }
+                    enabled: !AppSettings.isDefault("diarizationEmbeddingModel")
+                    opacity: enabled ? 1 : 0.35
+                    hoverEnabled: enabled
+                    onClicked: AppSettings.resetProperty("diarizationEmbeddingModel")
+
+                    HoverHandler {
+                        cursorShape: Qt.PointingHandCursor
+                        enabled: embeddingModelResetButton.enabled
+                    }
+                    HoverBorder {
+                        anchors.fill: parent
+                        active: embeddingModelResetButton.enabled && embeddingModelResetButton.hovered
+                    }
+                }
+            }
+
+            Label {
+                Layout.fillWidth: true
+                wrapMode: Text.WordWrap
+                visible: segmentationModelCombo.currentValue === "reverb-diarization-v1"
+                text: qsTr("⚠ Reverb v1 is released under a non-commercial / research license.")
+                color: "#c9a227"
+                font.pixelSize: 11
+            }
+
+            RowLayout {
+                Layout.fillWidth: true
+                Label {
+                    Layout.preferredWidth: 90
+                    elide: Text.ElideRight
+                    color: "white"
+                    text: qsTr("Sensitivity")
+                }
+                Slider {
+                    id: diarizationSensitivitySlider
+                    Layout.fillWidth: true
+                    Layout.minimumWidth: 80
+                    // Continuous (like chapterDensity) — NOT the 3-tier snap the
+                    // labeling sliders use. Clamped away from the 0/1 extremes,
+                    // which degenerate (everything one cluster / every turn its own).
+                    from: 0.1
+                    to: 0.9
+                    value: AppSettings.diarizationSensitivity
+                    hoverEnabled: true
+                    onMoved: AppSettings.diarizationSensitivity = value
+
+                    HoverHandler {
+                        cursorShape: Qt.PointingHandCursor
+                    }
+                    HoverBorder {
+                        anchors.fill: parent
+                        active: diarizationSensitivitySlider.hovered
+                    }
+                }
+                Button {
+                    id: diarizationSensitivityResetButton
+                    contentItem: AppIcon { name: "reset"; iconSize: 14; color: "#dddddd"; anchors.centerIn: parent }
+                    implicitWidth: 22
+                    implicitHeight: 22
+
+                    background: Rectangle {
+                        radius: AppSettings.borderRadius
+                        color: "transparent"
+                        border.width: 1
+                        border.color: "#3a3a3a"
+                    }
+                    enabled: !AppSettings.isDefault("diarizationSensitivity")
+                    opacity: enabled ? 1 : 0.35
+                    hoverEnabled: enabled
+                    onClicked: AppSettings.resetProperty("diarizationSensitivity")
+
+                    HoverHandler {
+                        cursorShape: Qt.PointingHandCursor
+                        enabled: diarizationSensitivityResetButton.enabled
+                    }
+                    HoverBorder {
+                        anchors.fill: parent
+                        active: diarizationSensitivityResetButton.enabled && diarizationSensitivityResetButton.hovered
+                    }
+                }
+            }
+
+            Label {
+                Layout.fillWidth: true
+                wrapMode: Text.WordWrap
+                text: qsTr("Clustering distance cutoff (%1). Lower = stricter = MORE speakers; higher = "
+                           + "more merging = FEWER. Tunes auto-detection — it is not a fixed speaker count.")
+                        .arg(diarizationSensitivitySlider.value.toFixed(2))
+                color: "#666666"
+                font.italic: true
+                font.pixelSize: 11
+            }
+
+            }
+
             // AI Auto-Labeling section (page 2)
             ColumnLayout {
                 Layout.fillWidth: true
@@ -4649,15 +4861,18 @@ Popup {
             }
             }
 
-            // ===== Page 4: Benchmark (BenchmarkPage.qml) =====
-            // Its own component (the benchmark UI is substantial) rather than
-            // inline here — mounted as a page wrapper like the others.
-            BenchmarkPage {
+            // ===== Page 4: Models (ModelsPage.qml) =====
+            // Its own component — download/predownload/delete/import/export of
+            // the app-global model store (see DESIGN.md "Model management").
+            ModelsPage {
                 Layout.fillWidth: true
                 visible: settingsPopup.currentPage === 4
                 transcriptionController: settingsPopup.transcriptionController
-                vaultTreeModel: settingsPopup.vaultTreeModel
             }
+
+            // Benchmark was promoted out of Settings to its own top-level
+            // TitleBar page (see MainPanel's BenchmarkPage block) — no longer a
+            // settings sub-page.
         }
     }
 

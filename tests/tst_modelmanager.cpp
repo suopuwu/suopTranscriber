@@ -2,11 +2,17 @@
 // plus the speaker-diarization ONNX model pair.
 //
 // Sources of truth:
-//   DESIGN.md  "Model management" / vault layout — models are stored inside the
-//              vault at <vault>/.transcriber/models/<file name>.
+//   DESIGN.md  "Model management" — models live in ONE app-global store shared
+//              across vaults (modelsStoreDir()), searched store-first then a
+//              read-only bundled dir (bundledModelsDir()); downloads/imports/
+//              deletes touch only the writable store.
 //   DESIGN.md  "Speaker diarization" — pyannote-segmentation-3.0 +
 //              WeSpeaker ResNet293-LM ONNX models, downloaded as a pair (see
 //              ensureDiarizationModels).
+//
+// Isolation: SUOP_MODELS_DIR / SUOP_BUNDLED_MODELS_DIR are redirected to fresh
+// temp dirs in init() so the tests never touch the real store (CLAUDE.md:
+// "never touch the user's real vault or app config").
 //
 // Network policy: these tests NEVER exercise the download path. Every
 // ensure* call pre-creates the expected file so the manager returns early;
@@ -23,21 +29,6 @@
 
 namespace {
 
-// Pre-creates a fake ggml file at the documented vault-relative location and
-// returns its full path — this is how every test avoids the download path.
-QString plantFakeModel(const QString &vaultPath, const QString &fileName, const QByteArray &content)
-{
-    const QDir modelsDir(vaultPath + "/.transcriber/models");
-    if (!QDir().mkpath(modelsDir.path()))
-        return {};
-    const QString path = modelsDir.filePath(fileName);
-    QFile f(path);
-    if (!f.open(QIODevice::WriteOnly))
-        return {};
-    f.write(content);
-    return path;
-}
-
 QByteArray readAll(const QString &path)
 {
     QFile f(path);
@@ -52,13 +43,67 @@ class TstModelManager : public QObject
 {
     Q_OBJECT
 
+    // Fresh writable-store + bundled dirs per test, redirected via env so the
+    // real store is never touched.
+    QScopedPointer<QTemporaryDir> m_store;
+    QScopedPointer<QTemporaryDir> m_bundled;
+
+    // Plants a fake model file into the writable store (the location every
+    // presence check / ensure* resolves first) — how every test avoids the
+    // download path. Returns its full path.
+    QString plantFakeModel(const QString &fileName, const QByteArray &content)
+    {
+        const QDir modelsDir(ModelManager::modelsStoreDir());
+        if (!QDir().mkpath(modelsDir.path()))
+            return {};
+        const QString path = modelsDir.filePath(fileName);
+        QFile f(path);
+        if (!f.open(QIODevice::WriteOnly))
+            return {};
+        f.write(content);
+        return path;
+    }
+
+    // Plants a fake model file into the read-only BUNDLED dir (searched after
+    // the store) — used to exercise the bundled-fallback resolution.
+    QString plantBundledModel(const QString &fileName, const QByteArray &content)
+    {
+        const QDir modelsDir(ModelManager::bundledModelsDir());
+        if (!QDir().mkpath(modelsDir.path()))
+            return {};
+        const QString path = modelsDir.filePath(fileName);
+        QFile f(path);
+        if (!f.open(QIODevice::WriteOnly))
+            return {};
+        f.write(content);
+        return path;
+    }
+
 private slots:
+    void init()
+    {
+        m_store.reset(new QTemporaryDir);
+        m_bundled.reset(new QTemporaryDir);
+        QVERIFY(m_store->isValid());
+        QVERIFY(m_bundled->isValid());
+        qputenv("SUOP_MODELS_DIR", m_store->path().toLocal8Bit());
+        qputenv("SUOP_BUNDLED_MODELS_DIR", m_bundled->path().toLocal8Bit());
+    }
+
+    void cleanup()
+    {
+        qunsetenv("SUOP_MODELS_DIR");
+        qunsetenv("SUOP_BUNDLED_MODELS_DIR");
+        m_store.reset();
+        m_bundled.reset();
+    }
+
     // --- Model catalog -----------------------------------------------------
 
     // The dropdown offers the four documented English whisper tiers plus the
     // multilingual large-v3 tier (item O31), ordered fastest/smallest to
     // slowest/most-accurate with the documented ggml file names (which double
-    // as the on-disk names under .transcriber/models/), then the in-process
+    // as the on-disk names in the model store), then the in-process
     // Parakeet model (sherpa-onnx, see ParakeetEngine) as a final entry.
     void availableModels_areTheWhisperTiersPlusParakeet_inSpeedOrder()
     {
@@ -90,44 +135,40 @@ private slots:
     }
 
     // Parakeet is a multi-file ONNX bundle, not a single ggml file: its four
-    // files resolve under .transcriber/models/<bundle>/, isModelDownloaded is
+    // files resolve under the store's <bundle>/ subdir, isModelDownloaded is
     // true only when ALL are present, and isParakeetModelId distinguishes it
     // from the whisper tiers. No network touched (nothing planted ⇒ absent).
     void parakeetModel_isABundleGatedOnAllFourFiles()
     {
-        QTemporaryDir vault;
-        QVERIFY(vault.isValid());
-        const QUrl vaultUrl = QUrl::fromLocalFile(vault.path());
-
         QVERIFY(ModelManager::isParakeetModelId(QString(ModelManager::kParakeetModelId)));
         QVERIFY(!ModelManager::isParakeetModelId(QStringLiteral("base.en")));
 
-        const ModelManager::ParakeetModelPaths paths = ModelManager::parakeetModelPaths(vaultUrl);
+        const ModelManager::ParakeetModelPaths paths = ModelManager::parakeetModelPaths();
         for (const QString &p : {paths.encoder, paths.decoder, paths.joiner, paths.tokens})
-            QVERIFY2(p.contains(QStringLiteral(".transcriber/models/parakeet-tdt-0.6b-v2")), qPrintable(p));
+            QVERIFY2(p.contains(QStringLiteral("parakeet-tdt-0.6b-v2")), qPrintable(p));
 
         // Nothing on disk ⇒ not complete, not downloaded.
         QVERIFY(!paths.isComplete());
-        QVERIFY(!ModelManager::isModelDownloaded(vaultUrl, QString(ModelManager::kParakeetModelId)));
+        QVERIFY(!ModelManager::isModelDownloaded(QString(ModelManager::kParakeetModelId)));
 
         // Plant three of the four files ⇒ still not complete (never a
         // half-extracted "downloaded").
-        const QDir bundle(vault.path() + "/.transcriber/models/parakeet-tdt-0.6b-v2");
+        const QDir bundle(ModelManager::modelsStoreDir() + "/parakeet-tdt-0.6b-v2");
         QVERIFY(QDir().mkpath(bundle.path()));
         for (const QString &f : {paths.encoder, paths.decoder, paths.joiner}) {
             QFile file(f);
             QVERIFY(file.open(QIODevice::WriteOnly));
             file.write("x");
         }
-        QVERIFY(!ModelManager::parakeetModelPaths(vaultUrl).isComplete());
-        QVERIFY(!ModelManager::isModelDownloaded(vaultUrl, QString(ModelManager::kParakeetModelId)));
+        QVERIFY(!ModelManager::parakeetModelPaths().isComplete());
+        QVERIFY(!ModelManager::isModelDownloaded(QString(ModelManager::kParakeetModelId)));
 
         // The fourth (tokens) present ⇒ complete + downloaded.
         QFile tokens(paths.tokens);
         QVERIFY(tokens.open(QIODevice::WriteOnly));
         tokens.write("x");
-        QVERIFY(ModelManager::parakeetModelPaths(vaultUrl).isComplete());
-        QVERIFY(ModelManager::isModelDownloaded(vaultUrl, QString(ModelManager::kParakeetModelId)));
+        QVERIFY(ModelManager::parakeetModelPaths().isComplete());
+        QVERIFY(ModelManager::isModelDownloaded(QString(ModelManager::kParakeetModelId)));
     }
 
     // The documented default model is base.en ("balanced"), and it is one of
@@ -145,21 +186,18 @@ private slots:
 
     // --- Storage layout + no-redownload guarantee ---------------------------
 
-    // DESIGN.md vault layout: models live at <vault>/.transcriber/models/.
+    // DESIGN.md "Model management": models live in the app-global store.
     // If the ggml file is already there, ensureModel returns that exact path
     // WITHOUT downloading — the pre-created file's bytes are untouched and no
     // .part temp file appears (this test runs with no network).
     void ensureModel_returnsExistingFileWithoutDownloading()
     {
-        QTemporaryDir vault;
-        QVERIFY(vault.isValid());
         const QByteArray fakeBytes = "not a real ggml model — planted by the test";
-        const QString planted = plantFakeModel(vault.path(), "ggml-base.en.bin", fakeBytes);
+        const QString planted = plantFakeModel("ggml-base.en.bin", fakeBytes);
         QVERIFY(!planted.isEmpty());
 
         QString error;
-        const QString returned =
-            ModelManager::ensureModel(QUrl::fromLocalFile(vault.path()), "base.en", &error);
+        const QString returned = ModelManager::ensureModel("base.en", &error);
 
         QVERIFY2(error.isEmpty(), qPrintable(error));
         QCOMPARE(QFileInfo(returned).absoluteFilePath(), QFileInfo(planted).absoluteFilePath());
@@ -178,15 +216,12 @@ private slots:
     // letting the file read as if the requested model had been honored.
     void unknownModelId_fallsBackToDefaultModel_andSignalsIt()
     {
-        QTemporaryDir vault;
-        QVERIFY(vault.isValid());
-        const QString planted = plantFakeModel(vault.path(), "ggml-base.en.bin", "fake default model");
+        const QString planted = plantFakeModel("ggml-base.en.bin", "fake default model");
         QVERIFY(!planted.isEmpty());
 
         QString error;
         bool usedFallback = false;
-        const QString returned = ModelManager::ensureModel(
-            QUrl::fromLocalFile(vault.path()), "no-such-model", &error, &usedFallback);
+        const QString returned = ModelManager::ensureModel("no-such-model", &error, &usedFallback);
 
         QVERIFY2(error.isEmpty(), qPrintable(error));
         QCOMPARE(QFileInfo(returned).absoluteFilePath(), QFileInfo(planted).absoluteFilePath());
@@ -198,9 +233,6 @@ private slots:
     // transcription look like a fallback happened.
     void recognizedModelId_neverSignalsFallback()
     {
-        QTemporaryDir vault;
-        QVERIFY(vault.isValid());
-
         for (const ModelManager::ModelInfo &info : ModelManager::availableModels()) {
             // Parakeet's "fileName" is a bundle DIRECTORY, not a single ggml
             // file — its download path is separate (multi-file extract) and it
@@ -208,13 +240,12 @@ private slots:
             // doesn't apply. Covered by parakeetModel_isABundleGatedOnAllFourFiles.
             if (ModelManager::isParakeetModelId(info.id))
                 continue;
-            const QString planted = plantFakeModel(vault.path(), info.fileName, "fake model");
+            const QString planted = plantFakeModel(info.fileName, "fake model");
             QVERIFY(!planted.isEmpty());
 
             QString error;
             bool usedFallback = true; // deliberately wrong initial value
-            const QString returned = ModelManager::ensureModel(
-                QUrl::fromLocalFile(vault.path()), info.id, &error, &usedFallback);
+            const QString returned = ModelManager::ensureModel(info.id, &error, &usedFallback);
 
             QVERIFY2(error.isEmpty(), qPrintable(error));
             QCOMPARE(QFileInfo(returned).absoluteFilePath(), QFileInfo(planted).absoluteFilePath());
@@ -241,21 +272,22 @@ private slots:
     // no-redownload guarantee as ensureModel()/ensureLabelModel() above.
     void ensureDiarizationModels_returnsExistingFilesWithoutDownloading()
     {
-        QTemporaryDir vault;
-        QVERIFY(vault.isValid());
         const QByteArray segBytes = "not a real segmentation onnx model — planted by the test";
         const QByteArray embBytes = "not a real embedding onnx model — planted by the test";
         const QString plantedSeg =
-            plantFakeModel(vault.path(), QString(ModelManager::kDiarizationSegmentationFileName), segBytes);
+            plantFakeModel(QString(ModelManager::kDiarizationSegmentationFileName), segBytes);
         const QString plantedEmb =
-            plantFakeModel(vault.path(), QString(ModelManager::kDiarizationEmbeddingFileName), embBytes);
+            plantFakeModel(QString(ModelManager::kDiarizationEmbeddingFileName), embBytes);
         QVERIFY(!plantedSeg.isEmpty());
         QVERIFY(!plantedEmb.isEmpty());
 
         QString error;
         QString segOut, embOut;
-        const bool ok = ModelManager::ensureDiarizationModels(QUrl::fromLocalFile(vault.path()), &segOut, &embOut,
-                                                               &error);
+        // Default segmentation + embedding ids resolve to the planted default
+        // pair (kDiarizationSegmentationFileName / kDiarizationEmbeddingFileName).
+        const bool ok = ModelManager::ensureDiarizationModels(
+            QString(ModelManager::kDefaultSegmentationModelId), QString(ModelManager::kDefaultEmbeddingModelId),
+            &segOut, &embOut, &error);
 
         QVERIFY2(ok, qPrintable(error));
         QVERIFY2(error.isEmpty(), qPrintable(error));
@@ -279,19 +311,16 @@ private slots:
 
     // --- AI auto-labeling model (DESIGN.md "Model management") ---------------
 
-    // Same vault-scoped storage/no-redownload guarantee as ensureModel(), for
+    // Same app-global storage/no-redownload guarantee as ensureModel(), for
     // the one hardcoded label-model file — no per-size picker for this one.
     void ensureLabelModel_returnsExistingFileWithoutDownloading()
     {
-        QTemporaryDir vault;
-        QVERIFY(vault.isValid());
         const QByteArray fakeBytes = "not a real gguf model — planted by the test";
-        const QString planted =
-            plantFakeModel(vault.path(), QString(ModelManager::kLabelModelFileName), fakeBytes);
+        const QString planted = plantFakeModel(QString(ModelManager::kLabelModelFileName), fakeBytes);
         QVERIFY(!planted.isEmpty());
 
         QString error;
-        const QString returned = ModelManager::ensureLabelModel(QUrl::fromLocalFile(vault.path()), &error);
+        const QString returned = ModelManager::ensureLabelModel(&error);
 
         QVERIFY2(error.isEmpty(), qPrintable(error));
         QCOMPARE(QFileInfo(returned).absoluteFilePath(), QFileInfo(planted).absoluteFilePath());
@@ -303,6 +332,248 @@ private slots:
     {
         QSKIP("Download path deliberately untested: tests must pass with no network "
               "(would fetch ~2.5 GB from huggingface.co via curl).");
+    }
+
+    // --- Bundled-dir fallback (Settings → Models: search-path bundling) ------
+
+    // A model absent from the writable store but present in the read-only
+    // bundled dir resolves as downloaded, and ensureModel() returns the bundled
+    // path directly (no download). This is the durability escape hatch: a
+    // distributor can ship models beside the binary.
+    void bundledModel_resolvesAndIsUsedWithoutDownload()
+    {
+        const QByteArray bytes = "bundled fake model";
+        const QString bundled = plantBundledModel("ggml-base.en.bin", bytes);
+        QVERIFY(!bundled.isEmpty());
+
+        QVERIFY(ModelManager::isModelDownloaded("base.en"));
+        QVERIFY(ModelManager::isModelBundledOnly("base.en"));
+
+        QString error;
+        const QString returned = ModelManager::ensureModel("base.en", &error);
+        QVERIFY2(error.isEmpty(), qPrintable(error));
+        QCOMPARE(QFileInfo(returned).absoluteFilePath(), QFileInfo(bundled).absoluteFilePath());
+        QVERIFY(!QFileInfo::exists(bundled + ".part")); // never tried to download
+    }
+
+    // The store shadows the bundled dir: a file in BOTH resolves to the store
+    // copy, and it is no longer "bundled only".
+    void storeShadowsBundled()
+    {
+        plantBundledModel("ggml-base.en.bin", "bundled");
+        const QString store = plantFakeModel("ggml-base.en.bin", "store");
+        QCOMPARE(QFileInfo(ModelManager::ensureModel("base.en")).absoluteFilePath(),
+                 QFileInfo(store).absoluteFilePath());
+        QVERIFY(!ModelManager::isModelBundledOnly("base.en"));
+    }
+
+    // --- Delete (Settings → Models) ------------------------------------------
+
+    // deleteModel removes a store file and flips isModelDownloaded to false.
+    void deleteModel_removesFromStore()
+    {
+        plantFakeModel("ggml-base.en.bin", "fake");
+        QVERIFY(ModelManager::isModelDownloaded("base.en"));
+
+        QString error;
+        QVERIFY2(ModelManager::deleteModel("base.en", &error), qPrintable(error));
+        QVERIFY(!ModelManager::isModelDownloaded("base.en"));
+    }
+
+    // A bundled-only model can't be deleted (the bundled dir is read-only /
+    // shipped) — deleteModel reports failure and leaves the file in place.
+    void deleteModel_bundledOnly_refuses()
+    {
+        const QString bundled = plantBundledModel("ggml-base.en.bin", "bundled");
+        QVERIFY(ModelManager::isModelBundledOnly("base.en"));
+
+        QString error;
+        QVERIFY(!ModelManager::deleteModel("base.en", &error));
+        QVERIFY(!error.isEmpty());
+        QVERIFY(QFileInfo::exists(bundled)); // untouched
+    }
+
+    // Deleting the multi-file parakeet bundle removes the whole store subdir.
+    void deleteModel_parakeetBundle_removesDir()
+    {
+        const QDir bundle(ModelManager::modelsStoreDir() + "/parakeet-tdt-0.6b-v2");
+        QVERIFY(QDir().mkpath(bundle.path()));
+        for (const QString &f : {QStringLiteral("encoder.int8.onnx"), QStringLiteral("decoder.int8.onnx"),
+                                 QStringLiteral("joiner.int8.onnx"), QStringLiteral("tokens.txt")}) {
+            QFile file(bundle.filePath(f));
+            QVERIFY(file.open(QIODevice::WriteOnly));
+            file.write("x");
+        }
+        QVERIFY(ModelManager::isModelDownloaded(QString(ModelManager::kParakeetModelId)));
+        QString error;
+        QVERIFY2(ModelManager::deleteModel(QString(ModelManager::kParakeetModelId), &error), qPrintable(error));
+        QVERIFY(!QDir(bundle.path()).exists());
+        QVERIFY(!ModelManager::isModelDownloaded(QString(ModelManager::kParakeetModelId)));
+    }
+
+    // --- Import (Settings → Models) ------------------------------------------
+
+    // A single-file model imports from a FILE, copied into the store under its
+    // canonical name so it resolves as downloaded with no network.
+    void importModel_singleFile_copiesIntoStore()
+    {
+        // Source file the user "brings" — outside the store, any name.
+        QTemporaryDir src;
+        QVERIFY(src.isValid());
+        const QString srcPath = src.filePath("whatever-the-user-named-it.bin");
+        {
+            QFile f(srcPath);
+            QVERIFY(f.open(QIODevice::WriteOnly));
+            f.write("imported bytes");
+        }
+        QVERIFY(!ModelManager::isModelDownloaded("small.en"));
+
+        QString error;
+        QVERIFY2(ModelManager::importModel("small.en", srcPath, &error), qPrintable(error));
+        QVERIFY(ModelManager::isModelDownloaded("small.en"));
+        QCOMPARE(readAll(ModelManager::ensureModel("small.en")), QByteArray("imported bytes"));
+    }
+
+    // A single-file import rejects a directory source (wrong shape).
+    void importModel_singleFile_rejectsFolder()
+    {
+        QTemporaryDir src;
+        QString error;
+        QVERIFY(!ModelManager::importModel("small.en", src.path(), &error));
+        QVERIFY(!error.isEmpty());
+    }
+
+    // The parakeet bundle imports from a FOLDER holding its four files.
+    void importModel_parakeetBundle_fromFolder()
+    {
+        QTemporaryDir src;
+        QVERIFY(src.isValid());
+        for (const QString &f : {QStringLiteral("encoder.int8.onnx"), QStringLiteral("decoder.int8.onnx"),
+                                 QStringLiteral("joiner.int8.onnx"), QStringLiteral("tokens.txt")}) {
+            QFile file(src.filePath(f));
+            QVERIFY(file.open(QIODevice::WriteOnly));
+            file.write("x");
+        }
+        QString error;
+        QVERIFY2(ModelManager::importModel(QString(ModelManager::kParakeetModelId), src.path(), &error),
+                 qPrintable(error));
+        QVERIFY(ModelManager::isModelDownloaded(QString(ModelManager::kParakeetModelId)));
+    }
+
+    // A multi-file import fails if the folder is missing an expected file.
+    void importModel_parakeetBundle_missingFileFails()
+    {
+        QTemporaryDir src;
+        QVERIFY(src.isValid());
+        // only 3 of 4
+        for (const QString &f : {QStringLiteral("encoder.int8.onnx"), QStringLiteral("decoder.int8.onnx"),
+                                 QStringLiteral("joiner.int8.onnx")}) {
+            QFile file(src.filePath(f));
+            QVERIFY(file.open(QIODevice::WriteOnly));
+            file.write("x");
+        }
+        QString error;
+        QVERIFY(!ModelManager::importModel(QString(ModelManager::kParakeetModelId), src.path(), &error));
+        QVERIFY(!error.isEmpty());
+        QVERIFY(!ModelManager::isModelDownloaded(QString(ModelManager::kParakeetModelId)));
+    }
+
+    // --- Export (Settings → Models) ------------------------------------------
+
+    // Exporting a single-file model copies it into the chosen dir under its
+    // canonical name, re-importable as-is.
+    void exportModel_singleFile_copiesOut()
+    {
+        plantFakeModel("ggml-base.en.bin", "export me");
+        QTemporaryDir dest;
+        QVERIFY(dest.isValid());
+
+        QString error;
+        QVERIFY2(ModelManager::exportModel("base.en", dest.path(), &error), qPrintable(error));
+        const QString exported = dest.filePath("ggml-base.en.bin");
+        QVERIFY(QFileInfo::exists(exported));
+        QCOMPARE(readAll(exported), QByteArray("export me"));
+    }
+
+    // Export round-trips: a parakeet bundle exported to a folder re-imports.
+    void exportModel_parakeetBundle_roundTrips()
+    {
+        const QDir bundle(ModelManager::modelsStoreDir() + "/parakeet-tdt-0.6b-v2");
+        QVERIFY(QDir().mkpath(bundle.path()));
+        for (const QString &f : {QStringLiteral("encoder.int8.onnx"), QStringLiteral("decoder.int8.onnx"),
+                                 QStringLiteral("joiner.int8.onnx"), QStringLiteral("tokens.txt")}) {
+            QFile file(bundle.filePath(f));
+            QVERIFY(file.open(QIODevice::WriteOnly));
+            file.write("x");
+        }
+        QTemporaryDir dest;
+        QVERIFY(dest.isValid());
+        QString error;
+        QVERIFY2(ModelManager::exportModel(QString(ModelManager::kParakeetModelId), dest.path(), &error),
+                 qPrintable(error));
+        // Exported as a <bundle>/ subdir with all four files — the exact shape
+        // importModel expects back.
+        QVERIFY2(ModelManager::importModel(QString(ModelManager::kParakeetModelId),
+                                           dest.filePath("parakeet-tdt-0.6b-v2"), &error),
+                 qPrintable(error));
+    }
+
+    // Export refuses a model that isn't downloaded.
+    void exportModel_notDownloaded_fails()
+    {
+        QTemporaryDir dest;
+        QString error;
+        QVERIFY(!ModelManager::exportModel("base.en", dest.path(), &error));
+        QVERIFY(!error.isEmpty());
+    }
+
+    // --- Size ----------------------------------------------------------------
+
+    void modelSizeOnDisk_sumsPresentFiles()
+    {
+        QCOMPARE(ModelManager::modelSizeOnDisk("base.en"), qint64(0)); // absent
+        const QByteArray bytes(1234, 'x');
+        plantFakeModel("ggml-base.en.bin", bytes);
+        QCOMPARE(ModelManager::modelSizeOnDisk("base.en"), qint64(1234));
+    }
+
+    // Each selectable diarization sub-model (segmentation + embedding) is now
+    // its own single-file manageable id, routing through the same id-keyed ops.
+    void diarizationSubModels_areManaged()
+    {
+        const QString segId = QString(ModelManager::kDefaultSegmentationModelId);
+        const QString embedId = QString(ModelManager::kDefaultEmbeddingModelId);
+        plantFakeModel(QString(ModelManager::kDiarizationSegmentationFileName), QByteArray(10, 'a'));
+        plantFakeModel(QString(ModelManager::kDiarizationEmbeddingFileName), QByteArray(20, 'b'));
+        QCOMPARE(ModelManager::modelSizeOnDisk(segId), qint64(10));
+        QCOMPARE(ModelManager::modelSizeOnDisk(embedId), qint64(20));
+        QVERIFY(ModelManager::isSegmentationModelDownloaded(segId));
+        QVERIFY(ModelManager::isEmbeddingModelDownloaded(embedId));
+        QVERIFY(ModelManager::areDiarizationModelsDownloaded(segId, embedId));
+
+        QString error;
+        QVERIFY2(ModelManager::deleteModel(segId, &error), qPrintable(error));
+        QVERIFY(!ModelManager::isSegmentationModelDownloaded(segId));
+        QVERIFY(!ModelManager::areDiarizationModelsDownloaded(segId, embedId));
+        QVERIFY2(ModelManager::deleteModel(embedId, &error), qPrintable(error));
+        QVERIFY(!ModelManager::isEmbeddingModelDownloaded(embedId));
+    }
+
+    // An unrecognized segmentation/embedding id falls back to the default entry
+    // (never silently misrepresents which model ran — see ensureModel()).
+    void diarizationSubModels_unknownIdFallsBackToDefault()
+    {
+        bool usedFallback = false;
+        const ModelManager::DiarizationModelInfo &seg =
+            ModelManager::segmentationModelInfo(QStringLiteral("nope-not-a-model"), &usedFallback);
+        QVERIFY(usedFallback);
+        QCOMPARE(seg.id, QString(ModelManager::kDefaultSegmentationModelId));
+
+        usedFallback = false;
+        const ModelManager::DiarizationModelInfo &embed =
+            ModelManager::embeddingModelInfo(QString(ModelManager::kDefaultEmbeddingModelId), &usedFallback);
+        QVERIFY(!usedFallback);
+        QCOMPARE(embed.id, QString(ModelManager::kDefaultEmbeddingModelId));
     }
 };
 

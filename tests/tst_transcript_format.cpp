@@ -120,6 +120,11 @@ private slots:
     // QSettings, which must never touch the real ~/.config/suopTranscriber.
     void initTestCase() { QStandardPaths::setTestModeEnabled(true); }
 
+    // Models moved to an app-global store (ModelManager); each test then points
+    // SUOP_MODELS_DIR at its own temp models dir. Unset here so a prior test's
+    // now-deleted override never leaks in.
+    void init() { qunsetenv("SUOP_MODELS_DIR"); }
+
     // Frontmatter carries exactly the documented keys: model,
     // speakerDetection, transcribedAt. Booleans come back as real bools
     // (readMetadata maps the literal strings "true"/"false"), everything
@@ -978,6 +983,7 @@ private slots:
         QVERIFY(vault.isValid());
         const QString modelsDir = vault.path() + "/.transcriber/models";
         QVERIFY(QDir().mkpath(modelsDir));
+        qputenv("SUOP_MODELS_DIR", modelsDir.toLocal8Bit()); // app-global store -> this test's dir
         QVERIFY(QFile::copy(whisperModelPath, modelsDir + "/ggml-base.en.bin"));
         QVERIFY(QFile::copy(labelModelPath, modelsDir + "/Qwen3-4B-Instruct-2507-Q4_K_M.gguf"));
 
@@ -1376,6 +1382,7 @@ private slots:
         QVERIFY(vault.isValid());
         const QString modelsDir = vault.path() + "/.transcriber/models";
         QVERIFY(QDir().mkpath(modelsDir));
+        qputenv("SUOP_MODELS_DIR", modelsDir.toLocal8Bit()); // app-global store -> this test's dir
         // Plant the real model at the FALLBACK's target name (kDefaultModelId
         // == "base.en" -> "ggml-base.en.bin") so ensureModel's substitution
         // resolves to a model that actually loads, without ever downloading.
@@ -1462,6 +1469,7 @@ private slots:
         QVERIFY(vault.isValid());
         const QString modelsDir = vault.path() + "/.transcriber/models";
         QVERIFY(QDir().mkpath(modelsDir));
+        qputenv("SUOP_MODELS_DIR", modelsDir.toLocal8Bit()); // app-global store -> this test's dir
         QVERIFY(QFile::copy(modelPath, modelsDir + "/ggml-base.en.bin"));
         // Planted at ModelManager's exact expected local names (see
         // ModelManager::kDiarizationSegmentationFileName/
@@ -1528,6 +1536,7 @@ private slots:
         QVERIFY(vault.isValid());
         const QString modelsDir = vault.path() + "/.transcriber/models";
         QVERIFY(QDir().mkpath(modelsDir));
+        qputenv("SUOP_MODELS_DIR", modelsDir.toLocal8Bit()); // app-global store -> this test's dir
         QVERIFY(QFile::copy(modelPath, modelsDir + "/ggml-base.en.bin"));
         // Fake (empty, unloadable) diarization models — see comment above:
         // this makes ensureDiarizationModels() skip its (network-dependent)
@@ -1596,6 +1605,7 @@ private slots:
         QVERIFY(vault.isValid());
         const QString modelsDir = vault.path() + "/.transcriber/models";
         QVERIFY(QDir().mkpath(modelsDir));
+        qputenv("SUOP_MODELS_DIR", modelsDir.toLocal8Bit()); // app-global store -> this test's dir
         QVERIFY(QFile::copy(whisperModelPath, modelsDir + "/ggml-base.en.bin"));
         QVERIFY(QFile::copy(labelModelPath, modelsDir + "/Qwen3-4B-Instruct-2507-Q4_K_M.gguf"));
 
@@ -1660,6 +1670,7 @@ private slots:
         QVERIFY(vault.isValid());
         const QString modelsDir = vault.path() + "/.transcriber/models";
         QVERIFY(QDir().mkpath(modelsDir));
+        qputenv("SUOP_MODELS_DIR", modelsDir.toLocal8Bit()); // app-global store -> this test's dir
         QVERIFY(QFile::copy(whisperModelPath, modelsDir + "/ggml-base.en.bin"));
         QVERIFY(QFile::copy(labelModelPath, modelsDir + "/Qwen3-4B-Instruct-2507-Q4_K_M.gguf"));
 
@@ -1731,6 +1742,7 @@ private slots:
         QVERIFY(vault.isValid());
         const QString modelsDir = vault.path() + "/.transcriber/models";
         QVERIFY(QDir().mkpath(modelsDir));
+        qputenv("SUOP_MODELS_DIR", modelsDir.toLocal8Bit()); // app-global store -> this test's dir
         QVERIFY(QFile::copy(whisperModelPath, modelsDir + "/ggml-base.en.bin"));
         QVERIFY(QFile::copy(labelModelPath, modelsDir + "/Qwen3-4B-Instruct-2507-Q4_K_M.gguf"));
 

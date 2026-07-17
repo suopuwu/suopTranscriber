@@ -3,19 +3,49 @@ import QtQuick.Controls
 import QtQuick.Layouts
 import SuopTranscriber
 
-// Settings "Benchmark" page (mounted by SettingsPopup as page 4). Runs every
-// already-downloaded model + available engine over ONE vault audio file and
-// shows their transcripts side by side with simple heuristics (audio length,
-// run time, realtime factor, segment/word counts). Writes NO transcripts — the
-// only on-disk footprint is the last-run cache
-// (VaultTreeModel::writeBenchmarkLastRun), reloaded when the page reopens. All
-// transcription runs on the controller's worker thread (TranscriptionController::
-// runBenchmark), so the UI stays responsive; results stream in per model.
+// Benchmark page — a TOP-LEVEL page (its own TitleBar button, mounted by
+// MainPanel inside a ScrollView; promoted out of Settings). Two sweeps over ONE
+// file, both on the controller's worker thread so the UI stays responsive:
+//   1. Model benchmark — every downloaded transcription model + available engine
+//      over the file, transcripts side by side (TranscriptionController::
+//      runBenchmark). runtimeMs / realtime factor / segment-word counts.
+//   2. Diarization sweep — combinations of segmentation × embedding × sensitivity
+//      (runDiarizationBenchmark), reporting how many speakers each finds; guarded
+//      by a confirm above ~10 tests. This is how you settle "which combo actually
+//      splits a hard far-field recording".
+// Writes NO transcripts — the model benchmark's only on-disk footprint is the
+// last-run cache (VaultTreeModel::writeBenchmarkLastRun), reloaded on show.
+// Defaults to the file open in the left panel (currentFilePath); onShown() (fired
+// via the `active` flag) refreshes lists since a gated parent hides it.
 ColumnLayout {
     id: benchmarkPage
 
     property var transcriptionController: null
     property var vaultTreeModel: null
+
+    // B2: the file open/highlighted in the left panel (fed from MainPanel's
+    // "current file" expression). When the page opens, the benchmark defaults to
+    // this file; empty ⇒ fall back to the vault-wide picker below.
+    property string currentFilePath: ""
+
+    // Set by the enclosing ScrollView's visibility (this page's own `visible`
+    // stays true; onVisibleChanged wouldn't fire when a gated parent hides it).
+    // Drives the on-show refresh below.
+    property bool active: false
+    onActiveChanged: if (active) benchmarkPage.onShown()
+
+    function onShown() {
+        // The vault is loaded by now — gather the file list, detect engines
+        // lazily, restore the last run, and default to the open file.
+        benchmarkPage.refreshAudioFiles()
+        if (!benchmarkPage.enginesDetected)
+            Qt.callLater(benchmarkPage.detectEngines)
+        if (benchmarkPage.results.length === 0)
+            benchmarkPage.loadLastRun()
+        if (benchmarkPage.currentFilePath !== "")
+            benchmarkPage.selectedFilePath = benchmarkPage.currentFilePath
+        benchmarkPage.refreshDiarizationModels()
+    }
 
     spacing: 10
 
@@ -108,17 +138,98 @@ ColumnLayout {
         benchmarkPage.transcriptionController.runBenchmark("file://" + benchmarkPage.selectedFilePath, ids)
     }
 
-    onVisibleChanged: {
-        if (visible) {
-            // The vault is loaded by the time a user opens this page — this is
-            // where the file list is actually gathered (see audioFiles).
-            benchmarkPage.refreshAudioFiles()
-            if (!benchmarkPage.enginesDetected)
-                Qt.callLater(benchmarkPage.detectEngines)
-            if (benchmarkPage.results.length === 0)
-                benchmarkPage.loadLastRun()
-        }
+    // --- Diarization sweep (segmentation × embedding × sensitivity) -----------
+    property var segModels: []
+    property var embedModels: []
+    property var selectedSegIds: []
+    property var selectedEmbedIds: []
+    // The candidate sensitivity values a sweep can include (B4 warning triggers
+    // on the full combo count = segs × embeds × thresholds).
+    readonly property var thresholdChoices: [0.3, 0.4, 0.5, 0.6, 0.7]
+    property var selectedThresholds: [0.3, 0.5, 0.7]
+    property var diarizationResults: []
+    property bool diarizationRunning: false
+    property string diarizationStatus: ""
+
+    function refreshDiarizationModels() {
+        if (!benchmarkPage.transcriptionController)
+            return
+        benchmarkPage.segModels = benchmarkPage.transcriptionController.availableSegmentationModels()
+        benchmarkPage.embedModels = benchmarkPage.transcriptionController.availableEmbeddingModels()
+        // Default the selection to the currently-configured pair the first time.
+        if (benchmarkPage.selectedSegIds.length === 0)
+            benchmarkPage.selectedSegIds = [AppSettings.diarizationSegmentationModel]
+        if (benchmarkPage.selectedEmbedIds.length === 0)
+            benchmarkPage.selectedEmbedIds = [AppSettings.diarizationEmbeddingModel]
     }
+
+    function toggleIn(arr, val) {
+        const copy = arr.slice()
+        const i = copy.indexOf(val)
+        if (i >= 0)
+            copy.splice(i, 1)
+        else
+            copy.push(val)
+        return copy
+    }
+
+    function labelForId(list, id) {
+        for (let i = 0; i < list.length; i++)
+            if (list[i].id === id)
+                return list[i].label
+        return id
+    }
+
+    function diarizationComboCount() {
+        return benchmarkPage.selectedSegIds.length * benchmarkPage.selectedEmbedIds.length
+                * benchmarkPage.selectedThresholds.length
+    }
+
+    function buildDiarizationCombos() {
+        const combos = []
+        const segs = benchmarkPage.selectedSegIds
+        const embs = benchmarkPage.selectedEmbedIds
+        const ths = benchmarkPage.selectedThresholds.slice().sort(function (a, b) { return a - b })
+        for (let s = 0; s < segs.length; s++)
+            for (let e = 0; e < embs.length; e++)
+                for (let t = 0; t < ths.length; t++)
+                    combos.push({
+                        segmentationModelId: segs[s],
+                        embeddingModelId: embs[e],
+                        threshold: ths[t],
+                        label: benchmarkPage.labelForId(benchmarkPage.segModels, segs[s]) + "  +  "
+                               + benchmarkPage.labelForId(benchmarkPage.embedModels, embs[e]) + "  @ "
+                               + ths[t].toFixed(2)
+                    })
+        return combos
+    }
+
+    // B4: guard a large sweep behind a confirm.
+    function startDiarizationBenchmark() {
+        if (!benchmarkPage.transcriptionController || benchmarkPage.selectedFilePath === "")
+            return
+        const combos = benchmarkPage.buildDiarizationCombos()
+        if (combos.length === 0) {
+            benchmarkPage.diarizationStatus = qsTr("Pick at least one segmentation model, one embedding model, "
+                                                   + "and one sensitivity.")
+            return
+        }
+        if (combos.length > 10) {
+            diarizationConfirmDialog.pendingCombos = combos
+            diarizationConfirmDialog.open()
+            return
+        }
+        benchmarkPage.runDiarizationSweep(combos)
+    }
+
+    function runDiarizationSweep(combos) {
+        benchmarkPage.diarizationResults = []
+        benchmarkPage.diarizationRunning = true
+        benchmarkPage.diarizationStatus = qsTr("Starting %1 tests…").arg(combos.length)
+        benchmarkPage.transcriptionController.runDiarizationBenchmark(
+                    "file://" + benchmarkPage.selectedFilePath, combos)
+    }
+
     Component.onCompleted: {
         benchmarkPage.refreshAudioFiles()
         benchmarkPage.loadLastRun()
@@ -144,7 +255,37 @@ ColumnLayout {
         }
         function onBenchmarkFailed(error) {
             benchmarkPage.running = false
+            benchmarkPage.diarizationRunning = false
             benchmarkPage.statusText = qsTr("Failed: %1").arg(error)
+        }
+
+        function onDiarizationBenchmarkComboStarted(label, index, total) {
+            benchmarkPage.diarizationStatus = qsTr("Running %1 of %2…").arg(index + 1).arg(total)
+        }
+        function onDiarizationBenchmarkComboDone(result) {
+            benchmarkPage.diarizationResults = benchmarkPage.diarizationResults.concat([result])
+        }
+        function onDiarizationBenchmarkFinished(run) {
+            benchmarkPage.diarizationRunning = false
+            benchmarkPage.diarizationResults = run.results
+            benchmarkPage.diarizationStatus = run.cancelled ? qsTr("Cancelled.") : qsTr("Done.")
+        }
+    }
+
+    // B4: confirmation before a large sweep.
+    Dialog {
+        id: diarizationConfirmDialog
+        property var pendingCombos: []
+        modal: true
+        anchors.centerIn: Overlay.overlay
+        title: qsTr("Run a large sweep?")
+        standardButtons: Dialog.Ok | Dialog.Cancel
+        onAccepted: benchmarkPage.runDiarizationSweep(diarizationConfirmDialog.pendingCombos)
+        contentItem: Label {
+            wrapMode: Text.WordWrap
+            text: qsTr("This runs %1 diarization tests over the file — each loads models and runs a full "
+                       + "pass, so it can take a while. Continue?").arg(diarizationConfirmDialog.pendingCombos.length)
+            color: "white"
         }
     }
 
@@ -374,6 +515,214 @@ ColumnLayout {
                             HoverHandler { cursorShape: Qt.IBeamCursor }
                         }
                     }
+                }
+            }
+        }
+    }
+
+    // ===== Diarization sweep =================================================
+    Rectangle {
+        Layout.fillWidth: true
+        Layout.topMargin: 12
+        Layout.preferredHeight: 1
+        color: "#3a3a3a"
+    }
+
+    Label {
+        text: qsTr("Diarization sweep")
+        color: "white"
+        font.bold: true
+    }
+    Label {
+        Layout.fillWidth: true
+        wrapMode: Text.WordWrap
+        text: qsTr("Run combinations of segmentation × embedding × sensitivity over the same file and "
+                   + "compare how many speakers each finds. Only downloaded models run (manage them under "
+                   + "Models). Nothing is saved to the vault.")
+        color: "#aaaaaa"
+        font.pixelSize: 12
+    }
+
+    // Segmentation model checkboxes.
+    Label { text: qsTr("Segmentation models"); color: "#dddddd"; font.pixelSize: 12 }
+    Flow {
+        Layout.fillWidth: true
+        spacing: 12
+        Repeater {
+            model: benchmarkPage.segModels
+            CheckBox {
+                required property var modelData
+                text: modelData.label + (modelData.downloaded ? "" : qsTr(" (not downloaded)"))
+                enabled: modelData.downloaded
+                checked: benchmarkPage.selectedSegIds.indexOf(modelData.id) >= 0
+                contentItem: Label {
+                    text: parent.text
+                    color: parent.enabled ? "white" : "#777777"
+                    leftPadding: parent.indicator.width + 6
+                    verticalAlignment: Text.AlignVCenter
+                }
+                onToggled: benchmarkPage.selectedSegIds = benchmarkPage.toggleIn(benchmarkPage.selectedSegIds,
+                                                                                  modelData.id)
+                HoverHandler { cursorShape: Qt.PointingHandCursor; enabled: parent.enabled }
+            }
+        }
+    }
+
+    // Embedding model checkboxes.
+    Label { text: qsTr("Embedding models"); color: "#dddddd"; font.pixelSize: 12 }
+    Flow {
+        Layout.fillWidth: true
+        spacing: 12
+        Repeater {
+            model: benchmarkPage.embedModels
+            CheckBox {
+                required property var modelData
+                text: modelData.label + (modelData.downloaded ? "" : qsTr(" (not downloaded)"))
+                enabled: modelData.downloaded
+                checked: benchmarkPage.selectedEmbedIds.indexOf(modelData.id) >= 0
+                contentItem: Label {
+                    text: parent.text
+                    color: parent.enabled ? "white" : "#777777"
+                    leftPadding: parent.indicator.width + 6
+                    verticalAlignment: Text.AlignVCenter
+                }
+                onToggled: benchmarkPage.selectedEmbedIds = benchmarkPage.toggleIn(benchmarkPage.selectedEmbedIds,
+                                                                                    modelData.id)
+                HoverHandler { cursorShape: Qt.PointingHandCursor; enabled: parent.enabled }
+            }
+        }
+    }
+
+    // Sensitivity value chips.
+    Label { text: qsTr("Sensitivity values (lower = more speakers)"); color: "#dddddd"; font.pixelSize: 12 }
+    Flow {
+        Layout.fillWidth: true
+        spacing: 12
+        Repeater {
+            model: benchmarkPage.thresholdChoices
+            CheckBox {
+                required property var modelData
+                text: Number(modelData).toFixed(2)
+                checked: benchmarkPage.selectedThresholds.indexOf(modelData) >= 0
+                contentItem: Label {
+                    text: parent.text
+                    color: "white"
+                    leftPadding: parent.indicator.width + 6
+                    verticalAlignment: Text.AlignVCenter
+                }
+                onToggled: benchmarkPage.selectedThresholds = benchmarkPage.toggleIn(benchmarkPage.selectedThresholds,
+                                                                                      modelData)
+                HoverHandler { cursorShape: Qt.PointingHandCursor }
+            }
+        }
+    }
+
+    RowLayout {
+        Layout.fillWidth: true
+        spacing: 8
+        Label {
+            Layout.fillWidth: true
+            text: qsTr("%1 tests").arg(benchmarkPage.diarizationComboCount())
+                  + (benchmarkPage.diarizationComboCount() > 10 ? qsTr("  ⚠ large sweep") : "")
+            color: benchmarkPage.diarizationComboCount() > 10 ? "#c9a227" : "#dddddd"
+            font.pixelSize: 12
+        }
+        Button {
+            id: diarRunButton
+            text: benchmarkPage.diarizationRunning ? qsTr("Running…") : qsTr("Run diarization sweep")
+            enabled: !benchmarkPage.diarizationRunning && benchmarkPage.selectedFilePath !== ""
+                     && benchmarkPage.diarizationComboCount() > 0
+            opacity: enabled ? 1 : 0.4
+            onClicked: benchmarkPage.startDiarizationBenchmark()
+            background: Rectangle {
+                radius: AppSettings.borderRadius
+                color: (diarRunButton.hovered && diarRunButton.enabled) ? "#3a3a3a" : "#2a2a2a"
+                border.width: 1
+                border.color: "#3a3a3a"
+            }
+            HoverHandler { cursorShape: Qt.PointingHandCursor; enabled: diarRunButton.enabled }
+            HoverBorder { anchors.fill: parent; active: diarRunButton.enabled && diarRunButton.hovered }
+        }
+        Button {
+            id: diarCancelButton
+            visible: benchmarkPage.diarizationRunning
+            text: qsTr("Cancel")
+            onClicked: if (benchmarkPage.transcriptionController) benchmarkPage.transcriptionController.cancelBenchmark()
+            background: Rectangle {
+                radius: AppSettings.borderRadius
+                color: diarCancelButton.hovered ? "#3a3a3a" : "#2a2a2a"
+                border.width: 1
+                border.color: "#3a3a3a"
+            }
+            HoverHandler { cursorShape: Qt.PointingHandCursor }
+            HoverBorder { anchors.fill: parent; active: diarCancelButton.hovered }
+        }
+    }
+
+    Label {
+        visible: benchmarkPage.diarizationStatus !== ""
+        text: benchmarkPage.diarizationStatus
+        color: "#cccccc"
+        font.pixelSize: 12
+    }
+
+    // Diarization result cards — speaker count is the money metric.
+    Repeater {
+        model: benchmarkPage.diarizationResults
+        Rectangle {
+            required property var modelData
+            Layout.fillWidth: true
+            Layout.preferredHeight: diarCardCol.implicitHeight + 16
+            radius: AppSettings.borderRadius
+            color: "#2a2a2a"
+            border.width: 1
+            border.color: "#3a3a3a"
+
+            ColumnLayout {
+                id: diarCardCol
+                anchors.top: parent.top
+                anchors.left: parent.left
+                anchors.right: parent.right
+                anchors.margins: 8
+                spacing: 4
+
+                RowLayout {
+                    Layout.fillWidth: true
+                    spacing: 8
+                    Label {
+                        Layout.fillWidth: true
+                        text: modelData.label
+                        color: "white"
+                        font.bold: true
+                        font.pixelSize: 13
+                        elide: Text.ElideRight
+                    }
+                    Label {
+                        visible: modelData.ok === true
+                        text: modelData.speakerCount === 1
+                              ? qsTr("1 speaker")
+                              : qsTr("%1 speakers").arg(modelData.speakerCount || 0)
+                        color: (modelData.speakerCount || 0) > 1 ? "#8fce9e" : "#c98500"
+                        font.bold: true
+                        font.pixelSize: 13
+                    }
+                }
+                Label {
+                    visible: modelData.ok === true
+                    text: qsTr("%1 turns · %2s · %3× realtime")
+                          .arg(modelData.turnCount || 0)
+                          .arg(((modelData.runtimeMs || 0) / 1000).toFixed(1))
+                          .arg((modelData.realtimeFactor || 0).toFixed(1))
+                    color: "#999999"
+                    font.pixelSize: 11
+                }
+                Label {
+                    visible: modelData.ok !== true
+                    Layout.fillWidth: true
+                    wrapMode: Text.WordWrap
+                    text: qsTr("Skipped: %1").arg(modelData.error || qsTr("unavailable"))
+                    color: "#c98500"
+                    font.pixelSize: 12
                 }
             }
         }
