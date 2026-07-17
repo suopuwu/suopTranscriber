@@ -50,21 +50,28 @@ private slots:
     // writing/labeling — see tst_engine_contract.cpp's
     // multiChunkStitch_producesGloballyOrderedOffsetSegments().
 
-    void subprocessEngines_manifestAndCapabilities()
-    {
-        QSKIP("DESIGN.md 'Pluggable engines': out-of-process engines added by dropping a folder "
-              "with manifest.json {name, command, capabilities{languages, gpu, vram_gb_min}}, "
-              "enumerated at startup with GPU + model-file capability detection (unrunnable "
-              "engines grayed out). NOT BUILT: no SubprocessEngine, no manifest handling. The "
-              "JSONL wire protocol itself is tracked in tst_engine_contract.");
-    }
+    // subprocessEngines_manifestAndCapabilities: BUILT. DESIGN.md "Pluggable
+    // engines" is now real — EngineManifest parses manifest.json
+    // {name, command, capabilities{languages, gpu, vram_gb_min}}
+    // (tst_enginemanifest); EngineRegistry discovers engine folders (bundled +
+    // <vault>/.transcriber/engines) and capability-detects them against
+    // GpuProbe + a dependency self-test + model presence, graying out
+    // unrunnable ones with a reason rather than dropping them
+    // (tst_engineregistry); SubprocessEngine drives an engine's command via
+    // QProcess and parses the JSONL wire protocol (tst_subprocessengine,
+    // against a fake engine script). TranscriptionController selects an engine
+    // via the "engine:" model-id prefix and exposes availableEngines() to QML.
+    // The bundled Parakeet engine (engines/parakeet/) ships as a
+    // verified-by-contract skeleton — it needs NeMo installed to actually run.
 
     void modelManagement_uiAndRegistry()
     {
-        QSKIP("DESIGN.md 'Model management': a model download/management UI backed by a registry "
-              "in vault config. PARTIAL: models auto-download to <vault>/.transcriber/models/ and "
-              "a fixed 4-model dropdown exists (covered by tst_modelmanager), but there is no "
-              "registry and no management UI.");
+        QSKIP("DESIGN.md 'Model management': a whisper-model download/management UI backed by a "
+              "registry in vault config. STILL PARTIAL: whisper tiers auto-download to "
+              "<vault>/.transcriber/models/ and a fixed dropdown exists (tst_modelmanager); "
+              "out-of-process ENGINES now DO have a real registry + capability detection "
+              "(EngineRegistry, availableEngines(), see subprocessEngines_* note above), but a "
+              "general whisper-model download/management UI is still not built.");
     }
 
     void vaultConfigJson_appScopedSettingsDivergence()

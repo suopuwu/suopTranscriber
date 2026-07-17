@@ -1,5 +1,6 @@
 #include "TranscriptionController.h"
 
+#include <QCoreApplication>
 #include <QDateTime>
 #include <QDebug>
 #include <QDir>
@@ -38,6 +39,10 @@
 #include "ModelManager.h"
 #include "RegexValidation.h"
 #include "Segment.h"
+#include "EngineRegistry.h"
+#include "GpuProbe.h"
+#include "ParakeetEngine.h"
+#include "SubprocessEngine.h"
 #include "VadChunker.h"
 #include "WhisperCppEngine.h"
 
@@ -1411,6 +1416,111 @@ QList<int> computeChapterWindows(const QStringList &segmentTexts)
     return windowStarts;
 }
 
+// --- Out-of-process engine discovery (DESIGN.md "Pluggable engines") -------
+//
+// A transcription model id is either a whisper ggml id ("base.en",
+// "large-v3", resolved by ModelManager) or an out-of-process engine, written
+// with the literal "engine:" prefix ("engine:parakeet"). These helpers turn
+// the latter into a runnable SubprocessEngine, and back the availableEngines()
+// capability list. All are free functions (internal linkage) so both the
+// worker thread and the controller's availableEngines() can call them — they
+// only do filesystem/process probing, no shared mutable state.
+
+constexpr auto kEngineIdPrefix = "engine:";
+
+bool isEngineModelId(const QString &modelId)
+{
+    return modelId.startsWith(QLatin1String(kEngineIdPrefix));
+}
+
+QString engineIdFromModelId(const QString &modelId)
+{
+    return isEngineModelId(modelId) ? modelId.mid(int(qstrlen(kEngineIdPrefix))) : QString();
+}
+
+// The read-only bundled engines dir shipped beside the app. Checked in a few
+// install-layout-tolerant spots, with an env override for dev/tests. Empty if
+// none exist (then only vault-local engines are discovered).
+QString bundledEnginesDir()
+{
+    const QString env = qEnvironmentVariable("SUOP_ENGINES_DIR");
+    if (!env.isEmpty() && QDir(env).exists())
+        return QDir(env).absolutePath();
+    const QString appDir = QCoreApplication::applicationDirPath();
+    const QStringList candidates{appDir + QStringLiteral("/engines"), appDir + QStringLiteral("/../engines"),
+                                 appDir + QStringLiteral("/../share/suopTranscriber/engines")};
+    for (const QString &candidate : candidates) {
+        if (QDir(candidate).exists())
+            return QDir(candidate).absolutePath();
+    }
+    return QString();
+}
+
+// Engine root search path: bundled first, then the vault's own
+// .transcriber/engines (which overrides bundled by id, per EngineRegistry).
+QStringList engineRootDirs(const QString &vaultPath)
+{
+    QStringList roots;
+    const QString bundled = bundledEnginesDir();
+    if (!bundled.isEmpty())
+        roots << bundled;
+    if (!vaultPath.isEmpty())
+        roots << QDir(vaultPath).filePath(QStringLiteral(".transcriber/engines"));
+    return roots;
+}
+
+// "Are this engine's runtime deps installed?" — runs its command with an extra
+// --selftest arg (the run.py exits 0 iff its imports resolve, WITHOUT loading a
+// model). Best-effort: a missing interpreter / an engine that doesn't support
+// --selftest reads as "deps absent", i.e. grayed out with a reason.
+bool engineDepsPresent(const EngineDescriptor &desc)
+{
+    if (desc.manifest.command.isEmpty())
+        return false;
+    QProcess probe;
+    probe.setWorkingDirectory(desc.dir);
+    QStringList args = desc.manifest.command.mid(1);
+    args << QStringLiteral("--selftest");
+    probe.start(desc.manifest.command.first(), args);
+    if (!probe.waitForStarted(3000))
+        return false;
+    if (!probe.waitForFinished(20000)) {
+        probe.kill();
+        probe.waitForFinished(500);
+        return false;
+    }
+    return probe.exitStatus() == QProcess::NormalExit && probe.exitCode() == 0;
+}
+
+// Discovers every engine visible to `vaultPath`, capability-checked against
+// this machine. GPU is probed once per process (nvidia-smi/vulkaninfo are
+// slow-ish and static). Model presence is delegated to ModelManager.
+std::vector<EngineDescriptor> discoverEngines(const QString &vaultPath)
+{
+    static const GpuStatus gpu = GpuProbe::probe();
+    const QUrl vaultUrl = QUrl::fromLocalFile(vaultPath);
+    return EngineRegistry::discover(
+        engineRootDirs(vaultPath), gpu, [](const EngineDescriptor &d) { return engineDepsPresent(d); },
+        [vaultUrl](const EngineDescriptor &d) { return ModelManager::isEngineModelPresent(vaultUrl, d.id); });
+}
+
+// Finds one engine by id for the transcribe path. Returns nullopt (with *error
+// set) if it doesn't exist; a found-but-unavailable engine is returned so the
+// caller can surface .unavailableReason.
+std::optional<EngineDescriptor> resolveEngine(const QString &engineId, const QString &vaultPath, QString *error)
+{
+    for (const EngineDescriptor &desc : discoverEngines(vaultPath)) {
+        if (desc.id == engineId) {
+            if (!desc.available && error)
+                *error = desc.unavailableReason;
+            return desc;
+        }
+    }
+    if (error)
+        *error = QStringLiteral("engine \"%1\" not found").arg(engineId);
+    return std::nullopt;
+}
+
 // Lives on TranscriptionController's dedicated QThread; never touches the
 // GUI thread. Owns the warm WhisperCppEngine so the model stays resident
 // across transcribe() calls.
@@ -1475,28 +1585,64 @@ public slots:
         // ~1.5GB) can take a real, previously-unexplained-looking delay here.
         emit phase(QStringLiteral("loading"));
 
+        // A model id with the "engine:" prefix routes to an out-of-process
+        // SubprocessEngine (DESIGN.md "Pluggable engines"); anything else is a
+        // whisper ggml tier resolved by ModelManager. Everything downstream —
+        // diarization, VAD-windowing (whisper only, see below), the offset
+        // merge, frontmatter, labeling — is engine-agnostic because the
+        // abstraction is at the Segment level.
+        const bool useSubprocessEngine = isEngineModelId(modelId);
+        // Parakeet is in-process (sherpa-onnx, like whisper) but a different
+        // engine class + a multi-file ONNX bundle. It resolves through
+        // ensureModel() (which returns the bundle dir) and uses VAD windowing
+        // like whisper — only its engine construction differs.
+        const bool useParakeet = ModelManager::isParakeetModelId(modelId);
         QString error;
         bool modelFallback = false;
-        const QString modelPath =
-            ModelManager::ensureModel(QUrl::fromLocalFile(vaultPath), modelId, &error, &modelFallback);
-        if (modelPath.isEmpty()) {
-            emit finished(false, error.isEmpty() ? QStringLiteral("model unavailable") : error);
-            return;
+        QString modelPath;     // ggml file path (whisper) OR the "engine:" id (subprocess) — also the reuse key
+        QString modelUsedName; // frontmatter "model" field: ggml file name, or the engine's display name
+        EngineDescriptor engineDesc;
+
+        if (useSubprocessEngine) {
+            const auto desc = resolveEngine(engineIdFromModelId(modelId), vaultPath, &error);
+            if (!desc || !desc->available) {
+                emit finished(false, error.isEmpty() ? QStringLiteral("engine unavailable") : error);
+                return;
+            }
+            engineDesc = *desc;
+            modelPath = modelId;
+            modelUsedName = desc->manifest.name;
+        } else {
+            modelPath = ModelManager::ensureModel(QUrl::fromLocalFile(vaultPath), modelId, &error, &modelFallback);
+            if (modelPath.isEmpty()) {
+                emit finished(false, error.isEmpty() ? QStringLiteral("model unavailable") : error);
+                return;
+            }
+            modelUsedName = QFileInfo(modelPath).fileName();
         }
 
-        // Item 50 (why "stop" can't be instant here): the model load below is
-        // a single blocking whisper.cpp call (whisper_init_from_file_with_params)
-        // with NO abort hook — unlike whisper_full()'s abort_callback (see
-        // onAbort further down) or ffmpeg decode (a real killable subprocess).
-        // There is simply no interruption point to check a pause/cancel flag
-        // AT during a load, so pause is a no-op during "loading" (see
-        // pauseActive()) and a cancel requested here only takes effect at the
-        // next real checkpoint after the load returns. This is a genuine hard
-        // limitation of the native call, not something this app can fix
-        // cooperatively — documented so it's discoverable rather than looking
-        // like a missing feature.
+        // Item 50 (why "stop" can't be instant here): the whisper model load
+        // below is a single blocking whisper.cpp call
+        // (whisper_init_from_file_with_params) with NO abort hook — unlike
+        // whisper_full()'s abort_callback (see onAbort further down) or ffmpeg
+        // decode (a real killable subprocess). There is simply no interruption
+        // point to check a pause/cancel flag AT during a load, so pause is a
+        // no-op during "loading" (see pauseActive()) and a cancel requested
+        // here only takes effect at the next real checkpoint after the load
+        // returns. This is a genuine hard limitation of the native call, not
+        // something this app can fix cooperatively — documented so it's
+        // discoverable rather than looking like a missing feature. (A
+        // subprocess engine constructs instantly and validates lazily at spawn
+        // time, so none of this applies to it.)
         if (!m_engine || m_engine->isValid() == false || m_modelPath != modelPath) {
-            m_engine = std::make_unique<WhisperCppEngine>(modelPath);
+            if (useSubprocessEngine)
+                m_engine = std::make_unique<SubprocessEngine>(engineDesc.manifest, engineDesc.dir);
+            else if (useParakeet) {
+                const ModelManager::ParakeetModelPaths p =
+                    ModelManager::parakeetModelPaths(QUrl::fromLocalFile(vaultPath));
+                m_engine = std::make_unique<ParakeetEngine>(p.encoder, p.decoder, p.joiner, p.tokens);
+            } else
+                m_engine = std::make_unique<WhisperCppEngine>(modelPath);
             m_modelPath = modelPath;
         }
         if (!m_engine->isValid()) {
@@ -1605,11 +1751,19 @@ public slots:
         // a no-op.
         m_diarizationEngine.reset();
 
-        // Reload whisper now that diarization's GPU footprint is gone (see
-        // the eviction above) — a no-op if speaker detection wasn't
-        // requested, since m_engine was never evicted in that case.
+        // Reload the engine now that diarization's GPU footprint is gone (see
+        // the eviction above) — a no-op if speaker detection wasn't requested,
+        // since m_engine was never evicted in that case. Same engine:model
+        // branch as the first construction above.
         if (!m_engine || !m_engine->isValid() || m_modelPath != modelPath) {
-            m_engine = std::make_unique<WhisperCppEngine>(modelPath);
+            if (useSubprocessEngine)
+                m_engine = std::make_unique<SubprocessEngine>(engineDesc.manifest, engineDesc.dir);
+            else if (useParakeet) {
+                const ModelManager::ParakeetModelPaths p =
+                    ModelManager::parakeetModelPaths(QUrl::fromLocalFile(vaultPath));
+                m_engine = std::make_unique<ParakeetEngine>(p.encoder, p.decoder, p.joiner, p.tokens);
+            } else
+                m_engine = std::make_unique<WhisperCppEngine>(modelPath);
             m_modelPath = modelPath;
         }
         if (!m_engine->isValid()) {
@@ -1638,24 +1792,36 @@ public slots:
         // honestly in frontmatter below, same contract as speaker detection's
         // speakerDetectionError.
         QString vadError;
-        const QString vadModelPath = ModelManager::ensureVadModel(QUrl::fromLocalFile(vaultPath), &vadError);
         std::vector<VadChunker::Window> windows;
         bool vadActive = false;
-        if (!vadModelPath.isEmpty()) {
-            QString chunkingError;
-            windows = VadChunker::computeWindows(*pcm, vadModelPath, &chunkingError);
-            if (chunkingError.isEmpty())
-                vadActive = true;
-            else
-                vadError = chunkingError;
-        }
-        if (windows.empty())
+        if (useSubprocessEngine) {
+            // Out-of-process engines load a heavy model per process and do
+            // their own internal segmentation, so we feed the whole file as ONE
+            // chunk (one spawn) rather than VAD-windowing it into many spawns
+            // (v1 decision — a persistent multi-chunk worker process is a later
+            // optimization). whisper.cpp's own VAD gating is a WhisperCppEngine
+            // feature and simply doesn't apply here.
             windows.push_back({0.0, static_cast<double>(pcm->size()) / 16000.0});
-        // Reset on every job (not just a failure this time) — m_engine is a
-        // persistent member reused across jobs/files, so a PREVIOUS job's
-        // successful VAD path must not silently leak into this one if this
-        // job's VAD failed.
-        m_engine->setVadModelPath(vadActive ? vadModelPath : QString());
+        } else {
+            const QString vadModelPath = ModelManager::ensureVadModel(QUrl::fromLocalFile(vaultPath), &vadError);
+            if (!vadModelPath.isEmpty()) {
+                QString chunkingError;
+                windows = VadChunker::computeWindows(*pcm, vadModelPath, &chunkingError);
+                if (chunkingError.isEmpty())
+                    vadActive = true;
+                else
+                    vadError = chunkingError;
+            }
+            if (windows.empty())
+                windows.push_back({0.0, static_cast<double>(pcm->size()) / 16000.0});
+            // Reset on every job (not just a failure this time) — m_engine is a
+            // persistent member reused across jobs/files, so a PREVIOUS job's
+            // successful VAD path must not silently leak into this one if this
+            // job's VAD failed. Guarded to the concrete whisper engine (VAD
+            // gating is its feature); a subprocess engine never reaches here.
+            if (auto *whisper = dynamic_cast<WhisperCppEngine *>(m_engine.get()))
+                whisper->setVadModelPath(vadActive ? vadModelPath : QString());
+        }
 
         QFile mdFile(sidecarPath(filePath));
         if (!mdFile.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
@@ -1667,7 +1833,7 @@ public slots:
         for (int i = 1; i <= distinctSpeakerCount(diarizedTurns); ++i)
             speakerLabels.append(QStringLiteral("Speaker %1").arg(i));
 
-        writeFrontmatter(mdFile, QFileInfo(modelPath).fileName(), effectiveSpeakerDetection, modelFallback, modelId,
+        writeFrontmatter(mdFile, modelUsedName, effectiveSpeakerDetection, modelFallback, modelId,
                           speakerLabels, speakerDetectionError, vadActive, vadError);
         SegmentLineWriter lineWriter(mdFile);
 
@@ -1784,6 +1950,59 @@ public slots:
         }
         emit phaseDurationMs(QStringLiteral("transcribing"), phaseTimer.elapsed());
         emit finished(true, {});
+    }
+
+    // Model benchmark (Settings "Benchmark" page): runs each requested model /
+    // engine over ONE audio file, in memory, purely for comparison — writes NO
+    // .md, touches no queue or vault state, decodes the audio ONCE and reuses
+    // it across models. Deliberately a slot on this same worker (not a separate
+    // thread) so it serializes with real transcription jobs and never contends
+    // with them for the GPU. modelIds is exactly what to run (the Settings page
+    // filters to downloaded whisper tiers + available engines — the "only
+    // downloaded models" policy lives there, where availableModels()/
+    // availableEngines() give it the info). Reports each model's result as it
+    // finishes via benchmarkModelDone, and the whole run via benchmarkFinished
+    // (which the page persists through VaultTreeModel::writeBenchmarkLastRun).
+    void benchmarkJob(const QString &filePath, const QString &vaultPath, const QStringList &modelIds)
+    {
+        resetControl(); // a benchmark is cancellable via the same atomics jobs use
+
+        QString decodeError;
+        auto pcm = AudioDecoder::decodeTo16kMono(filePath, &decodeError);
+        if (!pcm) {
+            emit benchmarkFailed(decodeError.isEmpty() ? QStringLiteral("audio decode failed") : decodeError);
+            return;
+        }
+        const double audioSeconds = static_cast<double>(pcm->size()) / 16000.0;
+
+        AudioChunk chunk;
+        chunk.pcm16kMono = *pcm;
+        chunk.offsetSeconds = 0.0; // whole file, single chunk — no offset merge needed for display
+
+        const AbortCallback onAbort = [this] { return isCancelRequested(); };
+        QVariantList results;
+        QElapsedTimer totalTimer;
+        totalTimer.start();
+
+        for (int i = 0; i < modelIds.size(); ++i) {
+            if (isCancelRequested())
+                break;
+            const QString modelId = modelIds.at(i);
+            emit benchmarkModelStarted(modelId, i, modelIds.size());
+
+            QVariantMap result = runOneBenchmarkModel(modelId, vaultPath, chunk, audioSeconds, onAbort);
+            results.append(result);
+            emit benchmarkModelDone(result);
+        }
+
+        QVariantMap run;
+        run["file"] = filePath;
+        run["fileName"] = QFileInfo(filePath).fileName();
+        run["audioSeconds"] = audioSeconds;
+        run["totalRuntimeMs"] = static_cast<qint64>(totalTimer.elapsed());
+        run["cancelled"] = isCancelRequested();
+        run["results"] = results;
+        emit benchmarkFinished(run);
     }
 
     // "Regenerate auto-title" (item 9): re-runs JUST the labeling pass on an
@@ -2492,8 +2711,107 @@ signals:
     void speakerRenamed(const QString &path, const QString &oldName, bool ok, const QString &error);
     void speakersMerged(const QString &path, const QString &sourceName, const QString &targetName, bool ok,
                          const QString &error);
+    // Model-benchmark progress (see benchmarkJob()): started per model (with
+    // its index/total for a progress bar), done per model (the finished result
+    // row), finished once with the whole run, or failed before any model ran
+    // (e.g. audio decode failed).
+    void benchmarkModelStarted(const QString &modelId, int index, int total);
+    void benchmarkModelDone(const QVariantMap &result);
+    void benchmarkFinished(const QVariantMap &run);
+    void benchmarkFailed(const QString &error);
 
 private:
+    // Runs one model/engine for benchmarkJob() and returns its result row. Never
+    // writes anything; an unavailable/failed model becomes a row with ok=false
+    // and a reason rather than aborting the whole benchmark. runtimeMs measures
+    // ONLY transcribe() (model load happens before the timer starts, so tiers
+    // aren't penalized for cold-load differences the way the file's own
+    // transcription would be).
+    QVariantMap runOneBenchmarkModel(const QString &modelId, const QString &vaultPath, const AudioChunk &chunk,
+                                     double audioSeconds, const AbortCallback &onAbort)
+    {
+        QVariantMap row;
+        row["modelId"] = modelId;
+
+        std::unique_ptr<TranscriptionEngine> engine;
+        if (isEngineModelId(modelId)) {
+            QString error;
+            const auto desc = resolveEngine(engineIdFromModelId(modelId), vaultPath, &error);
+            row["kind"] = QStringLiteral("engine");
+            row["label"] = desc && desc->manifestValid ? desc->manifest.name : engineIdFromModelId(modelId);
+            if (!desc || !desc->available) {
+                row["ok"] = false;
+                row["error"] = error.isEmpty() ? QStringLiteral("engine unavailable") : error;
+                return row;
+            }
+            engine = std::make_unique<SubprocessEngine>(desc->manifest, desc->dir);
+        } else if (ModelManager::isParakeetModelId(modelId)) {
+            row["kind"] = QStringLiteral("parakeet");
+            row["label"] = modelId;
+            const ModelManager::ParakeetModelPaths p =
+                ModelManager::parakeetModelPaths(QUrl::fromLocalFile(vaultPath));
+            if (!p.isComplete()) {
+                row["ok"] = false;
+                row["error"] = QStringLiteral("model not downloaded");
+                return row;
+            }
+            auto parakeet = std::make_unique<ParakeetEngine>(p.encoder, p.decoder, p.joiner, p.tokens);
+            if (!parakeet->isValid()) {
+                row["ok"] = false;
+                row["error"] = QStringLiteral("failed to load Parakeet model");
+                return row;
+            }
+            engine = std::move(parakeet);
+        } else {
+            row["kind"] = QStringLiteral("whisper");
+            row["label"] = modelId;
+            QString error;
+            // Only downloaded tiers are passed in, so ensureModel() resolves the
+            // existing file without a network fetch.
+            const QString modelPath = ModelManager::ensureModel(QUrl::fromLocalFile(vaultPath), modelId, &error);
+            if (modelPath.isEmpty()) {
+                row["ok"] = false;
+                row["error"] = error.isEmpty() ? QStringLiteral("model unavailable") : error;
+                return row;
+            }
+            auto whisper = std::make_unique<WhisperCppEngine>(modelPath);
+            if (!whisper->isValid()) {
+                row["ok"] = false;
+                row["error"] = QStringLiteral("failed to load model");
+                return row;
+            }
+            engine = std::move(whisper);
+        }
+
+        QElapsedTimer timer;
+        timer.start();
+        const std::vector<Segment> segments = engine->transcribe(chunk, {}, {}, onAbort);
+        const qint64 runtimeMs = timer.elapsed();
+
+        QString text;
+        int wordCount = 0;
+        for (const Segment &seg : segments) {
+            const QString segText = QString::fromStdString(seg.text).trimmed();
+            if (segText.isEmpty())
+                continue;
+            if (!text.isEmpty())
+                text += QLatin1Char(' ');
+            text += segText;
+            wordCount += segText.split(QRegularExpression(QStringLiteral("\\s+")), Qt::SkipEmptyParts).size();
+        }
+
+        row["ok"] = true;
+        row["runtimeMs"] = runtimeMs;
+        row["segmentCount"] = static_cast<int>(segments.size());
+        row["wordCount"] = wordCount;
+        row["charCount"] = text.size();
+        // Realtime factor: seconds of audio processed per second of wall clock
+        // (>1 = faster than realtime). 0 if it somehow finished instantly.
+        row["realtimeFactor"] = runtimeMs > 0 ? audioSeconds / (runtimeMs / 1000.0) : 0.0;
+        row["text"] = text;
+        return row;
+    }
+
     // Item 52: the diarization core shared by BOTH the inline transcribe path
     // (run(), gated by its speakerDetection toggle) and the standalone
     // diarizeJob(). Ensures + loads the diarization models, emits the
@@ -2619,7 +2937,12 @@ private:
         return true;
     }
 
-    std::unique_ptr<WhisperCppEngine> m_engine;
+    // Base-interface pointer so the in-process WhisperCppEngine and an
+    // out-of-process SubprocessEngine are swappable behind transcribe() (see
+    // DESIGN.md "Engine architecture"). m_modelPath doubles as the reuse key:
+    // the ggml file path for whisper, or the "engine:<id>" id for a subprocess
+    // engine — either way, an unchanged key skips a reload.
+    std::unique_ptr<TranscriptionEngine> m_engine;
     QString m_modelPath;
     std::unique_ptr<LabelingEngine> m_labelingEngine;
     QString m_labelModelPath;
@@ -2762,6 +3085,14 @@ TranscriptionController::TranscriptionController(QObject *parent)
                    const QString &error) {
                 emit speakersMerged(QUrl::fromLocalFile(path), sourceName, targetName, ok, error);
             });
+    // Benchmark signals are plain value pass-throughs (worker emits on the
+    // worker thread; the queued connection marshals them to the GUI thread).
+    connect(m_worker, &TranscriptionWorker::benchmarkModelStarted, this,
+            &TranscriptionController::benchmarkModelStarted);
+    connect(m_worker, &TranscriptionWorker::benchmarkModelDone, this,
+            &TranscriptionController::benchmarkModelDone);
+    connect(m_worker, &TranscriptionWorker::benchmarkFinished, this, &TranscriptionController::benchmarkFinished);
+    connect(m_worker, &TranscriptionWorker::benchmarkFailed, this, &TranscriptionController::benchmarkFailed);
     m_thread.start();
 }
 
@@ -5259,6 +5590,43 @@ QVariantList TranscriptionController::availableModels() const
         // lets the model dropdown show which tiers would need a fresh
         // download vs. start immediately.
         entry["downloaded"] = ModelManager::isModelDownloaded(m_vaultUrl, info.id);
+        list.append(entry);
+    }
+    return list;
+}
+
+void TranscriptionController::runBenchmark(const QUrl &fileUrl, const QStringList &modelIds)
+{
+    // Dispatched onto the worker thread's event loop — serializes behind any
+    // in-flight job (no GPU contention), then runs benchmarkJob(). No queue
+    // entry, no file writes; results arrive via the benchmark* signals. Uses
+    // the currently-open vault, same as availableModels()/availableEngines().
+    QMetaObject::invokeMethod(m_worker, "benchmarkJob", Qt::QueuedConnection,
+                              Q_ARG(QString, fileUrl.toLocalFile()), Q_ARG(QString, m_vaultUrl.toLocalFile()),
+                              Q_ARG(QStringList, modelIds));
+}
+
+void TranscriptionController::cancelBenchmark()
+{
+    if (m_worker)
+        m_worker->requestCancel();
+}
+
+QVariantList TranscriptionController::availableEngines() const
+{
+    QVariantList list;
+    const QString vaultPath = m_vaultUrl.toLocalFile();
+    for (const EngineDescriptor &desc : discoverEngines(vaultPath)) {
+        QVariantMap entry;
+        entry["id"] = desc.id;
+        entry["modelId"] = QString::fromLatin1(kEngineIdPrefix) + desc.id;
+        entry["label"] = desc.manifestValid ? desc.manifest.name : desc.id;
+        entry["available"] = desc.available;
+        entry["unavailableReason"] = desc.unavailableReason;
+        // "downloaded" mirrors the model dropdown's own flag so the UI can
+        // reuse the same treatment; for an engine it's specifically whether the
+        // engine's model file is present for this vault.
+        entry["downloaded"] = ModelManager::isEngineModelPresent(m_vaultUrl, desc.id);
         list.append(entry);
     }
     return list;

@@ -1384,6 +1384,53 @@ bool VaultTreeModel::appendUsbGrabHistoryEntry(const QVariantMap &entry, QString
     return true;
 }
 
+QVariantMap VaultTreeModel::readBenchmarkLastRun() const
+{
+    QVariantMap result;
+    const QString localPath = vaultLocalPath();
+    if (localPath.isEmpty())
+        return result;
+
+    QFile file(localPath + QStringLiteral("/.transcriber/benchmarkLastRun.json"));
+    if (!file.open(QIODevice::ReadOnly))
+        return result;
+
+    const QJsonDocument doc = QJsonDocument::fromJson(file.readAll());
+    if (!doc.isObject())
+        return result;
+    return doc.object().toVariantMap();
+}
+
+bool VaultTreeModel::writeBenchmarkLastRun(const QVariantMap &run, QString *errorOut) const
+{
+    const QString localPath = vaultLocalPath();
+    if (localPath.isEmpty()) {
+        if (errorOut)
+            *errorOut = QStringLiteral("no vault open");
+        return false;
+    }
+
+    const QDir configDir(localPath + QStringLiteral("/.transcriber"));
+    if (!configDir.mkpath(QStringLiteral("."))) {
+        if (errorOut)
+            *errorOut = QStringLiteral("could not create %1").arg(configDir.path());
+        return false;
+    }
+
+    // Overwrite each run (not appended, unlike usbGrabHistory) — only the last
+    // benchmark is kept.
+    QFile file(configDir.filePath(QStringLiteral("benchmarkLastRun.json")));
+    if (!file.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
+        if (errorOut)
+            *errorOut = QStringLiteral("could not open %1 for writing").arg(file.fileName());
+        return false;
+    }
+
+    const QJsonDocument doc(QJsonObject::fromVariantMap(run));
+    file.write(doc.toJson(QJsonDocument::Indented));
+    return true;
+}
+
 QStringList VaultTreeModel::allAudioPaths() const
 {
     QStringList out;

@@ -119,6 +119,37 @@ class TstTranscriptionQueue : public QObject
     Q_OBJECT
 
 private slots:
+    // The model benchmark (benchmarkJob) is display-only: it must NEVER write a
+    // transcript .md or otherwise mutate the vault (that's the whole point —
+    // "doing so changes no files"). No QQuickView/model-run harness here to
+    // drive a real benchmark end-to-end, so this is a source-scan guard on the
+    // benchmarkJob body (same technique as tst_styleguide's guards): a future
+    // edit that reaches for sidecarPath()/writeFrontmatter()/a SegmentLineWriter
+    // inside benchmarkJob trips it.
+    void benchmarkJob_writesNoTranscriptFiles()
+    {
+        QFile src(QStringLiteral(SUOP_SRC_DIR "/core/TranscriptionController.cpp"));
+        QVERIFY2(src.open(QIODevice::ReadOnly), "TranscriptionController.cpp must be readable");
+        const QString all = QString::fromUtf8(src.readAll());
+
+        const int start = all.indexOf(QStringLiteral("void benchmarkJob("));
+        QVERIFY2(start >= 0, "benchmarkJob must exist");
+        // Body ends where the next helper (runOneBenchmarkModel, declared right
+        // after in the private section, or the following slot) begins.
+        int end = all.indexOf(QStringLiteral("runOneBenchmarkModel"), start);
+        if (end < 0)
+            end = all.indexOf(QStringLiteral("void relabelJob("), start);
+        QVERIFY(end > start);
+        const QString body = all.mid(start, end - start);
+
+        QVERIFY2(!body.contains(QStringLiteral("sidecarPath(")),
+                 "benchmarkJob must not resolve a transcript sidecar path (it writes no files)");
+        QVERIFY2(!body.contains(QStringLiteral("writeFrontmatter(")),
+                 "benchmarkJob must not write frontmatter (it writes no files)");
+        QVERIFY2(!body.contains(QStringLiteral("SegmentLineWriter")),
+                 "benchmarkJob must not open a SegmentLineWriter (it writes no files)");
+    }
+
     // TranscriptionController persists rolling-average phase timing via a
     // plain QSettings() (see RollingAverage.h / loadPhaseTimings()) — CLAUDE.md
     // "Never let testing touch the user's real vault or app config" applies

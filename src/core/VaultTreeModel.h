@@ -273,6 +273,16 @@ public:
     // timestamp/deviceSerial/deviceLabel/filesCopied/filesSkipped/errors.
     Q_INVOKABLE bool appendUsbGrabHistoryEntry(const QVariantMap &entry, QString *errorOut = nullptr) const;
 
+    // Model-benchmark last-run cache (`.transcriber/benchmarkLastRun.json`) —
+    // same `.transcriber/`-creates-if-missing behavior as the settings/history
+    // files above, JSON root an object. Unlike the grab history this is
+    // OVERWRITTEN each run (only the most recent benchmark is kept, per the
+    // feature spec). Empty map if no vault is open or no benchmark has run yet.
+    // The benchmark itself writes no transcripts — this cache is its only
+    // on-disk footprint.
+    Q_INVOKABLE QVariantMap readBenchmarkLastRun() const;
+    Q_INVOKABLE bool writeBenchmarkLastRun(const QVariantMap &run, QString *errorOut = nullptr) const;
+
     // Every audio file's absolute path in the vault, transcribed or not —
     // walks the full tree rather than relying on which TreeView rows happen
     // to be realized (Sidebar's untranscribedPaths/transcribedPaths only

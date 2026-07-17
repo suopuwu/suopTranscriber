@@ -1,0 +1,9 @@
+{
+  "name": "Parakeet TDT 0.6B v2 (NVIDIA NeMo)",
+  "command": ["python3", "run.py"],
+  "capabilities": {
+    "languages": ["en"],
+    "gpu": "cuda",
+    "vram_gb_min": 4
+  }
+}

@@ -2175,6 +2175,45 @@ private slots:
         QCOMPARE(readBack.value(QStringLiteral("sidebarBackgroundColor")).toString(), QStringLiteral("#112233"));
     }
 
+    // Benchmark last-run cache round-trips through its own hidden JSON file and
+    // is OVERWRITTEN (not appended) each write — only the most recent run is
+    // kept, per the Benchmark page's spec.
+    void benchmarkLastRun_roundTripsAndOverwrites()
+    {
+        QTemporaryDir vault;
+        QVERIFY(vault.isValid());
+
+        VaultTreeModel model;
+        model.setVaultPath(QUrl::fromLocalFile(vault.path()));
+
+        // Nothing written yet ⇒ empty map, not an error.
+        QVERIFY(model.readBenchmarkLastRun().isEmpty());
+
+        QVariantMap first;
+        first[QStringLiteral("fileName")] = QStringLiteral("a.mp3");
+        first[QStringLiteral("audioSeconds")] = 42.0;
+        first[QStringLiteral("results")] = QVariantList{QVariantMap{{QStringLiteral("modelId"), QStringLiteral("base.en")}}};
+
+        QString error;
+        QVERIFY2(model.writeBenchmarkLastRun(first, &error), qPrintable(error));
+        QVERIFY(QFileInfo::exists(vault.filePath(".transcriber/benchmarkLastRun.json")));
+
+        QVariantMap readBack = model.readBenchmarkLastRun();
+        QCOMPARE(readBack.value(QStringLiteral("fileName")).toString(), QStringLiteral("a.mp3"));
+        QCOMPARE(readBack.value(QStringLiteral("audioSeconds")).toDouble(), 42.0);
+        QCOMPARE(readBack.value(QStringLiteral("results")).toList().size(), 1);
+
+        // A second write replaces the first entirely (overwrite, not append).
+        QVariantMap second;
+        second[QStringLiteral("fileName")] = QStringLiteral("b.wav");
+        second[QStringLiteral("results")] = QVariantList{};
+        QVERIFY(model.writeBenchmarkLastRun(second));
+
+        readBack = model.readBenchmarkLastRun();
+        QCOMPARE(readBack.value(QStringLiteral("fileName")).toString(), QStringLiteral("b.wav"));
+        QVERIFY(!readBack.contains(QStringLiteral("audioSeconds")));
+    }
+
     // The settings file lives inside .transcriber/, which is itself a hidden
     // dotdir (QDir's default filters exclude it), so neither it nor its
     // contents ever appear as a tree node even though it sits at the vault

@@ -220,6 +220,7 @@ qt_add_qml_module(suopTranscriber
         qml/MainPanel.qml
         qml/BottomBar.qml
         qml/SettingsPopup.qml
+        qml/BenchmarkPage.qml
         qml/MiddleDragScroll.qml
     RESOURCES
         ${SUOP_ICON_ASSETS}
@@ -256,6 +257,16 @@ qt_add_qml_module(suopTranscriber
         src/core/AudioDecoder.cpp
         src/core/WhisperCppEngine.h
         src/core/WhisperCppEngine.cpp
+        src/core/ParakeetEngine.h
+        src/core/ParakeetEngine.cpp
+        src/core/EngineManifest.h
+        src/core/EngineManifest.cpp
+        src/core/GpuProbe.h
+        src/core/GpuProbe.cpp
+        src/core/SubprocessEngine.h
+        src/core/SubprocessEngine.cpp
+        src/core/EngineRegistry.h
+        src/core/EngineRegistry.cpp
         src/core/VadChunker.h
         src/core/VadChunker.cpp
         src/core/LabelingEngine.h

@@ -48,6 +48,33 @@ Rectangle {
     readonly property bool showTranscribingOverlay: mainPanel.transcribingThisFile
         && mainPanel.awaitingFirstSegment
     onTranscribingThisFileChanged: mainPanel.awaitingFirstSegment = mainPanel.transcribingThisFile
+
+    // The per-file action icons below (regenerate label, generate chapters,
+    // detect speakers, the delete trio) grey out while a job for THEIR file is
+    // queued/active/paused and must re-enable the instant it clears. They used
+    // to gate their `enabled` on transcriptionController.isQueued(url)
+    // directly — but that is a plain Q_INVOKABLE, and reading it inside a
+    // binding subscribes the binding to NOTHING. So the binding was evaluated
+    // once (while the file was still Active → greyed) and then never re-ran
+    // when the job left the queue, leaving the button greyed until some
+    // UNRELATED re-eval happened to fire it (e.g. reopening the file — exactly
+    // the "leave and re-enter to enable them" the user hit). This list is the
+    // same Queued/Active/Paused set isQueued() reports, but built entirely from
+    // reactive Q_PROPERTYs so every binding that reads it re-evaluates on
+    // queueChanged/busyChanged/currentFileChanged: queuedFileUrls covers the
+    // Queued jobs; busy+currentFile covers the single Active-or-Paused one
+    // (only the running job is ever busy, and a pause leaves busy true, see
+    // TranscriptionController — so this pair captures both Active and Paused).
+    readonly property var busyOrQueuedUrls: {
+        const c = mainPanel.transcriptionController
+        if (!c)
+            return []
+        const urls = c.queuedFileUrls.map(u => u.toString())
+        if (c.busy && c.currentFile.toString() !== "")
+            urls.push(c.currentFile.toString())
+        return urls
+    }
+
     signal openVaultRequested()
     // Item 16 (Wave E): a tag pill was clicked — Main.qml routes this to
     // sidebar.applyTagFilter(tag).
@@ -1816,10 +1843,37 @@ Rectangle {
     }
     Connections {
         target: mainPanel.transcriptionController
-        function onFinished() {
+        function onFinished(fileUrl, ok, error) {
             mainPanel.refreshMetadata()
             mainPanel.refreshPreludeAndChapters()
             mainPanel.refreshOrphanedMetadata()
+            // None of the three refreshes above touch the transcript BODY
+            // (transcriptBody/sentences) — during a live job that's driven only
+            // by the throttled liveUpdateTick (onLiveUpdateTickChanged below).
+            // An engine that streams segments one at a time (whisper.cpp) keeps
+            // that current, but one that emits a whole VAD window's segments in
+            // a single burst after a blocking decode (Parakeet via sherpa-onnx)
+            // collapses that burst to ONE tick — so every segment written after
+            // it, up to the whole transcript for a sub-3-minute single-window
+            // file, never lands on screen until a file switch reloads it. Reload
+            // the finished file's body here so the tail always shows, and — if
+            // the user was following at the bottom — keep them pinned there (the
+            // onTranscriptBodyChanged follow can't do it: busy is already false
+            // by the time finished() fires, so its own guard is off). Guarded on
+            // the finished file still being the open one so a background job for
+            // another file never yanks what you're reading.
+            if (ok && mainPanel.player
+                    && fileUrl.toString() === mainPanel.player.source.toString()) {
+                const flick = transcriptScrollView.contentItem
+                const nearBottomThreshold = 40
+                const wasAtBottom = flick.contentY >= flick.contentHeight - flick.height - nearBottomThreshold
+                mainPanel.refreshTranscriptSync()
+                if (wasAtBottom) {
+                    Qt.callLater(function () {
+                        flick.contentY = Math.max(0, flick.contentHeight - flick.height)
+                    })
+                }
+            }
         }
         // Item 10: frontmatter is written at job START (durability, see
         // TranscriptionController), before any segment lines exist — so
@@ -2486,7 +2540,7 @@ Rectangle {
                          && (mainPanel.orphanedMdPath !== "" || mainPanel.hasStoredMetadata)
                 readonly property url targetUrl: mainPanel.orphanedMdPath !== ""
                     ? ("file://" + mainPanel.orphanedMdPath) : mainPanel.player.source
-                enabled: visible && !mainPanel.transcriptionController.isQueued(regenerateLabelButton.targetUrl)
+                enabled: visible && mainPanel.busyOrQueuedUrls.indexOf(regenerateLabelButton.targetUrl.toString()) === -1
 
                 ToolTip.visible: regenerateLabelHover.hovered
                 ToolTip.text: qsTr("Regenerate label and prelude")
@@ -2535,7 +2589,7 @@ Rectangle {
                          && (mainPanel.orphanedMdPath !== "" || mainPanel.hasStoredMetadata)
                 readonly property url targetUrl: mainPanel.orphanedMdPath !== ""
                     ? ("file://" + mainPanel.orphanedMdPath) : mainPanel.player.source
-                enabled: visible && !mainPanel.transcriptionController.isQueued(generateChaptersButton.targetUrl)
+                enabled: visible && mainPanel.busyOrQueuedUrls.indexOf(generateChaptersButton.targetUrl.toString()) === -1
 
                 ToolTip.visible: generateChaptersHover.hovered
                 ToolTip.text: qsTr("Generate chapters")
@@ -2583,7 +2637,7 @@ Rectangle {
                 visible: mainPanel.transcriptionController
                          && mainPanel.orphanedMdPath === "" && mainPanel.hasStoredMetadata
                 readonly property url targetUrl: mainPanel.player.source
-                enabled: visible && !mainPanel.transcriptionController.isQueued(detectSpeakersButton.targetUrl)
+                enabled: visible && mainPanel.busyOrQueuedUrls.indexOf(detectSpeakersButton.targetUrl.toString()) === -1
 
                 ToolTip.visible: detectSpeakersHover.hovered
                 ToolTip.text: qsTr("Detect speakers")
@@ -2625,7 +2679,7 @@ Rectangle {
                 visible: mainPanel.transcriptionController && mainPanel.vaultTreeModel && mainPanel.player
                          && mainPanel.orphanedMdPath === "" && mainPanel.hasStoredMetadata
                 readonly property url targetUrl: mainPanel.player.source
-                enabled: visible && !mainPanel.transcriptionController.isQueued(deleteTranscriptButton.targetUrl)
+                enabled: visible && mainPanel.busyOrQueuedUrls.indexOf(deleteTranscriptButton.targetUrl.toString()) === -1
 
                 ToolTip.visible: deleteTranscriptHover.hovered
                 ToolTip.text: qsTr("Delete transcript (keep audio)")
@@ -2666,7 +2720,7 @@ Rectangle {
                 visible: mainPanel.transcriptionController && mainPanel.vaultTreeModel && mainPanel.player
                          && mainPanel.orphanedMdPath === "" && mainPanel.hasStoredMetadata
                 readonly property url targetUrl: mainPanel.player.source
-                enabled: visible && !mainPanel.transcriptionController.isQueued(deleteAudioOnlyButton.targetUrl)
+                enabled: visible && mainPanel.busyOrQueuedUrls.indexOf(deleteAudioOnlyButton.targetUrl.toString()) === -1
 
                 ToolTip.visible: deleteAudioOnlyHover.hovered
                 ToolTip.text: qsTr("Delete audio (keep transcript)")
@@ -2705,8 +2759,7 @@ Rectangle {
                          && (mainPanel.orphanedMdPath !== ""
                              || (mainPanel.player && mainPanel.player.source.toString() !== ""))
                 readonly property url targetUrl: mainPanel.currentFileUrl()
-                enabled: visible && (!mainPanel.transcriptionController
-                         || !mainPanel.transcriptionController.isQueued(deleteFileButton.targetUrl))
+                enabled: visible && mainPanel.busyOrQueuedUrls.indexOf(deleteFileButton.targetUrl.toString()) === -1
 
                 ToolTip.visible: deleteFileHover.hovered
                 ToolTip.text: qsTr("Delete file")

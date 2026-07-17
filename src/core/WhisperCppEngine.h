@@ -19,7 +19,7 @@ public:
     explicit WhisperCppEngine(const QString &modelPath);
     ~WhisperCppEngine() override;
 
-    bool isValid() const { return m_ctx != nullptr; }
+    bool isValid() const override { return m_ctx != nullptr; }
 
     std::vector<Segment> transcribe(const AudioChunk &chunk, const ProgressCallback &onProgress,
                                      const SegmentCallback &onSegment,

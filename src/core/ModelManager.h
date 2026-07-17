@@ -32,6 +32,30 @@ const std::vector<ModelInfo> &availableModels();
 
 constexpr auto kDefaultModelId = "base.en";
 
+// In-process NVIDIA Parakeet-TDT, run via sherpa-onnx's OfflineRecognizer (see
+// ParakeetEngine) — NOT whisper ggml and NOT an out-of-process subprocess
+// engine. It appears in availableModels() like the whisper tiers, but its
+// "model" is a multi-file ONNX bundle (encoder/decoder/joiner + tokens)
+// downloaded/extracted from k2-fsa's release, so modelFileName()/
+// isModelDownloaded()/ensureModel() special-case this id. ensureModel()
+// returns the bundle DIRECTORY path for it; parakeetModelPaths() resolves the
+// four files inside.
+constexpr auto kParakeetModelId = "parakeet-tdt-0.6b-v2";
+
+bool isParakeetModelId(const QString &modelId);
+
+struct ParakeetModelPaths {
+    QString encoder;
+    QString decoder;
+    QString joiner;
+    QString tokens;
+    bool isComplete() const;
+};
+
+// Absolute paths to the Parakeet bundle's files for this vault (whether or not
+// they exist yet). isComplete() is true iff all four are present on disk.
+ParakeetModelPaths parakeetModelPaths(const QUrl &vaultPath);
+
 // Wave N (task system, item 5): resolves modelId to its ggml file name
 // without touching disk/network — lets a caller check "is this already
 // downloaded" (see isModelDownloaded()) before deciding whether a separate
@@ -103,6 +127,14 @@ QString ensureLabelModel(const QUrl &vaultPath, QString *errorOut = nullptr,
 // windowing, single whole-file chunk, recorded honestly in frontmatter),
 // same contract as ensureDiarizationModels().
 constexpr auto kVadModelFileName = "ggml-silero-v5.1.2.bin";
+
+// Whether an out-of-process engine's model is present for this vault (see
+// DESIGN.md "Pluggable engines" capability detection). True when the engine
+// ships no app-managed model file — i.e. its runtime fetches its own weights
+// (Parakeet via NeMo's from_pretrained/HF cache), so a missing file never
+// gates it here; its availability is instead gated by its dependencies. Never
+// downloads.
+bool isEngineModelPresent(const QUrl &vaultPath, const QString &engineId);
 
 // Returns true if kVadModelFileName already exists — never downloads.
 bool isVadModelDownloaded(const QUrl &vaultPath);

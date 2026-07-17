@@ -13,6 +13,21 @@
 
 namespace ModelManager {
 
+namespace {
+// Parakeet ONNX bundle (in-process via sherpa-onnx — see ParakeetEngine).
+// k2-fsa's int8 export on the sherpa-onnx `asr-models` release: a .tar.bz2
+// whose top dir holds encoder/decoder/joiner .int8.onnx + tokens.txt. We
+// extract it (strip the archive's top dir) into <models>/<kParakeetBundleDirName>/.
+constexpr auto kParakeetBundleDirName = "parakeet-tdt-0.6b-v2";
+constexpr auto kParakeetArchiveUrl =
+    "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/"
+    "sherpa-onnx-nemo-parakeet-tdt-0.6b-v2-int8.tar.bz2";
+constexpr auto kParakeetEncoderFile = "encoder.int8.onnx";
+constexpr auto kParakeetDecoderFile = "decoder.int8.onnx";
+constexpr auto kParakeetJoinerFile = "joiner.int8.onnx";
+constexpr auto kParakeetTokensFile = "tokens.txt";
+} // namespace
+
 const std::vector<ModelInfo> &availableModels()
 {
     static const std::vector<ModelInfo> models = {
@@ -24,6 +39,11 @@ const std::vector<ModelInfo> &availableModels()
         // multilingual-only, so (unlike the four entries above) this one
         // must not claim "(English)".
         {"large-v3", "ggml-large-v3.bin", "Large (multilingual, most accurate) — ~3.1 GB"},
+        // In-process NeMo Parakeet-TDT via sherpa-onnx (see ParakeetEngine).
+        // fileName is the extracted bundle DIRECTORY (not a single ggml file) —
+        // modelFileName()/isModelDownloaded()/ensureModel() special-case this id.
+        {kParakeetModelId, kParakeetBundleDirName,
+         "Parakeet TDT 0.6B v2 (English, NVIDIA) — ~630 MB, fast + accurate"},
     };
     return models;
 }
@@ -44,10 +64,49 @@ QDir modelsDirFor(const QUrl &vaultPath)
     return QDir(vaultPath.toLocalFile() + "/.transcriber/models");
 }
 
+// The single model file this app downloads into the vault for a given
+// out-of-process engine, or empty if the engine's model is managed externally
+// by its own runtime. Parakeet is deliberately absent: NeMo's from_pretrained()
+// fetches and caches its own weights (the HF cache), so Parakeet's availability
+// is gated by its dependencies being installed (see EngineRegistry's deps
+// check), not by an app-managed file. This table is where a future engine that
+// DOES ship an app-downloaded model file would register one.
+QString engineModelFileName(const QString &engineId)
+{
+    Q_UNUSED(engineId);
+    return QString();
+}
+
+}
+
+bool isParakeetModelId(const QString &modelId)
+{
+    return modelId == QLatin1String(kParakeetModelId);
+}
+
+ParakeetModelPaths parakeetModelPaths(const QUrl &vaultPath)
+{
+    const QDir bundle(modelsDirFor(vaultPath).filePath(QString::fromLatin1(kParakeetBundleDirName)));
+    ParakeetModelPaths paths;
+    paths.encoder = bundle.filePath(QString::fromLatin1(kParakeetEncoderFile));
+    paths.decoder = bundle.filePath(QString::fromLatin1(kParakeetDecoderFile));
+    paths.joiner = bundle.filePath(QString::fromLatin1(kParakeetJoinerFile));
+    paths.tokens = bundle.filePath(QString::fromLatin1(kParakeetTokensFile));
+    return paths;
+}
+
+bool ParakeetModelPaths::isComplete() const
+{
+    return QFileInfo::exists(encoder) && QFileInfo::exists(decoder) && QFileInfo::exists(joiner)
+        && QFileInfo::exists(tokens);
 }
 
 bool isModelDownloaded(const QUrl &vaultPath, const QString &modelId)
 {
+    // The Parakeet bundle is a directory of ONNX files, not a single file —
+    // "downloaded" means all four are present (a half-extracted dir is not).
+    if (isParakeetModelId(modelId))
+        return parakeetModelPaths(vaultPath).isComplete();
     const QString fileName = modelFileName(modelId);
     return !fileName.isEmpty() && QFileInfo::exists(modelsDirFor(vaultPath).filePath(fileName));
 }
@@ -62,6 +121,16 @@ bool areDiarizationModelsDownloaded(const QUrl &vaultPath)
     const QDir dir = modelsDirFor(vaultPath);
     return QFileInfo::exists(dir.filePath(QString(kDiarizationSegmentationFileName)))
         && QFileInfo::exists(dir.filePath(QString(kDiarizationEmbeddingFileName)));
+}
+
+bool isEngineModelPresent(const QUrl &vaultPath, const QString &engineId)
+{
+    const QString fileName = engineModelFileName(engineId);
+    // No app-managed file for this engine ⇒ its model is externally managed
+    // (e.g. NeMo/HF cache), so it never gates availability here.
+    if (fileName.isEmpty())
+        return true;
+    return QFileInfo::exists(modelsDirFor(vaultPath).filePath(fileName));
 }
 
 bool isVadModelDownloaded(const QUrl &vaultPath)
@@ -205,6 +274,56 @@ QString downloadAndExtractFromTarBz2(const QDir &modelsDir, const QString &local
     return modelPath;
 }
 
+// Downloads a .tar.bz2 and extracts the WHOLE archive into
+// <modelsDir>/<destDirName>/, stripping the archive's own top-level directory
+// (--strip-components=1) so files land directly under destDirName regardless of
+// what the archive names its root. Verifies every requiredFile exists
+// afterward. Unlike downloadAndExtractFromTarBz2() (one file via `tar -O`), this
+// is for multi-file model bundles (the Parakeet ONNX encoder/decoder/joiner +
+// tokens). Returns the dest dir, or empty on failure. Idempotent: returns
+// immediately if the bundle is already complete.
+QString downloadAndExtractBundle(const QDir &modelsDir, const QString &destDirName, const QString &archiveUrl,
+                                  const QStringList &requiredFiles, QString *errorOut,
+                                  const DownloadProgressCallback &onProgress = {},
+                                  const DownloadControl &control = {})
+{
+    const QDir destDir(modelsDir.filePath(destDirName));
+    const auto allPresent = [&] {
+        for (const QString &f : requiredFiles) {
+            if (!QFileInfo::exists(destDir.filePath(f)))
+                return false;
+        }
+        return true;
+    };
+    if (allPresent())
+        return destDir.path();
+
+    if (!modelsDir.mkpath(destDirName)) {
+        if (errorOut)
+            *errorOut = QStringLiteral("could not create %1").arg(destDir.path());
+        return {};
+    }
+
+    const QString archiveFileName = QStringLiteral("%1.tar.bz2").arg(destDirName);
+    const QString archivePath =
+        downloadToModelsDir(modelsDir, archiveFileName, archiveUrl, errorOut, onProgress, control);
+    if (archivePath.isEmpty())
+        return {}; // download failed/cancelled — errorOut already set
+
+    QProcess tar;
+    tar.start("tar", {"-xjf", archivePath, "-C", destDir.path(), "--strip-components=1"});
+    tar.waitForFinished(-1);
+    QFile::remove(archivePath);
+
+    if (tar.exitStatus() != QProcess::NormalExit || tar.exitCode() != 0 || !allPresent()) {
+        if (errorOut)
+            *errorOut = QStringLiteral("model bundle extraction failed: %1")
+                            .arg(QString::fromUtf8(tar.readAllStandardError()));
+        return {};
+    }
+    return destDir.path();
+}
+
 }
 
 QString ensureModel(const QUrl &vaultPath, const QString &modelId, QString *errorOut, bool *usedFallback,
@@ -212,6 +331,19 @@ QString ensureModel(const QUrl &vaultPath, const QString &modelId, QString *erro
 {
     if (usedFallback)
         *usedFallback = false;
+
+    // Parakeet is a multi-file ONNX bundle, not a single ggml file — download/
+    // extract it and return the bundle DIRECTORY (the caller resolves the four
+    // files via parakeetModelPaths()). Never falls back to a whisper default:
+    // an explicit Parakeet request must fail loudly if the bundle can't be had.
+    if (isParakeetModelId(modelId)) {
+        return downloadAndExtractBundle(
+            modelsDirFor(vaultPath), QString::fromLatin1(kParakeetBundleDirName),
+            QString::fromLatin1(kParakeetArchiveUrl),
+            {QString::fromLatin1(kParakeetEncoderFile), QString::fromLatin1(kParakeetDecoderFile),
+             QString::fromLatin1(kParakeetJoinerFile), QString::fromLatin1(kParakeetTokensFile)},
+            errorOut, onProgress, control);
+    }
 
     const QDir modelsDir = modelsDirFor(vaultPath);
     QString modelName = modelFileName(modelId);

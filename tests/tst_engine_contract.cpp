@@ -366,15 +366,14 @@ private slots:
                  qPrintable(QStringLiteral("transcript missing 'country': ") + QString::fromStdString(allText)));
     }
 
-    // Spec placeholder: DESIGN.md documents that non-default engines run
-    // out-of-process behind the JSONL manifest protocol (a SubprocessEngine
-    // implementing TranscriptionEngine by driving a child process and
-    // adapting its JSONL output to Segments). Not yet implemented.
-    void subprocessEngineJsonlProtocol()
-    {
-        QSKIP("DESIGN.md: out-of-process engines behind the JSONL manifest protocol "
-              "(SubprocessEngine) are documented but not yet implemented");
-    }
+    // subprocessEngineJsonlProtocol: BUILT. DESIGN.md's out-of-process engines
+    // behind the JSONL manifest protocol now exist — SubprocessEngine
+    // implements TranscriptionEngine by driving a child process and adapting
+    // its JSONL output to Segments. The full protocol (progress/segment/done/
+    // error parsing, chunk-relative timestamps with the app owning the offset
+    // merge, abort, graceful degradation) is exercised in tst_subprocessengine
+    // against a fake engine script, with manifest parsing in tst_enginemanifest
+    // and capability detection in tst_engineregistry.
 };
 
 QTEST_GUILESS_MAIN(TstEngineContract)

@@ -42,6 +42,13 @@ public:
                                              const SegmentCallback &onSegment,
                                              const AbortCallback &onAbort = {}) = 0;
 
+    // Whether this engine loaded successfully and can transcribe. In-process
+    // engines that load a model up front (WhisperCppEngine) override this to
+    // report a failed load; out-of-process engines validate lazily at spawn
+    // time and are always "valid" here (a spawn failure degrades per-call), so
+    // the default is true.
+    virtual bool isValid() const { return true; }
+
     // Item O35: which compute backend this engine's last model load actually
     // picked (e.g. "CUDA", "Vulkan", "CPU") — empty until a model has been
     // loaded, and empty forever for an engine with no such concept (e.g. an

@@ -55,14 +55,15 @@ class TstModelManager : public QObject
 private slots:
     // --- Model catalog -----------------------------------------------------
 
-    // The dropdown offers exactly the four documented English models plus
-    // the one multilingual large-v3 tier (item O31), ordered fastest/
-    // smallest to slowest/most-accurate, with the documented ggml file names
-    // (which double as the on-disk names under .transcriber/models/).
-    void availableModels_areExactlyTheFiveDocumentedModels_inSpeedOrder()
+    // The dropdown offers the four documented English whisper tiers plus the
+    // multilingual large-v3 tier (item O31), ordered fastest/smallest to
+    // slowest/most-accurate with the documented ggml file names (which double
+    // as the on-disk names under .transcriber/models/), then the in-process
+    // Parakeet model (sherpa-onnx, see ParakeetEngine) as a final entry.
+    void availableModels_areTheWhisperTiersPlusParakeet_inSpeedOrder()
     {
         const auto &models = ModelManager::availableModels();
-        QCOMPARE(models.size(), size_t(5));
+        QCOMPARE(models.size(), size_t(6));
 
         QCOMPARE(models[0].id, QStringLiteral("tiny.en"));
         QCOMPARE(models[0].fileName, QStringLiteral("ggml-tiny.en.bin"));
@@ -74,6 +75,9 @@ private slots:
         QCOMPARE(models[3].fileName, QStringLiteral("ggml-medium.en.bin"));
         QCOMPARE(models[4].id, QStringLiteral("large-v3"));
         QCOMPARE(models[4].fileName, QStringLiteral("ggml-large-v3.bin"));
+        // Parakeet: a bundle DIRECTORY name, not a single ggml file.
+        QCOMPARE(models[5].id, QString(ModelManager::kParakeetModelId));
+        QVERIFY(ModelManager::isParakeetModelId(models[5].id));
 
         // Every entry has a human-readable label for the model dropdown.
         for (const ModelManager::ModelInfo &info : models)
@@ -83,6 +87,47 @@ private slots:
         // ModelManager.cpp) — large-v3 must not claim "(English)" the way
         // the other four tiers do.
         QVERIFY(!models[4].label.contains(QStringLiteral("(English)")));
+    }
+
+    // Parakeet is a multi-file ONNX bundle, not a single ggml file: its four
+    // files resolve under .transcriber/models/<bundle>/, isModelDownloaded is
+    // true only when ALL are present, and isParakeetModelId distinguishes it
+    // from the whisper tiers. No network touched (nothing planted ⇒ absent).
+    void parakeetModel_isABundleGatedOnAllFourFiles()
+    {
+        QTemporaryDir vault;
+        QVERIFY(vault.isValid());
+        const QUrl vaultUrl = QUrl::fromLocalFile(vault.path());
+
+        QVERIFY(ModelManager::isParakeetModelId(QString(ModelManager::kParakeetModelId)));
+        QVERIFY(!ModelManager::isParakeetModelId(QStringLiteral("base.en")));
+
+        const ModelManager::ParakeetModelPaths paths = ModelManager::parakeetModelPaths(vaultUrl);
+        for (const QString &p : {paths.encoder, paths.decoder, paths.joiner, paths.tokens})
+            QVERIFY2(p.contains(QStringLiteral(".transcriber/models/parakeet-tdt-0.6b-v2")), qPrintable(p));
+
+        // Nothing on disk ⇒ not complete, not downloaded.
+        QVERIFY(!paths.isComplete());
+        QVERIFY(!ModelManager::isModelDownloaded(vaultUrl, QString(ModelManager::kParakeetModelId)));
+
+        // Plant three of the four files ⇒ still not complete (never a
+        // half-extracted "downloaded").
+        const QDir bundle(vault.path() + "/.transcriber/models/parakeet-tdt-0.6b-v2");
+        QVERIFY(QDir().mkpath(bundle.path()));
+        for (const QString &f : {paths.encoder, paths.decoder, paths.joiner}) {
+            QFile file(f);
+            QVERIFY(file.open(QIODevice::WriteOnly));
+            file.write("x");
+        }
+        QVERIFY(!ModelManager::parakeetModelPaths(vaultUrl).isComplete());
+        QVERIFY(!ModelManager::isModelDownloaded(vaultUrl, QString(ModelManager::kParakeetModelId)));
+
+        // The fourth (tokens) present ⇒ complete + downloaded.
+        QFile tokens(paths.tokens);
+        QVERIFY(tokens.open(QIODevice::WriteOnly));
+        tokens.write("x");
+        QVERIFY(ModelManager::parakeetModelPaths(vaultUrl).isComplete());
+        QVERIFY(ModelManager::isModelDownloaded(vaultUrl, QString(ModelManager::kParakeetModelId)));
     }
 
     // The documented default model is base.en ("balanced"), and it is one of
@@ -157,6 +202,12 @@ private slots:
         QVERIFY(vault.isValid());
 
         for (const ModelManager::ModelInfo &info : ModelManager::availableModels()) {
+            // Parakeet's "fileName" is a bundle DIRECTORY, not a single ggml
+            // file — its download path is separate (multi-file extract) and it
+            // never signals a fallback, so the plant-a-fake-file trick here
+            // doesn't apply. Covered by parakeetModel_isABundleGatedOnAllFourFiles.
+            if (ModelManager::isParakeetModelId(info.id))
+                continue;
             const QString planted = plantFakeModel(vault.path(), info.fileName, "fake model");
             QVERIFY(!planted.isEmpty());
 

@@ -98,6 +98,55 @@ engines — it is the most common source of bugs in this kind of app.
 **Capability detection** at startup: enumerate manifests, check GPU + installed
 model files, gray out engines that can't run on this machine.
 
+**BUILT.** `EngineManifest` (pure `manifest.json` parser), `EngineRegistry`
+(discovers `engines/<id>/` in the bundled dir + `<vault>/.transcriber/engines/`,
+capability-checks each against `GpuProbe` + a dependency self-test + model
+presence, graying out unrunnable ones with a reason), and `SubprocessEngine`
+(drives the manifest `command` via `QProcess`, parses the streamed JSONL into
+`Segment`s — chunk-relative, the app owns the offset merge — with cooperative
+pause/cancel and graceful degradation on a child crash). Selected through
+`TranscriptionController` via an `engine:<id>` model-id prefix (the whisper
+path is unchanged for un-prefixed ids); `availableEngines()` surfaces the
+capability list to QML. `engines/parakeet/` (NeMo Parakeet-TDT) ships as a
+verified-by-contract skeleton — its `run.py` speaks the protocol but needs
+`pip install nemo_toolkit[asr]` to run; until then capability detection reports
+it unavailable with a reason. Tests: `tst_enginemanifest`,
+`tst_subprocessengine` (fake engine, no NeMo), `tst_engineregistry`.
+
+### Parakeet — in-process via sherpa-onnx (the preferred path)
+
+Parakeet-TDT also runs **in-process**, via sherpa-onnx's `OfflineRecognizer` —
+the SAME sherpa-onnx library already linked for diarization, so **no Python /
+NeMo**. `ParakeetEngine` (`src/core/ParakeetEngine.h/.cpp`) implements
+`TranscriptionEngine` over an ONNX transducer bundle (encoder/decoder/joiner +
+tokens), feeds 16 kHz mono PCM straight in (sherpa does mel internally with
+`model_type="nemo_transducer"`), and assembles the model's per-token timestamps
+into sentence-level `Segment`s (`assembleSentenceSegments`, split on `.!?`). It's
+a normal entry in `ModelManager::availableModels()` (id `parakeet-tdt-0.6b-v2`),
+so it appears in the model dropdown and auto-downloads (k2-fsa's int8 `.tar.bz2`,
+multi-file extract via `downloadAndExtractBundle`) exactly like the whisper
+tiers and diarization models — the answer to "download in-app + in-process like
+the others". Tries CUDA then falls back to CPU (like `DiarizationEngine`).
+Tests: `tst_parakeetengine` (pure token→segment assembly + a real-decode case
+gated on `SUOP_PARAKEET_DIR`, verified end-to-end on the JFK sample), plus the
+bundle logic in `tst_modelmanager`.
+
+This makes the out-of-process NeMo `engines/parakeet/` above the *fallback*
+route for Parakeet; the subprocess subsystem's real value is genuinely
+Python-only engines (faster-whisper, etc.).
+
+## Model benchmark (Settings → Benchmark)
+
+A display-only comparison harness: pick one vault audio file, and
+`TranscriptionController::runBenchmark()` runs every *already-downloaded* model
+plus every *available* engine over it sequentially (on the transcription worker
+thread, so it serializes with real jobs and never contends for the GPU),
+reporting per-model run time, realtime factor, and segment/word/char counts
+alongside each transcript. It writes **no** `.md` and touches no queue/vault
+state — its only footprint is `<vault>/.transcriber/benchmarkLastRun.json`
+(overwritten each run, reloaded when the page reopens). UI in
+`BenchmarkPage.qml`; persistence via `VaultTreeModel::read/writeBenchmarkLastRun`.
+
 ## GPU: cross-vendor is not uniform across engines
 
 | Engine            | NVIDIA        | AMD             | Notes |

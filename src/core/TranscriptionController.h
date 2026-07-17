@@ -658,6 +658,29 @@ public:
     // {id, label} pairs for the model dropdown (see ModelManager).
     Q_INVOKABLE QVariantList availableModels() const;
 
+    // Capability-detected out-of-process engines (DESIGN.md "Pluggable
+    // engines") for the currently-open vault. Each entry:
+    //   { id, modelId ("engine:<id>"), label, available(bool),
+    //     unavailableReason(string), downloaded(bool) }
+    // Grayed-out engines are still listed with a reason (never silently
+    // dropped) — same never-misrepresent contract as availableModels()'s
+    // `downloaded`. Blocking (probes GPU + runs a deps self-test), so QML
+    // should call it off the hot path (e.g. when the benchmark/settings page
+    // opens), not per frame.
+    Q_INVOKABLE QVariantList availableEngines() const;
+
+    // Model benchmark (Settings "Benchmark" page): runs each id in modelIds
+    // over the one file at fileUrl, in memory, writing NO files and touching no
+    // queue/vault state (see the worker's benchmarkJob()). modelIds is what to
+    // run — the page filters to downloaded whisper tiers + available engines
+    // before calling. Runs on the transcription worker thread (serialized with
+    // real jobs, so no GPU contention); results arrive via the benchmark*
+    // signals above. Uses the currently-open vault (m_vaultUrl), same as
+    // availableModels()/availableEngines(). cancelBenchmark() stops it between
+    // models / mid-model.
+    Q_INVOKABLE void runBenchmark(const QUrl &fileUrl, const QStringList &modelIds);
+    Q_INVOKABLE void cancelBenchmark();
+
     // Removes one Done/Failed entry matching fileUrl from the job list. A
     // no-op if the only match is still Queued/Active, or if there's no
     // match at all.
@@ -1056,6 +1079,17 @@ public:
                                    const QString &outputPath, const QUrl &vaultUrl, bool deleteOriginals);
 
 signals:
+    // Model-benchmark signals (see runBenchmark()), re-emitted from the worker
+    // on the GUI thread so QML can react directly. benchmarkModelStarted per
+    // model (index/total for a progress bar); benchmarkModelDone per finished
+    // result row; benchmarkFinished once with the whole run (the Benchmark page
+    // persists it via VaultTreeModel::writeBenchmarkLastRun); benchmarkFailed if
+    // it couldn't start (e.g. decode failed).
+    void benchmarkModelStarted(const QString &modelId, int index, int total);
+    void benchmarkModelDone(const QVariantMap &result);
+    void benchmarkFinished(const QVariantMap &run);
+    void benchmarkFailed(const QString &error);
+
     void busyChanged();
     void progressChanged();
     void overallProgressChanged();

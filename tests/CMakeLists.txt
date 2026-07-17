@@ -117,6 +117,10 @@ suop_add_test(tst_bottombar_pathsegments LINK_QUICK LINK_SVG ICON_ASSETS SOURCES
 # See its top-of-file comment.
 suop_add_test(tst_mainpanel_chapterselection LINK_QUICK LINK_SVG ICON_ASSETS LINK_GUI SOURCES IconTheme.cpp Clipboard.cpp)
 suop_add_test(tst_scratch_headingrepro LINK_QUICK LINK_SVG ICON_ASSETS LINK_GUI SOURCES IconTheme.cpp Clipboard.cpp)
+# Loads the real BenchmarkPage.qml inside a modal Popup -> ScrollView (its
+# SettingsPopup nesting) and proves the audio-file ComboBox is populated +
+# selectable — the allAudioPaths() no-NOTIFY binding trap that left it empty.
+suop_add_test(tst_benchmarkpage_filecombo LINK_QUICK SOURCES VaultTreeModel.cpp VaultSearchProxyModel.cpp)
 # Loads the real MainPanel.qml in a QQuickView AND wires a REAL
 # TranscriptionController into it — the assertion is what the panel reads back
 # off disk for the file that's actually open, so a stubbed readChapters() would
@@ -125,22 +129,40 @@ suop_add_test(tst_scratch_headingrepro LINK_QUICK LINK_SVG ICON_ASSETS LINK_GUI 
 suop_add_test(tst_mainpanel_chapterrefresh LINK_QUICK LINK_SVG ICON_ASSETS LINK_GUI
     LINK_WHISPER LINK_LLAMA LINK_SHERPA_ONNX
     SOURCES IconTheme.cpp Clipboard.cpp TranscriptionController.cpp WhisperCppEngine.cpp VadChunker.cpp
-            ModelManager.cpp AudioDecoder.cpp LabelingEngine.cpp DiarizationEngine.cpp)
+            ModelManager.cpp AudioDecoder.cpp LabelingEngine.cpp DiarizationEngine.cpp
+            EngineManifest.cpp GpuProbe.cpp SubprocessEngine.cpp EngineRegistry.cpp ParakeetEngine.cpp)
+# Loads the real MainPanel.qml + a REAL TranscriptionController and drives the
+# queue (fake zero-byte model → fast-fail jobs) to prove busyOrQueuedUrls clears
+# reactively when a job finishes — the per-file action buttons' re-enable. Same
+# link deps as the other real-controller MainPanel harness. See its top comment.
+suop_add_test(tst_mainpanel_buttonstate LINK_QUICK LINK_SVG ICON_ASSETS LINK_GUI
+    LINK_WHISPER LINK_LLAMA LINK_SHERPA_ONNX
+    SOURCES IconTheme.cpp Clipboard.cpp TranscriptionController.cpp WhisperCppEngine.cpp VadChunker.cpp
+            ModelManager.cpp AudioDecoder.cpp LabelingEngine.cpp DiarizationEngine.cpp
+            EngineManifest.cpp GpuProbe.cpp SubprocessEngine.cpp EngineRegistry.cpp ParakeetEngine.cpp)
 suop_add_test(tst_mainpanel_deleteundo LINK_QUICK LINK_SVG ICON_ASSETS LINK_GUI
     LINK_WHISPER LINK_LLAMA LINK_SHERPA_ONNX
     SOURCES IconTheme.cpp Clipboard.cpp VaultTreeModel.cpp TranscriptionController.cpp
             WhisperCppEngine.cpp VadChunker.cpp ModelManager.cpp AudioDecoder.cpp
-            LabelingEngine.cpp DiarizationEngine.cpp)
+            LabelingEngine.cpp DiarizationEngine.cpp
+            EngineManifest.cpp GpuProbe.cpp SubprocessEngine.cpp EngineRegistry.cpp ParakeetEngine.cpp)
 suop_add_test(tst_vaultsearchproxymodel SOURCES VaultTreeModel.cpp VaultSearchProxyModel.cpp)
 suop_add_test(tst_modelmanager SOURCES ModelManager.cpp)
 suop_add_test(tst_transcript_format LINK_WHISPER LINK_LLAMA LINK_SHERPA_ONNX
-    SOURCES TranscriptionController.cpp WhisperCppEngine.cpp VadChunker.cpp ModelManager.cpp AudioDecoder.cpp LabelingEngine.cpp DiarizationEngine.cpp)
+    SOURCES TranscriptionController.cpp WhisperCppEngine.cpp VadChunker.cpp ModelManager.cpp AudioDecoder.cpp LabelingEngine.cpp DiarizationEngine.cpp
+            EngineManifest.cpp GpuProbe.cpp SubprocessEngine.cpp EngineRegistry.cpp ParakeetEngine.cpp)
 suop_add_test(tst_transcription_queue LINK_WHISPER LINK_LLAMA LINK_SHERPA_ONNX
-    SOURCES TranscriptionController.cpp WhisperCppEngine.cpp VadChunker.cpp ModelManager.cpp AudioDecoder.cpp LabelingEngine.cpp DiarizationEngine.cpp)
+    SOURCES TranscriptionController.cpp WhisperCppEngine.cpp VadChunker.cpp ModelManager.cpp AudioDecoder.cpp LabelingEngine.cpp DiarizationEngine.cpp
+            EngineManifest.cpp GpuProbe.cpp SubprocessEngine.cpp EngineRegistry.cpp ParakeetEngine.cpp)
 suop_add_test(tst_filecombine LINK_WHISPER LINK_LLAMA LINK_SHERPA_ONNX
-    SOURCES TranscriptionController.cpp WhisperCppEngine.cpp VadChunker.cpp ModelManager.cpp AudioDecoder.cpp LabelingEngine.cpp DiarizationEngine.cpp)
+    SOURCES TranscriptionController.cpp WhisperCppEngine.cpp VadChunker.cpp ModelManager.cpp AudioDecoder.cpp LabelingEngine.cpp DiarizationEngine.cpp
+            EngineManifest.cpp GpuProbe.cpp SubprocessEngine.cpp EngineRegistry.cpp ParakeetEngine.cpp)
 suop_add_test(tst_engine_contract LINK_WHISPER
     SOURCES WhisperCppEngine.cpp AudioDecoder.cpp)
+suop_add_test(tst_parakeetengine LINK_SHERPA_ONNX SOURCES ParakeetEngine.cpp AudioDecoder.cpp)
+suop_add_test(tst_enginemanifest SOURCES EngineManifest.cpp)
+suop_add_test(tst_subprocessengine SOURCES SubprocessEngine.cpp EngineManifest.cpp)
+suop_add_test(tst_engineregistry SOURCES EngineRegistry.cpp EngineManifest.cpp GpuProbe.cpp)
 suop_add_test(tst_vadchunking LINK_WHISPER SOURCES VadChunker.cpp)
 suop_add_test(tst_audiodecoder SOURCES AudioDecoder.cpp)
 suop_add_test(tst_audiorecorder LINK_MULTIMEDIA SOURCES AudioRecorder.cpp)

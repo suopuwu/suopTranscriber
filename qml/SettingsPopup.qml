@@ -22,7 +22,7 @@ Popup {
     // presentation reorg — every control/binding/save-hook is unchanged, only
     // grouped behind a page gate.
     readonly property var pageNames: [qsTr("Appearance"), qsTr("Sidebar & Layout"),
-                                      qsTr("Transcription & AI"), qsTr("Combine")]
+                                      qsTr("Transcription & AI"), qsTr("Combine"), qsTr("Benchmark")]
     property int currentPage: 0
 
     // Whether the (long) per-icon override grid is expanded. Collapsed by
@@ -4647,6 +4647,16 @@ Popup {
                     HoverBorder { anchors.fill: parent; active: addRuleButton.hovered }
                 }
             }
+            }
+
+            // ===== Page 4: Benchmark (BenchmarkPage.qml) =====
+            // Its own component (the benchmark UI is substantial) rather than
+            // inline here — mounted as a page wrapper like the others.
+            BenchmarkPage {
+                Layout.fillWidth: true
+                visible: settingsPopup.currentPage === 4
+                transcriptionController: settingsPopup.transcriptionController
+                vaultTreeModel: settingsPopup.vaultTreeModel
             }
         }
     }
