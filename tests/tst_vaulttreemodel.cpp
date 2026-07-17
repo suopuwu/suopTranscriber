@@ -103,14 +103,22 @@ int trashMany(VaultTreeModel &m, const QList<QUrl> &urls)
     return m.trashFiles(urls).value(QStringLiteral("trashed")).toInt();
 }
 
+// The trash*/delete* calls are all batch-shaped (one rebuild per user action —
+// see trashFiles()' doc comment); these adapt them for the many single-target
+// cases below, where the batch is just one url.
 bool trashTranscriptOne(VaultTreeModel &m, const QUrl &url)
 {
-    return m.trashTranscript(url).value(QStringLiteral("trashed")).toInt() == 1;
+    return m.trashTranscript({ url }).value(QStringLiteral("trashed")).toInt() == 1;
 }
 
 bool trashAudioOnlyOne(VaultTreeModel &m, const QUrl &url)
 {
-    return m.trashAudioOnly(url).value(QStringLiteral("trashed")).toInt() == 1;
+    return m.trashAudioOnly({ url }).value(QStringLiteral("trashed")).toInt() == 1;
+}
+
+bool deleteAudioOnlyPermanentlyOne(VaultTreeModel &m, const QUrl &url)
+{
+    return m.deleteAudioOnlyPermanently({ url }) == 1;
 }
 
 // The "restorable" list from a trash result, ready to hand to restoreFromTrash().
@@ -1198,7 +1206,7 @@ private slots:
         VaultTreeModel model;
         model.setVaultPath(QUrl::fromLocalFile(vault.path()));
 
-        const QVariantMap result = model.trashAudioOnly(QUrl::fromLocalFile(vault.filePath("talk.mp3")));
+        const QVariantMap result = model.trashAudioOnly({ QUrl::fromLocalFile(vault.filePath("talk.mp3")) });
         QCOMPARE(result.value("trashed").toInt(), 1);
         QVERIFY(QFileInfo::exists(trashedPath(QStringLiteral("talk.mp3"))));
         // Only the audio is restorable — the .md was never trashed, so it must
@@ -1222,11 +1230,154 @@ private slots:
         VaultTreeModel model;
         model.setVaultPath(QUrl::fromLocalFile(vault.path()));
 
-        const QVariantMap result = model.trashAudioOnly(QUrl::fromLocalFile(vault.filePath("stray.md")));
+        const QVariantMap result = model.trashAudioOnly({ QUrl::fromLocalFile(vault.filePath("stray.md")) });
         QCOMPARE(result.value("trashed").toInt(), 0);
         QCOMPARE(result.value("invalid").toList().size(), 1);
         QVERIFY2(QFileInfo::exists(vault.filePath("stray.md")),
                  "an Invalid audio-only delete must never remove the .md instead");
+    }
+
+    // ---- Batch deletes -----------------------------------------------------
+    //
+    // trashTranscript()/trashAudioOnly() take a LIST, like trashFiles(): the
+    // Sidebar's ribbon buttons, its Delete key and its context menu all act on
+    // a whole selection, and a single row is just a one-element batch (see
+    // VaultTreeModel.h's deletion block). The load-bearing part is that a batch
+    // costs ONE rebuild, not one per entry — a rebuild rescans the vault
+    // recursively and resets the model.
+
+    void trashTranscript_batch_removesEveryTranscriptAndKeepsEveryAudio()
+    {
+        QTemporaryDir vault;
+        QVERIFY(vault.isValid());
+        for (const QString &stem : { QStringLiteral("a"), QStringLiteral("b"), QStringLiteral("c") }) {
+            QVERIFY(touch(vault.filePath(stem + ".mp3"), "audio"));
+            QVERIFY(touch(vault.filePath(stem + ".mp3.md"), "# t"));
+        }
+
+        VaultTreeModel model;
+        model.setVaultPath(QUrl::fromLocalFile(vault.path()));
+
+        const QVariantMap result = model.trashTranscript({ QUrl::fromLocalFile(vault.filePath("a.mp3")),
+                                                           QUrl::fromLocalFile(vault.filePath("b.mp3")),
+                                                           QUrl::fromLocalFile(vault.filePath("c.mp3")) });
+        QCOMPARE(result.value("trashed").toInt(), 3);
+        for (const QString &stem : { QStringLiteral("a"), QStringLiteral("b"), QStringLiteral("c") }) {
+            QVERIFY2(!QFileInfo::exists(vault.filePath(stem + ".mp3.md")), "every transcript in the batch goes");
+            QVERIFY2(QFileInfo::exists(vault.filePath(stem + ".mp3")), "every audio in the batch stays");
+            QCOMPARE(statusOf(model, stem + ".mp3"), int(VaultTreeModel::UntranscribedStatus));
+        }
+    }
+
+    // The whole reason these take a list. One user action, one rescan.
+    void trashTranscript_batch_resetsTheModelOnce_notOncePerEntry()
+    {
+        QTemporaryDir vault;
+        QVERIFY(vault.isValid());
+        for (const QString &stem : { QStringLiteral("a"), QStringLiteral("b"), QStringLiteral("c") }) {
+            QVERIFY(touch(vault.filePath(stem + ".mp3"), "audio"));
+            QVERIFY(touch(vault.filePath(stem + ".mp3.md"), "# t"));
+        }
+
+        VaultTreeModel model;
+        model.setVaultPath(QUrl::fromLocalFile(vault.path()));
+
+        QSignalSpy resetSpy(&model, &QAbstractItemModel::modelReset);
+        model.trashTranscript({ QUrl::fromLocalFile(vault.filePath("a.mp3")),
+                                QUrl::fromLocalFile(vault.filePath("b.mp3")),
+                                QUrl::fromLocalFile(vault.filePath("c.mp3")) });
+        QCOMPARE(resetSpy.count(), 1);
+    }
+
+    // A batch is a set of independent entries: one bad entry must not strand
+    // the good ones, and must be reported as its own outcome.
+    void trashTranscript_batch_skipsEntriesWithNoTranscript_andStillTrashesTheRest()
+    {
+        QTemporaryDir vault;
+        QVERIFY(vault.isValid());
+        QVERIFY(touch(vault.filePath("has.mp3"), "audio"));
+        QVERIFY(touch(vault.filePath("has.mp3.md"), "# t"));
+        QVERIFY(touch(vault.filePath("bare.mp3"), "audio")); // no .md
+
+        VaultTreeModel model;
+        model.setVaultPath(QUrl::fromLocalFile(vault.path()));
+
+        const QVariantMap result = model.trashTranscript({ QUrl::fromLocalFile(vault.filePath("bare.mp3")),
+                                                           QUrl::fromLocalFile(vault.filePath("has.mp3")) });
+        QCOMPARE(result.value("trashed").toInt(), 1);
+        QVERIFY2(!QFileInfo::exists(vault.filePath("has.mp3.md")),
+                 "a no-op entry earlier in the batch must not stop a later real one");
+        // Nothing was refused by the filesystem, so nothing may be offered up
+        // for a permanent delete — "there was no transcript" is not "the trash
+        // said no".
+        QVERIFY(result.value("untrashable").toList().isEmpty());
+    }
+
+    void trashAudioOnly_batch_removesEveryAudioAndKeepsEveryTranscript()
+    {
+        QTemporaryDir vault;
+        QVERIFY(vault.isValid());
+        for (const QString &stem : { QStringLiteral("a"), QStringLiteral("b") }) {
+            QVERIFY(touch(vault.filePath(stem + ".mp3"), "audio"));
+            QVERIFY(touch(vault.filePath(stem + ".mp3.md"), "# t"));
+        }
+
+        VaultTreeModel model;
+        model.setVaultPath(QUrl::fromLocalFile(vault.path()));
+
+        QSignalSpy resetSpy(&model, &QAbstractItemModel::modelReset);
+        const QVariantMap result = model.trashAudioOnly({ QUrl::fromLocalFile(vault.filePath("a.mp3")),
+                                                          QUrl::fromLocalFile(vault.filePath("b.mp3")) });
+        QCOMPARE(result.value("trashed").toInt(), 2);
+        QCOMPARE(resetSpy.count(), 1);
+        for (const QString &stem : { QStringLiteral("a"), QStringLiteral("b") }) {
+            QVERIFY(!QFileInfo::exists(vault.filePath(stem + ".mp3")));
+            QVERIFY(QFileInfo::exists(vault.filePath(stem + ".mp3.md")));
+            // The surviving .md changes KIND rather than vanishing.
+            QCOMPARE(statusOf(model, stem + ".mp3.md"), int(VaultTreeModel::OrphanedMdStatus));
+        }
+    }
+
+    // Each entry earns its own signal, decided by whether ITS transcript
+    // survived — a batch mixing the two kinds must not pick one for the lot.
+    void trashAudioOnly_batch_emitsThePerEntrySignalEachEntryEarned()
+    {
+        QTemporaryDir vault;
+        QVERIFY(vault.isValid());
+        QVERIFY(touch(vault.filePath("kept.mp3"), "audio"));
+        QVERIFY(touch(vault.filePath("kept.mp3.md"), "# t")); // transcript survives
+        QVERIFY(touch(vault.filePath("bare.mp3"), "audio"));  // nothing survives
+
+        VaultTreeModel model;
+        model.setVaultPath(QUrl::fromLocalFile(vault.path()));
+
+        QSignalSpy keptSpy(&model, &VaultTreeModel::audioDeletedTranscriptKept);
+        QSignalSpy goneSpy(&model, &VaultTreeModel::fileDeleted);
+        model.trashAudioOnly({ QUrl::fromLocalFile(vault.filePath("kept.mp3")),
+                               QUrl::fromLocalFile(vault.filePath("bare.mp3")) });
+
+        QCOMPARE(keptSpy.count(), 1);
+        QCOMPARE(keptSpy.at(0).at(0).toUrl(), QUrl::fromLocalFile(vault.filePath("kept.mp3")));
+        QCOMPARE(goneSpy.count(), 1);
+        QCOMPARE(goneSpy.at(0).at(0).toUrl(), QUrl::fromLocalFile(vault.filePath("bare.mp3")));
+    }
+
+    void deleteTranscriptPermanently_batch_reportsHowManyItRemoved()
+    {
+        QTemporaryDir vault;
+        QVERIFY(vault.isValid());
+        QVERIFY(touch(vault.filePath("a.mp3"), "audio"));
+        QVERIFY(touch(vault.filePath("a.mp3.md"), "# t"));
+        QVERIFY(touch(vault.filePath("bare.mp3"), "audio")); // nothing to remove
+
+        VaultTreeModel model;
+        model.setVaultPath(QUrl::fromLocalFile(vault.path()));
+
+        QCOMPARE(model.deleteTranscriptPermanently({ QUrl::fromLocalFile(vault.filePath("a.mp3")),
+                                                     QUrl::fromLocalFile(vault.filePath("bare.mp3")) }),
+                 1);
+        QVERIFY(!QFileInfo::exists(vault.filePath("a.mp3.md")));
+        QVERIFY(QFileInfo::exists(vault.filePath("a.mp3")));
     }
 
     // The confirmed, irreversible counterpart keeps the same promise.
@@ -1241,7 +1392,7 @@ private slots:
         model.setVaultPath(QUrl::fromLocalFile(vault.path()));
 
         QSignalSpy kept(&model, &VaultTreeModel::audioDeletedTranscriptKept);
-        QVERIFY(model.deleteAudioOnlyPermanently(QUrl::fromLocalFile(vault.filePath("gone.mp3"))));
+        QVERIFY(deleteAudioOnlyPermanentlyOne(model, QUrl::fromLocalFile(vault.filePath("gone.mp3"))));
         QVERIFY(!QFileInfo::exists(vault.filePath("gone.mp3")));
         QVERIFY2(QFileInfo::exists(vault.filePath("gone.mp3.md")),
                  "even the permanent path keeps the transcript");
@@ -1330,7 +1481,7 @@ private slots:
         QVERIFY(!trashOne(model, QUrl::fromLocalFile(outside.filePath("victim.mp3"))));
         QVERIFY(!trashTranscriptOne(model, QUrl::fromLocalFile(outside.filePath("victim.mp3"))));
         QVERIFY(!trashAudioOnlyOne(model, QUrl::fromLocalFile(outside.filePath("victim.mp3"))));
-        QVERIFY(!model.deleteAudioOnlyPermanently(QUrl::fromLocalFile(outside.filePath("victim.mp3"))));
+        QVERIFY(!deleteAudioOnlyPermanentlyOne(model, QUrl::fromLocalFile(outside.filePath("victim.mp3"))));
         QVERIFY(QFileInfo::exists(outside.filePath("victim.mp3")));
         QVERIFY(QFileInfo::exists(outside.filePath("victim.mp3.md")));
     }
@@ -1617,7 +1768,7 @@ private slots:
         VaultTreeModel model;
         model.setVaultPath(QUrl::fromLocalFile(vault.path()));
 
-        const QVariantMap result = model.trashTranscript(QUrl::fromLocalFile(vault.filePath("talk.mp3")));
+        const QVariantMap result = model.trashTranscript({ QUrl::fromLocalFile(vault.filePath("talk.mp3")) });
         QCOMPARE(result.value("trashed").toInt(), 1);
         QCOMPARE(statusOf(model, "talk.mp3"), int(VaultTreeModel::UntranscribedStatus));
 
@@ -1646,7 +1797,7 @@ private slots:
         VaultTreeModel model;
         model.setVaultPath(QUrl::fromLocalFile(vault.path()));
 
-        const QVariantMap result = model.trashAudioOnly(QUrl::fromLocalFile(vault.filePath("talk.mp3")));
+        const QVariantMap result = model.trashAudioOnly({ QUrl::fromLocalFile(vault.filePath("talk.mp3")) });
         QCOMPARE(result.value("trashed").toInt(), 1);
 
         QSignalSpy back(&model, &VaultTreeModel::audioRestoredForTranscript);
@@ -1712,7 +1863,7 @@ private slots:
         VaultTreeModel model;
         model.setVaultPath(QUrl::fromLocalFile(vault.path()));
 
-        const QVariantMap result = model.trashTranscript(QUrl::fromLocalFile(vault.filePath("talk.mp3")));
+        const QVariantMap result = model.trashTranscript({ QUrl::fromLocalFile(vault.filePath("talk.mp3")) });
         QCOMPARE(result.value("trashed").toInt(), 1);
 
         QSignalSpy transcript(&model, &VaultTreeModel::transcriptRestored);
@@ -1791,7 +1942,7 @@ private slots:
         VaultTreeModel model;
         model.setVaultPath(QUrl::fromLocalFile(vault.path()));
 
-        const QVariantMap result = model.trashAudioOnly(QUrl::fromLocalFile(vault.filePath("talk.mp3")));
+        const QVariantMap result = model.trashAudioOnly({ QUrl::fromLocalFile(vault.filePath("talk.mp3")) });
         QCOMPARE(result.value("trashed").toInt(), 1);
         // Something took the name back while the snackbar was up.
         QVERIFY(touch(vault.filePath("talk.mp3"), "a different file"));
@@ -2520,6 +2671,208 @@ private slots:
         QVERIFY(touch(vault.filePath("late-arrival.mp3")));
         QTRY_VERIFY_WITH_TIMEOUT(findByName(model, "late-arrival.mp3").isValid(), 10000);
         QCOMPARE(statusOf(model, "late-arrival.mp3"), int(VaultTreeModel::UntranscribedStatus));
+    }
+
+    // ---- Combine placeholders (setPendingCombines) -------------------------
+    //
+    // A combine job concatenates its sources into outputPath and only THEN
+    // moves them into .combined/, so scanning the filesystem honestly shows the
+    // merge not having happened right up until it has. setPendingCombines()
+    // lets the tree show the merge as underway: sources out, one placeholder
+    // in. See VaultTreeModel.h's doc comment.
+
+    void setPendingCombines_hidesTheSources_andAddsOnePlaceholderInTheirPlace()
+    {
+        QTemporaryDir vault;
+        QVERIFY(vault.isValid());
+        QVERIFY(touch(vault.filePath("part1.wav")));
+        QVERIFY(touch(vault.filePath("part2.wav")));
+        QVERIFY(touch(vault.filePath("unrelated.wav")));
+
+        VaultTreeModel model;
+        model.setVaultPath(QUrl::fromLocalFile(vault.path()));
+        QVERIFY(findByName(model, "part1.wav").isValid());
+
+        model.setPendingCombines({ QVariantMap{
+            { "outputPath", vault.filePath("merged.wav") },
+            { "sources", QStringList{ vault.filePath("part1.wav"), vault.filePath("part2.wav") } } } });
+
+        QVERIFY2(!findByName(model, "part1.wav").isValid(), "a pending combine's sources leave the tree");
+        QVERIFY2(!findByName(model, "part2.wav").isValid(), "a pending combine's sources leave the tree");
+        QVERIFY2(findByName(model, "unrelated.wav").isValid(),
+                 "a file no pending combine claims is untouched");
+
+        // Exactly one placeholder, carrying the part count and the output path
+        // (its identity — what lets a caller match it to the job driving it).
+        const int placeholderRole = roleByName(model, "isCombinePlaceholder");
+        QVERIFY(placeholderRole >= 0);
+        QModelIndexList placeholders;
+        for (int row = 0; row < model.rowCount(); ++row) {
+            const QModelIndex idx = model.index(row, 0);
+            if (model.data(idx, placeholderRole).toBool())
+                placeholders << idx;
+        }
+        QCOMPARE(placeholders.size(), 1);
+        QCOMPARE(model.data(placeholders.first(), roleByName(model, "combineSourceCount")).toInt(), 2);
+        QCOMPARE(model.data(placeholders.first(), roleByName(model, "path")).toString(),
+                 vault.filePath("merged.wav"));
+    }
+
+    // ffmpeg creates its output up front and grows it, so the merged path can
+    // exist — half-written — for the whole run. It must not surface as ordinary
+    // playable, transcribable audio; the placeholder stands there instead.
+    void setPendingCombines_hidesTheHalfWrittenOutputFile_showingOnlyThePlaceholder()
+    {
+        QTemporaryDir vault;
+        QVERIFY(vault.isValid());
+        QVERIFY(touch(vault.filePath("part1.wav")));
+        QVERIFY(touch(vault.filePath("merged.wav"), "half-written")); // ffmpeg mid-run
+
+        VaultTreeModel model;
+        model.setVaultPath(QUrl::fromLocalFile(vault.path()));
+
+        model.setPendingCombines({ QVariantMap{
+            { "outputPath", vault.filePath("merged.wav") },
+            { "sources", QStringList{ vault.filePath("part1.wav") } } } });
+
+        const int placeholderRole = roleByName(model, "isCombinePlaceholder");
+        const int audioRole = roleByName(model, "isAudio");
+        int audioRows = 0;
+        int placeholderRows = 0;
+        for (int row = 0; row < model.rowCount(); ++row) {
+            const QModelIndex idx = model.index(row, 0);
+            if (model.data(idx, audioRole).toBool())
+                ++audioRows;
+            if (model.data(idx, placeholderRole).toBool())
+                ++placeholderRows;
+        }
+        QCOMPARE(placeholderRows, 1);
+        QCOMPARE(audioRows, 0);
+        QVERIFY2(!model.allAudioPaths().contains(vault.filePath("merged.wav")),
+                 "a half-written combine output must never be offered as audio to transcribe");
+    }
+
+    // The placeholder is deliberately not a file row — that's what keeps every
+    // existing "is this a note?" walk ignoring it without naming it.
+    void setPendingCombines_placeholderIsNeitherAudioNorDirNorOrphanedMd()
+    {
+        QTemporaryDir vault;
+        QVERIFY(vault.isValid());
+        QVERIFY(touch(vault.filePath("part1.wav")));
+
+        VaultTreeModel model;
+        model.setVaultPath(QUrl::fromLocalFile(vault.path()));
+        model.setPendingCombines({ QVariantMap{
+            { "outputPath", vault.filePath("merged.wav") },
+            { "sources", QStringList{ vault.filePath("part1.wav") } } } });
+
+        const QModelIndex idx = model.index(0, 0);
+        QVERIFY(model.data(idx, roleByName(model, "isCombinePlaceholder")).toBool());
+        QVERIFY(!model.data(idx, roleByName(model, "isAudio")).toBool());
+        QVERIFY(!model.data(idx, roleByName(model, "isDir")).toBool());
+        QVERIFY(!model.data(idx, roleByName(model, "isOrphanedMd")).toBool());
+        QVERIFY2(model.allAudioPaths().isEmpty(),
+                 "a placeholder must never reach allAudioPaths() — bulk transcribe reads it");
+        QVERIFY2(model.searchResults(QStringLiteral("merged"), false).isEmpty(),
+                 "a placeholder names no file, so it can never be a search result");
+    }
+
+    // A hidden source's own .md must not pop out as a stray orphaned-.md row
+    // just because its audio left the tree — the sidecar goes quiet with it.
+    void setPendingCombines_hiddenSourceDoesNotStrandItsSidecarAsAnOrphanedMd()
+    {
+        QTemporaryDir vault;
+        QVERIFY(vault.isValid());
+        QVERIFY(touch(vault.filePath("part1.wav")));
+        QVERIFY(touch(vault.filePath("part1.wav.md"), "# t"));
+
+        VaultTreeModel model;
+        model.setVaultPath(QUrl::fromLocalFile(vault.path()));
+        model.setPendingCombines({ QVariantMap{
+            { "outputPath", vault.filePath("merged.wav") },
+            { "sources", QStringList{ vault.filePath("part1.wav") } } } });
+
+        QVERIFY(!findByName(model, "part1.wav").isValid());
+        QVERIFY2(!findByName(model, "part1.wav.md").isValid(),
+                 "hiding a source must not surface its sidecar as an orphaned .md");
+    }
+
+    // Placeholders retire by dropping out of the pushed list — that one path
+    // covers success (merged file now on disk, sources gone), and failure or
+    // cancel (sources never moved). The model doesn't need to know which.
+    void setPendingCombines_clearing_returnsTheTreeToWhateverIsActuallyOnDisk()
+    {
+        QTemporaryDir vault;
+        QVERIFY(vault.isValid());
+        QVERIFY(touch(vault.filePath("part1.wav")));
+        QVERIFY(touch(vault.filePath("part2.wav")));
+
+        VaultTreeModel model;
+        model.setVaultPath(QUrl::fromLocalFile(vault.path()));
+        const QVariantList pending{ QVariantMap{
+            { "outputPath", vault.filePath("merged.wav") },
+            { "sources", QStringList{ vault.filePath("part1.wav"), vault.filePath("part2.wav") } } } };
+        model.setPendingCombines(pending);
+        QVERIFY(!findByName(model, "part1.wav").isValid());
+
+        // The combine failed / was cancelled: no merged file, sources intact.
+        model.setPendingCombines({});
+        QVERIFY2(findByName(model, "part1.wav").isValid(), "a retired placeholder gives the sources back");
+        QVERIFY(findByName(model, "part2.wav").isValid());
+        const int placeholderRole = roleByName(model, "isCombinePlaceholder");
+        for (int row = 0; row < model.rowCount(); ++row)
+            QVERIFY(!model.data(model.index(row, 0), placeholderRole).toBool());
+    }
+
+    // Sidebar pushes this from onQueueChanged, which fires on every queue
+    // transition — the overwhelming majority touching no combine at all. A
+    // rebuild is a full recursive rescan + model reset, so an unchanged push
+    // must cost nothing.
+    void setPendingCombines_withAnUnchangedSet_doesNotRebuild()
+    {
+        QTemporaryDir vault;
+        QVERIFY(vault.isValid());
+        QVERIFY(touch(vault.filePath("part1.wav")));
+
+        VaultTreeModel model;
+        model.setVaultPath(QUrl::fromLocalFile(vault.path()));
+
+        const QVariantList pending{ QVariantMap{
+            { "outputPath", vault.filePath("merged.wav") },
+            { "sources", QStringList{ vault.filePath("part1.wav") } } } };
+
+        QSignalSpy resetSpy(&model, &QAbstractItemModel::modelReset);
+        model.setPendingCombines(pending);
+        QCOMPARE(resetSpy.count(), 1); // the real change rebuilds
+        model.setPendingCombines(pending);
+        model.setPendingCombines(pending);
+        QCOMPARE(resetSpy.count(), 1); // identical pushes are free
+    }
+
+    // A placeholder lands next to the files it is merging, not at the vault
+    // root — the output path's own directory decides, same as any file row.
+    void setPendingCombines_placesThePlaceholderInTheOutputPathsOwnFolder()
+    {
+        QTemporaryDir vault;
+        QVERIFY(vault.isValid());
+        QVERIFY(touch(vault.filePath("sub/part1.wav")));
+        QVERIFY(touch(vault.filePath("sub/part2.wav")));
+
+        VaultTreeModel model;
+        model.setVaultPath(QUrl::fromLocalFile(vault.path()));
+        model.setPendingCombines({ QVariantMap{
+            { "outputPath", vault.filePath("sub/merged.wav") },
+            { "sources", QStringList{ vault.filePath("sub/part1.wav"), vault.filePath("sub/part2.wav") } } } });
+
+        const QModelIndex sub = findByName(model, "sub");
+        QVERIFY(sub.isValid());
+        const int placeholderRole = roleByName(model, "isCombinePlaceholder");
+        int found = 0;
+        for (int row = 0; row < model.rowCount(sub); ++row) {
+            if (model.data(model.index(row, 0, sub), placeholderRole).toBool())
+                ++found;
+        }
+        QCOMPARE(found, 1);
     }
 };
 

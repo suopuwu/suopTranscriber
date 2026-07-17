@@ -43,6 +43,7 @@
 #include "GpuProbe.h"
 #include "ParakeetEngine.h"
 #include "SubprocessEngine.h"
+#include "UsbGrabJob.h"
 #include "VadChunker.h"
 #include "WhisperCppEngine.h"
 
@@ -2597,7 +2598,7 @@ public slots:
         // Restamp only now that ffmpeg has exited and closed the output —
         // anything that writes the file stamps mtime as "now", so an earlier
         // setFileTime() would just get clobbered.
-        if (false && firstPartMtime.isValid()) {
+        if (firstPartMtime.isValid()) {
             QFile out(outputPath);
             if (out.open(QIODevice::ReadWrite))
                 out.setFileTime(firstPartMtime, QFileDevice::FileModificationTime);
@@ -2631,6 +2632,64 @@ public slots:
     // honor pause/cancel between chunks, same cooperative-checkpoint discipline
     // combineJob()/download() use. Never touches m_engine/m_diarizationEngine/
     // m_labelingEngine — nothing to evict/reload for a plain file copy.
+    // One USB grab: the whole recursive scan+copy of one mounted volume under
+    // one already-resolved rule. The walk itself is runUsbGrabScan() (shared
+    // verbatim with the dry-run preview — see UsbGrabJob.h); everything here is
+    // just wiring it to this worker's phase/progress/pause/cancel contract.
+    //
+    // Reports its counts through usbGrabScanCompleted() rather than stuffing
+    // them into finished(ok, error): a grab's result is "copied N, skipped M,
+    // and here are the K files that failed", which is not ok/error-shaped —
+    // per-file copy errors are non-fatal, so a grab that missed one file is a
+    // SUCCEEDED job that has something to report, not a failed one.
+    void usbGrabJob(const UsbGrabRule &rule, const QString &mountPath, const QString &destinationPath)
+    {
+        emit phase(QStringLiteral("grabbing"));
+
+        bool wasPaused = false;
+        UsbGrabScanHooks hooks;
+        hooks.onProgress = [this](int processed, int total) {
+            if (total > 0)
+                emit progress(std::clamp(static_cast<double>(processed) / static_cast<double>(total), 0.0, 1.0));
+        };
+        hooks.shouldAbort = [this, &wasPaused] {
+            // Between files, not between bytes: a grab's unit of work is one
+            // file, and QFile::copy() is uninterruptible anyway, so a pause or
+            // cancel lands at the next file boundary. Mirrors importJob()'s
+            // loop — no subprocess to SIGSTOP, so just block this worker here.
+            while (m_pauseRequested.load() && !isCancelRequested()) {
+                if (!wasPaused) {
+                    wasPaused = true;
+                    emit paused(true);
+                }
+                QThread::msleep(100);
+            }
+            if (wasPaused) {
+                wasPaused = false;
+                emit paused(false);
+            }
+            return isCancelRequested();
+        };
+
+        const UsbGrabScanResult result = runUsbGrabScan(rule, mountPath, destinationPath, /*dryRun=*/false, hooks);
+
+        if (!result.refusal.isEmpty()) {
+            // A refusal means the walk never ran (see usbGrabRefusalReason) —
+            // a genuinely failed job, unlike a per-file copy error.
+            emit usbGrabScanCompleted(0, 0, QStringList { result.refusal }, false);
+            emit finished(false, result.refusal);
+            return;
+        }
+
+        emit usbGrabScanCompleted(result.filesCopied, result.filesSkipped, result.errors, result.aborted);
+        if (result.aborted) {
+            emit finished(false, QStringLiteral("Cancelled"));
+            return;
+        }
+        emit progress(1.0);
+        emit finished(true, QString());
+    }
+
     void importJob(const QString &sourcePath, const QString &destPath)
     {
         emit phase(QStringLiteral("importing"));
@@ -2716,6 +2775,11 @@ public slots:
 
 signals:
     void progress(double fraction);
+    // Emitted by usbGrabJob() immediately before its finished(), carrying the
+    // grab's actual result (which finished(ok, error) has no room for — see
+    // usbGrabJob()'s doc comment). cancelled means the counts are a partial
+    // tally, so the controller must not report the grab as completed.
+    void usbGrabScanCompleted(int filesCopied, int filesSkipped, const QStringList &errors, bool cancelled);
     // 2026-07-10 (rolling-average phase weighting): fired once a named phase
     // (one of TranscriptionController::kTimedPhases) completes NORMALLY —
     // never on a cancel/failure mid-phase, see run()'s emit sites — so
@@ -3065,6 +3129,12 @@ private:
 TranscriptionController::TranscriptionController(QObject *parent)
     : QObject(parent)
 {
+    // A usbGrab job hands its whole UsbGrabRule to the worker across a QUEUED
+    // connection (see startJob()'s dispatch), which copies the argument through
+    // the metatype system — without this the invoke fails at RUNTIME, silently
+    // doing nothing, rather than at compile time.
+    qRegisterMetaType<UsbGrabRule>();
+
     loadPhaseTimings();
     // See recomputeOverallProgress()'s doc comment — the only way
     // "loading"/"decoding" (no real progress callback) ever advance
@@ -3164,6 +3234,19 @@ TranscriptionController::TranscriptionController(QObject *parent)
             [this](const QString &path, const QString &sourceName, const QString &targetName, bool ok,
                    const QString &error) {
                 emit speakersMerged(QUrl::fromLocalFile(path), sourceName, targetName, ok, error);
+            });
+    connect(m_worker, &TranscriptionWorker::usbGrabScanCompleted, this,
+            [this](int filesCopied, int filesSkipped, const QStringList &errors, bool cancelled) {
+                // Safe to read m_activeIndex here: the worker emits this
+                // immediately BEFORE its finished(), and both arrive queued on
+                // this (the GUI) thread in that order — so the grab that just
+                // ran is still the active job, and onWorkerFinished() hasn't
+                // reset m_activeIndex to -1 yet. Attaching the job id here
+                // rather than making the worker carry it keeps the worker
+                // ignorant of the queue, like every other signal it emits.
+                if (m_activeIndex < 0 || m_activeIndex >= m_jobs.size())
+                    return;
+                emit usbGrabFinished(m_jobs[m_activeIndex].id, filesCopied, filesSkipped, errors, cancelled);
             });
     // Benchmark signals are plain value pass-throughs (worker emits on the
     // worker thread; the queued connection marshals them to the GUI thread).
@@ -3558,6 +3641,33 @@ void TranscriptionController::importAudio(const QUrl &sourceUrl, const QUrl &des
         startJob(insertAt);
 }
 
+int TranscriptionController::enqueueUsbGrab(const UsbGrabRule &rule, const QString &mountPath, const QUrl &destUrl,
+                                             const QUrl &vaultUrl, bool autoTriggered)
+{
+    // No isQueued(destUrl) dedup here, deliberately — see the header's doc
+    // comment: a grab's fileUrl is a destination FOLDER that a device's two
+    // volumes legitimately share.
+    const int insertAt = frontOfQueueInsertIndex();
+
+    Job job;
+    job.id = m_nextJobId++;
+    job.fileUrl = destUrl; // the destination folder (see Job::usbGrabOnly)
+    job.vaultUrl = vaultUrl;
+    job.usbGrabOnly = true;
+    job.usbGrabRule = rule;
+    job.usbGrabMountPath = mountPath;
+    job.usbGrabAuto = autoTriggered;
+    job.status = JobStatus::Queued;
+    m_jobs.insert(insertAt, job);
+
+    emit queueChanged();
+
+    if (m_activeIndex < 0)
+        startJob(insertAt);
+
+    return job.id;
+}
+
 void TranscriptionController::diarizeFile(const QUrl &fileUrl, const QUrl &vaultUrl,
                                           const QString &segmentationModelId, const QString &embeddingModelId,
                                           double sensitivity)
@@ -3891,6 +4001,10 @@ void TranscriptionController::startJob(int index)
                                    Q_ARG(QStringList, job.combineSourcePaths),
                                    Q_ARG(QString, job.fileUrl.toLocalFile()),
                                    Q_ARG(bool, job.deleteOriginalsAfterCombine));
+    } else if (job.usbGrabOnly) {
+        QMetaObject::invokeMethod(m_worker, "usbGrabJob", Qt::QueuedConnection, Q_ARG(UsbGrabRule, job.usbGrabRule),
+                                   Q_ARG(QString, job.usbGrabMountPath),
+                                   Q_ARG(QString, job.fileUrl.toLocalFile()));
     } else if (job.importOnly) {
         QMetaObject::invokeMethod(m_worker, "importJob", Qt::QueuedConnection,
                                    Q_ARG(QString, job.importSourcePath),
@@ -4656,6 +4770,16 @@ void TranscriptionController::persistQueue() const
         // import is inherently a live, in-session action; if it didn't finish
         // before close, the user simply drags the file in again.
         if (job.importOnly)
+            continue;
+
+        // USB grabs are not persisted, for a STRONGER version of the same
+        // reason: usbGrabMountPath is a mount point for removable media that is
+        // very likely unplugged by next session, and a mount point that gets
+        // reused by a DIFFERENT volume would make a restored job walk the wrong
+        // device entirely. A grab is inherently tied to the device being
+        // present — replugging it re-fires the auto-grab (or the user clicks
+        // Grab now), which is the correct way to resume one.
+        if (job.usbGrabOnly)
             continue;
 
         QJsonObject obj;
@@ -5743,6 +5867,8 @@ QString TranscriptionController::jobKind(const Job &job)
         return QStringLiteral("diarize");
     if (job.combineOnly)
         return QStringLiteral("combine");
+    if (job.usbGrabOnly)
+        return QStringLiteral("usbGrab");
     if (job.importOnly)
         return QStringLiteral("import");
     return QStringLiteral("transcribe");

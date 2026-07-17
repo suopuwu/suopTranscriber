@@ -209,6 +209,7 @@ Popup {
                 || !AppSettings.isDefault("progressGlowLayerCount")
                 || !AppSettings.isDefault("progressGlowHidesBar")
                 || !AppSettings.isDefault("deleteOriginalsAfterCombine")
+                || !AppSettings.isDefault("autoCombineAfterGrab")
                 || !AppSettings.isDefault("sidebarEdgeLeftMargin")
                 || !AppSettings.isDefault("sidebarContentLeftMargin")
                 || !AppSettings.isDefault("sidebarRightMargin")
@@ -4055,9 +4056,10 @@ Popup {
                 Layout.fillWidth: true
                 wrapMode: Text.WordWrap
                 text: qsTr("Some recorders split one continuous recording into several files (e.g. a "
-                           + "size or time limit). Rules below auto-detect and merge those parts into "
-                           + "one file — losslessly, before transcription — the instant a new part "
-                           + "shows up in the vault.")
+                           + "size or time limit). Rules below detect those parts so they can be "
+                           + "merged into one file — losslessly, before transcription. Combining runs "
+                           + "when you ask for it (the sidebar's combine button, or a group's own "
+                           + "button), never on its own as parts arrive.")
                 color: "#888888"
                 font.pixelSize: 11
             }
@@ -4108,6 +4110,61 @@ Popup {
                     HoverBorder {
                         anchors.fill: parent
                         active: deleteOriginalsAfterCombineResetButton.enabled && deleteOriginalsAfterCombineResetButton.hovered
+                    }
+                }
+            }
+
+            // The ONE automatic combine, and deliberately a narrow one: it runs
+            // after a USB auto-grab batch finishes — a discrete moment when a
+            // split recording has just finished arriving — not on every vault
+            // change (that behavior existed once and was removed for silently
+            // merging parts mid-recording; see AppSettings.autoCombineAfterGrab).
+            RowLayout {
+                Layout.fillWidth: true
+                Label {
+                    Layout.fillWidth: true
+                    wrapMode: Text.WordWrap
+                    color: "white"
+                    text: qsTr("Combine automatically after a USB auto-grab finishes")
+                }
+                Switch {
+                    id: autoCombineAfterGrabSwitch
+                    checked: AppSettings.autoCombineAfterGrab
+                    hoverEnabled: true
+                    onToggled: AppSettings.autoCombineAfterGrab = checked
+
+                    HoverHandler {
+                        cursorShape: Qt.PointingHandCursor
+                    }
+                    HoverBorder {
+                        anchors.fill: parent
+                        active: autoCombineAfterGrabSwitch.hovered
+                    }
+                }
+                Button {
+                    id: autoCombineAfterGrabResetButton
+                    contentItem: AppIcon { name: "reset"; iconSize: 14; color: "#dddddd"; anchors.centerIn: parent }
+                    implicitWidth: 22
+                    implicitHeight: 22
+
+                    background: Rectangle {
+                        radius: AppSettings.borderRadius
+                        color: "transparent"
+                        border.width: 1
+                        border.color: "#3a3a3a"
+                    }
+                    enabled: !AppSettings.isDefault("autoCombineAfterGrab")
+                    opacity: enabled ? 1 : 0.35
+                    hoverEnabled: enabled
+                    onClicked: AppSettings.resetProperty("autoCombineAfterGrab")
+
+                    HoverHandler {
+                        cursorShape: Qt.PointingHandCursor
+                        enabled: autoCombineAfterGrabResetButton.enabled
+                    }
+                    HoverBorder {
+                        anchors.fill: parent
+                        active: autoCombineAfterGrabResetButton.enabled && autoCombineAfterGrabResetButton.hovered
                     }
                 }
             }

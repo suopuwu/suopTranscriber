@@ -2,17 +2,17 @@
 
 #include <QHash>
 #include <QObject>
+#include <QSet>
 #include <QString>
 #include <QStringList>
 #include <QVariantList>
 #include <QVariantMap>
 #include <qqml.h>
 
+#include "TranscriptionController.h"
 #include "UsbDeviceMonitor.h"
 #include "UsbRuleStore.h"
 #include "VaultTreeModel.h"
-
-class UsbGrabJob;
 
 // Every entry of mountedVolumes (the per-volume shape
 // UsbDeviceMonitor::currentlyMountedDevices() returns) whose "serial" is
@@ -37,14 +37,35 @@ QVariantList usbVolumesForSerial(const QVariantList &mountedVolumes, const QStri
 // needs to share it) and one UsbRuleStore (persisted per-device rules; plain
 // value class, cheap to own directly).
 //
-// Hotplug behavior: when UsbDeviceMonitor reports a newly-mounted device,
-// this class checks the device's own rule and, if that isn't enabled, the
-// "*" catch-all rule — if EITHER is enabled AND a vault is currently open
-// (vaultTreeModel is non-null with a non-empty vaultLocalPath), a UsbGrabJob
-// is started immediately against whatever vault is open at that moment. If
-// no vault is open, the device is skipped entirely — no queueing, no retry,
-// per the confirmed product decision that grabs only ever target whatever
-// vault happens to be open at the moment of detection.
+// A grab is a QUEUED TASK, not this class's own thread. startGrabJob() hands
+// the resolved rule to TranscriptionController::enqueueUsbGrab(), so a grab
+// takes its turn in the one task queue alongside transcribes/imports/combines
+// and inherits that queue's Tasks row, progress glow, and pause/cancel with no
+// bespoke plumbing here. This class keeps only what the queue can't know: which
+// rule applies, which vault, and what to do with the result (history entry,
+// snackbar, auto-combine). The dry-run PREVIEW is the one thing still on its
+// own thread (UsbGrabPreviewJob) — it's an interactive answer while editing a
+// rule and must not queue behind a running transcription.
+//
+// Hotplug behavior, two independent gates, in order:
+//   1. resolveEffectiveRule(...).enabled — is this device grabbable at all?
+//      Also the mount gate (see below).
+//   2. rule.autoGrab — may a hotplug fire the grab BY ITSELF, with no click?
+//      Default false, so an enabled-but-not-autoGrab device mounts, appears in
+//      the UI, and waits for "Grab now". Auto-grab is the surprising behavior,
+//      so it's opted into per device (see UsbGrabRule::autoGrab).
+// Both must pass, AND a vault must be open (vaultTreeModel non-null with a
+// non-empty vaultLocalPath), for a hotplug to enqueue anything. If no vault is
+// open the device is skipped entirely — no queueing, no retry, per the
+// confirmed product decision that grabs only ever target whatever vault happens
+// to be open at the moment of detection.
+//
+// Auto-combine handoff: this class tracks the ids of the auto-grab jobs it has
+// enqueued and emits autoGrabsSettled() once the LAST of them leaves the queue
+// — the "only after all auto grabbings have run" barrier. It deliberately
+// stops there and does not itself combine: the combine rules live in
+// vault-scoped AppSettings and the vault's audio listing in the tree model,
+// both of which are QML's to hand over (see Main.qml's onAutoGrabsSettled).
 //
 // Mount policy: a stock KDE install does not auto-mount removable media (its
 // device_automounter kded module is off by default), so a device can be
@@ -80,6 +101,16 @@ class UsbGrabberController : public QObject {
     // with an empty vaultLocalPath) means "no vault open": manual grabs
     // no-op with lastError set, hotplug grabs are skipped silently.
     Q_PROPERTY(VaultTreeModel *vaultTreeModel READ vaultTreeModel WRITE setVaultTreeModel NOTIFY vaultTreeModelChanged)
+    // The task queue every grab runs through — wired from QML to the SAME
+    // TranscriptionController instance the rest of the app uses (Main.qml), so
+    // grabs share one queue with transcribes rather than racing them for the
+    // disk. Null means grabs can't run at all: triggerManualGrab() no-ops with
+    // lastError set, hotplug grabs are skipped silently (same shape as a
+    // missing vault). Settable rather than constructed internally because the
+    // instance is QML-owned and shared — unlike m_deviceMonitor, which nothing
+    // else needs.
+    Q_PROPERTY(TranscriptionController *transcriptionController READ transcriptionController WRITE
+                   setTranscriptionController NOTIFY transcriptionControllerChanged)
     // Non-empty if the most recent triggerManualGrab() call couldn't
     // proceed (no vault open, device not currently mounted, or no enabled
     // rule for it) — mirrors AudioRecorder::lastError's surfaced-not-
@@ -95,6 +126,9 @@ public:
 
     VaultTreeModel *vaultTreeModel() const { return m_vaultTreeModel; }
     void setVaultTreeModel(VaultTreeModel *model);
+
+    TranscriptionController *transcriptionController() const { return m_transcriptionController; }
+    void setTranscriptionController(TranscriptionController *controller);
 
     QString lastError() const { return m_lastError; }
 
@@ -161,12 +195,28 @@ public:
 
 signals:
     void vaultTreeModelChanged();
+    void transcriptionControllerChanged();
     void lastErrorChanged();
-    // Emitted once a grab (manual or hotplug-triggered) finishes, after its
-    // history entry has already been appended (UsbGrabJob::finished's own
-    // ordering guarantee). QML may surface this as a toast/notification —
-    // that's Step G's decision, not this one.
-    void grabFinished(const QString &deviceSerial, int filesCopied, int filesSkipped, const QStringList &errors);
+    // Emitted once a grab (manual or auto) finishes, after its history entry
+    // has already been appended (see handleUsbGrabFinished()'s ordering).
+    // Never emitted for a CANCELLED grab: its counts are a partial tally, and
+    // announcing "grabbed 3 files" for a run the user just stopped would be a
+    // lie about what happened. autoTriggered lets QML word the snackbar for
+    // something the user didn't ask for versus something they clicked.
+    void grabFinished(const QString &deviceSerial, int filesCopied, int filesSkipped, const QStringList &errors,
+                       bool autoTriggered);
+    // Emitted once the LAST auto-grab this class enqueued has left the queue —
+    // the "only after all auto grabbings have run" barrier the auto-combine
+    // hangs off (see the class doc comment for why the combine itself is QML's
+    // job). Fires exactly once per batch, and only if at least one auto-grab
+    // actually ran: a manual "Grab now" never triggers it, and neither does a
+    // hotplug for a device whose autoGrab is off.
+    //
+    // Fires even if every grab in the batch copied nothing or was cancelled —
+    // it reports that the grabs are DONE, not that they found anything. The
+    // combine scan re-derives its own candidates from the vault either way, and
+    // a scan over an unchanged vault finds no ready groups and does nothing.
+    void autoGrabsSettled();
     // Emitted ONCE per requestGrabPreview() call, after every mounted volume of
     // the device has been previewed — entries is their combined result, so this
     // covers exactly what triggerManualGrab() would do. entries is a list of
@@ -186,7 +236,28 @@ private slots:
     // Bound to m_deviceMonitor's unmountedVolumeDetected signal at
     // construction: mounts the volume, but ONLY if its resolved rule is
     // enabled — see the class doc comment for why that's the gate.
+    //
+    // Gated on `enabled` and NOT on `autoGrab`: mounting is what makes a device
+    // addressable at all (previewable, configurable, grabbable by hand), so a
+    // device the user has vouched for should mount whether or not they also
+    // asked for hands-off grabbing. autoGrab decides what happens AFTER the
+    // mount, not whether it happens.
     void handleUnmountedVolumeDetected(const QVariantMap &info);
+
+    // Bound to m_transcriptionController's usbGrabFinished signal: records the
+    // history entry, re-emits grabFinished, and retires the job from
+    // m_inFlightJobs / m_pendingAutoGrabJobIds — emitting autoGrabsSettled()
+    // when that last set empties.
+    void handleUsbGrabFinished(int jobId, int filesCopied, int filesSkipped, const QStringList &errors,
+                                bool cancelled);
+
+    // Bound to m_transcriptionController's queueChanged: retires any tracked
+    // grab that has left the queue WITHOUT reporting a result — i.e. one
+    // cancelled while it was still Queued, which the queue drops outright
+    // rather than running (so usbGrabFinished never fires for it). Without
+    // this the auto-grab barrier would never empty again and the auto-combine
+    // would silently stop working for the session.
+    void reconcileInFlightJobs();
 
 private:
     // Shared by triggerManualGrab() and handleDeviceAdded(): the device-
@@ -215,26 +286,46 @@ private:
     // volume-aware bug got in.
     QVariantList findMountedVolumesBySerial(const QString &deviceSerial) const;
 
-    // Constructs and starts a UsbGrabJob against the currently-open vault,
-    // keyed into m_inFlightJobs by deviceId — which is the VOLUME's id
-    // (UsbDeviceInfo::id), never its serial: a device's volumes share a serial,
-    // so keying by that let two concurrent jobs for one device evict each other
-    // from the map. deviceRemoved is deliberately never connected to anything
-    // here: an unplug mid-grab just accumulates copy errors in the job's
+    // Enqueues one grab task (TranscriptionController::enqueueUsbGrab) against
+    // the currently-open vault and records what the queue can't: which device
+    // and rule the resulting job id belongs to.
+    //
+    // autoTriggered marks a hotplug-initiated grab, which additionally joins
+    // m_pendingAutoGrabJobIds so autoGrabsSettled() can fire when the batch
+    // drains. deviceRemoved is deliberately never connected to anything here:
+    // an unplug mid-grab just accumulates copy errors in runUsbGrabScan()'s
     // own per-file error handling and finishes naturally (per the confirmed
     // product decision — no early-abort-on-unmount logic).
-    void startGrabJob(const UsbGrabRule &rule, const QString &mountPath, const QString &deviceId);
+    void startGrabJob(const UsbGrabRule &rule, const QString &mountPath, bool autoTriggered);
 
     void setLastError(const QString &error);
 
     UsbDeviceMonitor m_deviceMonitor;
     UsbRuleStore m_ruleStore;
     VaultTreeModel *m_vaultTreeModel = nullptr;
+    TranscriptionController *m_transcriptionController = nullptr;
     QString m_lastError;
 
-    // In-flight grab jobs keyed by VOLUME id (see startGrabJob()'s doc
-    // comment). Entries are removed (and the job deleteLater()'d) once its
-    // finished() signal fires. One entry per mounted volume, so a two-volume
-    // device legitimately has two concurrent entries.
-    QHash<QString, UsbGrabJob *> m_inFlightJobs;
+    // What one in-flight grab job needs at completion time that its id alone
+    // can't answer — snapshotted at enqueue, since the rule can be edited (or
+    // the device unplugged) while the job waits its turn in the queue, and the
+    // history entry must record what actually RAN.
+    struct InFlightGrab {
+        QString deviceSerial;
+        QString deviceLabel;
+        bool autoTriggered = false;
+    };
+    // Keyed by JOB id, not by volume id or serial: the job id is the only thing
+    // that's unique per run and stable across the wait in the queue. (A serial
+    // is shared by a device's volumes — keying runtime state by it is a
+    // shipped-and-fixed bug that let two concurrent jobs for one device evict
+    // each other; a volume id is unique but runtime-only and would still
+    // collide across two grabs of the same volume.)
+    QHash<int, InFlightGrab> m_inFlightJobs;
+
+    // The subset of m_inFlightJobs' ids that a hotplug started by itself. Emptying
+    // this is what fires autoGrabsSettled() — see its doc comment. A set, not a
+    // count, so a completion for an id that isn't ours (or arrives twice) can't
+    // drive the barrier negative and fire the combine early.
+    QSet<int> m_pendingAutoGrabJobIds;
 };

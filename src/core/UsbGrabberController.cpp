@@ -4,7 +4,9 @@
 #include "UsbGrabJob.h"
 #include "VaultTreeModel.h"
 
+#include <QDateTime>
 #include <QFileInfo>
+#include <QUrl>
 
 #include <memory>
 
@@ -17,6 +19,7 @@ QVariantMap ruleToVariantMap(const UsbGrabRule &rule)
     QVariantMap map;
     map.insert(QStringLiteral("deviceSerial"), rule.deviceSerial);
     map.insert(QStringLiteral("enabled"), rule.enabled);
+    map.insert(QStringLiteral("autoGrab"), rule.autoGrab);
     map.insert(QStringLiteral("extensionFilter"), rule.extensionFilter);
     map.insert(QStringLiteral("filenameRegex"), rule.filenameRegex);
     map.insert(QStringLiteral("preserveStructure"), rule.preserveStructure);
@@ -31,6 +34,7 @@ UsbGrabRule ruleFromVariantMap(const QVariantMap &map)
     UsbGrabRule rule;
     rule.deviceSerial = map.value(QStringLiteral("deviceSerial")).toString();
     rule.enabled = map.value(QStringLiteral("enabled"), false).toBool();
+    rule.autoGrab = map.value(QStringLiteral("autoGrab"), false).toBool();
     rule.extensionFilter = map.value(QStringLiteral("extensionFilter")).toStringList();
     rule.filenameRegex = map.value(QStringLiteral("filenameRegex")).toString();
     rule.preserveStructure = map.value(QStringLiteral("preserveStructure"), true).toBool();
@@ -67,6 +71,22 @@ void UsbGrabberController::setVaultTreeModel(VaultTreeModel *model)
         return;
     m_vaultTreeModel = model;
     emit vaultTreeModelChanged();
+}
+
+void UsbGrabberController::setTranscriptionController(TranscriptionController *controller)
+{
+    if (controller == m_transcriptionController)
+        return;
+    if (m_transcriptionController)
+        disconnect(m_transcriptionController, nullptr, this, nullptr);
+    m_transcriptionController = controller;
+    if (m_transcriptionController) {
+        connect(m_transcriptionController, &TranscriptionController::usbGrabFinished, this,
+                &UsbGrabberController::handleUsbGrabFinished);
+        connect(m_transcriptionController, &TranscriptionController::queueChanged, this,
+                &UsbGrabberController::reconcileInFlightJobs);
+    }
+    emit transcriptionControllerChanged();
 }
 
 void UsbGrabberController::setLastError(const QString &error)
@@ -148,8 +168,8 @@ UsbGrabRule UsbGrabberController::resolveEffectiveRule(const QString &deviceSeri
     // The catch-all rule's own deviceSerial/deviceLabel are the literal "*"
     // placeholder and whatever generic label (if any) was set when
     // configuring it — override both with this specific device's real
-    // identity so the resulting history entry (see UsbGrabJob::
-    // handleWorkerFinished()) records which device actually ran, not "*".
+    // identity so the resulting history entry (see handleUsbGrabFinished())
+    // records which device actually ran, not "*".
     UsbGrabRule effective = catchAllRule;
     effective.deviceSerial = deviceSerial;
     const QString vendor = deviceInfo.value(QStringLiteral("vendor")).toString();
@@ -166,6 +186,11 @@ void UsbGrabberController::triggerManualGrab(const QString &deviceSerial)
 
     if (!m_vaultTreeModel || m_vaultTreeModel->vaultLocalPath().isEmpty()) {
         setLastError(QStringLiteral("No vault is open."));
+        return;
+    }
+
+    if (!m_transcriptionController) {
+        setLastError(QStringLiteral("The task queue is unavailable."));
         return;
     }
 
@@ -187,8 +212,7 @@ void UsbGrabberController::triggerManualGrab(const QString &deviceSerial)
     // rule's worth of user intent covers the whole physical device.
     for (const QVariant &volumeVariant : volumes) {
         const QVariantMap volume = volumeVariant.toMap();
-        startGrabJob(rule, volume.value(QStringLiteral("mountPath")).toString(),
-                      volume.value(QStringLiteral("id")).toString());
+        startGrabJob(rule, volume.value(QStringLiteral("mountPath")).toString(), /*autoTriggered=*/false);
     }
 }
 
@@ -199,10 +223,14 @@ void UsbGrabberController::handleDeviceAdded(const QVariantMap &info)
 
     const QString deviceSerial = info.value(QStringLiteral("serial")).toString();
     const UsbGrabRule rule = resolveEffectiveRule(deviceSerial, info);
-    if (!rule.enabled)
+    // Both gates, in order — see the class doc comment. enabled says the device
+    // is grabbable at all; autoGrab says a hotplug may grab it with no click.
+    // An enabled-but-not-autoGrab device still mounted (that's enabled's job)
+    // and still shows up here to be grabbed on demand; it just isn't touched.
+    if (!rule.enabled || !rule.autoGrab)
         return;
 
-    startGrabJob(rule, info.value(QStringLiteral("mountPath")).toString(), info.value(QStringLiteral("id")).toString());
+    startGrabJob(rule, info.value(QStringLiteral("mountPath")).toString(), /*autoTriggered=*/true);
 }
 
 void UsbGrabberController::handleUnmountedVolumeDetected(const QVariantMap &info)
@@ -229,20 +257,105 @@ QString UsbGrabberController::resolveDestinationPath(const UsbGrabRule &rule) co
     return path;
 }
 
-void UsbGrabberController::startGrabJob(const UsbGrabRule &rule, const QString &mountPath, const QString &deviceId)
+void UsbGrabberController::startGrabJob(const UsbGrabRule &rule, const QString &mountPath, bool autoTriggered)
 {
-    auto *job = new UsbGrabJob(this);
-    m_inFlightJobs.insert(deviceId, job);
+    if (!m_transcriptionController)
+        return;
 
-    const QString deviceSerial = rule.deviceSerial;
-    connect(job, &UsbGrabJob::finished, this,
-            [this, job, deviceId, deviceSerial](int filesCopied, int filesSkipped, const QStringList &errors) {
-                m_inFlightJobs.remove(deviceId);
-                job->deleteLater();
-                emit grabFinished(deviceSerial, filesCopied, filesSkipped, errors);
-            });
+    const QString destinationPath = resolveDestinationPath(rule);
+    const int jobId = m_transcriptionController->enqueueUsbGrab(
+        rule, mountPath, QUrl::fromLocalFile(destinationPath),
+        QUrl::fromLocalFile(m_vaultTreeModel->vaultLocalPath()), autoTriggered);
 
-    job->start(rule, mountPath, resolveDestinationPath(rule), m_vaultTreeModel);
+    m_inFlightJobs.insert(jobId, InFlightGrab { rule.deviceSerial, rule.deviceLabel, autoTriggered });
+    if (autoTriggered)
+        m_pendingAutoGrabJobIds.insert(jobId);
+}
+
+void UsbGrabberController::handleUsbGrabFinished(int jobId, int filesCopied, int filesSkipped,
+                                                  const QStringList &errors, bool cancelled)
+{
+    // Not ours: this controller and the queue are both app-wide, and the queue
+    // has no reason to believe every usbGrab job came from here.
+    if (!m_inFlightJobs.contains(jobId))
+        return;
+    const InFlightGrab grab = m_inFlightJobs.take(jobId);
+
+    // Retire from the auto-grab barrier BEFORE the early-return below, so a
+    // cancelled auto-grab can't strand the batch and block the auto-combine
+    // forever. "All auto-grabs have run" means none are left, not that they all
+    // succeeded — see autoGrabsSettled()'s doc comment.
+    const bool wasPendingAuto = m_pendingAutoGrabJobIds.remove(jobId);
+    const bool settled = wasPendingAuto && m_pendingAutoGrabJobIds.isEmpty();
+
+    // A cancelled grab's counts are a partial tally — recording it in history
+    // or announcing it would misreport a run the user stopped as a completed
+    // one. The Tasks row already shows it as cancelled, which is the honest
+    // account of what happened.
+    if (!cancelled) {
+        QStringList combinedErrors = errors;
+        if (m_vaultTreeModel) {
+            QVariantMap entry;
+            entry[QStringLiteral("timestamp")] = QDateTime::currentDateTimeUtc().toString(Qt::ISODate);
+            entry[QStringLiteral("deviceSerial")] = grab.deviceSerial;
+            entry[QStringLiteral("deviceLabel")] = grab.deviceLabel;
+            entry[QStringLiteral("filesCopied")] = filesCopied;
+            entry[QStringLiteral("filesSkipped")] = filesSkipped;
+            entry[QStringLiteral("errors")] = errors;
+
+            QString appendError;
+            if (!m_vaultTreeModel->appendUsbGrabHistoryEntry(entry, &appendError) && !appendError.isEmpty())
+                combinedErrors.append(QStringLiteral("Failed to record grab history: %1").arg(appendError));
+        }
+        // After the history append, so a QML handler that re-reads history()
+        // on this signal already sees this run's entry.
+        emit grabFinished(grab.deviceSerial, filesCopied, filesSkipped, combinedErrors, grab.autoTriggered);
+    }
+
+    // Last, so the auto-combine it kicks off is enqueued behind nothing and
+    // every grabFinished for the batch has already been delivered.
+    if (settled)
+        emit autoGrabsSettled();
+}
+
+void UsbGrabberController::reconcileInFlightJobs()
+{
+    if (m_inFlightJobs.isEmpty() || !m_transcriptionController)
+        return;
+
+    QSet<int> liveIds;
+    const QVariantList jobs = m_transcriptionController->jobs();
+    liveIds.reserve(jobs.size());
+    for (const QVariant &jobVariant : jobs)
+        liveIds.insert(jobVariant.toMap().value(QStringLiteral("id")).toInt());
+
+    bool settled = false;
+    for (auto it = m_inFlightJobs.begin(); it != m_inFlightJobs.end();) {
+        if (liveIds.contains(it.key())) {
+            ++it;
+            continue;
+        }
+        // Vanished from the queue without ever reporting a result — which means
+        // it was cancelled while still QUEUED: cancelJob()/cancelAll() simply
+        // drop such a job, so the worker never runs it and usbGrabFinished
+        // never fires for it. Without this, its id would sit in
+        // m_pendingAutoGrabJobIds forever and the barrier below would never
+        // empty again, silently disabling the auto-combiner for the rest of the
+        // session. Retired exactly like a cancelled run: no history entry, no
+        // announcement.
+        //
+        // Reconciling against the queue (rather than teaching every removal
+        // path to notify us) is deliberate: it's correct for cancel-while-
+        // queued, cancelAll, and any future removal path, none of which can
+        // forget to call it. A completed job is already out of m_inFlightJobs
+        // by the time its queueChanged lands, so this never double-retires one.
+        if (m_pendingAutoGrabJobIds.remove(it.key()) && m_pendingAutoGrabJobIds.isEmpty())
+            settled = true;
+        it = m_inFlightJobs.erase(it);
+    }
+
+    if (settled)
+        emit autoGrabsSettled();
 }
 
 void UsbGrabberController::requestGrabPreview(const QString &deviceSerial)
@@ -294,8 +407,8 @@ void UsbGrabberController::requestGrabPreview(const QString &deviceSerial)
         // the ordinary single-volume preview stays unprefixed.
         const QString volumeName = QFileInfo(mountPath).fileName();
 
-        auto *job = new UsbGrabJob(this);
-        connect(job, &UsbGrabJob::previewReady, this,
+        auto *job = new UsbGrabPreviewJob(this);
+        connect(job, &UsbGrabPreviewJob::previewReady, this,
                 [this, job, deviceSerial, volumeName, multiVolume, remaining, combined, firstError](
                     const QVariantList &entries, const QString &error) {
                     job->deleteLater();
@@ -316,6 +429,6 @@ void UsbGrabberController::requestGrabPreview(const QString &deviceSerial)
                         setLastError(*firstError);
                     emit grabPreviewReady(deviceSerial, *combined, *firstError);
                 });
-        job->startPreview(rule, mountPath, resolveDestinationPath(rule));
+        job->start(rule, mountPath, resolveDestinationPath(rule));
     }
 }

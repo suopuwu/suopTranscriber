@@ -706,6 +706,11 @@ Rectangle {
     property int jobStatusRevision: 0
     Connections {
         target: sidebar.transcriptionController
+        // The queue is the only thing that can change which combines are
+        // pending — a combine being enqueued, starting, or finishing all land
+        // here. setPendingCombines() no-ops unless the set genuinely changed,
+        // which is what makes it safe to call on a signal this chatty.
+        function onQueueChanged() { sidebar.pushPendingCombines() }
         function onFinished(fileUrl, ok, error) {
             sidebar.metadataRevision += 1
             sidebar.refreshTreeOrdering()
@@ -742,6 +747,40 @@ Rectangle {
             // alreadyTranscribed) and onModelReset (the watcher saw the
             // directory change).
         }
+    }
+
+    // Combine placeholders (see VaultTreeModel::setPendingCombines()): the
+    // combines that are queued or running but haven't landed on disk yet, as
+    // [{outputPath, sources}]. Derived from the controller's `jobs` list rather
+    // than from a bespoke C++ property — a combine job already carries exactly
+    // this (its fileUrl IS the output path, and combineSourcePaths is the
+    // ordered part list), so there's nothing for the controller to add.
+    //
+    // Queued AND active, not just active: the whole point is that the tree
+    // reacts the moment you press Combine, and a job sitting behind other work
+    // is precisely the case where the wait is longest. Finished jobs (done/
+    // failed) drop out, which is what retires the placeholder — see
+    // setPendingCombines().
+    function pendingCombines() {
+        // `jobs` is a real Q_PROPERTY on a live controller, but a test harness
+        // (or the window between wiring and first read) can hand us a
+        // controller whose jobs isn't populated yet — guard the list, not just
+        // the controller, so .filter is never called on undefined.
+        const jobs = sidebar.transcriptionController ? sidebar.transcriptionController.jobs : null
+        if (!jobs)
+            return []
+        return jobs
+            .filter((j) => j.kind === "combine"
+                    && (j.status === "queued" || j.status === "active"))
+            .map((j) => ({
+                outputPath: String(j.fileUrl).replace("file://", ""),
+                sources: j.combineSourcePaths
+            }))
+    }
+
+    function pushPendingCombines() {
+        if (sidebar.model)
+            sidebar.model.setPendingCombines(sidebar.pendingCombines())
     }
 
     // Item 51: path -> outputPath, for every file currently a member of a
@@ -940,6 +979,28 @@ Rectangle {
                                key !== undefined ? memberOrderRank(path) : ownRank(path)]
         }
 
+        // Combine placeholders (see pendingCombines()) are not in audioPaths —
+        // they aren't audio, or even files yet — but they still need a key.
+        // Without one the proxy drops them into its keyless tier, which sorts
+        // after every real audio file in the folder (see lessThan()'s
+        // "has a key" comment), so an in-progress merge would jump to the
+        // bottom and then jump back when it landed.
+        //
+        // Keyed as an ungrouped file at the output's own path, so the
+        // placeholder sits exactly where the merged file will appear once it
+        // exists — the row doesn't move when the real thing replaces it.
+        // That's exact for sortMode "name". For the date modes it's
+        // approximate: ownRank() wants an mtime, and a file that hasn't been
+        // written has none (mtimes has no entry -> 0), so a placeholder sorts
+        // to the newest/oldest edge for the seconds it exists. Chasing that
+        // would mean ranking by the sources' mtimes, and the sources are the
+        // very rows being hidden — not worth the machinery for a transient row
+        // that resolves itself.
+        for (const pending of sidebar.pendingCombines()) {
+            const p = pending.outputPath
+            sortKeys[p] = [ownRank(p), p, ownRank(p)]
+        }
+
         // Adjacency (combineTopMerged/combineBottomMerged) has to be
         // computed from the SAME order the tree actually ends up displaying
         // — see this property's doc comment above for the bug that bit when
@@ -972,7 +1033,13 @@ Rectangle {
         sidebar.combineBottomMergedPaths = bottomMerged
         searchProxy.fileSortKeys = sortKeys
     }
-    Component.onCompleted: sidebar.refreshTreeOrdering()
+    // pushPendingCombines() too, not just on the queueChanged above: a combine
+    // job survives a restart (the queue is persisted), so the tree can open
+    // with one already pending and no queue transition coming to announce it.
+    Component.onCompleted: {
+        sidebar.pushPendingCombines()
+        sidebar.refreshTreeOrdering()
+    }
     Connections {
         target: AppSettings
         function onCombineRulesChanged() { sidebar.refreshTreeOrdering() }
@@ -1543,11 +1610,13 @@ Rectangle {
     // Nothing predicts trash-ability up front; attempting it IS the test, and
     // it's free. So the prompt now means what it says: "this cannot be undone".
     //
-    // An ARRAY, not a single path: "Delete file" acts on the whole
-    // multi-selection when the right-clicked row is part of one (see
-    // selectionPathsFor, shared with drag-to-move). "Delete transcript" stays
-    // deliberately single-file — it's offered only for the one right-clicked
-    // transcribed audio row, so it always has exactly one target.
+    // An ARRAY, not a single path: every file-kind delete acts on a whole set.
+    // From the context menu that's the multi-selection when the right-clicked
+    // row is part of one (see selectionPathsFor, shared with drag-to-move);
+    // from the ribbon's delete buttons and the Delete key it's the selection
+    // itself. Only "folder" is ever single-target — trashFolder() is a separate
+    // C++ call precisely so a recursive folder delete can't ride along in a
+    // file batch (see its doc comment).
     property var pendingDeletePaths: []
     property string pendingDeleteMode: "" // "transcript" | "audioOnly" | "file" | "folder"
 
@@ -1593,41 +1662,59 @@ Rectangle {
         }
     }
 
-    function beginDeleteTranscript(path) {
-        if (!sidebar.model)
+    // All three take a PATHS ARRAY, not a single path, so the three callers can
+    // share one entry point each: the context menu passes
+    // selectionPathsFor(ctxPath) (the right-clicked row, widened to the
+    // selection when it's part of one), while the ribbon's delete buttons and
+    // the Delete key pass a selection subset directly — they have no
+    // right-clicked row for selectionPathsFor() to widen from.
+    //
+    // Each is ONE C++ call for the whole batch: the trash* calls rebuild the
+    // model once per call rather than once per file, and a rebuild rescans the
+    // vault recursively AND resets the model (see trashFiles()' doc comment).
+    // Looping here would also eat its own selection — a model reset clears
+    // selectedPaths (see onModelReset above).
+    function baseNameOf(path) {
+        return path.substring(path.lastIndexOf("/") + 1)
+    }
+
+    function beginDeleteTranscript(paths) {
+        if (!sidebar.model || paths.length === 0)
             return
-        const name = path.substring(path.lastIndexOf("/") + 1)
+        const result = sidebar.model.trashTranscript(paths.map((p) => "file://" + p))
+        // Keyed on the TARGET count, not on result.trashed: with several
+        // targets and one success, paths[0] isn't necessarily the file that
+        // succeeded, so naming it would name the wrong one.
         sidebar.handleTrashResult(
-            sidebar.model.trashTranscript("file://" + path), "transcript",
-            qsTr("Moved the transcript for %1 to the trash.").arg(name))
+            result, "transcript",
+            paths.length === 1
+                ? qsTr("Moved the transcript for %1 to the trash.").arg(sidebar.baseNameOf(paths[0]))
+                : qsTr("Moved %1 transcripts to the trash.").arg(result.trashed))
     }
 
     // The complement of beginDeleteTranscript(): drops the audio, keeps the .md
-    // (which becomes an orphaned-.md row). Single-file for the same reason
-    // beginDeleteTranscript() is — see pendingDeletePaths' comment.
-    function beginDeleteAudioOnly(path) {
-        if (!sidebar.model)
+    // (which becomes an orphaned-.md row).
+    function beginDeleteAudioOnly(paths) {
+        if (!sidebar.model || paths.length === 0)
             return
-        const name = path.substring(path.lastIndexOf("/") + 1)
+        const result = sidebar.model.trashAudioOnly(paths.map((p) => "file://" + p))
         sidebar.handleTrashResult(
-            sidebar.model.trashAudioOnly("file://" + path), "audioOnly",
-            qsTr("Moved the audio for %1 to the trash — the transcript is still here.").arg(name))
+            result, "audioOnly",
+            paths.length === 1
+                ? qsTr("Moved the audio for %1 to the trash — the transcript is still here.")
+                      .arg(sidebar.baseNameOf(paths[0]))
+                : qsTr("Moved %1 audio files to the trash — their transcripts are still here.")
+                      .arg(result.trashed))
     }
 
-    function beginDeleteFile(path) {
-        if (!sidebar.model)
+    function beginDeleteFile(paths) {
+        if (!sidebar.model || paths.length === 0)
             return
-        const paths = sidebar.selectionPathsFor(path, false)
-        if (paths.length === 0)
-            return
-        // One C++ call for the whole batch — trashFiles() rebuilds the model
-        // once rather than once per file (see its doc comment).
         const result = sidebar.model.trashFiles(paths.map((p) => "file://" + p))
         sidebar.handleTrashResult(
             result, "file",
-            result.trashed === 1
-                ? qsTr("Moved %1 to the trash.").arg(
-                      paths[0].substring(paths[0].lastIndexOf("/") + 1))
+            paths.length === 1
+                ? qsTr("Moved %1 to the trash.").arg(sidebar.baseNameOf(paths[0]))
                 : qsTr("Moved %1 items to the trash.").arg(result.trashed))
     }
 
@@ -1645,15 +1732,19 @@ Rectangle {
     function confirmFileDelete() {
         const paths = sidebar.pendingDeletePaths
         if (sidebar.model && paths.length > 0) {
-            if (sidebar.pendingDeleteMode === "transcript") {
-                sidebar.model.deleteTranscriptPermanently("file://" + paths[0])
-            } else if (sidebar.pendingDeleteMode === "audioOnly") {
-                sidebar.model.deleteAudioOnlyPermanently("file://" + paths[0])
-            } else if (sidebar.pendingDeleteMode === "folder") {
-                sidebar.model.deleteFolderPermanently("file://" + paths[0])
+            const urls = paths.map((p) => "file://" + p)
+            // "folder" is the one single-target mode — see pendingDeletePaths'
+            // comment. The other three are batches, and each reports how many
+            // of the batch it actually removed.
+            if (sidebar.pendingDeleteMode === "folder") {
+                if (!sidebar.model.deleteFolderPermanently(urls[0]))
+                    Notifications.error(qsTr("Couldn't delete that folder."))
             } else {
-                const urls = paths.map((p) => "file://" + p)
-                const deleted = sidebar.model.deleteFilesPermanently(urls)
+                const deleted = sidebar.pendingDeleteMode === "transcript"
+                    ? sidebar.model.deleteTranscriptPermanently(urls)
+                    : sidebar.pendingDeleteMode === "audioOnly"
+                        ? sidebar.model.deleteAudioOnlyPermanently(urls)
+                        : sidebar.model.deleteFilesPermanently(urls)
                 if (deleted < paths.length)
                     Notifications.error(qsTr("Couldn't delete %1 of %2 items.")
                         .arg(paths.length - deleted).arg(paths.length))
@@ -1695,18 +1786,31 @@ Rectangle {
         }
     }
 
-    // Vertical arrow-key navigation between notes, gated on the tree/
-    // search-results view actually having keyboard focus (grabbed by their
-    // TapHandlers above on click) — inert while a TextField elsewhere has
-    // focus, since only one item can have activeFocus at a time.
+    // The gate every note-selection shortcut below shares: the tree or the
+    // search-results view actually has keyboard focus (grabbed by their
+    // TapHandlers on click), and no inline rename is in flight.
+    //
+    // The `renamingPath` half is load-bearing, not belt-and-braces. The other
+    // conjunct's "a TextField elsewhere has focus, so the tree doesn't" logic
+    // holds for the search/tag fields, which sit OUTSIDE the tree — but the
+    // inline rename editor is a TextField INSIDE a tree delegate, and TreeView
+    // is a FocusScope: when its focused child holds active focus, the scope
+    // reports activeFocus too. So `tree.activeFocus` is true while you're
+    // typing in the rename editor, and without this an ordinary Delete
+    // keystroke mid-rename would trash the file being renamed instead of
+    // deleting a character.
+    readonly property bool noteShortcutsEnabled:
+        (tree.activeFocus || searchResultsView.activeFocus) && sidebar.renamingPath === ""
+
+    // Vertical arrow-key navigation between notes.
     Shortcut {
         sequence: "Up"
-        enabled: tree.activeFocus || searchResultsView.activeFocus
+        enabled: sidebar.noteShortcutsEnabled
         onActivated: sidebar.moveNoteSelection(-1)
     }
     Shortcut {
         sequence: "Down"
-        enabled: tree.activeFocus || searchResultsView.activeFocus
+        enabled: sidebar.noteShortcutsEnabled
         onActivated: sidebar.moveNoteSelection(1)
     }
 
@@ -1714,12 +1818,12 @@ Rectangle {
     // (mirrors Shift-click), same focus gating as plain Up/Down.
     Shortcut {
         sequence: "Shift+Up"
-        enabled: tree.activeFocus || searchResultsView.activeFocus
+        enabled: sidebar.noteShortcutsEnabled
         onActivated: sidebar.extendNoteSelection(-1)
     }
     Shortcut {
         sequence: "Shift+Down"
-        enabled: tree.activeFocus || searchResultsView.activeFocus
+        enabled: sidebar.noteShortcutsEnabled
         onActivated: sidebar.extendNoteSelection(1)
     }
 
@@ -1727,12 +1831,12 @@ Rectangle {
     // first/last note, then hop group-by-group on repeat.
     Shortcut {
         sequence: "Ctrl+Up"
-        enabled: tree.activeFocus || searchResultsView.activeFocus
+        enabled: sidebar.noteShortcutsEnabled
         onActivated: sidebar.jumpToGroupBoundary(-1)
     }
     Shortcut {
         sequence: "Ctrl+Down"
-        enabled: tree.activeFocus || searchResultsView.activeFocus
+        enabled: sidebar.noteShortcutsEnabled
         onActivated: sidebar.jumpToGroupBoundary(1)
     }
 
@@ -1742,8 +1846,24 @@ Rectangle {
     // Ctrl+A (select-all-text).
     Shortcut {
         sequence: "Ctrl+A"
-        enabled: tree.activeFocus || searchResultsView.activeFocus
+        enabled: sidebar.noteShortcutsEnabled
         onActivated: sidebar.selectAllVisible()
+    }
+
+    // Delete the selection, mirroring the ribbon's deleteFileAllButton and the
+    // context menu's ctxDeleteFileRow — the whole-file delete, since that's the
+    // one a Delete key means everywhere else. Trash-first like every other
+    // delete path here, so it's undoable from the snackbar and prompts only if
+    // the filesystem refuses (see pendingDeletePaths' comment).
+    //
+    // Deliberately the plain-file delete and not a folder one: selectedPaths
+    // only ever holds notes (a directory row's TapHandler toggles expand and
+    // never selects — see treeDelegate), so this can't recursively take a
+    // folder. Deleting a folder stays an explicit right-click action.
+    Shortcut {
+        sequence: StandardKey.Delete
+        enabled: sidebar.noteShortcutsEnabled && sidebar.selectedPaths.length > 0
+        onActivated: sidebar.beginDeleteFile(sidebar.selectedPaths.slice())
     }
 
     Item {
@@ -1758,10 +1878,27 @@ Rectangle {
         // (anchored to ribbon.bottom) overlap the bottom search rows.
         // Binding to expandedColumn.implicitHeight tracks whatever rows
         // actually exist, so future additions can't repeat this bug.
-        height: sidebar.searchExpanded ? expandedColumn.implicitHeight : 32
+        //
+        // The collapsed half follows the same rule for the same reason: it was
+        // a literal 32 (one 22px button row + padding), which only held while
+        // the buttons fit on one line. They no longer do — the destructive trio
+        // (CLAUDE.md action parity with MainPanel's cluster) pushed the count
+        // past what a narrow sidebar can show in a row, so ribbonFlow wraps and
+        // this tracks however many lines it ends up needing.
+        height: sidebar.searchExpanded ? expandedColumn.implicitHeight
+                                        : ribbonFlow.implicitHeight + ribbonFlow.anchors.topMargin * 2
 
-        RowLayout {
-            anchors.fill: parent
+        // A Flow, not the RowLayout this used to be: with 13 items a fixed row
+        // silently squeezed/clipped buttons at a narrow sidebar width. Flow
+        // ignores Layout attached properties entirely (it positions by plain
+        // width/height), which is why every child below sets width/height
+        // directly rather than Layout.preferredWidth/Height.
+        Flow {
+            id: ribbonFlow
+            anchors.top: parent.top
+            anchors.left: parent.left
+            anchors.right: parent.right
+            anchors.topMargin: 5
             anchors.leftMargin: 6
             anchors.rightMargin: 6
             spacing: 4
@@ -1775,8 +1912,8 @@ Rectangle {
             Item {
                 id: selectAllButton
                 objectName: "selectAllButton"
-                Layout.preferredWidth: 22
-                Layout.preferredHeight: 22
+                width: 22
+                height: 22
                 enabled: sidebar.visibleNotePaths().length > 0
 
                 HoverHandler {
@@ -1807,20 +1944,31 @@ Rectangle {
             // Separates select-all from the bulk action buttons it feeds —
             // same border color as the rest of the app's thin-line dividers
             // (e.g. sortModeMenu's Popup border below).
-            Rectangle {
+            //
+            // A full-height Item wrapping a shorter line, rather than a bare
+            // 18px Rectangle with Layout.alignment: Qt.AlignVCenter — a Flow
+            // has no per-item alignment, so a short child would hang off the
+            // top of its row instead of centering against the 22px buttons.
+            // Same shape as ribbonDeleteDivider below.
+            Item {
                 id: ribbonDivider
                 objectName: "ribbonDivider"
-                Layout.preferredWidth: 1
-                Layout.preferredHeight: 18
-                Layout.alignment: Qt.AlignVCenter
-                color: "#3a3a3a"
+                width: 1
+                height: 22
+
+                Rectangle {
+                    anchors.centerIn: parent
+                    width: 1
+                    height: 18
+                    color: "#3a3a3a"
+                }
             }
 
             Item {
                 id: transcribeAllButton
                 objectName: "transcribeAllButton"
-                Layout.preferredWidth: 22
-                Layout.preferredHeight: 22
+                width: 22
+                height: 22
                 // Item 3 (reworked): the ribbon always narrows to the
                 // current selection now (see bulkTargetPaths()'s comment) —
                 // an empty selection means nothing to transcribe, so dim
@@ -1868,8 +2016,8 @@ Rectangle {
             // instead of untranscribed ones.
             Item {
                 id: relabelAllButton
-                Layout.preferredWidth: 22
-                Layout.preferredHeight: 22
+                width: 22
+                height: 22
                 // Item 3 (reworked): same bulkTargetPaths narrowing as
                 // transcribeAllButton above.
                 enabled: sidebar.transcriptionController && sidebar.bulkTargetPaths(sidebar.transcribedPaths).length > 0
@@ -1912,8 +2060,8 @@ Rectangle {
             // generateChaptersAll().
             Item {
                 id: chaptersAllButton
-                Layout.preferredWidth: 22
-                Layout.preferredHeight: 22
+                width: 22
+                height: 22
                 // Item 3 (reworked): same bulkTargetPaths narrowing as
                 // transcribeAllButton above.
                 enabled: sidebar.transcriptionController && sidebar.bulkTargetPaths(sidebar.chaptersPaths).length > 0
@@ -1955,8 +2103,8 @@ Rectangle {
             // diarizeFilesForPaths(). Mirrors MainPanel's detectSpeakersButton.
             Item {
                 id: detectSpeakersAllButton
-                Layout.preferredWidth: 22
-                Layout.preferredHeight: 22
+                width: 22
+                height: 22
                 // Same bulkTargetPaths narrowing as the other ribbon buttons.
                 enabled: sidebar.transcriptionController && sidebar.bulkTargetPaths(sidebar.transcribedPaths).length > 0
 
@@ -2000,8 +2148,8 @@ Rectangle {
             // slips through already-transcribed, so it's safe regardless.
             Item {
                 id: runAllButton
-                Layout.preferredWidth: 22
-                Layout.preferredHeight: 22
+                width: 22
+                height: 22
                 enabled: sidebar.transcriptionController
                          && sidebar.bulkTargetPaths(sidebar.untranscribedPaths).length > 0
 
@@ -2053,8 +2201,8 @@ Rectangle {
             // see TranscriptionController::runCombineScan()'s doc comment.
             Item {
                 id: combineButton
-                Layout.preferredWidth: 22
-                Layout.preferredHeight: 22
+                width: 22
+                height: 22
                 enabled: sidebar.transcriptionController && AppSettings.combineRules.length > 0
 
                 HoverHandler {
@@ -2094,8 +2242,8 @@ Rectangle {
             // for it here.
             Item {
                 id: sortModeButton
-                Layout.preferredWidth: 22
-                Layout.preferredHeight: 22
+                width: 22
+                height: 22
 
                 HoverHandler {
                     id: sortModeHover
@@ -2189,8 +2337,8 @@ Rectangle {
 
             Item {
                 id: searchToggleButton
-                Layout.preferredWidth: 22
-                Layout.preferredHeight: 22
+                width: 22
+                height: 22
 
                 HoverHandler {
                     id: searchToggleHover
@@ -2214,8 +2362,139 @@ Rectangle {
                 }
             }
 
+            // Separates the constructive actions from the destructive trio
+            // below — same shape/reasoning as ribbonDivider above.
             Item {
-                Layout.fillWidth: true
+                id: ribbonDeleteDivider
+                objectName: "ribbonDeleteDivider"
+                width: 1
+                height: 22
+
+                Rectangle {
+                    anchors.centerIn: parent
+                    width: 1
+                    height: 18
+                    color: "#3a3a3a"
+                }
+            }
+
+            // The destructive trio — CLAUDE.md per-file-action parity with
+            // MainPanel's deleteTranscriptButton/deleteAudioOnlyButton/
+            // deleteFileButton, which had no bulk counterpart here.
+            //
+            // A bulk ribbon delete was deliberately left out once before, as
+            // "too dangerous" (see tst_styleguide's
+            // delete_transcriptAndFile_wiredInSidebarAndMainPanel). That call
+            // was made while every delete was a confirm-then-maybe-permanent
+            // one. It isn't anymore: these are the same trash-first calls the
+            // context menu uses, so the recoverable case (all but a filesystem
+            // refusal) costs an Undo click from the snackbar rather than the
+            // file — and the Delete key needs a visible affordance to advertise
+            // anyway. Destructive-red icons (#e07a7a), matching MainPanel's.
+            //
+            // Eligibility mirrors MainPanel's gating exactly: the transcript/
+            // audio-only pair need a transcribed AUDIO row (transcribedPaths —
+            // the same map relabelAll/detectSpeakersAll use), since "keep the
+            // other half" is meaningless without both halves. "Delete file"
+            // takes any selected note.
+            Item {
+                id: deleteTranscriptAllButton
+                objectName: "deleteTranscriptAllButton"
+                width: 22
+                height: 22
+                enabled: sidebar.model && sidebar.bulkTargetPaths(sidebar.transcribedPaths).length > 0
+
+                HoverHandler {
+                    id: deleteTranscriptAllHover
+                    cursorShape: Qt.PointingHandCursor
+                    enabled: deleteTranscriptAllButton.enabled
+                }
+                TapHandler {
+                    enabled: deleteTranscriptAllButton.enabled
+                    onTapped: sidebar.beginDeleteTranscript(
+                                  sidebar.bulkTargetPaths(sidebar.transcribedPaths))
+                }
+                HoverBorder {
+                    anchors.fill: parent
+                    active: deleteTranscriptAllButton.enabled && deleteTranscriptAllHover.hovered
+                }
+                AppIcon {
+                    anchors.centerIn: parent
+                    name: "delete-transcript"
+                    color: deleteTranscriptAllButton.enabled ? "#e07a7a" : "#666666"
+                    iconSize: 14
+                }
+
+                ToolTip.visible: deleteTranscriptAllHover.hovered
+                ToolTip.text: qsTr("Delete transcripts for selected files (keep audio)")
+                ToolTip.delay: 500
+            }
+
+            Item {
+                id: deleteAudioOnlyAllButton
+                objectName: "deleteAudioOnlyAllButton"
+                width: 22
+                height: 22
+                enabled: sidebar.model && sidebar.bulkTargetPaths(sidebar.transcribedPaths).length > 0
+
+                HoverHandler {
+                    id: deleteAudioOnlyAllHover
+                    cursorShape: Qt.PointingHandCursor
+                    enabled: deleteAudioOnlyAllButton.enabled
+                }
+                TapHandler {
+                    enabled: deleteAudioOnlyAllButton.enabled
+                    onTapped: sidebar.beginDeleteAudioOnly(
+                                  sidebar.bulkTargetPaths(sidebar.transcribedPaths))
+                }
+                HoverBorder {
+                    anchors.fill: parent
+                    active: deleteAudioOnlyAllButton.enabled && deleteAudioOnlyAllHover.hovered
+                }
+                AppIcon {
+                    anchors.centerIn: parent
+                    name: "delete-audio"
+                    color: deleteAudioOnlyAllButton.enabled ? "#e07a7a" : "#666666"
+                    iconSize: 14
+                }
+
+                ToolTip.visible: deleteAudioOnlyAllHover.hovered
+                ToolTip.text: qsTr("Delete audio for selected files (keep transcripts)")
+                ToolTip.delay: 500
+            }
+
+            // The Delete key's visible affordance — see the Delete Shortcut
+            // above, which runs this same beginDeleteFile(selection).
+            Item {
+                id: deleteFileAllButton
+                objectName: "deleteFileAllButton"
+                width: 22
+                height: 22
+                enabled: sidebar.model && sidebar.selectedPaths.length > 0
+
+                HoverHandler {
+                    id: deleteFileAllHover
+                    cursorShape: Qt.PointingHandCursor
+                    enabled: deleteFileAllButton.enabled
+                }
+                TapHandler {
+                    enabled: deleteFileAllButton.enabled
+                    onTapped: sidebar.beginDeleteFile(sidebar.selectedPaths.slice())
+                }
+                HoverBorder {
+                    anchors.fill: parent
+                    active: deleteFileAllButton.enabled && deleteFileAllHover.hovered
+                }
+                AppIcon {
+                    anchors.centerIn: parent
+                    name: "delete-file"
+                    color: deleteFileAllButton.enabled ? "#e07a7a" : "#666666"
+                    iconSize: 14
+                }
+
+                ToolTip.visible: deleteFileAllHover.hovered
+                ToolTip.text: qsTr("Delete selected files (Delete)")
+                ToolTip.delay: 500
             }
 
             // Item 3: "N selected" indicator, only shown once a genuine
@@ -2225,13 +2504,21 @@ Rectangle {
             // would be redundant. Same typography as BottomBar.qml's
             // tasksLabel (the closest existing "small status readout next
             // to a toolbar" precedent in this codebase).
+            //
+            // Flows along with the buttons rather than being pushed to the far
+            // right by a Layout.fillWidth spacer, as it was under the old
+            // RowLayout: a Flow gives its items no alignment and a
+            // fillWidth spacer nothing to fill, so a spacer would just wrap the
+            // label onto a line of its own. The explicit height centers it
+            // against the 22px buttons.
             Label {
                 id: multiSelectCountLabel
                 visible: sidebar.selectedPaths.length > 1
                 text: qsTr("%1 selected").arg(sidebar.selectedPaths.length)
                 color: "#aaaaaa"
                 font.pixelSize: 11
-                Layout.alignment: Qt.AlignVCenter
+                height: 22
+                verticalAlignment: Text.AlignVCenter
             }
 
         }
@@ -3208,6 +3495,33 @@ Rectangle {
             required property bool isAudio
             required property int status
             required property bool isOrphanedMd
+            // The synthetic in-progress row standing in for a combine that
+            // hasn't produced its file yet — see VaultTreeModel::
+            // setPendingCombines(). It is not a file: isDir/isAudio/
+            // isOrphanedMd are all false, which already makes every eligibility
+            // binding below false and keeps it out of sidebar.visibleNotePaths()
+            // (so it can't be selected, arrow-navigated, or bulk-acted on)
+            // without any of them naming it. Only the things that would
+            // otherwise treat "not a dir" as "openable file" need the explicit
+            // guards below: the two TapHandlers and the drag.
+            required property bool isCombinePlaceholder
+            required property int combineSourceCount
+
+            // Is the combine this placeholder stands for the job actually
+            // RUNNING right now (vs. still queued behind other work)? A combine
+            // job's fileUrl is its output path, which is exactly this row's
+            // path — that's what lets the row find its own job without a
+            // lookup. Bound to currentFile/busy/progress, all of which are real
+            // Q_PROPERTYs with notify signals, so this stays live (an
+            // isQueued()-style Q_INVOKABLE would not — see MainPanel's
+            // busyOrQueuedUrls comment for that exact trap).
+            readonly property bool combineActive: treeDelegate.isCombinePlaceholder
+                && sidebar.transcriptionController
+                && sidebar.transcriptionController.busy
+                && String(sidebar.transcriptionController.currentFile).replace("file://", "")
+                       === treeDelegate.path
+            readonly property real combineProgress: treeDelegate.combineActive
+                ? sidebar.transcriptionController.progress : 0
             // Proxy-provided (VaultSearchProxyModel): true for a direct match
             // or, for a directory, any matching descendant; always true with
             // no active query. Single source of truth for both the sort
@@ -3454,7 +3768,10 @@ Rectangle {
 
             HoverHandler {
                 id: rowHover
-                cursorShape: Qt.PointingHandCursor
+                // A placeholder isn't clickable (both TapHandlers are disabled
+                // for it), so it must not offer a pointing hand — the cursor is
+                // the only thing that would still claim it is.
+                cursorShape: treeDelegate.isCombinePlaceholder ? Qt.ArrowCursor : Qt.PointingHandCursor
                 // Item 51 refinement: pushes this row's group into
                 // sidebar.hoveredCombineGroup so the ONE per-group merge
                 // button (see groupMergeButton) reveals on hovering ANY
@@ -3489,6 +3806,9 @@ Rectangle {
             TapHandler {
                 id: treeRowContextTap
                 acceptedButtons: Qt.RightButton
+                // Every entry in that menu (open/rename/move/delete/combine)
+                // acts on a file, and a placeholder has none yet.
+                enabled: !treeDelegate.isCombinePlaceholder
                 onTapped: {
                     const p = treeDelegate.mapToItem(sidebar, treeRowContextTap.point.position.x,
                                                        treeRowContextTap.point.position.y)
@@ -3574,6 +3894,9 @@ Rectangle {
 
             TapHandler {
                 id: treeRowTap
+                // A placeholder has nothing to open, expand, or rename — see
+                // isCombinePlaceholder. Inert rather than click-then-fail.
+                enabled: !treeDelegate.isCombinePlaceholder
                 onTapped: {
                     // Clicking a DIFFERENT row while an inline rename is open
                     // must commit it (blur convention) — and nothing else will,
@@ -4052,6 +4375,45 @@ Rectangle {
                         ToolTip.delay: 500
                     }
 
+                    // The in-progress combine row (see
+                    // treeDelegate.isCombinePlaceholder). Deliberately names no
+                    // file: the merged file does not exist yet, so there is
+                    // nothing honest to call it — it says what is happening and
+                    // to how many parts, and tracks the job's progress.
+                    RowLayout {
+                        id: combinePlaceholderRow
+                        objectName: "combinePlaceholderRow"
+                        visible: treeDelegate.isCombinePlaceholder
+                        Layout.fillWidth: true
+                        Layout.alignment: Qt.AlignVCenter
+                        spacing: 6
+
+                        AppIcon {
+                            Layout.alignment: Qt.AlignVCenter
+                            name: "combine"
+                            // The same blue jobStatusDot uses for an Active job
+                            // when it's running; the grey it uses for a waiting
+                            // one when it isn't.
+                            color: treeDelegate.combineActive ? "#3498db" : "#95a5a6"
+                            iconSize: 12
+                        }
+
+                        Text {
+                            objectName: "combinePlaceholderLabel"
+                            Layout.alignment: Qt.AlignVCenter
+                            Layout.fillWidth: true
+                            elide: Text.ElideRight
+                            color: "#aaaaaa"
+                            font.pixelSize: 12
+                            font.italic: true
+                            text: treeDelegate.combineActive
+                                  ? qsTr("Combining %n recording(s)… %1%", "", treeDelegate.combineSourceCount)
+                                        .arg(Math.round(treeDelegate.combineProgress * 100))
+                                  : qsTr("Combining %n recording(s)… (queued)", "",
+                                          treeDelegate.combineSourceCount)
+                        }
+                    }
+
                     Text {
                         id: rowNameText
                         objectName: "rowNameText"
@@ -4061,7 +4423,9 @@ Rectangle {
                         // rowRenameField below takes its place in the layout.
                         // Gated on sidebar.renamingPath, never on the field's
                         // activeFocus (see sidebar.renamingPath's doc comment).
-                        visible: !treeDelegate.renamingThisRow
+                        // A combine placeholder has no name to show and
+                        // combinePlaceholderRow above stands in its place.
+                        visible: !treeDelegate.renamingThisRow && !treeDelegate.isCombinePlaceholder
                         // Item 1 (Wave D): sidebar previously always showed the
                         // raw filename — AppSettings.useLabelsSidebar lets it
                         // show the stored label instead, when one exists. That
@@ -4230,6 +4594,43 @@ Rectangle {
                         anchors.margins: -2
                         active: snippetHover.hovered
                     }
+                }
+            }
+
+            // The combine placeholder's progress track (see
+            // treeDelegate.isCombinePlaceholder). Declared here, after
+            // treeColumn, so it paints over the row's background layers rather
+            // than under them — same reason groupMergeButton below is.
+            //
+            // A thin bar pinned to the row's bottom edge, not an inline
+            // ProgressBar in combinePlaceholderRow: the row is 28px and already
+            // carries an icon and a label, and a full-width edge bar reads as
+            // "this row is filling up" at a glance without competing for that
+            // space. Only ever shown while the job is actually running —
+            // combineProgress is 0 while queued, and a permanently-empty track
+            // would just read as a stalled one.
+            Rectangle {
+                objectName: "combineProgressTrack"
+                visible: treeDelegate.combineActive
+                anchors.left: parent.left
+                anchors.right: parent.right
+                anchors.bottom: parent.bottom
+                anchors.leftMargin: AppSettings.sidebarEdgeLeftMargin
+                anchors.rightMargin: AppSettings.sidebarRightMargin
+                height: 2
+                radius: 1
+                color: "#2a2a2a"
+
+                Rectangle {
+                    objectName: "combineProgressFill"
+                    anchors.left: parent.left
+                    anchors.top: parent.top
+                    anchors.bottom: parent.bottom
+                    width: parent.width * Math.max(0, Math.min(1, treeDelegate.combineProgress))
+                    // No radius: a 2px-tall sliver anchored inside the already-
+                    // rounded track — its own corner rounding is imperceptible,
+                    // and a hardcoded one trips the corner-radius guard.
+                    color: "#3498db"
                 }
             }
 
@@ -4748,10 +5149,16 @@ Rectangle {
             // reverting the audio to untranscribed; the audio itself is kept.
             // (An orphaned .md has no audio to keep, so it gets "Delete file"
             // below instead, not this.)
+            //
+            // Acts on the whole multi-selection when the right-clicked row is
+            // part of one, and names the count — see ctxDeleteFileRow below for
+            // why the label must say so.
             Item {
                 id: ctxDeleteTranscriptRow
                 objectName: "ctxDeleteTranscriptRow"
                 visible: sidebar.ctxIsAudio && sidebar.ctxStatus === 2
+                readonly property int targetCount: ctxDeleteTranscriptRow.visible
+                    ? sidebar.selectionPathsFor(sidebar.ctxPath, false).length : 1
                 width: parent.width
                 height: 28
 
@@ -4762,7 +5169,8 @@ Rectangle {
                 TapHandler {
                     onTapped: {
                         contextMenu.close()
-                        sidebar.beginDeleteTranscript(sidebar.ctxPath)
+                        sidebar.beginDeleteTranscript(
+                            sidebar.selectionPathsFor(sidebar.ctxPath, false))
                     }
                 }
                 Rectangle {
@@ -4771,10 +5179,13 @@ Rectangle {
                     color: ctxDeleteTranscriptHover.hovered ? "#3a3a3a" : "transparent"
                 }
                 Text {
+                    objectName: "ctxDeleteTranscriptLabel"
                     anchors.left: parent.left
                     anchors.leftMargin: 8
                     anchors.verticalCenter: parent.verticalCenter
-                    text: qsTr("Delete transcript")
+                    text: ctxDeleteTranscriptRow.targetCount > 1
+                          ? qsTr("Delete %1 transcripts").arg(ctxDeleteTranscriptRow.targetCount)
+                          : qsTr("Delete transcript")
                     color: "#e07a7a"
                     font.pixelSize: 12
                 }
@@ -4791,6 +5202,8 @@ Rectangle {
                 id: ctxDeleteAudioOnlyRow
                 objectName: "ctxDeleteAudioOnlyRow"
                 visible: sidebar.ctxIsAudio && sidebar.ctxStatus === 2
+                readonly property int targetCount: ctxDeleteAudioOnlyRow.visible
+                    ? sidebar.selectionPathsFor(sidebar.ctxPath, false).length : 1
                 width: parent.width
                 height: 28
 
@@ -4801,7 +5214,8 @@ Rectangle {
                 TapHandler {
                     onTapped: {
                         contextMenu.close()
-                        sidebar.beginDeleteAudioOnly(sidebar.ctxPath)
+                        sidebar.beginDeleteAudioOnly(
+                            sidebar.selectionPathsFor(sidebar.ctxPath, false))
                     }
                 }
                 Rectangle {
@@ -4810,10 +5224,13 @@ Rectangle {
                     color: ctxDeleteAudioOnlyHover.hovered ? "#3a3a3a" : "transparent"
                 }
                 Text {
+                    objectName: "ctxDeleteAudioOnlyLabel"
                     anchors.left: parent.left
                     anchors.leftMargin: 8
                     anchors.verticalCenter: parent.verticalCenter
-                    text: qsTr("Delete audio only")
+                    text: ctxDeleteAudioOnlyRow.targetCount > 1
+                          ? qsTr("Delete audio only for %1 items").arg(ctxDeleteAudioOnlyRow.targetCount)
+                          : qsTr("Delete audio only")
                     color: "#e07a7a"
                     font.pixelSize: 12
                 }
@@ -4845,7 +5262,8 @@ Rectangle {
                 TapHandler {
                     onTapped: {
                         contextMenu.close()
-                        sidebar.beginDeleteFile(sidebar.ctxPath)
+                        sidebar.beginDeleteFile(
+                            sidebar.selectionPathsFor(sidebar.ctxPath, false))
                     }
                 }
                 Rectangle {

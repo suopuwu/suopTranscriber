@@ -1,21 +1,125 @@
 // Living spec: UsbGrabberController — the QML-facing coordinator for the USB
 // Grabber feature (see CLAUDE.md). Covers the parts that don't require a live
 // UDisks2/D-Bus session: rule CRUD (QVariantMap <-> UsbGrabRule projection),
-// the no-vault-open and device-not-connected guard paths, and history
-// proxying. UsbDeviceMonitor's own D-Bus hotplug detection isn't
-// unit-testable without a fake D-Bus session/UDisks2 service — not covered
-// here (see .task/plan.md's Decisions for that scope call).
+// the no-vault-open and device-not-connected guard paths, history proxying,
+// and — via GrabFixture below — the hotplug behavior itself: the two gates
+// (enabled, then autoGrab), a grab becoming a QUEUED TASK on
+// TranscriptionController rather than a thread of its own, the history entry,
+// and the autoGrabsSettled() barrier the auto-combiner hangs off.
+//
+// UsbDeviceMonitor's own D-Bus hotplug DETECTION still isn't unit-testable
+// without a fake D-Bus session/UDisks2 service; what's driven here is
+// everything downstream of it, by invoking the handleDeviceAdded slot the
+// monitor would have called (see GrabFixture::hotplug()).
 
 #include <QtTest>
 
 #include <QCoreApplication>
+#include <QFile>
+#include <QFileInfo>
 #include <QSignalSpy>
 #include <QStandardPaths>
 #include <QTemporaryDir>
 #include <QUrl>
+#include <QVariantMap>
 
+#include "TranscriptionController.h"
 #include "UsbGrabberController.h"
 #include "VaultTreeModel.h"
+
+namespace {
+
+// A whole wired-up grabber: temp vault, temp "device" to stand in for a mount
+// point, a REAL TranscriptionController (the queue is the thing under test — a
+// stub would only agree with itself), and a controller with both wired in.
+//
+// Declaration order matters and is deliberate: the QTemporaryDirs and the two
+// collaborators must all outlive `controller`, which unregisters from the
+// transcription controller in its own teardown.
+struct GrabFixture {
+    QTemporaryDir vault;
+    QTemporaryDir device;
+    VaultTreeModel vaultModel;
+    TranscriptionController transcription;
+    UsbGrabberController controller;
+
+    GrabFixture()
+    {
+        vaultModel.setVaultPath(QUrl::fromLocalFile(vault.path()));
+        controller.setVaultTreeModel(&vaultModel);
+        controller.setTranscriptionController(&transcription);
+    }
+
+    bool writeDeviceFile(const QString &name, const QByteArray &content)
+    {
+        QFile f(device.filePath(name));
+        if (!f.open(QIODevice::WriteOnly))
+            return false;
+        return f.write(content) == content.size();
+    }
+
+    void saveRule(const QString &serial, bool enabled, bool autoGrab)
+    {
+        QVariantMap rule;
+        rule[QStringLiteral("deviceSerial")] = serial;
+        rule[QStringLiteral("enabled")] = enabled;
+        rule[QStringLiteral("autoGrab")] = autoGrab;
+        controller.saveRule(rule);
+    }
+
+    // Fake a newly-mounted volume. handleDeviceAdded is a private slot; moc
+    // registers it anyway, which is what makes a hotplug drivable with no
+    // UDisks2 session (the monitor is owned internally — nothing to inject).
+    void hotplug(const QString &serial)
+    {
+        QVariantMap info;
+        info[QStringLiteral("serial")] = serial;
+        info[QStringLiteral("id")] = QStringLiteral("/block_devices/fake-") + serial;
+        info[QStringLiteral("mountPath")] = device.path();
+        QVERIFY(QMetaObject::invokeMethod(&controller, "handleDeviceAdded", Qt::DirectConnection,
+                                           Q_ARG(QVariantMap, info)));
+    }
+
+    // Every "usbGrab" row in the queue, whatever its status.
+    int usbGrabJobCount() const { return countUsbGrabJobs(/*pendingOnly=*/false); }
+
+    // Only the ones still to run. A finished job STAYS in jobs() as a Done
+    // history row until clearFinished(), so "the grabs have drained" is not
+    // "no usbGrab rows" — it's "no unfinished ones".
+    int pendingUsbGrabJobCount() const { return countUsbGrabJobs(/*pendingOnly=*/true); }
+
+    // The id of the first "usbGrab" row in the given status, or -1. Ids aren't
+    // knowable up front (enqueueUsbGrab's return goes to the controller), so
+    // targeting a specific job means finding it by status.
+    int firstUsbGrabJobIdWithStatus(const QString &status) const
+    {
+        for (const QVariant &jobVariant : transcription.jobs()) {
+            const QVariantMap job = jobVariant.toMap();
+            if (job.value(QStringLiteral("kind")).toString() == QStringLiteral("usbGrab")
+                    && job.value(QStringLiteral("status")).toString() == status) {
+                return job.value(QStringLiteral("id")).toInt();
+            }
+        }
+        return -1;
+    }
+
+    int countUsbGrabJobs(bool pendingOnly) const
+    {
+        int count = 0;
+        for (const QVariant &jobVariant : transcription.jobs()) {
+            const QVariantMap job = jobVariant.toMap();
+            if (job.value(QStringLiteral("kind")).toString() != QStringLiteral("usbGrab"))
+                continue;
+            const QString status = job.value(QStringLiteral("status")).toString();
+            if (pendingOnly && (status == QStringLiteral("done") || status == QStringLiteral("failed")))
+                continue;
+            ++count;
+        }
+        return count;
+    }
+};
+
+}
 
 class TstUsbGrabberController : public QObject
 {
@@ -110,6 +214,11 @@ private slots:
 
         QCOMPARE(rule.value(QStringLiteral("deviceSerial")).toString(), QStringLiteral("NEVER-SEEN"));
         QCOMPARE(rule.value(QStringLiteral("enabled")).toBool(), false);
+        // Same load-bearing default as the store's (see tst_usbrulestore.cpp),
+        // re-pinned at the projection layer the auto-grab Switch actually binds
+        // to: the key must be PRESENT and false, or the switch reads undefined.
+        QVERIFY(rule.contains(QStringLiteral("autoGrab")));
+        QCOMPARE(rule.value(QStringLiteral("autoGrab")).toBool(), false);
         QCOMPARE(rule.value(QStringLiteral("preserveStructure")).toBool(), true);
         QVERIFY(rule.value(QStringLiteral("extensionFilter")).toStringList().isEmpty());
         // Blank = "no regex constraint". The key must still be PRESENT: the
@@ -119,7 +228,7 @@ private slots:
     }
 
     // Backs the live ✓/✗ indicator under the pattern field. Must agree with
-    // the engine UsbGrabJob actually filters with (QRegularExpression), which
+    // the engine runUsbGrabScan() actually filters with (QRegularExpression), which
     // is why QML calls this instead of using JS RegExp — and it must treat an
     // empty pattern as valid, since blank means "no regex constraint".
     // Mirrors tst_filecombine.cpp's regexValidationError_* case; both now
@@ -138,6 +247,7 @@ private slots:
         QVariantMap rule;
         rule[QStringLiteral("deviceSerial")] = QStringLiteral("XYZ");
         rule[QStringLiteral("enabled")] = true;
+        rule[QStringLiteral("autoGrab")] = true;
         rule[QStringLiteral("extensionFilter")] = QStringList{QStringLiteral("wav"), QStringLiteral("mp3")};
         rule[QStringLiteral("filenameRegex")] = QStringLiteral("^REC_\\d+");
         rule[QStringLiteral("preserveStructure")] = false;
@@ -149,6 +259,7 @@ private slots:
 
         const QVariantMap loaded = controller.ruleForDevice(QStringLiteral("XYZ"));
         QCOMPARE(loaded.value(QStringLiteral("enabled")).toBool(), true);
+        QCOMPARE(loaded.value(QStringLiteral("autoGrab")).toBool(), true);
         QCOMPARE(loaded.value(QStringLiteral("extensionFilter")).toStringList(),
                  QStringList({QStringLiteral("wav"), QStringLiteral("mp3")}));
         // MainPanel.qml's rule cards read this key straight off the map, so a
@@ -229,6 +340,198 @@ private slots:
 
         QVERIFY(usbVolumesForSerial(mounted, QStringLiteral("20200101.1")).isEmpty());
         QVERIFY(usbVolumesForSerial(QVariantList(), QStringLiteral("20200101.1")).isEmpty());
+    }
+
+    // ---- Hotplug: the two gates, and grabs as queued tasks ----
+    //
+    // handleDeviceAdded() is a private slot, which moc still registers — so it
+    // can be invoked directly here with a fabricated device map. That's the
+    // whole test seam: the controller owns its UsbDeviceMonitor internally, so
+    // there's no way to inject a fake hotplug through the real D-Bus path (the
+    // same constraint that gave usbVolumesForSerial() its free-function shape).
+    // A QTemporaryDir stands in for the mount point; nothing here needs UDisks2.
+
+    void hotplug_enabledButAutoGrabOff_doesNotGrab()
+    {
+        GrabFixture fx;
+        fx.saveRule(QStringLiteral("DEV-A"), /*enabled=*/true, /*autoGrab=*/false);
+
+        fx.hotplug(QStringLiteral("DEV-A"));
+
+        // Both gates must pass. `enabled` alone means "grabbable" (and is what
+        // let the volume mount at all) — never "grab it without being asked".
+        QCOMPARE(fx.usbGrabJobCount(), 0);
+    }
+
+    void hotplug_notEnabled_doesNotGrab_evenWithAutoGrabOn()
+    {
+        GrabFixture fx;
+        fx.saveRule(QStringLiteral("DEV-A"), /*enabled=*/false, /*autoGrab=*/true);
+
+        fx.hotplug(QStringLiteral("DEV-A"));
+
+        // autoGrab is strictly narrower than enabled, never a way around it:
+        // a disabled rule is not grabbable by any path.
+        QCOMPARE(fx.usbGrabJobCount(), 0);
+    }
+
+    void hotplug_enabledAndAutoGrab_enqueuesGrabAsAQueuedTask()
+    {
+        GrabFixture fx;
+        fx.saveRule(QStringLiteral("DEV-A"), /*enabled=*/true, /*autoGrab=*/true);
+
+        fx.hotplug(QStringLiteral("DEV-A"));
+
+        // The point of the feature: a grab is a job in the ONE task queue, not
+        // a thread of its own — so it gets a Tasks row, the glow, pause/cancel.
+        QCOMPARE(fx.usbGrabJobCount(), 1);
+    }
+
+    void hotplug_noVaultOpen_doesNotGrab()
+    {
+        GrabFixture fx;
+        fx.controller.setVaultTreeModel(nullptr);
+        fx.saveRule(QStringLiteral("DEV-A"), /*enabled=*/true, /*autoGrab=*/true);
+
+        fx.hotplug(QStringLiteral("DEV-A"));
+
+        // A grab only ever targets whatever vault is open at detection time —
+        // with none open there's nowhere to put the files, so it's skipped
+        // outright rather than queued against a vault chosen later.
+        QCOMPARE(fx.usbGrabJobCount(), 0);
+    }
+
+    // ---- The auto-combine barrier ----
+
+    void autoGrab_emitsAutoGrabsSettledOnceTheLastOneFinishes()
+    {
+        GrabFixture fx;
+        QVERIFY(fx.writeDeviceFile(QStringLiteral("rec.wav"), "audio"));
+        fx.saveRule(QStringLiteral("DEV-A"), /*enabled=*/true, /*autoGrab=*/true);
+
+        QSignalSpy settledSpy(&fx.controller, &UsbGrabberController::autoGrabsSettled);
+        QSignalSpy grabbedSpy(&fx.controller, &UsbGrabberController::grabFinished);
+
+        fx.hotplug(QStringLiteral("DEV-A"));
+
+        // Not before the grab has actually run: the whole contract is that the
+        // combine waits for the files to be on disk.
+        QCOMPARE(settledSpy.count(), 0);
+
+        QVERIFY(grabbedSpy.wait(10000));
+        QCOMPARE(grabbedSpy.first().at(1).toInt(), 1);          // filesCopied
+        QCOMPARE(grabbedSpy.first().at(4).toBool(), true);       // autoTriggered
+        QVERIFY(QFileInfo::exists(fx.vault.filePath(QStringLiteral("rec.wav"))));
+
+        // Exactly once — a second firing would run the combine scan twice over
+        // the same vault.
+        QTRY_COMPARE(settledSpy.count(), 1);
+        QCOMPARE(settledSpy.count(), 1);
+    }
+
+    void autoGrab_settledFiresOnlyAfterEveryVolumeOfTheBatchIsDone()
+    {
+        GrabFixture fx;
+        QVERIFY(fx.writeDeviceFile(QStringLiteral("rec.wav"), "audio"));
+        fx.saveRule(QStringLiteral("DEV-A"), /*enabled=*/true, /*autoGrab=*/true);
+        fx.saveRule(QStringLiteral("DEV-B"), /*enabled=*/true, /*autoGrab=*/true);
+
+        QSignalSpy settledSpy(&fx.controller, &UsbGrabberController::autoGrabsSettled);
+
+        // Two auto-grabs in flight at once (a two-volume recorder, or two
+        // devices plugged together). The barrier must hold until BOTH drain —
+        // combining after the first would merge half a split recording.
+        fx.hotplug(QStringLiteral("DEV-A"));
+        fx.hotplug(QStringLiteral("DEV-B"));
+        QCOMPARE(fx.usbGrabJobCount(), 2);
+
+        QTRY_VERIFY_WITH_TIMEOUT(settledSpy.count() == 1, 10000);
+        // One settle for the whole batch, not one per grab.
+        QCOMPARE(settledSpy.count(), 1);
+        // ...and it really did wait for both, rather than firing early and
+        // leaving one still to run.
+        QCOMPARE(fx.pendingUsbGrabJobCount(), 0);
+    }
+
+    void grab_writesHistoryEntryForTheDeviceThatRan()
+    {
+        GrabFixture fx;
+        QVERIFY(fx.writeDeviceFile(QStringLiteral("rec.wav"), "audio"));
+        fx.saveRule(QStringLiteral("DEV-A"), /*enabled=*/true, /*autoGrab=*/true);
+
+        QSignalSpy grabbedSpy(&fx.controller, &UsbGrabberController::grabFinished);
+        fx.hotplug(QStringLiteral("DEV-A"));
+        QVERIFY(grabbedSpy.wait(10000));
+
+        // History moved out of the grab worker (which can't touch the
+        // GUI-thread-owned VaultTreeModel) into the controller — it must still
+        // land, and grabFinished must arrive AFTER it so a handler that re-reads
+        // history() on that signal already sees this run.
+        const QVariantList history = fx.controller.history();
+        QCOMPARE(history.size(), 1);
+        QCOMPARE(history.first().toMap().value(QStringLiteral("deviceSerial")).toString(),
+                 QStringLiteral("DEV-A"));
+        QCOMPARE(history.first().toMap().value(QStringLiteral("filesCopied")).toInt(), 1);
+    }
+
+    void cancelledGrab_writesNoHistoryAndAnnouncesNothing_butStillSettles()
+    {
+        GrabFixture fx;
+        QVERIFY(fx.writeDeviceFile(QStringLiteral("rec.wav"), "audio"));
+        fx.saveRule(QStringLiteral("DEV-A"), /*enabled=*/true, /*autoGrab=*/true);
+
+        QSignalSpy grabbedSpy(&fx.controller, &UsbGrabberController::grabFinished);
+        QSignalSpy settledSpy(&fx.controller, &UsbGrabberController::autoGrabsSettled);
+
+        fx.hotplug(QStringLiteral("DEV-A"));
+        // Deterministic, not a race: startJob() calls resetControl() and then
+        // dispatches the work QUEUED, so it hasn't run yet. cancelActive() sets
+        // the cancel atomic synchronously, landing AFTER that reset and BEFORE
+        // the worker's first abort check.
+        fx.transcription.cancelActive();
+
+        QTRY_COMPARE_WITH_TIMEOUT(settledSpy.count(), 1, 10000);
+
+        // A cancelled grab's counts are a partial tally. Recording it in
+        // history, or telling the user "grabbed N files", would misreport a run
+        // they stopped as one that completed.
+        QCOMPARE(grabbedSpy.count(), 0);
+        QVERIFY(fx.controller.history().isEmpty());
+
+        // ...but it must still release the barrier, or one cancelled auto-grab
+        // would strand the batch and block the auto-combine forever.
+        QCOMPARE(settledSpy.count(), 1);
+    }
+
+    // Regression: a grab cancelled while still QUEUED never reaches the worker,
+    // so it never reports a result. Tracking it purely off that result left its
+    // id in the auto-grab barrier forever — which didn't just lose one combine,
+    // it permanently disabled the auto-combiner for the rest of the session,
+    // silently. The barrier is reconciled against the queue for this reason.
+    void autoGrabCancelledWhileStillQueued_doesNotStrandTheBarrier()
+    {
+        GrabFixture fx;
+        QVERIFY(fx.writeDeviceFile(QStringLiteral("rec.wav"), "audio"));
+        fx.saveRule(QStringLiteral("DEV-A"), /*enabled=*/true, /*autoGrab=*/true);
+        fx.saveRule(QStringLiteral("DEV-B"), /*enabled=*/true, /*autoGrab=*/true);
+
+        QSignalSpy settledSpy(&fx.controller, &UsbGrabberController::autoGrabsSettled);
+
+        // Two auto-grabs: the first goes Active, the second waits behind it.
+        fx.hotplug(QStringLiteral("DEV-A"));
+        fx.hotplug(QStringLiteral("DEV-B"));
+        QCOMPARE(fx.usbGrabJobCount(), 2);
+
+        // Cancel the one that is still merely Queued — the queue drops it
+        // outright, so no worker ever runs it and no result is ever reported
+        // for it.
+        const int queuedId = fx.firstUsbGrabJobIdWithStatus(QStringLiteral("queued"));
+        QVERIFY2(queuedId >= 0, "expected the second grab to be waiting its turn");
+        fx.transcription.cancelJob(queuedId);
+
+        // The batch must still settle off the back of the OTHER grab finishing.
+        QTRY_COMPARE_WITH_TIMEOUT(settledSpy.count(), 1, 10000);
+        QCOMPARE(fx.pendingUsbGrabJobCount(), 0);
     }
 
     void history_noVaultOpen_returnsEmptyList()

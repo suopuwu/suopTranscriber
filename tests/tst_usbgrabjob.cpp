@@ -1,11 +1,22 @@
-// Living spec: UsbGrabJob — the background scan+copy for one USB grab rule
-// against one already-mounted device (see CLAUDE.md's "USB Grabber" feature
-// and DESIGN.md's "USB import" section: diff against the vault by filename +
-// size + mtime and copy only new audio in, never reading file content).
+// Living spec: runUsbGrabScan() — the scan+filter+dedup+copy walk for one USB
+// grab rule against one already-mounted device (see CLAUDE.md's "USB Grabber"
+// feature and DESIGN.md's "USB import" section: diff against the vault by
+// filename + size + mtime and copy only new audio in, never reading file
+// content).
 //
-// Runs entirely on its own worker thread (mirrors AudioRecorder's threading
-// shape) — tests drive it through its public start()/finished() surface and
-// QSignalSpy::wait(), same as any other cross-thread Qt signal in this suite.
+// The walk is a plain SYNCHRONOUS free function over its inputs, so almost
+// everything here calls it directly and reads the UsbGrabScanResult it returns
+// — no signals, no waiting. That's the whole point of the shape: the walk knows
+// nothing about threads, the job queue, history entries or VaultTreeModel, and
+// neither does its spec.
+//
+// Threading lives with the callers, not here: a real grab is a queued "usbGrab"
+// task on TranscriptionController's worker (specced in tst_transcription_queue),
+// and the dry-run preview runs on UsbGrabPreviewJob's own thread (its
+// start()/previewReady() surface is exercised below by
+// refusedPreview_reportsErrorRatherThanEmptyList, via QSignalSpy::wait() like
+// any other cross-thread Qt signal in this suite). This file specs the walk
+// itself.
 
 #include <QtTest>
 
@@ -72,21 +83,15 @@ private slots:
         QVERIFY(writeFile(device.filePath("interview.wav"), "audio-data"));
         QVERIFY(writeFile(device.filePath("readme.txt"), "not audio"));
 
-        VaultTreeModel vaultModel;
-        vaultModel.setVaultPath(QUrl::fromLocalFile(vault.path()));
-
         UsbGrabRule rule;
         rule.deviceSerial = QStringLiteral("TEST-SERIAL");
         rule.extensionFilter = {QStringLiteral("wav")};
         rule.preserveStructure = true;
 
-        UsbGrabJob job;
-        QSignalSpy finishedSpy(&job, &UsbGrabJob::finished);
-        job.start(rule, device.path(), vault.path(), &vaultModel);
-        QVERIFY(finishedSpy.wait(10000));
+        const UsbGrabScanResult result = runUsbGrabScan(rule, device.path(), vault.path(), /*dryRun=*/false);
 
-        QCOMPARE(finishedSpy.first().at(0).toInt(), 1); // filesCopied
-        QCOMPARE(finishedSpy.first().at(1).toInt(), 0); // filesSkipped
+        QCOMPARE(result.filesCopied, 1);
+        QCOMPARE(result.filesSkipped, 0);
         QVERIFY(QFileInfo::exists(vault.filePath("interview.wav")));
         QVERIFY(!QFileInfo::exists(vault.filePath("readme.txt")));
     }
@@ -99,19 +104,13 @@ private slots:
         QVERIFY(writeFile(device.filePath("a.wav"), "a"));
         QVERIFY(writeFile(device.filePath("b.txt"), "b"));
 
-        VaultTreeModel vaultModel;
-        vaultModel.setVaultPath(QUrl::fromLocalFile(vault.path()));
-
         UsbGrabRule rule;
         rule.deviceSerial = QStringLiteral("TEST-SERIAL");
         // extensionFilter left empty deliberately.
 
-        UsbGrabJob job;
-        QSignalSpy finishedSpy(&job, &UsbGrabJob::finished);
-        job.start(rule, device.path(), vault.path(), &vaultModel);
-        QVERIFY(finishedSpy.wait(10000));
+        const UsbGrabScanResult result = runUsbGrabScan(rule, device.path(), vault.path(), /*dryRun=*/false);
 
-        QCOMPARE(finishedSpy.first().at(0).toInt(), 2);
+        QCOMPARE(result.filesCopied, 2);
         QVERIFY(QFileInfo::exists(vault.filePath("a.wav")));
         QVERIFY(QFileInfo::exists(vault.filePath("b.txt")));
     }
@@ -130,20 +129,14 @@ private slots:
         QVERIFY(setMtime(device.filePath("clip.wav"), fixedMtime()));
         QVERIFY(writeFile(device.filePath("nested/clip2.wav"), "different")); // different basename, always new
 
-        VaultTreeModel vaultModel;
-        vaultModel.setVaultPath(QUrl::fromLocalFile(vault.path()));
-
         UsbGrabRule rule;
         rule.deviceSerial = QStringLiteral("TEST-SERIAL");
         rule.preserveStructure = false; // flatten, so clip2.wav lands at vault root too
 
-        UsbGrabJob job;
-        QSignalSpy finishedSpy(&job, &UsbGrabJob::finished);
-        job.start(rule, device.path(), vault.path(), &vaultModel);
-        QVERIFY(finishedSpy.wait(10000));
+        const UsbGrabScanResult result = runUsbGrabScan(rule, device.path(), vault.path(), /*dryRun=*/false);
 
-        QCOMPARE(finishedSpy.first().at(0).toInt(), 1); // filesCopied: clip2.wav only
-        QCOMPARE(finishedSpy.first().at(1).toInt(), 1); // filesSkipped: clip.wav (identical)
+        QCOMPARE(result.filesCopied, 1);  // filesCopied: clip2.wav only
+        QCOMPARE(result.filesSkipped, 1); // filesSkipped: clip.wav (identical)
         QVERIFY(QFileInfo::exists(vault.filePath("clip2.wav")));
     }
 
@@ -162,19 +155,13 @@ private slots:
         QVERIFY(setMtime(vault.filePath("clip.wav"), fixedMtime()));
         QVERIFY(setMtime(device.filePath("clip.wav"), fixedMtime()));
 
-        VaultTreeModel vaultModel;
-        vaultModel.setVaultPath(QUrl::fromLocalFile(vault.path()));
-
         UsbGrabRule rule;
         rule.deviceSerial = QStringLiteral("TEST-SERIAL");
 
-        UsbGrabJob job;
-        QSignalSpy finishedSpy(&job, &UsbGrabJob::finished);
-        job.start(rule, device.path(), vault.path(), &vaultModel);
-        QVERIFY(finishedSpy.wait(10000));
+        const UsbGrabScanResult result = runUsbGrabScan(rule, device.path(), vault.path(), /*dryRun=*/false);
 
-        QCOMPARE(finishedSpy.first().at(0).toInt(), 1); // copied, not skipped
-        QCOMPARE(finishedSpy.first().at(1).toInt(), 0);
+        QCOMPARE(result.filesCopied, 1); // copied, not skipped
+        QCOMPARE(result.filesSkipped, 0);
         // The original vault file must survive untouched (never overwritten).
         QFile original(vault.filePath("clip.wav"));
         QVERIFY(original.open(QIODevice::ReadOnly));
@@ -189,17 +176,11 @@ private slots:
         QVERIFY(device.isValid() && vault.isValid());
         QVERIFY(writeFile(device.filePath("Voice/2026/session.wav"), "x"));
 
-        VaultTreeModel vaultModel;
-        vaultModel.setVaultPath(QUrl::fromLocalFile(vault.path()));
-
         UsbGrabRule rule;
         rule.deviceSerial = QStringLiteral("TEST-SERIAL");
         rule.preserveStructure = true;
 
-        UsbGrabJob job;
-        QSignalSpy finishedSpy(&job, &UsbGrabJob::finished);
-        job.start(rule, device.path(), vault.path(), &vaultModel);
-        QVERIFY(finishedSpy.wait(10000));
+        runUsbGrabScan(rule, device.path(), vault.path(), /*dryRun=*/false);
 
         QVERIFY(QFileInfo::exists(vault.filePath("Voice/2026/session.wav")));
     }
@@ -211,17 +192,11 @@ private slots:
         QVERIFY(device.isValid() && vault.isValid());
         QVERIFY(writeFile(device.filePath("Voice/2026/session.wav"), "x"));
 
-        VaultTreeModel vaultModel;
-        vaultModel.setVaultPath(QUrl::fromLocalFile(vault.path()));
-
         UsbGrabRule rule;
         rule.deviceSerial = QStringLiteral("TEST-SERIAL");
         rule.preserveStructure = false;
 
-        UsbGrabJob job;
-        QSignalSpy finishedSpy(&job, &UsbGrabJob::finished);
-        job.start(rule, device.path(), vault.path(), &vaultModel);
-        QVERIFY(finishedSpy.wait(10000));
+        runUsbGrabScan(rule, device.path(), vault.path(), /*dryRun=*/false);
 
         QVERIFY(!QFileInfo::exists(vault.filePath("Voice/2026/session.wav")));
         QVERIFY(QFileInfo::exists(vault.filePath("session.wav")));
@@ -235,26 +210,20 @@ private slots:
         QVERIFY(writeFile(device.filePath("Podcasts/ep1.wav"), "x"));
         QVERIFY(writeFile(device.filePath("Other/ignored.wav"), "y"));
 
-        VaultTreeModel vaultModel;
-        vaultModel.setVaultPath(QUrl::fromLocalFile(vault.path()));
-
         UsbGrabRule rule;
         rule.deviceSerial = QStringLiteral("TEST-SERIAL");
         rule.startFolder = QStringLiteral("Podcasts");
 
-        UsbGrabJob job;
-        QSignalSpy finishedSpy(&job, &UsbGrabJob::finished);
-        job.start(rule, device.path(), vault.path(), &vaultModel);
-        QVERIFY(finishedSpy.wait(10000));
+        const UsbGrabScanResult result = runUsbGrabScan(rule, device.path(), vault.path(), /*dryRun=*/false);
 
-        QCOMPARE(finishedSpy.first().at(0).toInt(), 1);
+        QCOMPARE(result.filesCopied, 1);
         QVERIFY(QFileInfo::exists(vault.filePath("ep1.wav")));
         QVERIFY(!QFileInfo::exists(vault.filePath("ignored.wav")));
     }
 
-    // startPreview() classifies every file (grab / duplicate / filtered)
-    // without copying anything, and never appends a history entry — the
-    // dry-run counterpart to matchingExtensionsAreCopied_nonMatchingAreIgnored()
+    // dryRun=true classifies every file (grab / duplicate / filtered) without
+    // copying anything, and never appends a history entry — the dry-run
+    // counterpart to matchingExtensionsAreCopied_nonMatchingAreIgnored()
     // and quickCheck_skipsAlreadyPresentFile_...() above, sharing the exact same
     // extension-filter + quick-check dedup logic.
     void dryRun_classifiesWithoutCopyingOrTouchingDisk()
@@ -276,12 +245,9 @@ private slots:
         rule.deviceSerial = QStringLiteral("TEST-SERIAL");
         rule.extensionFilter = {QStringLiteral("wav")};
 
-        UsbGrabJob job;
-        QSignalSpy previewSpy(&job, &UsbGrabJob::previewReady);
-        job.startPreview(rule, device.path(), vault.path());
-        QVERIFY(previewSpy.wait(10000));
+        const UsbGrabScanResult result = runUsbGrabScan(rule, device.path(), vault.path(), /*dryRun=*/true);
 
-        const QVariantList entries = previewSpy.first().at(0).toList();
+        const QVariantList entries = result.previewEntries;
         QCOMPARE(entries.size(), 3);
 
         QHash<QString, QString> statusByPath;
@@ -326,18 +292,12 @@ private slots:
         for (const QString &path : sources)
             QVERIFY(QFile::setPermissions(path, QFileDevice::WriteOwner));
 
-        VaultTreeModel vaultModel;
-        vaultModel.setVaultPath(QUrl::fromLocalFile(vault.path()));
-
         UsbGrabRule rule;
         rule.deviceSerial = QStringLiteral("TEST-SERIAL");
 
-        UsbGrabJob job;
-        QSignalSpy previewSpy(&job, &UsbGrabJob::previewReady);
-        job.startPreview(rule, device.path(), vault.path());
-        QVERIFY(previewSpy.wait(10000));
+        const UsbGrabScanResult result = runUsbGrabScan(rule, device.path(), vault.path(), /*dryRun=*/true);
 
-        const QVariantList entries = previewSpy.first().at(0).toList();
+        const QVariantList entries = result.previewEntries;
         QCOMPARE(entries.size(), 2);
         QHash<QString, QString> statusByPath;
         for (const QVariant &entryVariant : entries) {
@@ -354,7 +314,7 @@ private slots:
     }
 
     // THE regression test for the quick-check: QFile::copy() stamps the copy
-    // with the time of the copy, not the source's mtime. Without UsbGrabJob
+    // with the time of the copy, not the source's mtime. Without runUsbGrabScan()
     // explicitly restoring it, a grabbed file would never match its source
     // again and every single re-grab would re-copy the whole device under
     // _1/_2/... suffixes — silently duplicating gigabytes.
@@ -368,31 +328,86 @@ private slots:
         QVERIFY(setMtime(device.filePath("take1.wav"), fixedMtime()));
         QVERIFY(setMtime(device.filePath("nested/take2.wav"), fixedMtime()));
 
-        VaultTreeModel vaultModel;
-        vaultModel.setVaultPath(QUrl::fromLocalFile(vault.path()));
-
         UsbGrabRule rule;
         rule.deviceSerial = QStringLiteral("TEST-SERIAL");
 
-        UsbGrabJob firstRun;
-        QSignalSpy firstSpy(&firstRun, &UsbGrabJob::finished);
-        firstRun.start(rule, device.path(), vault.path(), &vaultModel);
-        QVERIFY(firstSpy.wait(10000));
-        QCOMPARE(firstSpy.first().at(0).toInt(), 2); // both copied
+        const UsbGrabScanResult firstRun = runUsbGrabScan(rule, device.path(), vault.path(), /*dryRun=*/false);
+        QCOMPARE(firstRun.filesCopied, 2); // both copied
 
         // The copies carry the source's mtime, not "now".
         QCOMPARE(QFileInfo(vault.filePath("take1.wav")).lastModified(), fixedMtime());
         QCOMPARE(QFileInfo(vault.filePath("nested/take2.wav")).lastModified(), fixedMtime());
 
         // Re-grabbing the same untouched device must copy nothing at all.
-        UsbGrabJob secondRun;
-        QSignalSpy secondSpy(&secondRun, &UsbGrabJob::finished);
-        secondRun.start(rule, device.path(), vault.path(), &vaultModel);
-        QVERIFY(secondSpy.wait(10000));
-        QCOMPARE(secondSpy.first().at(0).toInt(), 0); // filesCopied
-        QCOMPARE(secondSpy.first().at(1).toInt(), 2); // filesSkipped
+        const UsbGrabScanResult secondRun = runUsbGrabScan(rule, device.path(), vault.path(), /*dryRun=*/false);
+        QCOMPARE(secondRun.filesCopied, 0);  // filesCopied
+        QCOMPARE(secondRun.filesSkipped, 2); // filesSkipped
         QVERIFY(!QFileInfo::exists(vault.filePath("take1_1.wav")));
         QVERIFY(!QFileInfo::exists(vault.filePath("nested/take2_1.wav")));
+    }
+
+    // THE regression test for partial copies: a file that doesn't land whole
+    // must not be counted, must not be kept, and must be reported.
+    //
+    // QFile::copy() cannot be taken at its word here. Verified against Qt 6.11:
+    // when the source stops delivering bytes partway — a recorder unplugged
+    // mid-grab, the normal failure on removable media — it returns TRUE having
+    // written a truncated file. Believing it put a file in the vault that wears
+    // a recording's name, plays, and transcribes into garbage, inside a run that
+    // reported a clean success.
+    //
+    // The trick: a symlink to a /proc file is the one way to drive that exact
+    // condition with no race, no threads and no multi-GB fixture. /proc/self/status
+    // stats at size 0 but reads back ~1.5 KB, so the copy "succeeds" with a size
+    // that disagrees with the source's stat — precisely what a yanked device
+    // produces, just from the opposite direction (more bytes than stat'd rather
+    // than fewer). The check under test rejects any MISMATCH, deliberately: a
+    // source still being written on the device isn't grabbable either.
+    void copyThatDoesNotLandWhole_isRejectedNotCountedAndReported()
+    {
+        QTemporaryDir device;
+        QTemporaryDir vault;
+        QVERIFY(device.isValid() && vault.isValid());
+        QVERIFY(QFile::link(QStringLiteral("/proc/self/status"), device.filePath("clip.wav")));
+        // The premise of the trick, asserted rather than assumed: if /proc ever
+        // stopped lying about its size this test would silently stop testing.
+        QCOMPARE(QFileInfo(device.filePath("clip.wav")).size(), 0);
+
+        UsbGrabRule rule;
+        rule.deviceSerial = QStringLiteral("TEST-SERIAL");
+
+        const UsbGrabScanResult result = runUsbGrabScan(rule, device.path(), vault.path(), /*dryRun=*/false);
+
+        // Not counted as copied...
+        QCOMPARE(result.filesCopied, 0);
+        QCOMPARE(result.filesSkipped, 0);
+        // ...not left in the vault to masquerade as a real recording...
+        QVERIFY(!QFileInfo::exists(vault.filePath("clip.wav")));
+        // ...and reported, by name, as a per-file error rather than silently.
+        QCOMPARE(result.errors.size(), 1);
+        QVERIFY(result.errors.first().contains(QStringLiteral("clip.wav")));
+    }
+
+    // A partial copy is a per-file error, NOT a fatal one: the rest of the
+    // device still gets grabbed. Pins the failure as non-fatal so a single
+    // unreadable file can't cost the user the whole run.
+    void copyThatDoesNotLandWhole_doesNotAbortTheRestOfTheGrab()
+    {
+        QTemporaryDir device;
+        QTemporaryDir vault;
+        QVERIFY(device.isValid() && vault.isValid());
+        QVERIFY(QFile::link(QStringLiteral("/proc/self/status"), device.filePath("bad.wav")));
+        QVERIFY(writeFile(device.filePath("good.wav"), "real-audio"));
+
+        UsbGrabRule rule;
+        rule.deviceSerial = QStringLiteral("TEST-SERIAL");
+
+        const UsbGrabScanResult result = runUsbGrabScan(rule, device.path(), vault.path(), /*dryRun=*/false);
+
+        QCOMPARE(result.filesCopied, 1); // the healthy file still made it
+        QCOMPARE(result.errors.size(), 1);
+        QVERIFY(QFileInfo::exists(vault.filePath("good.wav")));
+        QVERIFY(!QFileInfo::exists(vault.filePath("bad.wav")));
     }
 
     // A grab immediately followed by a preview must agree: the files just
@@ -407,24 +422,15 @@ private slots:
         QVERIFY(writeFile(device.filePath("take1.wav"), "audio"));
         QVERIFY(setMtime(device.filePath("take1.wav"), fixedMtime()));
 
-        VaultTreeModel vaultModel;
-        vaultModel.setVaultPath(QUrl::fromLocalFile(vault.path()));
-
         UsbGrabRule rule;
         rule.deviceSerial = QStringLiteral("TEST-SERIAL");
 
-        UsbGrabJob grab;
-        QSignalSpy finishedSpy(&grab, &UsbGrabJob::finished);
-        grab.start(rule, device.path(), vault.path(), &vaultModel);
-        QVERIFY(finishedSpy.wait(10000));
-        QCOMPARE(finishedSpy.first().at(0).toInt(), 1);
+        const UsbGrabScanResult grab = runUsbGrabScan(rule, device.path(), vault.path(), /*dryRun=*/false);
+        QCOMPARE(grab.filesCopied, 1);
 
-        UsbGrabJob preview;
-        QSignalSpy previewSpy(&preview, &UsbGrabJob::previewReady);
-        preview.startPreview(rule, device.path(), vault.path());
-        QVERIFY(previewSpy.wait(10000));
+        const UsbGrabScanResult preview = runUsbGrabScan(rule, device.path(), vault.path(), /*dryRun=*/true);
 
-        const QVariantList entries = previewSpy.first().at(0).toList();
+        const QVariantList entries = preview.previewEntries;
         QCOMPARE(entries.size(), 1);
         QCOMPARE(entries.first().toMap().value(QStringLiteral("status")).toString(),
                  QStringLiteral("duplicate"));
@@ -448,19 +454,13 @@ private slots:
         QVERIFY(setMtime(vault.filePath("clip.wav"), fixedMtime()));
         QVERIFY(setMtime(device.filePath("clip.wav"), fixedMtime()));
 
-        VaultTreeModel vaultModel;
-        vaultModel.setVaultPath(QUrl::fromLocalFile(vault.path()));
-
         UsbGrabRule rule;
         rule.deviceSerial = QStringLiteral("TEST-SERIAL");
 
-        UsbGrabJob job;
-        QSignalSpy finishedSpy(&job, &UsbGrabJob::finished);
-        job.start(rule, device.path(), vault.path(), &vaultModel);
-        QVERIFY(finishedSpy.wait(10000));
+        const UsbGrabScanResult result = runUsbGrabScan(rule, device.path(), vault.path(), /*dryRun=*/false);
 
-        QCOMPARE(finishedSpy.first().at(0).toInt(), 0); // copied nothing
-        QCOMPARE(finishedSpy.first().at(1).toInt(), 1); // skipped as "already present"
+        QCOMPARE(result.filesCopied, 0);  // copied nothing
+        QCOMPARE(result.filesSkipped, 1); // skipped as "already present"
         // The vault's original is untouched either way — nothing is overwritten.
         QFile original(vault.filePath("clip.wav"));
         QVERIFY(original.open(QIODevice::ReadOnly));
@@ -478,55 +478,24 @@ private slots:
         QVERIFY(device.isValid() && vault.isValid());
         QVERIFY(writeFile(device.filePath("clip.wav"), "x"));
 
-        VaultTreeModel vaultModel;
-        vaultModel.setVaultPath(QUrl::fromLocalFile(vault.path()));
-
         UsbGrabRule rule;
         rule.deviceSerial = QStringLiteral("TEST-SERIAL");
 
         const QString destination = vault.filePath("Interviews/USB");
         QVERIFY(!QFileInfo::exists(destination));
 
-        UsbGrabJob job;
-        QSignalSpy finishedSpy(&job, &UsbGrabJob::finished);
-        job.start(rule, device.path(), destination, &vaultModel);
-        QVERIFY(finishedSpy.wait(10000));
+        const UsbGrabScanResult result = runUsbGrabScan(rule, device.path(), destination, /*dryRun=*/false);
 
-        QCOMPARE(finishedSpy.first().at(0).toInt(), 1);
+        QCOMPARE(result.filesCopied, 1);
         QVERIFY(QFileInfo::exists(destination + "/clip.wav"));
     }
 
-    // On completion, one history entry lands in the destination vault's
-    // .transcriber/usbGrabHistory.json (see VaultTreeModel::
-    // appendUsbGrabHistoryEntry(), tested independently in
-    // tst_vaulttreemodel.cpp) — verified here end-to-end from a real job run.
-    void completion_recordsHistoryEntryInDestinationVault()
-    {
-        QTemporaryDir device;
-        QTemporaryDir vault;
-        QVERIFY(device.isValid() && vault.isValid());
-        QVERIFY(writeFile(device.filePath("a.wav"), "x"));
-
-        VaultTreeModel vaultModel;
-        vaultModel.setVaultPath(QUrl::fromLocalFile(vault.path()));
-
-        UsbGrabRule rule;
-        rule.deviceSerial = QStringLiteral("HIST-SERIAL");
-        rule.deviceLabel = QStringLiteral("Test Recorder");
-
-        UsbGrabJob job;
-        QSignalSpy finishedSpy(&job, &UsbGrabJob::finished);
-        job.start(rule, device.path(), vault.path(), &vaultModel);
-        QVERIFY(finishedSpy.wait(10000));
-
-        const QVariantList history = vaultModel.readUsbGrabHistory();
-        QCOMPARE(history.size(), 1);
-        const QVariantMap entry = history.first().toMap();
-        QCOMPARE(entry.value(QStringLiteral("deviceSerial")).toString(), QStringLiteral("HIST-SERIAL"));
-        QCOMPARE(entry.value(QStringLiteral("deviceLabel")).toString(), QStringLiteral("Test Recorder"));
-        QCOMPARE(entry.value(QStringLiteral("filesCopied")).toInt(), 1);
-        QVERIFY(!entry.value(QStringLiteral("timestamp")).toString().isEmpty());
-    }
+    // (The old completion_recordsHistoryEntryInDestinationVault lived here. It
+    // wasn't dropped — it MOVED, along with the behavior: writing the history
+    // entry is now UsbGrabberController::handleUsbGrabFinished()'s job, which
+    // runUsbGrabScan() has no handle on and no business knowing about. See
+    // tst_usbgrabbercontroller.cpp's grab_writesHistoryEntryForTheDeviceThatRan,
+    // which specs it end-to-end through a real queued grab.)
 
     // Defence in depth behind UsbDeviceMonitor's external-media filter (tested in
     // tst_usbdevicemonitor.cpp): even if a scan root somehow resolves to "/", the
@@ -611,8 +580,8 @@ private slots:
         QVERIFY(!usbGrabRefusalReason(device.path(), device.filePath("Nested/Vault")).isEmpty());
     }
 
-    // End-to-end: a refused run reports the reason through finished()'s errors and
-    // copies nothing. Uses a destination inside the scan root (a refusal that's
+    // End-to-end: a refused run reports the reason through the result's refusal
+    // and copies nothing. Uses a destination inside the scan root (a refusal that's
     // safe to actually execute, unlike pointing a real job at "/").
     void refusedRun_reportsErrorAndCopiesNothing()
     {
@@ -621,26 +590,28 @@ private slots:
         QVERIFY(writeFile(device.filePath("clip.wav"), "x"));
         const QString destination = device.filePath("Vault");
 
-        VaultTreeModel vaultModel;
-        vaultModel.setVaultPath(QUrl::fromLocalFile(device.path()));
-
         UsbGrabRule rule;
         rule.deviceSerial = QStringLiteral("REFUSE-SERIAL");
 
-        UsbGrabJob job;
-        QSignalSpy finishedSpy(&job, &UsbGrabJob::finished);
-        job.start(rule, device.path(), destination, &vaultModel);
-        QVERIFY(finishedSpy.wait(10000));
+        const UsbGrabScanResult result = runUsbGrabScan(rule, device.path(), destination, /*dryRun=*/false);
 
-        QCOMPARE(finishedSpy.first().at(0).toInt(), 0); // copied
-        QCOMPARE(finishedSpy.first().at(1).toInt(), 0); // skipped
-        QCOMPARE(finishedSpy.first().at(2).toStringList().size(), 1);
+        QCOMPARE(result.filesCopied, 0);  // copied
+        QCOMPARE(result.filesSkipped, 0); // skipped
+        // The reason now rides its own field rather than being stuffed into the
+        // per-file errors list, which stays empty: a refusal isn't a file that
+        // failed to copy, and the caller has to tell them apart to report the
+        // run honestly.
+        QVERIFY(!result.refusal.isEmpty());
+        QVERIFY(result.errors.isEmpty());
         QVERIFY(!QFileInfo::exists(destination));
     }
 
     // A refused PREVIEW surfaces the reason through previewReady()'s error rather
     // than returning an empty list, which would be indistinguishable from a device
-    // with nothing on it.
+    // with nothing on it. Kept on the threaded UsbGrabPreviewJob deliberately:
+    // this is the one place that specs the signal contract itself — that
+    // UsbGrabScanResult::refusal reaches the GUI thread as previewReady()'s
+    // error argument, and doesn't quietly arrive as an empty entries list.
     void refusedPreview_reportsErrorRatherThanEmptyList()
     {
         QTemporaryDir device;
@@ -650,9 +621,9 @@ private slots:
         UsbGrabRule rule;
         rule.deviceSerial = QStringLiteral("REFUSE-SERIAL");
 
-        UsbGrabJob job;
-        QSignalSpy previewSpy(&job, &UsbGrabJob::previewReady);
-        job.startPreview(rule, device.path(), device.filePath("Vault"));
+        UsbGrabPreviewJob job;
+        QSignalSpy previewSpy(&job, &UsbGrabPreviewJob::previewReady);
+        job.start(rule, device.path(), device.filePath("Vault"));
         QVERIFY(previewSpy.wait(10000));
 
         QVERIFY(previewSpy.first().at(0).toList().isEmpty());
@@ -671,19 +642,13 @@ private slots:
         QVERIFY(writeFile(device.filePath("REC_0042.wav"), "keep"));
         QVERIFY(writeFile(device.filePath("MEMO_0042.wav"), "drop"));
 
-        VaultTreeModel vaultModel;
-        vaultModel.setVaultPath(QUrl::fromLocalFile(vault.path()));
-
         UsbGrabRule rule;
         rule.deviceSerial = QStringLiteral("TEST-SERIAL");
         rule.filenameRegex = QStringLiteral("^REC_\\d+");
 
-        UsbGrabJob job;
-        QSignalSpy finishedSpy(&job, &UsbGrabJob::finished);
-        job.start(rule, device.path(), vault.path(), &vaultModel);
-        QVERIFY(finishedSpy.wait(10000));
+        const UsbGrabScanResult result = runUsbGrabScan(rule, device.path(), vault.path(), /*dryRun=*/false);
 
-        QCOMPARE(finishedSpy.first().at(0).toInt(), 1); // filesCopied
+        QCOMPARE(result.filesCopied, 1); // filesCopied
         QVERIFY(QFileInfo::exists(vault.filePath("REC_0042.wav")));
         QVERIFY(!QFileInfo::exists(vault.filePath("MEMO_0042.wav")));
     }
@@ -698,19 +663,13 @@ private slots:
         QVERIFY(writeFile(device.filePath("a.wav"), "a"));
         QVERIFY(writeFile(device.filePath("b.txt"), "b"));
 
-        VaultTreeModel vaultModel;
-        vaultModel.setVaultPath(QUrl::fromLocalFile(vault.path()));
-
         UsbGrabRule rule;
         rule.deviceSerial = QStringLiteral("TEST-SERIAL");
         // filenameRegex left empty deliberately.
 
-        UsbGrabJob job;
-        QSignalSpy finishedSpy(&job, &UsbGrabJob::finished);
-        job.start(rule, device.path(), vault.path(), &vaultModel);
-        QVERIFY(finishedSpy.wait(10000));
+        const UsbGrabScanResult result = runUsbGrabScan(rule, device.path(), vault.path(), /*dryRun=*/false);
 
-        QCOMPARE(finishedSpy.first().at(0).toInt(), 2);
+        QCOMPARE(result.filesCopied, 2);
     }
 
     // The two filters AND: a file must clear BOTH. Each stays independently
@@ -724,20 +683,14 @@ private slots:
         QVERIFY(writeFile(device.filePath("MEMO_1.wav"), "ext"));   // ext ok, regex no  -> filtered
         QVERIFY(writeFile(device.filePath("REC_2.txt"), "regex"));  // ext no, regex ok  -> filtered
 
-        VaultTreeModel vaultModel;
-        vaultModel.setVaultPath(QUrl::fromLocalFile(vault.path()));
-
         UsbGrabRule rule;
         rule.deviceSerial = QStringLiteral("TEST-SERIAL");
         rule.extensionFilter = {QStringLiteral("wav")};
         rule.filenameRegex = QStringLiteral("^REC_");
 
-        UsbGrabJob job;
-        QSignalSpy finishedSpy(&job, &UsbGrabJob::finished);
-        job.start(rule, device.path(), vault.path(), &vaultModel);
-        QVERIFY(finishedSpy.wait(10000));
+        const UsbGrabScanResult result = runUsbGrabScan(rule, device.path(), vault.path(), /*dryRun=*/false);
 
-        QCOMPARE(finishedSpy.first().at(0).toInt(), 1);
+        QCOMPARE(result.filesCopied, 1);
         QVERIFY(QFileInfo::exists(vault.filePath("REC_1.wav")));
         QVERIFY(!QFileInfo::exists(vault.filePath("MEMO_1.wav")));
         QVERIFY(!QFileInfo::exists(vault.filePath("REC_2.txt")));
@@ -754,20 +707,14 @@ private slots:
         QVERIFY(device.isValid() && vault.isValid());
         QVERIFY(writeFile(device.filePath("DCIM/clip.wav"), "in-dcim"));
 
-        VaultTreeModel vaultModel;
-        vaultModel.setVaultPath(QUrl::fromLocalFile(vault.path()));
-
         UsbGrabRule rule;
         rule.deviceSerial = QStringLiteral("TEST-SERIAL");
         rule.preserveStructure = false;
         rule.filenameRegex = QStringLiteral("DCIM"); // a FOLDER name, not a file name
 
-        UsbGrabJob job;
-        QSignalSpy finishedSpy(&job, &UsbGrabJob::finished);
-        job.start(rule, device.path(), vault.path(), &vaultModel);
-        QVERIFY(finishedSpy.wait(10000));
+        const UsbGrabScanResult result = runUsbGrabScan(rule, device.path(), vault.path(), /*dryRun=*/false);
 
-        QCOMPARE(finishedSpy.first().at(0).toInt(), 0);
+        QCOMPARE(result.filesCopied, 0);
         QVERIFY(!QFileInfo::exists(vault.filePath("clip.wav")));
     }
 
@@ -781,33 +728,22 @@ private slots:
         QVERIFY(device.isValid() && vault.isValid());
         QVERIFY(writeFile(device.filePath("my_REC_tail.wav"), "substring"));
 
-        VaultTreeModel vaultModel;
-        vaultModel.setVaultPath(QUrl::fromLocalFile(vault.path()));
-
         UsbGrabRule unanchored;
         unanchored.deviceSerial = QStringLiteral("TEST-SERIAL");
         unanchored.filenameRegex = QStringLiteral("REC");
 
-        UsbGrabJob job;
-        QSignalSpy finishedSpy(&job, &UsbGrabJob::finished);
-        job.start(unanchored, device.path(), vault.path(), &vaultModel);
-        QVERIFY(finishedSpy.wait(10000));
-        QCOMPARE(finishedSpy.first().at(0).toInt(), 1);
+        const UsbGrabScanResult result = runUsbGrabScan(unanchored, device.path(), vault.path(), /*dryRun=*/false);
+        QCOMPARE(result.filesCopied, 1);
 
         // ...and anchoring it excludes the very same file.
         QTemporaryDir vault2;
         QVERIFY(vault2.isValid());
-        VaultTreeModel vaultModel2;
-        vaultModel2.setVaultPath(QUrl::fromLocalFile(vault2.path()));
 
         UsbGrabRule anchored = unanchored;
         anchored.filenameRegex = QStringLiteral("^REC");
 
-        UsbGrabJob job2;
-        QSignalSpy finishedSpy2(&job2, &UsbGrabJob::finished);
-        job2.start(anchored, device.path(), vault2.path(), &vaultModel2);
-        QVERIFY(finishedSpy2.wait(10000));
-        QCOMPARE(finishedSpy2.first().at(0).toInt(), 0);
+        const UsbGrabScanResult result2 = runUsbGrabScan(anchored, device.path(), vault2.path(), /*dryRun=*/false);
+        QCOMPARE(result2.filesCopied, 0);
     }
 
     // Fails CLOSED. An unparseable pattern must never be read as "no
@@ -821,19 +757,13 @@ private slots:
         QVERIFY(device.isValid() && vault.isValid());
         QVERIFY(writeFile(device.filePath("clip.wav"), "audio"));
 
-        VaultTreeModel vaultModel;
-        vaultModel.setVaultPath(QUrl::fromLocalFile(vault.path()));
-
         UsbGrabRule rule;
         rule.deviceSerial = QStringLiteral("TEST-SERIAL");
         rule.filenameRegex = QStringLiteral("(unterminated[");
 
-        UsbGrabJob job;
-        QSignalSpy finishedSpy(&job, &UsbGrabJob::finished);
-        job.start(rule, device.path(), vault.path(), &vaultModel);
-        QVERIFY(finishedSpy.wait(10000));
+        const UsbGrabScanResult result = runUsbGrabScan(rule, device.path(), vault.path(), /*dryRun=*/false);
 
-        QCOMPARE(finishedSpy.first().at(0).toInt(), 0);
+        QCOMPARE(result.filesCopied, 0);
         QVERIFY(!QFileInfo::exists(vault.filePath("clip.wav")));
     }
 
@@ -852,12 +782,9 @@ private slots:
         rule.deviceSerial = QStringLiteral("TEST-SERIAL");
         rule.filenameRegex = QStringLiteral("^REC_");
 
-        UsbGrabJob job;
-        QSignalSpy previewSpy(&job, &UsbGrabJob::previewReady);
-        job.startPreview(rule, device.path(), vault.path());
-        QVERIFY(previewSpy.wait(10000));
+        const UsbGrabScanResult result = runUsbGrabScan(rule, device.path(), vault.path(), /*dryRun=*/true);
 
-        const QVariantList entries = previewSpy.first().at(0).toList();
+        const QVariantList entries = result.previewEntries;
         QCOMPARE(entries.size(), 2);
         QHash<QString, QString> statusByPath;
         for (const QVariant &entryVariant : entries) {

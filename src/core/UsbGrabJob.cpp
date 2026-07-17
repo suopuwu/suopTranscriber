@@ -90,6 +90,56 @@ bool filenameRegexMatches(const QFileInfo &info, const QRegularExpression &filen
     return filenameRegex.match(info.fileName()).hasMatch();
 }
 
+// Copy one grabbed file into place, or leave NOTHING at destPath and say why
+// (empty return = copied, whole and verified — same "empty means fine" idiom as
+// usbGrabRefusalReason() below).
+//
+// QFile::copy()'s return value is not enough to believe on removable media.
+// Verified against Qt 6.11: when the source stops delivering bytes partway — a
+// recorder unplugged mid-grab — it returns **true**, having written a truncated
+// file. Uncaught, that file lands in the vault wearing a recording's name (the
+// tree lists it, it plays, it transcribes into garbage), the run counts it in
+// filesCopied, and the history entry reports a clean success. The size check
+// below is the whole reason this function exists: it turns silent corruption
+// into an ordinary per-file error, which the grab already knows how to report.
+//
+// Compared against the stat the walk already took, and rejecting a MISMATCH
+// rather than only a short file, so it also catches a source still being written
+// on the device. Either way what landed isn't the file the scan decided to grab,
+// and half a recording is worth less than a re-grab that gets it whole.
+//
+// Deliberately does NOT stage the bytes under a temp name of its own: Qt copies
+// through an unnamed O_TMPFILE inode and linkat()s it into place at the end, so
+// a copy that never finishes at all (crash, power loss) leaves the destination
+// untouched — verified by SIGKILLing a 3 GB copy mid-flight and finding an empty
+// destination folder. Hand-rolled staging would only trade that for .partial
+// litter of our own to clean up.
+QString copyGrabbedFile(const QFileInfo &sourceInfo, const QString &destPath)
+{
+    if (!QFile::copy(sourceInfo.absoluteFilePath(), destPath))
+        return QStringLiteral("Failed to copy \"%1\"").arg(sourceInfo.fileName());
+
+    if (QFileInfo(destPath).size() != sourceInfo.size()) {
+        QFile::remove(destPath);
+        return QStringLiteral("Incomplete copy of \"%1\" — was the device removed?")
+            .arg(sourceInfo.fileName());
+    }
+
+    // Load-bearing, not a nicety: QFile::copy() stamps the copy with the time of
+    // the copy, so without this the grabbed file would never match its source's
+    // mtime again and EVERY subsequent grab would re-copy the whole device under
+    // _1/_2/... suffixes. This is what makes alreadyPresentAtDestination() work
+    // at all. Best-effort: a destination that won't reopen still copied fine, and
+    // the worst case is that one file looks new next time rather than a failed
+    // grab.
+    QFile copied(destPath);
+    if (copied.open(QIODevice::ReadWrite)) {
+        copied.setFileTime(sourceInfo.lastModified(), QFileDevice::FileModificationTime);
+        copied.close();
+    }
+    return QString();
+}
+
 QVariantMap makePreviewEntry(const QString &relativePath, const QString &status)
 {
     QVariantMap entry;
@@ -133,12 +183,155 @@ QString usbGrabRefusalReason(const QString &scanRoot, const QString &destination
     return QString();
 }
 
+UsbGrabScanResult runUsbGrabScan(const UsbGrabRule &rule, const QString &mountPath,
+                                  const QString &destinationVaultPath, bool dryRun,
+                                  const UsbGrabScanHooks &hooks)
+{
+    UsbGrabScanResult result;
+
+    // Compiled ONCE here rather than inside the walk: QRegularExpression
+    // parses its pattern on construction, and the walk below runs this
+    // test against every file on a device that can hold tens of thousands
+    // of them.
+    const QRegularExpression filenameRe(rule.filenameRegex);
+
+    QString scanRoot = mountPath;
+    if (!rule.startFolder.isEmpty())
+        scanRoot += QLatin1Char('/') + rule.startFolder;
+
+    // Before ANY filesystem work — no destination indexing, no walk, and in
+    // particular no copying. See usbGrabRefusalReason()'s doc comment.
+    result.refusal = usbGrabRefusalReason(scanRoot, destinationVaultPath);
+    if (!result.refusal.isEmpty())
+        return result;
+
+    // Index every file already in the destination vault by basename, up
+    // front, so each source file's quick-check doesn't need to re-walk the
+    // vault per source file. Only stat data is collected (see DestFile), so
+    // this stays cheap no matter how large the vault's audio is.
+    QHash<QString, QList<DestFile>> destFilesByBasename;
+    QDirIterator destIt(destinationVaultPath, QDir::Files, QDirIterator::Subdirectories);
+    while (destIt.hasNext()) {
+        const QFileInfo info(destIt.next());
+        destFilesByBasename[info.fileName()].append({info.size(), info.lastModified()});
+    }
+
+    // A denominator for onProgress, from a second walk of the same tree. Only
+    // worth its cost when someone is actually watching (the queued grab, which
+    // drives a progress bar); the preview reports no progress and skips it.
+    // Cheap despite being a whole extra pass: this reads no file CONTENT, only
+    // directory entries — the same reason the quick-check itself is instant
+    // where a content hash took ~25 minutes (see alreadyPresentAtDestination()).
+    int totalCandidates = 0;
+    if (hooks.onProgress) {
+        QDirIterator countIt(scanRoot, QDir::Files, QDirIterator::Subdirectories);
+        while (countIt.hasNext()) {
+            const QFileInfo info(countIt.next());
+            if (extensionMatches(info, rule.extensionFilter) && filenameRegexMatches(info, filenameRe))
+                ++totalCandidates;
+        }
+    }
+
+    int filesProcessed = 0;
+
+    QDirIterator it(scanRoot, QDir::Files, QDirIterator::Subdirectories);
+    while (it.hasNext()) {
+        const QString sourcePath = it.next();
+        const QFileInfo sourceInfo(sourcePath);
+
+        // ANDed, and each is independently "no constraint" when blank —
+        // a file must clear BOTH the extension set and the filename regex
+        // to be a grab candidate.
+        if (!extensionMatches(sourceInfo, rule.extensionFilter)
+                || !filenameRegexMatches(sourceInfo, filenameRe)) {
+            if (dryRun)
+                result.previewEntries.append(makePreviewEntry(QDir(scanRoot).relativeFilePath(sourcePath),
+                                                               QStringLiteral("filtered")));
+        } else {
+            ++filesProcessed;
+            if (hooks.onProgress)
+                hooks.onProgress(filesProcessed, totalCandidates);
+
+            const bool alreadyPresent = alreadyPresentAtDestination(
+                sourceInfo, destFilesByBasename.value(sourceInfo.fileName()));
+
+            if (alreadyPresent) {
+                ++result.filesSkipped;
+                if (dryRun)
+                    result.previewEntries.append(makePreviewEntry(QDir(scanRoot).relativeFilePath(sourcePath),
+                                                                   QStringLiteral("duplicate")));
+            } else if (dryRun) {
+                result.previewEntries.append(
+                    makePreviewEntry(QDir(scanRoot).relativeFilePath(sourcePath), QStringLiteral("grab")));
+            } else {
+                QString relativeDir;
+                if (rule.preserveStructure) {
+                    const QString rel = QDir(scanRoot).relativeFilePath(sourceInfo.absolutePath());
+                    if (rel != QStringLiteral("."))
+                        relativeDir = rel;
+                }
+                const QString destDir = relativeDir.isEmpty()
+                    ? destinationVaultPath
+                    : destinationVaultPath + QLatin1Char('/') + relativeDir;
+                QDir().mkpath(destDir);
+
+                // Same basename already sitting at this exact spot, but
+                // ruled out above by the quick-check (i.e. a genuinely
+                // different file) — don't silently overwrite it; append
+                // a short numeric suffix before the extension until we
+                // land on a name that isn't taken (mirrors
+                // VaultTreeModel::importFile()'s dest-exists check
+                // precedent, just resolved instead of rejected).
+                QString destPath = destDir + QLatin1Char('/') + sourceInfo.fileName();
+                if (QFileInfo::exists(destPath)) {
+                    const QString baseName = sourceInfo.completeBaseName();
+                    const QString suffix = sourceInfo.suffix();
+                    int n = 1;
+                    do {
+                        const QString candidateName = suffix.isEmpty()
+                            ? QStringLiteral("%1_%2").arg(baseName).arg(n)
+                            : QStringLiteral("%1_%2.%3").arg(baseName).arg(n).arg(suffix);
+                        destPath = destDir + QLatin1Char('/') + candidateName;
+                        ++n;
+                    } while (QFileInfo::exists(destPath));
+                }
+
+                const QString copyError = copyGrabbedFile(sourceInfo, destPath);
+                if (copyError.isEmpty()) {
+                    ++result.filesCopied;
+
+                    // Keep the index current so a later source file in
+                    // this same run that shares this basename also diffs
+                    // correctly against what this run has already copied.
+                    // Indexed under the SOURCE's size/mtime — which, thanks
+                    // to the stamp in copyGrabbedFile(), is exactly what's
+                    // now on disk. Only reached for a VERIFIED copy, so a
+                    // file that failed mid-copy is never indexed as present.
+                    destFilesByBasename[sourceInfo.fileName()].append(
+                        {sourceInfo.size(), sourceInfo.lastModified()});
+                } else {
+                    result.errors.append(copyError);
+                }
+            }
+        }
+
+        if (hooks.shouldAbort && hooks.shouldAbort()) {
+            result.aborted = true;
+            break;
+        }
+    }
+
+    return result;
+}
+
 // Lives on UsbGrabJob's dedicated QThread; never touches the GUI thread.
-// Owns the whole recursive scan+copy for one run — unlike AudioRecorderWorker
-// (which sets up capture and then idles behind a QTimer, letting the worker's
-// event loop keep running), this worker's start() slot runs the entire scan
-// synchronously to completion in one call, since there's no ongoing hardware
-// stream to service in the meantime.
+// Drives runUsbGrabScan() for the PREVIEW path only — a real grab is a queued
+// task on TranscriptionController's worker instead (see UsbGrabberController::
+// startGrabJob()), so this worker exists purely to keep the dry-run walk off
+// the GUI thread. Unlike AudioRecorderWorker (which sets up capture and then
+// idles behind a QTimer, letting the worker's event loop keep running), this
+// worker's start() slot runs the entire scan synchronously to completion in one
+// call, since there's no ongoing hardware stream to service in the meantime.
 class UsbGrabJobWorker : public QObject {
     Q_OBJECT
 
@@ -146,254 +339,72 @@ public:
     using QObject::QObject;
 
 public slots:
-    // dryRun classifies every file the scan sees (matched-and-copied,
-    // matched-but-already-present, or filtered-out-by-the-rule's-filters)
-    // without touching the filesystem at all — no mkpath, no QFile::copy, no
-    // destFilesByBasename mutation — emitting previewCompleted() instead of
-    // scanCompleted(). Everything else (the filters, quick-check dedup
-    // index, cancel support) is identical between the two modes, written
-    // once here rather than duplicated across a separate preview method.
-    void start(const QString &mountPath, const QString &startFolder, const QStringList &extensionFilter,
-               const QString &filenameRegex, bool preserveStructure, const QString &destinationVaultPath,
-               bool dryRun)
+    void start(const UsbGrabRule &rule, const QString &mountPath, const QString &destinationVaultPath)
     {
         m_cancelRequested = false;
 
-        // Compiled ONCE here rather than inside the walk: QRegularExpression
-        // parses its pattern on construction, and the walk below runs this
-        // test against every file on a device that can hold tens of thousands
-        // of them.
-        const QRegularExpression filenameRe(filenameRegex);
-
-        QString scanRoot = mountPath;
-        if (!startFolder.isEmpty())
-            scanRoot += QLatin1Char('/') + startFolder;
-
-        // Before ANY filesystem work — no destination indexing, no walk, and in
-        // particular no copying. See usbGrabRefusalReason()'s doc comment.
-        const QString refusal = usbGrabRefusalReason(scanRoot, destinationVaultPath);
-        if (!refusal.isEmpty()) {
-            if (dryRun)
-                emit previewCompleted(QVariantList(), refusal);
-            else
-                emit scanCompleted(0, 0, QStringList { refusal });
-            return;
-        }
-
-        // Index every file already in the destination vault by basename, up
-        // front, so each source file's quick-check doesn't need to re-walk the
-        // vault per source file. Only stat data is collected (see DestFile), so
-        // this stays cheap no matter how large the vault's audio is.
-        QHash<QString, QList<DestFile>> destFilesByBasename;
-        QDirIterator destIt(destinationVaultPath, QDir::Files, QDirIterator::Subdirectories);
-        while (destIt.hasNext()) {
-            const QFileInfo info(destIt.next());
-            destFilesByBasename[info.fileName()].append({info.size(), info.lastModified()});
-        }
-
-        int filesCopied = 0;
-        int filesSkipped = 0;
-        QStringList errors;
-        int filesProcessed = 0;
-        QVariantList previewEntries;
-
-        QDirIterator it(scanRoot, QDir::Files, QDirIterator::Subdirectories);
-        while (it.hasNext()) {
-            const QString sourcePath = it.next();
-            const QFileInfo sourceInfo(sourcePath);
-
-            // ANDed, and each is independently "no constraint" when blank —
-            // a file must clear BOTH the extension set and the filename regex
-            // to be a grab candidate.
-            if (!extensionMatches(sourceInfo, extensionFilter)
-                    || !filenameRegexMatches(sourceInfo, filenameRe)) {
-                if (dryRun)
-                    previewEntries.append(makePreviewEntry(QDir(scanRoot).relativeFilePath(sourcePath),
-                                                            QStringLiteral("filtered")));
-            } else {
-                ++filesProcessed;
-                emit progressed(filesProcessed);
-
-                const bool alreadyPresent = alreadyPresentAtDestination(
-                    sourceInfo, destFilesByBasename.value(sourceInfo.fileName()));
-
-                if (alreadyPresent) {
-                    ++filesSkipped;
-                    if (dryRun)
-                        previewEntries.append(makePreviewEntry(QDir(scanRoot).relativeFilePath(sourcePath),
-                                                                QStringLiteral("duplicate")));
-                } else if (dryRun) {
-                    previewEntries.append(
-                        makePreviewEntry(QDir(scanRoot).relativeFilePath(sourcePath), QStringLiteral("grab")));
-                } else {
-                    QString relativeDir;
-                    if (preserveStructure) {
-                        const QString rel = QDir(scanRoot).relativeFilePath(sourceInfo.absolutePath());
-                        if (rel != QStringLiteral("."))
-                            relativeDir = rel;
-                    }
-                    const QString destDir = relativeDir.isEmpty()
-                        ? destinationVaultPath
-                        : destinationVaultPath + QLatin1Char('/') + relativeDir;
-                    QDir().mkpath(destDir);
-
-                    // Same basename already sitting at this exact spot, but
-                    // ruled out above by the quick-check (i.e. a genuinely
-                    // different file) — don't silently overwrite it; append
-                    // a short numeric suffix before the extension until we
-                    // land on a name that isn't taken (mirrors
-                    // VaultTreeModel::importFile()'s dest-exists check
-                    // precedent, just resolved instead of rejected).
-                    QString destPath = destDir + QLatin1Char('/') + sourceInfo.fileName();
-                    if (QFileInfo::exists(destPath)) {
-                        const QString baseName = sourceInfo.completeBaseName();
-                        const QString suffix = sourceInfo.suffix();
-                        int n = 1;
-                        do {
-                            const QString candidateName = suffix.isEmpty()
-                                ? QStringLiteral("%1_%2").arg(baseName).arg(n)
-                                : QStringLiteral("%1_%2.%3").arg(baseName).arg(n).arg(suffix);
-                            destPath = destDir + QLatin1Char('/') + candidateName;
-                            ++n;
-                        } while (QFileInfo::exists(destPath));
-                    }
-
-                    if (QFile::copy(sourcePath, destPath)) {
-                        ++filesCopied;
-
-                        // Load-bearing, not a nicety: QFile::copy() stamps the
-                        // copy with the time of the copy, so without this the
-                        // grabbed file would never match its source's mtime
-                        // again and EVERY subsequent grab would re-copy the
-                        // whole device under _1/_2/... suffixes. This is what
-                        // makes alreadyPresentAtDestination() work at all.
-                        // Best-effort: a destination that won't reopen still
-                        // copied fine, and the worst case is that one file
-                        // looks new next time rather than a failed grab.
-                        QFile copied(destPath);
-                        if (copied.open(QIODevice::ReadWrite)) {
-                            copied.setFileTime(sourceInfo.lastModified(),
-                                                QFileDevice::FileModificationTime);
-                            copied.close();
-                        }
-
-                        // Keep the index current so a later source file in
-                        // this same run that shares this basename also diffs
-                        // correctly against what this run has already copied.
-                        // Indexed under the SOURCE's size/mtime — which, thanks
-                        // to the stamp above, is exactly what's now on disk.
-                        destFilesByBasename[sourceInfo.fileName()].append(
-                            {sourceInfo.size(), sourceInfo.lastModified()});
-                    } else {
-                        errors.append(QStringLiteral("Failed to copy \"%1\"").arg(sourceInfo.fileName()));
-                    }
-                }
-            }
-
+        UsbGrabScanHooks hooks;
+        // No onProgress: nothing renders preview progress, and supplying one
+        // would make runUsbGrabScan() pay for its pre-count pass for nothing.
+        hooks.shouldAbort = [this] {
             // Give the event loop a chance to deliver a queued requestCancel()
-            // (see UsbGrabJob's destructor) between files, rather than only
-            // after the entire — potentially large — device has been walked.
+            // (see UsbGrabPreviewJob's destructor) between files, rather than
+            // only after the entire — potentially large — device has been
+            // walked.
             QCoreApplication::processEvents();
-            if (m_cancelRequested)
-                break;
-        }
+            return m_cancelRequested;
+        };
 
-        if (dryRun)
-            emit previewCompleted(previewEntries, QString());
-        else
-            emit scanCompleted(filesCopied, filesSkipped, errors);
+        const UsbGrabScanResult result = runUsbGrabScan(rule, mountPath, destinationVaultPath,
+                                                         /*dryRun=*/true, hooks);
+        emit previewCompleted(result.previewEntries, result.refusal);
     }
 
     void requestCancel() { m_cancelRequested = true; }
 
 signals:
-    void progressed(int filesProcessedSoFar);
-    void scanCompleted(int filesCopied, int filesSkipped, const QStringList &errors);
     void previewCompleted(const QVariantList &entries, const QString &error);
 
 private:
     bool m_cancelRequested = false;
 };
 
-UsbGrabJob::UsbGrabJob(QObject *parent)
+UsbGrabPreviewJob::UsbGrabPreviewJob(QObject *parent)
     : QObject(parent)
 {
+    // start() hands the whole rule to the worker across a QUEUED connection,
+    // which copies it through the metatype system — without this the invoke
+    // fails at RUNTIME (silently doing nothing), not at compile time.
+    qRegisterMetaType<UsbGrabRule>();
+
     m_worker = new UsbGrabJobWorker;
     m_worker->moveToThread(&m_thread);
     connect(&m_thread, &QThread::finished, m_worker, &QObject::deleteLater);
-
-    connect(m_worker, &UsbGrabJobWorker::progressed, this, &UsbGrabJob::progressed);
-    connect(m_worker, &UsbGrabJobWorker::scanCompleted, this, &UsbGrabJob::handleWorkerFinished);
-    connect(m_worker, &UsbGrabJobWorker::previewCompleted, this, &UsbGrabJob::previewReady);
+    connect(m_worker, &UsbGrabJobWorker::previewCompleted, this, &UsbGrabPreviewJob::previewReady);
 
     m_thread.start();
 }
 
-UsbGrabJob::~UsbGrabJob()
+UsbGrabPreviewJob::~UsbGrabPreviewJob()
 {
     // Same "never leave real work running in the background after this
     // object is gone" requirement as AudioRecorder's destructor, reached the
     // same way: queue the cancel request rather than touching the worker's
     // members directly from this (GUI) thread. Posted events for one target
     // are delivered in FIFO order, and the worker's scan loop itself pumps
-    // its own event queue between files (see start()'s processEvents() call
-    // above), so this is picked up promptly rather than only after the
-    // entire device has been walked.
+    // its own event queue between files (see the shouldAbort hook above), so
+    // this is picked up promptly rather than only after the entire device has
+    // been walked.
     if (m_worker)
         QMetaObject::invokeMethod(m_worker, "requestCancel", Qt::QueuedConnection);
     m_thread.quit();
     m_thread.wait();
 }
 
-void UsbGrabJob::start(const UsbGrabRule &rule, const QString &mountPath, const QString &destinationVaultPath,
-                        VaultTreeModel *destinationVaultTreeModel)
+void UsbGrabPreviewJob::start(const UsbGrabRule &rule, const QString &mountPath, const QString &destinationVaultPath)
 {
-    m_destinationVaultTreeModel = destinationVaultTreeModel;
-    m_deviceSerial = rule.deviceSerial;
-    m_deviceLabel = rule.deviceLabel;
-
-    QMetaObject::invokeMethod(m_worker, "start", Qt::QueuedConnection, Q_ARG(QString, mountPath),
-                               Q_ARG(QString, rule.startFolder), Q_ARG(QStringList, rule.extensionFilter),
-                               Q_ARG(QString, rule.filenameRegex), Q_ARG(bool, rule.preserveStructure),
-                               Q_ARG(QString, destinationVaultPath), Q_ARG(bool, false));
-}
-
-void UsbGrabJob::startPreview(const UsbGrabRule &rule, const QString &mountPath, const QString &destinationVaultPath)
-{
-    // No history entry is ever written for a preview, so m_destinationVaultTreeModel/
-    // m_deviceSerial/m_deviceLabel (only consulted by handleWorkerFinished(), which
-    // scanCompleted() — not previewCompleted() — triggers) are deliberately left unset.
-    QMetaObject::invokeMethod(m_worker, "start", Qt::QueuedConnection, Q_ARG(QString, mountPath),
-                               Q_ARG(QString, rule.startFolder), Q_ARG(QStringList, rule.extensionFilter),
-                               Q_ARG(QString, rule.filenameRegex), Q_ARG(bool, rule.preserveStructure),
-                               Q_ARG(QString, destinationVaultPath), Q_ARG(bool, true));
-}
-
-void UsbGrabJob::handleWorkerFinished(int filesCopied, int filesSkipped, const QStringList &errors)
-{
-    // Runs on the GUI thread (normal auto-connection from the worker's
-    // cross-thread signal) — safe to call directly into
-    // m_destinationVaultTreeModel here, since that object is GUI-thread-owned
-    // and this handler is too. The worker itself never touches it (see
-    // UsbGrabJob.h's class doc comment).
-    if (m_destinationVaultTreeModel) {
-        QVariantMap entry;
-        entry[QStringLiteral("timestamp")] = QDateTime::currentDateTimeUtc().toString(Qt::ISODate);
-        entry[QStringLiteral("deviceSerial")] = m_deviceSerial;
-        entry[QStringLiteral("deviceLabel")] = m_deviceLabel;
-        entry[QStringLiteral("filesCopied")] = filesCopied;
-        entry[QStringLiteral("filesSkipped")] = filesSkipped;
-        entry[QStringLiteral("errors")] = errors;
-
-        QString appendError;
-        if (!m_destinationVaultTreeModel->appendUsbGrabHistoryEntry(entry, &appendError) && !appendError.isEmpty()) {
-            QStringList combinedErrors = errors;
-            combinedErrors.append(QStringLiteral("Failed to record grab history: %1").arg(appendError));
-            emit finished(filesCopied, filesSkipped, combinedErrors);
-            return;
-        }
-    }
-    emit finished(filesCopied, filesSkipped, errors);
+    QMetaObject::invokeMethod(m_worker, "start", Qt::QueuedConnection, Q_ARG(UsbGrabRule, rule),
+                               Q_ARG(QString, mountPath), Q_ARG(QString, destinationVaultPath));
 }
 
 #include "UsbGrabJob.moc"

@@ -130,7 +130,8 @@ suop_add_test(tst_mainpanel_chapterrefresh LINK_QUICK LINK_SVG ICON_ASSETS LINK_
     LINK_WHISPER LINK_LLAMA LINK_SHERPA_ONNX
     SOURCES IconTheme.cpp Clipboard.cpp TranscriptionController.cpp WhisperCppEngine.cpp VadChunker.cpp
             ModelManager.cpp AudioDecoder.cpp LabelingEngine.cpp DiarizationEngine.cpp
-            EngineManifest.cpp GpuProbe.cpp SubprocessEngine.cpp EngineRegistry.cpp ParakeetEngine.cpp)
+            EngineManifest.cpp GpuProbe.cpp SubprocessEngine.cpp EngineRegistry.cpp ParakeetEngine.cpp
+            UsbGrabJob.cpp UsbRuleStore.cpp)
 # Loads the real MainPanel.qml + a REAL TranscriptionController and drives the
 # queue (fake zero-byte model → fast-fail jobs) to prove busyOrQueuedUrls clears
 # reactively when a job finishes — the per-file action buttons' re-enable. Same
@@ -139,7 +140,8 @@ suop_add_test(tst_mainpanel_buttonstate LINK_QUICK LINK_SVG ICON_ASSETS LINK_GUI
     LINK_WHISPER LINK_LLAMA LINK_SHERPA_ONNX
     SOURCES IconTheme.cpp Clipboard.cpp TranscriptionController.cpp WhisperCppEngine.cpp VadChunker.cpp
             ModelManager.cpp AudioDecoder.cpp LabelingEngine.cpp DiarizationEngine.cpp
-            EngineManifest.cpp GpuProbe.cpp SubprocessEngine.cpp EngineRegistry.cpp ParakeetEngine.cpp)
+            EngineManifest.cpp GpuProbe.cpp SubprocessEngine.cpp EngineRegistry.cpp ParakeetEngine.cpp
+            UsbGrabJob.cpp UsbRuleStore.cpp)
 # Loads the real MainPanel.qml and proves the live transcript follows the tail
 # as content streams in — including a single large (>threshold) growth, the case
 # that regressed. Drives the follow deterministically (no model) plus one real
@@ -149,24 +151,29 @@ suop_add_test(tst_mainpanel_livescroll LINK_QUICK LINK_SVG ICON_ASSETS LINK_GUI
     LINK_WHISPER LINK_LLAMA LINK_SHERPA_ONNX
     SOURCES IconTheme.cpp Clipboard.cpp TranscriptionController.cpp WhisperCppEngine.cpp VadChunker.cpp
             ModelManager.cpp AudioDecoder.cpp LabelingEngine.cpp DiarizationEngine.cpp
-            EngineManifest.cpp GpuProbe.cpp SubprocessEngine.cpp EngineRegistry.cpp ParakeetEngine.cpp)
+            EngineManifest.cpp GpuProbe.cpp SubprocessEngine.cpp EngineRegistry.cpp ParakeetEngine.cpp
+            UsbGrabJob.cpp UsbRuleStore.cpp)
 suop_add_test(tst_mainpanel_deleteundo LINK_QUICK LINK_SVG ICON_ASSETS LINK_GUI
     LINK_WHISPER LINK_LLAMA LINK_SHERPA_ONNX
     SOURCES IconTheme.cpp Clipboard.cpp VaultTreeModel.cpp TranscriptionController.cpp
             WhisperCppEngine.cpp VadChunker.cpp ModelManager.cpp AudioDecoder.cpp
             LabelingEngine.cpp DiarizationEngine.cpp
-            EngineManifest.cpp GpuProbe.cpp SubprocessEngine.cpp EngineRegistry.cpp ParakeetEngine.cpp)
+            EngineManifest.cpp GpuProbe.cpp SubprocessEngine.cpp EngineRegistry.cpp ParakeetEngine.cpp
+            UsbGrabJob.cpp UsbRuleStore.cpp)
 suop_add_test(tst_vaultsearchproxymodel SOURCES VaultTreeModel.cpp VaultSearchProxyModel.cpp)
 suop_add_test(tst_modelmanager SOURCES ModelManager.cpp)
 suop_add_test(tst_transcript_format LINK_WHISPER LINK_LLAMA LINK_SHERPA_ONNX
     SOURCES TranscriptionController.cpp WhisperCppEngine.cpp VadChunker.cpp ModelManager.cpp AudioDecoder.cpp LabelingEngine.cpp DiarizationEngine.cpp
-            EngineManifest.cpp GpuProbe.cpp SubprocessEngine.cpp EngineRegistry.cpp ParakeetEngine.cpp)
+            EngineManifest.cpp GpuProbe.cpp SubprocessEngine.cpp EngineRegistry.cpp ParakeetEngine.cpp
+            UsbGrabJob.cpp UsbRuleStore.cpp)
 suop_add_test(tst_transcription_queue LINK_WHISPER LINK_LLAMA LINK_SHERPA_ONNX
     SOURCES TranscriptionController.cpp WhisperCppEngine.cpp VadChunker.cpp ModelManager.cpp AudioDecoder.cpp LabelingEngine.cpp DiarizationEngine.cpp
-            EngineManifest.cpp GpuProbe.cpp SubprocessEngine.cpp EngineRegistry.cpp ParakeetEngine.cpp)
+            EngineManifest.cpp GpuProbe.cpp SubprocessEngine.cpp EngineRegistry.cpp ParakeetEngine.cpp
+            UsbGrabJob.cpp UsbRuleStore.cpp)
 suop_add_test(tst_filecombine LINK_WHISPER LINK_LLAMA LINK_SHERPA_ONNX
     SOURCES TranscriptionController.cpp WhisperCppEngine.cpp VadChunker.cpp ModelManager.cpp AudioDecoder.cpp LabelingEngine.cpp DiarizationEngine.cpp
-            EngineManifest.cpp GpuProbe.cpp SubprocessEngine.cpp EngineRegistry.cpp ParakeetEngine.cpp)
+            EngineManifest.cpp GpuProbe.cpp SubprocessEngine.cpp EngineRegistry.cpp ParakeetEngine.cpp
+            UsbGrabJob.cpp UsbRuleStore.cpp)
 suop_add_test(tst_engine_contract LINK_WHISPER
     SOURCES WhisperCppEngine.cpp AudioDecoder.cpp)
 suop_add_test(tst_parakeetengine LINK_SHERPA_ONNX SOURCES ParakeetEngine.cpp AudioDecoder.cpp)
@@ -212,11 +219,22 @@ suop_add_test(tst_sidebar_contextmenu LINK_QUICK LINK_SVG ICON_ASSETS SOURCES Va
 suop_add_test(tst_usbdevicemonitor LINK_DBUS SOURCES UsbDeviceMonitor.cpp)
 suop_add_test(tst_usbrulestore SOURCES UsbRuleStore.cpp)
 suop_add_test(tst_usbgrabjob SOURCES UsbGrabJob.cpp UsbRuleStore.cpp VaultTreeModel.cpp)
-suop_add_test(tst_usbgrabbercontroller LINK_DBUS
-    SOURCES UsbGrabberController.cpp UsbDeviceMonitor.cpp UsbRuleStore.cpp UsbGrabJob.cpp VaultTreeModel.cpp)
+# UsbGrabberController now enqueues every grab onto TranscriptionController's
+# task queue (see its class doc comment), so these two drag in the controller
+# and its whole engine dependency chain — the same set the other real-controller
+# tests above link. Not a stub: the queue IS the thing under test here (a grab
+# has to actually become a job), and a stubbed one would only agree with itself.
+suop_add_test(tst_usbgrabbercontroller LINK_DBUS LINK_WHISPER LINK_LLAMA LINK_SHERPA_ONNX
+    SOURCES UsbGrabberController.cpp UsbDeviceMonitor.cpp UsbRuleStore.cpp UsbGrabJob.cpp VaultTreeModel.cpp
+            TranscriptionController.cpp WhisperCppEngine.cpp VadChunker.cpp ModelManager.cpp AudioDecoder.cpp
+            LabelingEngine.cpp DiarizationEngine.cpp EngineManifest.cpp GpuProbe.cpp SubprocessEngine.cpp
+            EngineRegistry.cpp ParakeetEngine.cpp)
 # Loads the real UsbRegexField.qml in a QQuickView — tst_styleguide.cpp keeps
 # the cheap source-scan guard, this one proves the component actually LOADS
 # (a green cmake build doesn't) and that its validity indicator/token buttons
 # behave. See its top-of-file comment.
-suop_add_test(tst_usbregexfield LINK_QUICK LINK_DBUS
-    SOURCES UsbGrabberController.cpp UsbDeviceMonitor.cpp UsbRuleStore.cpp UsbGrabJob.cpp VaultTreeModel.cpp)
+suop_add_test(tst_usbregexfield LINK_QUICK LINK_DBUS LINK_WHISPER LINK_LLAMA LINK_SHERPA_ONNX
+    SOURCES UsbGrabberController.cpp UsbDeviceMonitor.cpp UsbRuleStore.cpp UsbGrabJob.cpp VaultTreeModel.cpp
+            TranscriptionController.cpp WhisperCppEngine.cpp VadChunker.cpp ModelManager.cpp AudioDecoder.cpp
+            LabelingEngine.cpp DiarizationEngine.cpp EngineManifest.cpp GpuProbe.cpp SubprocessEngine.cpp
+            EngineRegistry.cpp ParakeetEngine.cpp)

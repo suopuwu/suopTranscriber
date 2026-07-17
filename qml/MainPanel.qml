@@ -598,8 +598,12 @@ Rectangle {
         const url = mainPanel.currentFileUrl()
         if (String(url) === "")
             return
+        // A 1-element list: these calls are batch-shaped (one rebuild per user
+        // action — see trashFiles()' doc comment), and MainPanel's cluster is
+        // by definition the single-open-file half of the CLAUDE.md action
+        // parity, so its batch is always exactly one.
         mainPanel.handleTrashResult(
-            mainPanel.vaultTreeModel.trashTranscript(url), "transcript",
+            mainPanel.vaultTreeModel.trashTranscript([url]), "transcript",
             qsTr("Moved the transcript for %1 to the trash.").arg(mainPanel.currentFileName()))
     }
 
@@ -613,7 +617,7 @@ Rectangle {
         if (String(url) === "")
             return
         mainPanel.handleTrashResult(
-            mainPanel.vaultTreeModel.trashAudioOnly(url), "audioOnly",
+            mainPanel.vaultTreeModel.trashAudioOnly([url]), "audioOnly",
             qsTr("Moved the audio for %1 to the trash — the transcript is still here.")
                 .arg(mainPanel.currentFileName()))
     }
@@ -635,9 +639,9 @@ Rectangle {
             const url = mainPanel.currentFileUrl()
             if (String(url) !== "") {
                 if (mainPanel.pendingDeleteMode === "transcript")
-                    mainPanel.vaultTreeModel.deleteTranscriptPermanently(url)
+                    mainPanel.vaultTreeModel.deleteTranscriptPermanently([url])
                 else if (mainPanel.pendingDeleteMode === "audioOnly")
-                    mainPanel.vaultTreeModel.deleteAudioOnlyPermanently(url)
+                    mainPanel.vaultTreeModel.deleteAudioOnlyPermanently([url])
                 else
                     mainPanel.vaultTreeModel.deleteFilesPermanently([url])
             }
@@ -5293,6 +5297,19 @@ Rectangle {
             mainPanel.usbGrabberController.requestGrabPreview(serial)
         }
 
+        // Put the preview panel away. Clearing previewDeviceSerial is all it
+        // takes even mid-scan: onGrabPreviewReady discards any result whose
+        // serial no longer matches, so an in-flight walk simply lands nowhere
+        // (it copies nothing and writes nothing — there is no side effect to
+        // undo, only a panel to close). Nothing else re-shows the panel; only
+        // another Preview click does.
+        function dismissPreview() {
+            usbGrabberPage.previewDeviceSerial = ""
+            usbGrabberPage.previewEntries = []
+            usbGrabberPage.previewError = ""
+            usbGrabberPage.previewRunning = false
+        }
+
         // Same three-state palette across color/label/summary — "will grab"
         // reuses the same green the "connected" status label already uses
         // (see deviceCard's mounted Label below), so the preview's meaning
@@ -5429,6 +5446,7 @@ Rectangle {
                 const row = bySerial[serial]
                 const rule = mainPanel.usbGrabberController.ruleForDevice(serial)
                 row.enabled = rule.enabled
+                row.autoGrab = rule.autoGrab
                 row.extensionFilterText = (rule.extensionFilter || []).join(", ")
                 row.filenameRegex = rule.filenameRegex
                 row.preserveStructure = rule.preserveStructure
@@ -5527,6 +5545,27 @@ Rectangle {
                             Layout.fillWidth: true
                             text: qsTr("Any USB device")
                             color: "white"
+                        }
+                        // Auto-grab is strictly narrower than enabled (see
+                        // UsbGrabRule::autoGrab) — meaningless on a device that
+                        // can't be grabbed at all, so it's disabled until the
+                        // rule is on rather than sitting there as a live switch
+                        // that quietly does nothing.
+                        Switch {
+                            id: catchAllAutoGrabSwitch
+                            text: qsTr("Auto-grab")
+                            enabled: usbGrabberPage.catchAllRule.enabled
+                            checked: usbGrabberPage.catchAllRule.autoGrab || false
+                            hoverEnabled: true
+                            onToggled: usbGrabberPage.commitRuleField("*", "", "autoGrab", checked)
+                            HoverHandler { cursorShape: Qt.PointingHandCursor; enabled: catchAllAutoGrabSwitch.enabled }
+                            HoverBorder {
+                                anchors.fill: parent
+                                active: catchAllAutoGrabSwitch.enabled && catchAllAutoGrabSwitch.hovered
+                            }
+                            ToolTip.visible: hovered
+                            ToolTip.delay: 500
+                            ToolTip.text: qsTr("Grab from any matching device as soon as it's plugged in, without asking")
                         }
                         Switch {
                             id: catchAllEnabledSwitch
@@ -5670,6 +5709,28 @@ Rectangle {
                                         : qsTr("connected")
                                 color: deviceCard.modelData.mounted ? "#7ac07a" : "#888888"
                                 font.pixelSize: 11
+                            }
+                            // Strictly narrower than the enable switch beside it
+                            // (see UsbGrabRule::autoGrab) — meaningless on a
+                            // device that can't be grabbed at all, so it's
+                            // disabled until the rule is on rather than sitting
+                            // there as a live switch that quietly does nothing.
+                            Switch {
+                                id: deviceAutoGrabSwitch
+                                text: qsTr("Auto-grab")
+                                enabled: deviceCard.modelData.enabled
+                                checked: deviceCard.modelData.autoGrab || false
+                                hoverEnabled: true
+                                onToggled: usbGrabberPage.commitRuleField(deviceCard.modelData.serial,
+                                    deviceCard.modelData.label, "autoGrab", checked)
+                                HoverHandler { cursorShape: Qt.PointingHandCursor; enabled: deviceAutoGrabSwitch.enabled }
+                                HoverBorder {
+                                    anchors.fill: parent
+                                    active: deviceAutoGrabSwitch.enabled && deviceAutoGrabSwitch.hovered
+                                }
+                                ToolTip.visible: hovered
+                                ToolTip.delay: 500
+                                ToolTip.text: qsTr("Grab from this device as soon as it's plugged in, without asking")
                             }
                             Switch {
                                 id: deviceEnabledSwitch
@@ -5828,6 +5889,48 @@ Rectangle {
                             Layout.fillWidth: true
                             spacing: 4
                             visible: deviceCard.modelData.serial === usbGrabberPage.previewDeviceSerial
+
+                            // Preview header. The dismiss control lives HERE
+                            // rather than inside the results card below so it's
+                            // reachable in every preview state — scanning,
+                            // refused, empty, and results — not only the one
+                            // that happened to find files. Nothing else ever
+                            // takes the panel down (deliberately: it survives
+                            // the 2.5s device poll, see previewDeviceSerial),
+                            // so without this the only way out was previewing a
+                            // different device or leaving the page.
+                            RowLayout {
+                                Layout.fillWidth: true
+                                spacing: 4
+
+                                Label {
+                                    Layout.fillWidth: true
+                                    text: qsTr("Preview")
+                                    color: "#888888"
+                                    font.pixelSize: 11
+                                }
+                                Item {
+                                    id: dismissPreviewButton
+                                    Layout.preferredWidth: 20
+                                    Layout.preferredHeight: 20
+
+                                    HoverHandler {
+                                        id: dismissPreviewHover
+                                        cursorShape: Qt.PointingHandCursor
+                                    }
+                                    TapHandler { onTapped: usbGrabberPage.dismissPreview() }
+                                    HoverBorder { anchors.fill: parent; active: dismissPreviewHover.hovered }
+                                    AppIcon {
+                                        anchors.centerIn: parent
+                                        name: "close"
+                                        iconSize: 13
+                                        color: "#dddddd"
+                                    }
+                                    ToolTip.visible: dismissPreviewHover.hovered
+                                    ToolTip.delay: 500
+                                    ToolTip.text: qsTr("Dismiss preview")
+                                }
+                            }
 
                             Label {
                                 visible: usbGrabberPage.previewRunning

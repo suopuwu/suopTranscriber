@@ -30,7 +30,7 @@ ColumnLayout {
     // usbGrabberPage.commitRuleField()).
     property string pattern: ""
     // Supplies regexValidationError() — the SAME QRegularExpression engine
-    // UsbGrabJob's walk filters with, never QML/JS RegExp (whose syntax isn't
+    // runUsbGrabScan()'s walk filters with, never QML/JS RegExp (whose syntax isn't
     // guaranteed identical, so a JS-valid pattern could still match nothing at
     // grab time). Asserted by tst_styleguide.cpp.
     property UsbGrabberController controller
@@ -100,7 +100,7 @@ ColumnLayout {
         ToolTip.text: validityLabel.validationError
     }
 
-    // An invalid pattern matches NOTHING (UsbGrabJob's filenameRegexMatches()
+    // An invalid pattern matches NOTHING (UsbGrabJob.cpp's filenameRegexMatches()
     // fails closed), so say so where the user is looking rather than letting a
     // preview full of "filtered" be the only clue. Inline banner, per
     // StyleGuide.md — it describes the state of the field beside it.

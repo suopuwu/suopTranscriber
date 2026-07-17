@@ -40,6 +40,75 @@ ApplicationWindow {
     UsbGrabberController {
         id: usbGrabberController
         vaultTreeModel: vaultModel
+        // Grabs are queued tasks on the SAME controller everything else uses,
+        // so they share one queue (and one disk) with transcribes/imports
+        // rather than racing them — see UsbGrabberController's class doc.
+        transcriptionController: transcriptionController
+    }
+
+    // A grab is invisible unless the USB Grabber page happens to be open — and
+    // an AUTO grab is invisible by definition, since the user didn't ask for
+    // it. That's exactly what a snackbar is for ("post only what is otherwise
+    // silent", StyleGuide.md). Cancelled grabs never reach here (the controller
+    // doesn't emit for them — a partial tally isn't a result), and the Tasks
+    // row already tells that story.
+    Connections {
+        target: usbGrabberController
+
+        function onGrabFinished(deviceSerial, filesCopied, filesSkipped, errors, autoTriggered) {
+            if (errors.length > 0) {
+                Notifications.error(qsTr("Grab finished with %n problem(s): %1", "", errors.length)
+                                    .arg(errors.join("; ")))
+                return
+            }
+            // A manual grab that copied nothing is a silent no-op the user is
+            // watching for a result of — worth saying. An auto grab that copied
+            // nothing is the common, boring case every time an already-emptied
+            // device is replugged; announcing it would train the user to ignore
+            // the corner the interesting messages land in.
+            if (filesCopied === 0) {
+                if (!autoTriggered)
+                    Notifications.info(qsTr("Nothing new to grab (%n file(s) already in the vault).", "",
+                                            filesSkipped))
+                return
+            }
+            Notifications.info(autoTriggered
+                               ? qsTr("Auto-grabbed %n new file(s) from USB.", "", filesCopied)
+                               : qsTr("Grabbed %n new file(s).", "", filesCopied))
+        }
+
+        // The auto-combiner. Fires once per auto-grab batch, after the LAST
+        // auto-grab has left the queue (see autoGrabsSettled()) — never
+        // mid-batch, so a recording split across parts that arrive in different
+        // grab jobs is combined as one group rather than half-combined twice.
+        //
+        // Rule-driven like every other combine path (DESIGN.md "Split-recording
+        // combine"): runCombineScan enqueues only groups a user-authored rule
+        // matched AND detectCombineGroups() calls "ready", so a part the
+        // recorder is still writing, an already-transcribed group, or a group
+        // with nothing to merge is left alone by the same logic the manual scan
+        // button uses. With no rules, or the setting off, this does nothing.
+        function onAutoGrabsSettled() {
+            if (!AppSettings.autoCombineAfterGrab || AppSettings.combineRules.length === 0)
+                return
+            // Load-bearing: allAudioPaths() reads the in-memory tree, which is
+            // refreshed by a filesystem WATCHER — asynchronously, and not at
+            // all for subfolders the grab itself just created. Scanning without
+            // this would routinely decide against a tree that predates the
+            // grabbed files and silently find nothing to combine.
+            vaultModel.refresh()
+            const audioPaths = vaultModel.allAudioPaths()
+            const ready = transcriptionController.detectCombineGroups(AppSettings.combineRules, audioPaths)
+                            .filter(g => g.status === "ready")
+            if (ready.length === 0)
+                return
+            transcriptionController.runCombineScan(AppSettings.combineRules, audioPaths, vaultModel.vaultPath,
+                                                    AppSettings.deleteOriginalsAfterCombine)
+            // Announced because it's the one combine the user didn't click: a
+            // merge that moves their original parts into .combined/ must never
+            // just happen with no account of itself.
+            Notifications.info(qsTr("Auto-combining %n recording group(s) after grab.", "", ready.length))
+        }
     }
 
     // Bug report (2026-07-09): closing the window must never leave a

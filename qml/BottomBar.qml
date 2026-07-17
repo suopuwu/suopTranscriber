@@ -264,8 +264,8 @@ Item {
         }
         return count
     }
-    // Shared with the Tasks popup's per-row kind badge below — same five
-    // "kind" values (see TranscriptionController::jobs()' doc comment).
+    // Shared with the Tasks popup's per-row kind badge below — one case per
+    // "kind" value (see TranscriptionController::jobKind()).
     function kindLabel(kind) {
         switch (kind) {
         case "relabel": return qsTr("Label")
@@ -276,6 +276,7 @@ Item {
         case "combine": return qsTr("Combine")
         case "diarize": return qsTr("Detect speakers")
         case "import": return qsTr("Import")
+        case "usbGrab": return qsTr("USB grab")
         default: return qsTr("Transcribe")
         }
     }
@@ -295,6 +296,7 @@ Item {
         case "combining": return qsTr("combining…")
         case "chaptering": return qsTr("chaptering…")
         case "importing": return qsTr("importing…")
+        case "grabbing": return qsTr("grabbing…")
         default: return ""
         }
     }

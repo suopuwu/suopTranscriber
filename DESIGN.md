@@ -374,13 +374,29 @@ the overview, not a duplicate of it.
   group, and it ignored the configured `deleteOriginalsAfterCombine`. The
   source-scan guard `sidebar_combineIsRuleDrivenOnly` in `tst_styleguide.cpp`
   keeps it from coming back.
-- **Never automatic.** Both entry points are user-initiated. Silently merging
-  on every file-add is a surprise a recorder shouldn't spring on the user.
-  The one exception is `maybeRedirectForCombine()`, a safety net at the top of
-  `startJob()`: transcribing a file that is a member of a currently-"ready"
-  group inserts the combine ahead of it and retargets the job at the merged
-  output, so a part that appeared after the user's last scan can't get
-  transcribed alone.
+- **Never automatic on a file-add.** Silently merging every time a new part
+  lands is a surprise a recorder shouldn't spring on the user — combine used to
+  fire on every vault-tree rebuild and was removed for exactly that (it merged
+  files out from under people watching a vault fill up mid-recording). Both
+  entry points above stay user-initiated. Two narrow exceptions:
+  - `maybeRedirectForCombine()`, a safety net at the top of `startJob()`:
+    transcribing a file that is a member of a currently-"ready" group inserts
+    the combine ahead of it and retargets the job at the merged output, so a
+    part that appeared after the user's last scan can't get transcribed alone.
+  - **The auto-combiner** (`AppSettings.autoCombineAfterGrab`, default off):
+    when a batch of USB **auto-grabs** finishes, `Main.qml` runs the ordinary
+    `runCombineScan()` over the vault. This is not the old behavior returning:
+    it's opt-in, and it fires on ONE discrete event — a device the user chose to
+    auto-grab has just finished offloading, which is the moment a split
+    recording is complete and combining it is what they'd do by hand anyway —
+    rather than on every filesystem change. It waits for the LAST auto-grab to
+    leave the queue (`UsbGrabberController::autoGrabsSettled()`), so a recording
+    whose parts arrive across several grab jobs is combined once, as one group,
+    not half-combined twice. Still rule-driven and still "ready"-gated like
+    every other combine, and it posts a snackbar — a merge that moves the
+    user's originals into `.combined/` must never happen with no account of
+    itself. A manual "Grab now" does NOT trigger it (the user is right there and
+    can click combine); neither does a drag-and-drop import.
 - **Grouping identity = captured text + containing folder.** Rules match with
   QRegularExpression *search* semantics against the bare filename; the
   concatenated capture groups form the group key. Uncaptured wildcard spans
@@ -410,6 +426,14 @@ the overview, not a duplicate of it.
   `deleteOriginalsAfterCombine`) so the next scan doesn't re-detect the group.
   A combine never also queues a transcribe — the merged file just becomes a
   normal untranscribed vault entry.
+- **The merged file inherits the first part's mtime**, rather than taking the
+  time of the merge. It stands in for the original recording, and mtime is what
+  this app treats as when a recording happened (it's the default group ordering
+  signal above, for the same "birth time doesn't survive a copy" reason), so
+  combining a week-old recording today must not make it look like today's.
+  "First" means first in *combine order*, not oldest on disk — the two differ
+  whenever a rule designates a sort differentiator. The restamp happens after
+  ffmpeg exits, since writing the file stamps mtime as now.
 - **`detectCombineGroups()` is pure** over its inputs (disk access limited to
   `QFileInfo` stats on the paths passed in), so the same entry point backs both
   the Settings "test this rule" preview and the real enqueue decisions.
@@ -435,11 +459,26 @@ the overview, not a duplicate of it.
   which is all the gate below ever offers it.
 - **Mount gate = an enabled rule, nothing else.** `UsbGrabberController` mounts a
   volume only if `resolveEffectiveRule().enabled` — the device's own rule or the `"*"`
-  catch-all — which is the same predicate the grab uses, so the app mounts precisely
-  what it would grab from. Deliberately NOT a setting of its own (off by default, it
+  catch-all — so the app mounts precisely what it is willing to grab from.
+  Deliberately NOT a setting of its own (off by default, it
   would leave the out-of-box experience exactly as broken) and deliberately not
   unconditional (that makes a transcription app into a general-purpose automounter for
-  every photo SD card the user owns). Known cost: an unconfigured device with no
+  every photo SD card the user owns). Note the mount gate is `enabled`, NOT
+  `autoGrab` (below): mounting is what makes a device addressable at all —
+  previewable, configurable, grabbable by hand — so a device the user has
+  vouched for should mount whether or not they also asked for hands-off
+  grabbing. `autoGrab` decides what happens *after* the mount, not whether it
+  happens.
+- **Two gates, not one: `enabled` then `autoGrab`.** `enabled` says a device is
+  grabbable at all; `autoGrab` (per-rule, default **off**) says a hotplug may
+  fire the grab *by itself*, with no click. An enabled-but-not-autoGrab device
+  still mounts, still lists, still previews, and still grabs from "Grab now" —
+  it just waits to be asked. Per-device rather than one global toggle because
+  the two devices a user owns want opposite answers: the recorder they plug in
+  to offload should just do it; the photo SD card that happens to match the
+  catch-all shouldn't start copying on its own. Default off because auto-grab is
+  the surprising behavior — which does mean an already-`enabled` rule stops
+  auto-grabbing until its owner opts in, a deliberate one-time narrowing. Known cost: an unconfigured device with no
   catch-all never mounts, so it never reaches the settings list to be configured —
   mount it once by hand to set it up. If that friction bites, widen what the device
   list shows (unmounted identity is already available), not what the app mounts.
@@ -509,16 +548,43 @@ the overview, not a duplicate of it.
     sharing one definition with the combine rules' check via `RegexValidation.h`)
     rather than JS `RegExp` — the syntaxes aren't guaranteed identical, so a
     JS-valid pattern could still match nothing at grab time.
-- **Grab (`UsbGrabJob`/`UsbGrabJobWorker`, `src/core/UsbGrabJob.h/.cpp`):** runs on
-  its own worker thread (same QThread+moveToThread shape as `AudioRecorder`), never
-  the GUI thread — recursively walks the device, diffs against files already in the
-  destination folder by **rsync's quick-check: filename + size + mtime**, and copies
-  only files that are both filter-matching and not already present (never silently
-  overwrites a same-named-but-different file — appends a numeric suffix instead).
+- **Grab (`runUsbGrabScan()`, `src/core/UsbGrabJob.h/.cpp`):** recursively walks
+  the device, diffs against files already in the destination folder by **rsync's
+  quick-check: filename + size + mtime**, and copies only files that are both
+  filter-matching and not already present (never silently overwrites a
+  same-named-but-different file — appends a numeric suffix instead). A plain
+  synchronous function over its inputs that knows nothing about threads, the
+  queue, or history entries — it walks, it copies, it returns what happened.
   Triggered either manually (`UsbGrabberController::triggerManualGrab()`) or
-  automatically on hotplug when a device's own rule (or the catch-all) is enabled
-  and a vault is open — auto-grabs always target whichever vault is open at that
-  moment, never a pinned path.
+  automatically on hotplug when the two gates above both pass and a vault is
+  open — auto-grabs always target whichever vault is open at that moment, never
+  a pinned path.
+- **A grab is a queued task, not its own thread.** `UsbGrabberController::
+  startGrabJob()` hands the resolved rule to `TranscriptionController::
+  enqueueUsbGrab()`, so a grab is an ordinary `"usbGrab"` job in the ONE task
+  queue alongside transcribe/import/combine, and inherits that queue's Tasks
+  row, progress glow, and pause/cancel with no bespoke plumbing (`
+  TranscriptionWorker::usbGrabJob()` just wires `runUsbGrabScan`'s hooks to the
+  worker's phase/progress/pause/cancel contract; pause/cancel land at a file
+  boundary, since `QFile::copy()` is uninterruptible). This replaced a
+  dedicated QThread per grab. The cost, accepted: a hotplug grab that lands
+  mid-transcription waits its turn instead of starting immediately — which also
+  means it can't fight the transcription for the same disk. Grab jobs are
+  **never persisted** across a restart (`persistQueue()` skips them), for a
+  stronger version of the reason import jobs aren't: the mount path names
+  removable media that is likely gone next session, and a reused mount point
+  would make a restored job walk a *different* device. Replugging re-fires the
+  auto-grab; that's the resume.
+  - The **preview** stays on its own thread (`UsbGrabPreviewJob`) rather than
+    joining the queue: it's an interactive answer to "what would this rule do?"
+    wanted immediately while editing a rule, and it writes nothing — queueing it
+    behind a running transcription would make the rule editor unusable.
+  - The **history entry** is written by `UsbGrabberController` on the GUI thread
+    when the job reports back (`TranscriptionController::usbGrabFinished`),
+    never by the worker (`VaultTreeModel` is GUI-thread-owned). A **cancelled**
+    grab writes no history entry and posts no snackbar: its counts are a partial
+    tally, and reporting "grabbed 3 files" for a run the user stopped would
+    misstate what happened — the Tasks row already tells that story.
   - **Why not a content hash** (it was one, until it wasn't): hashing is O(bytes on
     the device), and it's slowest in exactly the case it's asked about most — a
     device whose files are *already* grabbed, where every candidate is byte-identical
@@ -533,8 +599,28 @@ the overview, not a duplicate of it.
     stamp no grabbed file would ever match its source again and every grab would
     re-copy the whole device under `_1`/`_2`/… suffixes. The quick-check is only
     sound because of this.
+  - **The copy must verify its own size** — `QFile::copy()`'s return value is not
+    trustworthy on removable media. Verified against Qt 6.11: when the source stops
+    delivering bytes partway (a recorder unplugged mid-grab) it returns **true**,
+    having written a *truncated* file. Unchecked, that file lands in the vault
+    wearing a recording's name — the tree lists it, it plays, it transcribes into
+    garbage — and the run reports a clean success with it counted in `filesCopied`.
+    So `copyGrabbedFile()` compares what landed against the stat the walk already
+    took and, on a mismatch, deletes it and reports an ordinary per-file error
+    (non-fatal: the rest of the device still grabs). It rejects any *mismatch*
+    rather than only a short file, so a source still being written on the device is
+    caught too — half a recording is worth less than a re-grab that gets it whole,
+    and the next grab does exactly that.
+    - **Why no temp-file staging of our own:** Qt copies through an unnamed
+      `O_TMPFILE` inode and `linkat()`s it into place at the end, so a copy that
+      never finishes at all (crash, power loss) leaves the destination untouched —
+      verified by `SIGKILL`ing a 3 GB copy mid-flight and finding an empty
+      destination folder. Hand-rolled `.partial` staging would only trade that for
+      litter of our own to clean up. The size check is the part Qt doesn't do.
 - **Preview:** `UsbGrabberController::requestGrabPreview()` runs the identical
-  scan/filter/quick-check logic in a dry-run mode (`UsbGrabJob::startPreview()`) —
+  scan/filter/quick-check logic in a dry-run mode (`runUsbGrabScan(dryRun=true)`,
+  driven off the GUI thread by `UsbGrabPreviewJob`) — literally the same function
+  a real grab runs, so the preview cannot drift from what the grab would do —
   no copying, no history entry — and returns a line-by-line classification of
   every file the scan sees: `"grab"` (would be copied), `"duplicate"` (matches the
   filters but a file with the same name, size and mtime is already present at the

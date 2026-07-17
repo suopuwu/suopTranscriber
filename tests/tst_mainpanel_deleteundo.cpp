@@ -270,7 +270,7 @@ private slots:
 
         m_player->setSource(QUrl::fromLocalFile(m_audioPath));
 
-        const QVariantMap result = m_model->trashAudioOnly(QUrl::fromLocalFile(m_audioPath));
+        const QVariantMap result = m_model->trashAudioOnly({ QUrl::fromLocalFile(m_audioPath) });
         QCOMPARE(result.value(QStringLiteral("trashed")).toInt(), 1);
         // Precondition, not the assertion: the delete half already worked, and if
         // it ever stops, the undo half below would pass for the wrong reason.
@@ -294,7 +294,7 @@ private slots:
         m_player->setSource(QUrl::fromLocalFile(m_audioPath));
         QTRY_VERIFY(m_panel->property("hasStoredMetadata").toBool());
 
-        const QVariantMap result = m_model->trashTranscript(QUrl::fromLocalFile(m_audioPath));
+        const QVariantMap result = m_model->trashTranscript({ QUrl::fromLocalFile(m_audioPath) });
         QCOMPARE(result.value(QStringLiteral("trashed")).toInt(), 1);
         QTRY_VERIFY2(!m_panel->property("hasStoredMetadata").toBool(),
                      "precondition: deleting the transcript must revert the panel to untranscribed");
@@ -438,7 +438,7 @@ private slots:
 
         m_player->setSource(QUrl::fromLocalFile(m_audioPath));
 
-        const QVariantMap result = m_model->trashAudioOnly(QUrl::fromLocalFile(otherAudio));
+        const QVariantMap result = m_model->trashAudioOnly({ QUrl::fromLocalFile(otherAudio) });
         QCOMPARE(result.value(QStringLiteral("trashed")).toInt(), 1);
         QCOMPARE(m_model->restoreFromTrash(result.value(QStringLiteral("restorable")).toList()), 1);
 

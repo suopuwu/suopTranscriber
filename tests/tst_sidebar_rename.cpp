@@ -843,13 +843,19 @@ private slots:
         clickAt(&view, nameTextPoint(itemB), Qt::ControlModifier);
         QCOMPARE(sidebarItem->property("selectedPaths").toStringList().size(), 2);
 
-        // Right-clicking a selected row targets the whole selection. Deleting no
-        // longer STAGES the paths for a confirm — it trashes them immediately
-        // (recoverable, Undo offered in a snackbar), and only stages the ones
-        // the trash refuses. Everything trashes here, so the delete is done the
-        // moment this returns and pendingDeletePaths stays empty.
-        QMetaObject::invokeMethod(sidebarItem, "beginDeleteFile",
-                                   Q_ARG(QVariant, vault.filePath(QStringLiteral("a.mp3"))));
+        // Right-clicking a selected row targets the whole selection. The
+        // widening lives at the call site now (selectionPathsFor) rather than
+        // inside beginDeleteFile, so this replicates exactly what the context
+        // menu's ctxDeleteFileRow does. Deleting no longer STAGES the paths for
+        // a confirm — it trashes them immediately (recoverable, Undo offered in
+        // a snackbar), and only stages the ones the trash refuses. Everything
+        // trashes here, so the delete is done the moment this returns and
+        // pendingDeletePaths stays empty.
+        QVariant fileTargets;
+        QMetaObject::invokeMethod(sidebarItem, "selectionPathsFor", Q_RETURN_ARG(QVariant, fileTargets),
+                                   Q_ARG(QVariant, vault.filePath(QStringLiteral("a.mp3"))),
+                                   Q_ARG(QVariant, false));
+        QMetaObject::invokeMethod(sidebarItem, "beginDeleteFile", Q_ARG(QVariant, fileTargets));
         QTest::qWait(150);
         QVERIFY2(sidebarItem->property("pendingDeletePaths").toStringList().isEmpty(),
                  "a delete that trashed cleanly must not stage anything for confirmation");
@@ -1129,16 +1135,21 @@ private slots:
         QCOMPARE(delLabel->property("text").toString(), QStringLiteral("Delete file"));
     }
 
-    // "Delete transcript" is single-target even when several rows are selected
-    // — it's offered only for the one right-clicked transcribed audio row, and
-    // must never be widened into the multi-select delete beside it.
-    void confirmTranscriptDelete_isSingleTargetAndKeepsAudio()
+    // "Delete transcript" widens to the whole selection when the right-clicked
+    // row is part of one — same selectionPathsFor() rule "Delete file" uses,
+    // and the same batch call. (This reverses an earlier single-target-only
+    // design: now that the C++ takes batches and the ribbon has a bulk
+    // delete-transcript button, the context menu widens for consistency, and
+    // its label reads "Delete N transcripts" so the count is never silent.)
+    // Every selected transcript goes; every selected AUDIO stays.
+    void confirmTranscriptDelete_widensToSelectionAndKeepsAudio()
     {
         QTemporaryDir vault;
         QVERIFY(vault.isValid());
         QVERIFY(touch(vault.filePath(QStringLiteral("a.mp3"))));
         QVERIFY(touch(vault.filePath(QStringLiteral("a.mp3.md")), "---\nmodel: x\n---\n[0] hi\n"));
         QVERIFY(touch(vault.filePath(QStringLiteral("b.mp3"))));
+        QVERIFY(touch(vault.filePath(QStringLiteral("b.mp3.md")), "---\nmodel: x\n---\n[0] yo\n"));
 
         QQuickView view;
         QQuickItem *sidebarItem = nullptr;
@@ -1154,18 +1165,21 @@ private slots:
         clickAt(&view, nameTextPoint(rowItem(treeItem, rowB)), Qt::ControlModifier);
         QCOMPARE(sidebarItem->property("selectedPaths").toStringList().size(), 2);
 
-        // Single-target even though two rows are selected — and, as above,
-        // trashed immediately rather than staged for a confirm.
-        QMetaObject::invokeMethod(sidebarItem, "beginDeleteTranscript",
-                                   Q_ARG(QVariant, vault.filePath(QStringLiteral("a.mp3"))));
+        // Right-clicking a selected row widens through selectionPathsFor, same
+        // as ctxDeleteTranscriptRow does — trashed immediately, not staged.
+        QVariant transcriptTargets;
+        QMetaObject::invokeMethod(sidebarItem, "selectionPathsFor", Q_RETURN_ARG(QVariant, transcriptTargets),
+                                   Q_ARG(QVariant, vault.filePath(QStringLiteral("a.mp3"))),
+                                   Q_ARG(QVariant, false));
+        QMetaObject::invokeMethod(sidebarItem, "beginDeleteTranscript", Q_ARG(QVariant, transcriptTargets));
         QTest::qWait(150);
 
         QVERIFY2(!QFileInfo::exists(vault.filePath(QStringLiteral("a.mp3.md"))),
-                 "the transcript must be deleted");
+                 "every selected transcript must be deleted");
+        QVERIFY2(!QFileInfo::exists(vault.filePath(QStringLiteral("b.mp3.md"))),
+                 "\"Delete transcript\" widens to the whole selection, like \"Delete file\"");
         QVERIFY2(QFileInfo::exists(vault.filePath(QStringLiteral("a.mp3"))),
-                 "the audio file must be kept");
-        // The OTHER selected file is untouched — "Delete transcript" never
-        // widens to the selection the way "Delete file" does.
+                 "every selected audio file must be kept");
         QVERIFY(QFileInfo::exists(vault.filePath(QStringLiteral("b.mp3"))));
     }
 
@@ -1185,8 +1199,13 @@ private slots:
         QTRY_VERIFY(treeItem->property("rows").toInt() > 0);
         expandEverything(treeItem);
 
-        QMetaObject::invokeMethod(sidebarItem, "beginDeleteFile",
-                                   Q_ARG(QVariant, vault.filePath(QStringLiteral("a.mp3"))));
+        // No selection, so selectionPathsFor returns just this one row — the
+        // batch is a single element. Same call site the context menu uses.
+        QVariant oneTarget;
+        QMetaObject::invokeMethod(sidebarItem, "selectionPathsFor", Q_RETURN_ARG(QVariant, oneTarget),
+                                   Q_ARG(QVariant, vault.filePath(QStringLiteral("a.mp3"))),
+                                   Q_ARG(QVariant, false));
+        QMetaObject::invokeMethod(sidebarItem, "beginDeleteFile", Q_ARG(QVariant, oneTarget));
         QTest::qWait(150);
 
         QVERIFY(!QFileInfo::exists(vault.filePath(QStringLiteral("a.mp3"))));
@@ -1221,8 +1240,11 @@ private slots:
         QVERIFY(queue);
         QCOMPARE(queue->property("count").toInt(), 0);
 
-        QMetaObject::invokeMethod(sidebarItem, "beginDeleteFile",
-                                   Q_ARG(QVariant, vault.filePath(QStringLiteral("gone.mp3"))));
+        QVariant goneTarget;
+        QMetaObject::invokeMethod(sidebarItem, "selectionPathsFor", Q_RETURN_ARG(QVariant, goneTarget),
+                                   Q_ARG(QVariant, vault.filePath(QStringLiteral("gone.mp3"))),
+                                   Q_ARG(QVariant, false));
+        QMetaObject::invokeMethod(sidebarItem, "beginDeleteFile", Q_ARG(QVariant, goneTarget));
         QTest::qWait(150);
 
         // Gone, with its sidecar...

@@ -36,6 +36,11 @@ public:
         TagsRole,
         SpeakersRole,
         TranscriptBodyRole,
+        // See setPendingCombines(). True only for the synthetic in-progress row
+        // standing in for a combine that hasn't produced its file yet;
+        // CombineSourceCountRole is how many parts it will merge.
+        IsCombinePlaceholderRole,
+        CombineSourceCountRole,
     };
     Q_ENUM(Roles)
 
@@ -191,17 +196,20 @@ public:
     // Irreversible counterpart to trashFolder(), same confirm-first flow.
     Q_INVOKABLE bool deleteFolderPermanently(const QUrl &folderUrl);
 
-    // Item 2 (delete transcript): trashes an audio file's sibling transcript —
+    // Item 2 (delete transcript): trashes each audio file's sibling transcript —
     // the <fileName>.md sidecar plus, if present, its .<fileName>.partial.jsonl
-    // resume-state file — reverting the audio to "untranscribed" (yellow) while
-    // KEEPING the audio itself. When fileUrl names an orphaned .md directly,
-    // that .md IS the transcript, so it's the thing removed. Same result map as
-    // trashFiles(); a no-op with trashed == 0 if there's no sidecar .md.
-    // rebuild()s + emits transcriptDeleted(fileUrl) when something was trashed.
-    Q_INVOKABLE QVariantMap trashTranscript(const QUrl &fileUrl);
+    // resume-state file — reverting that audio to "untranscribed" (yellow) while
+    // KEEPING the audio itself. When a url names an orphaned .md directly,
+    // that .md IS the transcript, so it's the thing removed. Same result map and
+    // same single-rebuild-per-batch discipline as trashFiles(); a url with no
+    // sidecar .md contributes nothing rather than failing (a no-op, not an
+    // error). Emits transcriptDeleted() once per transcript actually trashed,
+    // after the rebuild.
+    Q_INVOKABLE QVariantMap trashTranscript(const QList<QUrl> &urls);
 
-    // Irreversible counterpart to trashTranscript(), same confirm-first flow.
-    Q_INVOKABLE bool deleteTranscriptPermanently(const QUrl &fileUrl);
+    // Irreversible counterpart to trashTranscript(), same confirm-first flow;
+    // returns how many transcripts were removed.
+    Q_INVOKABLE int deleteTranscriptPermanently(const QList<QUrl> &urls);
 
     // The exact complement of trashTranscript(): trashes an audio file but
     // DELIBERATELY LEAVES its <fileName>.md behind, where trashFiles() would
@@ -214,14 +222,17 @@ public:
     // transcribing THIS audio and means nothing once the audio is gone — the
     // .md is the durable artifact, the partial is scaffolding.
     //
-    // fileUrl must name an audio file: on an orphaned .md "delete the audio,
+    // Every url must name an audio file: on an orphaned .md "delete the audio,
     // keep the transcript" has no referent, so that's Invalid rather than a
-    // silent no-op. Same result map as trashFiles(); rebuild()s + emits
-    // fileDeleted(fileUrl) when the audio was trashed.
-    Q_INVOKABLE QVariantMap trashAudioOnly(const QUrl &fileUrl);
+    // silent no-op. Same result map and same single-rebuild-per-batch discipline
+    // as trashFiles(); emits one signal per audio actually trashed, after the
+    // rebuild — audioDeletedTranscriptKept or fileDeleted per entry, whichever
+    // that entry earned (see emitAudioOnlyDeleted()).
+    Q_INVOKABLE QVariantMap trashAudioOnly(const QList<QUrl> &urls);
 
-    // Irreversible counterpart to trashAudioOnly(), same confirm-first flow.
-    Q_INVOKABLE bool deleteAudioOnlyPermanently(const QUrl &fileUrl);
+    // Irreversible counterpart to trashAudioOnly(), same confirm-first flow;
+    // returns how many audio files were removed.
+    Q_INVOKABLE int deleteAudioOnlyPermanently(const QList<QUrl> &urls);
 
     // Undo: moves each {"trashPath","originalPath"} entry back where it came
     // from. Takes "restorable" from any trash* result
@@ -368,6 +379,60 @@ public:
     // file that's since been deleted/renamed, or one outside the vault).
     Q_INVOKABLE void refreshFile(const QUrl &fileUrl);
 
+    // Combine placeholders: the tree's view of combines that are queued or
+    // running but haven't landed on disk yet. `pending` is one entry per such
+    // combine — {"outputPath": string, "sources": [string]} — and Sidebar.qml
+    // rebuilds it from TranscriptionController's `jobs` list (kind "combine",
+    // status queued/active) whenever the queue changes.
+    //
+    // Why the tree needs to know at all: a combine job concatenates its sources
+    // into outputPath and only THEN moves them into a sibling .combined/, so
+    // for the whole run — which is queued behind other work and then takes as
+    // long as ffmpeg takes — the vault still holds every source and no merged
+    // file. Scanning the filesystem honestly therefore shows the merge not
+    // having happened right up until it has, with no sign anything is underway.
+    //
+    // So for each pending entry rebuild()/scanDirectory():
+    //   - omit every path in "sources" (they are spoken for);
+    //   - omit outputPath's own real file if it exists — ffmpeg creates the
+    //     output up front and grows it, and a half-written file must not show
+    //     up as ordinary, playable, transcribable audio;
+    //   - add ONE placeholder node at outputPath in its place.
+    //
+    // The placeholder is deliberately not a file row: isAudio/isOrphanedMd/
+    // isDir are all false, which is what keeps it out of allAudioPaths(),
+    // searchResults(), and Sidebar's own note walks without any of them
+    // needing to know it exists. It carries outputPath so a caller can match
+    // it to the job driving it, but renders as anonymous progress (see
+    // Sidebar's combinePlaceholderDelegate) — it names no file because no file
+    // is there to name yet.
+    //
+    // Entries retire by dropping out of `pending`: the job finishes, the queue
+    // changes, Sidebar pushes the smaller list, and the rebuild shows whatever
+    // the filesystem now really holds — the merged file on success, the
+    // untouched sources on failure or cancel. Nothing here has to know which
+    // of those happened.
+    //
+    // rebuild()s only when the set actually changes, since queueChanged fires
+    // on every queue transition and a rebuild is a full recursive rescan.
+    Q_INVOKABLE void setPendingCombines(const QVariantList &pending);
+
+    // Re-read the whole vault tree from disk NOW, instead of waiting for
+    // QFileSystemWatcher::directoryChanged to get around to it. The heavy
+    // counterpart to refreshFile() above: a full rescan + model reset, so this
+    // is for callers who must not act on a stale tree, not for routine
+    // refreshes (the watcher already handles those).
+    //
+    // Exists for the auto-combine after a USB grab (see Main.qml's
+    // onAutoGrabsSettled). The grab's files are written from a worker thread
+    // and the watcher's notification is asynchronous, so a combine scan run the
+    // instant the grab reports done would be deciding against a tree that
+    // predates the very files it exists to consider — and would silently find
+    // nothing to combine. Worse, a grab with preserveStructure creates
+    // subfolders that were not being watched at all when it started, so no
+    // notification for their contents is coming until something rebuilds.
+    Q_INVOKABLE void refresh() { rebuild(); }
+
 signals:
     void vaultPathChanged();
     // Item 2 (delete): a transcript (.md sidecar) was removed by
@@ -424,12 +489,35 @@ private:
         bool isDir = false;
         bool isAudio = false;
         bool isOrphanedMd = false;
+        // See setPendingCombines(). A placeholder is none of the three flags
+        // above — that's what keeps every existing "is this a note?" walk
+        // ignoring it for free.
+        bool isCombinePlaceholder = false;
+        int combineSourceCount = 0;
         Status status = NoneStatus;
         Node *parent = nullptr;
         std::vector<std::unique_ptr<Node>> children;
     };
 
+    // One queued/active combine, as setPendingCombines() was given it.
+    struct PendingCombine {
+        QString outputPath;
+        QStringList sources;
+        bool operator==(const PendingCombine &o) const
+        {
+            return outputPath == o.outputPath && sources == o.sources;
+        }
+    };
+
     void rebuild();
+
+    // Is this scanned file spoken for by a pending combine — one of its sources,
+    // or the half-written output itself? Such a path is omitted from the tree in
+    // favour of the placeholder. See setPendingCombines().
+    bool isHiddenByPendingCombine(const QString &path) const;
+    // Appends a placeholder child to `parent` for every pending combine whose
+    // output lands directly in `dirPath`.
+    void appendCombinePlaceholders(Node *parent, const QString &dirPath) const;
 
     // What became of one entry in a batch. Untrashable is emphatically NOT a
     // failure: the entry is still on disk, untouched, and is exactly what the
@@ -453,11 +541,29 @@ private:
 
     // The guards + trash of ONE entry (file or folder), WITHOUT the rebuild()/
     // fileDeleted() that must happen once for a whole batch — shared by
-    // trashFiles()/trashFolder()/trashTranscript(). Appends a {trashPath, originalPath}
+    // trashFiles()/trashFolder(). Appends a {trashPath, originalPath}
     // map to *restorable for every path it actually trashed, sidecars included.
     TrashOutcome trashEntry(const QUrl &url, EntryKind kind, QVariantList *restorable);
     // Irreversible counterpart, same guards and same sidecar set.
     bool removeEntryPermanently(const QUrl &url, EntryKind kind);
+
+    // The per-entry halves of trashTranscript()/trashAudioOnly(), split out for
+    // the same reason trashEntry() is: the batch call owns the single rebuild()
+    // and the post-rebuild signals, so these must do neither. A no-op entry
+    // (audio with no .md to remove) reports Trashed == false with an empty
+    // *restorable rather than Untrashable — there was nothing to refuse.
+    TrashOutcome trashTranscriptEntry(const QUrl &fileUrl, QVariantList *restorable);
+    // *mdPathOut carries the .md path back for the caller's post-rebuild
+    // emitAudioOnlyDeleted(): whether the transcript survived decides which
+    // signal the entry earns, and the path must be resolved before the audio
+    // moves (see trashEntry()'s lazy-stat comment).
+    TrashOutcome trashAudioOnlyEntry(const QUrl &fileUrl, QVariantList *restorable,
+                                      QString *mdPathOut);
+
+    // The one result-map shape every trash* call returns — see trashFiles()'s
+    // doc comment for what each key means.
+    static QVariantMap makeTrashResult(int trashed, const QVariantList &restorable,
+                                        const QVariantList &untrashable, const QVariantList &invalid);
     // Shared guard set for both of the above: inside the vault, never the vault
     // root itself. Returns the resolved local path, or empty if refused.
     QString guardedLocalPath(const QUrl &url, EntryKind kind) const;
@@ -540,6 +646,14 @@ private:
     QUrl m_vaultPath;
     std::unique_ptr<Node> m_root;
     QFileSystemWatcher m_watcher;
+    // See setPendingCombines(). Kept as the given list (rather than only the
+    // derived lookups) so a push can be compared against the last one and skip
+    // the rebuild when nothing actually changed.
+    QList<PendingCombine> m_pendingCombines;
+    // Every path m_pendingCombines hides — the union of their sources plus each
+    // outputPath. Derived once per push; isHiddenByPendingCombine() is called
+    // per scanned file, so it must not walk the list.
+    QSet<QString> m_pendingCombineHidden;
     // Item P12: keyed by sidecar .md path — see transcriptBody()'s doc
     // comment. mutable so transcriptBody() can stay callable from data()
     // const.

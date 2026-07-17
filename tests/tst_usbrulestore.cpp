@@ -47,6 +47,10 @@ private slots:
         const UsbGrabRule rule = store.ruleForSerial(QStringLiteral("NEVER-SEEN-SERIAL"));
         QCOMPARE(rule.deviceSerial, QStringLiteral("NEVER-SEEN-SERIAL"));
         QCOMPARE(rule.enabled, false);
+        // Load-bearing default, not incidental: an unconfigured device (or one
+        // swept up by an enabled "*" catch-all) must never start copying itself
+        // into the vault on plug-in. Auto-grab is opted into per device.
+        QCOMPARE(rule.autoGrab, false);
         QCOMPARE(rule.preserveStructure, true);
         QVERIFY(rule.extensionFilter.isEmpty());
         QVERIFY(rule.startFolder.isEmpty());
@@ -59,6 +63,7 @@ private slots:
         UsbGrabRule rule;
         rule.deviceSerial = QStringLiteral("ABC123");
         rule.enabled = true;
+        rule.autoGrab = true;
         rule.extensionFilter = {QStringLiteral("wav"), QStringLiteral("mp3")};
         // Backslashes and quantifiers must survive QSettings' own escaping
         // intact — a pattern that came back mangled would silently filter
@@ -73,6 +78,7 @@ private slots:
         const UsbGrabRule loaded = store.ruleForSerial(QStringLiteral("ABC123"));
         QCOMPARE(loaded.deviceSerial, rule.deviceSerial);
         QCOMPARE(loaded.enabled, rule.enabled);
+        QCOMPARE(loaded.autoGrab, rule.autoGrab);
         QCOMPARE(loaded.extensionFilter, rule.extensionFilter);
         QCOMPARE(loaded.filenameRegex, rule.filenameRegex);
         QCOMPARE(loaded.preserveStructure, rule.preserveStructure);

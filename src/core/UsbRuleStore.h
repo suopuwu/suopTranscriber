@@ -1,6 +1,7 @@
 #pragma once
 
 #include <QList>
+#include <QMetaType>
 #include <QString>
 #include <QStringList>
 
@@ -11,6 +12,21 @@
 struct UsbGrabRule {
     QString deviceSerial;        // stable device identity from UsbDeviceMonitor, or "*" for the any-device catch-all rule
     bool enabled = false;
+    // Grab this device the moment it mounts, with no user action. Strictly
+    // NARROWER than `enabled`, never a substitute for it: `enabled` is what
+    // makes the device grabbable at all (and is what gates the app's own
+    // mounting — see UsbGrabberController's class doc comment), while this
+    // says whether a hotplug ALSO fires the grab off by itself. So an
+    // enabled+!autoGrab device still mounts, still appears in the UI, and
+    // still grabs from "Grab now" — it just waits to be asked.
+    //
+    // Per-device rather than one global setting because the two devices a user
+    // owns want opposite answers: the recorder they plug in to offload should
+    // just do it, while the photo SD card that happens to match a catch-all
+    // shouldn't start copying on its own. Default false — auto-grab is the
+    // surprising behavior, so it's opted into per device, and an existing
+    // enabled rule keeps behaving manually until its owner says otherwise.
+    bool autoGrab = false;
     QStringList extensionFilter; // e.g. {"wav","mp3","m4a"} — empty means "all files"
     // Optional QRegularExpression source matched against a candidate's FILE
     // NAME only (never its path) — empty means "no regex constraint", not
@@ -27,6 +43,12 @@ struct UsbGrabRule {
     QString deviceLabel;         // human-readable vendor/model string, for display purposes only, not identity
     QString destinationFolder;   // relative path from vault root to grab into; "" = vault root, created if missing
 };
+
+// So a whole rule can ride a queued cross-thread invoke as one Q_ARG (see
+// UsbGrabPreviewJob::start(), and TranscriptionController's usbGrab job kind)
+// instead of being shredded into six loose parallel arguments that a new rule
+// field would have to be threaded through by hand every time.
+Q_DECLARE_METATYPE(UsbGrabRule)
 
 // Persists UsbGrabRule entries APP-SCOPED via QSettings (NOT vault-scoped
 // .transcriber/settings.json) — the same USB device is plugged in across many

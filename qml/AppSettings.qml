@@ -203,6 +203,25 @@ Item {
     // until confident" bias around anything that touches source recordings.
     property bool deleteOriginalsAfterCombine: false
 
+    // Run a combine scan automatically once a batch of USB auto-grabs has
+    // finished (UsbGrabberController::autoGrabsSettled -> Main.qml). false
+    // (default) keeps combine a purely explicit action.
+    //
+    // Narrow on purpose. Combine used to fire on every vault-tree rebuild, and
+    // it was removed for good reason: it silently merged files the moment a
+    // recorder dropped in a new part, surprising anyone watching a vault fill
+    // up mid-recording (see Sidebar.qml's combineButton). This is not that
+    // coming back. It's opt-in, and it fires on ONE discrete event — a device
+    // the user chose to auto-grab has just finished offloading, which is
+    // precisely when a split recording is complete and combining it is what
+    // they'd do by hand anyway. It is not a general "combine whenever the vault
+    // changes" mode, and it must never grow into one.
+    //
+    // Still rule-driven like every other combine: only groups a user-authored
+    // combineRules entry matched, and only ones detectCombineGroups() reports
+    // "ready", are ever enqueued. An empty combineRules means this does nothing.
+    property bool autoCombineAfterGrab: false
+
     // Where new in-app recordings are written to. Empty string (default)
     // means "use vault root" — interpreted downstream by the recording
     // controller, not here.
@@ -306,6 +325,7 @@ Item {
         progressGlowLayerCount: 2,
         progressGlowHidesBar: true,
         deleteOriginalsAfterCombine: false,
+        autoCombineAfterGrab: false,
         recordingOutputFolder: "",
         recordingMicGain: 1.0,
         recordingSystemGain: 1.0

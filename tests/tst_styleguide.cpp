@@ -1110,7 +1110,7 @@ private slots:
     // for TreeView context menus, so this is a source-scan guard.
     void sidebar_deleteFileActsOnWholeSelection()
     {
-        const QString src = readAll(QStringLiteral(SUOP_QML_DIR "/Sidebar.qml"));
+        const QString src = stripComments(readAll(QStringLiteral(SUOP_QML_DIR "/Sidebar.qml")));
         QVERIFY2(!src.isEmpty(), "qml/Sidebar.qml must exist");
 
         // Drag-to-move and delete must read a multi-selection through the same
@@ -1118,22 +1118,29 @@ private slots:
         QVERIFY2(src.contains(QStringLiteral("function selectionPathsFor(")),
                  "the \"row in a 2+ selection carries the whole selection\" rule must be one shared "
                  "function (selectionPathsFor)");
-        const int beginDeleteIdx = src.indexOf(QStringLiteral("function beginDeleteFile("));
-        QVERIFY2(beginDeleteIdx >= 0, "beginDeleteFile() must exist");
-        QVERIFY2(src.mid(beginDeleteIdx, 200).contains(QStringLiteral("selectionPathsFor(")),
+        // selectionPathsFor() is applied at the CALL SITE now, not inside
+        // beginDeleteFile() — the ribbon's deleteFileAllButton and the Delete
+        // key pass a selection subset directly (they have no right-clicked row
+        // for selectionPathsFor to widen from), while the context menu widens
+        // its right-clicked row through it. So the context-menu row is where
+        // this rule must appear.
+        const QString ctxDeleteFile = enclosingBlock(src, QStringLiteral("id: ctxDeleteFileRow"));
+        QVERIFY2(!ctxDeleteFile.isEmpty(), "ctxDeleteFileRow must exist");
+        QVERIFY2(ctxDeleteFile.contains(QStringLiteral("selectionPathsFor(")),
                  "\"Delete file\" must target the whole multi-selection via selectionPathsFor()");
+        QVERIFY2(ctxDeleteFile.contains(QStringLiteral("beginDeleteFile(")),
+                 "the context-menu \"Delete file\" row must call beginDeleteFile()");
 
         // The menu row must name the real count.
-        const int delRowIdx = src.indexOf(QStringLiteral("id: ctxDeleteFileRow"));
-        QVERIFY2(delRowIdx >= 0, "ctxDeleteFileRow must exist");
-        const QString delRowBlock = src.mid(delRowIdx, 1400);
-        QVERIFY2(delRowBlock.contains(QStringLiteral("Delete %1 items")),
+        QVERIFY2(ctxDeleteFile.contains(QStringLiteral("Delete %1 items")),
                  "with 2+ rows selected the menu must read \"Delete N items\", not a bare \"Delete file\" "
                  "that hides how many rows it will take");
 
         // The batch must go through the single-rebuild C++ invokable, not a
-        // QML loop (one full vault rescan + model reset per file).
-        QVERIFY2(src.contains(QStringLiteral("sidebar.model.trashFiles(")),
+        // QML loop (one full vault rescan + model reset per file). beginDeleteFile()
+        // is where that happens now.
+        QVERIFY2(functionBody(src, QStringLiteral("function beginDeleteFile("))
+                     .contains(QStringLiteral("sidebar.model.trashFiles(")),
                  "a multi-delete must call VaultTreeModel.trashFiles() so the batch costs one rebuild()");
 
         // Destructive, so still confirmed — and the confirmation must be
@@ -1355,11 +1362,23 @@ private slots:
     // focus on click so a freshly-clicked row is what Up/Down moves from.
     void sidebar_arrowKeyNavigatesNotes()
     {
-        const QString src = readAll(QStringLiteral(SUOP_QML_DIR "/Sidebar.qml"));
+        const QString src = stripComments(readAll(QStringLiteral(SUOP_QML_DIR "/Sidebar.qml")));
         QVERIFY2(!src.isEmpty(), "qml/Sidebar.qml must exist");
 
         QVERIFY2(src.contains(QStringLiteral("function moveNoteSelection(direction)")),
                  "Sidebar.qml must define moveNoteSelection() to back Up/Down navigation");
+
+        // The focus requirement now lives in ONE shared gate, noteShortcutsEnabled
+        // (it grew a second conjunct — no inline rename in flight — so every
+        // note shortcut had to stop hand-rolling the focus test; see the Delete
+        // key guard). The gate's own definition must still carry the focus test,
+        // NOT sidebar.currentPath (MainPanel's open-file state, unrelated to
+        // keyboard focus).
+        const int gateIdx = src.indexOf(QStringLiteral("readonly property bool noteShortcutsEnabled"));
+        QVERIFY2(gateIdx >= 0, "Sidebar must define a shared noteShortcutsEnabled gate");
+        QVERIFY2(src.mid(gateIdx, 220).contains(QStringLiteral("tree.activeFocus || searchResultsView.activeFocus")),
+                 "noteShortcutsEnabled must gate on the tree/search-results view actually having focus, "
+                 "not on sidebar.currentPath (MainPanel's open-file state, unrelated to keyboard focus)");
 
         const int upIdx = src.indexOf(QStringLiteral("sequence: \"Up\""));
         const int downIdx = src.indexOf(QStringLiteral("sequence: \"Down\""));
@@ -1367,10 +1386,9 @@ private slots:
         QVERIFY2(downIdx >= 0, "Down must be wired as a Shortcut");
         const QString upBlock = src.mid(upIdx, 200);
         const QString downBlock = src.mid(downIdx, 200);
-        QVERIFY2(upBlock.contains(QStringLiteral("tree.activeFocus || searchResultsView.activeFocus")),
-                 "Up shortcut must be gated on the tree/search-results view actually having focus, "
-                 "not on sidebar.currentPath (MainPanel's open-file state, unrelated to keyboard focus)");
-        QVERIFY2(downBlock.contains(QStringLiteral("tree.activeFocus || searchResultsView.activeFocus")),
+        QVERIFY2(upBlock.contains(QStringLiteral("sidebar.noteShortcutsEnabled")),
+                 "Up shortcut must be gated on the shared noteShortcutsEnabled");
+        QVERIFY2(downBlock.contains(QStringLiteral("sidebar.noteShortcutsEnabled")),
                  "Down shortcut must be gated the same way as Up");
         QVERIFY2(upBlock.contains(QStringLiteral("moveNoteSelection(-1)")), "Up must move backward");
         QVERIFY2(downBlock.contains(QStringLiteral("moveNoteSelection(1)")), "Down must move forward");
@@ -1531,6 +1549,149 @@ private slots:
         QVERIFY2(labelBlock.contains(QStringLiteral("sidebar.selectedPaths.length > 1")),
                  "the \"N selected\" label must only show for a genuine multi-selection (2+), not a "
                  "single selected row (already covered by the existing O7 currently-open outline)");
+    }
+
+    // The ribbon WRAPS. It outgrew a single row once the destructive trio
+    // landed (CLAUDE.md action parity), and a sidebar is narrow and
+    // user-resizable, so a fixed row silently squeezed or clipped buttons.
+    //
+    // The load-bearing half is that a Flow ignores Layout attached properties
+    // ENTIRELY — it positions by plain width/height. A child left on
+    // Layout.preferredWidth inside it doesn't warn; it collapses to an
+    // implicit size and the button becomes an invisible 0-width hit target.
+    // So this guards the conversion, not just the Flow's existence.
+    void sidebar_ribbonWraps_andItsChildrenSizeWithoutLayoutAttachments()
+    {
+        const QString src = stripComments(readAll(QStringLiteral(SUOP_QML_DIR "/Sidebar.qml")));
+        QVERIFY2(!src.isEmpty(), "qml/Sidebar.qml must exist");
+
+        const int ribbonFlowIdx = src.indexOf(QStringLiteral("id: ribbonFlow"));
+        QVERIFY2(ribbonFlowIdx >= 0, "the ribbon's button container must be `Flow { id: ribbonFlow }` "
+                                      "so the buttons wrap at a narrow sidebar width");
+        // The element type sits just before the id: line. A small backward
+        // window (not an exact-whitespace match) so reindentation can't break
+        // the guard — this file's own doc comments warn against fixed windows
+        // that rot silently, but a "does the token appear right here" check is
+        // exactly what a small window is for.
+        QVERIFY2(src.mid(qMax(0, ribbonFlowIdx - 40), 40).contains(QStringLiteral("Flow {")),
+                 "ribbonFlow must be a Flow — a RowLayout does not wrap");
+        const QString ribbonFlow = enclosingBlock(src, QStringLiteral("id: ribbonFlow"));
+        QVERIFY(!ribbonFlow.isEmpty());
+
+        // No Layout.* attachment may survive inside it. Layout.preferredWidth/
+        // Height are the ones that were converted; fillWidth/alignment are the
+        // ones a Flow silently gives nothing to fill and nothing to align.
+        for (const QString &attachment : { QStringLiteral("Layout.preferredWidth"),
+                                            QStringLiteral("Layout.preferredHeight"),
+                                            QStringLiteral("Layout.fillWidth"),
+                                            QStringLiteral("Layout.alignment") }) {
+            QVERIFY2(!ribbonFlow.contains(attachment),
+                     qPrintable(QStringLiteral("%1 inside ribbonFlow is a silent no-op — a Flow positions "
+                                                "by plain width/height. Use width:/height: instead.")
+                                    .arg(attachment)));
+        }
+
+        // The ribbon's own height must track the Flow's wrapped height. It was
+        // a literal 32 (one 22px row + padding), which is exactly the kind of
+        // magic number this file's ribbon height binding already got burned by
+        // once — see its doc comment in Sidebar.qml.
+        const QString ribbon = enclosingBlock(src, QStringLiteral("id: ribbon"));
+        QVERIFY2(ribbon.contains(QStringLiteral("ribbonFlow.implicitHeight")),
+                 "the ribbon's collapsed height must follow ribbonFlow.implicitHeight, not a fixed "
+                 "one-row constant — it wraps now, so the row count is not knowable up front");
+    }
+
+    // The Delete key deletes the sidebar's selection, mirroring the ribbon's
+    // deleteFileAllButton.
+    //
+    // The renamingPath gate is the load-bearing half and the reason this guard
+    // exists at all. The other note shortcuts reason that "a TextField
+    // elsewhere has focus, so the tree does not" — which holds for the search
+    // fields (they sit outside the tree) but NOT for the inline rename editor,
+    // which is a TextField INSIDE a tree delegate. TreeView is a FocusScope, so
+    // tree.activeFocus is TRUE while you type in that editor (Sidebar.qml's own
+    // treeRowTap comment documents exactly this: forceActiveFocus() on the
+    // TreeView hands focus straight back to its focused child). Without the
+    // gate, pressing Delete to erase a character mid-rename trashes the file
+    // being renamed.
+    void sidebar_deleteKey_deletesSelection_andIsInertDuringAnInlineRename()
+    {
+        const QString src = stripComments(readAll(QStringLiteral(SUOP_QML_DIR "/Sidebar.qml")));
+        QVERIFY2(!src.isEmpty(), "qml/Sidebar.qml must exist");
+
+        QVERIFY2(src.contains(QStringLiteral("sequence: StandardKey.Delete")),
+                 "Sidebar must bind a Delete Shortcut so the file tree's selection can be deleted "
+                 "from the keyboard");
+        const QString deleteBlock = enclosingBlock(src, QStringLiteral("sequence: StandardKey.Delete"));
+        QVERIFY2(deleteBlock.contains(QStringLiteral("sidebar.beginDeleteFile(")),
+                 "the Delete key must route through beginDeleteFile() — the trash-first path, so it is "
+                 "undoable from the snackbar, not deleteFilesPermanently()");
+        QVERIFY2(deleteBlock.contains(QStringLiteral("sidebar.noteShortcutsEnabled")),
+                 "the Delete key must use the shared noteShortcutsEnabled gate");
+        QVERIFY2(deleteBlock.contains(QStringLiteral("sidebar.selectedPaths.length > 0")),
+                 "the Delete key must be inert with an empty selection");
+
+        // The gate itself: focus AND no rename in flight.
+        const int gateIdx = src.indexOf(QStringLiteral("readonly property bool noteShortcutsEnabled"));
+        QVERIFY2(gateIdx >= 0, "Sidebar must define a shared noteShortcutsEnabled gate for the note "
+                                "shortcuts");
+        const QString gate = src.mid(gateIdx, 220);
+        QVERIFY2(gate.contains(QStringLiteral("sidebar.renamingPath === \"\"")),
+                 "noteShortcutsEnabled MUST require renamingPath === \"\": TreeView is a FocusScope, so "
+                 "tree.activeFocus stays true while the inline rename editor (a TextField INSIDE a tree "
+                 "delegate) has focus — without this, Delete mid-rename trashes the file being renamed");
+        QVERIFY2(gate.contains(QStringLiteral("tree.activeFocus"))
+                     && gate.contains(QStringLiteral("searchResultsView.activeFocus")),
+                 "noteShortcutsEnabled must still require the tree/search-results view to have focus");
+    }
+
+    // Combine placeholders: pressing Combine must change the tree NOW, not when
+    // ffmpeg finishes. See VaultTreeModel::setPendingCombines()'s doc comment.
+    void sidebar_pendingCombines_pushedFromTheQueue_andRenderedAsAnonymousProgress()
+    {
+        const QString src = stripComments(readAll(QStringLiteral(SUOP_QML_DIR "/Sidebar.qml")));
+        QVERIFY2(!src.isEmpty(), "qml/Sidebar.qml must exist");
+
+        // Derived from the controller's own jobs list — a combine job already
+        // carries its output path (as fileUrl) and its ordered sources, so
+        // there is nothing for the controller to add for this.
+        const QString pending = functionBody(src, QStringLiteral("function pendingCombines()"));
+        QVERIFY2(!pending.isEmpty(), "Sidebar must define pendingCombines()");
+        QVERIFY2(pending.contains(QStringLiteral("\"combine\"")),
+                 "pendingCombines() must select combine-kind jobs");
+        QVERIFY2(pending.contains(QStringLiteral("\"queued\"")) && pending.contains(QStringLiteral("\"active\"")),
+                 "pendingCombines() must cover QUEUED as well as active jobs — a combine waiting behind "
+                 "other work is exactly the case where the wait is longest and the feedback matters most");
+        QVERIFY2(pending.contains(QStringLiteral("combineSourcePaths")),
+                 "pendingCombines() must carry each job's source parts so the model can hide them");
+
+        QVERIFY2(functionBody(src, QStringLiteral("function pushPendingCombines()"))
+                     .contains(QStringLiteral("setPendingCombines(")),
+                 "pushPendingCombines() must push into VaultTreeModel.setPendingCombines()");
+        // The queue is the only thing that can change which combines are
+        // pending — enqueue, start and finish all land on queueChanged.
+        QVERIFY2(src.contains(QStringLiteral("function onQueueChanged() { sidebar.pushPendingCombines() }")),
+                 "Sidebar must re-push pending combines on the controller's queueChanged");
+
+        // The row is anonymous progress, never a filename: the merged file does
+        // not exist yet, so there is nothing honest to call it.
+        const QString placeholderRow = enclosingBlock(src, QStringLiteral("id: combinePlaceholderRow"));
+        QVERIFY2(!placeholderRow.isEmpty(), "the tree delegate must render a combinePlaceholderRow");
+        QVERIFY2(placeholderRow.contains(QStringLiteral("treeDelegate.isCombinePlaceholder")),
+                 "combinePlaceholderRow must only show for a placeholder row");
+        QVERIFY2(!placeholderRow.contains(QStringLiteral("treeDelegate.name")),
+                 "the placeholder must NOT render a filename — no file exists yet to name");
+        QVERIFY2(placeholderRow.contains(QStringLiteral("combineSourceCount")),
+                 "the placeholder must say how many parts it is merging");
+
+        // Not clickable: it has nothing to open, rename or act on.
+        QVERIFY2(enclosingBlock(src, QStringLiteral("id: treeRowTap"))
+                     .contains(QStringLiteral("enabled: !treeDelegate.isCombinePlaceholder")),
+                 "the row TapHandler must be disabled for a combine placeholder — it has no file to open");
+        QVERIFY2(enclosingBlock(src, QStringLiteral("id: treeRowContextTap"))
+                     .contains(QStringLiteral("enabled: !treeDelegate.isCombinePlaceholder")),
+                 "the context-menu TapHandler must be disabled for a combine placeholder — every entry "
+                 "in that menu acts on a file");
     }
 
     // Combining is RULE-DRIVEN ONLY: a merge may only ever happen for a group
@@ -1953,6 +2114,33 @@ private slots:
                  "shows a phase label instead of a blank");
     }
 
+    // A USB grab is a normal queued job now (see DESIGN.md "USB import"), so it
+    // renders through the same Tasks rows as every other kind — and a kind with
+    // no case here doesn't degrade, it actively LIES: kindLabel()'s default arm
+    // is "Transcribe", so an unlabelled grab would show up claiming to be a
+    // transcription of the destination folder.
+    void bottomBar_usbGrabKindHasBadgeAndPhaseLabel()
+    {
+        // functionBody() rather than the fixed-width mid() windows the older
+        // BottomBar guards use: those silently stop covering the last case as
+        // soon as a kind is added above it, which is exactly what adding this
+        // kind does to them.
+        const QString bar = stripComments(readAll(QStringLiteral(SUOP_QML_DIR "/BottomBar.qml")));
+        QVERIFY2(!bar.isEmpty(), "qml/BottomBar.qml must exist");
+
+        const QString kindFn = functionBody(bar, QStringLiteral("function kindLabel"));
+        QVERIFY2(!kindFn.isEmpty(), "kindLabel() must exist");
+        QVERIFY2(kindFn.contains(QStringLiteral("case \"usbGrab\":")),
+                 "kindLabel() must have a \"usbGrab\" case — without one the default arm labels a grab "
+                 "\"Transcribe\", which is worse than blank: it's wrong");
+
+        const QString phaseFn = functionBody(bar, QStringLiteral("function phaseLabel"));
+        QVERIFY2(!phaseFn.isEmpty(), "phaseLabel() must exist");
+        QVERIFY2(phaseFn.contains(QStringLiteral("case \"grabbing\":")),
+                 "phaseLabel() must have a \"grabbing\" case so an active grab shows a phase label instead "
+                 "of a blank (TranscriptionWorker::usbGrabJob emits phase \"grabbing\")");
+    }
+
     // Item 52 (diarize kind) + item 26/31 (chaptering phase): the two recently
     // added job kinds/phases must have label cases so their Tasks badge / phase
     // text isn't blank. The standalone diarize job is kind "diarize"; chapter
@@ -2223,7 +2411,7 @@ private slots:
     // the same view-focus condition as plain Up/Down.
     void sidebar_shiftAndCtrlArrowSelection()
     {
-        const QString src = readAll(QStringLiteral(SUOP_QML_DIR "/Sidebar.qml"));
+        const QString src = stripComments(readAll(QStringLiteral(SUOP_QML_DIR "/Sidebar.qml")));
         QVERIFY2(!src.isEmpty(), "qml/Sidebar.qml must exist");
 
         QVERIFY2(src.contains(QStringLiteral("function extendNoteSelection(direction)")),
@@ -2249,14 +2437,17 @@ private slots:
         QVERIFY2(jumpBody.contains(QStringLiteral("sidebar.parentDir(")),
                  "jumpToGroupBoundary must stop at folder boundaries (same parent-folder run)");
 
-        // Both key pairs wired as Shortcuts, gated like plain Up/Down.
+        // Both key pairs wired as Shortcuts, gated like plain Up/Down — via the
+        // shared noteShortcutsEnabled now (see sidebar_arrowKeyNavigatesNotes
+        // for why the focus test moved into that gate).
         for (const QString &seq : {QStringLiteral("Shift+Up"), QStringLiteral("Shift+Down"),
                                    QStringLiteral("Ctrl+Up"), QStringLiteral("Ctrl+Down")}) {
             const int sIdx = src.indexOf(QStringLiteral("sequence: \"%1\"").arg(seq));
             QVERIFY2(sIdx >= 0, qPrintable(seq + QStringLiteral(" must be wired as a Shortcut")));
             const QString sBlock = src.mid(sIdx, 220);
-            QVERIFY2(sBlock.contains(QStringLiteral("tree.activeFocus || searchResultsView.activeFocus")),
-                     qPrintable(seq + QStringLiteral(" must be focus-gated exactly like plain Up/Down")));
+            QVERIFY2(sBlock.contains(QStringLiteral("sidebar.noteShortcutsEnabled")),
+                     qPrintable(seq + QStringLiteral(" must be focus-gated exactly like plain Up/Down "
+                                                     "(via noteShortcutsEnabled)")));
         }
         const int suIdx = src.indexOf(QStringLiteral("sequence: \"Shift+Up\""));
         QVERIFY2(src.mid(suIdx, 220).contains(QStringLiteral("extendNoteSelection(-1)")),
@@ -2801,69 +2992,105 @@ private slots:
         }
     }
 
-    // Item 2 (delete transcript + delete file): the two destructive file
-    // actions must reach the user via the Sidebar context menu AND the
-    // MainPanel open-file icon cluster (CLAUDE.md per-file-action parity; the
-    // Sidebar per-row site is satisfied by its right-click context menu, the
-    // natural home alongside "Delete folder"). A bulk ribbon variant is
-    // deliberately NOT added — a one-click bulk "delete file" over a
-    // multi-selection is too dangerous, and per-file + open-file are the
-    // parity sites that matter for a destructive action. No QQuickView here,
-    // so this is a source-scan guard that the wiring exists.
+    // Item 2 (delete transcript + delete file): the destructive file actions
+    // must reach the user via the Sidebar context menu, the Sidebar RIBBON, and
+    // the MainPanel open-file icon cluster (CLAUDE.md per-file-action parity).
+    //
+    // The ribbon half is a REVERSAL, recorded here so it isn't quietly undone:
+    // a bulk ribbon delete was previously left out on purpose, as "too
+    // dangerous for a multi-selection". That call was made while a delete was
+    // confirm-then-maybe-permanent. It isn't anymore — every delete path here
+    // now tries the trash FIRST (see Sidebar's handleTrashResult), so the
+    // recoverable case costs an Undo click from the snackbar rather than the
+    // file, and only a filesystem refusal is ever permanent. The Delete key
+    // also needs a visible affordance to advertise. No QQuickView here, so this
+    // is a source-scan guard that the wiring exists.
     void delete_transcriptAndFile_wiredInSidebarAndMainPanel()
     {
         const QString sidebar = readAll(QStringLiteral(SUOP_QML_DIR "/Sidebar.qml"));
         QVERIFY2(!sidebar.isEmpty(), "qml/Sidebar.qml must exist");
 
+        // Stripped: every assertion below is a PRESENCE one, and those pass on
+        // a comment alone — this block's own doc comment names most of these
+        // calls, so an unstripped scan would go green on documentation.
+        const QString sidebarCode = stripComments(sidebar);
+
         // Context-menu entries for both actions.
-        QVERIFY2(sidebar.contains(QStringLiteral("id: ctxDeleteTranscriptRow")),
+        QVERIFY2(sidebarCode.contains(QStringLiteral("id: ctxDeleteTranscriptRow")),
                  "Sidebar context menu must offer a 'Delete transcript' entry for transcribed files");
-        QVERIFY2(sidebar.contains(QStringLiteral("id: ctxDeleteFileRow")),
+        QVERIFY2(sidebarCode.contains(QStringLiteral("id: ctxDeleteFileRow")),
                  "Sidebar context menu must offer a 'Delete file' entry for note rows");
-        QVERIFY2(sidebar.contains(QStringLiteral("id: ctxDeleteAudioOnlyRow")),
+        QVERIFY2(sidebarCode.contains(QStringLiteral("id: ctxDeleteAudioOnlyRow")),
                  "Sidebar context menu must offer a 'Delete audio only' entry (drops the audio, "
                  "keeps the .md) for transcribed files");
         // "Delete transcript" is gated to a transcribed AUDIO row (status 2).
-        QVERIFY2(sidebar.contains(QStringLiteral("visible: sidebar.ctxIsAudio && sidebar.ctxStatus === 2")),
+        QVERIFY2(sidebarCode.contains(QStringLiteral("visible: sidebar.ctxIsAudio && sidebar.ctxStatus === 2")),
                  "'Delete transcript' must only show for a transcribed audio row (an orphaned .md gets "
                  "'Delete file' instead)");
         // Both route through the model's TRASH-first invokables. A delete only
         // reaches a confirm popup if the trash refused (see Sidebar's
         // handleTrashResult) — the recoverable case offers Undo instead.
-        QVERIFY2(sidebar.contains(QStringLiteral(".trashTranscript(")),
+        QVERIFY2(sidebarCode.contains(QStringLiteral(".trashTranscript(")),
                  "Sidebar must call VaultTreeModel.trashTranscript()");
-        QVERIFY2(sidebar.contains(QStringLiteral(".trashAudioOnly(")),
+        QVERIFY2(sidebarCode.contains(QStringLiteral(".trashAudioOnly(")),
                  "Sidebar must call VaultTreeModel.trashAudioOnly() — the trash-first call, not "
                  "deleteAudioOnlyPermanently()");
-        // trashFiles() takes a LIST: the sidebar's "Delete file" acts on a whole
-        // multi-selection, and a single row is just a one-element batch — one
-        // code path, not a count-dependent branch.
-        QVERIFY2(sidebar.contains(QStringLiteral(".trashFiles(")),
-                 "Sidebar must delete through VaultTreeModel.deleteFiles(), which handles both a single "
+        // Every delete call takes a LIST: the sidebar's deletes act on a whole
+        // selection, and a single row is just a one-element batch — one code
+        // path, not a count-dependent branch.
+        QVERIFY2(sidebarCode.contains(QStringLiteral(".trashFiles(")),
+                 "Sidebar must delete through VaultTreeModel.trashFiles(), which handles both a single "
                  "row and a multi-selection in one rebuild");
-        // Destructive => must be confirmed first.
-        QVERIFY2(sidebar.contains(QStringLiteral("id: fileDeleteConfirmPopup")),
-                 "a destructive file/transcript delete must be confirmed first");
+        // Reached ONLY when the trash refused — that's the one permanent case.
+        QVERIFY2(sidebarCode.contains(QStringLiteral("id: fileDeleteConfirmPopup")),
+                 "a delete the trash refused (the permanent case) must be confirmed first");
+
+        // The ribbon's bulk trio — the CLAUDE.md parity site for MainPanel's
+        // per-file cluster, and the Delete key's visible affordance. See this
+        // slot's doc comment for why these now exist.
+        for (const QString &id : { QStringLiteral("deleteTranscriptAllButton"),
+                                    QStringLiteral("deleteAudioOnlyAllButton"),
+                                    QStringLiteral("deleteFileAllButton") }) {
+            QVERIFY2(sidebarCode.contains(QStringLiteral("id: ") + id),
+                     qPrintable(QStringLiteral("Sidebar ribbon must have a bulk %1 — CLAUDE.md per-file "
+                                                "action parity with MainPanel's delete cluster").arg(id)));
+        }
+        // Bulk => must narrow to the current selection like every other ribbon
+        // button, never act on the whole vault.
+        //
+        // enclosingBlock(), not functionBody(): the anchor is an "id:" line,
+        // which sits INSIDE the block being asked about, so the brace that
+        // opens it is BEHIND the anchor. functionBody() searches forward and
+        // would brace-match the button's first child handler instead.
+        QVERIFY2(enclosingBlock(sidebarCode, QStringLiteral("id: deleteFileAllButton"))
+                     .contains(QStringLiteral("sidebar.selectedPaths")),
+                 "the ribbon delete-file button must act on the selection");
+        for (const QString &id : { QStringLiteral("id: deleteTranscriptAllButton"),
+                                    QStringLiteral("id: deleteAudioOnlyAllButton") }) {
+            QVERIFY2(enclosingBlock(sidebarCode, id).contains(QStringLiteral("bulkTargetPaths(")),
+                     qPrintable(QStringLiteral("%1 must narrow to the selection via bulkTargetPaths()").arg(id)));
+        }
 
         const QString mainPanel = readAll(QStringLiteral(SUOP_QML_DIR "/MainPanel.qml"));
         QVERIFY2(!mainPanel.isEmpty(), "qml/MainPanel.qml must exist");
+        const QString mainPanelCode = stripComments(mainPanel);
 
-        QVERIFY2(mainPanel.contains(QStringLiteral("id: deleteTranscriptButton")),
+        QVERIFY2(mainPanelCode.contains(QStringLiteral("id: deleteTranscriptButton")),
                  "MainPanel icon cluster must have a 'Delete transcript' action for the open file");
-        QVERIFY2(mainPanel.contains(QStringLiteral("id: deleteFileButton")),
+        QVERIFY2(mainPanelCode.contains(QStringLiteral("id: deleteFileButton")),
                  "MainPanel icon cluster must have a 'Delete file' action for the open file");
         // Per-file action parity (CLAUDE.md): "Delete audio only" is offered on
         // the vault tree's rows, so the open file must offer it too.
-        QVERIFY2(mainPanel.contains(QStringLiteral("id: deleteAudioOnlyButton")),
+        QVERIFY2(mainPanelCode.contains(QStringLiteral("id: deleteAudioOnlyButton")),
                  "MainPanel icon cluster must have a 'Delete audio only' action for the open file, "
                  "matching the Sidebar's ctxDeleteAudioOnlyRow");
-        QVERIFY2(mainPanel.contains(QStringLiteral(".trashTranscript("))
-                     && mainPanel.contains(QStringLiteral(".trashAudioOnly("))
-                     && mainPanel.contains(QStringLiteral(".trashFiles(")),
+        QVERIFY2(mainPanelCode.contains(QStringLiteral(".trashTranscript("))
+                     && mainPanelCode.contains(QStringLiteral(".trashAudioOnly("))
+                     && mainPanelCode.contains(QStringLiteral(".trashFiles(")),
                  "MainPanel must call VaultTreeModel.trashTranscript()/trashAudioOnly()/trashFiles() "
                  "— the trash-first calls, not the *Permanently() ones");
         // Still present, but now reached ONLY when the trash refused.
-        QVERIFY2(mainPanel.contains(QStringLiteral("id: deleteFileConfirmPopup")),
+        QVERIFY2(mainPanelCode.contains(QStringLiteral("id: deleteFileConfirmPopup")),
                  "MainPanel must still confirm a delete the trash refused (the permanent case)");
         QVERIFY2(mainPanel.contains(QStringLiteral("function handleTrashResult(")),
                  "MainPanel's deletes must funnel through handleTrashResult(), same trash-first "
@@ -3070,6 +3297,156 @@ private slots:
         QVERIFY2(!monitor.mid(emitIdx, 200).contains(QStringLiteral("mountVolume(")),
                  "UsbDeviceMonitor must not mount off the back of its own unmountedVolumeDetected signal: it "
                  "holds no rules, so it can only answer WHAT may be mounted, never WHETHER it should be");
+    }
+
+    // Dropped files must reach the vault as QUEUED TASKS, exactly like a USB
+    // grab — never as a copy done inline on the drop handler. The copy is
+    // unbounded (a dropped file can be gigabytes), so doing it here would
+    // freeze the UI for its whole duration and leave the user with no Tasks
+    // row, no progress, and no cancel. tst_transcription_queue.cpp specs the
+    // import JOB itself; this pins the drop path actually going through it.
+    void mainWindow_droppedFilesBecomeQueuedImportTasks()
+    {
+        // stripComments + functionBody: Main.qml's comments here name these very
+        // calls while explaining them, and a `contains` guard that a comment can
+        // satisfy guards nothing (see stripComments()' own doc comment).
+        const QString src = stripComments(readAll(QStringLiteral(SUOP_QML_DIR "/Main.qml")));
+        QVERIFY2(!src.isEmpty(), "qml/Main.qml must exist");
+
+        const int dropIdx = src.indexOf(QStringLiteral("onDropped:"));
+        QVERIFY2(dropIdx >= 0, "Main.qml must still accept OS file drops");
+        QVERIFY2(src.mid(dropIdx, 120).contains(QStringLiteral("importDroppedUrls(")),
+                 "the drop handler must delegate to importDroppedUrls()");
+
+        const QString fn = functionBody(src, QStringLiteral("function importDroppedUrls("));
+        QVERIFY2(!fn.isEmpty(), "Main.qml must define importDroppedUrls()");
+
+        QVERIFY2(fn.contains(QStringLiteral("transcriptionController.importAudio(")),
+                 "importDroppedUrls() must enqueue each file via TranscriptionController.importAudio() — the "
+                 "byte-copy belongs on the worker thread's job queue, never inline on the GUI thread");
+        QVERIFY2(fn.contains(QStringLiteral("importDestinationFor(")),
+                 "importDroppedUrls() must validate synchronously via importDestinationFor() before enqueuing: "
+                 "wrong-type/collision/no-vault deserve instant feedback, not a Failed task later");
+    }
+
+    // The mount gate above is `enabled`; the AUTO-grab gate is `enabled &&
+    // autoGrab`. Keeping them distinct is the whole point — collapsing the
+    // mount onto autoGrab would stop un-auto'd devices mounting (so they'd
+    // never be configurable), and collapsing the grab onto `enabled` alone
+    // would silently restore hands-off copying for every already-enabled rule.
+    void usbGrabber_hotplugGrabRequiresAutoGrabNotJustEnabled()
+    {
+        // stripComments: this function's comments explain the two gates BY NAME,
+        // so a raw scan would pass on the prose even if the code stopped
+        // checking. functionBody() brace-matches rather than trusting a "\n}"
+        // delimiter that any lambda or nested block would break.
+        const QString src = stripComments(readAll(QStringLiteral(SUOP_SRC_DIR "/core/UsbGrabberController.cpp")));
+        QVERIFY2(!src.isEmpty(), "src/core/UsbGrabberController.cpp must exist");
+
+        const QString handler = functionBody(src, QStringLiteral("void UsbGrabberController::handleDeviceAdded("));
+        QVERIFY2(!handler.isEmpty(), "handleDeviceAdded must still exist — it IS the hotplug auto-grab path");
+
+        QVERIFY2(handler.contains(QStringLiteral(".autoGrab")),
+                 "handleDeviceAdded() must gate on rule.autoGrab as well as rule.enabled: a hotplug may only "
+                 "grab by itself for a device whose owner opted that device into auto-grabbing");
+        QVERIFY2(handler.contains(QStringLiteral(".enabled")),
+                 "handleDeviceAdded() must still ALSO gate on rule.enabled — autoGrab is narrower than "
+                 "enabled, never a way around it");
+    }
+
+    // A grab must stay a task on the shared queue. Reverting it to a thread of
+    // its own would silently take away its Tasks row, the progress glow and
+    // pause/cancel, and let it fight a running transcription for the disk.
+    void usbGrabber_grabIsAQueuedTaskNotItsOwnThread()
+    {
+        // stripComments matters most for the two ABSENCE checks below: both
+        // would fail the moment someone documented WHY the thing is absent.
+        const QString src = stripComments(readAll(QStringLiteral(SUOP_SRC_DIR "/core/UsbGrabberController.cpp")));
+        QVERIFY2(!src.isEmpty(), "src/core/UsbGrabberController.cpp must exist");
+
+        const QString body = functionBody(src, QStringLiteral("void UsbGrabberController::startGrabJob("));
+        QVERIFY2(!body.isEmpty(), "startGrabJob must still exist");
+
+        QVERIFY2(body.contains(QStringLiteral("enqueueUsbGrab(")),
+                 "startGrabJob() must enqueue the grab onto TranscriptionController (enqueueUsbGrab) — a grab "
+                 "is a task in the one queue, not a bespoke thread");
+        QVERIFY2(!body.contains(QStringLiteral("new UsbGrabPreviewJob")),
+                 "startGrabJob() must not spawn a preview job: UsbGrabPreviewJob is the dry-run PREVIEW path "
+                 "only (it deliberately skips the queue), and it copies nothing");
+
+        // The preview, conversely, must NOT join the queue: it's an interactive
+        // answer while editing a rule, and queueing it behind a transcription
+        // would make the rule editor unusable.
+        const QString preview = functionBody(src, QStringLiteral("void UsbGrabberController::requestGrabPreview("));
+        QVERIFY2(!preview.isEmpty(), "requestGrabPreview must still exist");
+        QVERIFY2(!preview.contains(QStringLiteral("enqueueUsbGrab(")),
+                 "requestGrabPreview() must not go through the task queue — a preview writes nothing and is "
+                 "wanted immediately, not after whatever is transcribing finishes");
+    }
+
+    // The auto-combiner reverses a decision that was deliberately made once
+    // before (combine fired on every vault rebuild and was removed for silently
+    // merging mid-recording). It's allowed back ONLY in this narrow shape:
+    // opt-in, and hung off the auto-grab barrier — never a vault-change hook.
+    void usbGrabber_autoCombineIsOptInAndOnlyAfterAutoGrabsSettle()
+    {
+        // stripComments: this handler's own comments legitimately NAME the
+        // calls being checked (explaining why refresh() must precede
+        // allAudioPaths()), so scanning raw source matches the prose instead of
+        // the code — and the ordering check below then compares a comment
+        // against a call.
+        const QString main = stripComments(readAll(QStringLiteral(SUOP_QML_DIR "/Main.qml")));
+        QVERIFY2(!main.isEmpty(), "qml/Main.qml must exist");
+
+        const QString handler = functionBody(main, QStringLiteral("function onAutoGrabsSettled("));
+        QVERIFY2(!handler.isEmpty(),
+                 "Main.qml must handle onAutoGrabsSettled — that barrier is what makes the auto-combine run "
+                 "once, after ALL auto-grabs, rather than mid-batch on half a split recording");
+
+        QVERIFY2(handler.contains(QStringLiteral("AppSettings.autoCombineAfterGrab")),
+                 "the auto-combine must be gated on AppSettings.autoCombineAfterGrab (default off): combining "
+                 "moves the user's original parts into .combined/, so it is opted into, never assumed");
+        QVERIFY2(handler.contains(QStringLiteral("runCombineScan(")),
+                 "the auto-combine must go through the ordinary runCombineScan() — rule-driven and "
+                 "'ready'-gated like every other combine path, not a bespoke merge");
+        QVERIFY2(handler.contains(QStringLiteral("vaultModel.refresh()")),
+                 "the auto-combine must refresh() the vault tree before scanning it: allAudioPaths() reads "
+                 "the in-memory tree, which a filesystem WATCHER refreshes asynchronously (and never for "
+                 "subfolders the grab just created) — scanning first would silently combine nothing");
+        // Order matters as much as presence: refreshing after reading the paths
+        // would be the same bug with extra steps.
+        QVERIFY2(handler.indexOf(QStringLiteral("vaultModel.refresh()"))
+                     < handler.indexOf(QStringLiteral("allAudioPaths()")),
+                 "vaultModel.refresh() must come BEFORE allAudioPaths() — refreshing afterwards still scans "
+                 "the stale tree");
+
+        // The reverted behavior, kept out: combine must never be driven by the
+        // vault tree changing.
+        QVERIFY2(!main.contains(QStringLiteral("onModelReset")) || !main.contains(QStringLiteral("runCombineScan")),
+                 "combine must never be re-hooked to a vault-tree reset — that is exactly the behavior that "
+                 "was removed for merging files out from under a recording in progress");
+    }
+
+    // The preview panel survives the 2.5s device poll by design, so without an
+    // explicit dismiss there is no way to put it away except previewing another
+    // device or leaving the page.
+    void usbGrabber_previewHasADismissControl()
+    {
+        const QString src = stripComments(readAll(QStringLiteral(SUOP_QML_DIR "/MainPanel.qml")));
+        QVERIFY2(!src.isEmpty(), "qml/MainPanel.qml must exist");
+
+        QVERIFY2(src.contains(QStringLiteral("function dismissPreview(")),
+                 "usbGrabberPage must expose dismissPreview() — the grab preview needs a way out");
+        const int btnIdx = src.indexOf(QStringLiteral("id: dismissPreviewButton"));
+        QVERIFY2(btnIdx >= 0, "the grab preview must have a dismiss button (id: dismissPreviewButton)");
+
+        const QString btn = src.mid(btnIdx, 700);
+        QVERIFY2(btn.contains(QStringLiteral("dismissPreview()")),
+                 "the dismiss button must call dismissPreview()");
+        // StyleGuide.md "Iconography" + "Interactable hover behavior".
+        QVERIFY2(btn.contains(QStringLiteral("AppIcon")) && btn.contains(QStringLiteral("HoverBorder")),
+                 "the dismiss button must be an AppIcon inside the standard HoverHandler/HoverBorder wrapper, "
+                 "not a bare glyph");
     }
 
 };

@@ -21,6 +21,7 @@
 
 #include "RollingAverage.h"
 #include "Segment.h"
+#include "UsbRuleStore.h"
 
 class QTimer;
 class TranscriptionWorker;
@@ -498,6 +499,31 @@ public:
     // surfaces as a Failed job, mirroring every other kind. Dedup follows the
     // same Queued/Active rule as transcribe() (keyed on destUrl).
     Q_INVOKABLE void importAudio(const QUrl &sourceUrl, const QUrl &destUrl, const QUrl &vaultUrl);
+
+    // One USB grab — the recursive scan+copy of ONE mounted volume under ONE
+    // resolved rule — as a tracked, queued task. Returns the new job's id so
+    // UsbGrabberController can correlate the usbGrabFinished() below back to
+    // the device that asked for it (and know when its auto-grabs have drained).
+    //
+    // Called from C++ (UsbGrabberController), not QML: the rule has to be
+    // RESOLVED first (device rule, else the "*" catch-all — plus the mount
+    // gate), which is exactly the knowledge UsbGrabberController owns and this
+    // class has no business duplicating. So this is deliberately not
+    // Q_INVOKABLE — QML asks the grabber controller for a grab, not this.
+    //
+    // Queued through the SAME worker-thread pipeline as importAudio()/combine()
+    // rather than the standalone thread grabs used to own, which is the whole
+    // point: a grab is a long file-copy that now gets a Tasks row, the progress
+    // glow, and pause/cancel for free, and can't fight a running transcription
+    // for the same disk. The cost, accepted: a hotplug grab that lands mid-
+    // transcription waits its turn instead of starting immediately.
+    //
+    // No dedup on fileUrl (unlike transcribe()/importAudio()): a grab's fileUrl
+    // is its DESTINATION FOLDER, which two volumes of one device legitimately
+    // share — deduping on it would silently drop the second volume's grab, the
+    // exact bug the per-volume job map already exists to prevent.
+    int enqueueUsbGrab(const UsbGrabRule &rule, const QString &mountPath, const QUrl &destUrl, const QUrl &vaultUrl,
+                       bool autoTriggered);
 
     // Item 52: standalone speaker diarization on an ALREADY-transcribed file
     // — adds (or re-runs) speaker detection WITHOUT re-transcribing the audio.
@@ -1248,6 +1274,21 @@ signals:
     // to, targetName rounds out the pair for symmetry/debugging).
     void speakersMerged(const QUrl &fileUrl, const QString &sourceName, const QString &targetName, bool ok,
                          const QString &error);
+    // Fired when an enqueueUsbGrab() job's scan+copy completes — IN ADDITION
+    // to the generic finished() above (a grab is a normal queued job, so it
+    // participates in busy/progress/tasksTotal/jobs() like every other kind).
+    //
+    // Exists because finished(fileUrl, ok, error) can't carry a grab's actual
+    // result: "copied 4, skipped 118, 1 error" is not ok/error-shaped, and the
+    // history entry + snackbar both need the counts. jobId is echoed back (not
+    // just the serial) because one device's two volumes are two concurrent
+    // grabs under one serial — the serial alone can't tell them apart, which
+    // is the same reason the in-flight job map is keyed per-volume.
+    //
+    // cancelled distinguishes a grab the user stopped from one that ran to the
+    // end of the device: the counts are a partial tally in that case, so it
+    // must not be recorded or announced as a completed grab.
+    void usbGrabFinished(int jobId, int filesCopied, int filesSkipped, const QStringList &errors, bool cancelled);
 
 private:
     // Wave N (task system, item 5): which model file(s) a download job is
@@ -1307,6 +1348,20 @@ private:
         // importAudio() and TranscriptionWorker::importJob().
         bool importOnly = false;
         QString importSourcePath;
+        // USB grab job (see enqueueUsbGrab()): one mounted VOLUME walked under
+        // one resolved rule. Like combineOnly/importOnly, fileUrl doubles as
+        // this kind's OUTPUT — the destination folder the grab copies into.
+        // The whole rule rides along rather than six loose fields, so a new
+        // UsbGrabRule field never has to be re-threaded through the queue.
+        bool usbGrabOnly = false;
+        UsbGrabRule usbGrabRule;
+        QString usbGrabMountPath;
+        // True iff a hotplug started this grab by itself (rule.autoGrab),
+        // false for a "Grab now" click. Carried purely so UsbGrabberController
+        // can tell when the LAST auto-grab has drained and it's time to fire
+        // the auto-combine — see its autoGrabsSettled() signal. Nothing about
+        // how the grab actually runs depends on it.
+        bool usbGrabAuto = false;
         // Item 52: standalone speaker-diarization job — re-runs speaker
         // detection on an already-transcribed file (needs only fileUrl +
         // vaultUrl, like relabelOnly). See diarizeFile() and
