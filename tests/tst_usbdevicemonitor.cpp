@@ -235,6 +235,36 @@ private slots:
                                                      systemDriveDriveProps());
         QVERIFY(!volume.has_value());
     }
+
+    // An UNMOUNTED external volume still yields full identity — no mount is needed to
+    // read Vendor/Model/Serial, since those come off the Drive object. That's what
+    // makes the app-side mount possible at all: UsbGrabberController has to resolve
+    // this volume's rule by serial BEFORE anything is mounted, to decide whether to
+    // mount it (see its "Mount policy" doc comment). The empty mountPath is the ONLY
+    // difference from the mounted case, and is how callers tell the two apart.
+    void unmountedExternalVolume_yieldsIdentityWithEmptyMountPath()
+    {
+        const auto volume = usbVolumeFromProperties(QStringLiteral("/org/freedesktop/UDisks2/block_devices/sda"),
+                                                     QString(), usbRecorderBlockProps(), usbRecorderDriveProps());
+        QVERIFY(volume.has_value());
+        QVERIFY(volume->mountPath.isEmpty());
+        QCOMPARE(volume->serial, QStringLiteral("20200101.1"));
+        QCOMPARE(volume->id, QStringLiteral("/org/freedesktop/UDisks2/block_devices/sda"));
+        QCOMPARE(volume->vendor, QStringLiteral("Acme"));
+        QCOMPARE(volume->model, QStringLiteral("Mic Tx"));
+    }
+
+    // The headline guarantee again, on the mount path this time: an unmounted volume
+    // of the system drive is not a mount candidate, so no rule — not even an enabled
+    // "*" catch-all — can ever get the app to mount a system partition and then grab
+    // it. The gate runs BEFORE the mount, not just before the grab; if this regresses,
+    // "we only ever mount external media" stops being true.
+    void unmountedSystemDriveVolume_yieldsNoDeviceInfo()
+    {
+        const auto volume = usbVolumeFromProperties(QStringLiteral("/org/freedesktop/UDisks2/block_devices/nvme0n1p3"),
+                                                     QString(), systemDriveBlockProps(), systemDriveDriveProps());
+        QVERIFY(!volume.has_value());
+    }
 };
 
 QTEST_MAIN(TstUsbDeviceMonitor)

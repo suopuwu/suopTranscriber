@@ -10,6 +10,7 @@
 #include <QFileInfo>
 #include <QHash>
 #include <QList>
+#include <QRegularExpression>
 #include <QVariantMap>
 
 namespace {
@@ -69,6 +70,26 @@ bool extensionMatches(const QFileInfo &info, const QStringList &extensionFilter)
     return false;
 }
 
+// Empty pattern means "no regex constraint" (every file passes) — see
+// UsbGrabRule::filenameRegex's doc comment. Matched against the FILE NAME only
+// and UNANCHORED, exactly as the split-recording combine rules do (see
+// matchRuleCapturedKey() in TranscriptionController.cpp) so one pattern reads
+// the same in both features.
+//
+// An invalid pattern fails CLOSED — it matches nothing, so every file is
+// classified "filtered" and the grab copies zero files. The alternative
+// (treating unparseable as "no constraint") would silently widen a rule the
+// user was trying to narrow, and on a catch-all rule that means bulk-copying a
+// whole device on a typo. Zero files copied is recoverable and visible: the
+// preview shows everything filtered, and the pattern field's own live ✓/✗
+// indicator already says why (see MainPanel.qml's usbGrabberPage).
+bool filenameRegexMatches(const QFileInfo &info, const QRegularExpression &filenameRegex)
+{
+    if (filenameRegex.pattern().isEmpty())
+        return true;
+    return filenameRegex.match(info.fileName()).hasMatch();
+}
+
 QVariantMap makePreviewEntry(const QString &relativePath, const QString &status)
 {
     QVariantMap entry;
@@ -126,16 +147,23 @@ public:
 
 public slots:
     // dryRun classifies every file the scan sees (matched-and-copied,
-    // matched-but-already-present, or filtered-out-by-extension) without
-    // touching the filesystem at all — no mkpath, no QFile::copy, no
+    // matched-but-already-present, or filtered-out-by-the-rule's-filters)
+    // without touching the filesystem at all — no mkpath, no QFile::copy, no
     // destFilesByBasename mutation — emitting previewCompleted() instead of
-    // scanCompleted(). Everything else (extension filter, quick-check dedup
+    // scanCompleted(). Everything else (the filters, quick-check dedup
     // index, cancel support) is identical between the two modes, written
     // once here rather than duplicated across a separate preview method.
     void start(const QString &mountPath, const QString &startFolder, const QStringList &extensionFilter,
-               bool preserveStructure, const QString &destinationVaultPath, bool dryRun)
+               const QString &filenameRegex, bool preserveStructure, const QString &destinationVaultPath,
+               bool dryRun)
     {
         m_cancelRequested = false;
+
+        // Compiled ONCE here rather than inside the walk: QRegularExpression
+        // parses its pattern on construction, and the walk below runs this
+        // test against every file on a device that can hold tens of thousands
+        // of them.
+        const QRegularExpression filenameRe(filenameRegex);
 
         QString scanRoot = mountPath;
         if (!startFolder.isEmpty())
@@ -174,7 +202,11 @@ public slots:
             const QString sourcePath = it.next();
             const QFileInfo sourceInfo(sourcePath);
 
-            if (!extensionMatches(sourceInfo, extensionFilter)) {
+            // ANDed, and each is independently "no constraint" when blank —
+            // a file must clear BOTH the extension set and the filename regex
+            // to be a grab candidate.
+            if (!extensionMatches(sourceInfo, extensionFilter)
+                    || !filenameRegexMatches(sourceInfo, filenameRe)) {
                 if (dryRun)
                     previewEntries.append(makePreviewEntry(QDir(scanRoot).relativeFilePath(sourcePath),
                                                             QStringLiteral("filtered")));
@@ -322,8 +354,8 @@ void UsbGrabJob::start(const UsbGrabRule &rule, const QString &mountPath, const 
 
     QMetaObject::invokeMethod(m_worker, "start", Qt::QueuedConnection, Q_ARG(QString, mountPath),
                                Q_ARG(QString, rule.startFolder), Q_ARG(QStringList, rule.extensionFilter),
-                               Q_ARG(bool, rule.preserveStructure), Q_ARG(QString, destinationVaultPath),
-                               Q_ARG(bool, false));
+                               Q_ARG(QString, rule.filenameRegex), Q_ARG(bool, rule.preserveStructure),
+                               Q_ARG(QString, destinationVaultPath), Q_ARG(bool, false));
 }
 
 void UsbGrabJob::startPreview(const UsbGrabRule &rule, const QString &mountPath, const QString &destinationVaultPath)
@@ -333,8 +365,8 @@ void UsbGrabJob::startPreview(const UsbGrabRule &rule, const QString &mountPath,
     // scanCompleted() — not previewCompleted() — triggers) are deliberately left unset.
     QMetaObject::invokeMethod(m_worker, "start", Qt::QueuedConnection, Q_ARG(QString, mountPath),
                                Q_ARG(QString, rule.startFolder), Q_ARG(QStringList, rule.extensionFilter),
-                               Q_ARG(bool, rule.preserveStructure), Q_ARG(QString, destinationVaultPath),
-                               Q_ARG(bool, true));
+                               Q_ARG(QString, rule.filenameRegex), Q_ARG(bool, rule.preserveStructure),
+                               Q_ARG(QString, destinationVaultPath), Q_ARG(bool, true));
 }
 
 void UsbGrabJob::handleWorkerFinished(int filesCopied, int filesSkipped, const QStringList &errors)

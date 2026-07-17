@@ -29,6 +29,7 @@
 #include <QFile>
 #include <QQmlContext>
 #include <QQmlEngine>
+#include <QQmlExpression>
 #include <QQuickItem>
 #include <QQuickView>
 #include <QTemporaryDir>
@@ -39,6 +40,14 @@
 #include "VaultTreeModel.h"
 
 namespace {
+
+QByteArray readAll(const QString &path)
+{
+    QFile f(path);
+    if (!f.open(QIODevice::ReadOnly))
+        return {};
+    return f.readAll();
+}
 
 bool touch(const QString &path, const QByteArray &content = "x")
 {
@@ -293,6 +302,7 @@ private slots:
         QVERIFY(qmldir.open(QIODevice::WriteOnly | QIODevice::Text));
         qmldir.write("module SuopTranscriber\n"
                       "singleton AppSettings 1.0 qml/AppSettings.qml\n"
+                      "singleton Notifications 1.0 qml/Notifications.qml\n"
                       "HoverBorder 1.0 qml/HoverBorder.qml\n"
                       "CombineGroupOutline 1.0 qml/CombineGroupOutline.qml\n"
                       "UnderlineField 1.0 qml/UnderlineField.qml\n"
@@ -849,8 +859,18 @@ private slots:
         QVERIFY2(QFileInfo::exists(vault.filePath(QStringLiteral("talk.mp3"))),
                  "a refused rename must leave the original file untouched");
         QCOMPARE(QFileInfo(vault.filePath(QStringLiteral("taken.mp3"))).size(), qint64(1));
-        QVERIFY2(!sidebarItem->property("rowActionError").toString().isEmpty(),
-                 "a refused rename must surface an error banner, not fail silently");
+        // The report moved from the sidebar's own `rowActionError` banner to the
+        // app-wide Notifications queue (StyleGuide.md "Snackbars"), but the
+        // behavior under test is unchanged: a refused rename must SAY so. Read
+        // the singleton's queue rather than a panel property — this harness
+        // renders Sidebar.qml alone, with no SnackbarHost to draw the result.
+        QObject *notifications = view.engine()->singletonInstance<QObject *>(
+            QStringLiteral("SuopTranscriber"), QStringLiteral("Notifications"));
+        QVERIFY2(notifications, "the Notifications singleton must resolve");
+        QObject *queue = notifications->property("queue").value<QObject *>();
+        QVERIFY(queue);
+        QVERIFY2(queue->property("count").toInt() > 0,
+                 "a refused rename must surface a notification, not fail silently");
     }
 
     // Multi-select delete: the whole selection goes, in one call. This is the
@@ -885,13 +905,16 @@ private slots:
         clickAt(&view, nameTextPoint(itemB), Qt::ControlModifier);
         QCOMPARE(sidebarItem->property("selectedPaths").toStringList().size(), 2);
 
-        // Right-clicking a selected row targets the whole selection.
+        // Right-clicking a selected row targets the whole selection. Deleting no
+        // longer STAGES the paths for a confirm — it trashes them immediately
+        // (recoverable, Undo offered in a snackbar), and only stages the ones
+        // the trash refuses. Everything trashes here, so the delete is done the
+        // moment this returns and pendingDeletePaths stays empty.
         QMetaObject::invokeMethod(sidebarItem, "beginDeleteFile",
                                    Q_ARG(QVariant, vault.filePath(QStringLiteral("a.mp3"))));
-        QCOMPARE(sidebarItem->property("pendingDeletePaths").toStringList().size(), 2);
-
-        QMetaObject::invokeMethod(sidebarItem, "confirmFileDelete");
         QTest::qWait(150);
+        QVERIFY2(sidebarItem->property("pendingDeletePaths").toStringList().isEmpty(),
+                 "a delete that trashed cleanly must not stage anything for confirmation");
 
         QVERIFY2(!QFileInfo::exists(vault.filePath(QStringLiteral("a.mp3"))), "every selected file must go");
         QVERIFY2(!QFileInfo::exists(vault.filePath(QStringLiteral("a.mp3.md"))),
@@ -955,6 +978,151 @@ private slots:
         QQuickItem *delLabel = sidebarItem->findChild<QQuickItem *>(QStringLiteral("ctxDeleteFileLabel"));
         QVERIFY2(delLabel, "the context menu must have a delete row label");
         QCOMPARE(delLabel->property("text").toString(), QStringLiteral("Delete 2 items"));
+    }
+
+    // REGRESSION (user report, after the trash-first rework): "right click ...
+    // seems to work once, then not again". Right-click must open the menu every
+    // time, not just the first.
+    void rightClickRow_opensTheMenuEveryTime_notJustOnce()
+    {
+        QTemporaryDir vault;
+        QVERIFY(vault.isValid());
+        QVERIFY(touch(vault.filePath(QStringLiteral("a.mp3"))));
+        QVERIFY(touch(vault.filePath(QStringLiteral("b.mp3"))));
+
+        QQuickView view;
+        QQuickItem *sidebarItem = nullptr;
+        QQuickItem *treeItem = openVault(&view, vault.path(), &sidebarItem);
+        QVERIFY2(treeItem, "could not load Sidebar.qml / locate its TreeView");
+        QTRY_VERIFY(treeItem->property("rows").toInt() > 0);
+        expandEverything(treeItem);
+
+        // A Popup is a QObject, not a QQuickItem — findChild<QQuickItem*> misses it.
+        QObject *menu = sidebarItem->findChild<QObject *>(QStringLiteral("contextMenu"));
+        QVERIFY2(menu, "the context menu must be findable");
+
+        const int rowA = rowForPath(treeItem, vault.filePath(QStringLiteral("a.mp3")));
+        const int rowB = rowForPath(treeItem, vault.filePath(QStringLiteral("b.mp3")));
+        QVERIFY(rowA >= 0 && rowB >= 0);
+
+        for (int pass = 0; pass < 3; ++pass) {
+            const int row = (pass % 2 == 0) ? rowA : rowB;
+            QQuickItem *item = rowItem(treeItem, row);
+            QVERIFY(item);
+            QTest::mouseClick(&view, Qt::RightButton, Qt::NoModifier,
+                              item->mapToScene(QPointF(item->width() / 2,
+                                                       item->height() / 2)).toPoint());
+            QTRY_VERIFY2(menu->property("opened").toBool(),
+                         qPrintable(QStringLiteral("right-click #%1 must open the context menu")
+                                        .arg(pass + 1)));
+            // Dismiss it the way a user would, then go again.
+            QMetaObject::invokeMethod(menu, "close");
+            QTRY_VERIFY(!menu->property("opened").toBool());
+        }
+    }
+
+    // REGRESSION (user report, after the trash-first rework): "right click ...
+    // works once, then not again". The failing sequence isn't right-click alone
+    // (that passes) — it's right-click, USE the menu, then right-click again.
+    // Deleting now mutates the model synchronously from inside the context
+    // menu's own TapHandler, while that modal menu is mid-close.
+    void rightClickAfterUsingTheDeleteMenuEntry_stillOpensTheMenu()
+    {
+        QTemporaryDir vault;
+        QVERIFY(vault.isValid());
+        QVERIFY(touch(vault.filePath(QStringLiteral("a.mp3"))));
+        QVERIFY(touch(vault.filePath(QStringLiteral("b.mp3"))));
+
+        QQuickView view;
+        QQuickItem *sidebarItem = nullptr;
+        QQuickItem *treeItem = openVault(&view, vault.path(), &sidebarItem);
+        QVERIFY2(treeItem, "could not load Sidebar.qml / locate its TreeView");
+        QTRY_VERIFY(treeItem->property("rows").toInt() > 0);
+        expandEverything(treeItem);
+
+        QObject *menu = sidebarItem->findChild<QObject *>(QStringLiteral("contextMenu"));
+        QVERIFY(menu);
+
+        // 1. Right-click a row -> menu opens.
+        int row = rowForPath(treeItem, vault.filePath(QStringLiteral("a.mp3")));
+        QVERIFY(row >= 0);
+        QQuickItem *item = rowItem(treeItem, row);
+        QVERIFY(item);
+        QTest::mouseClick(&view, Qt::RightButton, Qt::NoModifier,
+                          item->mapToScene(QPointF(item->width() / 2,
+                                                   item->height() / 2)).toPoint());
+        QTRY_VERIFY2(menu->property("opened").toBool(), "the first right-click must open the menu");
+
+        // 2. Actually CLICK "Delete file" in it, the way a user does.
+        QQuickItem *delRow = sidebarItem->findChild<QQuickItem *>(QStringLiteral("ctxDeleteFileRow"));
+        QVERIFY2(delRow, "the context menu must have a Delete file row");
+        QTRY_VERIFY(delRow->isVisible() && delRow->width() > 0);
+        QTest::mouseClick(&view, Qt::LeftButton, Qt::NoModifier,
+                          delRow->mapToScene(QPointF(delRow->width() / 2,
+                                                     delRow->height() / 2)).toPoint());
+        QTest::qWait(200);
+        QVERIFY2(!QFileInfo::exists(vault.filePath(QStringLiteral("a.mp3"))),
+                 "precondition: the menu entry must actually have deleted the file");
+
+        // 3. The menu must have fully closed...
+        QTRY_VERIFY2(!menu->property("opened").toBool(),
+                     "the context menu must finish closing after its entry ran — a modal popup "
+                     "stuck open blocks every later click");
+        QVERIFY2(!menu->property("visible").toBool(),
+                 "a modal menu left visible keeps its overlay up and swallows all input");
+
+        // 4. ...and a second right-click must open it again.
+        row = rowForPath(treeItem, vault.filePath(QStringLiteral("b.mp3")));
+        QVERIFY(row >= 0);
+        item = rowItem(treeItem, row);
+        QVERIFY(item);
+        QTest::mouseClick(&view, Qt::RightButton, Qt::NoModifier,
+                          item->mapToScene(QPointF(item->width() / 2,
+                                                   item->height() / 2)).toPoint());
+        QTRY_VERIFY2(menu->property("opened").toBool(),
+                     "right-click must still work after using a menu entry once");
+        QCOMPARE(sidebarItem->property("ctxPath").toString(), vault.filePath(QStringLiteral("b.mp3")));
+    }
+
+    // REGRESSION (same report): "It also fails the first time and onwards for
+    // one with a transcript" — a transcribed row (status 2) shows the extra
+    // "Delete transcript" entry, and right-clicking it must still open the menu.
+    void rightClickTranscribedRow_opensTheMenu()
+    {
+        QTemporaryDir vault;
+        QVERIFY(vault.isValid());
+        QVERIFY(touch(vault.filePath(QStringLiteral("talk.mp3"))));
+        QVERIFY(touch(vault.filePath(QStringLiteral("talk.mp3.md")),
+                      "---\nmodel: x\n---\n[0] hi\n"));
+
+        QQuickView view;
+        QQuickItem *sidebarItem = nullptr;
+        QQuickItem *treeItem = openVault(&view, vault.path(), &sidebarItem);
+        QVERIFY2(treeItem, "could not load Sidebar.qml / locate its TreeView");
+        QTRY_VERIFY(treeItem->property("rows").toInt() > 0);
+        expandEverything(treeItem);
+
+        QObject *menu = sidebarItem->findChild<QObject *>(QStringLiteral("contextMenu"));
+        QVERIFY(menu);
+
+        const int row = rowForPath(treeItem, vault.filePath(QStringLiteral("talk.mp3")));
+        QVERIFY(row >= 0);
+        QQuickItem *item = rowItem(treeItem, row);
+        QVERIFY(item);
+
+        QTest::mouseClick(&view, Qt::RightButton, Qt::NoModifier,
+                          item->mapToScene(QPointF(item->width() / 2,
+                                                   item->height() / 2)).toPoint());
+        QTRY_VERIFY2(menu->property("opened").toBool(),
+                     "right-clicking a TRANSCRIBED row must open the context menu");
+        QCOMPARE(sidebarItem->property("ctxStatus").toInt(), 2);
+        QVERIFY(sidebarItem->property("ctxIsAudio").toBool());
+
+        QQuickItem *delTranscript =
+            sidebarItem->findChild<QQuickItem *>(QStringLiteral("ctxDeleteTranscriptRow"));
+        QVERIFY2(delTranscript, "the Delete transcript row must exist");
+        QVERIFY2(delTranscript->isVisible(),
+                 "Delete transcript must be offered for a transcribed audio row");
     }
 
     // The other half of the same fix: right-clicking genuinely empty space
@@ -1048,12 +1216,10 @@ private slots:
         clickAt(&view, nameTextPoint(rowItem(treeItem, rowB)), Qt::ControlModifier);
         QCOMPARE(sidebarItem->property("selectedPaths").toStringList().size(), 2);
 
+        // Single-target even though two rows are selected — and, as above,
+        // trashed immediately rather than staged for a confirm.
         QMetaObject::invokeMethod(sidebarItem, "beginDeleteTranscript",
                                    Q_ARG(QVariant, vault.filePath(QStringLiteral("a.mp3"))));
-        // Single-target even though two rows are selected.
-        QCOMPARE(sidebarItem->property("pendingDeletePaths").toStringList().size(), 1);
-
-        QMetaObject::invokeMethod(sidebarItem, "confirmFileDelete");
         QTest::qWait(150);
 
         QVERIFY2(!QFileInfo::exists(vault.filePath(QStringLiteral("a.mp3.md"))),
@@ -1083,15 +1249,73 @@ private slots:
 
         QMetaObject::invokeMethod(sidebarItem, "beginDeleteFile",
                                    Q_ARG(QVariant, vault.filePath(QStringLiteral("a.mp3"))));
-        QCOMPARE(sidebarItem->property("pendingDeletePaths").toStringList(),
-                 QStringList{vault.filePath(QStringLiteral("a.mp3"))});
-
-        QMetaObject::invokeMethod(sidebarItem, "confirmFileDelete");
         QTest::qWait(150);
 
         QVERIFY(!QFileInfo::exists(vault.filePath(QStringLiteral("a.mp3"))));
         QVERIFY2(QFileInfo::exists(vault.filePath(QStringLiteral("b.mp3"))),
                  "deleting one row must not touch any other");
+    }
+
+    // THE point of the trash-first flow: a delete that trashed cleanly must NOT
+    // prompt — it posts a snackbar carrying an Undo instead. The confirmation is
+    // reserved for the one case that's genuinely irreversible (the trash
+    // refusing), which can't be provoked without a specially-mounted filesystem
+    // (see tst_vaulttreemodel's note), so this covers the reachable half: no
+    // prompt, and an Undo that really puts the file back.
+    void trashableDelete_promptsNothingAndOffersAWorkingUndo()
+    {
+        QTemporaryDir vault;
+        QVERIFY(vault.isValid());
+        QVERIFY(touch(vault.filePath(QStringLiteral("gone.mp3")), "audio-bytes"));
+        QVERIFY(touch(vault.filePath(QStringLiteral("gone.mp3.md")), "# transcript"));
+
+        QQuickView view;
+        QQuickItem *sidebarItem = nullptr;
+        QQuickItem *treeItem = openVault(&view, vault.path(), &sidebarItem);
+        QVERIFY2(treeItem, "could not load Sidebar.qml / locate its TreeView");
+        QTRY_VERIFY(treeItem->property("rows").toInt() > 0);
+        expandEverything(treeItem);
+
+        QObject *notifications = view.engine()->singletonInstance<QObject *>(
+            QStringLiteral("SuopTranscriber"), QStringLiteral("Notifications"));
+        QVERIFY(notifications);
+        QObject *queue = notifications->property("queue").value<QObject *>();
+        QVERIFY(queue);
+        QCOMPARE(queue->property("count").toInt(), 0);
+
+        QMetaObject::invokeMethod(sidebarItem, "beginDeleteFile",
+                                   Q_ARG(QVariant, vault.filePath(QStringLiteral("gone.mp3"))));
+        QTest::qWait(150);
+
+        // Gone, with its sidecar...
+        QVERIFY(!QFileInfo::exists(vault.filePath(QStringLiteral("gone.mp3"))));
+        QVERIFY(!QFileInfo::exists(vault.filePath(QStringLiteral("gone.mp3.md"))));
+        // ...with NO confirmation staged...
+        QVERIFY2(sidebarItem->property("pendingDeletePaths").toStringList().isEmpty(),
+                 "a recoverable delete must not ask for confirmation");
+        // ...and a notification carrying an Undo.
+        QCOMPARE(queue->property("count").toInt(), 1);
+
+        QQmlExpression textExpr(qmlContext(sidebarItem), sidebarItem,
+                                QStringLiteral("Notifications.queue.get(0).text"));
+        QVERIFY2(!textExpr.evaluate().toString().isEmpty(),
+                 "the snackbar must say what happened");
+
+        // Fire action 0 exactly the way the snackbar's Undo button does.
+        QQmlExpression undoExpr(
+            qmlContext(sidebarItem), sidebarItem,
+            QStringLiteral("Notifications.trigger(Notifications.queue.get(0).token, 0)"));
+        undoExpr.evaluate();
+        QVERIFY2(!undoExpr.hasError(), qPrintable(undoExpr.error().toString()));
+        QTest::qWait(150);
+
+        QVERIFY2(QFileInfo::exists(vault.filePath(QStringLiteral("gone.mp3"))),
+                 "Undo must bring the file back");
+        QVERIFY2(QFileInfo::exists(vault.filePath(QStringLiteral("gone.mp3.md"))),
+                 "Undo must bring the sidecar back too");
+        QCOMPARE(readAll(vault.filePath(QStringLiteral("gone.mp3"))), QByteArray("audio-bytes"));
+        QVERIFY2(queue->property("count").toInt() == 0,
+                 "firing an action must dismiss its snackbar");
     }
 };
 
@@ -1105,6 +1329,15 @@ int main(int argc, char *argv[])
     qputenv("QT_QUICK_CONTROLS_STYLE", "Basic");
     QCoreApplication::setOrganizationName(QStringLiteral("suopTranscriberTestHarness"));
     QCoreApplication::setApplicationName(QStringLiteral("tst_sidebar_rename"));
+    // These tests delete files, and deleting now TRASHES them — so the trash is
+    // part of what's under test and must not be the developer's own (CLAUDE.md:
+    // never let testing touch real user state). Pointing XDG_DATA_HOME at a temp
+    // dir makes the home trash <temp>/Trash, thrown away with it. Same reasoning
+    // as tst_vaulttreemodel's initTestCase(). Must be set before the app reads
+    // it. The QTemporaryDir is static so it outlives every test.
+    static QTemporaryDir xdgDataHome;
+    if (xdgDataHome.isValid())
+        qputenv("XDG_DATA_HOME", xdgDataHome.path().toUtf8());
     QGuiApplication app(argc, argv);
     TstSidebarRename tc;
     return QTest::qExec(&tc, argc, argv);

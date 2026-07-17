@@ -1,5 +1,6 @@
 #include "UsbGrabberController.h"
 
+#include "RegexValidation.h"
 #include "UsbGrabJob.h"
 #include "VaultTreeModel.h"
 
@@ -17,6 +18,7 @@ QVariantMap ruleToVariantMap(const UsbGrabRule &rule)
     map.insert(QStringLiteral("deviceSerial"), rule.deviceSerial);
     map.insert(QStringLiteral("enabled"), rule.enabled);
     map.insert(QStringLiteral("extensionFilter"), rule.extensionFilter);
+    map.insert(QStringLiteral("filenameRegex"), rule.filenameRegex);
     map.insert(QStringLiteral("preserveStructure"), rule.preserveStructure);
     map.insert(QStringLiteral("startFolder"), rule.startFolder);
     map.insert(QStringLiteral("deviceLabel"), rule.deviceLabel);
@@ -30,6 +32,7 @@ UsbGrabRule ruleFromVariantMap(const QVariantMap &map)
     rule.deviceSerial = map.value(QStringLiteral("deviceSerial")).toString();
     rule.enabled = map.value(QStringLiteral("enabled"), false).toBool();
     rule.extensionFilter = map.value(QStringLiteral("extensionFilter")).toStringList();
+    rule.filenameRegex = map.value(QStringLiteral("filenameRegex")).toString();
     rule.preserveStructure = map.value(QStringLiteral("preserveStructure"), true).toBool();
     rule.startFolder = map.value(QStringLiteral("startFolder")).toString();
     rule.deviceLabel = map.value(QStringLiteral("deviceLabel")).toString();
@@ -43,6 +46,17 @@ UsbGrabberController::UsbGrabberController(QObject *parent)
     : QObject(parent)
 {
     connect(&m_deviceMonitor, &UsbDeviceMonitor::deviceAdded, this, &UsbGrabberController::handleDeviceAdded);
+    connect(&m_deviceMonitor, &UsbDeviceMonitor::unmountedVolumeDetected, this,
+            &UsbGrabberController::handleUnmountedVolumeDetected);
+    connect(&m_deviceMonitor, &UsbDeviceMonitor::mountFailed, this,
+            [](const QString &id, const QString &error) {
+                // Nowhere to surface this: lastError belongs to triggerManualGrab()
+                // (see its doc comment), and a hotplug has no user action to report
+                // back to — same reason a hotplug grab that can't run is skipped
+                // silently rather than setting it.
+                qWarning("UsbGrabberController: could not mount %s: %s", qUtf8Printable(id),
+                          qUtf8Printable(error));
+            });
 }
 
 UsbGrabberController::~UsbGrabberController() = default;
@@ -91,6 +105,11 @@ QVariantList UsbGrabberController::allRules() const
     for (const UsbGrabRule &rule : rules)
         list.append(ruleToVariantMap(rule));
     return list;
+}
+
+QString UsbGrabberController::regexValidationError(const QString &pattern) const
+{
+    return regexValidationErrorFor(pattern);
 }
 
 QVariantList UsbGrabberController::history() const
@@ -184,6 +203,22 @@ void UsbGrabberController::handleDeviceAdded(const QVariantMap &info)
         return;
 
     startGrabJob(rule, info.value(QStringLiteral("mountPath")).toString(), info.value(QStringLiteral("id")).toString());
+}
+
+void UsbGrabberController::handleUnmountedVolumeDetected(const QVariantMap &info)
+{
+    // THE mount gate — an enabled rule, exactly the predicate handleDeviceAdded()
+    // above grabs on. See the header for why this and not a setting of its own.
+    const QString deviceSerial = info.value(QStringLiteral("serial")).toString();
+    if (!resolveEffectiveRule(deviceSerial, info).enabled)
+        return;
+
+    // Deliberately NOT also gated on a vault being open, unlike handleDeviceAdded():
+    // an unmounted volume can't be grabbed OR configured OR previewed, so a mount is
+    // worth doing for a device the user has already vouched for whether or not a
+    // vault happens to be open this second — the mount just makes it addressable, and
+    // the grab that follows re-checks the vault on its own.
+    m_deviceMonitor.mountVolume(info.value(QStringLiteral("id")).toString());
 }
 
 QString UsbGrabberController::resolveDestinationPath(const UsbGrabRule &rule) const

@@ -118,6 +118,42 @@ WhisperCppEngine::~WhisperCppEngine()
         whisper_free(m_ctx);
 }
 
+// Repetition-hallucination hardening (2026-07-16), on top of what the
+// pipeline already had (VadChunker's bounded windows, Silero VAD gating,
+// whisper.cpp's default no_context=true and temperature-fallback retries):
+//
+// - BEAM_SEARCH (beam_size 5, whisper.cpp's own default for this strategy)
+//   instead of GREEDY. Repetition loops are the classic greedy failure —
+//   one bad argmax step enters a cycle it can't back out of, while beam
+//   search keeps alternatives alive. whisper.cpp's own CLI has defaulted to
+//   beam search (see examples/cli's params.beam_size = 5 → strategy
+//   selection), so greedy was the nonstandard path here, not the reference
+//   behavior. Cost is roughly 1.5-2x decode time — acceptable for this
+//   quality-first app (DESIGN.md).
+//
+// - entropy_thold 2.2 (default 2.4). This is whisper.cpp's repetition
+//   tripwire: a decoded 30s window whose token entropy falls below the
+//   threshold (highly repetitive text compresses well = low entropy) is
+//   rejected and retried at the next temperature step. Lowering it makes
+//   the tripwire more sensitive, at the price of extra retry passes and
+//   occasional false trips on genuinely repetitive speech (counting,
+//   reading lists) — 2.2 is a deliberately modest tightening, not the
+//   floor.
+//
+// - suppress_nst true (default false): suppresses non-speech tokens (music
+//   notation, bracketed sound-effect markers) that seed a different,
+//   smaller class of noise-driven hallucination.
+whisper_full_params WhisperCppEngine::decodeParams()
+{
+    whisper_full_params wparams = whisper_full_default_params(WHISPER_SAMPLING_BEAM_SEARCH);
+    wparams.entropy_thold = 2.2f;
+    wparams.suppress_nst = true;
+    wparams.print_progress = false;
+    wparams.print_realtime = false;
+    wparams.print_special = false;
+    return wparams;
+}
+
 std::vector<Segment> WhisperCppEngine::transcribe(const AudioChunk &chunk, const ProgressCallback &onProgress,
                                                     const SegmentCallback &onSegment, const AbortCallback &onAbort)
 {
@@ -128,10 +164,7 @@ std::vector<Segment> WhisperCppEngine::transcribe(const AudioChunk &chunk, const
     CallbackContext cbCtx{&onProgress, &onSegment, &segments,
                            static_cast<double>(chunk.pcm16kMono.size()) / 16000.0};
 
-    whisper_full_params wparams = whisper_full_default_params(WHISPER_SAMPLING_GREEDY);
-    wparams.print_progress = false;
-    wparams.print_realtime = false;
-    wparams.print_special = false;
+    whisper_full_params wparams = decodeParams();
     wparams.new_segment_callback = onNewSegment;
     wparams.new_segment_callback_user_data = &cbCtx;
     wparams.progress_callback = onProgressUpdate;

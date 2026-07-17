@@ -3,8 +3,11 @@
 #include <QByteArrayList>
 #include <QDBusArgument>
 #include <QDBusConnection>
+#include <QDBusError>
 #include <QDBusInterface>
 #include <QDBusMetaType>
+#include <QDBusPendingCallWatcher>
+#include <QDBusPendingReply>
 #include <QDBusReply>
 #include <QTimer>
 
@@ -28,6 +31,9 @@ const QString kUDisks2Service = QStringLiteral("org.freedesktop.UDisks2");
 const QString kUDisks2RootPath = QStringLiteral("/org/freedesktop/UDisks2");
 const QString kObjectManagerInterface = QStringLiteral("org.freedesktop.DBus.ObjectManager");
 const QString kPropertiesInterface = QStringLiteral("org.freedesktop.DBus.Properties");
+// What UDisks2 answers a Mount() for a volume that's already mounted — the desktop's
+// automounter having won the race, not a failure. See mountVolume().
+const QString kAlreadyMountedError = QStringLiteral("org.freedesktop.UDisks2.Error.AlreadyMounted");
 
 } // namespace
 
@@ -94,8 +100,8 @@ UsbDeviceMonitor::UsbDeviceMonitor(QObject *parent)
     currentlyMountedDevices();
 }
 
-std::optional<UsbDeviceInfo> UsbDeviceMonitor::readMountedFilesystem(const QDBusObjectPath &objectPath,
-                                                                      const UsbDbusInterfaces &interfaces) const
+std::optional<UsbDeviceInfo> UsbDeviceMonitor::readFilesystemVolume(const QDBusObjectPath &objectPath,
+                                                                     const UsbDbusInterfaces &interfaces) const
 {
     if (!interfaces.contains(kFilesystemInterface))
         return std::nullopt;
@@ -106,12 +112,13 @@ std::optional<UsbDeviceInfo> UsbDeviceMonitor::readMountedFilesystem(const QDBus
         QDBusArgument arg = fsProps.value(QStringLiteral("MountPoints")).value<QDBusArgument>();
         arg >> mountPoints;
     }
-    if (mountPoints.isEmpty())
-        return std::nullopt; // Filesystem interface present, but not mounted anywhere right now.
 
-    // Each mount point is a raw byte array ending in a trailing '\0' per the UDisks2
-    // wire format; fromUtf8(const char *) stops at that terminator on its own.
-    const QString mountPath = QString::fromUtf8(mountPoints.first().constData());
+    // Empty MountPoints is NOT a rejection — it's the unmounted case, which callers
+    // distinguish by the empty mountPath (see the header). Each mount point is a raw
+    // byte array ending in a trailing '\0' per the UDisks2 wire format;
+    // fromUtf8(const char *) stops at that terminator on its own.
+    const QString mountPath =
+        mountPoints.isEmpty() ? QString() : QString::fromUtf8(mountPoints.first().constData());
 
     // Every UDisks2 Filesystem sits on a Block object, and only the Block object
     // names the backing Drive whose Removable/ConnectionBus decide whether this is
@@ -149,8 +156,10 @@ QVariantList UsbDeviceMonitor::currentlyMountedDevices() const
 
     const UsbDbusManagedObjects objects = reply.value();
     for (auto it = objects.constBegin(); it != objects.constEnd(); ++it) {
-        const std::optional<UsbDeviceInfo> info = readMountedFilesystem(it.key(), it.value());
-        if (!info)
+        const std::optional<UsbDeviceInfo> info = readFilesystemVolume(it.key(), it.value());
+        // Mounted volumes only: this list's contract is "what can be grabbed right
+        // now", and m_knownObjectPaths tracks exactly what's been reported as such.
+        if (!info || info->mountPath.isEmpty())
             continue;
         m_knownObjectPaths.insert(it.key().path());
         result.append(toVariantMap(*info));
@@ -160,19 +169,56 @@ QVariantList UsbDeviceMonitor::currentlyMountedDevices() const
 
 void UsbDeviceMonitor::handleInterfacesAdded(const QDBusObjectPath &objectPath, const UsbDbusInterfaces &interfaces)
 {
-    const std::optional<UsbDeviceInfo> info = readMountedFilesystem(objectPath, interfaces);
-    if (info) {
+    const std::optional<UsbDeviceInfo> info = readFilesystemVolume(objectPath, interfaces);
+    if (info && !info->mountPath.isEmpty()) {
         m_knownObjectPaths.insert(objectPath.path());
         emit deviceAdded(toVariantMap(*info));
         return;
     }
 
-    // Not mounted yet — if this object at least has a Filesystem interface, an
-    // auto-mount policy may still mount it moments from now (see
-    // rescanForNewlyMountedDevices()'s doc comment). One retry is enough: this is a
-    // one-shot race with a fast desktop-side mount call, not a slow/uncertain wait.
+    // External media that nothing has mounted — offer it to whoever knows whether it's
+    // worth mounting (UsbGrabberController, which holds the rules). Note this class
+    // does NOT call mountVolume() itself off the back of its own signal: "may be
+    // mounted" and "should be mounted" are different questions, and this class only
+    // answers the first.
+    if (info)
+        emit unmountedVolumeDetected(toVariantMap(*info));
+
+    // Either way, an auto-mount policy may still mount it moments from now (see
+    // rescanForNewlyMountedDevices()'s doc comment) — including on a device with no
+    // rule, which the line above just declined to mount but which must still show up
+    // in the settings UI's device list once the desktop mounts it. One retry is
+    // enough: this is a one-shot race with a fast desktop-side mount call, not a
+    // slow/uncertain wait.
     if (interfaces.contains(kFilesystemInterface))
         QTimer::singleShot(1500, this, &UsbDeviceMonitor::rescanForNewlyMountedDevices);
+}
+
+void UsbDeviceMonitor::mountVolume(const QString &volumeId)
+{
+    QDBusInterface filesystem(kUDisks2Service, volumeId, kFilesystemInterface, QDBusConnection::systemBus());
+
+    QVariantMap options;
+    options.insert(QStringLiteral("auth.no_user_interaction"), true);
+
+    auto *watcher = new QDBusPendingCallWatcher(
+        filesystem.asyncCall(QStringLiteral("Mount"), QVariant::fromValue(options)), this);
+    connect(watcher, &QDBusPendingCallWatcher::finished, this, [this, volumeId](QDBusPendingCallWatcher *call) {
+        call->deleteLater();
+
+        const QDBusPendingReply<QString> reply = *call;
+        if (reply.isError() && reply.error().name() != kAlreadyMountedError) {
+            emit mountFailed(volumeId, reply.error().message());
+            return;
+        }
+
+        // Success, or someone else mounted it first — either way there is now a mount
+        // to report, and the reply's own mount path is discarded in favour of the one
+        // shared reporting path (see mountVolume()'s doc comment). AlreadyMounted also
+        // covers the case where the desktop's automounter won: the rescan's
+        // m_knownObjectPaths check means the volume is still only reported once.
+        rescanForNewlyMountedDevices();
+    });
 }
 
 void UsbDeviceMonitor::rescanForNewlyMountedDevices()
@@ -187,9 +233,9 @@ void UsbDeviceMonitor::rescanForNewlyMountedDevices()
     for (auto it = objects.constBegin(); it != objects.constEnd(); ++it) {
         if (m_knownObjectPaths.contains(it.key().path()))
             continue; // already reported (or not a mounted filesystem last time we looked)
-        const std::optional<UsbDeviceInfo> info = readMountedFilesystem(it.key(), it.value());
-        if (!info)
-            continue;
+        const std::optional<UsbDeviceInfo> info = readFilesystemVolume(it.key(), it.value());
+        if (!info || info->mountPath.isEmpty())
+            continue; // still unmounted — this rescan only ever reports NEWLY MOUNTED volumes
         m_knownObjectPaths.insert(it.key().path());
         emit deviceAdded(toVariantMap(*info));
     }

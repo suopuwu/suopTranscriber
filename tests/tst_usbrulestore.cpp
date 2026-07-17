@@ -60,6 +60,10 @@ private slots:
         rule.deviceSerial = QStringLiteral("ABC123");
         rule.enabled = true;
         rule.extensionFilter = {QStringLiteral("wav"), QStringLiteral("mp3")};
+        // Backslashes and quantifiers must survive QSettings' own escaping
+        // intact — a pattern that came back mangled would silently filter
+        // differently than the one the user validated in the field.
+        rule.filenameRegex = QStringLiteral("^REC_(\\d{4})\\.wav$");
         rule.preserveStructure = false;
         rule.startFolder = QStringLiteral("Recordings/Voice");
         rule.deviceLabel = QStringLiteral("Zoom H1n");
@@ -70,6 +74,7 @@ private slots:
         QCOMPARE(loaded.deviceSerial, rule.deviceSerial);
         QCOMPARE(loaded.enabled, rule.enabled);
         QCOMPARE(loaded.extensionFilter, rule.extensionFilter);
+        QCOMPARE(loaded.filenameRegex, rule.filenameRegex);
         QCOMPARE(loaded.preserveStructure, rule.preserveStructure);
         QCOMPARE(loaded.startFolder, rule.startFolder);
         QCOMPARE(loaded.deviceLabel, rule.deviceLabel);

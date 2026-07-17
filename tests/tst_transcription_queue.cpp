@@ -803,7 +803,19 @@ private slots:
     // Bug report (2026-07-09): "the pause button doesn't work for the rest
     // of the session" after cancelling a job during its "loading" phase.
     // Reproduces the exact user sequence: cancel job #1 while it's loading,
-    // then queue job #2 and try to pause IT during real transcribing.
+    // then queue job #2 and try to pause IT during a real, pausable phase.
+    //
+    // Job #2 pauses during "decoding" (a real, SIGSTOP-able ffmpeg subprocess
+    // — see pauseActive_duringDecoding_reallyPauses_notRestart), NOT during
+    // "transcribing": jfk.wav is short enough that whisper can finish the
+    // whole clip inside a single QTRY tick, so a pause requested "during
+    // transcribing" intermittently landed after the job had already completed
+    // — a flake, not the bug. The suppression this test guards against (a
+    // leaked cancel flag from job #1 breaking pause on job #2) lives in the
+    // shared worker pause/cancel state and would break pause in ANY phase, so
+    // catching it during the deterministically-observable decode window proves
+    // exactly the same thing. Uses a synthetic tone long enough that decode
+    // takes real, catchable wall-clock time.
     void pauseActive_stillWorksOnNextJob_afterCancelDuringPreviousLoading()
     {
         const QString modelPath = locateRealModel();
@@ -820,7 +832,14 @@ private slots:
         const QString sampleA = vault.path() + "/a.wav";
         const QString sampleB = vault.path() + "/b.wav";
         QVERIFY(QFile::copy(QStringLiteral(SUOP_SAMPLES_DIR "/jfk.wav"), sampleA));
-        QVERIFY(QFile::copy(QStringLiteral(SUOP_SAMPLES_DIR "/jfk.wav"), sampleB));
+        // Long tone so job #2's decode takes an observable amount of time (see
+        // pauseActive_duringDecoding_reallyPauses_notRestart for the same
+        // technique); jfk.wav decodes in well under one polling tick.
+        QProcess gen;
+        gen.start("ffmpeg", {"-y", "-f", "lavfi", "-i", QStringLiteral("sine=frequency=440:duration=300"),
+                              sampleB});
+        if (!gen.waitForFinished(30000) || gen.exitCode() != 0 || !QFileInfo::exists(sampleB))
+            QSKIP("could not generate synthetic test audio via ffmpeg");
 
         TranscriptionController controller;
         QSignalSpy finishedSpy(&controller, &TranscriptionController::finished);
@@ -833,17 +852,23 @@ private slots:
         QCOMPARE(finishedSpy.at(0).at(1).toBool(), false);
         QCOMPARE(finishedSpy.at(0).at(2).toString(), QStringLiteral("Cancelled"));
 
-        // Job #2: a fresh job for a different file. Model is already loaded
-        // (cached m_engine from job #1), so this should reach "transcribing"
-        // quickly, real decode work in flight.
+        // Job #2: a fresh job for a different file. Pause it during "decoding"
+        // — if job #1's cancel had leaked into the shared worker state, this
+        // pause would be silently suppressed (isActivePaused stays false) or
+        // the job would cancel outright instead of finishing true.
         controller.transcribe(QUrl::fromLocalFile(sampleB), QUrl::fromLocalFile(vault.path()), kModelId, false);
-        QTRY_VERIFY_WITH_TIMEOUT(controller.currentPhase() == QStringLiteral("transcribing"), 10000);
+        QTRY_VERIFY_WITH_TIMEOUT(controller.currentPhase() == QStringLiteral("decoding"), 10000);
 
         controller.pauseActive();
         QTRY_VERIFY_WITH_TIMEOUT(controller.isActivePaused(), 5000);
+        // Job #2 (sampleB) is still Active — a real cooperative pause, not the
+        // restart-based Paused status. Keyed off its fileUrl, NOT jobs().at(0):
+        // index 0 is the cancelled job #1, whose status is legitimately
+        // "failed".
+        QCOMPARE(statusOf(controller, QUrl::fromLocalFile(sampleB)), QStringLiteral("active"));
 
         controller.resumeActive();
-        QVERIFY(finishedSpy.wait(10000));
+        QVERIFY(finishedSpy.wait(60000));
         QCOMPARE(finishedSpy.at(1).at(1).toBool(), true);
     }
 

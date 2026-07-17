@@ -47,14 +47,24 @@ must show both:
   default boxed background — `background: UnderlineField { focused:
   <id>.activeFocus }`. Thin/dim normally, thicker + `AppSettings.highlightColor`
   when focused.
+- A **pure text box** — one that exists only to be typed into (the USB
+  grabber's filename regex and start folder, search/filter fields, the numeric
+  settings fields, the rename editors) — always shows its underline, dim (25%)
+  at rest, so it reads as an input even when untouched. Never leave one with no
+  underline at all: there's no surrounding prose for it to blend into, so a
+  bare field just looks like a label. The three tiers are focused (100%) >
+  hovered (50%) > at rest (25%).
+- The only fields that hide the underline at rest are the always-editable ones
+  below, via `plainUntilHovered: true`.
 
 ## Always-editable text
 
 - Display-vs-edit is never a swap between two different elements (a `Label`/
   read-only `TextEdit` that gets replaced by a `TextField`/`TextArea` on
   click). One editable control is present at all times, styled via
-  `UnderlineField` (see "Text fields" above) so it reads as plain text until
-  focused. A visibility flag tied to focus state is exactly the bug this
+  `UnderlineField { plainUntilHovered: true }` (see "Text fields" above) so it
+  reads as plain text until hovered/focused. `plainUntilHovered` is for these
+  fields ONLY — a pure text box keeps its resting underline. A visibility flag tied to focus state is exactly the bug this
   fixes: the platform's native right-click "Copy" menu steals focus, and if
   that flip hides the field, the box disappears out from under the user.
 - If the pill/control ALSO needs a click-triggered action other than editing
@@ -95,18 +105,79 @@ must show both:
     handler) and reject + revert with an inline warning banner rather than
     writing a corrupted result.
 
-## Warning banners
+## Feedback: inline banner vs. snackbar
 
-- Inline, not a popup/toast: a plain `Label`, conditionally visible on a
-  non-empty backing string property (empty = hidden, no separate `visible`
-  flag to keep in sync).
-- Color `#e07a7a` for an error/rejection (e.g. `speakerRenameError`),
-  `#e0a25a` for a softer "didn't fully work" warning (e.g. a requested
-  feature that degraded rather than failed outright).
+Two surfaces, and the split is **what the message is about**, not how bad it
+is. Both use the same colors (below), so the same class of problem reads the
+same wherever it lands.
+
+- **Describes the state of a control you're looking at** → inline banner,
+  beside that control. An invalid regex belongs next to the search bar; an
+  out-of-vault folder next to its picker. Moving these to a screen corner
+  breaks the association with the field they explain.
+- **Reports that an action just happened/failed, and is over** → snackbar. A
+  refused import, move, rename, or delete has no control to sit beside — the
+  row just stays put. These float bottom-right and auto-expire.
+
+The tell: if the message must survive as long as some state does (the open
+file's stored metadata, a field's current contents), it's inline. If it
+describes a moment that has already passed, it's a snackbar.
+
+### Warning banners (inline)
+
+- A plain `Label`, conditionally visible on a non-empty backing string
+  property (empty = hidden, no separate `visible` flag to keep in sync).
 - `font.pixelSize: 11`, `wrapMode: Text.WordWrap`, `Layout.fillWidth: true`.
 - No dismiss button — the label disappears once its backing property clears
   (either automatically, e.g. a timer, or the next time the underlying state
   it reports on changes).
+
+### Snackbars (floating)
+
+- **Never instantiate `Snackbar.qml` at a call site.** Post to the
+  `Notifications` singleton: `Notifications.error(qsTr("Couldn't move: …"))`,
+  or `.warn()` / `.info()` / `.post(cfg)` for actions and a custom timeout.
+- One `SnackbarHost` exists, in `Main.qml`; it renders the queue bottom-right
+  over `Overlay.overlay`. Don't add a second, and don't parent snackbars
+  anywhere else — the whole point is that every floating message lands in one
+  place the user learns to look at.
+- Actions are `[{ label, onTriggered }]` on `post()`. An action is terminal:
+  firing it dismisses the entry. Use one for a **reversal** (`Undo`) or a
+  **retry**, not as a general button rack.
+- Action/dismiss controls are `Item` + `TapHandler`, never a QQC2 `Button` or
+  `MouseArea` — a focusable control would steal focus from a `TextField`
+  behind the snackbar, and fields commit on blur here (see "Always-editable
+  text"), so a press could fire a commit whose failure posts another snackbar
+  mid-click.
+- Entries auto-expire (default 6s, `timeout: 0` for sticky) and pause while
+  the pointer is over the stack. An action never has to race its own timer.
+- No confirmations and no successes that speak for themselves — a renamed row
+  visibly renames itself. Post only what is otherwise silent.
+
+## Destructive actions: trash first, confirm only what's permanent
+
+- **Never confirm an action you can undo.** A delete tries the trash first; if
+  that works, it just happens, and a snackbar offers `Undo`. A prompt on a
+  reversible action is friction that teaches the user to click through
+  prompts — which is what makes the one that matters get clicked through too.
+- **A confirmation means "this cannot be undone", and only that.** The only
+  delete prompt left (`fileDeleteConfirmPopup`) is reached solely for entries
+  the trash refused, and its wording says so.
+- **Don't predict whether the trash will work — try it.** A failed
+  `QFile::moveToTrash()` is non-destructive (see `trashOnly()` in
+  `VaultTreeModel.cpp`), so attempting it *is* the test, and the entries that
+  fail are still on disk, untouched, ready to prompt about. Predicting would
+  mean reimplementing the freedesktop spec and hoping it matches Qt's.
+- Recoverable and permanent deletion are **separate model calls**
+  (`trashFiles()` vs `deleteFilesPermanently()`), never one call that silently
+  picks. A UI that can't tell which it got has to assume the worst every time.
+
+### Colors (both surfaces)
+
+- `#e07a7a` for an error/rejection, `#e0a25a` for a softer "didn't fully
+  work" warning (e.g. a requested feature that degraded rather than failed
+  outright). A snackbar's `kind` (`"error"` / `"warning"` / `"info"`) selects
+  these; `"info"` uses `AppSettings.accentColor`.
 
 ## Iconography
 

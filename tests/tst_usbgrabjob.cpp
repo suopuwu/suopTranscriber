@@ -658,6 +658,219 @@ private slots:
         QVERIFY(previewSpy.first().at(0).toList().isEmpty());
         QVERIFY(!previewSpy.first().at(1).toString().isEmpty());
     }
+
+    // --- filenameRegex (UsbGrabRule::filenameRegex) -----------------------
+    // Same engine and same semantics as the split-recording combine rules:
+    // QRegularExpression, matched against the FILE NAME only, unanchored.
+
+    void filenameRegex_copiesOnlyMatchingFiles()
+    {
+        QTemporaryDir device;
+        QTemporaryDir vault;
+        QVERIFY(device.isValid() && vault.isValid());
+        QVERIFY(writeFile(device.filePath("REC_0042.wav"), "keep"));
+        QVERIFY(writeFile(device.filePath("MEMO_0042.wav"), "drop"));
+
+        VaultTreeModel vaultModel;
+        vaultModel.setVaultPath(QUrl::fromLocalFile(vault.path()));
+
+        UsbGrabRule rule;
+        rule.deviceSerial = QStringLiteral("TEST-SERIAL");
+        rule.filenameRegex = QStringLiteral("^REC_\\d+");
+
+        UsbGrabJob job;
+        QSignalSpy finishedSpy(&job, &UsbGrabJob::finished);
+        job.start(rule, device.path(), vault.path(), &vaultModel);
+        QVERIFY(finishedSpy.wait(10000));
+
+        QCOMPARE(finishedSpy.first().at(0).toInt(), 1); // filesCopied
+        QVERIFY(QFileInfo::exists(vault.filePath("REC_0042.wav")));
+        QVERIFY(!QFileInfo::exists(vault.filePath("MEMO_0042.wav")));
+    }
+
+    // Empty means "no regex constraint", NOT "match nothing" — the same
+    // reading extensionFilter gets (see emptyExtensionFilter_... above).
+    void emptyFilenameRegex_meansAllFilesNotZeroFiles()
+    {
+        QTemporaryDir device;
+        QTemporaryDir vault;
+        QVERIFY(device.isValid() && vault.isValid());
+        QVERIFY(writeFile(device.filePath("a.wav"), "a"));
+        QVERIFY(writeFile(device.filePath("b.txt"), "b"));
+
+        VaultTreeModel vaultModel;
+        vaultModel.setVaultPath(QUrl::fromLocalFile(vault.path()));
+
+        UsbGrabRule rule;
+        rule.deviceSerial = QStringLiteral("TEST-SERIAL");
+        // filenameRegex left empty deliberately.
+
+        UsbGrabJob job;
+        QSignalSpy finishedSpy(&job, &UsbGrabJob::finished);
+        job.start(rule, device.path(), vault.path(), &vaultModel);
+        QVERIFY(finishedSpy.wait(10000));
+
+        QCOMPARE(finishedSpy.first().at(0).toInt(), 2);
+    }
+
+    // The two filters AND: a file must clear BOTH. Each stays independently
+    // "no constraint" when blank, so neither can silently widen the other.
+    void filenameRegexAndExtensionFilter_bothMustPass()
+    {
+        QTemporaryDir device;
+        QTemporaryDir vault;
+        QVERIFY(device.isValid() && vault.isValid());
+        QVERIFY(writeFile(device.filePath("REC_1.wav"), "both"));   // ext ok, regex ok  -> grab
+        QVERIFY(writeFile(device.filePath("MEMO_1.wav"), "ext"));   // ext ok, regex no  -> filtered
+        QVERIFY(writeFile(device.filePath("REC_2.txt"), "regex"));  // ext no, regex ok  -> filtered
+
+        VaultTreeModel vaultModel;
+        vaultModel.setVaultPath(QUrl::fromLocalFile(vault.path()));
+
+        UsbGrabRule rule;
+        rule.deviceSerial = QStringLiteral("TEST-SERIAL");
+        rule.extensionFilter = {QStringLiteral("wav")};
+        rule.filenameRegex = QStringLiteral("^REC_");
+
+        UsbGrabJob job;
+        QSignalSpy finishedSpy(&job, &UsbGrabJob::finished);
+        job.start(rule, device.path(), vault.path(), &vaultModel);
+        QVERIFY(finishedSpy.wait(10000));
+
+        QCOMPARE(finishedSpy.first().at(0).toInt(), 1);
+        QVERIFY(QFileInfo::exists(vault.filePath("REC_1.wav")));
+        QVERIFY(!QFileInfo::exists(vault.filePath("MEMO_1.wav")));
+        QVERIFY(!QFileInfo::exists(vault.filePath("REC_2.txt")));
+    }
+
+    // Matched against the file name, never the path — so a pattern naming a
+    // FOLDER matches nothing, and a file deep in a matching folder is judged
+    // only on its own name. Mirrors matchRuleCapturedKey()'s use of
+    // QFileInfo::fileName() for combine rules.
+    void filenameRegex_matchesFileNameNotPath()
+    {
+        QTemporaryDir device;
+        QTemporaryDir vault;
+        QVERIFY(device.isValid() && vault.isValid());
+        QVERIFY(writeFile(device.filePath("DCIM/clip.wav"), "in-dcim"));
+
+        VaultTreeModel vaultModel;
+        vaultModel.setVaultPath(QUrl::fromLocalFile(vault.path()));
+
+        UsbGrabRule rule;
+        rule.deviceSerial = QStringLiteral("TEST-SERIAL");
+        rule.preserveStructure = false;
+        rule.filenameRegex = QStringLiteral("DCIM"); // a FOLDER name, not a file name
+
+        UsbGrabJob job;
+        QSignalSpy finishedSpy(&job, &UsbGrabJob::finished);
+        job.start(rule, device.path(), vault.path(), &vaultModel);
+        QVERIFY(finishedSpy.wait(10000));
+
+        QCOMPARE(finishedSpy.first().at(0).toInt(), 0);
+        QVERIFY(!QFileInfo::exists(vault.filePath("clip.wav")));
+    }
+
+    // Unanchored unless the pattern says otherwise, exactly like the combine
+    // rules — "REC" finds REC anywhere in the name. This is why the field's
+    // hint text calls out ^ and $.
+    void filenameRegex_isUnanchoredUnlessAnchored()
+    {
+        QTemporaryDir device;
+        QTemporaryDir vault;
+        QVERIFY(device.isValid() && vault.isValid());
+        QVERIFY(writeFile(device.filePath("my_REC_tail.wav"), "substring"));
+
+        VaultTreeModel vaultModel;
+        vaultModel.setVaultPath(QUrl::fromLocalFile(vault.path()));
+
+        UsbGrabRule unanchored;
+        unanchored.deviceSerial = QStringLiteral("TEST-SERIAL");
+        unanchored.filenameRegex = QStringLiteral("REC");
+
+        UsbGrabJob job;
+        QSignalSpy finishedSpy(&job, &UsbGrabJob::finished);
+        job.start(unanchored, device.path(), vault.path(), &vaultModel);
+        QVERIFY(finishedSpy.wait(10000));
+        QCOMPARE(finishedSpy.first().at(0).toInt(), 1);
+
+        // ...and anchoring it excludes the very same file.
+        QTemporaryDir vault2;
+        QVERIFY(vault2.isValid());
+        VaultTreeModel vaultModel2;
+        vaultModel2.setVaultPath(QUrl::fromLocalFile(vault2.path()));
+
+        UsbGrabRule anchored = unanchored;
+        anchored.filenameRegex = QStringLiteral("^REC");
+
+        UsbGrabJob job2;
+        QSignalSpy finishedSpy2(&job2, &UsbGrabJob::finished);
+        job2.start(anchored, device.path(), vault2.path(), &vaultModel2);
+        QVERIFY(finishedSpy2.wait(10000));
+        QCOMPARE(finishedSpy2.first().at(0).toInt(), 0);
+    }
+
+    // Fails CLOSED. An unparseable pattern must never be read as "no
+    // constraint": on the "*" catch-all rule that would bulk-copy a whole
+    // device on a typo. Copying nothing is recoverable and is what the
+    // pattern field's own ✗ indicator already warns about.
+    void invalidFilenameRegex_copiesNothing()
+    {
+        QTemporaryDir device;
+        QTemporaryDir vault;
+        QVERIFY(device.isValid() && vault.isValid());
+        QVERIFY(writeFile(device.filePath("clip.wav"), "audio"));
+
+        VaultTreeModel vaultModel;
+        vaultModel.setVaultPath(QUrl::fromLocalFile(vault.path()));
+
+        UsbGrabRule rule;
+        rule.deviceSerial = QStringLiteral("TEST-SERIAL");
+        rule.filenameRegex = QStringLiteral("(unterminated[");
+
+        UsbGrabJob job;
+        QSignalSpy finishedSpy(&job, &UsbGrabJob::finished);
+        job.start(rule, device.path(), vault.path(), &vaultModel);
+        QVERIFY(finishedSpy.wait(10000));
+
+        QCOMPARE(finishedSpy.first().at(0).toInt(), 0);
+        QVERIFY(!QFileInfo::exists(vault.filePath("clip.wav")));
+    }
+
+    // The preview must classify a regex-rejected file as "filtered" just like
+    // an extension-rejected one — one status covers both filters, and the
+    // preview still lists EVERY file the scan saw.
+    void preview_regexRejectedFileIsFiltered()
+    {
+        QTemporaryDir device;
+        QTemporaryDir vault;
+        QVERIFY(device.isValid() && vault.isValid());
+        QVERIFY(writeFile(device.filePath("REC_1.wav"), "keep"));
+        QVERIFY(writeFile(device.filePath("MEMO_1.wav"), "drop"));
+
+        UsbGrabRule rule;
+        rule.deviceSerial = QStringLiteral("TEST-SERIAL");
+        rule.filenameRegex = QStringLiteral("^REC_");
+
+        UsbGrabJob job;
+        QSignalSpy previewSpy(&job, &UsbGrabJob::previewReady);
+        job.startPreview(rule, device.path(), vault.path());
+        QVERIFY(previewSpy.wait(10000));
+
+        const QVariantList entries = previewSpy.first().at(0).toList();
+        QCOMPARE(entries.size(), 2);
+        QHash<QString, QString> statusByPath;
+        for (const QVariant &entryVariant : entries) {
+            const QVariantMap entry = entryVariant.toMap();
+            statusByPath.insert(entry.value(QStringLiteral("path")).toString(),
+                                entry.value(QStringLiteral("status")).toString());
+        }
+        QCOMPARE(statusByPath.value(QStringLiteral("REC_1.wav")), QStringLiteral("grab"));
+        QCOMPARE(statusByPath.value(QStringLiteral("MEMO_1.wav")), QStringLiteral("filtered"));
+
+        // Nothing was copied — a preview never writes.
+        QVERIFY(!QFileInfo::exists(vault.filePath("REC_1.wav")));
+    }
 };
 
 QTEST_GUILESS_MAIN(TstUsbGrabJob)

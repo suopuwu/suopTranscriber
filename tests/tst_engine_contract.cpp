@@ -26,6 +26,8 @@
 #include "TranscriptionEngine.h"
 #include "WhisperCppEngine.h"
 
+#include <whisper.h>
+
 // ---------------------------------------------------------------------------
 // Spec: Segment is the unit of abstraction — a plain aggregate holding
 // sentence-level start/end times (seconds, doubles) plus text. No word
@@ -138,6 +140,36 @@ private slots:
         const AudioChunk chunk;
         QVERIFY(chunk.pcm16kMono.empty());
         QCOMPARE(chunk.offsetSeconds, 0.0);
+    }
+
+    // Spec: WhisperCppEngine's decode parameters carry the
+    // repetition-hallucination hardening documented at decodeParams()'s
+    // definition — beam search (not greedy), a tightened entropy tripwire,
+    // and non-speech-token suppression — while leaving whisper.cpp's
+    // temperature-fallback retry loop and cross-window context reset
+    // (no_context) at their defaults, which the hardening relies on.
+    void decodeParamsHardenAgainstRepetitionHallucination()
+    {
+        const whisper_full_params wparams = WhisperCppEngine::decodeParams();
+
+        // Beam search with whisper.cpp's own beam_size default (5) — the
+        // same strategy its CLI uses; greedy is the nonstandard path.
+        QCOMPARE(wparams.strategy, WHISPER_SAMPLING_BEAM_SEARCH);
+        QCOMPARE(wparams.beam_search.beam_size, 5);
+
+        // Repetition tripwire tightened below the 2.4 default; low-entropy
+        // (repetitive) windows get rejected and retried at a higher
+        // temperature, so the fallback ladder must remain enabled for the
+        // rejection to have somewhere to go.
+        QVERIFY(wparams.entropy_thold < 2.4f);
+        QCOMPARE(wparams.entropy_thold, 2.2f);
+        QVERIFY(wparams.temperature_inc > 0.0f);
+
+        // Non-speech tokens (music notation, sound-effect markers) stay
+        // suppressed, and a fresh text context per 30s window keeps one
+        // window's repetition loop from seeding the next.
+        QVERIFY(wparams.suppress_nst);
+        QVERIFY(wparams.no_context);
     }
 
     // Spec (DESIGN.md "Engine architecture" + CLAUDE.md): engines return

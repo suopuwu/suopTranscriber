@@ -1,6 +1,7 @@
-// Spec under test — split-recording combine (see DESIGN.md's vault
-// layout section and TranscriptionController::findCombineGroups()'s doc
-// comment): user-authored regex rules matched against vault filenames,
+// Spec under test — split-recording combine (see DESIGN.md's "Split-recording
+// combine" section for the overview and TranscriptionController::
+// findCombineGroups()'s doc comment for the authoritative
+// semantics): user-authored regex rules matched against vault filenames,
 // grouped by their CAPTURED text (not just "the rule matched") AND their
 // containing folder (a rule only sees the bare filename, so same-named parts
 // in two folders are two groups, never one), ordered by mtime by default — or
@@ -514,107 +515,6 @@ private slots:
         const QUrl vaultUrl = QUrl::fromLocalFile(dir.path());
         controller.combineGroup(rules, allPaths, group.value("outputPath").toString(), vaultUrl, false);
         controller.combineGroup(rules, allPaths, group.value("outputPath").toString(), vaultUrl, false);
-        QCOMPARE(controller.jobs().size(), 1);
-    }
-
-    // Item 44: manual combine — combineSelected() takes an EXPLICIT, user-
-    // selected list of audio files (no regex rule involved) and must enqueue
-    // exactly ONE combine job over exactly those files, ordered mtime
-    // ascending (findCombineGroups()'s default order, reused so the
-    // concatenation isn't in arbitrary selection/click order). The files here
-    // are PASSED newest-first so a result that echoed input order (rather than
-    // sorting by mtime) would be provably wrong.
-    void combineSelected_enqueuesCombineJobOverSelectionInMtimeOrder()
-    {
-        QTemporaryDir dir;
-        QVERIFY(dir.isValid());
-        const QString oldest = touchFile(dir.path(), "part_a.wav", 60);
-        const QString middle = touchFile(dir.path(), "part_b.wav", 40);
-        const QString newest = touchFile(dir.path(), "part_c.wav", 20);
-
-        TranscriptionController controller;
-        const QUrl vaultUrl = QUrl::fromLocalFile(dir.path());
-        // Deliberately newest -> oldest input order; expected output is
-        // oldest -> newest (mtime ascending).
-        const QVariantList selection = {QUrl::fromLocalFile(newest), QUrl::fromLocalFile(middle),
-                                        QUrl::fromLocalFile(oldest)};
-        controller.combineSelected(selection, vaultUrl);
-
-        const QVariantList jobsAfter = controller.jobs();
-        QCOMPARE(jobsAfter.size(), 1);
-        const QVariantMap job = jobsAfter.first().toMap();
-        QCOMPARE(job.value("kind").toString(), QStringLiteral("combine"));
-        QCOMPARE(job.value("combineSourcePaths").toStringList(), QStringList({oldest, middle, newest}));
-        // Output is named from the earliest part's stem, ".combined.<ext>",
-        // beside it — same shape as the auto path's outputPath.
-        QCOMPARE(job.value("fileUrl").toUrl(),
-                 QUrl::fromLocalFile(dir.path() + QStringLiteral("/part_a.combined.wav")));
-    }
-
-    // Fewer than two audio files is a silent no-op — a single audio file, or a
-    // selection whose only extra member is a non-audio .md (dropped by the
-    // audio filter), leaves zero jobs enqueued.
-    void combineSelected_underTwoAudioFilesIsNoOp()
-    {
-        QTemporaryDir dir;
-        QVERIFY(dir.isValid());
-        const QString a1 = touchFile(dir.path(), "solo.wav", 60);
-        const QString notAudio = touchFile(dir.path(), "notes.md", 40);
-
-        TranscriptionController controller;
-        const QUrl vaultUrl = QUrl::fromLocalFile(dir.path());
-
-        // One audio file only.
-        controller.combineSelected({QUrl::fromLocalFile(a1)}, vaultUrl);
-        QVERIFY(controller.jobs().isEmpty());
-
-        // One audio + one .md: the .md is dropped, leaving <2 audio -> no-op.
-        controller.combineSelected({QUrl::fromLocalFile(a1), QUrl::fromLocalFile(notAudio)}, vaultUrl);
-        QVERIFY(controller.jobs().isEmpty());
-
-        // Empty selection -> no-op.
-        controller.combineSelected({}, vaultUrl);
-        QVERIFY(controller.jobs().isEmpty());
-    }
-
-    // A non-audio member mixed into an otherwise-valid selection is dropped,
-    // not fed to the merge — combineSourcePaths must contain only the audio
-    // files, still ordered by mtime.
-    void combineSelected_dropsNonAudioMembers()
-    {
-        QTemporaryDir dir;
-        QVERIFY(dir.isValid());
-        const QString a1 = touchFile(dir.path(), "one.wav", 60);
-        const QString a2 = touchFile(dir.path(), "two.wav", 40);
-        const QString md = touchFile(dir.path(), "one.wav.md", 30);
-
-        TranscriptionController controller;
-        const QUrl vaultUrl = QUrl::fromLocalFile(dir.path());
-        controller.combineSelected(
-            {QUrl::fromLocalFile(a1), QUrl::fromLocalFile(md), QUrl::fromLocalFile(a2)}, vaultUrl);
-
-        const QVariantList jobsAfter = controller.jobs();
-        QCOMPARE(jobsAfter.size(), 1);
-        QCOMPARE(jobsAfter.first().toMap().value("combineSourcePaths").toStringList(),
-                 QStringList({a1, a2}));
-    }
-
-    // Calling combineSelected() twice for the same selection must not double-
-    // queue it — the output path is deterministic (earliest part's stem), so
-    // the second call hits isCombineQueued() and no-ops, mirroring
-    // combineGroup()'s dedup.
-    void combineSelected_alreadyQueuedIsNotDuplicated()
-    {
-        QTemporaryDir dir;
-        QVERIFY(dir.isValid());
-        const QString a1 = touchFile(dir.path(), "x.wav", 60);
-        const QString a2 = touchFile(dir.path(), "y.wav", 40);
-
-        TranscriptionController controller;
-        const QUrl vaultUrl = QUrl::fromLocalFile(dir.path());
-        const QVariantList selection = {QUrl::fromLocalFile(a1), QUrl::fromLocalFile(a2)};
-        controller.combineSelected(selection, vaultUrl);
-        controller.combineSelected(selection, vaultUrl);
         QCOMPARE(controller.jobs().size(), 1);
     }
 };

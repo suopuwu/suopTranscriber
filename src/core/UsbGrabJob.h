@@ -59,9 +59,11 @@ public:
 
     // Kicks off the scan+copy on the worker thread: recursively walks
     // mountPath + "/" + rule.startFolder (or just mountPath if startFolder is
-    // empty), copies every file whose extension matches rule.extensionFilter
-    // (case-insensitive; an empty filter means "all files", not zero files)
-    // and that isn't already present in destinationVaultPath under the same
+    // empty), copies every file that clears BOTH of the rule's filters —
+    // rule.extensionFilter (case-insensitive) and rule.filenameRegex
+    // (unanchored, against the file name only), each of which means "no
+    // constraint" when blank rather than "match nothing" — and that isn't
+    // already present in destinationVaultPath under the same
     // basename + size + mtime, preserving relative subfolder structure under
     // destinationVaultPath if rule.preserveStructure is true (flattened into
     // destinationVaultPath's root otherwise). destinationVaultTreeModel is
@@ -73,16 +75,20 @@ public:
     Q_INVOKABLE void start(const UsbGrabRule &rule, const QString &mountPath, const QString &destinationVaultPath,
                             VaultTreeModel *destinationVaultTreeModel);
 
-    // Same scan as start() — same extension filter + quick-check dedup logic,
-    // run on the same worker thread — but never copies anything and never
-    // appends a history entry. Classifies EVERY file the scan sees (not just
-    // extension-matching ones) so the caller can show a complete line-by-line
+    // Same scan as start() — same filters + quick-check dedup logic, run on
+    // the same worker thread — but never copies anything and never appends a
+    // history entry. Classifies EVERY file the scan sees (not just
+    // filter-matching ones) so the caller can show a complete line-by-line
     // "what would happen" preview: each entry in previewReady()'s list is a
     // {"path": <relative to the scan root>, "status": ...} map, status one of
-    // "grab" (matches the filter, not already present — would be copied),
-    // "duplicate" (matches the filter, a file with the same basename, size and
+    // "grab" (matches the filters, not already present — would be copied),
+    // "duplicate" (matches the filters, a file with the same basename, size and
     // mtime already exists at the destination — would be skipped), or
-    // "filtered" (extension doesn't match — never considered for copying).
+    // "filtered" (failed the extension filter and/or the filename regex —
+    // never considered for copying). One "filtered" status covers both filters
+    // rather than distinguishing them: the entry carries the path, and the
+    // pattern field's own live ✓/✗ indicator is what explains a regex that
+    // doesn't compile.
     //
     // Reads no file content whatsoever, so this is fast even on a multi-GB
     // device over USB — which is the whole reason it's a quick-check and not a

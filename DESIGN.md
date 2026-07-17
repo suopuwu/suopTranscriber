@@ -216,6 +216,7 @@ vault/
   interviews/2026-06-30.m4a
   interviews/2026-06-30.md              # human-readable transcript = "done" (green)
   interviews/.2026-06-30.partial.jsonl  # exists only mid-transcription (resume)
+  interviews/.combined/                 # original parts, after a combine merged them
 ```
 
 - **Vault-scoped settings (`.transcriber/settings.json`):** appearance/behavior
@@ -256,11 +257,104 @@ vault/
     `modelFallback: true` in that case, so the file never reads as if the
     requested model had been honored when it wasn't.
 
+- **`.combined/`:** a group's original parts are moved here after a
+  split-recording combine merges them (see below) — a hidden dotfolder, so
+  the sidebar tree naturally excludes it for the same reason `.transcriber/`
+  is excluded.
+
+## Split-recording combine
+
+Recorders routinely split one recording into numbered parts. Combine merges
+those parts back into a single audio file *before* transcription, so the user
+transcribes one file instead of N fragments with N broken sentences at the
+seams. Implementation lives in `TranscriptionController`; the authoritative
+spec is `findCombineGroups()`'s doc comment in the header — this section is
+the overview, not a duplicate of it.
+
+- **Rule-driven only — never selection-driven.** A merge only ever happens for
+  a group that a user-authored regex rule (`AppSettings.combineRules`) actually
+  matched. There are exactly two entry points, both of which take the rules as
+  an argument: the sidebar ribbon's scan button (`runCombineScan()`, enqueues
+  every "ready" group) and the per-row "combine this group" button
+  (`combineGroup()`, the one matched group). A selection-driven "combine
+  whatever N files I selected" action was built and then deliberately removed:
+  with no rule consulted it would merge unrelated recordings no rule would ever
+  group, and it ignored the configured `deleteOriginalsAfterCombine`. The
+  source-scan guard `sidebar_combineIsRuleDrivenOnly` in `tst_styleguide.cpp`
+  keeps it from coming back.
+- **Never automatic.** Both entry points are user-initiated. Silently merging
+  on every file-add is a surprise a recorder shouldn't spring on the user.
+  The one exception is `maybeRedirectForCombine()`, a safety net at the top of
+  `startJob()`: transcribing a file that is a member of a currently-"ready"
+  group inserts the combine ahead of it and retargets the job at the merged
+  output, so a part that appeared after the user's last scan can't get
+  transcribed alone.
+- **Grouping identity = captured text + containing folder.** Rules match with
+  QRegularExpression *search* semantics against the bare filename; the
+  concatenated capture groups form the group key. Uncaptured wildcard spans
+  vary freely between members without affecting grouping ("same real string =
+  combine"). The containing folder is part of the identity, so identically
+  named parts in two folders are two groups, never one cross-folder group —
+  which also keeps `outputPath` unambiguous and lets the vault tree draw one
+  outline around what are always sibling rows.
+- **Order within a group** is mtime ascending by default. A rule may instead
+  designate *one* capture group as a sort differentiator (numeric-aware),
+  which then stops being a grouping group — it can't be both. mtime, not
+  creation/birth time: birth time doesn't survive a plain copy on Linux, while
+  every standard copy tool preserves mtime, and the app can't know whether a
+  vault's audio was recorded in place or copied off an SD card.
+- **`outputPath`** is derived from (sanitized rule name, sanitized key) — not
+  from any one member's filename — so it stays re-derivable from a single
+  surviving filename after the other parts have moved into `.combined/`.
+- **Group status** is one of `ready`, `singleton` (only one match),
+  `alreadyTranscribed` (a member already has a sibling `.md` — never silently
+  discard existing work), `alreadyCombined` (output already on disk), or
+  `pending` (the newest member was modified within a few seconds, so the
+  recorder may still be writing it). Only `ready` groups are enqueued.
+- **The merge itself** is an ffmpeg concat-demuxer stream copy (`-c copy`, no
+  re-encode) run as a normal `combine`-kind job in the same queue as
+  transcription, so it gets the same progress/pause/cancel handling. On
+  success the parts move into `.combined/` (or are deleted, if
+  `deleteOriginalsAfterCombine`) so the next scan doesn't re-detect the group.
+  A combine never also queues a transcribe — the merged file just becomes a
+  normal untranscribed vault entry.
+- **`detectCombineGroups()` is pure** over its inputs (disk access limited to
+  `QFileInfo` stats on the paths passed in), so the same entry point backs both
+  the Settings "test this rule" preview and the real enqueue decisions.
+
 ## USB import
 
 - **Detection:** `UsbDeviceMonitor` (`src/core/UsbDeviceMonitor.h/.cpp`) watches
   UDisks2 over D-Bus (`InterfacesAdded`/`InterfacesRemoved`) for mounted removable
   volumes — not `QStorageInfo::mountedVolumes()` polling.
+- **The app does its own mounting.** Nothing on a stock Linux desktop is obliged to
+  auto-mount: KDE ships `device_automounter` off, and Plasma just shows a Device
+  Notifier for the user to click, so a recorder plugged in with the app running can
+  sit unmounted forever — no mount point, no `deviceAdded`, no grab. So an unmounted
+  external volume is reported as `unmountedVolumeDetected` (identity comes off the
+  `Drive` object and needs no mount), and `UsbDeviceMonitor::mountVolume()` asks
+  UDisks2's `Filesystem.Mount()` to mount it. A mounted volume is then reported as an
+  ordinary `deviceAdded` — the app's mounts and the desktop's are indistinguishable
+  downstream, and the two racing on one hotplug still report the volume exactly once
+  (`m_knownObjectPaths`; `AlreadyMounted` is treated as success, not failure). The
+  call never prompts (`auth.no_user_interaction`): a hotplug isn't a user action, so
+  a polkit dialog springing from one would be unattributable. It doesn't normally
+  arise — udisks2's `filesystem-mount` is `allow_active=yes` for non-system devices,
+  which is all the gate below ever offers it.
+- **Mount gate = an enabled rule, nothing else.** `UsbGrabberController` mounts a
+  volume only if `resolveEffectiveRule().enabled` — the device's own rule or the `"*"`
+  catch-all — which is the same predicate the grab uses, so the app mounts precisely
+  what it would grab from. Deliberately NOT a setting of its own (off by default, it
+  would leave the out-of-box experience exactly as broken) and deliberately not
+  unconditional (that makes a transcription app into a general-purpose automounter for
+  every photo SD card the user owns). Known cost: an unconfigured device with no
+  catch-all never mounts, so it never reaches the settings list to be configured —
+  mount it once by hand to set it up. If that friction bites, widen what the device
+  list shows (unmounted identity is already available), not what the app mounts.
+  Deciding whether to mount is the controller's job (it holds the rules); deciding
+  what *may* be mounted is the monitor's (the external-media gate below). The monitor
+  never mounts off its own signal — `usbGrabber_mountIsRuleGated` in
+  `tst_styleguide.cpp` guards both halves.
 - **External media only (safety-critical):** a mounted filesystem becomes a visible
   device *only* if it passes `usbDeviceIsExternalMedia()` — UDisks2's
   `Block.HintSystem` must be false **and** the backing `Drive` must be either
@@ -300,10 +394,29 @@ vault/
   of its volumes). Rules are **app-scoped** (`QSettings`, not the vault's
   `.transcriber/settings.json`) since the same physical device is reused across
   vaults. Each rule carries: `enabled`, `extensionFilter` (empty = all files),
+  `filenameRegex` (empty = no regex constraint; see below),
   `preserveStructure` (mirror the device's subfolder layout vs. flatten),
   `startFolder` (relative to the device root), and `destinationFolder` (relative
   to the *vault* root; empty = vault root, created automatically on first grab if
   it doesn't exist yet).
+- **Filters (`extensionFilter` + `filenameRegex`) are ANDed**, and each is
+  independently "no constraint" when blank (never "match nothing") — a file is a
+  grab candidate only if it clears both. The regex deliberately has the *same
+  semantics as the split-recording combine rules* (`matchRuleCapturedKey()`):
+  `QRegularExpression`, matched against the **file name only** (never the path),
+  and **unanchored** unless the pattern says so — so one pattern reads the same
+  in both features. Capture groups carry no meaning here (there they decide
+  group identity; here the pattern is a pure include-test), which is why the
+  differentiator/sort-group apparatus isn't carried over.
+  - **An invalid pattern fails closed** — it matches nothing, so the rule grabs
+    zero files. Reading unparseable as "no constraint" would silently *widen* a
+    rule the user was narrowing, and on the `"*"` catch-all that means
+    bulk-copying a whole device on a typo. Zero files copied is recoverable and
+    visible; the field's own live ✓/✗ indicator says why.
+  - **QML validates through C++** (`UsbGrabberController::regexValidationError()`,
+    sharing one definition with the combine rules' check via `RegexValidation.h`)
+    rather than JS `RegExp` — the syntaxes aren't guaranteed identical, so a
+    JS-valid pattern could still match nothing at grab time.
 - **Grab (`UsbGrabJob`/`UsbGrabJobWorker`, `src/core/UsbGrabJob.h/.cpp`):** runs on
   its own worker thread (same QThread+moveToThread shape as `AudioRecorder`), never
   the GUI thread — recursively walks the device, diffs against files already in the
@@ -332,10 +445,17 @@ vault/
   scan/filter/quick-check logic in a dry-run mode (`UsbGrabJob::startPreview()`) —
   no copying, no history entry — and returns a line-by-line classification of
   every file the scan sees: `"grab"` (would be copied), `"duplicate"` (matches the
-  filter but a file with the same name, size and mtime is already present at the
-  destination), or `"filtered"` (extension doesn't match the rule). Async, like the
-  real grab: the walk still stats every file on an external device, which is too
-  slow for the GUI thread.
+  filters but a file with the same name, size and mtime is already present at the
+  destination), or `"filtered"` (failed the extension filter and/or the filename
+  regex — one status covers both, since the entry carries the path and the
+  pattern field's own indicator is what explains a regex that won't compile).
+  Async, like the real grab: the walk still stats every file on an external
+  device, which is too slow for the GUI thread.
+  - Re-run automatically on any rule-field commit while that device's preview is
+    on screen (`MainPanel.qml`'s `commitRuleField()`), so the preview follows an
+    edited regex the way the combine preview follows its pattern field — but on
+    *commit*, never per keystroke: this walks a physical device, unlike the
+    combine preview's pure in-memory pass over the vault's file list.
 - **History:** each completed grab appends one entry (timestamp, device, files
   copied/skipped, errors) to the vault-scoped `.transcriber/usbGrabHistory.json`
   via `VaultTreeModel::appendUsbGrabHistoryEntry()`.

@@ -63,15 +63,12 @@ ApplicationWindow {
     // (importAudio()), so dropping a large file no longer freezes the UI and
     // every import appears in the Tasks queue. Validation failures aren't
     // fatal to the whole drop — every dropped file is attempted
-    // independently, and any that failed validation are named in a small
-    // auto-clearing banner (this app's established no-toast-system
-    // convention, see MainPanel's speakerOpError); a copy that fails on the
-    // worker surfaces as a Failed row in the Tasks popup instead.
-    property string importError: ""
+    // independently, and any that failed validation are named in a snackbar
+    // (StyleGuide.md "Snackbars"); a copy that fails on the worker surfaces
+    // as a Failed row in the Tasks popup instead.
     function importDroppedUrls(urls) {
         if (vaultModel.vaultPath.toString() === "") {
-            window.importError = qsTr("Open a vault before dropping in audio files.")
-            importErrorClearTimer.restart()
+            Notifications.error(qsTr("Open a vault before dropping in audio files."))
             return
         }
         const failed = []
@@ -87,16 +84,8 @@ ApplicationWindow {
             else
                 transcriptionController.importAudio(url, "file://" + dest, vaultModel.vaultPath)
         }
-        if (failed.length > 0) {
-            window.importError = qsTr("Couldn't import: %1").arg(failed.join(", "))
-            importErrorClearTimer.restart()
-        }
-    }
-
-    Timer {
-        id: importErrorClearTimer
-        interval: 4000
-        onTriggered: window.importError = ""
+        if (failed.length > 0)
+            Notifications.error(qsTr("Couldn't import: %1").arg(failed.join(", ")))
     }
 
     // Wave D item 3: reverted to the native/portal dialog (was replaced by
@@ -368,19 +357,13 @@ ApplicationWindow {
             BottomBar {
                 id: bottomBar
                 Layout.fillWidth: true
-                vaultPath: vaultModel.vaultPath
                 vaultLocalPath: vaultModel.vaultLocalPath
-                vaultTreeModel: vaultModel
                 currentFilePath: mainPanel.orphanedMdPath !== "" ? mainPanel.orphanedMdPath
                                  : (mainPanel.player.source.toString() !== ""
                                     ? mainPanel.player.source.toString().replace("file://", "") : "")
                 transcriptionController: transcriptionController
                 onSettingsRequested: settingsPopup.open()
                 onTaskActivated: (path) => mainPanel.showAudioFile(path)
-                // Item 42: clicking the bottom-left current-file label focuses
-                // the in-app file explorer (Sidebar tree) and scrolls/selects
-                // the open file there, instead of opening the OS file manager.
-                onFocusFileExplorerRequested: (path) => sidebar.focusAndRevealNote(path)
             }
         }
 
@@ -482,25 +465,12 @@ ApplicationWindow {
             width: 8; height: 8
         }
 
-        // Drag-and-drop import failure feedback — same reparent-onto-
-        // Overlay.overlay + high-z treatment as ResizeGrip above, so it
-        // floats above every panel regardless of where the drop happened.
-        // Auto-clears via importErrorClearTimer; success needs no banner
-        // since the imported file simply appears in the sidebar tree.
-        Label {
-            parent: Overlay.overlay
-            z: 1001
-            anchors.top: parent.top
-            anchors.horizontalCenter: parent.horizontalCenter
-            anchors.topMargin: 12
-            visible: window.importError !== ""
-            text: window.importError
-            color: "white"
-            padding: 8
-            background: Rectangle {
-                color: "#c0392b"
-                radius: AppSettings.borderRadius
-            }
-        }
+        // The app's ONE floating-notification surface — every transient
+        // message (failed import, failed move/rename/delete, rejected speaker
+        // rename, rejected transcript edit) lands here rather than in four
+        // separate per-panel banners. Posts come from the Notifications
+        // singleton, so nothing has to route a signal up to this file. See
+        // StyleGuide.md "Snackbars"; it does its own Overlay.overlay reparent.
+        SnackbarHost {}
     }
 }

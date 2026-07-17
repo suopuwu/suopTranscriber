@@ -1055,20 +1055,6 @@ public:
     Q_INVOKABLE void combineGroup(const QVariantList &rules, const QStringList &audioPaths,
                                    const QString &outputPath, const QUrl &vaultUrl, bool deleteOriginals);
 
-    // Item 44: manual combine — merges an EXPLICIT, user-selected ordered set
-    // of audio files (the sidebar's multi-selection, filtered to audio), NOT a
-    // regex-rule-detected group. `fileUrls` is a QVariantList of file:// QUrls
-    // (bare local-path strings also tolerated); non-audio entries (.md, dirs)
-    // are dropped and duplicates de-duped. Requires >= 2 audio files, else a
-    // silent no-op. Reuses the exact combine machinery combineGroup()/
-    // runCombineScan() use — builds a synthetic CombineGroup and calls the
-    // shared enqueueCombineJob()/TranscriptionWorker::combineJob(); only the
-    // file selection is supplied by the user instead of findCombineGroups().
-    // Order is mtime ascending (findCombineGroups()'s default, no-sort-
-    // differentiator order); output is "<earliest part's stem>.combined.<ext>"
-    // beside the earliest part. See the .cpp for the full rationale.
-    Q_INVOKABLE void combineSelected(const QVariantList &fileUrls, const QUrl &vaultUrl);
-
 signals:
     void busyChanged();
     void progressChanged();

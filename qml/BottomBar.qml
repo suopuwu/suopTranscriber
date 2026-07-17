@@ -6,33 +6,53 @@ import SuopTranscriber
 Item {
     id: bottomBar
 
-    property url vaultPath
     property string vaultLocalPath: ""
     property TranscriptionController transcriptionController
-    property VaultTreeModel vaultTreeModel
     // Wave D item 2: the currently-open file's raw local path (audio file or
     // orphaned .md — whatever MainPanel currently shows), empty if none.
     property string currentFilePath: ""
-    readonly property string currentFileRelativePath: {
-        if (bottomBar.currentFilePath === "" || bottomBar.vaultLocalPath === "")
-            return ""
+    // The bottom-left path, split into independently clickable segments, in
+    // display order: the vault root, then one per subfolder inside the vault,
+    // then the open file itself. Each segment carries the absolute local path
+    // its OWN click acts on, and `isFile` picks reveal-the-file-selected over
+    // just-open-the-folder.
+    //
+    // The vault root stays ONE segment on purpose: the folders above it
+    // (/home, /home/user, …) are outside the vault and get no target of their
+    // own, so clicking anywhere in the root always lands on the vault folder.
+    readonly property var pathSegments: {
+        if (bottomBar.vaultLocalPath === "")
+            return []
+        const segments = [{
+            text: bottomBar.vaultLocalPath, path: bottomBar.vaultLocalPath, isFile: false
+        }]
+        if (bottomBar.currentFilePath === "")
+            return segments
+
+        // An open file that isn't under the vault root can't be broken down
+        // against it, so it stays one whole-path segment rather than being
+        // split into segments whose paths would be fiction.
         const prefix = bottomBar.vaultLocalPath + "/"
-        return bottomBar.currentFilePath.startsWith(prefix)
-            ? bottomBar.currentFilePath.slice(prefix.length) : bottomBar.currentFilePath
+        if (!bottomBar.currentFilePath.startsWith(prefix)) {
+            segments.push({
+                text: bottomBar.currentFilePath, path: bottomBar.currentFilePath, isFile: true
+            })
+            return segments
+        }
+
+        const parts = bottomBar.currentFilePath.slice(prefix.length).split("/")
+        let path = bottomBar.vaultLocalPath
+        for (let i = 0; i < parts.length; ++i) {
+            path += "/" + parts[i]
+            segments.push({ text: "/" + parts[i], path: path, isFile: i === parts.length - 1 })
+        }
+        return segments
     }
     signal settingsRequested()
     // Emitted when a Tasks-popup row is clicked — path is the job's audio
     // file's LOCAL path (fileUrl minus the "file://" prefix, same convention
     // Sidebar.qml's fileActivated uses), for the caller to open in MainPanel.
     signal taskActivated(string path)
-    // Item 42: clicking the current-file path label focuses the IN-APP file
-    // explorer (the Sidebar tree) and reveals `path` there, instead of
-    // shelling out to the OS file manager. `path` is the
-    // open file's LOCAL path, empty if none (then just focus the explorer).
-    // Routed up through Main.qml (which owns both panels), same as
-    // settingsRequested/taskActivated — BottomBar never reaches across to the
-    // Sidebar directly.
-    signal focusFileExplorerRequested(string path)
     // Percentage TEXT (item 6): this phase's own 0..1 (see
     // TranscriptionController::progress's doc comment for why it's phase-
     // relative, not blended across the whole job).
@@ -386,55 +406,70 @@ Item {
             }
         }
 
-        Item {
+        // Item 4 (Wave E): the segments must read as ONE continuous
+        // left-aligned string, so exactly ONE of them may claim
+        // Layout.fillWidth and it must be the LAST. Give the claim to an
+        // earlier segment and it takes the whole row, shoving everything after
+        // it flush against the right edge instead of sitting immediately after
+        // it. The fillWidth segment is also the one that elides, and eliding
+        // belongs at the far end of the string, never mid-path.
+        RowLayout {
             Layout.fillWidth: true
-            implicitHeight: vaultPathRow.implicitHeight
+            spacing: 0
 
-            HoverHandler {
-                id: vaultPathHover
-                cursorShape: Qt.PointingHandCursor
-                enabled: bottomBar.vaultLocalPath !== ""
+            Label {
+                visible: bottomBar.vaultLocalPath === ""
+                Layout.fillWidth: true
+                text: qsTr("No vault open")
+                color: "#aaaaaa"
+                font.pixelSize: 11
             }
-            TapHandler {
-                enabled: bottomBar.vaultLocalPath !== ""
-                // Item 42: focus the in-app file explorer (Sidebar tree) and
-                // reveal the open file there, rather than shelling out to the
-                // OS file manager. Handled in Main.qml, which owns both panels.
-                onTapped: bottomBar.focusFileExplorerRequested(bottomBar.currentFilePath)
-            }
-            RowLayout {
-                id: vaultPathRow
-                anchors.left: parent.left
-                anchors.right: parent.right
-                spacing: 0
 
-                // Item 4 (Wave E): both parts must read as ONE continuous
-                // left-aligned string. Previously the vault-root Label alone
-                // had Layout.fillWidth, which claimed the whole row and shoved
-                // the subpath Label flush against the right edge instead of
-                // immediately after it. Now the (variable-width, non-elided)
-                // vault-root Label sits at its natural width, and the elided
-                // fillWidth claim moves to the subpath Label after it, so
-                // eliding happens at the far end of the combined string, not
-                // in the middle of the vault path.
-                Label {
-                    Layout.fillWidth: bottomBar.currentFileRelativePath === ""
-                    elide: Text.ElideMiddle
-                    text: bottomBar.vaultLocalPath === "" ? qsTr("No vault open") : bottomBar.vaultLocalPath
-                    color: "#aaaaaa"
+            Repeater {
+                model: bottomBar.pathSegments
+                delegate: Label {
+                    id: segment
+
+                    // Carries an objectName purely so tst_bottombar_pathsegments
+                    // can find the segments and click them — they have no other
+                    // stable handle (same trick as the tree's "expandGlyph").
+                    objectName: "pathSegment"
+
+                    required property var modelData
+                    required property int index
+                    readonly property bool isRoot: segment.index === 0
+
+                    Layout.fillWidth: segment.index === bottomBar.pathSegments.length - 1
+                    // The vault root is the one segment whose middle is the
+                    // least interesting part of it (…/deeply/nested/vault), so
+                    // it's the one that elides there rather than at its end.
+                    elide: segment.isRoot ? Text.ElideMiddle : Text.ElideRight
+                    text: segment.modelData.text
+                    // Wave D item 2: the in-vault part is dimmer than the root.
+                    color: segment.isRoot ? "#aaaaaa" : "#666666"
                     font.pixelSize: 11
-                    font.underline: vaultPathHover.hovered
-                }
-                // Wave D item 2: subfolder/filename part of the currently-
-                // open file, dimmer than the vault-root part above.
-                Label {
-                    visible: bottomBar.currentFileRelativePath !== ""
-                    Layout.fillWidth: true
-                    elide: Text.ElideRight
-                    text: "/" + bottomBar.currentFileRelativePath
-                    color: "#666666"
-                    font.pixelSize: 11
-                    font.underline: vaultPathHover.hovered
+                    // Underline only the hovered segment, not the whole path:
+                    // each segment is its own target, so underlining all of
+                    // them would misreport what the click is about to open.
+                    font.underline: segmentHover.hovered
+
+                    HoverHandler {
+                        id: segmentHover
+                        cursorShape: Qt.PointingHandCursor
+                    }
+                    TapHandler {
+                        onTapped: {
+                            // The file itself opens its folder with the file
+                            // selected; a folder segment just opens that
+                            // folder. Either way the file manager's window is
+                            // raised and focused — see DesktopIntegration for
+                            // the activation token that takes.
+                            if (segment.modelData.isFile)
+                                DesktopIntegration.revealInFileManager("file://" + segment.modelData.path)
+                            else
+                                DesktopIntegration.openInFileManager("file://" + segment.modelData.path)
+                        }
+                    }
                 }
             }
         }

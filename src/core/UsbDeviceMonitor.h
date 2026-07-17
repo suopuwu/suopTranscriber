@@ -84,10 +84,16 @@ struct UsbDeviceInfo {
 // exercise it against hand-built property maps with no D-Bus and no real hardware.
 bool usbDeviceIsExternalMedia(const QVariantMap &blockProps, const QVariantMap &driveProps);
 
-// One mounted volume's UsbDeviceInfo built from its UDisks2 properties, or nullopt
-// if it isn't external media (usbDeviceIsExternalMedia() above). objectPath is the
-// Block object's D-Bus path and becomes the volume's `id`; mountPath is its
-// already-decoded mount point.
+// One volume's UsbDeviceInfo built from its UDisks2 properties, or nullopt if it
+// isn't external media (usbDeviceIsExternalMedia() above). objectPath is the Block
+// object's D-Bus path and becomes the volume's `id`; mountPath is its already-decoded
+// mount point, or EMPTY for a volume that is present but not mounted anywhere.
+//
+// The external-media gate is applied identically either way, which is what makes it
+// safe to feed an UNMOUNTED volume to UsbDeviceMonitor::mountVolume(): a volume the
+// app is about to mount itself passes exactly the same check as one the desktop had
+// already mounted, so the system drive can no more be mounted-then-grabbed than it
+// could be grabbed off an existing mount.
 //
 // Split out of UsbDeviceMonitor::readMountedFilesystem() — which keeps only the
 // parts that genuinely need D-Bus (decoding the MountPoints byte-array wire format,
@@ -113,8 +119,18 @@ std::optional<UsbDeviceInfo> usbVolumeFromProperties(const QString &objectPath, 
 // class rather than merely deprioritised by callers. That filter is load-bearing,
 // not cosmetic: "mounted" alone would make / and /boot grabbable devices.
 //
-// Detection only — no recursive file scanning, copying, or rule-matching happens
-// here; that's UsbGrabJob, a separate, not-yet-built consumer of these signals.
+// Detection and mounting — no recursive file scanning, copying, or rule-matching
+// happens here; that's UsbGrabJob/UsbGrabberController, separate consumers of these
+// signals. mountVolume() is the one action this class takes, and it never decides on
+// its own to take it: WHETHER to mount is UsbGrabberController's call (it holds the
+// rules), WHAT may be mounted is this class's (the external-media gate).
+//
+// Why the app mounts at all: nothing in a stock Linux desktop is obliged to. KDE's
+// device_automounter kded module is off by default and Plasma just shows a Device
+// Notifier for the user to click, so a recorder plugged in with the app running can
+// sit there unmounted forever — no mount point, no Filesystem.MountPoints, hence no
+// deviceAdded and no grab. Waiting on a desktop-side policy that may never come
+// makes grab-on-attach unreliable for reasons that have nothing to do with this app.
 class UsbDeviceMonitor : public QObject {
     Q_OBJECT
     QML_ELEMENT
@@ -133,6 +149,34 @@ public:
     // filter applies identically to both.
     Q_INVOKABLE QVariantList currentlyMountedDevices() const;
 
+    // Asks UDisks2 to mount the volume whose UsbDeviceInfo::id (block-device object
+    // path) is volumeId, reporting the result as an ordinary deviceAdded — so a
+    // volume the app mounted is indistinguishable, to every consumer, from one the
+    // desktop mounted. Nothing else about this class's contract changes: consumers
+    // that only ever listen for deviceAdded need no new code.
+    //
+    // ASYNC (QDBusPendingCallWatcher, not a blocking call()): mounting spins up the
+    // device and can take seconds on a real recorder, and this class lives on the GUI
+    // thread. The mount path in the reply is deliberately DISCARDED in favour of
+    // re-running rescanForNewlyMountedDevices() — that rebuilds the volume's identity
+    // through the same Filesystem/Block/Drive path every other deviceAdded goes
+    // through, instead of hand-assembling a second, subtly-different UsbDeviceInfo
+    // here. Its m_knownObjectPaths check also makes the emit idempotent, which is
+    // what keeps the desktop-automount race below from double-reporting.
+    //
+    // Never prompts (auth.no_user_interaction): a hotplug is not a user action, so a
+    // polkit password dialog springing from one would be unattributable to anything
+    // the user just did. It doesn't normally arise — udisks2's filesystem-mount action
+    // is allow_active=yes for non-system devices, and this class only ever offers
+    // non-system devices (usbDeviceIsExternalMedia() requires HintSystem=false) — but
+    // when it does (no active session, e.g. over ssh), it fails as mountFailed rather
+    // than blocking on a dialog nobody is there to answer.
+    //
+    // Safe to call for an already-mounted volume: UDisks2 answers AlreadyMounted,
+    // which is treated as success (the desktop's automounter won the race — the goal
+    // was a mounted volume, and there is one), not as mountFailed.
+    void mountVolume(const QString &volumeId);
+
 signals:
     // Both are per-VOLUME, not per-physical-device: a multi-LUN device that mounts
     // two filesystems fires two deviceAdded, and unmounting just one fires exactly
@@ -144,6 +188,26 @@ signals:
     void deviceAdded(const QVariantMap &info);
     void deviceRemoved(const QString &id);
 
+    // A volume on EXTERNAL MEDIA that is present but mounted nowhere — a candidate
+    // for mountVolume(), not a device that can be grabbed from. `mountPath` is empty
+    // (that's what unmounted means); every other field is populated, because identity
+    // comes off the Drive object and needs no mount to read. If it does get mounted,
+    // a normal deviceAdded follows for the same `id`.
+    //
+    // Separate from deviceAdded rather than folded into it with an empty mountPath:
+    // deviceAdded means "grabbable" to every existing consumer, and a volume with no
+    // mount path would send UsbGrabJob walking a "" scan root. Emitted regardless of
+    // any rule, since this class has no idea what the rules are — the listener
+    // decides whether this one is worth mounting.
+    void unmountedVolumeDetected(const QVariantMap &info);
+
+    // A mountVolume() call that failed, with UDisks2's own error message (e.g. a
+    // corrupt filesystem, or NotAuthorized with no active session). Surfaced rather
+    // than swallowed, per AudioRecorder::lastError's convention. No retry: a mount
+    // that failed for a real reason fails again the same way, and a replug re-runs
+    // the whole path anyway.
+    void mountFailed(const QString &id, const QString &error);
+
 private slots:
     // Bound to UDisks2's ObjectManager InterfacesAdded/InterfacesRemoved signals (see
     // the constructor). Parameter types must match the D-Bus signals' marshalled
@@ -154,13 +218,24 @@ private slots:
 
 private:
     // Shared by handleInterfacesAdded() and currentlyMountedDevices() so the
-    // Filesystem/Block/Drive property-reading logic — and the external-media filter
-    // — exist exactly once. Returns std::nullopt for objects that aren't an
-    // actively-mounted filesystem (no Filesystem interface present, or a
-    // present-but-empty MountPoints list), and for those that are mounted but fail
-    // usbDeviceIsExternalMedia() (the system drive, internal data disks, zram).
-    std::optional<UsbDeviceInfo> readMountedFilesystem(const QDBusObjectPath &objectPath,
-                                                        const UsbDbusInterfaces &interfaces) const;
+    // Filesystem/Block/Drive property-reading logic — and the external-media filter —
+    // exist exactly once. Returns std::nullopt for objects that aren't a filesystem
+    // on external media at all: no Filesystem interface, no reachable Block/Drive
+    // (zram0, whose Block.Drive is the placeholder "/"), or a failed
+    // usbDeviceIsExternalMedia() (the system drive, internal data disks).
+    //
+    // A returned volume may be MOUNTED (mountPath non-empty) or merely present
+    // (mountPath empty) — the caller decides which it wants, because the two answers
+    // have different consumers: currentlyMountedDevices() and the rescan report only
+    // the mounted ones (their contract is "what can be grabbed right now"), while
+    // handleInterfacesAdded() also routes the unmounted ones to
+    // unmountedVolumeDetected. Reading unmounted volumes too costs one extra Drive
+    // GetAll per unmounted filesystem during a full enumeration, which is the price
+    // of having ONE reader rather than a near-copy that differs only in which side of
+    // the MountPoints check it returns on — and enumeration is rare (construction,
+    // and once after a hotplug or a mount).
+    std::optional<UsbDeviceInfo> readFilesystemVolume(const QDBusObjectPath &objectPath,
+                                                       const UsbDbusInterfaces &interfaces) const;
 
     // UDisks2 commonly adds a block device's Block/Filesystem interfaces (this class's
     // InterfacesAdded handler) slightly BEFORE an auto-mount policy actually mounts it
@@ -173,6 +248,11 @@ private:
     // currentlyMountedDevices() already does and emits deviceAdded for anything newly
     // mounted that m_knownObjectPaths doesn't already have. Safe to call redundantly:
     // already-known object paths are skipped.
+    //
+    // Also how mountVolume() reports its own successful mounts, for that same
+    // idempotence: the app's mount and a desktop automounter's mount race each other
+    // on every hotplug of a device the user has a rule for, and whichever lands first,
+    // the volume is reported exactly once.
     void rescanForNewlyMountedDevices();
 
     // org.freedesktop.DBus.Properties.GetAll on the given Drive object

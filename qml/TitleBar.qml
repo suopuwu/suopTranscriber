@@ -30,6 +30,17 @@ Item {
         topRightRadius: AppSettings.borderRadius
     }
 
+    // Bar-wide double-click to maximize, the way a system titlebar behaves.
+    // DragThreshold (a PASSIVE grab) is deliberate and load-bearing: it has to
+    // coexist with the DragHandler below, which needs to be able to take the
+    // grab for a window move without this cancelling first.
+    //
+    // The flip side is that a passive grab does NOT stop at this bar's own
+    // buttons — nested TapHandlers don't consume each other's taps the way an
+    // accepted MouseArea press would, so both fire. Every button in here is
+    // therefore on ReleaseWithinBounds (exclusive grab from press), which is
+    // what keeps a double-click on a button from ALSO toggling maximize. See
+    // tst_titlebar_buttons.cpp, which fails on all of them without it.
     TapHandler {
         acceptedButtons: Qt.LeftButton
         onTapped: if (tapCount === 2) titleBar.window.visibility = titleBar.window.visibility === Window.Maximized ? Window.Windowed : Window.Maximized
@@ -43,6 +54,7 @@ Item {
 
     Item {
         id: settingsButton
+        objectName: "titleBarSettingsButton"
         anchors.left: parent.left
         anchors.leftMargin: 8
         anchors.verticalCenter: parent.verticalCenter
@@ -54,6 +66,8 @@ Item {
             cursorShape: Qt.PointingHandCursor
         }
         TapHandler {
+            // Exclusive grab from press — see the bar-wide maximize handler.
+            gesturePolicy: TapHandler.ReleaseWithinBounds
             onTapped: titleBar.settingsRequested()
         }
         HoverBorder {
@@ -70,6 +84,7 @@ Item {
 
     Item {
         id: recordButton
+        objectName: "titleBarRecordButton"
         anchors.left: settingsButton.right
         anchors.leftMargin: 4
         anchors.verticalCenter: parent.verticalCenter
@@ -81,6 +96,7 @@ Item {
             cursorShape: Qt.PointingHandCursor
         }
         TapHandler {
+            gesturePolicy: TapHandler.ReleaseWithinBounds
             onTapped: titleBar.recordRequested()
         }
         HoverBorder {
@@ -97,6 +113,7 @@ Item {
 
     Item {
         id: usbGrabberButton
+        objectName: "titleBarUsbGrabberButton"
         anchors.left: recordButton.right
         anchors.leftMargin: 4
         anchors.verticalCenter: parent.verticalCenter
@@ -108,6 +125,7 @@ Item {
             cursorShape: Qt.PointingHandCursor
         }
         TapHandler {
+            gesturePolicy: TapHandler.ReleaseWithinBounds
             onTapped: titleBar.usbGrabberRequested()
         }
         HoverBorder {
@@ -127,6 +145,7 @@ Item {
     // the gear rather than cluttering the per-row/bulk sidebar controls.
     Item {
         id: moreActionsButton
+        objectName: "titleBarMoreActionsButton"
         anchors.left: usbGrabberButton.right
         anchors.leftMargin: 4
         anchors.verticalCenter: parent.verticalCenter
@@ -138,6 +157,7 @@ Item {
             cursorShape: Qt.PointingHandCursor
         }
         TapHandler {
+            gesturePolicy: TapHandler.ReleaseWithinBounds
             onTapped: moreActionsMenu.visible ? moreActionsMenu.close() : moreActionsMenu.open()
         }
         HoverBorder {

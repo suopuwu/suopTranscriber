@@ -45,6 +45,29 @@ QVariantList usbVolumesForSerial(const QVariantList &mountedVolumes, const QStri
 // no vault is open, the device is skipped entirely — no queueing, no retry,
 // per the confirmed product decision that grabs only ever target whatever
 // vault happens to be open at the moment of detection.
+//
+// Mount policy: a stock KDE install does not auto-mount removable media (its
+// device_automounter kded module is off by default), so a device can be
+// plugged in and never mount, which means never fire deviceAdded, which means
+// never grab. This class therefore mounts unmounted external volumes itself,
+// via UsbDeviceMonitor::mountVolume() on its unmountedVolumeDetected signal —
+// gated on EXACTLY ONE THING: the same resolveEffectiveRule().enabled check
+// the grab itself uses. So the app mounts precisely what it would grab from
+// and nothing else, and there's no separate "auto-mount" setting to configure,
+// explain, or leave inconsistent with the rules.
+//
+// That gate has one known cost: a device that has never been configured AND
+// isn't covered by an enabled "*" catch-all has no rule, so the app won't
+// mount it, so it never appears in the settings UI's device list (fed by
+// mountedDevices()) to BE configured — it has to be mounted once by hand (a
+// click in the file manager) to get set up. The alternatives were worse: a
+// setting of its own is off by default and so leaves the out-of-box experience
+// exactly as broken, while mounting every external volume unconditionally
+// turns a transcription app into a general-purpose automounter for every photo
+// SD card and flash drive the user owns. If this friction bites, the fix is to
+// widen what the device LIST shows (identity is readable from an unmounted
+// volume — that's what unmountedVolumeDetected carries), not to widen what the
+// app mounts.
 class UsbGrabberController : public QObject {
     Q_OBJECT
     QML_ELEMENT
@@ -97,6 +120,18 @@ public:
     // saved), for listing every configured device in the UI.
     Q_INVOKABLE QVariantList allRules() const;
 
+    // Why a rule's filenameRegex won't compile, as a user-facing sentence — or
+    // an empty string if it's valid (an empty pattern is valid: it means "no
+    // regex constraint"). Backs the live ✓/✗ indicator under the pattern field
+    // in MainPanel.qml's usbGrabberPage.
+    //
+    // Exists so QML validates against the EXACT SAME QRegularExpression engine
+    // UsbGrabJob's walk actually filters with, rather than QML/JS RegExp, whose
+    // syntax isn't guaranteed identical — a pattern that looks valid in JS
+    // could still match nothing at grab time. Shares one definition with the
+    // combine rules' identically-shaped check (see RegexValidation.h).
+    Q_INVOKABLE QString regexValidationError(const QString &pattern) const;
+
     // Looks up deviceSerial's rule (falling back to the "*" catch-all rule
     // if the device-specific one isn't enabled), then starts one UsbGrabJob
     // per currently-mounted VOLUME of that device against the currently-open
@@ -147,6 +182,11 @@ private slots:
     // Bound to m_deviceMonitor's deviceAdded signal at construction — see
     // the class doc comment for the enable-check/vault-open-check logic.
     void handleDeviceAdded(const QVariantMap &info);
+
+    // Bound to m_deviceMonitor's unmountedVolumeDetected signal at
+    // construction: mounts the volume, but ONLY if its resolved rule is
+    // enabled — see the class doc comment for why that's the gate.
+    void handleUnmountedVolumeDetected(const QVariantMap &info);
 
 private:
     // Shared by triggerManualGrab() and handleDeviceAdded(): the device-

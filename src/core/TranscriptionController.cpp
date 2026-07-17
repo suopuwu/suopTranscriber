@@ -36,6 +36,7 @@
 #include "DiarizationEngine.h"
 #include "LabelingEngine.h"
 #include "ModelManager.h"
+#include "RegexValidation.h"
 #include "Segment.h"
 #include "VadChunker.h"
 #include "WhisperCppEngine.h"
@@ -1144,24 +1145,6 @@ QString combineOutputPathFor(const QString &ruleName, const QString &key, const 
     if (!key.isEmpty())
         name += QStringLiteral("-") + sanitizeForFilename(key);
     return dir + QStringLiteral("/") + name + QStringLiteral(".combined.") + ext;
-}
-
-// Backstop audio-file check for combineSelected() (item 44): the sidebar only
-// offers manual combine over rows it already knows are audio, but the
-// controller re-validates the explicit selection so a stray .md (or anything
-// non-audio) is dropped rather than fed to ffmpeg. Suffix set intentionally
-// mirrors VaultTreeModel's audioExtensions() — the sidebar's own isAudio
-// source of truth; kept as a local copy rather than reaching across into that
-// unrelated model just for a guard (pre-stable, no cross-module coupling
-// wanted here).
-bool isAudioPath(const QString &path)
-{
-    static const QSet<QString> kAudioExts = {
-        QStringLiteral("mp3"),  QStringLiteral("wav"),  QStringLiteral("m4a"), QStringLiteral("flac"),
-        QStringLiteral("ogg"),  QStringLiteral("opus"), QStringLiteral("aac"), QStringLiteral("wma"),
-        QStringLiteral("aiff"), QStringLiteral("alac"),
-    };
-    return kAudioExts.contains(QFileInfo(path).suffix().toLower());
 }
 
 }
@@ -3981,10 +3964,7 @@ QVariantList TranscriptionController::detectCombineGroups(const QVariantList &ru
 
 QString TranscriptionController::regexValidationError(const QString &pattern) const
 {
-    if (pattern.isEmpty())
-        return QString();
-    const QRegularExpression re(pattern);
-    return re.isValid() ? QString() : re.errorString();
+    return regexValidationErrorFor(pattern);
 }
 
 QStringList TranscriptionController::differentiatorNonParticipatingFiles(const QString &pattern, int groupIndex,
@@ -4139,68 +4119,6 @@ void TranscriptionController::combineGroup(const QVariantList &rules, const QStr
             startNext();
         return;
     }
-}
-
-// Item 44: manual combine — the user explicitly selected N files in the
-// sidebar and asked to merge them, instead of a regex rule auto-detecting a
-// split-recording group. Everything downstream is SHARED with the auto path:
-// we build an ordered file list + a deterministic output path and hand a
-// synthetic CombineGroup to the SAME enqueueCombineJob() (and thus
-// TranscriptionWorker::combineJob()) that rule-driven runCombineScan()/
-// combineGroup() use — only the "which files" decision differs (an explicit
-// selection here vs. findCombineGroups()'s regex matching there). No second
-// concat mechanism, no duplicated ffmpeg logic.
-void TranscriptionController::combineSelected(const QVariantList &fileUrls, const QUrl &vaultUrl)
-{
-    // Collect local audio paths from the explicit selection, dropping anything
-    // that isn't an audio file (an orphaned .md, a directory) — the sidebar
-    // already filters to audio, this is the controller-side backstop.
-    QStringList audioPaths;
-    for (const QVariant &v : fileUrls) {
-        QString path = v.toUrl().toLocalFile();
-        if (path.isEmpty()) // tolerate a plain path passed as a bare string
-            path = v.toString();
-        if (!path.isEmpty() && isAudioPath(path) && !audioPaths.contains(path))
-            audioPaths << path;
-    }
-    // Concatenation needs at least two files; silently no-op otherwise. The UI
-    // only offers the action when 2+ audio files are selected, so this is the
-    // backstop — mirrors combineGroup()'s silent no-op on a stale selection.
-    if (audioPaths.size() < 2)
-        return;
-
-    // Combine order: mtime ascending — the exact default order
-    // findCombineGroups() uses for an auto group with no configured sort
-    // differentiator (see Candidate::mtime's doc comment there for WHY mtime
-    // and not creation/birth time). A manual selection has no rule and thus no
-    // sort differentiator, so this default is the right — and only — order to
-    // reuse; the concatenation is oldest-part-first, never selection/click
-    // order, which would be arbitrary.
-    std::sort(audioPaths.begin(), audioPaths.end(), [](const QString &a, const QString &b) {
-        return QFileInfo(a).lastModified() < QFileInfo(b).lastModified();
-    });
-
-    // Deterministic output path next to the earliest part, named from its
-    // stem — a manual combine has no (ruleName, key) to reuse
-    // findCombineGroups()'s derivation, so the earliest member's base name is
-    // the stable, human-readable stem. Same ".combined.<ext>" suffix and
-    // sibling-directory placement as the auto path (combineOutputPathFor()).
-    const QFileInfo firstInfo(audioPaths.first());
-    const QString outputPath = combineOutputPathFor(firstInfo.completeBaseName(), QString(),
-                                                     firstInfo.absolutePath(), firstInfo.suffix());
-    // Don't double-queue the same merge — mirrors runCombineScan()/
-    // combineGroup()'s isCombineQueued() dedup.
-    if (isCombineQueued(outputPath))
-        return;
-
-    CombineGroup group;
-    group.files = audioPaths;
-    group.outputPath = outputPath;
-    enqueueCombineJob(group, vaultUrl, /*deleteOriginals=*/false);
-    emit queueChanged();
-    // Live trigger, same as combineGroup()/runCombineScan(): auto-start when idle.
-    if (m_activeIndex < 0)
-        startNext();
 }
 
 QString TranscriptionController::tasksJsonPath(const QUrl &vaultUrl)
@@ -5240,8 +5158,7 @@ QVariantList TranscriptionController::jobs() const
         entry["kind"] = jobKind(job);
         // Ordered source parts of a "combine" job (empty for every other kind)
         // — the exact concatenation order, so a caller/test can see WHICH files
-        // this merge covers and in what order. See combineSelected()/
-        // enqueueCombineJob().
+        // this merge covers and in what order. See enqueueCombineJob().
         entry["combineSourcePaths"] = job.combineSourcePaths;
         // -1 (QML sees it as a negative number) until Done/Failed — see
         // Job::durationMs's doc comment.

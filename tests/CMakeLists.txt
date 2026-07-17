@@ -10,7 +10,7 @@ set(SUOP_CORE_DIR ${CMAKE_SOURCE_DIR}/src/core)
 # so the app target stays untouched. QML_ELEMENT headers compile outside the
 # qml module as long as Qt6::Qml is linked.
 function(suop_add_test name)
-    cmake_parse_arguments(ARG "LINK_WHISPER;LINK_LLAMA;LINK_SHERPA_ONNX;LINK_QUICK;LINK_MULTIMEDIA;LINK_DBUS;LINK_SVG;ICON_ASSETS" "" "SOURCES" ${ARGN})
+    cmake_parse_arguments(ARG "LINK_WHISPER;LINK_LLAMA;LINK_SHERPA_ONNX;LINK_QUICK;LINK_MULTIMEDIA;LINK_DBUS;LINK_KWINDOWSYSTEM;LINK_GUI;LINK_SVG;ICON_ASSETS" "" "SOURCES" ${ARGN})
     set(abs_sources "")
     foreach(src ${ARG_SOURCES})
         list(APPEND abs_sources ${SUOP_CORE_DIR}/${src})
@@ -33,12 +33,25 @@ function(suop_add_test name)
         # around it still references QtDBus and has to link.
         target_link_libraries(${name} PRIVATE Qt6::DBus)
     endif()
+    if(ARG_LINK_KWINDOWSYSTEM)
+        # For tests that compile DesktopIntegration.cpp — it mints xdg-activation
+        # tokens via KWaylandExtras. Pulls in Qt6::Gui transitively (KF6's own
+        # public dependency), which that TU also needs for QGuiApplication.
+        target_link_libraries(${name} PRIVATE KF6::WindowSystem)
+    endif()
     if(ARG_LINK_MULTIMEDIA)
         # For tests that compile AudioRecorder.cpp/AudioPlayer.cpp — those
         # reference QAudioSource/QMediaDevices etc. even when the test itself
         # only exercises hardware-free helper functions (see
         # tst_audiorecorder.cpp), so the TU still needs Qt6::Multimedia to link.
         target_link_libraries(${name} PRIVATE Qt6::Multimedia)
+    endif()
+    if(ARG_LINK_GUI)
+        # For tests that compile a core source needing QtGui directly without
+        # dragging in Quick — Clipboard.cpp (QGuiApplication::clipboard()).
+        # Also what puts QT_GUI_LIB in the TU, so the test's own
+        # QGuiApplication is available.
+        target_link_libraries(${name} PRIVATE Qt6::Gui)
     endif()
     if(ARG_LINK_SVG)
         # For tests that compile IconTheme.cpp — IconImageProvider uses
@@ -90,6 +103,34 @@ endfunction()
 suop_add_test(tst_smoke)
 suop_add_test(tst_rollingaverage)
 suop_add_test(tst_vaulttreemodel SOURCES VaultTreeModel.cpp)
+suop_add_test(tst_desktopintegration LINK_DBUS LINK_KWINDOWSYSTEM SOURCES DesktopIntegration.cpp)
+suop_add_test(tst_clipboard LINK_GUI SOURCES Clipboard.cpp)
+# Loads the real BottomBar.qml in a QQuickView. Deliberately does NOT compile
+# DesktopIntegration.cpp — it registers a recording stub under that name, so a
+# clicked path segment never launches a real file manager (see the test's
+# top-of-file comment).
+suop_add_test(tst_bottombar_pathsegments LINK_QUICK LINK_SVG ICON_ASSETS SOURCES IconTheme.cpp)
+# Loads the real MainPanel.qml in a QQuickView and proves the chapter-title <->
+# transcript cross-selection offset math (which the tst_styleguide source scans
+# structurally cannot check). Compiles the REAL Clipboard.cpp — not a stub —
+# because the assertion is what actually lands on the clipboard; hence LINK_GUI.
+# See its top-of-file comment.
+suop_add_test(tst_mainpanel_chapterselection LINK_QUICK LINK_SVG ICON_ASSETS LINK_GUI SOURCES IconTheme.cpp Clipboard.cpp)
+suop_add_test(tst_scratch_headingrepro LINK_QUICK LINK_SVG ICON_ASSETS LINK_GUI SOURCES IconTheme.cpp Clipboard.cpp)
+# Loads the real MainPanel.qml in a QQuickView AND wires a REAL
+# TranscriptionController into it — the assertion is what the panel reads back
+# off disk for the file that's actually open, so a stubbed readChapters() would
+# only prove the stub agrees with itself. Hence the whisper/llama link deps that
+# the other MainPanel QML tests don't need. See its top-of-file comment.
+suop_add_test(tst_mainpanel_chapterrefresh LINK_QUICK LINK_SVG ICON_ASSETS LINK_GUI
+    LINK_WHISPER LINK_LLAMA LINK_SHERPA_ONNX
+    SOURCES IconTheme.cpp Clipboard.cpp TranscriptionController.cpp WhisperCppEngine.cpp VadChunker.cpp
+            ModelManager.cpp AudioDecoder.cpp LabelingEngine.cpp DiarizationEngine.cpp)
+suop_add_test(tst_mainpanel_deleteundo LINK_QUICK LINK_SVG ICON_ASSETS LINK_GUI
+    LINK_WHISPER LINK_LLAMA LINK_SHERPA_ONNX
+    SOURCES IconTheme.cpp Clipboard.cpp VaultTreeModel.cpp TranscriptionController.cpp
+            WhisperCppEngine.cpp VadChunker.cpp ModelManager.cpp AudioDecoder.cpp
+            LabelingEngine.cpp DiarizationEngine.cpp)
 suop_add_test(tst_vaultsearchproxymodel SOURCES VaultTreeModel.cpp VaultSearchProxyModel.cpp)
 suop_add_test(tst_modelmanager SOURCES ModelManager.cpp)
 suop_add_test(tst_transcript_format LINK_WHISPER LINK_LLAMA LINK_SHERPA_ONNX
@@ -108,6 +149,18 @@ suop_add_test(tst_diarizationengine LINK_SHERPA_ONNX SOURCES DiarizationEngine.c
 suop_add_test(tst_future_spec)
 suop_add_test(tst_styleguide)
 suop_add_test(tst_icontheme LINK_QUICK LINK_SVG ICON_ASSETS SOURCES IconTheme.cpp)
+# Renders the real Snackbar/SnackbarHost/Notifications in an ApplicationWindow
+# (not a QQuickView — SnackbarHost needs Overlay.overlay; see the test's
+# top-of-file comment). Needs IconTheme + icon resources for the close AppIcon.
+suop_add_test(tst_snackbar LINK_QUICK LINK_SVG ICON_ASSETS SOURCES IconTheme.cpp)
+# MiddleDragScroll.qml's own harness: pure QML (the component imports nothing
+# from this module and needs no C++ types), so it links Quick but compiles no
+# core sources.
+suop_add_test(tst_middledragscroll LINK_QUICK)
+# TitleBar.qml's own harness: loads the real TitleBar (frameless-mode custom
+# titlebar), so like the sidebar harnesses below it needs IconTheme (its
+# singleton + image provider) and the icon-pack resources for AppIcon.
+suop_add_test(tst_titlebar_buttons LINK_QUICK LINK_SVG ICON_ASSETS SOURCES IconTheme.cpp)
 # The sidebar QQuickView harnesses load the real Sidebar.qml, which now uses
 # AppIcon — so they need IconTheme (its singleton + image provider) and the
 # icon-pack resources, exactly as the app does, or AppIcon.qml throws
@@ -117,8 +170,19 @@ suop_add_test(tst_sidebar_dragmove LINK_QUICK LINK_SVG ICON_ASSETS SOURCES Vault
 suop_add_test(tst_sidebar_rename LINK_QUICK LINK_SVG ICON_ASSETS SOURCES VaultTreeModel.cpp VaultSearchProxyModel.cpp IconTheme.cpp)
 suop_add_test(tst_sidebar_expand LINK_QUICK LINK_SVG ICON_ASSETS SOURCES VaultTreeModel.cpp VaultSearchProxyModel.cpp IconTheme.cpp)
 suop_add_test(tst_sidebar_guides LINK_QUICK LINK_SVG ICON_ASSETS SOURCES VaultTreeModel.cpp VaultSearchProxyModel.cpp IconTheme.cpp)
+# The ONLY sidebar harness that renders inside a real ApplicationWindow (hence a
+# real Overlay + SnackbarHost), which is what the context menu's modal dimming
+# needs — the QQuickView harnesses above structurally cannot show it. See its
+# top-of-file comment.
+suop_add_test(tst_sidebar_contextmenu LINK_QUICK LINK_SVG ICON_ASSETS SOURCES VaultTreeModel.cpp VaultSearchProxyModel.cpp IconTheme.cpp)
 suop_add_test(tst_usbdevicemonitor LINK_DBUS SOURCES UsbDeviceMonitor.cpp)
 suop_add_test(tst_usbrulestore SOURCES UsbRuleStore.cpp)
 suop_add_test(tst_usbgrabjob SOURCES UsbGrabJob.cpp UsbRuleStore.cpp VaultTreeModel.cpp)
 suop_add_test(tst_usbgrabbercontroller LINK_DBUS
+    SOURCES UsbGrabberController.cpp UsbDeviceMonitor.cpp UsbRuleStore.cpp UsbGrabJob.cpp VaultTreeModel.cpp)
+# Loads the real UsbRegexField.qml in a QQuickView — tst_styleguide.cpp keeps
+# the cheap source-scan guard, this one proves the component actually LOADS
+# (a green cmake build doesn't) and that its validity indicator/token buttons
+# behave. See its top-of-file comment.
+suop_add_test(tst_usbregexfield LINK_QUICK LINK_DBUS
     SOURCES UsbGrabberController.cpp UsbDeviceMonitor.cpp UsbRuleStore.cpp UsbGrabJob.cpp VaultTreeModel.cpp)

@@ -355,37 +355,6 @@ Rectangle {
         return eligible.filter((p) => sidebar.selectedPaths.indexOf(p) >= 0)
     }
 
-    // Item 44: the current multi-selection narrowed to AUDIO notes only.
-    // combineSelected() concatenates audio, so an orphaned .md that got
-    // selected must be dropped. Reads isAudio from searchResultNotes() (the
-    // same visible-note metadata the search run-all eligibility uses, valid in
-    // both text-search and tree modes), intersected with selectedPaths.
-    // Returns [] for a selection of fewer than two audio files — the caller's
-    // and the UI's >= 2 gate.
-    function selectedAudioPaths() {
-        const selected = sidebar.selectedPaths
-        if (selected.length < 2)
-            return []
-        return sidebar.searchResultNotes()
-            .filter((n) => n.isAudio && selected.indexOf(n.path) >= 0)
-            .map((n) => n.path)
-    }
-
-    // Item 44: manual "combine selected" — hand the explicit, user-selected
-    // audio files to the controller's combineSelected(), which reuses the same
-    // combine job/worker the rule-driven auto-combine uses. Ordering (mtime
-    // ascending) and the merged output name are decided controller-side; the
-    // sidebar just supplies the file list as file:// URLs. No-op unless 2+
-    // audio files are selected (the UI gates on the same condition).
-    function combineSelectedFiles() {
-        if (!sidebar.transcriptionController)
-            return
-        const paths = sidebar.selectedAudioPaths()
-        if (paths.length < 2)
-            return
-        sidebar.transcriptionController.combineSelected(paths.map((p) => "file://" + p), sidebar.vaultPath)
-    }
-
     // Item 39: run-all over the CURRENT SEARCH/FILTER RESULTS (the third,
     // search-menu home for the transcribe/relabel/chapters actions, alongside
     // the ribbon's bulk buttons and treeDelegate's per-row cluster). The
@@ -531,31 +500,6 @@ Rectangle {
                 return
             }
         }
-    }
-
-    // Item 42: focus the in-app file explorer (this tree) and reveal `path` in
-    // it — the target of the bottom bar's current-file label click, which used
-    // to shell out to the OS file manager. `path` is normally already
-    // sidebar.currentPath (BottomBar mirrors MainPanel's open file), so the row
-    // already carries currentPath's persistent outline; this just gives the
-    // tree keyboard focus and scrolls the row into view, syncing the
-    // selection/cursor state so subsequent arrow-nav starts from it. Under an
-    // active text search the TreeView is hidden, so focus the results list and
-    // scroll to the row if it's among the matches (best-effort — no forced
-    // search clear).
-    function focusAndRevealNote(path) {
-        if (path === "")
-            return
-        if (sidebar.searchQuery !== "") {
-            searchResultsView.forceActiveFocus()
-            sidebar.scrollNoteIntoView(path)
-            return
-        }
-        tree.forceActiveFocus()
-        sidebar.selectedPaths = [path]
-        sidebar.lastClickedPath = path
-        sidebar.selectionCursorPath = path
-        sidebar.scrollNoteIntoView(path)
     }
 
     // Single-select + open + reveal one note, collapsing anchor and cursor
@@ -1317,6 +1261,7 @@ Rectangle {
     // minus the file's own current directory).
     property var moveFolderList: []
 
+
     function openContextMenu(path, isDir, isNote, isAudio, status, createInDir, label, x, y) {
         sidebar.ctxPath = path
         sidebar.ctxIsDir = isDir
@@ -1451,10 +1396,8 @@ Rectangle {
             return // empty or unchanged — silently keep the old name
 
         if (isDir) {
-            if (sidebar.model && !sidebar.model.renameFolder("file://" + path, trimmed)) {
-                sidebar.rowActionError = qsTr("Couldn't rename folder — name taken or invalid.")
-                rowActionErrorClearTimer.restart()
-            }
+            if (sidebar.model && !sidebar.model.renameFolder("file://" + path, trimmed))
+                Notifications.error(qsTr("Couldn't rename folder — name taken or invalid."))
             return
         }
 
@@ -1468,10 +1411,8 @@ Rectangle {
             return
         }
 
-        if (sidebar.model && !sidebar.model.renameFile("file://" + path, trimmed)) {
-            sidebar.rowActionError = qsTr("Couldn't rename — name taken or invalid.")
-            rowActionErrorClearTimer.restart()
-        }
+        if (sidebar.model && !sidebar.model.renameFile("file://" + path, trimmed))
+            Notifications.error(qsTr("Couldn't rename — name taken or invalid."))
     }
 
     function openMoveTo() {
@@ -1611,39 +1552,31 @@ Rectangle {
         }
         // A refused move (most likely a same-named file already in the
         // destination) is otherwise completely silent — the row just stays put.
-        // Same transient-banner treatment as Main.qml's drag-and-drop import
-        // failures, which this gesture is the in-vault sibling of.
-        if (failed.length > 0) {
-            sidebar.rowActionError = qsTr("Couldn't move: %1").arg(failed.join(", "))
-            rowActionErrorClearTimer.restart()
-        }
+        // Same snackbar treatment as Main.qml's drag-and-drop import failures,
+        // which this gesture is the in-vault sibling of.
+        if (failed.length > 0)
+            Notifications.error(qsTr("Couldn't move: %1").arg(failed.join(", ")))
     }
 
-    // Transient failure feedback for any row-targeted action the model refuses
-    // — a move (drag/"Move to…"), an inline rename, or a delete. All of them
-    // are otherwise completely silent: the row just stays put / keeps its old
-    // name, with nothing to tell the user why. Shared rather than one banner
-    // per action: the placement and lifetime are identical, and only one of
-    // these gestures can be in flight at a time.
-    property string rowActionError: ""
 
-    Timer {
-        id: rowActionErrorClearTimer
-        interval: 4000
-        onTriggered: sidebar.rowActionError = ""
-    }
-
-    function confirmDeleteFolder() {
-        if (sidebar.model && sidebar.ctxPath !== "")
-            sidebar.model.deleteFolder("file://" + sidebar.ctxPath)
-        deleteConfirmPopup.close()
-    }
-
-    // Item 2 (delete transcript / delete file): both destructive file actions
-    // route through the shared fileDeleteConfirmPopup below, keyed by
-    // pendingDeleteMode. VaultTreeModel::deleteTranscript()/deleteFile()
-    // move files to the trash (recoverable), but a confirm is still required
-    // for a destructive user action.
+    // Item 2 (delete transcript / delete file / delete folder): every delete
+    // TRIES THE TRASH FIRST and only asks for confirmation if the trash refuses.
+    //
+    // The old flow confirmed every delete, because the model's one delete call
+    // silently did "trash, or permanently remove if trashing fails" and the UI
+    // could never tell which it had gotten — so it had to assume the worst
+    // every time, and the prompt cried wolf on the overwhelmingly common
+    // recoverable case. Now:
+    //
+    //   trash succeeded  -> no prompt at all; a snackbar offers Undo instead.
+    //                       Confirming a reversible action is just friction.
+    //   trash refused    -> the entries are STILL ON DISK, untouched (a failed
+    //                       moveToTrash is non-destructive — see trashOnly() in
+    //                       VaultTreeModel.cpp), so we can safely prompt now,
+    //                       naming exactly the ones that would be permanent.
+    //
+    // Nothing predicts trash-ability up front; attempting it IS the test, and
+    // it's free. So the prompt now means what it says: "this cannot be undone".
     //
     // An ARRAY, not a single path: "Delete file" acts on the whole
     // multi-selection when the right-clicked row is part of one (see
@@ -1651,7 +1584,7 @@ Rectangle {
     // deliberately single-file — it's offered only for the one right-clicked
     // transcribed audio row, so it always has exactly one target.
     property var pendingDeletePaths: []
-    property string pendingDeleteMode: "" // "transcript" | "file"
+    property string pendingDeleteMode: "" // "transcript" | "audioOnly" | "file" | "folder"
 
     // The single filename a confirm message names, for the 1-target case.
     function pendingDeleteName() {
@@ -1661,34 +1594,104 @@ Rectangle {
         return p.substring(p.lastIndexOf("/") + 1)
     }
 
+    // Shared tail for all three delete kinds: report what happened, offer Undo
+    // for whatever went to the trash, and prompt only for what didn't.
+    // `result` is a trashFiles()/trashFolder()/trashTranscript() result map.
+    function handleTrashResult(result, mode, trashedMessage) {
+        const untrashable = result.untrashable || []
+        const restorable = result.restorable || []
+
+        if (result.trashed > 0) {
+            Notifications.post({
+                text: trashedMessage,
+                kind: "info",
+                actions: restorable.length > 0 ? [{
+                    label: qsTr("Undo"),
+                    onTriggered: function() {
+                        const back = sidebar.model.restoreFromTrash(restorable)
+                        if (back < restorable.length)
+                            Notifications.warn(qsTr("Only part of that could be restored — " +
+                                                    "some items are no longer in the trash."))
+                    }
+                }] : []
+            })
+        }
+
+        // Only the entries the filesystem refused to trash reach the prompt —
+        // those are the only ones a permanent delete is on the table for. They
+        // were left untouched, so nothing has happened to them yet.
+        if (untrashable.length > 0) {
+            sidebar.pendingDeletePaths = untrashable.map(
+                (u) => u.toString().replace("file://", ""))
+            sidebar.pendingDeleteMode = mode
+            fileDeleteConfirmPopup.open()
+        }
+    }
+
     function beginDeleteTranscript(path) {
-        sidebar.pendingDeletePaths = [path]
-        sidebar.pendingDeleteMode = "transcript"
-        fileDeleteConfirmPopup.open()
+        if (!sidebar.model)
+            return
+        const name = path.substring(path.lastIndexOf("/") + 1)
+        sidebar.handleTrashResult(
+            sidebar.model.trashTranscript("file://" + path), "transcript",
+            qsTr("Moved the transcript for %1 to the trash.").arg(name))
+    }
+
+    // The complement of beginDeleteTranscript(): drops the audio, keeps the .md
+    // (which becomes an orphaned-.md row). Single-file for the same reason
+    // beginDeleteTranscript() is — see pendingDeletePaths' comment.
+    function beginDeleteAudioOnly(path) {
+        if (!sidebar.model)
+            return
+        const name = path.substring(path.lastIndexOf("/") + 1)
+        sidebar.handleTrashResult(
+            sidebar.model.trashAudioOnly("file://" + path), "audioOnly",
+            qsTr("Moved the audio for %1 to the trash — the transcript is still here.").arg(name))
     }
 
     function beginDeleteFile(path) {
-        sidebar.pendingDeletePaths = sidebar.selectionPathsFor(path, false)
-        sidebar.pendingDeleteMode = "file"
-        fileDeleteConfirmPopup.open()
+        if (!sidebar.model)
+            return
+        const paths = sidebar.selectionPathsFor(path, false)
+        if (paths.length === 0)
+            return
+        // One C++ call for the whole batch — trashFiles() rebuilds the model
+        // once rather than once per file (see its doc comment).
+        const result = sidebar.model.trashFiles(paths.map((p) => "file://" + p))
+        sidebar.handleTrashResult(
+            result, "file",
+            result.trashed === 1
+                ? qsTr("Moved %1 to the trash.").arg(
+                      paths[0].substring(paths[0].lastIndexOf("/") + 1))
+                : qsTr("Moved %1 items to the trash.").arg(result.trashed))
     }
 
+    function beginDeleteFolder(path) {
+        if (!sidebar.model || path === "")
+            return
+        const name = path.substring(path.lastIndexOf("/") + 1)
+        sidebar.handleTrashResult(
+            sidebar.model.trashFolder("file://" + path), "folder",
+            qsTr("Moved the folder %1 to the trash.").arg(name))
+    }
+
+    // Reached ONLY for entries that couldn't be trashed — i.e. this really is
+    // the irreversible one, which is why it's the only path that prompts.
     function confirmFileDelete() {
         const paths = sidebar.pendingDeletePaths
         if (sidebar.model && paths.length > 0) {
             if (sidebar.pendingDeleteMode === "transcript") {
-                // Always exactly one target — see pendingDeletePaths.
-                sidebar.model.deleteTranscript("file://" + paths[0])
+                sidebar.model.deleteTranscriptPermanently("file://" + paths[0])
+            } else if (sidebar.pendingDeleteMode === "audioOnly") {
+                sidebar.model.deleteAudioOnlyPermanently("file://" + paths[0])
+            } else if (sidebar.pendingDeleteMode === "folder") {
+                sidebar.model.deleteFolderPermanently("file://" + paths[0])
             } else {
-                // One C++ call for the whole batch — deleteFiles() rebuilds the
-                // model once rather than once per file (see its doc comment).
                 const urls = paths.map((p) => "file://" + p)
-                const deleted = sidebar.model.deleteFiles(urls)
-                if (deleted < paths.length) {
-                    sidebar.rowActionError = qsTr("Couldn't delete %1 of %2 items.")
-                        .arg(paths.length - deleted).arg(paths.length)
-                    rowActionErrorClearTimer.restart()
-                }
+                const deleted = sidebar.model.deleteFilesPermanently(urls)
+                if (deleted < paths.length)
+                    Notifications.error(qsTr("Couldn't delete %1 of %2 items.")
+                        .arg(paths.length - deleted).arg(paths.length))
             }
         }
         // Nothing clears the selection here: a delete that removed anything
@@ -2230,36 +2233,6 @@ Rectangle {
                 Layout.alignment: Qt.AlignVCenter
             }
 
-            // Item 44: discoverable "Combine" button next to the "N selected"
-            // indicator — the nice-to-have companion to the context-menu entry.
-            // Shown only when 2+ AUDIO files are selected (same gate as the
-            // context entry); calls the same combineSelectedFiles() path.
-            Item {
-                id: combineSelectedButton
-                visible: sidebar.selectedAudioPaths().length >= 2
-                Layout.preferredHeight: 22
-                Layout.preferredWidth: combineSelectedButtonText.implicitWidth + 12
-                Layout.alignment: Qt.AlignVCenter
-
-                HoverHandler {
-                    id: combineSelectedButtonHover
-                    cursorShape: Qt.PointingHandCursor
-                }
-                TapHandler {
-                    onTapped: sidebar.combineSelectedFiles()
-                }
-                HoverBorder {
-                    anchors.fill: parent
-                    active: combineSelectedButtonHover.hovered
-                }
-                Text {
-                    id: combineSelectedButtonText
-                    anchors.centerIn: parent
-                    text: qsTr("Combine")
-                    color: "#dddddd"
-                    font.pixelSize: 11
-                }
-            }
         }
 
         Column {
@@ -2988,29 +2961,9 @@ Rectangle {
         }
     }
 
-    // Failure feedback for a row action VaultTreeModel refuses — a move (most
-    // likely a same-named file already in the destination), an inline rename
-    // (name taken / invalid), or a delete. Same transient red banner as
-    // Main.qml's drag-and-drop import errors, which these gestures are the
-    // in-vault siblings of; a SUCCESSFUL action needs no banner, the row simply
-    // reappears renamed / in its new folder / gone.
-    Label {
-        z: 101
-        anchors.top: parent.top
-        anchors.horizontalCenter: parent.horizontalCenter
-        anchors.topMargin: 12
-        visible: sidebar.rowActionError !== ""
-        text: sidebar.rowActionError
-        color: "white"
-        padding: 8
-        background: Rectangle {
-            color: "#c0392b"
-            radius: AppSettings.borderRadius
-        }
-    }
-
     TreeView {
         id: tree
+        objectName: "vaultTree"
         model: searchProxy
         // Search UI rearchitecture: a non-empty text search query now shows
         // searchResultsView (below) instead — the old in-tree dimming/
@@ -3363,6 +3316,29 @@ Rectangle {
                     && (rowHover.hovered
                         || (tree.activeFocus && treeDelegate.path === sidebar.currentPath
                             && sidebar.actionButtonFocus !== ""))
+
+            // Revealing the cluster only shows its RIGHTMOST icon; the rest fan
+            // out leftward once the cursor is actually inside the cluster (or
+            // the keyboard is — Left/Right nav needs real, non-zero-width
+            // targets to focus). Merely hovering a row used to drop five icons
+            // over the tail of its filename, so the width the name lost scaled
+            // with how much work the row was eligible for. Collapsed icons
+            // animate to width 0 (not just opacity 0) and actionButtonRow's
+            // spacing animates with them, so the cluster genuinely shrinks to
+            // one icon instead of leaving a gap where the hidden ones were.
+            readonly property bool rowActionsExpanded: treeDelegate.rowActionsRevealed
+                    && (actionsHover.hovered
+                        || (tree.activeFocus && treeDelegate.path === sidebar.currentPath
+                            && sidebar.actionButtonFocus !== ""))
+
+            // Which icon survives the collapse: the rightmost VISIBLE one, in
+            // actionButtonRow's declaration order (that Row is RightToLeft, so
+            // the first declared child is the rightmost). Audio rows always
+            // have transcribe; an orphaned .md has no transcribe/relabel, so
+            // its rightmost is chapters. Directory rows have no cluster at all.
+            readonly property string rowActionsPrimary: treeDelegate.isAudio
+                    ? "transcribe"
+                    : (treeDelegate.chaptersEligible ? "chapters" : "")
 
             // Item 51: true iff this row is a member of a "ready" (would-
             // combine-if-run) split-recording group per
@@ -4304,18 +4280,45 @@ Rectangle {
             // regardless of how many icons this row actually had (user
             // report). `visible` here is the row's PERMANENT eligibility
             // (isAudio/relabelEligible/chaptersEligible) — Row only reserves
-            // space for visible children — while each icon's own `opacity`
-            // stays the hover-only fade, so the cluster's width doesn't
-            // itself animate/jump as rowHover toggles, only the icons within
-            // it fade. layoutDirection: RightToLeft keeps declaration order
-            // matching visual order (transcribe rightmost, same as before).
+            // space for visible children — so an ineligible icon never
+            // occupies a slot at all, at any hover state. Eligible-but-
+            // collapsed icons are a separate axis: they stay `visible` and
+            // animate their own width to 0 (see each button's collapsedAway
+            // and treeDelegate.rowActionsExpanded), so the cluster fans out
+            // and back smoothly rather than snapping between eligibility
+            // sets. layoutDirection: RightToLeft keeps declaration order
+            // matching visual order (transcribe rightmost, same as before) —
+            // which also makes the FIRST declared eligible icon the one that
+            // survives the collapse (treeDelegate.rowActionsPrimary).
             Row {
                 id: actionButtonRow
+                // Lets tst_sidebar_keynav read the whole cluster's real width,
+                // so "collapsed" can be checked as one-icon-wide rather than
+                // just as its hidden icons' own properties.
+                objectName: "actionButtonRow"
                 anchors.right: parent.right
                 anchors.rightMargin: 8
                 anchors.verticalCenter: parent.verticalCenter
                 layoutDirection: Qt.RightToLeft
-                spacing: 4
+                // Collapses with the icons themselves (see
+                // treeDelegate.rowActionsExpanded) — Row inserts spacing
+                // between VISIBLE children regardless of their width, so
+                // leaving this at 4 would strand a 4px gap per collapsed icon.
+                spacing: treeDelegate.rowActionsExpanded ? 4 : 0
+
+                Behavior on spacing {
+                    NumberAnimation { duration: AppSettings.animationsEnabled ? 120 : 0 }
+                }
+
+                // The expand trigger. Sized by the Row's own contents, so while
+                // collapsed the hover region IS the lone rightmost icon, and
+                // once expanded it covers the whole fanned-out cluster
+                // (including the gaps between icons) — the cluster grows
+                // leftward, away from the cursor, so expanding can never pull
+                // the Row out from under the pointer and flip-flop.
+                HoverHandler {
+                    id: actionsHover
+                }
 
                 Item {
                     id: rowTranscribeButton
@@ -4331,12 +4334,23 @@ Rectangle {
                     // skips already-current files; this per-row icon is a
                     // deliberate single-file request, so it always fires).
                     visible: treeDelegate.isAudio
-                    width: 20
+                    // Collapsed to nothing unless the cluster is expanded or
+                    // this is the row's surviving rightmost icon. clip keeps
+                    // the glyph inside the shrinking box (this Item's children
+                    // are centered in it, not sized by it). Every button below
+                    // repeats this trio with its own action key.
+                    readonly property bool collapsedAway: !treeDelegate.rowActionsExpanded
+                            && treeDelegate.rowActionsPrimary !== "transcribe"
+                    width: rowTranscribeButton.collapsedAway ? 0 : 20
                     height: 20
-                    opacity: treeDelegate.rowActionsRevealed ? 1 : 0
+                    clip: true
+                    opacity: treeDelegate.rowActionsRevealed && !rowTranscribeButton.collapsedAway ? 1 : 0
                     enabled: opacity > 0
 
                     Behavior on opacity {
+                        NumberAnimation { duration: AppSettings.animationsEnabled ? 120 : 0 }
+                    }
+                    Behavior on width {
                         NumberAnimation { duration: AppSettings.animationsEnabled ? 120 : 0 }
                     }
 
@@ -4392,12 +4406,19 @@ Rectangle {
                     id: rowRelabelButton
                     objectName: "rowRelabelButton"
                     visible: treeDelegate.relabelEligible
-                    width: 20
+                    // See rowTranscribeButton's collapsedAway above.
+                    readonly property bool collapsedAway: !treeDelegate.rowActionsExpanded
+                            && treeDelegate.rowActionsPrimary !== "relabel"
+                    width: rowRelabelButton.collapsedAway ? 0 : 20
                     height: 20
-                    opacity: treeDelegate.rowActionsRevealed ? 1 : 0
+                    clip: true
+                    opacity: treeDelegate.rowActionsRevealed && !rowRelabelButton.collapsedAway ? 1 : 0
                     enabled: opacity > 0
 
                     Behavior on opacity {
+                        NumberAnimation { duration: AppSettings.animationsEnabled ? 120 : 0 }
+                    }
+                    Behavior on width {
                         NumberAnimation { duration: AppSettings.animationsEnabled ? 120 : 0 }
                     }
 
@@ -4446,12 +4467,19 @@ Rectangle {
                     id: rowChaptersButton
                     objectName: "rowChaptersButton"
                     visible: treeDelegate.chaptersEligible
-                    width: 20
+                    // See rowTranscribeButton's collapsedAway above.
+                    readonly property bool collapsedAway: !treeDelegate.rowActionsExpanded
+                            && treeDelegate.rowActionsPrimary !== "chapters"
+                    width: rowChaptersButton.collapsedAway ? 0 : 20
                     height: 20
-                    opacity: treeDelegate.rowActionsRevealed ? 1 : 0
+                    clip: true
+                    opacity: treeDelegate.rowActionsRevealed && !rowChaptersButton.collapsedAway ? 1 : 0
                     enabled: opacity > 0
 
                     Behavior on opacity {
+                        NumberAnimation { duration: AppSettings.animationsEnabled ? 120 : 0 }
+                    }
+                    Behavior on width {
                         NumberAnimation { duration: AppSettings.animationsEnabled ? 120 : 0 }
                     }
 
@@ -4498,12 +4526,19 @@ Rectangle {
                     id: rowDetectSpeakersButton
                     objectName: "rowDetectSpeakersButton"
                     visible: treeDelegate.relabelEligible
-                    width: 20
+                    // See rowTranscribeButton's collapsedAway above.
+                    readonly property bool collapsedAway: !treeDelegate.rowActionsExpanded
+                            && treeDelegate.rowActionsPrimary !== "detectSpeakers"
+                    width: rowDetectSpeakersButton.collapsedAway ? 0 : 20
                     height: 20
-                    opacity: treeDelegate.rowActionsRevealed ? 1 : 0
+                    clip: true
+                    opacity: treeDelegate.rowActionsRevealed && !rowDetectSpeakersButton.collapsedAway ? 1 : 0
                     enabled: opacity > 0
 
                     Behavior on opacity {
+                        NumberAnimation { duration: AppSettings.animationsEnabled ? 120 : 0 }
+                    }
+                    Behavior on width {
                         NumberAnimation { duration: AppSettings.animationsEnabled ? 120 : 0 }
                     }
 
@@ -4550,12 +4585,22 @@ Rectangle {
                     id: rowRunAllButton
                     objectName: "rowRunAllButton"
                     visible: treeDelegate.isAudio || treeDelegate.isOrphanedMd
-                    width: 20
+                    // See rowTranscribeButton's collapsedAway above. runAll is
+                    // never a row's rightmost icon (anything eligible for it is
+                    // eligible for transcribe or chapters, both declared before
+                    // it), so it always collapses.
+                    readonly property bool collapsedAway: !treeDelegate.rowActionsExpanded
+                            && treeDelegate.rowActionsPrimary !== "runAll"
+                    width: rowRunAllButton.collapsedAway ? 0 : 20
                     height: 20
-                    opacity: treeDelegate.rowActionsRevealed ? 1 : 0
+                    clip: true
+                    opacity: treeDelegate.rowActionsRevealed && !rowRunAllButton.collapsedAway ? 1 : 0
                     enabled: opacity > 0
 
                     Behavior on opacity {
+                        NumberAnimation { duration: AppSettings.animationsEnabled ? 120 : 0 }
+                    }
+                    Behavior on width {
                         NumberAnimation { duration: AppSettings.animationsEnabled ? 120 : 0 }
                     }
 
@@ -4909,125 +4954,23 @@ Rectangle {
         }
     }
 
-    // Chrome/Firefox-style middle-click autoscroll for the file tree —
-    // same two-gesture pattern (quick click arms free-scroll; press-drag-
-    // release disarms on release) as MainPanel's transcript-view
-    // middleDragScrollArea, adapted to TreeView (itself the Flickable, so
-    // no .contentItem indirection is needed the way ScrollView requires).
+    // Chrome/Firefox-style middle-click autoscroll for the file tree — see
+    // MiddleDragScroll.qml for the whole design. The tree is itself the
+    // Flickable, so no ScrollView .contentItem indirection is needed here.
     //
-    // z is the whole story here, confirmed empirically (an offscreen
-    // QTest::mouseMove repro against Qt 6.11's actual cursor resolution,
-    // since this was wrong twice from reasoning alone): Qt Quick's cursor
-    // resolution is a pure top-down PAINT-ORDER scan for "whichever item is
-    // topmost at this point" — NOT gated by hoverEnabled, acceptedButtons,
-    // or even whether that topmost item has an explicit cursorShape at all.
-    // An idle item sitting above a row, even fully inert (hoverEnabled:
-    // false, no cursorShape bound), still wins and shows the plain arrow
-    // instead of falling through to the row's HoverHandler cursor — and
-    // separately, an idle item with hoverEnabled: true also blocks hover
-    // EVENT delivery itself to the row below (a different mechanism; that
-    // part broke this area's HoverBorder highlight too, until an earlier
-    // fix made hoverEnabled conditional).
-    //
-    // So this item now stays BELOW tree (z negative) while idle — proven by
-    // the same repro that a below-tree MouseArea still receives the
-    // qualifying middle-button press (TreeView's delegates only claim
-    // LeftButton via TapHandler, so MiddleButton falls through to whatever
-    // is underneath, no special fallthrough trick needed) — and only rises
-    // above tree (z positive) once actually armed, which is exactly when it
-    // SHOULD own both the cursor (SizeAll/SizeVer) and click-to-cancel
-    // priority over row clicks, per Chrome's own convention.
-    MouseArea {
+    // Search UI rearchitecture: this is wired to tree's own Flickable
+    // geometry, and while search results are showing tree is invisible — so
+    // arming would just scroll a hidden view for no visible effect. Disabled
+    // rather than adapted to also drive searchResultsView, which already gets
+    // ordinary wheel/flick scrolling for free from ListView.
+    MiddleDragScroll {
         id: middleDragScrollArea
-        // Search UI rearchitecture: this autoscroll is wired specifically
-        // to tree's own Flickable geometry (contentY/contentHeight below) —
-        // while search results are showing, tree is invisible and this would
-        // just scroll a hidden view for no visible effect, so it's disabled
-        // rather than adapted to also drive searchResultsView (which already
-        // gets ordinary wheel/flick scrolling for free from ListView).
         enabled: sidebar.searchQuery === ""
         anchors.top: ribbon.bottom
         anchors.left: parent.left
         anchors.right: parent.right
         anchors.bottom: parent.bottom
-        z: middleDragScrollArea.armed ? 1 : -1
-        acceptedButtons: middleDragScrollArea.armed
-                         ? (Qt.LeftButton | Qt.MiddleButton | Qt.RightButton)
-                         : Qt.MiddleButton
-        // hoverEnabled only while armed: idle doesn't need it (arming only
-        // needs onPressed, which fires regardless of hoverEnabled), and
-        // leaving it true while idle would still shadow the row's own hover
-        // EVENT delivery (see comment above) even though z now keeps the
-        // CURSOR correct either way. Gesture 2's held-button drag still
-        // delivers onPositionChanged with hoverEnabled false (an active
-        // press grab guarantees that); gesture 1's free-scroll-without-
-        // holding is the one case that needs hover tracking, and that only
-        // ever runs once armed, when this binding has already flipped true.
-        hoverEnabled: middleDragScrollArea.armed
-        cursorShape: {
-            if (!middleDragScrollArea.armed)
-                return Qt.ArrowCursor
-            const dy = Math.abs(middleDragScrollArea.currentY - middleDragScrollArea.originY)
-            return dy <= middleDragScrollArea.deadzone ? Qt.SizeAllCursor : Qt.SizeVerCursor
-        }
-
-        property bool armed: false
-        property real originY: 0
-        property real currentY: 0
-        property bool buttonHeld: false
-        property bool draggedWhileHeld: false
-        readonly property int deadzone: 8
-
-        onPressed: (mouse) => {
-            if (middleDragScrollArea.armed) {
-                middleDragScrollArea.armed = false
-                return
-            }
-            middleDragScrollArea.buttonHeld = true
-            middleDragScrollArea.draggedWhileHeld = false
-            middleDragScrollArea.armed = true
-            const p = middleDragScrollArea.mapToItem(tree, mouse.x, mouse.y)
-            middleDragScrollArea.originY = p.y
-            middleDragScrollArea.currentY = p.y
-        }
-        onPositionChanged: (mouse) => {
-            const p = middleDragScrollArea.mapToItem(tree, mouse.x, mouse.y)
-            middleDragScrollArea.currentY = p.y
-            if (middleDragScrollArea.buttonHeld && !middleDragScrollArea.draggedWhileHeld
-                    && Math.abs(middleDragScrollArea.currentY - middleDragScrollArea.originY) > middleDragScrollArea.deadzone) {
-                middleDragScrollArea.draggedWhileHeld = true
-            }
-        }
-        onReleased: (mouse) => {
-            if (mouse.button !== Qt.MiddleButton)
-                return
-            middleDragScrollArea.buttonHeld = false
-            if (middleDragScrollArea.draggedWhileHeld)
-                middleDragScrollArea.armed = false
-            // else: real click, no drag — gesture 1 keeps running.
-        }
-
-        Timer {
-            interval: 16
-            repeat: true
-            running: middleDragScrollArea.armed
-            onTriggered: {
-                const dy = middleDragScrollArea.currentY - middleDragScrollArea.originY
-                const deadzone = middleDragScrollArea.deadzone
-                if (Math.abs(dy) <= deadzone)
-                    return
-                const beyond = dy - Math.sign(dy) * deadzone
-                const speed = Math.sign(beyond) * beyond * beyond * 0.002
-                const maxY = Math.max(0, tree.contentHeight - tree.height)
-                tree.contentY = Math.max(0, Math.min(maxY, tree.contentY + speed))
-            }
-        }
-    }
-
-    Shortcut {
-        sequence: "Escape"
-        enabled: middleDragScrollArea.armed
-        onActivated: middleDragScrollArea.armed = false
+        flickable: tree
     }
 
     // Item 40: folder-management context menu. Same custom-Popup shape as the
@@ -5035,6 +4978,7 @@ Rectangle {
     // each with a HoverHandler (pointer cursor) + TapHandler.
     Popup {
         id: contextMenu
+        objectName: "contextMenu"
         x: sidebar.ctxMenuX
         y: sidebar.ctxMenuY
         width: 200
@@ -5084,43 +5028,6 @@ Rectangle {
                     anchors.leftMargin: 8
                     anchors.verticalCenter: parent.verticalCenter
                     text: qsTr("New folder")
-                    color: "white"
-                    font.pixelSize: 12
-                }
-            }
-
-            // Item 44: "Combine selected (N)" — manual combine of the current
-            // multi-selection. Visible only when 2+ AUDIO files are selected
-            // (selectedAudioPaths() drops any orphaned .md), independent of
-            // which specific row was right-clicked; the cleanest home for the
-            // action alongside the other context entries. Calls
-            // combineSelectedFiles() -> controller.combineSelected().
-            Item {
-                id: ctxCombineSelectedRow
-                visible: sidebar.selectedAudioPaths().length >= 2
-                width: parent.width
-                height: 28
-
-                HoverHandler {
-                    id: ctxCombineSelectedHover
-                    cursorShape: Qt.PointingHandCursor
-                }
-                TapHandler {
-                    onTapped: {
-                        contextMenu.close()
-                        sidebar.combineSelectedFiles()
-                    }
-                }
-                Rectangle {
-                    anchors.fill: parent
-                    radius: AppSettings.borderRadius
-                    color: ctxCombineSelectedHover.hovered ? "#3a3a3a" : "transparent"
-                }
-                Text {
-                    anchors.left: parent.left
-                    anchors.leftMargin: 8
-                    anchors.verticalCenter: parent.verticalCenter
-                    text: qsTr("Combine selected (%1)").arg(sidebar.selectedAudioPaths().length)
                     color: "white"
                     font.pixelSize: 12
                 }
@@ -5220,8 +5127,14 @@ Rectangle {
                 }
                 TapHandler {
                     onTapped: {
+                        // No confirm up front: beginDeleteFolder() trashes
+                        // (recoverable, Undo offered in a snackbar) and only
+                        // prompts if the trash refuses. The folder's own
+                        // deleteConfirmPopup is gone — fileDeleteConfirmPopup
+                        // handles the one case that still needs confirming, for
+                        // all three delete kinds.
                         contextMenu.close()
-                        deleteConfirmPopup.open()
+                        sidebar.beginDeleteFolder(sidebar.ctxPath)
                     }
                 }
                 Rectangle {
@@ -5246,6 +5159,7 @@ Rectangle {
             // below instead, not this.)
             Item {
                 id: ctxDeleteTranscriptRow
+                objectName: "ctxDeleteTranscriptRow"
                 visible: sidebar.ctxIsAudio && sidebar.ctxStatus === 2
                 width: parent.width
                 height: 28
@@ -5275,6 +5189,45 @@ Rectangle {
                 }
             }
 
+            // "Delete audio only" — the complement of "Delete transcript", and
+            // gated identically (transcribed AUDIO row). Drops the audio and
+            // keeps the .md, which stays in the tree as an orphaned-.md row.
+            //
+            // Deliberately NOT shown for an untranscribed audio row: with no
+            // .md to keep, it would do exactly what "Delete file" does, and two
+            // menu items with one behavior is a worse menu.
+            Item {
+                id: ctxDeleteAudioOnlyRow
+                objectName: "ctxDeleteAudioOnlyRow"
+                visible: sidebar.ctxIsAudio && sidebar.ctxStatus === 2
+                width: parent.width
+                height: 28
+
+                HoverHandler {
+                    id: ctxDeleteAudioOnlyHover
+                    cursorShape: Qt.PointingHandCursor
+                }
+                TapHandler {
+                    onTapped: {
+                        contextMenu.close()
+                        sidebar.beginDeleteAudioOnly(sidebar.ctxPath)
+                    }
+                }
+                Rectangle {
+                    anchors.fill: parent
+                    radius: AppSettings.borderRadius
+                    color: ctxDeleteAudioOnlyHover.hovered ? "#3a3a3a" : "transparent"
+                }
+                Text {
+                    anchors.left: parent.left
+                    anchors.leftMargin: 8
+                    anchors.verticalCenter: parent.verticalCenter
+                    text: qsTr("Delete audio only")
+                    color: "#e07a7a"
+                    font.pixelSize: 12
+                }
+            }
+
             // Item 2: "Delete file" — for any note row (audio or orphaned .md):
             // deletes the file and all its sidecars (audio + .md + partial), or
             // just the orphaned .md alone.
@@ -5285,6 +5238,7 @@ Rectangle {
             // selectionPathsFor() rule drag-to-move uses.
             Item {
                 id: ctxDeleteFileRow
+                objectName: "ctxDeleteFileRow"
                 visible: sidebar.ctxIsNote
                 // Re-evaluates on selectedPaths/ctxPath change (both are
                 // properties), so the count is always the live selection's.
@@ -5501,97 +5455,16 @@ Rectangle {
         }
     }
 
-    // Item 40: delete-folder confirmation (recursive delete is destructive).
-    Popup {
-        id: deleteConfirmPopup
-        x: sidebar.ctxMenuX
-        y: sidebar.ctxMenuY
-        width: 260
-        padding: 8
-        modal: true
-        dim: true
-        focus: true
-        closePolicy: Popup.CloseOnPressOutside | Popup.CloseOnEscape
-
-        background: Rectangle {
-            color: "#242424"
-            radius: AppSettings.borderRadius
-            border.width: 1
-            border.color: "#3a3a3a"
-        }
-
-        Column {
-            width: deleteConfirmPopup.width - deleteConfirmPopup.padding * 2
-            spacing: 8
-
-            Label {
-                width: parent.width
-                wrapMode: Text.WordWrap
-                text: qsTr("Delete “%1” and everything inside it? This can't be undone.")
-                      .arg(sidebar.ctxPath.substring(sidebar.ctxPath.lastIndexOf("/") + 1))
-                color: "white"
-                font.pixelSize: 12
-            }
-
-            Row {
-                anchors.right: parent.right
-                spacing: 6
-
-                Item {
-                    id: deleteCancelButton
-                    width: deleteCancelLabel.implicitWidth + 16
-                    height: 24
-                    HoverHandler {
-                        id: deleteCancelHover
-                        cursorShape: Qt.PointingHandCursor
-                    }
-                    TapHandler {
-                        onTapped: deleteConfirmPopup.close()
-                    }
-                    HoverBorder {
-                        anchors.fill: parent
-                        active: deleteCancelHover.hovered
-                    }
-                    Text {
-                        id: deleteCancelLabel
-                        anchors.centerIn: parent
-                        text: qsTr("Cancel")
-                        color: "#aaaaaa"
-                        font.pixelSize: 12
-                    }
-                }
-
-                Item {
-                    id: deleteConfirmButton
-                    width: deleteConfirmLabel.implicitWidth + 16
-                    height: 24
-                    HoverHandler {
-                        id: deleteConfirmHover
-                        cursorShape: Qt.PointingHandCursor
-                    }
-                    TapHandler {
-                        onTapped: sidebar.confirmDeleteFolder()
-                    }
-                    HoverBorder {
-                        anchors.fill: parent
-                        active: deleteConfirmHover.hovered
-                    }
-                    Text {
-                        id: deleteConfirmLabel
-                        anchors.centerIn: parent
-                        text: qsTr("Delete")
-                        color: "#e07a7a"
-                        font.pixelSize: 12
-                    }
-                }
-            }
-        }
-    }
-
-    // Item 2: shared confirmation for "Delete transcript" / "Delete file"
-    // (destructive, though the files go to the trash — recoverable). Mirrors
-    // deleteConfirmPopup's style; the message + confirm action switch on
-    // sidebar.pendingDeleteMode.
+    // The ONLY delete confirmation left, and it now means what it says: it is
+    // reached only for entries the trash REFUSED (see handleTrashResult), so
+    // confirming really does delete them permanently. Everything that trashed
+    // successfully never gets here — it's already gone, with Undo offered in a
+    // snackbar instead.
+    //
+    // Hence the wording below promises no trash: it used to say "Moved to the
+    // trash" on every delete, which was exactly wrong for this path — this is
+    // the one case where nothing is going to the trash. Serves all three delete
+    // kinds; the message + confirm action switch on sidebar.pendingDeleteMode.
     Popup {
         id: fileDeleteConfirmPopup
         x: sidebar.ctxMenuX
@@ -5618,13 +5491,29 @@ Rectangle {
                 width: parent.width
                 wrapMode: Text.WordWrap
                 text: {
+                    // Every branch says "can't be moved to the trash" +
+                    // "permanently" + "can't be undone", because that is
+                    // precisely and only when this popup appears.
                     if (sidebar.pendingDeleteMode === "transcript")
-                        return qsTr("Delete the transcript for “%1”? The audio file is kept. Moved to the trash.")
+                        return qsTr("The transcript for “%1” can't be moved to the trash. " +
+                                    "Delete it permanently? The audio file is kept. " +
+                                    "This can't be undone.")
+                            .arg(sidebar.pendingDeleteName())
+                    if (sidebar.pendingDeleteMode === "audioOnly")
+                        return qsTr("The audio for “%1” can't be moved to the trash. " +
+                                    "Delete it permanently? The transcript is kept. " +
+                                    "This can't be undone.")
+                            .arg(sidebar.pendingDeleteName())
+                    if (sidebar.pendingDeleteMode === "folder")
+                        return qsTr("The folder “%1” can't be moved to the trash. Delete it " +
+                                    "and everything in it permanently? This can't be undone.")
                             .arg(sidebar.pendingDeleteName())
                     return sidebar.pendingDeletePaths.length > 1
-                        ? qsTr("Delete %1 items and their transcripts? Moved to the trash.")
+                        ? qsTr("%1 items can't be moved to the trash. Delete them and their " +
+                               "transcripts permanently? This can't be undone.")
                             .arg(sidebar.pendingDeletePaths.length)
-                        : qsTr("Delete “%1” and its transcript? Moved to the trash.")
+                        : qsTr("“%1” can't be moved to the trash. Delete it and its transcript " +
+                               "permanently? This can't be undone.")
                             .arg(sidebar.pendingDeleteName())
                 }
                 color: "white"
@@ -5679,6 +5568,8 @@ Rectangle {
                         anchors.centerIn: parent
                         text: sidebar.pendingDeleteMode === "transcript"
                               ? qsTr("Delete transcript")
+                              : sidebar.pendingDeleteMode === "audioOnly"
+                              ? qsTr("Delete audio")
                               : (sidebar.pendingDeletePaths.length > 1
                                  ? qsTr("Delete %1 items").arg(sidebar.pendingDeletePaths.length)
                                  : qsTr("Delete file"))

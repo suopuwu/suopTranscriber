@@ -4652,57 +4652,14 @@ Popup {
     }
 
     // Chrome/Firefox-style middle-click autoscroll for the Settings
-    // ScrollView — same two-gesture pattern (quick click arms free-scroll;
-    // press-drag-release disarms on release) as MainPanel's transcript-view
-    // and Sidebar's file-tree middleDragScrollArea. Lives as a sibling
+    // ScrollView — see MiddleDragScroll.qml for the whole design. A sibling
     // overlay of scrollArea (not inside it) so it isn't counted as the
-    // ScrollView's own content; anchors match scrollArea's own margins so
-    // it only covers the actual visible scroll region, not the popup's
-    // title bar / rule-editor buttons that sit outside it.
-    //
-    // NOT a MouseArea, and NOT z-toggled — both were tried and both broke
-    // something real, confirmed empirically each time (offscreen QTest):
-    //   1. A statically-topmost MouseArea (the first version) reliably
-    //      caught the click but stole the cursor from every hoverable
-    //      button/slider underneath, even fully idle — Qt Quick's cursor
-    //      resolution is pure top-down paint-order for the topmost HIT
-    //      item, independent of hoverEnabled/acceptedButtons, and MouseArea
-    //      always implicitly claims a cursor (default ArrowCursor) merely
-    //      by being the topmost hit item, regardless of its own config.
-    //   2. Toggling MouseArea's z below (-1) while idle (the second
-    //      version, matching Sidebar's TreeView-based fix) fixed the cursor
-    //      but broke the click itself: unlike a bare Flickable (which only
-    //      claims LeftButton by default and lets MiddleButton fall
-    //      through), QQC2's ScrollView/T.ScrollView Control claims ALL
-    //      mouse-button presses within its bounds at the outer Control
-    //      level before any per-button filtering, so a lower-z sibling
-    //      never sees a middle-click over it at all. Sidebar's tree isn't
-    //      wrapped in a Control the same way, which is why that fix never
-    //      needed to contend with this.
-    // The actual fix: a plain Item (not MouseArea) has NO implicit cursor
-    // at all, so it can sit PERMANENTLY topmost without poisoning cursor
-    // resolution for anything underneath, AS LONG AS it never itself binds
-    // an ENABLED cursor-setting handler while idle (confirmed empirically:
-    // a disabled HoverHandler{cursorShape:...} — enabled only once armed —
-    // doesn't count either). A permanently-topmost TapHandler reliably
-    // catches the middle-button press through ScrollView's swallow (a
-    // TapHandler participates in per-button hit-testing the same way
-    // MouseArea's fallthrough does, but being an Item-not-MouseArea it
-    // doesn't drag the implicit-cursor baggage along). gesturePolicy:
-    // DragWithinBounds (not the default DragThreshold) matters too: the
-    // default cancels TapHandler's own grab — and stops delivering ANY
-    // further events to anyone, including the real release — the instant
-    // the drag exceeds the platform threshold, which is far too early for
-    // gesture 2's long hold-drag; DragWithinBounds only cancels if the
-    // pointer leaves this Item's bounds, which for a full-viewport overlay
-    // essentially never happens mid-gesture.
-    Item {
+    // ScrollView's own content; anchored to the same region scrollArea covers
+    // (right of the nav rail, below the header chrome) so a middle-click arms
+    // it only from the scrollable page content, not from the nav rail or the
+    // persistent header.
+    MiddleDragScroll {
         id: middleDragScrollArea
-        // Anchored to the same region as scrollArea (right of the nav rail,
-        // below the header chrome) so the overlay only covers the scrollable
-        // page content, not the nav rail or persistent header. Still a Popup
-        // sibling of scrollArea (not inside it), so it isn't counted as the
-        // ScrollView's own content — see the doc comment above.
         anchors.left: navColumn.right
         anchors.right: parent.right
         anchors.top: headerRow.bottom
@@ -4711,111 +4668,6 @@ Popup {
         anchors.topMargin: 10
         anchors.bottomMargin: 16
         anchors.rightMargin: 2
-        z: 1
-
-        property bool armed: false
-        property real originY: 0
-        property real currentY: 0
-        property bool draggedWhileHeld: false
-        readonly property int deadzone: 8
-
-        // Drives arming (both gestures start here) and gesture 2's
-        // continued tracking while the button stays held — point.position
-        // updates live during the whole held drag under DragWithinBounds,
-        // unlike the default gesturePolicy which would stop updating (and
-        // stop being told about the eventual release) as soon as the drag
-        // threshold is crossed.
-        TapHandler {
-            id: middleDragTap
-            // Item 45: LeftButton is deliberately NOT included here, even
-            // while armed. This overlay sits topmost (z:1) over
-            // rulePatternField (the regex TextField) — widening to include
-            // LeftButton so "any click while armed cancels it" (Chrome
-            // convention) covered left clicks too meant a left-click meant
-            // to start a text selection got intercepted as a disarm-click
-            // instead of ever reaching the TextField, so text selection
-            // inside the regex box sometimes just didn't work (it dragged
-            // instead). Only Middle/Right actually need the disarm-cancel
-            // semantics here — a stray left click during an armed
-            // middle-drag now just passes straight through to whatever's
-            // underneath (the TextField starts a selection normally; a
-            // control like a Slider/Switch performs its own click). The one
-            // trade-off: a left click no longer disarms the scroll by
-            // itself — Escape, a middle/right click, or clicking outside the
-            // popup still do.
-            acceptedButtons: middleDragScrollArea.armed
-                             ? (Qt.MiddleButton | Qt.RightButton)
-                             : Qt.MiddleButton
-            gesturePolicy: TapHandler.DragWithinBounds
-            onPressedChanged: {
-                if (middleDragTap.pressed) {
-                    // Any click while already armed cancels it (Chrome
-                    // convention) instead of performing that button's
-                    // normal action — acceptedButtons above ensures this
-                    // branch is only reachable for Middle/Right once armed
-                    // (Left passes through instead, see the comment above).
-                    if (middleDragScrollArea.armed) {
-                        middleDragScrollArea.armed = false
-                        return
-                    }
-                    middleDragScrollArea.draggedWhileHeld = false
-                    middleDragScrollArea.armed = true
-                    middleDragScrollArea.originY = middleDragTap.point.position.y
-                    middleDragScrollArea.currentY = middleDragTap.point.position.y
-                } else if (middleDragScrollArea.draggedWhileHeld) {
-                    middleDragScrollArea.armed = false
-                    // else: real click, no drag — gesture 1 keeps running.
-                }
-            }
-            onPointChanged: {
-                if (!middleDragTap.pressed)
-                    return
-                middleDragScrollArea.currentY = middleDragTap.point.position.y
-                if (!middleDragScrollArea.draggedWhileHeld
-                        && Math.abs(middleDragScrollArea.currentY - middleDragScrollArea.originY) > middleDragScrollArea.deadzone) {
-                    middleDragScrollArea.draggedWhileHeld = true
-                }
-            }
-        }
-
-        // Drives gesture 1's free-scroll (no button held) and the visible
-        // cursor — enabled only while armed, so it never contributes a
-        // cursor (and never blocks hover-event delivery to covered
-        // buttons) while idle.
-        HoverHandler {
-            id: middleDragHover
-            enabled: middleDragScrollArea.armed
-            cursorShape: {
-                const dy = Math.abs(middleDragScrollArea.currentY - middleDragScrollArea.originY)
-                return dy <= middleDragScrollArea.deadzone ? Qt.SizeAllCursor : Qt.SizeVerCursor
-            }
-            onPointChanged: {
-                if (middleDragScrollArea.armed && !middleDragTap.pressed)
-                    middleDragScrollArea.currentY = middleDragHover.point.position.y
-            }
-        }
-
-        Timer {
-            interval: 16
-            repeat: true
-            running: middleDragScrollArea.armed
-            onTriggered: {
-                const flick = scrollArea.contentItem
-                const dy = middleDragScrollArea.currentY - middleDragScrollArea.originY
-                const deadzone = middleDragScrollArea.deadzone
-                if (Math.abs(dy) <= deadzone)
-                    return
-                const beyond = dy - Math.sign(dy) * deadzone
-                const speed = Math.sign(beyond) * beyond * beyond * 0.002
-                const maxY = Math.max(0, flick.contentHeight - flick.height)
-                flick.contentY = Math.max(0, Math.min(maxY, flick.contentY + speed))
-            }
-        }
-    }
-
-    Shortcut {
-        sequence: "Escape"
-        enabled: middleDragScrollArea.armed
-        onActivated: middleDragScrollArea.armed = false
+        flickable: scrollArea.contentItem as Flickable
     }
 }

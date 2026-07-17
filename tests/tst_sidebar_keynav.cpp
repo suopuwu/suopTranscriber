@@ -132,6 +132,7 @@ private slots:
         QVERIFY(qmldir.open(QIODevice::WriteOnly | QIODevice::Text));
         qmldir.write("module SuopTranscriber\n"
                       "singleton AppSettings 1.0 qml/AppSettings.qml\n"
+                      "singleton Notifications 1.0 qml/Notifications.qml\n"
                       "HoverBorder 1.0 qml/HoverBorder.qml\n"
                       "CombineGroupOutline 1.0 qml/CombineGroupOutline.qml\n"
                       "AppIcon 1.0 qml/AppIcon.qml\n"
@@ -408,6 +409,15 @@ private slots:
         QVERIFY(firstBtn);
         QTRY_VERIFY2(firstBtn->property("opacity").toReal() > 0.9,
                      "entering the cluster with Right must reveal the action icons");
+        // ...and FAN IT OUT: the cluster collapses to its rightmost icon until
+        // hovered (see hoverExpandsClusterFromItsRightmostIcon below), and
+        // Right enters at the LEFTMOST button — a collapsed one. Keyboard entry
+        // must expand too, or the arrows focus a 0-width, invisible target.
+        QTRY_VERIFY2(firstBtn->width() > 19.9,
+                     qPrintable(QStringLiteral("entering the cluster with Right focused '%1' but left it "
+                                                "collapsed (width=%2) — the keyboard must expand the cluster "
+                                                "like a hover does")
+                                    .arg(firstFocused).arg(firstBtn->width())));
 
         int steps = 0;
         for (int i = 0; i < 4; ++i) {
@@ -463,6 +473,112 @@ private slots:
         QTest::qWait(20);
         QVERIFY2(sidebarItem->property("actionButtonFocus").toString().isEmpty(),
                  "moving to a different row must drop out of the previous row's action cluster");
+    }
+
+    // Hovering a row reveals only the cluster's RIGHTMOST icon; the rest fan
+    // out leftward once the pointer is actually in the cluster, and fold back
+    // when it leaves. Driven as a real hover (QTest::mouseMove) rather than by
+    // poking rowActionsExpanded: the whole risk here is geometric — the cluster
+    // has to grow AWAY from the pointer, or expanding moves the icon that's
+    // being hovered out from under the cursor, which un-hovers it, which
+    // collapses it back under the cursor... a flip-flop that only a real
+    // pointer position can expose. Widths (not just opacity) are the assertion
+    // target because the user-visible bug was the cluster eating the tail of
+    // the filename: an opacity-0 icon that still holds its 20px slot fixes
+    // nothing.
+    void hoverExpandsClusterFromItsRightmostIcon()
+    {
+        QTemporaryDir vault;
+        QVERIFY(vault.isValid());
+        // A transcribed row (sibling .md) is eligible for every icon — the
+        // widest cluster there is, so a collapse has the most to hide.
+        QVERIFY(touch(vault.filePath(QStringLiteral("talk.mp3"))));
+        QVERIFY(touch(vault.filePath(QStringLiteral("talk.mp3.md")),
+                      "---\nmodel: base\n---\n[0] hello\n"));
+
+        QQuickView view;
+        view.engine()->addImportPath(m_moduleDir.path());
+        view.engine()->addImageProvider(QString::fromLatin1(IconImageProvider::kProviderId),
+                                        new IconImageProvider);
+        view.rootContext()->setContextProperty(QStringLiteral("vaultUrl"),
+                                                QUrl::fromLocalFile(vault.path()));
+        view.setSource(QUrl::fromLocalFile(m_driverQmlPath));
+        if (view.status() != QQuickView::Ready) {
+            QString msg;
+            for (const auto &e : view.errors())
+                msg += e.toString() + QStringLiteral("\n");
+            QFAIL(qPrintable(msg.isEmpty() ? QStringLiteral("QML failed to load, no error text") : msg));
+        }
+        view.show();
+        QVERIFY(QTest::qWaitForWindowExposed(&view));
+
+        QQuickItem *root = view.rootObject();
+        QVERIFY(root);
+        QQuickItem *sidebarItem = root->findChild<QQuickItem *>(QStringLiteral("sidebar"));
+        QVERIFY(sidebarItem);
+        QQuickItem *treeItem = findByClassNamePrefix(sidebarItem, "QQuickTreeView");
+        QVERIFY(treeItem);
+        QTRY_VERIFY(treeItem->property("rows").toInt() > 0);
+
+        QQuickItem *row0 = nullptr;
+        QMetaObject::invokeMethod(treeItem, "itemAtCell", Qt::DirectConnection,
+                                   Q_RETURN_ARG(QQuickItem *, row0), Q_ARG(QPoint, QPoint(0, 0)));
+        QVERIFY2(row0, "itemAtCell(0,0) returned null — row 0 delegate not realized");
+
+        QQuickItem *cluster = row0->findChild<QQuickItem *>(QStringLiteral("actionButtonRow"));
+        QQuickItem *transcribe = row0->findChild<QQuickItem *>(QStringLiteral("rowTranscribeButton"));
+        QQuickItem *runAll = row0->findChild<QQuickItem *>(QStringLiteral("rowRunAllButton"));
+        QVERIFY(cluster && transcribe && runAll);
+        QTRY_VERIFY2(runAll->isVisible(),
+                     "a transcribed audio row must be eligible for the run-all icon — fixture is stale");
+
+        // Prime the pointer somewhere harmless first: these tests share one
+        // process, so a move to coordinates the pointer already occupies
+        // delivers no event at all.
+        QTest::mouseMove(&view, QPoint(5, view.height() - 5));
+        QTest::qWait(20);
+
+        // Hover the row, but well left of the cluster (its icons sit at the
+        // row's right edge).
+        const QPoint rowLeftPoint = row0->mapToScene(QPointF(12, row0->height() / 2)).toPoint();
+        QTest::mouseMove(&view, rowLeftPoint);
+        QTRY_VERIFY2(transcribe->opacity() > 0.99,
+                     "hovering a row must still reveal its rightmost action icon");
+        QTRY_VERIFY2(runAll->width() < 0.01,
+                     "hovering the row alone must collapse every icon but the rightmost one to zero width");
+        QVERIFY2(runAll->opacity() < 0.01, "a collapsed icon must not paint");
+        QVERIFY2(!runAll->isEnabled(), "a collapsed icon must not stay clickable");
+        QVERIFY2(cluster->width() < 20.5,
+                 qPrintable(QStringLiteral("the collapsed cluster must be exactly one icon wide, was %1 — "
+                                            "Row spacing is stranding a gap where the hidden icons were")
+                                .arg(cluster->width())));
+
+        const qreal transcribeX = transcribe->mapToItem(row0, QPointF(0, 0)).x();
+
+        // Now hover the surviving icon itself: the rest must fan out.
+        QTest::mouseMove(&view, transcribe->mapToScene(
+                                    QPointF(transcribe->width() / 2, transcribe->height() / 2)).toPoint());
+        QTRY_VERIFY2(runAll->width() > 19.9,
+                     "hovering the cluster's rightmost icon must expand the rest of the cluster");
+        QTRY_VERIFY2(runAll->opacity() > 0.99, "an expanded icon must paint");
+        QVERIFY2(runAll->isEnabled(), "an expanded icon must be clickable");
+
+        // The crux: expanding must not shift the icon under the cursor. If the
+        // cluster grew rightward (or re-centred), the pointer would fall off
+        // the very icon whose hover is holding it open.
+        QCOMPARE(transcribe->mapToItem(row0, QPointF(0, 0)).x(), transcribeX);
+        QVERIFY2(runAll->mapToItem(row0, QPointF(0, 0)).x() < transcribeX,
+                 "the cluster must fan out LEFTWARD, away from the pointer");
+        // Hover held for longer than the expand animation: a flip-flop would
+        // have collapsed it again by now.
+        QTest::qWait(300);
+        QVERIFY2(runAll->width() > 19.9, "the expanded cluster must stay expanded while it's hovered");
+
+        // Leaving the cluster (but not the row) folds it back to one icon.
+        QTest::mouseMove(&view, rowLeftPoint);
+        QTRY_VERIFY2(runAll->width() < 0.01, "leaving the cluster must fold it back to its rightmost icon");
+        QVERIFY2(transcribe->opacity() > 0.99,
+                 "...while the row itself is still hovered, so its rightmost icon stays revealed");
     }
 };
 

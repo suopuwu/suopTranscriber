@@ -233,6 +233,7 @@ private slots:
         QVERIFY(qmldir.open(QIODevice::WriteOnly | QIODevice::Text));
         qmldir.write("module SuopTranscriber\n"
                       "singleton AppSettings 1.0 qml/AppSettings.qml\n"
+                      "singleton Notifications 1.0 qml/Notifications.qml\n"
                       "HoverBorder 1.0 qml/HoverBorder.qml\n"
                       "CombineGroupOutline 1.0 qml/CombineGroupOutline.qml\n"
                       "AppIcon 1.0 qml/AppIcon.qml\n"

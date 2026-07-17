@@ -324,20 +324,65 @@ private slots:
                  "iconOverrides must be saved back to the vault");
     }
 
-    // Always-editable fields with no other visual cue that they're a text
-    // box (title/tags/speakers/prelude) should hint at their editability on
-    // hover — the underline previews at 50% opacity before the field is
-    // actually focused (1). Source-scan since there's no QQuickView here to
-    // drive a real HoverHandler.
-    void underlineField_hoverPreviewsAtHalfOpacity()
+    // StyleGuide.md "Text fields": three opacity tiers, each dimmer than the
+    // state above it — focused (1) > hovered (0.5) > at rest (0.25). The
+    // resting tier is what makes a pure text box look like an input before
+    // it's touched; only an always-editable field (plainUntilHovered) drops
+    // to 0 there. Source-scan since there's no QQuickView here to drive a
+    // real HoverHandler.
+    void underlineField_dimsThroughThreeTiers()
     {
         const QString src = readAll(QStringLiteral(SUOP_QML_DIR "/UnderlineField.qml"));
         QVERIFY2(!src.isEmpty(), "qml/UnderlineField.qml must exist");
         QVERIFY2(src.contains(QStringLiteral("HoverHandler")),
                  "UnderlineField must track hover state to preview the underline before focus");
-        QVERIFY2(src.contains(QStringLiteral("hovered ? 0.5 : 0")),
-                 "unfocused hover state must show the underline at 50% opacity, not fully hidden or "
-                 "fully shown");
+        QVERIFY2(src.contains(QStringLiteral("property bool plainUntilHovered")),
+                 "UnderlineField must expose plainUntilHovered so an always-editable field can opt "
+                 "out of the resting underline");
+        QVERIFY2(src.contains(QStringLiteral(
+                     "focused ? 1 : (hoverHandler.hovered ? 0.5 : (plainUntilHovered ? 0 : 0.25))")),
+                 "StyleGuide.md \"Text fields\": a pure text box keeps a dim 25% underline at rest "
+                 "(hover 50%, focus 100%); only plainUntilHovered hides it entirely");
+    }
+
+    // StyleGuide.md "Text fields": plainUntilHovered belongs to the
+    // always-editable prose fields ONLY. A pure text box (the USB grabber's
+    // filename regex / start folder / extension filter) has no prose to blend
+    // into, so hiding its underline at rest just makes it read as a label.
+    void underlineField_onlyAlwaysEditableFieldsGoPlain()
+    {
+        const QString mainPanel = readAll(QStringLiteral(SUOP_QML_DIR "/MainPanel.qml"));
+        QVERIFY2(!mainPanel.isEmpty(), "qml/MainPanel.qml must exist");
+
+        // Every always-editable field must opt out (StyleGuide.md
+        // "Always-editable text").
+        for (const char *field : {"titleField", "tagField", "tagAddField", "speakerNameField",
+                                  "preludeArea", "transcriptArea"}) {
+            const QString expected = QStringLiteral(
+                    "UnderlineField { implicitHeight: 0; plainUntilHovered: true; focused: %1.activeFocus }")
+                    .arg(QLatin1StringView(field));
+            QVERIFY2(mainPanel.contains(expected),
+                     qPrintable(QStringLiteral("always-editable %1 must set plainUntilHovered: true "
+                                               "so it reads as plain text at rest")
+                                        .arg(QLatin1StringView(field))));
+        }
+
+        // ...and no pure text box may.
+        for (const char *field : {"catchAllStartFolderField", "deviceStartFolderField",
+                                  "catchAllExtensionField", "deviceExtensionField"}) {
+            const QString expected = QStringLiteral("UnderlineField { focused: %1.activeFocus }")
+                    .arg(QLatin1StringView(field));
+            QVERIFY2(mainPanel.contains(expected),
+                     qPrintable(QStringLiteral("pure text box %1 must keep its resting underline "
+                                               "(no plainUntilHovered)")
+                                        .arg(QLatin1StringView(field))));
+        }
+
+        const QString regexField = readAll(QStringLiteral(SUOP_QML_DIR "/UsbRegexField.qml"));
+        QVERIFY2(!regexField.isEmpty(), "qml/UsbRegexField.qml must exist");
+        QVERIFY2(regexField.contains(
+                         QStringLiteral("UnderlineField { focused: patternField.activeFocus }")),
+                 "the filename-regex field is a pure text box — it must keep its resting underline");
     }
 
     // StyleGuide.md "Always-editable text": display-vs-edit must never be a
@@ -480,6 +525,97 @@ private slots:
                  "use the entry's own modelData.idx (assigned in displayData)");
     }
 
+    // Item 33 regression: collapsing a chapter appeared to do nothing to the
+    // transcript body — it moved the following heading and gutter timestamps
+    // up (those are bound to displaySentences, which recomputes) while the
+    // collapsed sentences stayed on screen, so the heading landed on top of
+    // text it was supposed to have hidden.
+    //
+    // The cause is that transcriptArea's text is NOT a live binding:
+    // onDisplayTextChanged assigns it (severing the declarative one on the
+    // first change) and skips the assignment while the area has focus, so an
+    // edit in progress is never clobbered. The collapse triangle is an overlay
+    // ON the transcript, so by the time it's tapped transcriptArea is very
+    // often already focused — and the resync silently never happens.
+    // toggleChapterCollapse() must therefore blur first (which also commits
+    // any pending edit via onActiveFocusChanged).
+    void mainPanel_collapsingAChapterBlursTranscriptSoTheBodyResyncs()
+    {
+        // Comments stripped: the function carries the explanation above, which
+        // would otherwise satisfy the scan on prose alone.
+        const QString src = stripComments(readAll(QStringLiteral(SUOP_QML_DIR "/MainPanel.qml")));
+        QVERIFY2(!src.isEmpty(), "qml/MainPanel.qml must exist");
+
+        const QString body = functionBody(src, QStringLiteral("function toggleChapterCollapse"));
+        QVERIFY2(!body.isEmpty(), "MainPanel.qml must declare toggleChapterCollapse()");
+        QVERIFY2(body.contains(QStringLiteral("transcriptArea.focus = false")),
+                 "toggleChapterCollapse() must blur transcriptArea before changing collapsedChapters — "
+                 "onDisplayTextChanged skips the text resync while it has focus, so without this the "
+                 "collapse moves the overlays but leaves the collapsed body text on screen");
+
+        // The blur only matters because the resync is focus-gated; if that
+        // gate ever goes away this guard should go with it, not linger as
+        // cargo cult.
+        QVERIFY2(src.contains(QStringLiteral("onDisplayTextChanged: if (!transcriptArea.activeFocus)")),
+                 "the transcript resync is expected to be focus-gated — if that changed, revisit "
+                 "toggleChapterCollapse()'s blur (this test) rather than leaving both in place");
+    }
+
+    // Item 35 regression: clicking to the right of a chapter heading put an
+    // edit cursor on the heading's own blank reserved line (a line with no
+    // editable content) instead of editing the chapter title.
+    //
+    // Every chapter heading is an overlay row sitting ON transcriptArea, so
+    // any part of it that doesn't accept the press itself leaks that press
+    // through to the TextArea underneath. The collapse triangle is an AppIcon
+    // (a plain Item — accepts no mouse of its own) and a TapHandler's default
+    // DragThreshold policy takes only a PASSIVE grab, so its tap leaked too.
+    //
+    // The space right of the title was once a sibling strip with its own tap,
+    // which stopped the leak but made that space a BUTTON rather than part of
+    // the field: a click past the last character while editing did nothing, and
+    // a drag from out there selected nothing (its tap grabbed the press; a tap
+    // can begin an edit but can't extend a selection). headingTitle now fills
+    // that space itself, which both plugs the leak and makes the whole heading
+    // line real, clickable, drag-selectable text.
+    void mainPanel_chapterHeadingRowClicksNeverLandInTheTranscript()
+    {
+        const QString src = stripComments(readAll(QStringLiteral(SUOP_QML_DIR "/MainPanel.qml")));
+        QVERIFY2(!src.isEmpty(), "qml/MainPanel.qml must exist");
+
+        const QString row = enclosingBlock(src, QStringLiteral("id: chapterHeadingRow"));
+        QVERIFY2(!row.isEmpty(), "id: chapterHeadingRow must exist in MainPanel.qml");
+
+        // The collapse triangle is an AppIcon (a plain Item — it accepts no
+        // mouse buttons of its own), so its tap MUST take an exclusive grab.
+        const QString triangleTap = enclosingBlock(
+            row, QStringLiteral("mainPanel.toggleChapterCollapse(chapterHeadingRow.modelData.chapterT0)"));
+        QVERIFY2(triangleTap.contains(QStringLiteral("gesturePolicy: TapHandler.ReleaseWithinBounds")),
+                 "the collapse triangle's TapHandler must set an exclusive-grab gesturePolicy — the "
+                 "default DragThreshold is a passive grab, so the press also reaches transcriptArea "
+                 "underneath and focuses it");
+
+        // Clicking anywhere along the heading edits its title, because the
+        // title's field IS the rest of the heading line.
+        QVERIFY2(row.contains(QStringLiteral("function beginTitleEdit")),
+                 "chapterHeadingRow must expose beginTitleEdit() (the at-rest click-to-edit entry point)");
+        const QString title = enclosingBlock(row, QStringLiteral("id: headingTitle"));
+        QVERIFY2(!title.isEmpty(), "id: headingTitle must exist in chapterHeadingRow");
+        QVERIFY2(title.contains(QStringLiteral("Layout.fillWidth: true")),
+                 "headingTitle must fill the heading line's width — the space right of the title has to "
+                 "be part of the FIELD (so a click/drag past the last character reaches the text), and a "
+                 "TextEdit accepts the press itself, which is what keeps it off transcriptArea");
+
+        // The trailing rule must not be a sibling tap target again: it belongs
+        // INSIDE the field, offset by the text's width.
+        QVERIFY2(!row.contains(QStringLiteral("Layout.fillHeight: true")),
+                 "the space right of the title must not be a separate layout item — that's the strip "
+                 "whose tap swallowed clicks/drags past the last character");
+        QVERIFY2(title.contains(QStringLiteral("headingTitle.contentWidth")),
+                 "the heading rule must be a child of headingTitle positioned past contentWidth, not a "
+                 "sibling laid out beside it");
+    }
+
     // StyleGuide.md: one global AppSettings.borderRadius, used everywhere a
     // corner is rounded — never an ad-hoc literal. Exception: a radius equal
     // to half the item's width/height is drawing a circle (status dots,
@@ -569,6 +705,54 @@ private slots:
         QVERIFY2(src.contains(QStringLiteral("insertPatternToken(\"(?:|)\"")),
                  "the Either/Or token must insert an already-grouped (?:|) — the whole point is "
                  "that alternation is never inserted ungrouped in the first place");
+    }
+
+    // The USB grab rules' filename-regex field (UsbGrabRule::filenameRegex),
+    // which deliberately mirrors the combine rules' pattern authoring UI
+    // above. Source-scan guard for the same reason: no QQuickView in this
+    // suite to drive the live bindings.
+    void usbGrabber_filenameRegexAuthoringAids()
+    {
+        const QString src = readAll(QStringLiteral(SUOP_QML_DIR "/UsbRegexField.qml"));
+        QVERIFY2(!src.isEmpty(), "qml/UsbRegexField.qml must exist");
+
+        QVERIFY2(src.contains(QStringLiteral("controller.regexValidationError(")),
+                 "the pattern field's live validity indicator must call "
+                 "UsbGrabberController::regexValidationError() (the real QRegularExpression engine "
+                 "UsbGrabJob filters with), not a QML/JS RegExp re-implementation — the two "
+                 "syntaxes aren't guaranteed identical, so a JS-valid pattern could still match "
+                 "nothing at grab time");
+        QVERIFY2(!src.contains(QStringLiteral("new RegExp")),
+                 "must not validate or match with JS RegExp anywhere in this field, for the same "
+                 "reason");
+
+        QVERIFY2(src.contains(QStringLiteral("focusPolicy: Qt.NoFocus")),
+                 "every insert-token button needs focusPolicy: Qt.NoFocus — a click's press steals "
+                 "the pattern field's focus, firing onEditingFinished -> commitRuleField(), which "
+                 "re-reads the rule store and reassigns deviceRows, destroying the very button "
+                 "mid-click before onClicked can fire");
+        QVERIFY2(src.contains(QStringLiteral("patternField.insert(")),
+                 "tokens must be inserted via TextInput.insert(), not a `text = ...` reassignment "
+                 "— reassigning the whole text property silently clears TextInput's undo history, "
+                 "so Ctrl+Z would stop working after a token click");
+
+        // An invalid pattern fails closed in UsbGrabJob (matches nothing), so
+        // the field must say so rather than leaving an all-"filtered" preview
+        // as the only clue.
+        QVERIFY2(src.contains(QStringLiteral("will grab nothing until the pattern is valid")),
+                 "an invalid pattern matches nothing at grab time — the field must warn that the "
+                 "rule currently grabs nothing, not just that the regex is malformed");
+
+        // Both rule cards must offer it: the "*" catch-all and every
+        // per-device card are the two places a rule is edited, and a filter
+        // that exists on only one of them is an incomplete feature.
+        const QString panel = readAll(QStringLiteral(SUOP_QML_DIR "/MainPanel.qml"));
+        QVERIFY2(panel.count(QStringLiteral("UsbRegexField {")) >= 2,
+                 "both the \"Any USB device\" catch-all card and the per-device card must expose "
+                 "the filename-regex field");
+        QVERIFY2(panel.contains(QStringLiteral("\"filenameRegex\", newPattern")),
+                 "the field must commit through commitRuleField(), the same per-field save path "
+                 "every other rule field uses");
     }
 
     // Combine-rule "differentiator" buttons: every non-exact-match run of a
@@ -767,8 +951,9 @@ private slots:
         // file:// scheme — a raw local path makes QUrl::toLocalFile() empty).
         QVERIFY2(src.contains(QStringLiteral("sidebar.model.createFolder(")),
                  "New folder must call VaultTreeModel.createFolder()");
-        QVERIFY2(src.contains(QStringLiteral("sidebar.model.deleteFolder(")),
-                 "Delete folder must call VaultTreeModel.deleteFolder()");
+        QVERIFY2(src.contains(QStringLiteral("sidebar.model.trashFolder(")),
+                 "Delete folder must call VaultTreeModel.trashFolder() — the trash-first call. "
+                 "deleteFolderPermanently() is only for the confirmed, untrashable case");
         QVERIFY2(src.contains(QStringLiteral("sidebar.model.moveFile(")),
                  "Move to… must call VaultTreeModel.moveFile()");
         QVERIFY2(src.contains(QStringLiteral("sidebar.model.vaultFolders()")),
@@ -777,9 +962,22 @@ private slots:
                      || src.contains(QStringLiteral("\"file://\" + sidebar.ctxPath")),
                  "the invokable calls must pass file:// URLs, not raw local paths");
 
-        // Deleting a folder is destructive — must go through a confirmation.
-        QVERIFY2(src.contains(QStringLiteral("id: deleteConfirmPopup")),
-                 "deleting a folder (recursive) must require a confirmation Popup");
+        // Deleting a folder is the most destructive action in the tree (it takes
+        // every transcript under it), so it must stay REVERSIBLE — but the
+        // reversibility now comes from the trash + an Undo snackbar, not from a
+        // confirmation prompt. The prompt was dropped deliberately: it fired on
+        // every delete, including the recoverable ones, so it cried wolf. It now
+        // appears only when the trash refuses (see handleTrashResult), which is
+        // the only genuinely permanent case. What must hold:
+        QVERIFY2(!src.contains(QStringLiteral("id: deleteConfirmPopup")),
+                 "the folder-specific confirm popup is gone — a trashable folder delete is "
+                 "recoverable and offers Undo instead; the shared fileDeleteConfirmPopup "
+                 "handles the untrashable case for all three delete kinds");
+        QVERIFY2(src.contains(QStringLiteral("sidebar.beginDeleteFolder(")),
+                 "\"Delete folder\" must route through beginDeleteFolder(), which trashes first");
+        QVERIFY2(src.contains(QStringLiteral("function handleTrashResult(")),
+                 "the trash-first flow must funnel through handleTrashResult() — that's what "
+                 "offers Undo for what trashed and prompts only for what didn't");
 
         // The empty-area handler must bail when the tap landed on a real cell.
         // Nested TapHandlers are NOT mutually exclusive, so both fire on a row
@@ -823,16 +1021,22 @@ private slots:
                  "that hides how many rows it will take");
 
         // The batch must go through the single-rebuild C++ invokable, not a
-        // QML loop over deleteFile() (one full vault rescan + model reset per
-        // file).
-        QVERIFY2(src.contains(QStringLiteral("sidebar.model.deleteFiles(")),
-                 "a multi-delete must call VaultTreeModel.deleteFiles() so the batch costs one rebuild()");
+        // QML loop (one full vault rescan + model reset per file).
+        QVERIFY2(src.contains(QStringLiteral("sidebar.model.trashFiles(")),
+                 "a multi-delete must call VaultTreeModel.trashFiles() so the batch costs one rebuild()");
 
         // Destructive, so still confirmed — and the confirmation must be
         // count-aware too, not name a single file while deleting several.
-        const int confirmIdx = src.indexOf(QStringLiteral("id: fileDeleteConfirmPopup"));
-        QVERIFY2(confirmIdx >= 0, "fileDeleteConfirmPopup must exist");
-        QVERIFY2(src.mid(confirmIdx, 2000).contains(QStringLiteral("pendingDeletePaths.length > 1")),
+        //
+        // Brace-matched, NOT a fixed-size src.mid() window: this was a 2000-char
+        // slice, which silently measures "how much QML precedes the needle
+        // inside the popup" rather than the behavior it claims to assert.
+        // Adding one branch to the popup's message text (the "audioOnly" mode)
+        // pushed the needle to offset 1982..2011 and truncated it mid-string,
+        // failing a test whose subject hadn't changed at all.
+        const QString confirmBlock = enclosingBlock(src, QStringLiteral("id: fileDeleteConfirmPopup"));
+        QVERIFY2(!confirmBlock.isEmpty(), "fileDeleteConfirmPopup must exist");
+        QVERIFY2(confirmBlock.contains(QStringLiteral("pendingDeletePaths.length > 1")),
                  "the delete confirmation must state how many items it will delete");
     }
 
@@ -1190,47 +1394,46 @@ private slots:
                  "single selected row (already covered by the existing O7 currently-open outline)");
     }
 
-    // Item 44: manual "combine selected" — the sidebar must offer a way to
-    // combine the current multi-selection, gated on 2+ AUDIO files being
-    // selected, and route it through the controller's combineSelected(). No
-    // QQuickView in this suite to open the context menu or click the button,
-    // so this is a source-scan guard that the helper, the audio-only
-    // narrowing, the >= 2 gate, and the controller call all still exist.
-    void sidebar_combineSelectedActionGatedOnTwoAudio()
+    // Combining is RULE-DRIVEN ONLY: a merge may only ever happen for a group
+    // that AppSettings.combineRules actually matched. The sidebar's two combine
+    // affordances are the ribbon scan (runCombineScan(), every "ready" group)
+    // and the per-row "combine this group" button (combineGroup(), one matched
+    // group) — both take the rules as an argument.
+    //
+    // A selection-driven combine used to exist (the multi-select "Combine"
+    // button and a "Combine selected (N)" context row, via a controller
+    // combineSelected()). It was removed deliberately: it concatenated whatever
+    // audio the user happened to select, with no rule consulted, so it would
+    // merge unrelated recordings no rule would ever group — and it hard-coded
+    // deleteOriginals=false, silently ignoring the configured setting the
+    // rule-driven paths honor. No QQuickView in this suite to click the menu,
+    // so this is a source-scan guard that it doesn't come back.
+    void sidebar_combineIsRuleDrivenOnly()
     {
         const QString src = readAll(QStringLiteral(SUOP_QML_DIR "/Sidebar.qml"));
         QVERIFY2(!src.isEmpty(), "qml/Sidebar.qml must exist");
 
-        // The selection is narrowed to audio-only before combining (an
-        // orphaned .md can be multi-selected but can't be concatenated).
-        QVERIFY2(src.contains(QStringLiteral("function selectedAudioPaths()")),
-                 "Sidebar.qml must define selectedAudioPaths() to narrow the multi-selection to audio "
-                 "notes for combine");
-        QVERIFY2(src.contains(QStringLiteral("function combineSelectedFiles()")),
-                 "Sidebar.qml must define combineSelectedFiles() as the single entry point that hands the "
-                 "selection to the controller");
+        QVERIFY2(!src.contains(QStringLiteral("combineSelected")),
+                 "Sidebar.qml must not offer a selection-driven combine (combineSelected/"
+                 "combineSelectedFiles/ctxCombineSelectedRow): combining is only valid for a group "
+                 "matched by AppSettings.combineRules, never for an arbitrary multi-selection");
+        QVERIFY2(!src.contains(QStringLiteral("selectedAudioPaths")),
+                 "selectedAudioPaths() existed only to feed the removed selection-driven combine");
 
-        // The combine call itself must route through controller.combineSelected.
-        const int fnIdx = src.indexOf(QStringLiteral("function combineSelectedFiles()"));
-        QVERIFY(fnIdx >= 0);
-        const QString fnBody = src.mid(fnIdx, 700);
-        QVERIFY2(fnBody.contains(QStringLiteral(".combineSelected(")),
-                 "combineSelectedFiles() must call the controller's combineSelected()");
-        QVERIFY2(fnBody.contains(QStringLiteral("sidebar.selectedAudioPaths()"))
-                     && fnBody.contains(QStringLiteral("< 2")),
-                 "combineSelectedFiles() must gate on 2+ audio files (selectedAudioPaths().length < 2 -> "
-                 "no-op) before calling the controller");
-
-        // The context-menu entry — the must-have home — must exist and be
-        // gated on 2+ audio files selected.
-        const int ctxIdx = src.indexOf(QStringLiteral("id: ctxCombineSelectedRow"));
-        QVERIFY2(ctxIdx >= 0, "context menu must have a \"Combine selected\" row (ctxCombineSelectedRow)");
-        const QString ctxBlock = src.mid(ctxIdx, 900);
-        QVERIFY2(ctxBlock.contains(QStringLiteral("sidebar.selectedAudioPaths().length >= 2")),
-                 "the \"Combine selected\" context row must be visible only when 2+ audio files are "
-                 "selected");
-        QVERIFY2(ctxBlock.contains(QStringLiteral("sidebar.combineSelectedFiles()")),
-                 "the \"Combine selected\" context row must call combineSelectedFiles() on tap");
+        // The two legitimate, rule-driven entry points must still be wired: both
+        // pass AppSettings.combineRules, which is what makes them rule-driven.
+        QVERIFY2(src.contains(QStringLiteral(".runCombineScan(")),
+                 "the ribbon combine button must still call runCombineScan()");
+        QVERIFY2(src.contains(QStringLiteral(".combineGroup(")),
+                 "the per-row \"combine this group\" button must still call combineGroup()");
+        for (const char *call : {".runCombineScan(", ".combineGroup("}) {
+            const int idx = src.indexOf(QString::fromLatin1(call));
+            QVERIFY(idx >= 0);
+            QVERIFY2(src.mid(idx, 300).contains(QStringLiteral("AppSettings.combineRules")),
+                     qPrintable(QStringLiteral("%1 must be passed AppSettings.combineRules — the rules "
+                                               "are what decide which files may be merged")
+                                    .arg(QString::fromLatin1(call))));
+        }
     }
 
     // Item 49: closing search must also clear the tag filter — otherwise
@@ -1252,6 +1455,101 @@ private slots:
                  "searchCloseButton must also clear the tag filter (tagFilterField.text and "
                  "sidebar.tagFilterText) so closing search fully clears filtering, not just the text "
                  "query");
+    }
+
+    // StyleGuide.md "Snackbars": every transient notification goes through the
+    // Notifications singleton, so they all land in the one bottom-right stack.
+    // The four hand-rolled per-panel auto-clearing overlay banners this
+    // replaced (importError/rowActionError/speakerOpError/transcriptEditError)
+    // must not come back — re-adding one is how the app silently drifts back to
+    // four notification surfaces. tst_snackbar.cpp does the runtime half; this
+    // is the regression guard.
+    void snackbar_transientFeedbackGoesThroughTheNotificationsSingleton()
+    {
+        const QStringList retired = {
+            QStringLiteral("importError"),      QStringLiteral("rowActionError"),
+            QStringLiteral("speakerOpError"),   QStringLiteral("transcriptEditError"),
+        };
+        const QStringList panels = { QStringLiteral("Main.qml"), QStringLiteral("Sidebar.qml"),
+                                     QStringLiteral("MainPanel.qml") };
+        for (const QString &panel : panels) {
+            // stripComments throughout: these files' comments legitimately name
+            // the retired properties when explaining what replaced them.
+            const QString src = stripComments(readAll(QStringLiteral(SUOP_QML_DIR "/") + panel));
+            QVERIFY2(!src.isEmpty(), qPrintable(panel + QStringLiteral(" must exist")));
+            for (const QString &prop : retired) {
+                QVERIFY2(!src.contains(QStringLiteral("property string ") + prop),
+                         qPrintable(panel + QStringLiteral(" reintroduces the retired per-panel banner "
+                                                           "property '") + prop
+                                    + QStringLiteral("' — transient feedback posts to the Notifications "
+                                                     "singleton now (StyleGuide.md \"Snackbars\")")));
+            }
+        }
+
+        // ...and each panel actually posts.
+        for (const QString &panel : panels) {
+            const QString src = stripComments(readAll(QStringLiteral(SUOP_QML_DIR "/") + panel));
+            QVERIFY2(src.contains(QStringLiteral("Notifications.")),
+                     qPrintable(panel + QStringLiteral(" must post transient feedback via the "
+                                                       "Notifications singleton")));
+        }
+    }
+
+    // StyleGuide.md "Snackbars": exactly ONE SnackbarHost, in Main.qml. A
+    // second host (or a Snackbar parented at a call site) is exactly the
+    // scattered-notifications state the singleton exists to end.
+    void snackbar_singleHostInMainQmlOnly()
+    {
+        const QDir qmlDir{ QStringLiteral(SUOP_QML_DIR) };
+        const QStringList files = qmlDir.entryList({ QStringLiteral("*.qml") }, QDir::Files);
+        QVERIFY(!files.isEmpty());
+        for (const QString &f : files) {
+            if (f == QStringLiteral("SnackbarHost.qml") || f == QStringLiteral("Snackbar.qml"))
+                continue;
+            const QString src = stripComments(readAll(qmlDir.filePath(f)));
+            const bool instantiatesHost = src.contains(QStringLiteral("SnackbarHost {"));
+            const bool instantiatesBar = src.contains(QStringLiteral("Snackbar {"));
+            if (f == QStringLiteral("Main.qml")) {
+                QVERIFY2(instantiatesHost, "Main.qml must instantiate the one SnackbarHost");
+                QVERIFY2(!instantiatesBar, "Main.qml must not parent a Snackbar directly — post to "
+                                           "the Notifications singleton instead");
+                continue;
+            }
+            QVERIFY2(!instantiatesHost,
+                     qPrintable(f + QStringLiteral(" instantiates a second SnackbarHost — there must "
+                                                   "be exactly one, in Main.qml")));
+            QVERIFY2(!instantiatesBar,
+                     qPrintable(f + QStringLiteral(" instantiates a Snackbar directly — post to the "
+                                                   "Notifications singleton instead")));
+        }
+    }
+
+    // StyleGuide.md "Snackbars": action/dismiss controls are Item + TapHandler,
+    // never a focusable QQC2 Button/MouseArea. This app commits TextFields on
+    // blur, so a focus-stealing control here fires real writes on press — and a
+    // failed write posts another snackbar, mutating the queue mid-click.
+    // tst_snackbar.cpp asserts the focus behavior at runtime; this guards the
+    // mechanism that produces it.
+    void snackbar_controlsAreNonFocusableTapHandlers()
+    {
+        const QString raw = readAll(QStringLiteral(SUOP_QML_DIR "/Snackbar.qml"));
+        QVERIFY2(!raw.isEmpty(), "qml/Snackbar.qml must exist");
+        // stripComments() is load-bearing: this file's own comments EXPLAIN why
+        // it avoids MouseArea/Button, so a raw scan matches the prose and fails
+        // on a compliant file.
+        const QString src = stripComments(raw);
+        QVERIFY2(!src.contains(QStringLiteral("MouseArea")),
+                 "Snackbar.qml must not use MouseArea (cursor-bleed + focus-steal); use "
+                 "HoverHandler + TapHandler");
+        QVERIFY2(!src.contains(QStringLiteral("Button {")),
+                 "Snackbar.qml must not use a QQC2 Button — it takes focus on press and this app "
+                 "commits fields on blur");
+        QVERIFY2(src.contains(QStringLiteral("TapHandler")),
+                 "Snackbar.qml's action/dismiss controls must be TapHandler-driven");
+        QVERIFY2(raw.contains(QStringLiteral("pragma ComponentBehavior: Bound")),
+                 "Snackbar.qml reaches the outer `snackbar` id from its action delegate — without "
+                 "ComponentBehavior: Bound that's unqualified access and the AOT compiler can't "
+                 "compile those bindings");
     }
 
     // Item 22: the tag-filter chip itself (not just its embedded remove
@@ -1318,6 +1616,39 @@ private slots:
         QVERIFY2(bgBlock.contains(QStringLiteral("radius: AppSettings.borderRadius")),
                  "modelCombo's closed-state background must round its corners with "
                  "AppSettings.borderRadius (StyleGuide.md border-radius convention)");
+    }
+
+    // The Basic style's vertical ScrollBar is an overlay that floats flush
+    // against the ScrollView's right edge and covers whatever content fills
+    // the full width. MainPanel gets it out of the transcript by bleeding
+    // transcriptViewportContainer into the note page's otherwise-empty 16px
+    // right margin and giving the same amount back off the content's width.
+    // No QQuickView harness for MainPanel (too many C++ deps), so this is a
+    // source-scan guard on the invariant that actually matters: BOTH sides
+    // use the same scrollBarGutter property. Hardcode one side and the
+    // transcript either shrinks for nothing or slides back under the bar.
+    void mainPanel_transcriptScrollBarSitsInTheRightMarginGutter()
+    {
+        const QString src = readAll(QStringLiteral(SUOP_QML_DIR "/MainPanel.qml"));
+        QVERIFY2(!src.isEmpty(), "qml/MainPanel.qml must exist");
+
+        const int idx = src.indexOf(QStringLiteral("id: transcriptViewportContainer"));
+        QVERIFY2(idx >= 0, "transcriptViewportContainer must exist");
+        const QString containerBlock = src.mid(idx, 1600);
+        QVERIFY2(containerBlock.contains(QStringLiteral("readonly property int scrollBarGutter:")),
+                 "transcriptViewportContainer must declare scrollBarGutter — the single source of "
+                 "truth for how far the transcript viewport bleeds into the note page's right margin");
+        QVERIFY2(containerBlock.contains(QStringLiteral("Layout.rightMargin: -scrollBarGutter")),
+                 "transcriptViewportContainer must cancel that much of the root ColumnLayout's right "
+                 "margin, so the overlay ScrollBar lands in the empty gutter instead of on the transcript");
+
+        const int contentIdx = src.indexOf(QStringLiteral("id: scrollableContent"));
+        QVERIFY2(contentIdx > idx, "scrollableContent must exist inside transcriptViewportContainer");
+        const QString contentBlock = src.mid(contentIdx, 600);
+        QVERIFY2(contentBlock.contains(QStringLiteral(
+                     "width: transcriptScrollView.availableWidth - transcriptViewportContainer.scrollBarGutter")),
+                 "scrollableContent must subtract the SAME scrollBarGutter it bled into, so the "
+                 "transcript keeps the exact bounds it had before the bar moved");
     }
 
     // Item 14: the progress glow is now on by default, and its halo layer
@@ -1524,45 +1855,50 @@ private slots:
                  "floor was the source of uneven slack below the list");
     }
 
-    // Item 42: clicking the bottom-left current-file path label must focus the
-    // IN-APP file explorer (the Sidebar tree) and reveal the open file there,
-    // NOT shell out to the OS file manager (revealInFileManager). No QQuickView
-    // here to click the label and observe focus, so this is a source-scan guard
-    // covering the full BottomBar -> Main -> Sidebar wiring: BottomBar declares
-    // the upward signal and its label tap emits it (and no longer calls
-    // revealInFileManager); Main wires that signal to a Sidebar focus-and-reveal
-    // function; Sidebar defines that function and it takes tree focus.
-    void bottomBar_fileLabelFocusesInAppExplorer()
+    // Item 42, REVERSED by user decision: clicking the bottom-left current-file
+    // path label opens the OS file manager again — revealing the open file
+    // (selected) when there is one, else opening the vault folder — not the
+    // in-app Sidebar tree. Item 42's original in-app behavior, and the
+    // BottomBar -> Main -> Sidebar signal wiring it needed, are gone; the
+    // reveal now goes through the DesktopIntegration singleton, which is what
+    // carries the xdg-activation token that actually raises that window.
+    // What each segment DOES on click is proven for real in
+    // tst_bottombar_pathsegments (it clicks them against a recording stub);
+    // DesktopIntegration's own call shape, token included, is covered by
+    // tst_desktopintegration. This keeps only the cheap source-scan half.
+    void bottomBar_fileLabelRevealsInFileManager()
     {
         const QString bar = readAll(QStringLiteral(SUOP_QML_DIR "/BottomBar.qml"));
         QVERIFY2(!bar.isEmpty(), "qml/BottomBar.qml must exist");
-        QVERIFY2(bar.contains(QStringLiteral("signal focusFileExplorerRequested")),
-                 "BottomBar.qml must declare focusFileExplorerRequested(...) so the "
-                 "current-file label routes its click up to Main (item 42)");
-        QVERIFY2(bar.contains(QStringLiteral("focusFileExplorerRequested(bottomBar.currentFilePath)")),
-                 "the current-file label's TapHandler must emit focusFileExplorerRequested "
-                 "(item 42)");
-        QVERIFY2(!bar.contains(QStringLiteral("revealInFileManager")),
-                 "the current-file label must no longer shell out to the OS file manager "
-                 "via revealInFileManager (item 42)");
+        QVERIFY2(bar.contains(QStringLiteral("DesktopIntegration.revealInFileManager")),
+                 "the file segment must reveal the open file via "
+                 "DesktopIntegration.revealInFileManager (item 42, reversed)");
+        QVERIFY2(bar.contains(QStringLiteral("DesktopIntegration.openInFileManager")),
+                 "folder segments must open their folder via "
+                 "DesktopIntegration.openInFileManager (item 42, reversed)");
+        QVERIFY2(!bar.contains(QStringLiteral("focusFileExplorerRequested")),
+                 "BottomBar.qml must no longer route the label click to the in-app "
+                 "Sidebar tree (item 42, reversed)");
+
+        // Qt.openUrlExternally can only open a folder, never select a file
+        // inside it, and hands the compositor no activation token — it is not a
+        // substitute for the FileManager1 path.
+        QVERIFY2(!bar.contains(QStringLiteral("Qt.openUrlExternally")),
+                 "BottomBar.qml must go through DesktopIntegration, not "
+                 "Qt.openUrlExternally (item 42, reversed)");
 
         const QString main = readAll(QStringLiteral(SUOP_QML_DIR "/Main.qml"));
         QVERIFY2(!main.isEmpty(), "qml/Main.qml must exist");
-        QVERIFY2(main.contains(QStringLiteral("onFocusFileExplorerRequested"))
-                     && main.contains(QStringLiteral("sidebar.focusAndRevealNote")),
-                 "Main.qml must wire BottomBar's focusFileExplorerRequested to "
-                 "sidebar.focusAndRevealNote(...) (item 42)");
+        QVERIFY2(!main.contains(QStringLiteral("onFocusFileExplorerRequested")),
+                 "Main.qml must no longer wire focusFileExplorerRequested (item 42, "
+                 "reversed)");
 
         const QString side = readAll(QStringLiteral(SUOP_QML_DIR "/Sidebar.qml"));
         QVERIFY2(!side.isEmpty(), "qml/Sidebar.qml must exist");
-        const int fnIdx = side.indexOf(QStringLiteral("function focusAndRevealNote"));
-        QVERIFY2(fnIdx >= 0, "Sidebar.qml must define focusAndRevealNote() (item 42)");
-        const QString fnBlock = side.mid(fnIdx, 800);
-        QVERIFY2(fnBlock.contains(QStringLiteral("forceActiveFocus")),
-                 "focusAndRevealNote() must give the file explorer keyboard focus "
-                 "(forceActiveFocus) (item 42)");
-        QVERIFY2(fnBlock.contains(QStringLiteral("scrollNoteIntoView")),
-                 "focusAndRevealNote() must scroll the revealed note into view (item 42)");
+        QVERIFY2(!side.contains(QStringLiteral("focusAndRevealNote")),
+                 "Sidebar.qml's focusAndRevealNote() had no caller left once the label "
+                 "click went back to the OS file manager — it must not linger as dead "
+                 "code (item 42, reversed)");
     }
 
     // Item 13: QQC2 TextField/TextArea and a selectByMouse TextEdit get no
@@ -1822,8 +2158,10 @@ private slots:
                  "Shortcuts' own gating (focus leaving the tree re-hides the icons)");
 
         // The action buttons' opacity must be driven by rowActionsRevealed,
-        // not the old hover-only expression.
-        QVERIFY2(src.contains(QStringLiteral("opacity: treeDelegate.rowActionsRevealed ? 1 : 0")),
+        // not the old hover-only expression. (The second term is the
+        // collapse — see sidebar_actionClusterCollapsesToRightmostIcon.)
+        QVERIFY2(src.contains(QStringLiteral(
+                     "opacity: treeDelegate.rowActionsRevealed && !rowTranscribeButton.collapsedAway ? 1 : 0")),
                  "the per-row action buttons must key their opacity off rowActionsRevealed");
         QVERIFY2(!src.contains(QStringLiteral("opacity: rowHover.hovered ? 1 : 0")),
                  "no per-row action button should remain hover-only (item 41 reveals them for the "
@@ -2030,6 +2368,107 @@ private slots:
                  "clicking a non-interactive region must clear the active chapter edit (item 34)");
     }
 
+    // Clicking a chapter title opens it for editing with the caret AT THE CLICK,
+    // not with the whole title selected — a click-to-edit name is an invitation
+    // to amend it, and a select-all means the next keystroke silently wipes it.
+    // Neither title can lean on the press to place the caret (selectByMouse is
+    // false until the title becomes the active edit), so both must set
+    // cursorPosition themselves. No QQuickView here, so this is a source scan.
+    void mainPanel_chapterTitleClickDoesNotSelectAll()
+    {
+        const QString src = stripComments(readAll(QStringLiteral(SUOP_QML_DIR "/MainPanel.qml")));
+        QVERIFY2(!src.isEmpty(), "qml/MainPanel.qml must exist");
+
+        const QString toc = enclosingBlock(src, QStringLiteral("id: tocChapterTitle"));
+        QVERIFY2(!toc.isEmpty(), "id: tocChapterTitle must exist in MainPanel.qml");
+        QVERIFY2(!toc.contains(QStringLiteral("selectAll()")),
+                 "clicking the TOC chapter title must not select the whole title");
+        QVERIFY2(toc.contains(QStringLiteral("tocChapterTitle.positionAt(")),
+                 "the TOC chapter title must place the caret at the clicked position via positionAt()");
+
+        const QString row = enclosingBlock(src, QStringLiteral("id: chapterHeadingRow"));
+        QVERIFY2(!row.isEmpty(), "id: chapterHeadingRow must exist in MainPanel.qml");
+        const QString begin = functionBody(row, QStringLiteral("function beginTitleEdit"));
+        QVERIFY2(!begin.isEmpty(), "beginTitleEdit() must exist in chapterHeadingRow");
+        QVERIFY2(!begin.contains(QStringLiteral("selectAll()")),
+                 "clicking the in-transcript chapter heading must not select the whole title");
+        QVERIFY2(begin.contains(QStringLiteral("headingTitle.positionAt(")),
+                 "the chapter heading title must place the caret at the clicked position via positionAt()");
+    }
+
+    // A chapter title is NOT text in transcriptArea's document — displayData
+    // reserves a zero-length blank line for it and an overlay field draws the
+    // title — so one native selection can never span both. Selecting across
+    // chapters and transcript is therefore synthesized: a transcript selection
+    // sweeping a heading's reserved line selects that title too, and copy
+    // splices the same titles back into the clipboard text.
+    //
+    // The two MUST key off the same predicate. If they ever drift, the bug is
+    // silent and nasty: you copy something other than what you saw highlighted.
+    // No QQuickView harness for MainPanel, so this is a source-scan guard.
+    void mainPanel_chapterTitlesSelectAndCopyWithTheTranscript()
+    {
+        const QString src = stripComments(readAll(QStringLiteral(SUOP_QML_DIR "/MainPanel.qml")));
+        QVERIFY2(!src.isEmpty(), "qml/MainPanel.qml must exist");
+
+        const QString sweeps = functionBody(src, QStringLiteral("function selectionSweepsHeading("));
+        QVERIFY2(!sweeps.isEmpty(),
+                 "selectionSweepsHeading() must exist — the single predicate deciding whether a "
+                 "transcript selection covers a chapter heading");
+        // Strictly-greater on the end: a selection stopping exactly AT the
+        // heading's line hasn't reached it, and >= would drag in the next
+        // chapter's title on every such selection.
+        QVERIFY2(sweeps.contains(QStringLiteral("transcriptArea.selectionEnd > headingStart")),
+                 "selectionSweepsHeading() must require the selection to extend PAST the heading's "
+                 "zero-length line (>, not >=) — otherwise a selection ending at the previous "
+                 "sentence silently swallows the next title");
+
+        // The visible highlight is driven by that predicate...
+        const QString title = enclosingBlock(src, QStringLiteral("id: headingTitle"));
+        QVERIFY2(!title.isEmpty(), "id: headingTitle must exist");
+        QVERIFY2(title.contains(QStringLiteral("mainPanel.selectionSweepsHeading(")),
+                 "the heading title must mirror the transcript's selection via "
+                 "selectionSweepsHeading() — a drag through the transcript cannot natively select it");
+        QVERIFY2(title.contains(QStringLiteral("headingTitle.select(0, headingTitle.length)"))
+                     && title.contains(QStringLiteral("headingTitle.deselect()")),
+                 "a swept heading title must select (and un-select) its whole text — its reserved line "
+                 "is zero-length, so there is no sub-title offset to select to");
+        // ...and must never fight a real edit's own selection.
+        QVERIFY2(title.contains(QStringLiteral("!headingTitle.editing")),
+                 "the swept-selection mirror must be off while the title is being edited — the "
+                 "selection is the user's then");
+        // A mirrored highlight in a DIFFERENT colour doesn't read as one
+        // selection at all. Unset means the Basic palette's opaque navy + white
+        // text, which is what made a swept title look like an unrelated widget
+        // lighting up instead of part of the sweep.
+        QVERIFY2(title.contains(QStringLiteral("selectionColor: Qt.rgba(0.35, 0.55, 0.85, 0.5)")),
+                 "the heading title must use the SAME selection colour as transcriptArea — a title "
+                 "swept by a transcript selection has to look like part of that one selection");
+
+        // ...and so is the copy.
+        const QString copy = functionBody(src, QStringLiteral("function copySelectionWithChapters("));
+        QVERIFY2(!copy.isEmpty(),
+                 "copySelectionWithChapters() must exist — the native copy sees only transcriptArea's "
+                 "document, where every chapter title is a blank line");
+        QVERIFY2(copy.contains(QStringLiteral("mainPanel.selectionSweepsHeading(")),
+                 "copy must splice in exactly the titles the highlight showed as selected — same "
+                 "predicate, or you copy something you didn't see selected");
+        QVERIFY2(copy.contains(QStringLiteral("Clipboard.setText(")),
+                 "copy must put the spliced string on the clipboard via the Clipboard singleton");
+        // Back-to-front splicing is what keeps the offsets valid: each insert
+        // shifts everything after it.
+        QVERIFY2(copy.contains(QStringLiteral("for (let i = headings.length - 1; i >= 0; --i)")),
+                 "copy must splice titles back-to-front — a forward loop shifts the offsets of every "
+                 "heading it hasn't reached yet");
+
+        // The transcript must actually route Ctrl+C through it.
+        const QString area = enclosingBlock(src, QStringLiteral("id: transcriptArea"));
+        QVERIFY2(!area.isEmpty(), "id: transcriptArea must exist");
+        QVERIFY2(area.contains(QStringLiteral("StandardKey.Copy"))
+                     && area.contains(QStringLiteral("mainPanel.copySelectionWithChapters()")),
+                 "transcriptArea must intercept Copy and route it through copySelectionWithChapters()");
+    }
+
     // Item 33: chapters are collapsible in the transcript via a disclosure
     // affordance on the heading, and a collapsed chapter's body sentences are
     // filtered out of displayData (both the flowing text and displaySentences)
@@ -2045,10 +2484,12 @@ private slots:
                  "a per-chapter collapsed state must exist (item 33)");
         QVERIFY2(src.contains(QStringLiteral("function toggleChapterCollapse(")),
                  "a collapse toggle handler must exist (item 33)");
-        // The toggle must be wired on the in-transcript heading row.
-        const int headingIdx = src.indexOf(QStringLiteral("id: chapterHeadingRow"));
-        QVERIFY2(headingIdx >= 0, "the in-transcript chapter heading row must exist");
-        const QString headingBody = src.mid(headingIdx, 3000);
+        // The toggle must be wired on the in-transcript heading row. Scoped to
+        // the row's real braces, not a fixed char window from the id: — a
+        // window long enough to reach the affordance today silently stops
+        // reaching it the moment anything above it grows.
+        const QString headingBody = enclosingBlock(src, QStringLiteral("id: chapterHeadingRow"));
+        QVERIFY2(!headingBody.isEmpty(), "the in-transcript chapter heading row must exist");
         QVERIFY2(headingBody.contains(QStringLiteral("mainPanel.toggleChapterCollapse(")),
                  "the transcript heading must have a collapse affordance calling toggleChapterCollapse() "
                  "(item 33)");
@@ -2132,36 +2573,59 @@ private slots:
                  "each filtered run-all button must disable when its eligible subset of the results is empty");
     }
 
-    // Item 57: the middle-drag autoscroll overlay's ARMED hover-tracking
-    // region must be scoped wider than the transcript viewport
-    // (transcriptViewportContainer). Qt Quick hover delivery is bounds-scoped
-    // per item, so an overlay anchored only to the transcript box froze the
-    // free-scroll (gesture 1) the instant the cursor left it. The fix
-    // visually reparents the overlay to mainPanel (the whole note page) so
-    // its HoverHandler keeps receiving points anywhere in the panel. No
-    // QQuickView here, so this is a source-scan guard.
-    void mainPanel_middleDragOverlayTracksWiderThanTranscriptViewport()
+    // Item 57: middle-click autoscroll is ONE shared component
+    // (MiddleDragScroll.qml), used by all three scrollable surfaces. It used
+    // to be three hand-copied implementations, and each copy independently
+    // carried the same bug: the armed gesture was scoped to the panel it
+    // started in, so the scroll silently froze the moment the cursor moved
+    // onto anything else. tst_middledragscroll.cpp proves the behavior in a
+    // real view; these are the cheap source-scan guards over the two Qt Quick
+    // traps that caused it, both of which read as harmless in review.
+    void qml_middleDragAutoscrollIsOneSharedComponent()
     {
-        const QString src = readAll(QStringLiteral(SUOP_QML_DIR "/MainPanel.qml"));
-        QVERIFY2(!src.isEmpty(), "qml/MainPanel.qml must exist");
+        const QString component = readAll(QStringLiteral(SUOP_QML_DIR "/MiddleDragScroll.qml"));
+        QVERIFY2(!component.isEmpty(), "qml/MiddleDragScroll.qml must exist");
 
-        const int idx = src.indexOf(QStringLiteral("id: middleDragScrollArea"));
-        QVERIFY2(idx >= 0, "middleDragScrollArea overlay must exist");
-        const QString block = src.mid(idx, 900);
-        QVERIFY2(block.contains(QStringLiteral("parent: mainPanel")),
-                 "the middle-drag overlay must be reparented to mainPanel so its armed hover "
-                 "tracking spans the whole note page, not just transcriptViewportContainer (item 57)");
-        QVERIFY2(block.contains(QStringLiteral("anchors.fill: parent")),
-                 "the overlay must fill its (now panel-wide) parent so the tracked region is the "
-                 "whole page (item 57)");
-        // The armed free-scroll must still track via HoverHandler.onPointChanged.
-        const int hoverIdx = src.indexOf(QStringLiteral("id: middleDragHover"));
-        QVERIFY2(hoverIdx >= 0, "middleDragHover HoverHandler must exist");
-        const QString hoverBlock = src.mid(hoverIdx, 500);
-        QVERIFY2(hoverBlock.contains(QStringLiteral("onPointChanged"))
-                     && hoverBlock.contains(QStringLiteral("currentY")),
-                 "the armed HoverHandler must keep updating currentY on point changes so the "
-                 "widened tracking region actually drives the autoscroll (item 57)");
+        // Trap 1: `parent: Overlay.overlay` (attached to the tracker itself)
+        // resolves to null before the item has a window, and that null
+        // unparents the very item whose windowChanged would re-trigger the
+        // binding — so it stays parentless and inert forever. It must resolve
+        // against an item that stays in the scene.
+        QVERIFY2(component.contains(QStringLiteral("parent: root.Overlay.overlay")),
+                 "the armed-phase tracker must parent to root.Overlay.overlay — a bare "
+                 "Overlay.overlay deadlocks itself to a null parent (item 57)");
+        // Trap 2: gesture 2's held drag must survive leaving the arm region.
+        // DragThreshold (the default) cancels the grab within a few px;
+        // DragWithinBounds cancels it at the panel edge.
+        QVERIFY2(component.contains(QStringLiteral("gesturePolicy: TapHandler.ReleaseWithinBounds")),
+                 "the arming TapHandler must use ReleaseWithinBounds so a held middle-drag isn't "
+                 "cancelled by drag distance or by leaving the arm region (item 57)");
+
+        // All three call sites use the component, and none re-implements it —
+        // draggedWhileHeld/originY are its private gesture state, so any copy
+        // of the old hand-rolled version would name them.
+        const QStringList users = {QStringLiteral("MainPanel.qml"), QStringLiteral("Sidebar.qml"),
+                                   QStringLiteral("SettingsPopup.qml")};
+        for (const QString &file : users) {
+            const QString src = readAll(QStringLiteral(SUOP_QML_DIR "/") + file);
+            QVERIFY2(src.contains(QStringLiteral("MiddleDragScroll {")),
+                     qPrintable(file + QStringLiteral(" must use the shared MiddleDragScroll "
+                                                      "component for middle-click autoscroll (item 57)")));
+            QVERIFY2(!stripComments(src).contains(QStringLiteral("draggedWhileHeld")),
+                     qPrintable(file + QStringLiteral(" must not re-implement the autoscroll gesture — "
+                                                      "MiddleDragScroll.qml owns it (item 57)")));
+        }
+
+        // MainPanel's arm region is still deliberately the whole note page,
+        // not just the transcript box: a middle-click on the tag pills /
+        // prelude / chapter list should arm the transcript's scroll too.
+        const QString mainPanel = readAll(QStringLiteral(SUOP_QML_DIR "/MainPanel.qml"));
+        const int idx = mainPanel.indexOf(QStringLiteral("id: middleDragScrollArea"));
+        QVERIFY2(idx >= 0, "middleDragScrollArea must exist");
+        const QString block = mainPanel.mid(idx, 400);
+        QVERIFY2(block.contains(QStringLiteral("parent: mainPanel"))
+                     && block.contains(QStringLiteral("anchors.fill: parent")),
+                 "the transcript's autoscroll must arm from the whole note page (item 57)");
     }
 
     // Item 55: starting a (re)transcription of the OPEN file must, until the
@@ -2247,10 +2711,15 @@ private slots:
         QVERIFY2(ribbonBlock.contains(QStringLiteral("transcriptionController.runAllJobsForPaths(")),
                  "the ribbon run-all button must call the bulk runAllJobsForPaths() invokable");
 
-        // (2) Per-row hover-cluster run-all button in treeDelegate.
+        // (2) Per-row hover-cluster run-all button in treeDelegate. The window
+        // must span the WHOLE button block down to its TapHandler — it's sized
+        // well past the block's current length because a fixed char count
+        // shrinks into a false failure as the block's doc comments grow (it
+        // did, when the cluster gained its collapse). Overshooting is safe:
+        // runAllJobs() has no other call site anywhere near this one.
         const int rowIdx = sidebar.indexOf(QStringLiteral("id: rowRunAllButton"));
         QVERIFY2(rowIdx >= 0, "treeDelegate must have a per-row rowRunAllButton (items 24/53)");
-        QVERIFY2(sidebar.mid(rowIdx, 1200).contains(QStringLiteral("transcriptionController.runAllJobs(")),
+        QVERIFY2(sidebar.mid(rowIdx, 2600).contains(QStringLiteral("transcriptionController.runAllJobs(")),
                  "the per-row run-all button must call runAllJobs() for that one file");
 
         // Keyboard-nav cluster reachability: "runAll" must be a focusable
@@ -2326,18 +2795,25 @@ private slots:
                  "Sidebar context menu must offer a 'Delete transcript' entry for transcribed files");
         QVERIFY2(sidebar.contains(QStringLiteral("id: ctxDeleteFileRow")),
                  "Sidebar context menu must offer a 'Delete file' entry for note rows");
+        QVERIFY2(sidebar.contains(QStringLiteral("id: ctxDeleteAudioOnlyRow")),
+                 "Sidebar context menu must offer a 'Delete audio only' entry (drops the audio, "
+                 "keeps the .md) for transcribed files");
         // "Delete transcript" is gated to a transcribed AUDIO row (status 2).
         QVERIFY2(sidebar.contains(QStringLiteral("visible: sidebar.ctxIsAudio && sidebar.ctxStatus === 2")),
                  "'Delete transcript' must only show for a transcribed audio row (an orphaned .md gets "
                  "'Delete file' instead)");
-        // Both route through the model's invokables (via a confirm popup).
-        QVERIFY2(sidebar.contains(QStringLiteral(".deleteTranscript(")),
-                 "Sidebar must call VaultTreeModel.deleteTranscript()");
-        // deleteFiles(), not deleteFile(): the sidebar's "Delete file" acts on
-        // a whole multi-selection, and a single row is just a one-element batch
-        // — one code path, not a count-dependent branch. (MainPanel still calls
-        // the singular deleteFile() below; it only ever has one open file.)
-        QVERIFY2(sidebar.contains(QStringLiteral(".deleteFiles(")),
+        // Both route through the model's TRASH-first invokables. A delete only
+        // reaches a confirm popup if the trash refused (see Sidebar's
+        // handleTrashResult) — the recoverable case offers Undo instead.
+        QVERIFY2(sidebar.contains(QStringLiteral(".trashTranscript(")),
+                 "Sidebar must call VaultTreeModel.trashTranscript()");
+        QVERIFY2(sidebar.contains(QStringLiteral(".trashAudioOnly(")),
+                 "Sidebar must call VaultTreeModel.trashAudioOnly() — the trash-first call, not "
+                 "deleteAudioOnlyPermanently()");
+        // trashFiles() takes a LIST: the sidebar's "Delete file" acts on a whole
+        // multi-selection, and a single row is just a one-element batch — one
+        // code path, not a count-dependent branch.
+        QVERIFY2(sidebar.contains(QStringLiteral(".trashFiles(")),
                  "Sidebar must delete through VaultTreeModel.deleteFiles(), which handles both a single "
                  "row and a multi-selection in one rebuild");
         // Destructive => must be confirmed first.
@@ -2351,11 +2827,22 @@ private slots:
                  "MainPanel icon cluster must have a 'Delete transcript' action for the open file");
         QVERIFY2(mainPanel.contains(QStringLiteral("id: deleteFileButton")),
                  "MainPanel icon cluster must have a 'Delete file' action for the open file");
-        QVERIFY2(mainPanel.contains(QStringLiteral(".deleteTranscript("))
-                     && mainPanel.contains(QStringLiteral(".deleteFile(")),
-                 "MainPanel must call VaultTreeModel.deleteTranscript()/deleteFile()");
+        // Per-file action parity (CLAUDE.md): "Delete audio only" is offered on
+        // the vault tree's rows, so the open file must offer it too.
+        QVERIFY2(mainPanel.contains(QStringLiteral("id: deleteAudioOnlyButton")),
+                 "MainPanel icon cluster must have a 'Delete audio only' action for the open file, "
+                 "matching the Sidebar's ctxDeleteAudioOnlyRow");
+        QVERIFY2(mainPanel.contains(QStringLiteral(".trashTranscript("))
+                     && mainPanel.contains(QStringLiteral(".trashAudioOnly("))
+                     && mainPanel.contains(QStringLiteral(".trashFiles(")),
+                 "MainPanel must call VaultTreeModel.trashTranscript()/trashAudioOnly()/trashFiles() "
+                 "— the trash-first calls, not the *Permanently() ones");
+        // Still present, but now reached ONLY when the trash refused.
         QVERIFY2(mainPanel.contains(QStringLiteral("id: deleteFileConfirmPopup")),
-                 "MainPanel's delete actions must be confirmed first");
+                 "MainPanel must still confirm a delete the trash refused (the permanent case)");
+        QVERIFY2(mainPanel.contains(QStringLiteral("function handleTrashResult(")),
+                 "MainPanel's deletes must funnel through handleTrashResult(), same trash-first "
+                 "flow as the Sidebar's");
         // When the OPEN file is deleted, the view must clear/refresh — driven
         // off the model's transcriptDeleted/fileDeleted signals so it works
         // whether the delete was triggered here or from the Sidebar.
@@ -2363,6 +2850,18 @@ private slots:
                      && mainPanel.contains(QStringLiteral("onFileDeleted")),
                  "MainPanel must react to VaultTreeModel.transcriptDeleted/fileDeleted so the open file's "
                  "view refreshes (revert) or clears (deleted) gracefully");
+        // Deleting the audio TO KEEP the transcript, then closing that
+        // transcript, defeats the action. The panel must follow the .md over
+        // instead — and via the signal, so a Sidebar-triggered delete of the
+        // open file does it too.
+        const QString audioKept = functionBody(
+            mainPanel, QStringLiteral("function onAudioDeletedTranscriptKept("));
+        QVERIFY2(!audioKept.isEmpty(),
+                 "MainPanel must handle VaultTreeModel.audioDeletedTranscriptKept — otherwise "
+                 "\"delete audio only\" closes the very transcript it exists to preserve");
+        QVERIFY2(audioKept.contains(QStringLiteral("showOrphanedMd(")),
+                 "on an audio-only delete the panel must follow the surviving transcript via "
+                 "showOrphanedMd(), not clear the view");
     }
 
     // Item 27 + chapterDensity plumbing: every generateChapters()/
@@ -2419,9 +2918,11 @@ private slots:
                  "the ribbon detect-speakers button must call the bulk diarizeFilesForPaths() invokable");
 
         // (2) Per-row hover-cluster detect-speakers button in treeDelegate.
+        // See the run-all parity test above on why this window overshoots the
+        // block rather than hugging it.
         const int rowIdx = sidebar.indexOf(QStringLiteral("id: rowDetectSpeakersButton"));
         QVERIFY2(rowIdx >= 0, "treeDelegate must have a per-row rowDetectSpeakersButton (item 52)");
-        const QString rowBlock = sidebar.mid(rowIdx, 1200);
+        const QString rowBlock = sidebar.mid(rowIdx, 2600);
         QVERIFY2(rowBlock.contains(QStringLiteral("treeDelegate.relabelEligible")),
                  "the per-row detect-speakers button must be gated on a transcribed audio row");
         QVERIFY2(rowBlock.contains(QStringLiteral("transcriptionController.diarizeFile(")),
@@ -2530,6 +3031,46 @@ private slots:
         const QString listBlock = mainPanel.mid(listIdx, 200);
         QVERIFY2(!listBlock.contains(QStringLiteral("mainPanel.orphanedMdPath ===")),
                  "chapterListColumn must not be gated shut for orphaned .md files");
+    }
+
+    // The app mounts external volumes itself (KDE's automounter is off by default, so
+    // a plugged-in recorder can otherwise sit unmounted forever and never grab). What
+    // keeps that from making suopTranscriber a general-purpose automounter is that
+    // mountVolume() is called from exactly ONE place, behind an enabled rule — the
+    // same predicate the grab itself uses.
+    //
+    // A source scan rather than a unit test: UsbGrabberController constructs its
+    // UsbDeviceMonitor internally (no seam to inject a fake through), and the real one
+    // needs a live UDisks2 plus hardware to hotplug, so the composition
+    // "unmountedVolumeDetected -> rule check -> mount" has no direct test path. The
+    // pieces either side are covered — the external-media gate that decides WHAT may
+    // be mounted in tst_usbdevicemonitor, rule resolution in tst_usbgrabbercontroller.
+    void usbGrabber_mountIsRuleGated()
+    {
+        const QString src = readAll(QStringLiteral(SUOP_SRC_DIR "/core/UsbGrabberController.cpp"));
+        QVERIFY2(!src.isEmpty(), "src/core/UsbGrabberController.cpp must exist");
+
+        const int idx = src.indexOf(QStringLiteral("mountVolume("));
+        QVERIFY2(idx >= 0, "UsbGrabberController must still mount unmounted volumes itself — nothing on a "
+                            "stock KDE install is obliged to auto-mount them for us");
+        QVERIFY2(src.indexOf(QStringLiteral("mountVolume("), idx + 1) < 0,
+                 "mountVolume() must be called from exactly one place: every added call site is another "
+                 "way for the app to mount something no rule ever asked for");
+
+        // The gate itself, in the ~15 lines above the call.
+        const int gateIdx = src.lastIndexOf(QStringLiteral("resolveEffectiveRule("), idx);
+        QVERIFY2(gateIdx >= 0 && src.mid(gateIdx, idx - gateIdx).contains(QStringLiteral(".enabled")),
+                 "mountVolume() must be gated on resolveEffectiveRule(...).enabled — the app may only mount "
+                 "devices it would actually grab from, never every external volume it sees");
+
+        // The monitor offers the candidate; it must never decide to mount one itself.
+        const QString monitor = readAll(QStringLiteral(SUOP_SRC_DIR "/core/UsbDeviceMonitor.cpp"));
+        QVERIFY2(!monitor.isEmpty(), "src/core/UsbDeviceMonitor.cpp must exist");
+        const int emitIdx = monitor.indexOf(QStringLiteral("emit unmountedVolumeDetected("));
+        QVERIFY2(emitIdx >= 0, "UsbDeviceMonitor must still report unmounted external volumes");
+        QVERIFY2(!monitor.mid(emitIdx, 200).contains(QStringLiteral("mountVolume(")),
+                 "UsbDeviceMonitor must not mount off the back of its own unmountedVolumeDetected signal: it "
+                 "holds no rules, so it can only answer WHAT may be mounted, never WHETHER it should be");
     }
 
 };

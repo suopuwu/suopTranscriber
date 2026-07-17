@@ -32,6 +32,7 @@ QVariantMap ruleToVariantMap(const UsbGrabRule &rule)
     QVariantMap map;
     map.insert(QStringLiteral("enabled"), rule.enabled);
     map.insert(QStringLiteral("extensionFilter"), rule.extensionFilter);
+    map.insert(QStringLiteral("filenameRegex"), rule.filenameRegex);
     map.insert(QStringLiteral("preserveStructure"), rule.preserveStructure);
     map.insert(QStringLiteral("startFolder"), rule.startFolder);
     map.insert(QStringLiteral("deviceLabel"), rule.deviceLabel);
@@ -45,6 +46,7 @@ UsbGrabRule ruleFromVariantMap(const QString &deviceSerial, const QVariantMap &m
     rule.deviceSerial = deviceSerial;
     rule.enabled = map.value(QStringLiteral("enabled"), false).toBool();
     rule.extensionFilter = map.value(QStringLiteral("extensionFilter")).toStringList();
+    rule.filenameRegex = map.value(QStringLiteral("filenameRegex")).toString();
     rule.preserveStructure = map.value(QStringLiteral("preserveStructure"), true).toBool();
     rule.startFolder = map.value(QStringLiteral("startFolder")).toString();
     rule.deviceLabel = map.value(QStringLiteral("deviceLabel")).toString();

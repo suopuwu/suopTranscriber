@@ -10,7 +10,9 @@ option(SUOP_ENABLE_CUDA "Build whisper.cpp with CUDA backend (NVIDIA fast path)"
 option(SUOP_ENABLE_LABELING "Build with llama.cpp for AI auto-labeling" ON)
 
 find_package(Qt6 6.7 REQUIRED COMPONENTS Core Gui Qml Quick QuickControls2 Multimedia Core5Compat DBus Svg)
-find_package(KF6WindowSystem REQUIRED)
+# 6.19 for KWaylandExtras::xdgActivationToken()'s QFuture overload, which
+# DesktopIntegration needs to raise the file manager on Wayland.
+find_package(KF6WindowSystem 6.19 REQUIRED)
 
 qt_standard_project_setup(REQUIRES 6.7)
 
@@ -172,6 +174,7 @@ qt_add_executable(suopTranscriber
 # qt_add_qml_module only detects a QML-defined singleton via this source
 # property — it does not scan file contents for `pragma Singleton`.
 set_source_files_properties(qml/AppSettings.qml PROPERTIES QT_QML_SINGLETON_TYPE TRUE)
+set_source_files_properties(qml/Notifications.qml PROPERTIES QT_QML_SINGLETON_TYPE TRUE)
 
 # Icon packs (see DESIGN.md "Iconography"): each assets/icons/<id>/ directory
 # holds a pack.json manifest plus, for svg packs, the SVGs it names.
@@ -202,9 +205,13 @@ qt_add_qml_module(suopTranscriber
     QML_FILES
         qml/Main.qml
         qml/AppSettings.qml
+        qml/Notifications.qml
+        qml/Snackbar.qml
+        qml/SnackbarHost.qml
         qml/HoverBorder.qml
         qml/CombineGroupOutline.qml
         qml/UnderlineField.qml
+        qml/UsbRegexField.qml
         qml/AppIcon.qml
         qml/PlayGlyph.qml
         qml/PauseGlyph.qml
@@ -213,6 +220,7 @@ qt_add_qml_module(suopTranscriber
         qml/MainPanel.qml
         qml/BottomBar.qml
         qml/SettingsPopup.qml
+        qml/MiddleDragScroll.qml
     RESOURCES
         ${SUOP_ICON_ASSETS}
     SOURCES
@@ -220,6 +228,7 @@ qt_add_qml_module(suopTranscriber
         src/core/IconTheme.cpp
         src/core/Segment.h
         src/core/RollingAverage.h
+        src/core/RegexValidation.h
         src/core/TranscriptionEngine.h
         src/core/VaultTreeModel.h
         src/core/VaultTreeModel.cpp
@@ -239,6 +248,10 @@ qt_add_qml_module(suopTranscriber
         src/core/UsbGrabberController.cpp
         src/core/WindowEffects.h
         src/core/WindowEffects.cpp
+        src/core/DesktopIntegration.h
+        src/core/DesktopIntegration.cpp
+        src/core/Clipboard.h
+        src/core/Clipboard.cpp
         src/core/AudioDecoder.h
         src/core/AudioDecoder.cpp
         src/core/WhisperCppEngine.h

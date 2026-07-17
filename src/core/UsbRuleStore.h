@@ -12,6 +12,16 @@ struct UsbGrabRule {
     QString deviceSerial;        // stable device identity from UsbDeviceMonitor, or "*" for the any-device catch-all rule
     bool enabled = false;
     QStringList extensionFilter; // e.g. {"wav","mp3","m4a"} — empty means "all files"
+    // Optional QRegularExpression source matched against a candidate's FILE
+    // NAME only (never its path) — empty means "no regex constraint", not
+    // "match nothing". Deliberately the same semantics as the split-recording
+    // combine rules (see matchRuleCapturedKey() in TranscriptionController.cpp):
+    // same engine, same basename-only target, and UNANCHORED unless the pattern
+    // says otherwise — so a pattern reads identically in both features and can
+    // be moved between them. ANDed with extensionFilter rather than replacing
+    // it: a file is grabbed only if it satisfies both, and each field is
+    // independently "no constraint" when blank.
+    QString filenameRegex;
     bool preserveStructure = true;
     QString startFolder;         // relative path from device root to start recursive search; "" = device root
     QString deviceLabel;         // human-readable vendor/model string, for display purposes only, not identity

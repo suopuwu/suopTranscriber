@@ -5,6 +5,7 @@
 #include "TranscriptionEngine.h"
 
 struct whisper_context;
+struct whisper_full_params;
 
 // In-process, warm-model engine (see DESIGN.md "whisper.cpp — first-class,
 // in-process"). One instance keeps the model resident across transcribe()
@@ -23,6 +24,13 @@ public:
     std::vector<Segment> transcribe(const AudioChunk &chunk, const ProgressCallback &onProgress,
                                      const SegmentCallback &onSegment,
                                      const AbortCallback &onAbort = {}) override;
+
+    // The decode parameters transcribe() starts from — beam search plus the
+    // anti-hallucination tightenings documented at the definition. Split out
+    // (and public, by value) purely so tst_engine_contract can assert them
+    // without loading a model; transcribe() then layers per-call state
+    // (callbacks, VAD) on top of this.
+    static whisper_full_params decodeParams();
 
     // Item O35: "CUDA"/"Vulkan"/"CPU", parsed out of whisper.cpp's own
     // "using %s backend" log line (see the .cpp's whisper_log_set()

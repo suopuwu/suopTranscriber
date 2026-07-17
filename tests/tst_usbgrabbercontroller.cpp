@@ -112,6 +112,24 @@ private slots:
         QCOMPARE(rule.value(QStringLiteral("enabled")).toBool(), false);
         QCOMPARE(rule.value(QStringLiteral("preserveStructure")).toBool(), true);
         QVERIFY(rule.value(QStringLiteral("extensionFilter")).toStringList().isEmpty());
+        // Blank = "no regex constraint". The key must still be PRESENT: the
+        // rule cards bind to it, and a missing key would read as undefined.
+        QVERIFY(rule.contains(QStringLiteral("filenameRegex")));
+        QVERIFY(rule.value(QStringLiteral("filenameRegex")).toString().isEmpty());
+    }
+
+    // Backs the live ✓/✗ indicator under the pattern field. Must agree with
+    // the engine UsbGrabJob actually filters with (QRegularExpression), which
+    // is why QML calls this instead of using JS RegExp — and it must treat an
+    // empty pattern as valid, since blank means "no regex constraint".
+    // Mirrors tst_filecombine.cpp's regexValidationError_* case; both now
+    // share one definition (RegexValidation.h).
+    void regexValidationError_emptyValidAndInvalidPatterns()
+    {
+        UsbGrabberController controller;
+        QCOMPARE(controller.regexValidationError(QString()), QString());
+        QCOMPARE(controller.regexValidationError(QStringLiteral("^REC_(\\d{4})\\.wav$")), QString());
+        QVERIFY(!controller.regexValidationError(QStringLiteral("(unterminated[")).isEmpty());
     }
 
     void saveRule_thenRuleForDevice_roundTripsEveryField()
@@ -121,6 +139,7 @@ private slots:
         rule[QStringLiteral("deviceSerial")] = QStringLiteral("XYZ");
         rule[QStringLiteral("enabled")] = true;
         rule[QStringLiteral("extensionFilter")] = QStringList{QStringLiteral("wav"), QStringLiteral("mp3")};
+        rule[QStringLiteral("filenameRegex")] = QStringLiteral("^REC_\\d+");
         rule[QStringLiteral("preserveStructure")] = false;
         rule[QStringLiteral("startFolder")] = QStringLiteral("Recordings");
         rule[QStringLiteral("deviceLabel")] = QStringLiteral("Zoom H1n");
@@ -132,6 +151,9 @@ private slots:
         QCOMPARE(loaded.value(QStringLiteral("enabled")).toBool(), true);
         QCOMPARE(loaded.value(QStringLiteral("extensionFilter")).toStringList(),
                  QStringList({QStringLiteral("wav"), QStringLiteral("mp3")}));
+        // MainPanel.qml's rule cards read this key straight off the map, so a
+        // missing projection here is an invisible "the field won't stick" bug.
+        QCOMPARE(loaded.value(QStringLiteral("filenameRegex")).toString(), QStringLiteral("^REC_\\d+"));
         QCOMPARE(loaded.value(QStringLiteral("preserveStructure")).toBool(), false);
         QCOMPARE(loaded.value(QStringLiteral("startFolder")).toString(), QStringLiteral("Recordings"));
         QCOMPARE(loaded.value(QStringLiteral("deviceLabel")).toString(), QStringLiteral("Zoom H1n"));

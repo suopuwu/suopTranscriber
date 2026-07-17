@@ -94,13 +94,6 @@ public:
     // folder and the (still empty) folder appears in the tree right away.
     Q_INVOKABLE bool createFolder(const QUrl &parentDirUrl, const QString &name);
 
-    // Item 40: recursively deletes folderUrl and everything under it
-    // (QDir::removeRecursively). Guarded: refuses to delete the vault root
-    // itself, or any path that isn't strictly inside the vault. Returns false
-    // on guard/failure. rebuild()s on success (drops the deleted folder from
-    // the watched set).
-    Q_INVOKABLE bool deleteFolder(const QUrl &folderUrl);
-
     // Item 40: moves a single file (QFile::rename) into destDirUrl. When the
     // moved file is an AUDIO file it carries its sibling transcript data too —
     // the <fileName>.md sidecar (same full-filename convention as
@@ -132,40 +125,118 @@ public:
     // on success.
     Q_INVOKABLE bool moveFolder(const QUrl &folderUrl, const QUrl &destParentUrl);
 
-    // Item 2 (delete transcript): removes an audio file's sibling transcript —
-    // the <fileName>.md sidecar plus, if present, its
-    // .<fileName>.partial.jsonl resume-state file (same full-filename
-    // convention as sidecarMdPath()/moveFile()) — reverting the audio file to
-    // "untranscribed" (yellow) while KEEPING the audio itself. When fileUrl
-    // names an orphaned .md directly, that .md IS the transcript, so it's the
-    // thing removed. Files are sent to the trash (QFile::moveToTrash) so an
-    // accidental delete stays recoverable, falling back to a permanent
-    // remove() only if trashing fails. Guards: refuses a path outside the
-    // vault; a no-op returning false if there's no sidecar .md to delete.
-    // rebuild()s + emits transcriptDeleted(fileUrl) on success.
-    Q_INVOKABLE bool deleteTranscript(const QUrl &fileUrl);
+    // ---- Deletion: two explicitly separate paths, recoverable vs not --------
+    //
+    // The old deleteFile()/deleteFiles()/deleteFolder()/deleteTranscript() each
+    // did "trash, or permanently remove if trashing fails" behind one call, so
+    // the UI could never tell which of the two had happened and had to
+    // confirm-then-delete on the assumption it might be permanent. They're
+    // replaced by a trash-only attempt and an explicit permanent delete.
+    //
+    // What makes that split work is that a FAILED QFile::moveToTrash() is
+    // non-destructive — it leaves the original fully intact (verified
+    // empirically; see trashOnly()'s comment in the .cpp). So the UI never has
+    // to PREDICT trash-ability: it calls trashFiles()/trashFolder() first, and only
+    // the entries that come back "untrashable" (still on disk, untouched) need a
+    // confirmation prompt, because only those would be irreversible. See
+    // Sidebar.qml's requestEntryDelete().
+    //
+    // Naming, deliberately: these are NOT called deleteFiles() any more.
+    // Repurposing that name would have silently turned every existing caller's
+    // recoverable delete into a permanent one.
 
-    // Item 2 (delete file): removes a file and ALL its sidecars — for an audio
-    // file, the audio itself plus its <fileName>.md and
-    // .<fileName>.partial.jsonl (whichever exist); for an orphaned .md passed
-    // directly, just that .md. Trash-first (QFile::moveToTrash), permanent
-    // remove() only as a fallback, same recoverable-delete choice as
-    // deleteTranscript() above. Guards: refuses any path outside the vault
-    // (and only ever operates on a real file, never a directory / the vault
-    // root); returns false if the named file doesn't exist. rebuild()s +
-    // emits fileDeleted(fileUrl) on success.
-    Q_INVOKABLE bool deleteFile(const QUrl &fileUrl);
-
-    // Multi-select delete: deleteFile() over a whole selection, but with a
-    // SINGLE rebuild() for the batch rather than one per file (rebuild()
+    // Trashes files and/or folders — one call for a whole selection, with a
+    // SINGLE rebuild() for the batch rather than one per entry (rebuild()
     // rescans the vault recursively AND resets the model, so that cost is paid
-    // once per user action, not once per file). Identical per-file guards and
-    // trash-first behavior to deleteFile(); a file that fails its guards is
-    // skipped rather than aborting the batch, so one bad entry in a selection
-    // can't strand the valid ones. Emits fileDeleted() once per file actually
-    // deleted, after the rebuild. Returns how many were deleted — callers
-    // compare against fileUrls.size() to detect partial failure.
-    Q_INVOKABLE int deleteFiles(const QList<QUrl> &fileUrls);
+    // once per user action). Per entry:
+    //   - an AUDIO file carries its sidecars off with it (<fileName>.md and
+    //     .<fileName>.partial.jsonl, whichever exist — same full-filename
+    //     convention as sidecarMdPath()/moveFile());
+    //   - an orphaned .md (or any non-audio file) goes on its own;
+    //   - a FOLDER goes whole (moveToTrash takes the tree intact), guarded
+    //     against the vault root itself.
+    // Every entry is guarded against escaping the vault, and a guard failure
+    // skips that entry rather than aborting the batch, so one bad entry can't
+    // strand the valid ones. Emits fileDeleted() once per file actually
+    // trashed, after the rebuild.
+    //
+    // Returns {
+    //   "trashed":     int   — how many of fileUrls went to the trash,
+    //   "restorable":  list of {"trashPath","originalPath"} — EVERY path
+    //                  trashed, sidecars included; hand this straight back to
+    //                  restoreFromTrash() to undo. Nothing else can reconstruct
+    //                  it: the trash path is only knowable at trash time.
+    //   "untrashable": list of url strings — the filesystem refused; these are
+    //                  STILL ON DISK, untouched. Only these need confirming.
+    //   "invalid":     list of url strings — failed a guard / didn't exist.
+    // }
+    Q_INVOKABLE QVariantMap trashFiles(const QList<QUrl> &urls);
+
+    // Irreversible. Only ever called after the user confirms, and in practice
+    // only for the "untrashable" entries trashFiles() handed back. Same
+    // guards and same single-rebuild batching; returns how many were removed.
+    Q_INVOKABLE int deleteFilesPermanently(const QList<QUrl> &urls);
+
+    // Item 40: trashes folderUrl and everything under it (moveToTrash takes the
+    // tree intact), same result map as trashFiles(). A SEPARATE call from
+    // trashFiles() on purpose, not for tidiness: a folder delete is recursive
+    // and takes every transcript under it, so it must never be reachable from
+    // the call that handles a file SELECTION — one stray folder path leaking
+    // into a multi-select would otherwise destroy a whole tree silently.
+    // Guarded: refuses the vault root itself, and anything not strictly inside
+    // the vault. rebuild()s when something was trashed (dropping the folder from
+    // the watched set).
+    Q_INVOKABLE QVariantMap trashFolder(const QUrl &folderUrl);
+
+    // Irreversible counterpart to trashFolder(), same confirm-first flow.
+    Q_INVOKABLE bool deleteFolderPermanently(const QUrl &folderUrl);
+
+    // Item 2 (delete transcript): trashes an audio file's sibling transcript —
+    // the <fileName>.md sidecar plus, if present, its .<fileName>.partial.jsonl
+    // resume-state file — reverting the audio to "untranscribed" (yellow) while
+    // KEEPING the audio itself. When fileUrl names an orphaned .md directly,
+    // that .md IS the transcript, so it's the thing removed. Same result map as
+    // trashFiles(); a no-op with trashed == 0 if there's no sidecar .md.
+    // rebuild()s + emits transcriptDeleted(fileUrl) when something was trashed.
+    Q_INVOKABLE QVariantMap trashTranscript(const QUrl &fileUrl);
+
+    // Irreversible counterpart to trashTranscript(), same confirm-first flow.
+    Q_INVOKABLE bool deleteTranscriptPermanently(const QUrl &fileUrl);
+
+    // The exact complement of trashTranscript(): trashes an audio file but
+    // DELIBERATELY LEAVES its <fileName>.md behind, where trashFiles() would
+    // carry the .md off with it. The .md that survives isn't a stranded file —
+    // scanDirectory() classifies a .md with no sibling audio as an orphaned .md
+    // (OrphanedMdStatus), so the row simply changes kind in the rebuild. That's
+    // the whole point of the action: keep the words, drop the audio.
+    //
+    // The .partial.jsonl DOES go with the audio. It's resume state for
+    // transcribing THIS audio and means nothing once the audio is gone — the
+    // .md is the durable artifact, the partial is scaffolding.
+    //
+    // fileUrl must name an audio file: on an orphaned .md "delete the audio,
+    // keep the transcript" has no referent, so that's Invalid rather than a
+    // silent no-op. Same result map as trashFiles(); rebuild()s + emits
+    // fileDeleted(fileUrl) when the audio was trashed.
+    Q_INVOKABLE QVariantMap trashAudioOnly(const QUrl &fileUrl);
+
+    // Irreversible counterpart to trashAudioOnly(), same confirm-first flow.
+    Q_INVOKABLE bool deleteAudioOnlyPermanently(const QUrl &fileUrl);
+
+    // Undo: moves each {"trashPath","originalPath"} entry back where it came
+    // from. Takes "restorable" from any trash* result
+    // verbatim. Per entry it also deletes the freedesktop .trashinfo record
+    // that moveToTrash() wrote — Qt has no restore API, and renaming only the
+    // file back would orphan that record and leave a phantom row in the
+    // desktop's trash UI.
+    //
+    // Skips (rather than fails) an entry whose original path is occupied again,
+    // whose trashed file is gone (the user emptied the trash), or which would
+    // land outside the vault. Recreates the original's parent directory if it
+    // has since disappeared. rebuild()s if anything came back. Returns the
+    // number restored — callers compare against entries.size() for partial
+    // failure.
+    Q_INVOKABLE int restoreFromTrash(const QVariantList &entries);
 
     // Item 40: every real directory inside the vault (walks the filesystem
     // directly, NOT the pruned tree — a freshly-created empty folder must be a
@@ -174,15 +245,6 @@ public:
     // Backs Sidebar.qml's "Move to…" destination picker. Hidden dotdirs
     // (.transcriber) are excluded (QDir::Dirs skips hidden entries).
     Q_INVOKABLE QStringList vaultFolders() const;
-
-    // Reveals fileUrl in the desktop's file manager with it selected (Wave D
-    // item 2 — BottomBar's current-file path is clickable). Uses the
-    // freedesktop.org FileManager1 D-Bus interface's ShowItems method (the
-    // standard cross-DE way to select-and-reveal, vs. Qt.openUrlExternally
-    // which can only open a folder, never select something inside it).
-    // Fire-and-forget: if no file manager implements this interface, this is
-    // silently a no-op rather than an error the user needs to handle.
-    Q_INVOKABLE void revealInFileManager(const QUrl &fileUrl) const;
 
     // Item 9 (Wave E): vault-scoped settings file (`.transcriber/settings.json`,
     // JSON) — lives inside the hidden `.transcriber/` config dir, so it's
@@ -308,6 +370,42 @@ signals:
     // was removed by deleteFile(). MainPanel listens so it clears/closes the
     // view when the deleted file is the one currently open.
     void fileDeleted(const QUrl &fileUrl);
+    // trashAudioOnly() removed `fileUrl`'s audio but its transcript SURVIVED,
+    // and now stands alone at `transcriptUrl` as an orphaned .md.
+    //
+    // Deliberately NOT fileDeleted: that means "this is gone, drop it", and a
+    // listener obeying it closes the view — which for this action throws away
+    // the very transcript the user deleted the audio to keep. The open file
+    // doesn't disappear here, it CHANGES KIND (audio row -> orphaned-.md row),
+    // and no listener could work that out from a bare "the audio is gone" —
+    // hence the second argument. MainPanel listens and follows the file over.
+    //
+    // Emitted INSTEAD OF fileDeleted, never alongside it: two signals for one
+    // delete would leave the view's final state at the mercy of emission
+    // order (fileDeleted's handler clears exactly what this one restores).
+    // An audio file with no transcript to survive emits plain fileDeleted.
+    void audioDeletedTranscriptKept(const QUrl &fileUrl, const QUrl &transcriptUrl);
+    // restoreFromTrash() brought `fileUrl`'s audio back, and its transcript is
+    // still standing at `transcriptUrl` — the exact inverse of
+    // audioDeletedTranscriptKept, and emitted for the same reason: no listener
+    // could work out from a bare "a file came back" that the row it is showing
+    // as an orphaned .md just became an audio row again. MainPanel listens and
+    // follows the file back, so undoing the delete lands it where it started
+    // instead of stranding it in a text-only view of a file that has its audio.
+    void audioRestoredForTranscript(const QUrl &fileUrl, const QUrl &transcriptUrl);
+    // restoreFromTrash() brought a whole file back — the inverse of fileDeleted.
+    // The one restore signal that must say what KIND of file it is: fileDeleted's
+    // listener only had to close the view, which needs no kind, but REOPENING
+    // does (the audio player view, or the text-only orphaned-.md one). True when
+    // fileUrl is a standalone .md with no sibling audio — i.e. the row is the
+    // transcript itself.
+    void fileRestored(const QUrl &fileUrl, bool isOrphanedMd);
+    // restoreFromTrash() brought a transcript back — the inverse of
+    // transcriptDeleted, and `fileUrl` follows that signal's convention: the
+    // audio file the transcript belongs to, or the .md itself when it stands
+    // alone. MainPanel listens so the open file stops rendering as
+    // untranscribed the moment its transcript is un-deleted.
+    void transcriptRestored(const QUrl &fileUrl);
 
 private:
     struct Node {
@@ -322,11 +420,37 @@ private:
     };
 
     void rebuild();
-    // The guards + trash of one deleteFile(), WITHOUT the rebuild()/
+
+    // What became of one entry in a batch. Untrashable is emphatically NOT a
+    // failure: the entry is still on disk, untouched, and is exactly what the
+    // UI must ask the user to confirm a permanent delete for.
+    enum class TrashOutcome { Trashed, Untrashable, Invalid };
+
+    // Files and folders are handled by separate public calls on purpose (see
+    // guardedLocalPath()): a folder delete is recursive, so it must never be
+    // reachable from the file-selection path.
+    enum class EntryKind { File, Folder };
+
+    // Ends an audio-only delete on the right signal — audioDeletedTranscriptKept
+    // if `mdPath` survived, plain fileDeleted if there was nothing to keep.
+    void emitAudioOnlyDeleted(const QUrl &fileUrl, const QString &mdPath);
+
+    // Announces a batch of restored paths in the same terms the delete signals
+    // used to announce their removal, so a listener that followed the delete can
+    // follow the undo. Takes the whole batch, not one path: the batch is the only
+    // record of WHICH delete is being undone — see the definition.
+    void emitRestored(const QStringList &originalPaths);
+
+    // The guards + trash of ONE entry (file or folder), WITHOUT the rebuild()/
     // fileDeleted() that must happen once for a whole batch — shared by
-    // deleteFile() (one file) and deleteFiles() (a selection). Returns whether
-    // the file itself was trashed; absent optional sidecars aren't failures.
-    bool deleteFileEntry(const QUrl &fileUrl);
+    // trashFiles()/trashFolder()/trashTranscript(). Appends a {trashPath, originalPath}
+    // map to *restorable for every path it actually trashed, sidecars included.
+    TrashOutcome trashEntry(const QUrl &url, EntryKind kind, QVariantList *restorable);
+    // Irreversible counterpart, same guards and same sidecar set.
+    bool removeEntryPermanently(const QUrl &url, EntryKind kind);
+    // Shared guard set for both of the above: inside the vault, never the vault
+    // root itself. Returns the resolved local path, or empty if refused.
+    QString guardedLocalPath(const QUrl &url, EntryKind kind) const;
     std::unique_ptr<Node> scanDirectory(const QString &dirPath, Node *parent) const;
     Node *nodeFromIndex(const QModelIndex &index) const;
     // Backs refreshFile() — plain depth-first search by absolute path (the
