@@ -1241,6 +1241,37 @@ Rectangle {
     property string renamingLabel: "" // the label the row displays, "" if none
     property string renamingText: ""  // the editor's current text
 
+    // Item: anti-flash for the inline rename. commitActiveRename() leaves edit
+    // mode (clears renamingPath) SYNCHRONOUSLY but defers the actual write to
+    // the next tick (renameFile()→rebuild() would destroy the running
+    // delegate). In that one-frame gap the row falls back to rowNameText, whose
+    // text is still the OLD model name — a visible flash to the old name before
+    // the rebuild swaps in the new one. So during that window rowNameText shows
+    // this optimistic name for optimisticRenamePath instead of the stale model
+    // value; performRename() clears it once the write (and its rebuild/refresh)
+    // has landed. Mirrors MainPanel's pendingSpeakerRenames optimistic pattern.
+    property string optimisticRenamePath: ""
+    property string optimisticRenameName: ""
+
+    // The display name a row WILL show after a rename to newBase — mirrors
+    // rowNameText's own base derivation so the optimistic frame matches the
+    // rebuilt one exactly. A label edit shows the label verbatim; a filename
+    // edit shows base+extension when extensions are visible (renameFile
+    // re-appends the real extension), base alone when they're hidden.
+    function optimisticDisplayName(path, isDir, label, newBase) {
+        if (!isDir && AppSettings.useLabelsSidebar && label)
+            return newBase
+        if (isDir || !AppSettings.hideExtensionsSidebar) {
+            if (isDir)
+                return newBase
+            const oldBaseName = path.substring(path.lastIndexOf("/") + 1)
+            const dot = oldBaseName.lastIndexOf(".")
+            const ext = dot > 0 ? oldBaseName.substring(dot) : ""
+            return newBase + ext
+        }
+        return newBase
+    }
+
     function beginRename(path, isDir, label) {
         if (path === "")
             return
@@ -1298,19 +1329,35 @@ Rectangle {
         const isDir = sidebar.renamingIsDir
         const label = sidebar.renamingLabel
         const newValue = sidebar.renamingText
+        // Set the optimistic display BEFORE clearing renamingPath, so the frame
+        // where this row falls back to rowNameText already shows the new name
+        // (see optimisticRenamePath's doc comment). performRename() clears it.
+        const trimmed = newValue.trim()
+        if (trimmed !== "" && trimmed !== sidebar.renameInitialText(path, isDir, label)) {
+            sidebar.optimisticRenamePath = path
+            sidebar.optimisticRenameName = sidebar.optimisticDisplayName(path, isDir, label, trimmed)
+        }
         sidebar.renamingPath = ""
         sidebar.renamingText = ""
         Qt.callLater(() => sidebar.performRename(path, isDir, label, newValue))
     }
 
+    function clearOptimisticRename() {
+        sidebar.optimisticRenamePath = ""
+        sidebar.optimisticRenameName = ""
+    }
+
     function performRename(path, isDir, label, newValue) {
         const trimmed = newValue.trim()
-        if (trimmed === "" || trimmed === sidebar.renameInitialText(path, isDir, label))
+        if (trimmed === "" || trimmed === sidebar.renameInitialText(path, isDir, label)) {
+            sidebar.clearOptimisticRename()
             return // empty or unchanged — silently keep the old name
+        }
 
         if (isDir) {
             if (sidebar.model && !sidebar.model.renameFolder("file://" + path, trimmed))
                 Notifications.error(qsTr("Couldn't rename folder — name taken or invalid."))
+            sidebar.clearOptimisticRename()
             return
         }
 
@@ -1321,11 +1368,16 @@ Rectangle {
         if (AppSettings.useLabelsSidebar && label) {
             if (sidebar.transcriptionController)
                 sidebar.transcriptionController.setLabel("file://" + path, trimmed)
+            sidebar.clearOptimisticRename()
             return
         }
 
         if (sidebar.model && !sidebar.model.renameFile("file://" + path, trimmed))
             Notifications.error(qsTr("Couldn't rename — name taken or invalid."))
+        // renameFile() ran rebuild() synchronously (new delegates already show
+        // the new model name), so releasing the optimistic override now can't
+        // reintroduce the flash.
+        sidebar.clearOptimisticRename()
     }
 
     function openMoveTo() {
@@ -4051,6 +4103,13 @@ Rectangle {
                         textFormat: sidebar.searchQuery !== "" ? Text.StyledText : Text.PlainText
                         text: {
                             const base = (function () {
+                                // Anti-flash: while a just-committed rename's
+                                // write is still deferred (see
+                                // sidebar.optimisticRenamePath), show the new
+                                // name instead of the stale model value.
+                                if (sidebar.optimisticRenamePath !== ""
+                                        && sidebar.optimisticRenamePath === treeDelegate.path)
+                                    return sidebar.optimisticRenameName
                                 if (!treeDelegate.isDir && AppSettings.useLabelsSidebar
                                         && treeDelegate.metadata && treeDelegate.metadata.label)
                                     return treeDelegate.metadata.label

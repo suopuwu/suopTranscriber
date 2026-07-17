@@ -7,6 +7,12 @@ Item {
 
     property var window
     property string title: ""
+    // Which top-level page is currently open (fed from Main.qml). The matching
+    // toolbar button shows a persistent active border while its page is up, so
+    // it's obvious which page you're on (mirrors the window title suffix).
+    property bool recording: false
+    property bool usbGrabberOpen: false
+    property bool benchmarkOpen: false
     signal settingsRequested()
     signal forceRetranscribeAllRequested()
     signal recordRequested()
@@ -102,7 +108,13 @@ Item {
         }
         HoverBorder {
             anchors.fill: parent
-            active: recordHover.hovered
+            active: recordHover.hovered && !titleBar.recording
+        }
+        // Persistent, stronger border while the recorder page is open.
+        HoverBorder {
+            anchors.fill: parent
+            active: titleBar.recording
+            borderWidth: 2
         }
         AppIcon {
             anchors.centerIn: parent
@@ -131,7 +143,12 @@ Item {
         }
         HoverBorder {
             anchors.fill: parent
-            active: usbGrabberHover.hovered
+            active: usbGrabberHover.hovered && !titleBar.usbGrabberOpen
+        }
+        HoverBorder {
+            anchors.fill: parent
+            active: titleBar.usbGrabberOpen
+            borderWidth: 2
         }
         AppIcon {
             anchors.centerIn: parent
@@ -160,7 +177,12 @@ Item {
         }
         HoverBorder {
             anchors.fill: parent
-            active: benchmarkHover.hovered
+            active: benchmarkHover.hovered && !titleBar.benchmarkOpen
+        }
+        HoverBorder {
+            anchors.fill: parent
+            active: titleBar.benchmarkOpen
+            borderWidth: 2
         }
         AppIcon {
             anchors.centerIn: parent

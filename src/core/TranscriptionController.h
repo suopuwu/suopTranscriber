@@ -209,6 +209,14 @@ class TranscriptionController : public QObject {
     // proportioned width instead of just the two that happened to have a
     // progress callback.
     Q_PROPERTY(double overallProgress READ overallProgress NOTIFY overallProgressChanged)
+    // Benchmark runs (model + diarization sweeps) drive the bottom-bar progress
+    // glow too, but deliberately do NOT set `busy` / feed `overallProgress`:
+    // those are overloaded to mean "a real transcription job is running on the
+    // OPEN file" and gate things like MainPanel's blocking overlay, which must
+    // NOT appear during a benchmark. So the glow gets its own signal — active
+    // while a sweep runs, progress = fraction of models/combos started.
+    Q_PROPERTY(bool benchmarkActive READ benchmarkActive NOTIFY benchmarkActiveChanged)
+    Q_PROPERTY(double benchmarkProgress READ benchmarkProgress NOTIFY benchmarkProgressChanged)
     // "loading" (whisper model load — no native progress hook exists for
     // this; `progress` here is synthesized from elapsed-vs-historical-
     // average, see overallProgress's doc comment), "detecting-speakers-
@@ -348,6 +356,8 @@ public:
     double progress() const { return m_progress; }
     // See the overallProgress Q_PROPERTY doc comment above.
     double overallProgress() const { return m_overallProgress; }
+    bool benchmarkActive() const { return m_benchmarkActive; }
+    double benchmarkProgress() const { return m_benchmarkProgress; }
     QString currentPhase() const { return m_phase; }
     QUrl currentFile() const { return m_currentFile; }
     // See the liveUpdateTick Q_PROPERTY doc comment above.
@@ -856,6 +866,16 @@ public:
     // themselves contain commas.
     Q_INVOKABLE bool setTags(const QUrl &fileUrl, const QStringList &tags, QString *errorOut = nullptr) const;
 
+    // Persists which chapters are collapsed in the panel's view, as a
+    // `collapsedChapters:` frontmatter key holding the comma-joined chapter t0
+    // keys (the same String(t0) form MainPanel keys its collapse map by), so
+    // collapse survives closing/reopening a file. Same reopen/rewrite shape as
+    // setLabel(); an empty list REMOVES the key rather than leaving a blank
+    // one. Deliberately does NOT emit finished() — collapse is pure view state
+    // no listener needs to react to, so a toggle mustn't trigger a metadata/
+    // transcript reload cycle. Runs synchronously on the GUI thread.
+    Q_INVOKABLE bool setCollapsedChapters(const QUrl &fileUrl, const QStringList &chapterKeys, QString *errorOut = nullptr) const;
+
     // Manual-edit counterpart for the transcript BODY's segment text itself
     // (MainPanel's always-editable transcriptArea) — edits is a list of
     // {t0: seconds as double, text: QString} maps, one per changed sentence
@@ -1171,6 +1191,8 @@ signals:
     void busyChanged();
     void progressChanged();
     void overallProgressChanged();
+    void benchmarkActiveChanged();
+    void benchmarkProgressChanged();
     void currentPhaseChanged();
     void currentFileChanged();
     void queueChanged();
@@ -1578,6 +1600,11 @@ private:
     // comment), not emitted by the worker anymore, EXCEPT for a "downloading"
     // job (see the downloadProgress connection in the constructor).
     double m_overallProgress = 0.0;
+    // Benchmark-glow state (see the benchmarkActive/benchmarkProgress Q_PROPERTY
+    // doc comment). Set via setBenchmarkGlow(); independent of m_busy.
+    bool m_benchmarkActive = false;
+    double m_benchmarkProgress = 0.0;
+    void setBenchmarkGlow(bool active, double progress);
     // Rolling (last RollingAverage::kCapacity samples) average duration of
     // each named phase, keyed by a COMPOSITE string — phase bucket + modelId
     // + speakerDetection (see canonicalPhaseKey() in the .cpp), not just the

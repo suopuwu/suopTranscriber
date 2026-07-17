@@ -10,7 +10,15 @@ ApplicationWindow {
     height: 720
     visible: true
     color: "transparent"
+    // Base title plus a " - <Page>" suffix for whichever top-level page is
+    // open (priority matches MainPanel's page precedence: recording >
+    // usbGrabber > benchmark). The custom TitleBar mirrors this via
+    // `title: window.title`, so both update together. mainPanel is declared
+    // later in this file — a forward id reference in a binding resolves lazily.
     title: qsTr("Suop Transcriber")
+           + (mainPanel.recording ? qsTr(" - Recorder")
+              : mainPanel.usbGrabberOpen ? qsTr(" - USB Grabber")
+              : mainPanel.benchmarkOpen ? qsTr(" - Benchmark") : "")
     flags: AppSettings.useSystemTitlebar ? Qt.Window : (Qt.Window | Qt.FramelessWindowHint)
 
     VaultTreeModel {
@@ -291,6 +299,9 @@ ApplicationWindow {
                 Layout.fillWidth: true
                 window: window
                 title: window.title
+                recording: mainPanel.recording
+                usbGrabberOpen: mainPanel.usbGrabberOpen
+                benchmarkOpen: mainPanel.benchmarkOpen
                 visible: !AppSettings.useSystemTitlebar
                 onSettingsRequested: settingsPopup.open()
                 onForceRetranscribeAllRequested: sidebar.forceRetranscribeAll()

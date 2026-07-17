@@ -2513,6 +2513,17 @@ public slots:
             emit finished(false, QStringLiteral("could not create ffmpeg concat list"));
             return;
         }
+        // The merged file stands in for the original recording, so it inherits
+        // the first part's mtime instead of taking "now" (see the mtime note in
+        // findCombineGroups()'s doc comment — mtime is the vault's stand-in for
+        // when a recording happened, since birth time doesn't survive a copy).
+        // Read before ffmpeg runs, because the sources move into .combined/
+        // afterwards. sourcePaths is in combine order, so .first() is the part
+        // the recording actually starts with — not necessarily the oldest, if
+        // the rule designated a sort differentiator.
+        const QDateTime firstPartMtime =
+            sourcePaths.isEmpty() ? QDateTime() : QFileInfo(sourcePaths.first()).lastModified();
+
         qint64 totalInputBytes = 0;
         for (const QString &path : sourcePaths) {
             // ffmpeg concat demuxer syntax: single-quoted paths, any literal
@@ -2582,6 +2593,15 @@ public slots:
         }
 
         emit progress(1.0);
+
+        // Restamp only now that ffmpeg has exited and closed the output —
+        // anything that writes the file stamps mtime as "now", so an earlier
+        // setFileTime() would just get clobbered.
+        if (false && firstPartMtime.isValid()) {
+            QFile out(outputPath);
+            if (out.open(QIODevice::ReadWrite))
+                out.setFileTime(firstPartMtime, QFileDevice::FileModificationTime);
+        }
 
         // Move (or delete) every source now that the merge succeeded — a
         // sibling .combined/ dir next to each one (hidden dotfolder, same
@@ -3159,6 +3179,24 @@ TranscriptionController::TranscriptionController(QObject *parent)
             &TranscriptionController::diarizationBenchmarkComboDone);
     connect(m_worker, &TranscriptionWorker::diarizationBenchmarkFinished, this,
             &TranscriptionController::diarizationBenchmarkFinished);
+    // Drive the progress glow off benchmark progress (item: benchmark tasks
+    // affect the glow, without touching m_busy). Each *Started advances the
+    // fraction; Finished/Failed clears it. These are separate connections from
+    // the pass-through ones above, so QML still gets the raw signals too.
+    connect(m_worker, &TranscriptionWorker::benchmarkModelStarted, this,
+            [this](const QString &, int index, int total) {
+                setBenchmarkGlow(true, total > 0 ? double(index) / total : 0.0);
+            });
+    connect(m_worker, &TranscriptionWorker::benchmarkFinished, this,
+            [this](const QVariantMap &) { setBenchmarkGlow(false, 0.0); });
+    connect(m_worker, &TranscriptionWorker::benchmarkFailed, this,
+            [this](const QString &) { setBenchmarkGlow(false, 0.0); });
+    connect(m_worker, &TranscriptionWorker::diarizationBenchmarkComboStarted, this,
+            [this](const QString &, int index, int total) {
+                setBenchmarkGlow(true, total > 0 ? double(index) / total : 0.0);
+            });
+    connect(m_worker, &TranscriptionWorker::diarizationBenchmarkFinished, this,
+            [this](const QVariantMap &) { setBenchmarkGlow(false, 0.0); });
     m_thread.start();
 }
 
@@ -5036,6 +5074,90 @@ bool TranscriptionController::setTags(const QUrl &fileUrl, const QStringList &ta
     return true;
 }
 
+bool TranscriptionController::setCollapsedChapters(const QUrl &fileUrl, const QStringList &chapterKeys, QString *errorOut) const
+{
+    const QFileInfo fi(fileUrl.toLocalFile());
+    const QString path = sidecarPath(fileUrl.toLocalFile());
+
+    QFile mdFile(path);
+    if (!mdFile.exists()) {
+        if (errorOut)
+            *errorOut = QStringLiteral("%1 has not been transcribed yet").arg(fi.fileName());
+        return false;
+    }
+
+    if (!mdFile.open(QIODevice::ReadOnly | QIODevice::Text)) {
+        if (errorOut)
+            *errorOut = QStringLiteral("could not open %1 for reading").arg(path);
+        return false;
+    }
+
+    QTextStream in(&mdFile);
+    if (in.readLine() != QStringLiteral("---")) {
+        mdFile.close();
+        if (errorOut)
+            *errorOut = QStringLiteral("%1 has no frontmatter block").arg(mdFile.fileName());
+        return false;
+    }
+
+    // Mirror setLabel()/setTags()'s frontmatter-scanning shape.
+    QStringList frontmatterLines;
+    QString line;
+    bool closed = false;
+    while (!(line = in.readLine()).isNull()) {
+        if (line == QStringLiteral("---")) {
+            closed = true;
+            break;
+        }
+        frontmatterLines.append(line);
+    }
+    if (!closed) {
+        mdFile.close();
+        if (errorOut)
+            *errorOut = QStringLiteral("%1 has a malformed frontmatter block").arg(mdFile.fileName());
+        return false;
+    }
+
+    const QString body = in.readAll();
+    mdFile.close();
+
+    // Empty list REMOVES the key (no blank `collapsedChapters:` left behind);
+    // a non-empty list upserts it with the comma-joined keys.
+    const QString joined = chapterKeys.join(QLatin1Char(','));
+    bool replaced = false;
+    for (int i = 0; i < frontmatterLines.size(); ++i) {
+        const int colon = frontmatterLines[i].indexOf(':');
+        if (colon >= 0 && frontmatterLines[i].left(colon).trimmed() == QStringLiteral("collapsedChapters")) {
+            if (joined.isEmpty())
+                frontmatterLines.removeAt(i);
+            else
+                frontmatterLines[i] = QStringLiteral("collapsedChapters: ") + joined;
+            replaced = true;
+            break;
+        }
+    }
+    if (!replaced && !joined.isEmpty())
+        frontmatterLines.append(QStringLiteral("collapsedChapters: ") + joined);
+
+    if (!mdFile.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
+        if (errorOut)
+            *errorOut = QStringLiteral("could not open %1 for writing").arg(mdFile.fileName());
+        return false;
+    }
+    QTextStream out(&mdFile);
+    out << "---\n";
+    for (const QString &fmLine : frontmatterLines)
+        out << fmLine << '\n';
+    out << "---\n";
+    out << body;
+    out.flush();
+    mdFile.flush();
+    mdFile.close();
+    // No finished() emit — see the header doc comment (collapse is pure view
+    // state, must not trigger a metadata/transcript reload on every toggle).
+    return true;
+}
+
 // Manual-edit counterpart for segment text (MainPanel's always-editable
 // transcriptArea) — reuses parseSpeakerTaggedFile()/writeFrontmatterBlock()
 // (originally written for renameSpeakerInFile()/mergeSpeakersInFile() above)
@@ -5934,6 +6056,9 @@ void TranscriptionController::runBenchmark(const QUrl &fileUrl, const QStringLis
     // in-flight job (no GPU contention), then runs benchmarkJob(). No queue
     // entry, no file writes; results arrive via the benchmark* signals. Uses
     // the currently-open vault, same as availableModels()/availableEngines().
+    // Light the progress glow immediately (before the first model-started
+    // signal) so it doesn't lag the run kicking off.
+    setBenchmarkGlow(true, 0.0);
     QMetaObject::invokeMethod(m_worker, "benchmarkJob", Qt::QueuedConnection,
                               Q_ARG(QString, fileUrl.toLocalFile()), Q_ARG(QString, m_vaultUrl.toLocalFile()),
                               Q_ARG(QStringList, modelIds));
@@ -5943,8 +6068,21 @@ void TranscriptionController::runDiarizationBenchmark(const QUrl &fileUrl, const
 {
     // Same worker/serialization/cancel story as runBenchmark(); no queue entry,
     // no file writes. Results arrive via the diarizationBenchmark* signals.
+    setBenchmarkGlow(true, 0.0);
     QMetaObject::invokeMethod(m_worker, "diarizationBenchmarkJob", Qt::QueuedConnection,
                               Q_ARG(QString, fileUrl.toLocalFile()), Q_ARG(QVariantList, combos));
+}
+
+void TranscriptionController::setBenchmarkGlow(bool active, double progress)
+{
+    if (m_benchmarkProgress != progress) {
+        m_benchmarkProgress = progress;
+        emit benchmarkProgressChanged();
+    }
+    if (m_benchmarkActive != active) {
+        m_benchmarkActive = active;
+        emit benchmarkActiveChanged();
+    }
 }
 
 void TranscriptionController::cancelBenchmark()

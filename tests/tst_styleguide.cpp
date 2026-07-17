@@ -242,12 +242,96 @@ private slots:
         QVERIFY2(!src.isEmpty(), "qml/HoverBorder.qml must exist (StyleGuide.md hover convention)");
         QVERIFY(src.contains(QStringLiteral("color: \"transparent\"")));
         QVERIFY(src.contains(QStringLiteral("radius: AppSettings.borderRadius")));
-        QVERIFY(src.contains(QStringLiteral("border.width: 1")));
-        QVERIFY2(src.contains(QStringLiteral("border.color: AppSettings.accentColor")),
-                 "hover outline color must come from the configurable AppSettings.accentColor, not a "
+        // The width/color default to the 1px accent hover border, but are now
+        // overridable props (a stronger "active page" border reuses the same
+        // component — see TitleBar's page buttons), so the guard checks the
+        // parametrized form plus its 1px/accent defaults rather than literals.
+        QVERIFY(src.contains(QStringLiteral("border.width: borderWidth")));
+        QVERIFY(src.contains(QStringLiteral("property int borderWidth: 1")));
+        QVERIFY(src.contains(QStringLiteral("border.color: borderColor")));
+        QVERIFY2(src.contains(QStringLiteral("property color borderColor: AppSettings.accentColor")),
+                 "hover outline color must default to the configurable AppSettings.accentColor, not a "
                  "hardcoded \"white\"");
         QVERIFY2(src.contains(QStringLiteral("Behavior on opacity")),
                  "hover outline must fade, not pop (StyleGuide.md)");
+    }
+
+    // Item: the full-panel blocking overlay must name the ACTUAL task (keyed
+    // off currentPhase), not a hardcoded "Transcribing…".
+    void mainPanel_blockingOverlayNamesTheTask()
+    {
+        const QString src = readAll(QStringLiteral(SUOP_QML_DIR "/MainPanel.qml"));
+        QVERIFY2(src.contains(QStringLiteral("property string transcribingOverlayLabel")),
+                 "the overlay label must be derived (transcribingOverlayLabel), not fixed");
+        QVERIFY2(src.contains(QStringLiteral("text: mainPanel.transcribingOverlayLabel")),
+                 "the overlay's Label must bind to the derived task label");
+        QVERIFY2(src.contains(QStringLiteral("case \"detecting-speakers\"")),
+                 "the overlay label must map the actual phases (e.g. detecting-speakers)");
+    }
+
+    // Item: timestamps show on EVERY sentence line; speaker names stay one per
+    // turn. The two gutter models are what encode that rule.
+    void mainPanel_timestampAlways_speakerOnTurn()
+    {
+        const QString src = readAll(QStringLiteral(SUOP_QML_DIR "/MainPanel.qml"));
+        QVERIFY2(src.contains(QStringLiteral("displaySentences.filter(s => !s.isChapterHeading)")),
+                 "the timestamp gutter must show one timestamp per (non-heading) sentence, always");
+        QVERIFY2(src.contains(QStringLiteral("s.showGutter && s.speaker !== \"\"")),
+                 "the speaker gutter must stay one-per-turn (showGutter + non-empty speaker)");
+    }
+
+    // Item: the filename subtitle is an editable rename control for the real
+    // file, and chapter collapse persists to frontmatter.
+    void mainPanel_editableFilename_andPersistedCollapse()
+    {
+        const QString src = readAll(QStringLiteral(SUOP_QML_DIR "/MainPanel.qml"));
+        QVERIFY2(src.contains(QStringLiteral("function commitFilenameRename(")),
+                 "the filename subtitle must commit a real file rename");
+        QVERIFY2(src.contains(QStringLiteral("function initCollapsedFromFrontmatter("))
+                     && src.contains(QStringLiteral("function persistCollapsedChapters(")),
+                 "chapter collapse must round-trip through frontmatter (persist + restore)");
+        QVERIFY2(src.contains(QStringLiteral("setCollapsedChapters(")),
+                 "collapse must persist via the controller's setCollapsedChapters invokable");
+    }
+
+    // Item: a dedicated drag-handle grip carries the speaker merge gesture (so a
+    // plain click can still edit the name) — its own AppIcon, not overloading
+    // the pill body (StyleGuide "Always-editable text").
+    void mainPanel_speakerDragHandleGrip()
+    {
+        const QString src = readAll(QStringLiteral(SUOP_QML_DIR "/MainPanel.qml"));
+        QVERIFY2(src.contains(QStringLiteral("id: speakerDragHandle")),
+                 "the speaker pill must have a dedicated drag grip");
+        QVERIFY2(src.contains(QStringLiteral("name: \"drag-handle\"")),
+                 "the grip must be the semantic drag-handle AppIcon");
+    }
+
+    // Item: renaming a tree row must not flash the old name — the row shows an
+    // optimistic new name over the deferred-write window.
+    void sidebar_renameHasOptimisticAntiFlash()
+    {
+        const QString src = readAll(QStringLiteral(SUOP_QML_DIR "/Sidebar.qml"));
+        QVERIFY2(src.contains(QStringLiteral("optimisticRenamePath")),
+                 "the inline rename must carry an optimistic display name to avoid the old-name flash");
+        QVERIFY2(src.contains(QStringLiteral("sidebar.optimisticRenamePath === treeDelegate.path")),
+                 "rowNameText must show the optimistic name for the row being renamed");
+    }
+
+    // Item: top-level pages (recorder/usb/benchmark) show a persistent active
+    // border on their toolbar button and add a " - <Page>" window-title suffix.
+    void titleBar_activePageBorderAndTitleSuffix()
+    {
+        const QString titleBar = readAll(QStringLiteral(SUOP_QML_DIR "/TitleBar.qml"));
+        QVERIFY2(titleBar.contains(QStringLiteral("active: titleBar.benchmarkOpen")),
+                 "the benchmark button must show an active border while its page is open");
+        QVERIFY2(titleBar.contains(QStringLiteral("active: titleBar.recording"))
+                     && titleBar.contains(QStringLiteral("active: titleBar.usbGrabberOpen")),
+                 "the recorder and usb buttons must show an active border too");
+        const QString main = readAll(QStringLiteral(SUOP_QML_DIR "/Main.qml"));
+        QVERIFY2(main.contains(QStringLiteral(" - Benchmark"))
+                     && main.contains(QStringLiteral(" - Recorder"))
+                     && main.contains(QStringLiteral(" - USB Grabber")),
+                 "the window title must gain a \" - <Page>\" suffix for each top-level page");
     }
 
     // Iconography (DESIGN.md "Iconography"): AppIcon is THE way this app draws
@@ -1117,7 +1201,10 @@ private slots:
         // mid-execution — same hazard the drop handler defers for.
         const int commitIdx = src.indexOf(QStringLiteral("function commitActiveRename("));
         QVERIFY2(commitIdx >= 0, "commitActiveRename() must exist");
-        QVERIFY2(src.mid(commitIdx, 700).contains(QStringLiteral("Qt.callLater")),
+        // Window widened from 700: commitActiveRename now also seeds the
+        // optimistic-rename display (anti-flash) before deferring, so Qt.callLater
+        // sits a few lines further down.
+        QVERIFY2(src.mid(commitIdx, 1200).contains(QStringLiteral("Qt.callLater")),
                  "the rename commit must be deferred (Qt.callLater) — renameFile()/renameFolder() rebuild "
                  "the model and destroy the delegate the commit handler is running on");
 
@@ -1621,30 +1708,59 @@ private slots:
 
     // Item 4: the model picker's CLOSED-state box must round its corners with
     // AppSettings.borderRadius — QQC2's default ComboBox background is
-    // square-cornered, so modelCombo needs its own background: Rectangle
-    // override (the dropdown popup was already fixed separately). No
-    // QQuickView here to inspect the rendered corners, so this is a
-    // source-scan guard that the background override exists.
+    // square-cornered, so the picker needs its own background: Rectangle
+    // override (the dropdown popup was already fixed separately). The three
+    // MainPanel pickers (transcription model + diarization segmentation /
+    // embedding) share one reusable qml/ModelComboBox.qml, so this scans the
+    // component. No QQuickView here to inspect the rendered corners, so this
+    // is a source-scan guard that the background override exists.
     void mainPanel_modelComboClosedBoxIsRounded()
     {
-        const QString src = readAll(QStringLiteral(SUOP_QML_DIR "/MainPanel.qml"));
-        QVERIFY2(!src.isEmpty(), "qml/MainPanel.qml must exist");
+        const QString src = readAll(QStringLiteral(SUOP_QML_DIR "/ModelComboBox.qml"));
+        QVERIFY2(!src.isEmpty(), "qml/ModelComboBox.qml must exist");
 
-        const int idx = src.indexOf(QStringLiteral("id: modelCombo"));
-        QVERIFY2(idx >= 0, "modelCombo must exist");
         // Scan only up to the popup override so this asserts the closed-box
         // background specifically, not the already-fixed popup background.
-        const int popupIdx = src.indexOf(QStringLiteral("popup: Popup"), idx);
-        QVERIFY2(popupIdx > idx, "modelCombo's popup override must exist after it");
-        const QString closedBoxBlock = src.mid(idx, popupIdx - idx);
+        const int popupIdx = src.indexOf(QStringLiteral("popup: Popup"));
+        QVERIFY2(popupIdx >= 0, "ModelComboBox's popup override must exist");
+        const QString closedBoxBlock = src.left(popupIdx);
         QVERIFY2(closedBoxBlock.contains(QStringLiteral("background: Rectangle")),
-                 "modelCombo must override its closed-state background with a Rectangle (QQC2's default "
+                 "ModelComboBox must override its closed-state background with a Rectangle (QQC2's default "
                  "box is square-cornered) — item 4");
         const int bgIdx = closedBoxBlock.indexOf(QStringLiteral("background: Rectangle"));
         const QString bgBlock = closedBoxBlock.mid(bgIdx, 200);
         QVERIFY2(bgBlock.contains(QStringLiteral("radius: AppSettings.borderRadius")),
-                 "modelCombo's closed-state background must round its corners with "
+                 "ModelComboBox's closed-state background must round its corners with "
                  "AppSettings.borderRadius (StyleGuide.md border-radius convention)");
+        // The closed box must elide its current-selection label (a
+        // width-capped box in a shared row otherwise silently clips the tail).
+        QVERIFY2(closedBoxBlock.contains(QStringLiteral("elide: Text.ElideRight")),
+                 "ModelComboBox's closed-state contentItem must elide (truncate) the selected label");
+    }
+
+    // The MainPanel note-page controls surface, next to the transcription
+    // model, both diarization model pickers (segmentation + embedding) and the
+    // diarization sensitivity slider — all bound to the same AppSettings keys
+    // the "Detect speakers" / runAllJobs paths read. No QQuickView harness for
+    // MainPanel (too many C++ deps), so this is a source-scan guard that the
+    // three controls are mounted and wired to their settings.
+    void mainPanel_hasDiarizationModelAndSensitivityControls()
+    {
+        const QString src = readAll(QStringLiteral(SUOP_QML_DIR "/MainPanel.qml"));
+        QVERIFY2(!src.isEmpty(), "qml/MainPanel.qml must exist");
+
+        QVERIFY2(src.contains(QStringLiteral("id: segmentationCombo")),
+                 "MainPanel must mount a segmentation-model picker beside the transcription model");
+        QVERIFY2(src.contains(QStringLiteral("AppSettings.diarizationSegmentationModel = id")),
+                 "the segmentation picker must persist its choice to AppSettings.diarizationSegmentationModel");
+        QVERIFY2(src.contains(QStringLiteral("id: embeddingCombo")),
+                 "MainPanel must mount an embedding-model picker beside the transcription model");
+        QVERIFY2(src.contains(QStringLiteral("AppSettings.diarizationEmbeddingModel = id")),
+                 "the embedding picker must persist its choice to AppSettings.diarizationEmbeddingModel");
+        QVERIFY2(src.contains(QStringLiteral("id: diarizationSensitivitySlider")),
+                 "MainPanel must mount a diarization sensitivity slider");
+        QVERIFY2(src.contains(QStringLiteral("AppSettings.diarizationSensitivity = value")),
+                 "the sensitivity slider must persist to AppSettings.diarizationSensitivity");
     }
 
     // The Basic style's vertical ScrollBar is an overlay that floats flush

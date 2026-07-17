@@ -118,9 +118,9 @@ suop_add_test(tst_bottombar_pathsegments LINK_QUICK LINK_SVG ICON_ASSETS SOURCES
 suop_add_test(tst_mainpanel_chapterselection LINK_QUICK LINK_SVG ICON_ASSETS LINK_GUI SOURCES IconTheme.cpp Clipboard.cpp)
 suop_add_test(tst_scratch_headingrepro LINK_QUICK LINK_SVG ICON_ASSETS LINK_GUI SOURCES IconTheme.cpp Clipboard.cpp)
 # Loads the real BenchmarkPage.qml inside a modal Popup -> ScrollView (its
-# SettingsPopup nesting) and proves the audio-file ComboBox is populated +
-# selectable — the allAudioPaths() no-NOTIFY binding trap that left it empty.
-suop_add_test(tst_benchmarkpage_filecombo LINK_QUICK SOURCES VaultTreeModel.cpp VaultSearchProxyModel.cpp)
+# SettingsPopup nesting) and proves the benchmark file follows the left panel's
+# currentFilePath (the in-page file-picker ComboBox was removed).
+suop_add_test(tst_benchmarkpage_filesync LINK_QUICK SOURCES VaultTreeModel.cpp VaultSearchProxyModel.cpp)
 # Loads the real MainPanel.qml in a QQuickView AND wires a REAL
 # TranscriptionController into it — the assertion is what the panel reads back
 # off disk for the file that's actually open, so a stubbed readChapters() would

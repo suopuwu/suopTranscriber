@@ -34,16 +34,23 @@ ColumnLayout {
     property bool active: false
     onActiveChanged: if (active) benchmarkPage.onShown()
 
+    // Item: the benchmark file follows the left panel. currentFilePath is fed
+    // from MainPanel's current-file expression and changes whenever the user
+    // clicks a different file in the tree — mirror it into selectedFilePath so
+    // selecting a file there automatically switches what gets benchmarked, even
+    // while this page is hidden. (onShown() also seeds the initial value, since
+    // this only fires on CHANGE.)
+    onCurrentFilePathChanged: benchmarkPage.selectedFilePath = benchmarkPage.currentFilePath
+
     function onShown() {
-        // The vault is loaded by now — gather the file list, detect engines
-        // lazily, restore the last run, and default to the open file.
-        benchmarkPage.refreshAudioFiles()
+        // The vault is loaded by now — detect engines lazily, restore the last
+        // run, and default to the open file.
         if (!benchmarkPage.enginesDetected)
             Qt.callLater(benchmarkPage.detectEngines)
         if (benchmarkPage.results.length === 0)
             benchmarkPage.loadLastRun()
-        if (benchmarkPage.currentFilePath !== "")
-            benchmarkPage.selectedFilePath = benchmarkPage.currentFilePath
+        benchmarkPage.selectedFilePath = benchmarkPage.currentFilePath
+        benchmarkPage.refreshModels()
         benchmarkPage.refreshDiarizationModels()
     }
 
@@ -57,18 +64,44 @@ ColumnLayout {
     property string statusText: ""
     property string selectedFilePath: ""
 
-    // The vault's audio files, for the file picker. Refreshed IMPERATIVELY (see
-    // refreshAudioFiles()) rather than bound to vaultTreeModel.allAudioPaths()
-    // directly: that's a Q_INVOKABLE with no NOTIFY signal, so a declarative
-    // binding evaluates exactly once — at this page's creation, which happens
-    // when SettingsPopup is built (app startup, before any vault is loaded) —
-    // against an empty file list, and then never again. The combo would be
-    // permanently empty. Same untracked-invokable trap SettingsPopup.qml's
-    // combineOverlapWarnings documents and dodges the same way.
-    property var audioFiles: []
-    function refreshAudioFiles() {
-        benchmarkPage.audioFiles = benchmarkPage.vaultTreeModel
-                ? benchmarkPage.vaultTreeModel.allAudioPaths() : []
+    // The selectable transcription models (whisper tiers + parakeet), with a
+    // `downloaded` flag each. Refreshed IMPERATIVELY (availableModels() is a
+    // Q_INVOKABLE with no NOTIFY, so a declarative binding would evaluate once
+    // at page creation — before any vault/model state — and never again; the
+    // same untracked-invokable trap SettingsPopup.qml documents). Re-fetched on
+    // show AND on modelsChanged() so a just-finished download flips a row's
+    // "(not downloaded)" state live.
+    property var models: []
+    // Which model/engine ids are checked to benchmark. Undownloaded ones ARE
+    // selectable now (they're downloaded before the run — see startBenchmark);
+    // seeded to everything downloaded + every available engine the first time.
+    property var selectedModelIds: []
+    property bool modelSelectionSeeded: false
+    function refreshModels() {
+        benchmarkPage.models = benchmarkPage.transcriptionController
+                ? benchmarkPage.transcriptionController.availableModels() : []
+        benchmarkPage.seedModelSelectionIfNeeded()
+    }
+
+    // Default the model selection to everything already runnable — downloaded
+    // transcription models + every available engine — once, the first time
+    // BOTH lists are known (engines are detected lazily, AFTER models, so
+    // seeding must wait for them or the engines would never be pre-checked;
+    // see detectEngines). Guarded so it never clobbers the user's own picks.
+    function seedModelSelectionIfNeeded() {
+        if (benchmarkPage.modelSelectionSeeded)
+            return
+        if (benchmarkPage.models.length === 0 || !benchmarkPage.enginesDetected)
+            return
+        const seed = []
+        for (let i = 0; i < benchmarkPage.models.length; i++)
+            if (benchmarkPage.models[i].downloaded)
+                seed.push(benchmarkPage.models[i].id)
+        for (let j = 0; j < benchmarkPage.engineList.length; j++)
+            if (benchmarkPage.engineList[j].available)
+                seed.push(benchmarkPage.engineList[j].modelId)
+        benchmarkPage.selectedModelIds = seed
+        benchmarkPage.modelSelectionSeeded = true
     }
 
     // Engine capability detection is comparatively slow (probes GPU + runs each
@@ -86,22 +119,19 @@ ColumnLayout {
         return m + ":" + (r < 10 ? "0" + r : r)
     }
 
-    // The model ids to benchmark: every downloaded whisper tier plus every
-    // available engine. This is where the "only downloaded models" policy lives
-    // (the controller just runs what it's handed).
+    // Whether a model/engine id currently needs downloading before it can run.
+    // Engines are availability-gated (weights live outside the app), never
+    // "downloadable", so only transcription models can be pending.
+    function isModelDownloaded(id) {
+        for (let i = 0; i < benchmarkPage.models.length; i++)
+            if (benchmarkPage.models[i].id === id)
+                return benchmarkPage.models[i].downloaded === true
+        return true // an engine id (or unknown) — treated as ready
+    }
+
+    // The model/engine ids to benchmark: exactly what the user checked.
     function modelIdsToRun() {
-        const ids = []
-        const models = benchmarkPage.transcriptionController
-                       ? benchmarkPage.transcriptionController.availableModels() : []
-        for (let i = 0; i < models.length; i++) {
-            if (models[i].downloaded)
-                ids.push(models[i].id)
-        }
-        for (let j = 0; j < benchmarkPage.engineList.length; j++) {
-            if (benchmarkPage.engineList[j].available)
-                ids.push(benchmarkPage.engineList[j].modelId)
-        }
-        return ids
+        return benchmarkPage.selectedModelIds.slice()
     }
 
     function detectEngines() {
@@ -117,21 +147,64 @@ ColumnLayout {
         if (run && run.results) {
             benchmarkPage.lastRun = run
             benchmarkPage.results = run.results
-            if (run.file)
-                benchmarkPage.selectedFilePath = run.file
+            // NOTE: no longer restores selectedFilePath — the benchmark file
+            // follows the left-panel selection (currentFilePath), not the last
+            // run's file (item: removed the in-page picker).
         }
+    }
+
+    // A run waiting on model downloads before it can start (item: you can pick
+    // undownloaded models and they're fetched first). {kind:"model"|"diar",
+    // requiredIds:[...], ids?/combos?}. onModelsChanged launches it once every
+    // requiredId is present; cancelling clears it.
+    property var pendingRun: null
+
+    function missingModelIds(ids) {
+        const missing = []
+        for (let i = 0; i < ids.length; i++)
+            if (!benchmarkPage.isModelDownloaded(ids[i]))
+                missing.push(ids[i])
+        return missing
+    }
+    function isDiarModelDownloaded(id) {
+        for (let i = 0; i < benchmarkPage.segModels.length; i++)
+            if (benchmarkPage.segModels[i].id === id)
+                return benchmarkPage.segModels[i].downloaded === true
+        for (let i = 0; i < benchmarkPage.embedModels.length; i++)
+            if (benchmarkPage.embedModels[i].id === id)
+                return benchmarkPage.embedModels[i].downloaded === true
+        return true
+    }
+    function startDownloads(ids) {
+        for (let i = 0; i < ids.length; i++)
+            benchmarkPage.transcriptionController.downloadModel(ids[i])
     }
 
     function startBenchmark() {
         if (!benchmarkPage.transcriptionController || benchmarkPage.selectedFilePath === "")
             return
+        if (benchmarkPage.running || benchmarkPage.diarizationRunning || benchmarkPage.pendingRun)
+            return
         if (!benchmarkPage.enginesDetected)
             benchmarkPage.detectEngines()
         const ids = benchmarkPage.modelIdsToRun()
         if (ids.length === 0) {
-            benchmarkPage.statusText = qsTr("No downloaded models to benchmark — download a model first.")
+            benchmarkPage.statusText = qsTr("Select at least one model to benchmark.")
             return
         }
+        const missing = benchmarkPage.missingModelIds(ids)
+        if (missing.length > 0) {
+            // Download the picked-but-undownloaded models first, then run
+            // automatically once they land (see onModelsChanged).
+            benchmarkPage.pendingRun = {kind: "model", requiredIds: ids, ids: ids}
+            benchmarkPage.statusText = qsTr("Downloading %1 model(s) before running…").arg(missing.length)
+            benchmarkPage.startDownloads(missing)
+            return
+        }
+        benchmarkPage.executeBenchmark(ids)
+    }
+
+    function executeBenchmark(ids) {
         benchmarkPage.results = []
         benchmarkPage.running = true
         benchmarkPage.statusText = qsTr("Starting…")
@@ -208,6 +281,8 @@ ColumnLayout {
     function startDiarizationBenchmark() {
         if (!benchmarkPage.transcriptionController || benchmarkPage.selectedFilePath === "")
             return
+        if (benchmarkPage.running || benchmarkPage.diarizationRunning || benchmarkPage.pendingRun)
+            return
         const combos = benchmarkPage.buildDiarizationCombos()
         if (combos.length === 0) {
             benchmarkPage.diarizationStatus = qsTr("Pick at least one segmentation model, one embedding model, "
@@ -223,6 +298,29 @@ ColumnLayout {
     }
 
     function runDiarizationSweep(combos) {
+        // Ensure the segmentation/embedding models the combos use are
+        // downloaded first (undownloaded ones are now selectable), then run.
+        const req = []
+        for (let i = 0; i < combos.length; i++) {
+            if (req.indexOf(combos[i].segmentationModelId) < 0)
+                req.push(combos[i].segmentationModelId)
+            if (req.indexOf(combos[i].embeddingModelId) < 0)
+                req.push(combos[i].embeddingModelId)
+        }
+        const missing = []
+        for (let j = 0; j < req.length; j++)
+            if (!benchmarkPage.isDiarModelDownloaded(req[j]))
+                missing.push(req[j])
+        if (missing.length > 0) {
+            benchmarkPage.pendingRun = {kind: "diar", requiredIds: req, combos: combos}
+            benchmarkPage.diarizationStatus = qsTr("Downloading %1 model(s) before running…").arg(missing.length)
+            benchmarkPage.startDownloads(missing)
+            return
+        }
+        benchmarkPage.executeDiarizationSweep(combos)
+    }
+
+    function executeDiarizationSweep(combos) {
         benchmarkPage.diarizationResults = []
         benchmarkPage.diarizationRunning = true
         benchmarkPage.diarizationStatus = qsTr("Starting %1 tests…").arg(combos.length)
@@ -230,8 +328,26 @@ ColumnLayout {
                     "file://" + benchmarkPage.selectedFilePath, combos)
     }
 
+    // Launches a download-pending run once every required model has landed.
+    function tryLaunchPendingRun() {
+        const pr = benchmarkPage.pendingRun
+        if (!pr)
+            return
+        for (let i = 0; i < pr.requiredIds.length; i++) {
+            const ready = pr.kind === "diar" ? benchmarkPage.isDiarModelDownloaded(pr.requiredIds[i])
+                                             : benchmarkPage.isModelDownloaded(pr.requiredIds[i])
+            if (!ready)
+                return // still waiting on at least one download
+        }
+        benchmarkPage.pendingRun = null
+        if (pr.kind === "diar")
+            benchmarkPage.executeDiarizationSweep(pr.combos)
+        else
+            benchmarkPage.executeBenchmark(pr.ids)
+    }
+
     Component.onCompleted: {
-        benchmarkPage.refreshAudioFiles()
+        benchmarkPage.refreshModels()
         benchmarkPage.loadLastRun()
     }
 
@@ -270,6 +386,15 @@ ColumnLayout {
             benchmarkPage.diarizationResults = run.results
             benchmarkPage.diarizationStatus = run.cancelled ? qsTr("Cancelled.") : qsTr("Done.")
         }
+
+        // Item: refresh the model lists when a download finishes (or any
+        // model op) so "(not downloaded)" states update live — and launch a
+        // run that was waiting on those downloads.
+        function onModelsChanged() {
+            benchmarkPage.refreshModels()
+            benchmarkPage.refreshDiarizationModels()
+            benchmarkPage.tryLaunchPendingRun()
+        }
     }
 
     // B4: confirmation before a large sweep.
@@ -297,43 +422,88 @@ ColumnLayout {
     Label {
         Layout.fillWidth: true
         wrapMode: Text.WordWrap
-        text: qsTr("Run every downloaded model on one file and compare. Nothing is saved to the vault — "
-                   + "this is for comparison only.")
+        text: qsTr("Pick models to run on one file and compare. Undownloaded models are downloaded "
+                   + "before the run. Nothing is saved to the vault — this is for comparison only.")
         color: "#aaaaaa"
         font.pixelSize: 12
     }
 
-    // --- File picker + run controls ------------------------------------------
+    // --- Model selection -----------------------------------------------------
+    // Item: transcription models (whisper tiers + parakeet) plus available
+    // engines. Undownloaded models ARE selectable — startBenchmark downloads
+    // any checked-but-missing one first, then runs. The list refreshes on
+    // modelsChanged so a finished download drops the "(not downloaded)" note.
+    Label { text: qsTr("Models"); color: "#dddddd"; font.pixelSize: 12 }
+    Flow {
+        Layout.fillWidth: true
+        spacing: 12
+        Repeater {
+            model: benchmarkPage.models
+            CheckBox {
+                required property var modelData
+                text: modelData.label + (modelData.downloaded ? "" : qsTr(" (not downloaded)"))
+                checked: benchmarkPage.selectedModelIds.indexOf(modelData.id) >= 0
+                contentItem: Label {
+                    text: parent.text
+                    color: "white"
+                    leftPadding: parent.indicator.width + 6
+                    verticalAlignment: Text.AlignVCenter
+                }
+                onToggled: benchmarkPage.selectedModelIds =
+                           benchmarkPage.toggleIn(benchmarkPage.selectedModelIds, modelData.id)
+                HoverHandler { cursorShape: Qt.PointingHandCursor }
+            }
+        }
+        Repeater {
+            model: benchmarkPage.engineList
+            CheckBox {
+                required property var modelData
+                visible: modelData.available
+                text: modelData.label
+                checked: benchmarkPage.selectedModelIds.indexOf(modelData.modelId) >= 0
+                contentItem: Label {
+                    text: parent.text
+                    color: "white"
+                    leftPadding: parent.indicator.width + 6
+                    verticalAlignment: Text.AlignVCenter
+                }
+                onToggled: benchmarkPage.selectedModelIds =
+                           benchmarkPage.toggleIn(benchmarkPage.selectedModelIds, modelData.modelId)
+                HoverHandler { cursorShape: Qt.PointingHandCursor }
+            }
+        }
+    }
+
+    // --- Selected file + run controls ----------------------------------------
+    // Item: no in-page file picker — the benchmark file always follows the
+    // left-panel selection (currentFilePath), which is the same file the rest
+    // of the app is looking at. selectedFilePath tracks it (see
+    // onCurrentFilePathChanged). This label just shows what will be benchmarked.
     RowLayout {
         Layout.fillWidth: true
         spacing: 8
 
-        ComboBox {
-            id: fileCombo
+        Label {
             Layout.fillWidth: true
-            enabled: !benchmarkPage.running
-            model: benchmarkPage.audioFiles
-            textRole: ""
-            displayText: benchmarkPage.selectedFilePath === ""
-                         ? qsTr("Select an audio file…")
-                         : benchmarkPage.selectedFilePath.substring(
-                               benchmarkPage.selectedFilePath.lastIndexOf("/") + 1)
-            onActivated: benchmarkPage.selectedFilePath = model[currentIndex]
-
-            delegate: ItemDelegate {
-                required property int index
-                required property string modelData
-                width: fileCombo.width
-                text: modelData.substring(modelData.lastIndexOf("/") + 1)
-                highlighted: fileCombo.highlightedIndex === index
-            }
-            HoverHandler { cursorShape: Qt.PointingHandCursor }
+            text: benchmarkPage.selectedFilePath === ""
+                  ? qsTr("No file selected — pick one in the left panel")
+                  : benchmarkPage.selectedFilePath.substring(
+                        benchmarkPage.selectedFilePath.lastIndexOf("/") + 1)
+            color: benchmarkPage.selectedFilePath === "" ? "#c98500" : "#dddddd"
+            font.pixelSize: 12
+            elide: Text.ElideRight
         }
 
         Button {
             id: runButton
-            text: benchmarkPage.running ? qsTr("Running…") : qsTr("Run benchmark")
-            enabled: !benchmarkPage.running && benchmarkPage.selectedFilePath !== ""
+            text: benchmarkPage.pendingRun && benchmarkPage.pendingRun.kind === "model"
+                  ? qsTr("Downloading…")
+                  : benchmarkPage.running ? qsTr("Running…") : qsTr("Run benchmark")
+            // Item: only one benchmark at a time — both sweeps share the single
+            // worker thread, so a run is blocked while EITHER is in progress or
+            // waiting on model downloads (cancel to start a different one).
+            enabled: !benchmarkPage.running && !benchmarkPage.diarizationRunning
+                     && !benchmarkPage.pendingRun && benchmarkPage.selectedFilePath !== ""
             opacity: enabled ? 1 : 0.4
             onClicked: benchmarkPage.startBenchmark()
             background: Rectangle {
@@ -349,8 +519,18 @@ ColumnLayout {
         Button {
             id: cancelButton
             visible: benchmarkPage.running
+                     || (benchmarkPage.pendingRun && benchmarkPage.pendingRun.kind === "model")
             text: qsTr("Cancel")
-            onClicked: if (benchmarkPage.transcriptionController) benchmarkPage.transcriptionController.cancelBenchmark()
+            onClicked: {
+                if (benchmarkPage.running && benchmarkPage.transcriptionController)
+                    benchmarkPage.transcriptionController.cancelBenchmark()
+                else if (benchmarkPage.pendingRun) {
+                    // Stop waiting to auto-run; the queued downloads keep going
+                    // (they're in the tasks list) but won't trigger a run now.
+                    benchmarkPage.pendingRun = null
+                    benchmarkPage.statusText = qsTr("Cancelled.")
+                }
+            }
             background: Rectangle {
                 radius: AppSettings.borderRadius
                 color: cancelButton.hovered ? "#3a3a3a" : "#2a2a2a"
@@ -537,8 +717,8 @@ ColumnLayout {
         Layout.fillWidth: true
         wrapMode: Text.WordWrap
         text: qsTr("Run combinations of segmentation × embedding × sensitivity over the same file and "
-                   + "compare how many speakers each finds. Only downloaded models run (manage them under "
-                   + "Models). Nothing is saved to the vault.")
+                   + "compare how many speakers each finds. Undownloaded models are downloaded before the "
+                   + "run. Nothing is saved to the vault.")
         color: "#aaaaaa"
         font.pixelSize: 12
     }
@@ -552,18 +732,20 @@ ColumnLayout {
             model: benchmarkPage.segModels
             CheckBox {
                 required property var modelData
+                // Selectable even when not downloaded — it's fetched before the
+                // run (see runDiarizationSweep). The "(not downloaded)" note +
+                // dimmer text is just an indicator now, not a disable.
                 text: modelData.label + (modelData.downloaded ? "" : qsTr(" (not downloaded)"))
-                enabled: modelData.downloaded
                 checked: benchmarkPage.selectedSegIds.indexOf(modelData.id) >= 0
                 contentItem: Label {
                     text: parent.text
-                    color: parent.enabled ? "white" : "#777777"
+                    color: modelData.downloaded ? "white" : "#aaaaaa"
                     leftPadding: parent.indicator.width + 6
                     verticalAlignment: Text.AlignVCenter
                 }
                 onToggled: benchmarkPage.selectedSegIds = benchmarkPage.toggleIn(benchmarkPage.selectedSegIds,
                                                                                   modelData.id)
-                HoverHandler { cursorShape: Qt.PointingHandCursor; enabled: parent.enabled }
+                HoverHandler { cursorShape: Qt.PointingHandCursor }
             }
         }
     }
@@ -577,18 +759,18 @@ ColumnLayout {
             model: benchmarkPage.embedModels
             CheckBox {
                 required property var modelData
+                // Selectable even when not downloaded (fetched before the run).
                 text: modelData.label + (modelData.downloaded ? "" : qsTr(" (not downloaded)"))
-                enabled: modelData.downloaded
                 checked: benchmarkPage.selectedEmbedIds.indexOf(modelData.id) >= 0
                 contentItem: Label {
                     text: parent.text
-                    color: parent.enabled ? "white" : "#777777"
+                    color: modelData.downloaded ? "white" : "#aaaaaa"
                     leftPadding: parent.indicator.width + 6
                     verticalAlignment: Text.AlignVCenter
                 }
                 onToggled: benchmarkPage.selectedEmbedIds = benchmarkPage.toggleIn(benchmarkPage.selectedEmbedIds,
                                                                                     modelData.id)
-                HoverHandler { cursorShape: Qt.PointingHandCursor; enabled: parent.enabled }
+                HoverHandler { cursorShape: Qt.PointingHandCursor }
             }
         }
     }
@@ -629,8 +811,14 @@ ColumnLayout {
         }
         Button {
             id: diarRunButton
-            text: benchmarkPage.diarizationRunning ? qsTr("Running…") : qsTr("Run diarization sweep")
-            enabled: !benchmarkPage.diarizationRunning && benchmarkPage.selectedFilePath !== ""
+            text: benchmarkPage.pendingRun && benchmarkPage.pendingRun.kind === "diar"
+                  ? qsTr("Downloading…")
+                  : benchmarkPage.diarizationRunning ? qsTr("Running…") : qsTr("Run diarization sweep")
+            // Item: blocked while EITHER sweep runs or is waiting on downloads
+            // (shared worker thread).
+            enabled: !benchmarkPage.diarizationRunning && !benchmarkPage.running
+                     && !benchmarkPage.pendingRun
+                     && benchmarkPage.selectedFilePath !== ""
                      && benchmarkPage.diarizationComboCount() > 0
             opacity: enabled ? 1 : 0.4
             onClicked: benchmarkPage.startDiarizationBenchmark()
@@ -646,8 +834,16 @@ ColumnLayout {
         Button {
             id: diarCancelButton
             visible: benchmarkPage.diarizationRunning
+                     || (benchmarkPage.pendingRun && benchmarkPage.pendingRun.kind === "diar")
             text: qsTr("Cancel")
-            onClicked: if (benchmarkPage.transcriptionController) benchmarkPage.transcriptionController.cancelBenchmark()
+            onClicked: {
+                if (benchmarkPage.diarizationRunning && benchmarkPage.transcriptionController)
+                    benchmarkPage.transcriptionController.cancelBenchmark()
+                else if (benchmarkPage.pendingRun) {
+                    benchmarkPage.pendingRun = null
+                    benchmarkPage.diarizationStatus = qsTr("Cancelled.")
+                }
+            }
             background: Rectangle {
                 radius: AppSettings.borderRadius
                 color: diarCancelButton.hovered ? "#3a3a3a" : "#2a2a2a"
@@ -695,7 +891,10 @@ ColumnLayout {
                         color: "white"
                         font.bold: true
                         font.pixelSize: 13
-                        elide: Text.ElideRight
+                        // Item: don't truncate the configuration description —
+                        // the seg+embed+sensitivity combo is the whole point of
+                        // the row, so wrap it instead of eliding.
+                        wrapMode: Text.WordWrap
                     }
                     Label {
                         visible: modelData.ok === true

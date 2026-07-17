@@ -43,6 +43,7 @@
     "stop": "stop.svg",
     "move-up": "move-up.svg",
     "move-down": "move-down.svg",
+    "drag-handle": "drag-handle.svg",
 
     "settings": "settings.svg",
     "folder": "folder.svg",

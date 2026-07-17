@@ -222,6 +222,7 @@ qt_add_qml_module(suopTranscriber
         qml/SettingsPopup.qml
         qml/BenchmarkPage.qml
         qml/ModelsPage.qml
+        qml/ModelComboBox.qml
         qml/MiddleDragScroll.qml
     RESOURCES
         ${SUOP_ICON_ASSETS}

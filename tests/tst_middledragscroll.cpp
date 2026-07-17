@@ -150,9 +150,17 @@ private slots:
             "        width: 200\n"
             "        height: 300\n"
             "        property int taps: 0\n"
+            "        property int rightTaps: 0\n"
             "        TapHandler {\n"
             "            acceptedButtons: Qt.LeftButton | Qt.MiddleButton\n"
             "            onTapped: other.taps++\n"
+            "        }\n"
+            // Stands in for the app's context-menu opener (Sidebar's row
+            // RightButton TapHandler), sitting UNDER the window-wide armed
+            // tracker — a right-click while armed must still reach it.
+            "        TapHandler {\n"
+            "            acceptedButtons: Qt.RightButton\n"
+            "            onTapped: other.rightTaps++\n"
             "        }\n"
             "    }\n"
             "}\n");
@@ -278,6 +286,36 @@ private slots:
         QTest::mouseClick(m_view, Qt::LeftButton, {}, kOutside);
         QVERIFY2(!armed(), "any click while armed must cancel, wherever the pointer is");
         QCOMPARE(other->property("taps").toInt(), 0);
+
+        const qreal stopped = contentY();
+        letItScroll();
+        QCOMPARE(contentY(), stopped);
+    }
+
+    // A right-click while armed must cancel autoscroll (like any click) but,
+    // UNLIKE left/middle, must NOT be swallowed — it has to reach the context-
+    // menu handler underneath (Sidebar's row RightButton TapHandler). Swallowing
+    // it is the reported "right-click still isn't working" bug: a plain
+    // middle-click leaves gesture-1 autoscroll armed (invisibly, and across all
+    // panes since the tracker is window-wide), and the armed tracker then ate
+    // the next right-click before the context menu could open.
+    void rightClickWhileArmed_cancels_butReachesUnderlyingContextHandler()
+    {
+        QQuickItem *other = m_view->rootObject()->findChild<QQuickItem *>(QStringLiteral("other"));
+        QVERIFY(other);
+
+        quickMiddleClick(kInside);
+        moveMouse(kOutside);
+        letItScroll();
+        QVERIFY(armed());
+        QVERIFY(contentY() > 0.0);
+
+        QTest::mouseClick(m_view, Qt::RightButton, {}, kOutside);
+        QVERIFY2(!armed(), "a right-click while armed must still cancel autoscroll");
+        QVERIFY2(other->property("rightTaps").toInt() >= 1,
+                 "a right-click while armed must ALSO reach the context-menu handler underneath, "
+                 "not be swallowed by the tracker (the sidebar right-click bug)");
+        QCOMPARE(other->property("taps").toInt(), 0); // the left/middle handler stays untouched
 
         const qreal stopped = contentY();
         letItScroll();

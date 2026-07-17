@@ -67,6 +67,10 @@ Item {
     // (which also counts Done/Failed jobs still sitting in the persistent,
     // dismissible history list, see TranscriptionController's class doc).
     readonly property bool busy: transcriptionController ? transcriptionController.busy : false
+    // Benchmark sweeps drive the glow without setting `busy` (see the
+    // controller's benchmarkActive doc comment).
+    readonly property bool benchmarkActive: transcriptionController ? transcriptionController.benchmarkActive : false
+    readonly property real benchmarkProgress: transcriptionController ? transcriptionController.benchmarkProgress : 0
     // The Active job's kind/file — shown next to the progress bar so it's
     // clear at a glance WHAT is currently running, not just that something
     // is. currentFile here is the JOB's file (from TranscriptionController),
@@ -322,7 +326,7 @@ Item {
     // line — cheap, stock-QtQuick, no extra modules.
     Item {
         id: progressGlow
-        visible: AppSettings.progressGlowEnabled && bottomBar.busy
+        visible: AppSettings.progressGlowEnabled && (bottomBar.busy || bottomBar.benchmarkActive)
         anchors.top: parent.top
         anchors.left: parent.left
         // Bug: taskOverallProgress is genuinely 0.0 at the exact instant a
@@ -336,7 +340,8 @@ Item {
         // job finishes, reading as "doesn't work" rather than "just started
         // at 0%". A small width floor keeps it visible as soon as busy
         // flips true.
-        width: Math.max(4, bottomBar.width * bottomBar.taskOverallProgress)
+        width: Math.max(4, bottomBar.width
+                        * (bottomBar.busy ? bottomBar.taskOverallProgress : bottomBar.benchmarkProgress))
         height: AppSettings.progressGlowWidth + AppSettings.progressGlowRadius
 
         // Halo layers — configurable count (AppSettings.progressGlowLayerCount),
@@ -668,6 +673,14 @@ Item {
         // in practice, but the cap is still a needed hard backstop.
         readonly property int innerPadding: 8
         height: Math.min(jobColumn.implicitHeight + 2 * innerPadding, 500)
+        // Item: the height calc above assumes jobColumn (anchors.fill parent +
+        // margins:innerPadding) spans the WHOLE popup, so the popup's own
+        // default padding must be zeroed. Left at the style default (nonzero),
+        // it inset the contentItem jobColumn fills, adding that padding to the
+        // TOP while the unbudgeted overflow got clipped off the BOTTOM — the
+        // "bottom padding is shorter than the top above the Clear button" bug.
+        // With padding:0, top and bottom are both exactly innerPadding.
+        padding: 0
         clip: true
         // O21: was modal:false, which gives Qt no dim rectangle and no real
         // block-plane — clicks/hover reached whatever was behind the popup

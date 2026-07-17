@@ -51,6 +51,30 @@ Rectangle {
     property bool awaitingFirstSegment: false
     readonly property bool showTranscribingOverlay: mainPanel.transcribingThisFile
         && mainPanel.awaitingFirstSegment
+    // Item: the blocking overlay must name the ACTUAL task, not always
+    // "Transcribing…". Keyed off currentPhase (whose currentPhaseChanged
+    // fires on every phase transition, unlike currentJobKind which only
+    // re-notifies on currentFileChanged and so would go stale across a
+    // runAllJobs pipeline on one file). Mirrors BottomBar's phaseLabel wording
+    // but in the spinner's title-case gerund style; falls back to
+    // "Transcribing…" for an empty/unknown phase.
+    readonly property string transcribingOverlayLabel: {
+        const phase = mainPanel.transcriptionController ? mainPanel.transcriptionController.currentPhase : ""
+        switch (phase) {
+        case "detecting-speakers":
+        case "detecting-speakers-segmenting":
+        case "detecting-speakers-identifying": return qsTr("Detecting speakers…")
+        case "chaptering": return qsTr("Generating chapters…")
+        case "combining": return qsTr("Combining…")
+        case "importing": return qsTr("Importing…")
+        case "loading": return qsTr("Loading model…")
+        case "decoding": return qsTr("Decoding audio…")
+        case "detecting-speech": return qsTr("Detecting speech…")
+        case "downloading": return qsTr("Downloading…")
+        case "transcribing": return qsTr("Transcribing…")
+        default: return qsTr("Transcribing…")
+        }
+    }
     onTranscribingThisFileChanged: {
         mainPanel.awaitingFirstSegment = mainPanel.transcribingThisFile
         // Start following the tail the moment this file begins transcribing.
@@ -220,6 +244,11 @@ Rectangle {
         // this never fights their in-progress typing.
         if (!titleField.activeFocus)
             titleField.text = mainPanel.displayTitle()
+        // The filename subtitle is the same always-editable one-shot binding
+        // (text: currentFileStem()) — resync it here too, skipping while the
+        // user is typing into it, so a rename/file-switch refreshes it.
+        if (!filenameSubtitle.activeFocus)
+            filenameSubtitle.text = mainPanel.currentFileStem()
     }
 
     // Item P23: split out of refreshMetadata() above — prelude/chapters live
@@ -337,6 +366,54 @@ Rectangle {
         else
             updated[key] = true
         mainPanel.collapsedChapters = updated
+        mainPanel.persistCollapsedChapters()
+    }
+
+    // The .md url backing the currently-shown chapters (player file or the
+    // orphaned .md), or "" if none — chapters/collapse are readable/persistable
+    // for both.
+    function chaptersFileUrl() {
+        if (mainPanel.orphanedMdPath !== "")
+            return "file://" + mainPanel.orphanedMdPath
+        return (mainPanel.player && mainPanel.player.source.toString() !== "")
+            ? mainPanel.player.source.toString() : ""
+    }
+
+    // Item: persist which chapters are collapsed into the .md frontmatter, so
+    // it survives reopening the file. Writes the collapse map's live keys via
+    // setCollapsedChapters (which does NOT emit finished(), so this can't
+    // trigger a reload cycle).
+    function persistCollapsedChapters() {
+        if (!mainPanel.transcriptionController)
+            return
+        const url = mainPanel.chaptersFileUrl()
+        if (url === "")
+            return
+        const keys = []
+        for (const k in mainPanel.collapsedChapters)
+            if (mainPanel.collapsedChapters[k])
+                keys.push(k)
+        mainPanel.transcriptionController.setCollapsedChapters(url, keys)
+    }
+
+    // Item: rebuild the collapse map from the file's frontmatter — called once
+    // per file open (from onTranscriptLoaded, AFTER onSourceChanged/
+    // onOrphanedMdPathChanged reset it to {}), so a reopened file restores its
+    // collapsed chapters. Reads the `collapsedChapters:` frontmatter string
+    // (comma-joined String(t0) keys) from whichever metadata map backs the
+    // current view.
+    function initCollapsedFromFrontmatter() {
+        const meta = mainPanel.orphanedMdPath !== "" ? mainPanel.orphanedMdMetadata : mainPanel.storedMetadata
+        const raw = (meta && meta.collapsedChapters) ? meta.collapsedChapters : ""
+        const map = ({})
+        if (raw && typeof raw === "string") {
+            for (const part of raw.split(",")) {
+                const k = part.trim()
+                if (k !== "")
+                    map[k] = true
+            }
+        }
+        mainPanel.collapsedChapters = map
     }
 
     // Does a transcript selection sweep across the heading whose reserved line
@@ -396,17 +473,6 @@ Rectangle {
         mainPanel.player.source = ""
         mainPanel.orphanedMdPath = path
         mainPanel.refreshOrphanedMetadata()
-    }
-
-    function indexForModelId(id) {
-        if (!mainPanel.transcriptionController)
-            return -1
-        const models = mainPanel.transcriptionController.availableModels()
-        for (let i = 0; i < models.length; i++) {
-            if (models[i].id === id)
-                return i
-        }
-        return -1
     }
 
     // Item 13: tags are comma-separated (see TranscriptionController's
@@ -983,6 +1049,46 @@ Rectangle {
         }
     }
 
+    // The base filename stem (no directory, no extension) of the open file —
+    // what renameFile() takes as its new-name argument and what the editable
+    // filename subtitle shows/edits.
+    function currentFileStem() {
+        if (!mainPanel.player || mainPanel.player.source.toString() === "")
+            return ""
+        const rel = mainPanel.relativeToVault(mainPanel.player.source)
+        const base = rel.substring(rel.lastIndexOf("/") + 1)
+        return mainPanel.stripExtension(base)
+    }
+
+    // Item: the filename subtitle (shown when the title is an AI label) is an
+    // editable rename control for the REAL file. renameFile() renames the
+    // audio file AND its sibling .md together (so this "also edits the md
+    // file"), then we repoint player.source, which fires onSourceChanged →
+    // refreshMetadata → resyncs both the title and this subtitle. The subtitle
+    // is disabled while busy (see its `enabled`), so a rename can't race a
+    // running job; on any no-op/failure we revert the field to the real stem.
+    // No undo entry — file renames aren't on the undo stack (matches
+    // commitRename's file-rename branch).
+    function commitFilenameRename(newValue) {
+        const trimmed = newValue.trim()
+        const oldStem = mainPanel.currentFileStem()
+        if (!mainPanel.transcriptionController || !mainPanel.vaultTreeModel
+                || !mainPanel.player || mainPanel.player.source.toString() === ""
+                || trimmed === "" || trimmed === oldStem) {
+            filenameSubtitle.text = oldStem
+            return
+        }
+        const oldPath = mainPanel.player.source.toString().replace("file://", "")
+        if (mainPanel.vaultTreeModel.renameFile(mainPanel.player.source, trimmed)) {
+            const dir = oldPath.substring(0, oldPath.lastIndexOf("/"))
+            const dot = oldPath.lastIndexOf(".")
+            const ext = dot > 0 ? oldPath.substring(dot) : ""
+            mainPanel.player.source = "file://" + dir + "/" + trimmed + ext
+        } else {
+            filenameSubtitle.text = oldStem
+        }
+    }
+
     // Autosaves the prelude editor below on blur (see preludeArea's
     // onActiveFocusChanged) — no explicit Save/Cancel; plain Enter just
     // inserts a newline since the prelude is multi-line, same as
@@ -1211,6 +1317,12 @@ Rectangle {
             // just warmed the body cache for this exact file, so the reads it
             // does are cheap and can't block the GUI thread.
             mainPanel.refreshPreludeAndChapters()
+            // Restore which chapters were collapsed from frontmatter, now that
+            // chapters exist and the per-file reset (onSourceChanged/
+            // onOrphanedMdPathChanged) has run. Once per open — not in
+            // refreshPreludeAndChapters(), which also fires on every chapter
+            // edit and would clobber live toggles.
+            mainPanel.initCollapsedFromFrontmatter()
         }
         // Item 10/P23: same live-update gating the old computed bindings
         // used (currentFile matching the open file) — a synchronous
@@ -1399,8 +1511,12 @@ Rectangle {
     // `index` is its position in the FILTERED list and must never be used for
     // that lookup. Every filter condition below is exactly the `visible:`
     // expression the corresponding delegate used to carry.
+    // Item: timestamps display on EVERY sentence line (one per segment), while
+    // speaker names stay one-per-turn (only when the speaker changes). So the
+    // timestamp gutter takes every non-heading sentence; the speaker gutter
+    // keeps the showGutter (turn-boundary) gate.
     readonly property var gutterTimestampModel:
-        mainPanel.displaySentences.filter(s => s.showGutter)
+        mainPanel.displaySentences.filter(s => !s.isChapterHeading)
     readonly property var gutterSpeakerModel:
         mainPanel.displaySentences.filter(s => s.showGutter && s.speaker !== "")
     // Recomputes when the user toggles a speaker filter (empty model while no
@@ -2394,26 +2510,36 @@ Rectangle {
                     // untranscribed file with labels-mode on still just
                     // shows its filename as the title itself, so a
                     // filename-under-filename subtitle would be redundant).
-                    TextEdit {
+                    // Item: editable rename control for the REAL file (shown
+                    // only in labels mode, where the title field edits the AI
+                    // label instead — so without this the actual file couldn't
+                    // be renamed from the panel). Always-editable per
+                    // StyleGuide (one TextField, UnderlineField
+                    // plainUntilHovered so it reads as plain text until
+                    // hovered/focused; commit on Return + blur; Esc reverts).
+                    // Shows the base stem (no dir/ext) since renameFile takes a
+                    // stem and preserves the extension. Disabled while a job is
+                    // running so a rename can't race an operation.
+                    TextField {
                         id: filenameSubtitle
                         Layout.fillWidth: true
                         visible: AppSettings.useLabelsMainPanel
                                  && mainPanel.orphanedMdPath === "" && !!mainPanel.storedMetadata.label
-                        readOnly: true
-                        selectByMouse: true
-                        selectByKeyboard: true
-                        activeFocusOnPress: false
-                        // No persistentSelection: this and the "Previously
-                        // transcribed" line below should behave like normal
-                        // independent selections — picking one clears the
-                        // other, not two simultaneous highlights.
-                        // TextEdit has no `elide` (unlike the Label this
-                        // replaces) — same tradeoff already accepted for
-                        // speakerGutterRepeater below.
-                        text: (mainPanel.player && mainPanel.player.source.toString() !== "")
-                              ? mainPanel.relativeToVault(mainPanel.player.source) : ""
+                        enabled: !(mainPanel.transcriptionController && mainPanel.transcriptionController.busy)
                         color: "#777777"
                         font.pixelSize: 10
+                        text: mainPanel.currentFileStem()
+                        padding: 0
+                        leftPadding: 0
+                        rightPadding: 0
+                        topPadding: 0
+                        bottomPadding: 0
+
+                        onAccepted: mainPanel.commitFilenameRename(text)
+                        onActiveFocusChanged: if (!activeFocus) mainPanel.commitFilenameRename(text)
+                        Keys.onEscapePressed: filenameSubtitle.text = mainPanel.currentFileStem()
+
+                        background: UnderlineField { implicitHeight: 0; plainUntilHovered: true; focused: filenameSubtitle.activeFocus }
 
                         HoverHandler { cursorShape: Qt.IBeamCursor }
                     }
@@ -3403,55 +3529,18 @@ Rectangle {
                                 enabled: !speakerPillItem.confirmingMerge
                             }
                             // Filtering the sidebar file tree by this speaker
-                            // now goes through speakerSortIcon's dedicated
-                            // trigger below (mirrors tagPill's own
-                            // tagSortIcon) rather than the pill body — a
-                            // plain click on the pill instead falls through
-                            // to speakerNameField for direct editing.
-                            //
-                            // Drag source AND (via mainPanel.speakerIdAtScenePos())
-                            // the mechanism that finds the drop target. Coexists
-                            // with speakerNameField's own click-to-focus/text-
-                            // selection below via Qt's pointer-handler grab
-                            // arbitration — a plain click or short drag (cursor
-                            // placement, text selection) falls through to the
-                            // TextField; only a drag past DragHandler's movement
-                            // threshold takes an exclusive grab (merge). Once the
-                            // field actually HAS focus, disabled outright so an
-                            // in-progress text-selection drag can never be
-                            // hijacked into a merge-drag (see its own landmine
-                            // comment history — real click-drag text selection
-                            // was previously judged incompatible with this
-                            // gesture; disabling only while focused resolves it
-                            // without giving up either capability).
-                            DragHandler {
-                                id: speakerPillDrag
-                                enabled: !speakerPillItem.confirmingMerge && !speakerPillItem.pendingMerge
-                                         && !speakerNameField.activeFocus
-                                target: null
-                                onActiveChanged: {
-                                    if (active) {
-                                        mainPanel.draggingSpeakerId = speakerPillItem.modelData
-                                        return
-                                    }
-                                    if (mainPanel.draggingSpeakerId !== speakerPillItem.modelData)
-                                        return
-                                    if (mainPanel.dragHoverSpeakerId !== "")
-                                        mainPanel.handleSpeakerDrop(speakerPillItem.modelData, mainPanel.dragHoverSpeakerId)
-                                    mainPanel.draggingSpeakerId = ""
-                                    mainPanel.dragHoverSpeakerId = ""
-                                }
-                                onCentroidChanged: {
-                                    if (!active)
-                                        return
-                                    const scenePos = speakerPillItem.mapToItem(mainPanel, centroid.position.x,
-                                                                                centroid.position.y)
-                                    mainPanel.dragGhostX = scenePos.x
-                                    mainPanel.dragGhostY = scenePos.y
-                                    mainPanel.dragHoverSpeakerId =
-                                        mainPanel.speakerIdAtScenePos(scenePos.x, scenePos.y, speakerPillItem.modelData)
-                                }
-                            }
+                            // goes through speakerSortIcon's dedicated trigger
+                            // (mirrors tagPill's tagSortIcon); the merge-drag
+                            // gesture goes through the dedicated speakerDragHandle
+                            // grip below. Both are their own icons rather than
+                            // overloading the pill body / the name field's click
+                            // — a plain click on the pill just places the text
+                            // cursor in speakerNameField (StyleGuide "Always-
+                            // editable text": give a secondary action its own
+                            // trigger, never the field's own click). This is what
+                            // resolves the old text-selection-vs-merge-drag
+                            // conflict: the name field is freely click-dragged to
+                            // select text, and only the grip starts a merge.
 
                             // Always-editable (see titleField's doc comment
                             // for the general pattern): a single TextField is
@@ -3466,6 +3555,58 @@ Rectangle {
                                 anchors.centerIn: parent
                                 spacing: 3
                                 visible: !speakerPillItem.confirmingMerge
+
+                                // Item: dedicated drag grip — makes the
+                                // merge-by-drag gesture discoverable (a plain
+                                // click on the pill edits the name, so the drag
+                                // needs its own handle) and, being its own
+                                // element, it never collides with the name
+                                // field's click-drag text selection. Dragging
+                                // one speaker's grip onto another pill merges
+                                // them (see mainPanel.handleSpeakerDrop /
+                                // speakerIdAtScenePos). target:null so the pill
+                                // itself doesn't move — only the ghost follows.
+                                AppIcon {
+                                    id: speakerDragHandle
+                                    anchors.verticalCenter: parent.verticalCenter
+                                    name: "drag-handle"
+                                    iconSize: 10
+                                    color: speakerDragHandleHover.hovered || speakerPillDrag.active
+                                           ? "#dddddd" : "#888888"
+
+                                    HoverHandler {
+                                        id: speakerDragHandleHover
+                                        cursorShape: Qt.SizeAllCursor
+                                        enabled: !speakerPillItem.confirmingMerge && !speakerPillItem.pendingMerge
+                                    }
+                                    DragHandler {
+                                        id: speakerPillDrag
+                                        enabled: !speakerPillItem.confirmingMerge && !speakerPillItem.pendingMerge
+                                        target: null
+                                        onActiveChanged: {
+                                            if (active) {
+                                                mainPanel.draggingSpeakerId = speakerPillItem.modelData
+                                                return
+                                            }
+                                            if (mainPanel.draggingSpeakerId !== speakerPillItem.modelData)
+                                                return
+                                            if (mainPanel.dragHoverSpeakerId !== "")
+                                                mainPanel.handleSpeakerDrop(speakerPillItem.modelData, mainPanel.dragHoverSpeakerId)
+                                            mainPanel.draggingSpeakerId = ""
+                                            mainPanel.dragHoverSpeakerId = ""
+                                        }
+                                        onCentroidChanged: {
+                                            if (!active)
+                                                return
+                                            const scenePos = speakerDragHandle.mapToItem(mainPanel, centroid.position.x,
+                                                                                          centroid.position.y)
+                                            mainPanel.dragGhostX = scenePos.x
+                                            mainPanel.dragGhostY = scenePos.y
+                                            mainPanel.dragHoverSpeakerId =
+                                                mainPanel.speakerIdAtScenePos(scenePos.x, scenePos.y, speakerPillItem.modelData)
+                                        }
+                                    }
+                                }
 
                                 TextField {
                                     id: speakerNameField
@@ -3939,159 +4080,47 @@ Rectangle {
                         color: "#aaaaaa"
                     }
 
-                    // Item P2: measures every model's label once (not
-                    // per-delegate — a single throwaway FontMetrics reused
-                    // across the whole list) so a long label (e.g. a
-                    // multilingual "large-v3" entry) gets a box wide enough
-                    // to show it in full, both closed and in the dropdown,
-                    // instead of relying on elide to silently hide the tail.
-                    FontMetrics {
-                        id: modelLabelFontMetrics
+                    // Transcription model. Shares the row evenly with the two
+                    // diarization pickers below via matching Layout.fillWidth
+                    // + preferredWidth; ModelComboBox elides the closed label
+                    // (full text in tooltip/popup) so nothing overflows.
+                    ModelComboBox {
+                        id: modelCombo
+                        Layout.fillWidth: true
+                        Layout.preferredWidth: 1
+                        model: mainPanel.transcriptionController ? mainPanel.transcriptionController.availableModels() : []
+                        selectedId: AppSettings.defaultModel
+                        onPicked: (id) => AppSettings.defaultModel = id
                     }
 
-                    ComboBox {
-                        id: modelCombo
-                        // 240 stays the floor for short label sets; the +64
-                        // padding covers the dropdown row's own dot+spacing
-                        // (8+6) plus the control's indicator/content
-                        // padding, so the widest label never gets clipped
-                        // in either the closed box or a delegate row (both
-                        // are sized to modelCombo.width).
-                        property real cachedMaxLabelWidth: 0
-                        // The closed box takes half the row's width (leaving the
-                        // other half for a second selector to come). The label
-                        // elides here (full text stays in the tooltip) while the
-                        // popup below opens wider to show it in full.
-                        Layout.preferredWidth: modelRow.width / 2
-                        model: mainPanel.transcriptionController ? mainPanel.transcriptionController.availableModels() : []
-                        textRole: "label"
-                        valueRole: "id"
-                        hoverEnabled: true
+                    // The two speaker-diarization models (segmentation +
+                    // embedding). They tune the standalone "Detect speakers"
+                    // action / the runAllJobs pipeline step — both of which
+                    // already read these same AppSettings keys — surfaced here
+                    // for quick access alongside the fuller controls in
+                    // Settings › Speaker detection. Sensitivity is on its own
+                    // row below.
+                    Label {
+                        text: qsTr("Speakers")
+                        color: "#aaaaaa"
+                    }
 
-                        Component.onCompleted: {
-                            currentIndex = mainPanel.indexForModelId(AppSettings.defaultModel)
-                            let maxWidth = 0
-                            const models = mainPanel.transcriptionController ? mainPanel.transcriptionController.availableModels() : []
-                            for (const m of models)
-                                maxWidth = Math.max(maxWidth, modelLabelFontMetrics.advanceWidth(m.label))
-                            modelCombo.cachedMaxLabelWidth = maxWidth
-                        }
-                        onActivated: AppSettings.defaultModel = currentValue
+                    ModelComboBox {
+                        id: segmentationCombo
+                        Layout.fillWidth: true
+                        Layout.preferredWidth: 1
+                        model: mainPanel.transcriptionController ? mainPanel.transcriptionController.availableSegmentationModels() : []
+                        selectedId: AppSettings.diarizationSegmentationModel
+                        onPicked: (id) => AppSettings.diarizationSegmentationModel = id
+                    }
 
-                        ToolTip.visible: modelCombo.hovered
-                        ToolTip.text: modelCombo.currentText
-                        ToolTip.delay: 500
-
-                        HoverHandler {
-                            cursorShape: Qt.PointingHandCursor
-                        }
-                        HoverBorder {
-                            anchors.fill: parent
-                            active: modelCombo.hovered
-                        }
-
-                        // Custom eliding content: the default QQC2 ComboBox
-                        // contentItem clips (no ellipsis) when the box is
-                        // width-capped, so provide our own that elides.
-                        contentItem: Text {
-                            leftPadding: 12
-                            rightPadding: 28
-                            text: modelCombo.displayText
-                            color: "white"
-                            verticalAlignment: Text.AlignVCenter
-                            elide: Text.ElideRight
-                        }
-
-                        // Item P2: closed-state box gets the app's own corner
-                        // radius (QQC2's default box is square-cornered),
-                        // matching the popup background below (same radius,
-                        // same fill/border colors).
-                        background: Rectangle {
-                            color: "#242424"
-                            radius: AppSettings.borderRadius
-                            border.width: 1
-                            border.color: "#3a3a3a"
-                        }
-
-                        // O29: small dot per entry — green if that model's
-                        // weights are already on disk, gray if picking it
-                        // will first queue a download job.
-                        delegate: ItemDelegate {
-                            id: modelDelegate
-                            required property var modelData
-                            required property int index
-                            // Follow the popup's width (which is not capped like
-                            // the closed box) rather than modelCombo.width.
-                            width: ListView.view ? ListView.view.width : modelCombo.width
-                            highlighted: modelCombo.highlightedIndex === index
-
-                            contentItem: RowLayout {
-                                spacing: 6
-                                Label {
-                                    text: modelDelegate.modelData.label
-                                    color: "white"
-                                    Layout.fillWidth: true
-                                    // Wrap instead of eliding: when the popup is
-                                    // clamped by the screen edge the label spills
-                                    // onto a second line rather than being cut.
-                                    wrapMode: Text.Wrap
-                                }
-                                Rectangle {
-                                    width: 8
-                                    height: 8
-                                    radius: 4
-                                    color: modelDelegate.modelData.downloaded ? "#2ecc71" : "#555555"
-                                    Layout.alignment: Qt.AlignVCenter
-                                }
-                            }
-                        }
-
-                        // Item P2: custom popup so its background can use
-                        // the app's own corner radius (matches
-                        // SettingsPopup.qml's own Popup background exactly)
-                        // instead of QQC2's default square-cornered popup.
-                        // The ListView here still drives itself off
-                        // modelCombo.delegateModel (built from the
-                        // top-level `model:`/`delegate:` above) — this is
-                        // exactly how QQC2's OWN default ComboBox popup
-                        // composes delegate+background internally, just
-                        // with our own background/padding instead of the
-                        // style's.
-                        popup: Popup {
-                            id: modelPopup
-                            y: modelCombo.height
-                            padding: 1
-
-                            // Unlike the closed box, the popup is not width-
-                            // capped — it opens as wide as the widest label
-                            // needs so nothing is clipped. It's only clamped to
-                            // the space left to the window's right edge; when
-                            // even that isn't enough, the delegate labels wrap.
-                            property real desiredWidth: Math.max(modelCombo.width, modelCombo.cachedMaxLabelWidth + 64)
-                            width: desiredWidth
-                            onAboutToShow: {
-                                const p = modelCombo.mapToItem(null, 0, 0)
-                                const avail = modelCombo.Window.width - p.x - 12
-                                width = Math.min(desiredWidth, Math.max(modelCombo.width, avail))
-                            }
-
-                            implicitHeight: Math.min(contentItem.implicitHeight, 320)
-
-                            contentItem: ListView {
-                                clip: true
-                                implicitHeight: contentHeight
-                                model: modelCombo.popup.visible ? modelCombo.delegateModel : null
-                                currentIndex: modelCombo.highlightedIndex
-                                ScrollIndicator.vertical: ScrollIndicator {}
-                            }
-
-                            background: Rectangle {
-                                color: "#242424"
-                                radius: AppSettings.borderRadius
-                                border.width: 1
-                                border.color: "#3a3a3a"
-                            }
-                        }
+                    ModelComboBox {
+                        id: embeddingCombo
+                        Layout.fillWidth: true
+                        Layout.preferredWidth: 1
+                        model: mainPanel.transcriptionController ? mainPanel.transcriptionController.availableEmbeddingModels() : []
+                        selectedId: AppSettings.diarizationEmbeddingModel
+                        onPicked: (id) => AppSettings.diarizationEmbeddingModel = id
                     }
 
                     // O35 / Item 25: the coarse "gpu"/"cpu" kind of the
@@ -4102,6 +4131,48 @@ Rectangle {
                     Label {
                         text: mainPanel.transcriptionController ? mainPanel.transcriptionController.activeBackendKind : ""
                         visible: text !== ""
+                        color: "#888888"
+                        font.pixelSize: 11
+                    }
+                }
+
+                // Diarization clustering-distance cutoff for the "Detect
+                // speakers" action / runAllJobs step (both read
+                // AppSettings.diarizationSensitivity). Continuous knob (like
+                // SettingsPopup's copy) clamped away from the 0/1 extremes,
+                // which degenerate — lower = stricter = MORE speakers, higher
+                // = more merging = FEWER.
+                RowLayout {
+                    id: sensitivityRow
+                    spacing: 12
+                    Layout.fillWidth: true
+                    visible: mainPanel.orphanedMdPath === ""
+
+                    Label {
+                        text: qsTr("Sensitivity")
+                        color: "#aaaaaa"
+                    }
+
+                    Slider {
+                        id: diarizationSensitivitySlider
+                        Layout.fillWidth: true
+                        from: 0.1
+                        to: 0.9
+                        value: AppSettings.diarizationSensitivity
+                        hoverEnabled: true
+                        onMoved: AppSettings.diarizationSensitivity = value
+
+                        HoverHandler {
+                            cursorShape: Qt.PointingHandCursor
+                        }
+                        HoverBorder {
+                            anchors.fill: parent
+                            active: diarizationSensitivitySlider.hovered
+                        }
+                    }
+
+                    Label {
+                        text: diarizationSensitivitySlider.value.toFixed(2)
                         color: "#888888"
                         font.pixelSize: 11
                     }
@@ -4230,12 +4301,14 @@ Rectangle {
                 // Two SEPARATE gutter columns (Item: independently stylable
                 // areas, not one combined label) — each aligned to its
                 // sentence's first visual line via gutterLineRects above.
-                // showGutter (see displayData) collapses a run of
-                // same-speaker sentences down to ONE pair of labels at the
-                // start of that turn, rather than repeating the same
-                // timestamp+name on every line — this is what makes "one
-                // timestamp per section" a real, deterministic rule instead
-                // of a defensive guess.
+                // The TIMESTAMP gutter shows one timestamp on EVERY sentence
+                // line (gutterTimestampModel = every non-heading sentence),
+                // so the elapsed time is always readable per segment. The
+                // SPEAKER gutter still uses showGutter (see displayData) to
+                // collapse a run of same-speaker sentences down to ONE name
+                // at the start of that turn, rather than repeating the same
+                // name on every line — speakers read as turn boundaries,
+                // timestamps as a continuous per-line ruler.
                 Repeater {
                     id: timestampGutterRepeater
                     model: mainPanel.gutterTimestampModel
@@ -4591,7 +4664,8 @@ Rectangle {
         // (re)transcription starts until the first new segment lands (see
         // showTranscribingOverlay / awaitingFirstSegment). A dim scrim over
         // the (already dimmed + disabled) stale transcript plus a centered
-        // BusyIndicator + "Transcribing…" label. It also swallows pointer
+        // BusyIndicator + a task label (transcribingOverlayLabel, keyed off
+        // currentPhase so it names the actual task). It also swallows pointer
         // input (TapHandler for clicks/drags, HoverHandler for the wait
         // cursor) so nothing underneath reacts while the old transcript is
         // frozen. Sibling of transcriptScrollView inside
@@ -4621,7 +4695,7 @@ Rectangle {
                 }
                 Label {
                     Layout.alignment: Qt.AlignHCenter
-                    text: qsTr("Transcribing…")
+                    text: mainPanel.transcribingOverlayLabel
                     color: "#dddddd"
                     font.pixelSize: 13
                 }

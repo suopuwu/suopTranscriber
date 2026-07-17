@@ -1,26 +1,17 @@
-// Living spec + runtime verification for the Benchmark page's audio-file
-// picker. Loads the REAL BenchmarkPage.qml inside a ScrollView inside a
-// `modal: true` Popup — the exact nesting it has in SettingsPopup.qml — against
-// a real VaultTreeModel, and proves the file ComboBox is actually POPULATED and
-// SELECTABLE once the page shows. Same QQuickView harness shape as
-// tst_sidebar_expand.cpp (read its top-of-file comment first).
+// Living spec + runtime verification for the Benchmark page's file selection.
+// Loads the REAL BenchmarkPage.qml inside a ScrollView inside a `modal: true`
+// Popup — the exact nesting it has in SettingsPopup.qml — against a real
+// VaultTreeModel. Same QQuickView harness shape as tst_sidebar_expand.cpp (read
+// its top-of-file comment first).
 //
-// This file exists because the original bug was invisible to a source review
-// and to a green build: the combo bound `model:` straight to
-// vaultTreeModel.allAudioPaths(), a Q_INVOKABLE with NO NOTIFY signal. A
-// declarative binding on it evaluates exactly once — when BenchmarkPage is
-// created, which is at app startup while SettingsPopup is built, long before
-// any vault is loaded — against an empty list, and then never re-evaluates. The
-// dropdown was permanently empty, so "the audio file selector doesn't work."
-// BenchmarkPage now gathers the list imperatively (refreshAudioFiles(), driven
-// by onVisibleChanged) instead; comboIsPopulated_whenPageShows is what keeps
-// that honest, and would fail against the old declarative binding.
-//
-// NOTE on the offscreen QPA plugin: a ComboBox popup's ListView does not
-// realize its delegate rows on its own here (no live render/polish loop), so
-// itemAtIndex(0) is used to force the first row into existence before clicking
-// it — that's a test-environment accommodation, not part of the behavior under
-// test.
+// This replaces the old tst_benchmarkpage_filecombo: the in-page audio-file
+// ComboBox was REMOVED. The benchmark file now always follows the left panel's
+// current file (BenchmarkPage.currentFilePath, fed from MainPanel), so clicking
+// a file in the tree switches what gets benchmarked without a redundant picker.
+// These tests keep that honest:
+//   1. selectedFilePath follows currentFilePath — i.e. a left-panel selection
+//      switches the benchmark file automatically, and while the page is hidden.
+//   2. there is NO file-picker ComboBox left in the page.
 
 #include <QtTest>
 
@@ -54,9 +45,8 @@ class TranscriptionControllerStub : public QObject {
     Q_OBJECT
 };
 
-// The Basic style's ComboBox / ItemDelegate are QML types
-// ("ComboBox_QMLTYPE_*", "ItemDelegate_QMLTYPE_*"), not the bare C++
-// QQuick* classes — so they're matched by QML type-name prefix.
+// The Basic style's ComboBox is a QML type ("ComboBox_QMLTYPE_*"), not the bare
+// C++ QQuickComboBox — matched by QML type-name prefix.
 QQuickItem *findByClassNamePrefix(QQuickItem *root, const QByteArray &prefix)
 {
     for (QQuickItem *child : root->findChildren<QQuickItem *>()) {
@@ -68,7 +58,7 @@ QQuickItem *findByClassNamePrefix(QQuickItem *root, const QByteArray &prefix)
 
 } // namespace
 
-class TstBenchmarkPageFileCombo : public QObject
+class TstBenchmarkPageFileSync : public QObject
 {
     Q_OBJECT
 
@@ -78,10 +68,7 @@ private:
 
     void buildModule();
 
-    // Loads the driver, returns the ComboBox (or fails). Also hands back the
-    // BenchmarkPage and the enclosing modal Popup.
-    QQuickItem *load(QQuickView *view, const QString &vaultPath, QQuickItem **benchOut,
-                     QObject **settingsOut)
+    QQuickItem *load(QQuickView *view, const QString &vaultPath, QObject **settingsOut)
     {
         view->engine()->addImportPath(m_moduleDir.path());
         view->rootContext()->setContextProperty(QStringLiteral("vaultUrl"),
@@ -101,24 +88,18 @@ private:
         QQuickItem *root = view->rootObject();
         if (!root)
             return nullptr;
-        QQuickItem *bench = root->findChild<QQuickItem *>(QStringLiteral("bench"));
-        // The enclosing Settings Popup is a QQuickPopup (a QObject, NOT a
-        // QQuickItem) — find it as a QObject.
-        QObject *settings = root->findChild<QObject *>(QStringLiteral("settings"));
-        if (benchOut)
-            *benchOut = bench;
         if (settingsOut)
-            *settingsOut = settings;
-        return bench ? findByClassNamePrefix(bench, "ComboBox") : nullptr;
+            *settingsOut = root->findChild<QObject *>(QStringLiteral("settings"));
+        return root->findChild<QQuickItem *>(QStringLiteral("bench"));
     }
 
 private slots:
     void initTestCase() { buildModule(); }
 
-    // The headline claim: with a vault already loaded, opening the page fills
-    // the combo. Against the old declarative allAudioPaths() binding this
-    // evaluated too early (empty vault) and stuck at count 0 forever.
-    void comboIsPopulated_whenPageShows()
+    // The headline claim: setting currentFilePath (what a left-panel selection
+    // does) switches the benchmarked file — selectedFilePath mirrors it, even
+    // before the page is shown.
+    void selectedFilePathFollowsCurrentFilePath()
     {
         QTemporaryDir vault;
         QVERIFY(vault.isValid());
@@ -126,69 +107,41 @@ private slots:
         QVERIFY(touch(vault.filePath(QStringLiteral("two.wav"))));
 
         QQuickView view;
-        QQuickItem *bench = nullptr;
         QObject *settings = nullptr;
-        QQuickItem *combo = load(&view, vault.path(), &bench, &settings);
-        QVERIFY2(combo, "could not load BenchmarkPage / locate its ComboBox");
-        QVERIFY(bench && settings);
+        QQuickItem *bench = load(&view, vault.path(), &settings);
+        QVERIFY2(bench, "could not load BenchmarkPage");
+        QVERIFY(settings);
 
-        QTRY_COMPARE(combo->property("count").toInt(), 2);
+        const QString first = vault.filePath(QStringLiteral("one.mp3"));
+        bench->setProperty("currentFilePath", first);
+        QTRY_COMPARE(bench->property("selectedFilePath").toString(), first);
+
+        // Switching the left-panel file switches the benchmark file too.
+        const QString second = vault.filePath(QStringLiteral("two.wav"));
+        bench->setProperty("currentFilePath", second);
+        QTRY_COMPARE(bench->property("selectedFilePath").toString(), second);
     }
 
-    // The follow-through: clicking a dropdown row selects that file AND leaves
-    // the enclosing modal Settings popup open (a nested-popup click must not be
-    // read as a press-outside that closes the parent).
-    void clickingRow_selectsFile_andKeepsSettingsOpen()
+    // The redundant in-page file picker is gone: no ComboBox is left in the
+    // page (its job is served by the left panel now).
+    void noFilePickerComboBox()
     {
         QTemporaryDir vault;
         QVERIFY(vault.isValid());
         QVERIFY(touch(vault.filePath(QStringLiteral("one.mp3"))));
-        QVERIFY(touch(vault.filePath(QStringLiteral("two.wav"))));
 
         QQuickView view;
-        QQuickItem *bench = nullptr;
         QObject *settings = nullptr;
-        QQuickItem *combo = load(&view, vault.path(), &bench, &settings);
-        QVERIFY2(combo, "could not load BenchmarkPage / locate its ComboBox");
-        QVERIFY(bench && settings);
-        QTRY_COMPARE(combo->property("count").toInt(), 2);
-        QVERIFY(settings->property("visible").toBool());
+        QQuickItem *bench = load(&view, vault.path(), &settings);
+        QVERIFY2(bench, "could not load BenchmarkPage");
 
-        // Open the dropdown via the real click gesture.
-        const QPointF comboCenter =
-            combo->mapToScene(QPointF(combo->width() / 2, combo->height() / 2));
-        QTest::mouseClick(&view, Qt::LeftButton, Qt::NoModifier, comboCenter.toPoint());
-        QTest::qWait(80);
-
-        QObject *popup = combo->property("popup").value<QObject *>();
-        QVERIFY2(popup, "combo has no popup object");
-        QTRY_VERIFY2(popup->property("visible").toBool(),
-                     "the ComboBox dropdown never became visible after clicking it");
-
-        auto *popupContent = popup->property("contentItem").value<QQuickItem *>();
-        QVERIFY(popupContent);
-        // Offscreen: force row 0 into existence (see the top-of-file NOTE).
-        QMetaObject::invokeMethod(popupContent, "forceLayout", Qt::DirectConnection);
-        QQuickItem *firstItem = nullptr;
-        QMetaObject::invokeMethod(popupContent, "itemAtIndex", Qt::DirectConnection,
-                                  Q_RETURN_ARG(QQuickItem *, firstItem), Q_ARG(int, 0));
-        if (!firstItem)
-            firstItem = findByClassNamePrefix(popupContent, "ItemDelegate");
-        QVERIFY2(firstItem, "no delegate rows found in the dropdown");
-
-        const QPointF itemCenter =
-            firstItem->mapToScene(QPointF(firstItem->width() / 2, firstItem->height() / 2));
-        QTest::mouseClick(&view, Qt::LeftButton, Qt::NoModifier, itemCenter.toPoint());
-        QTest::qWait(80);
-
-        QVERIFY2(settings->property("visible").toBool(),
-                 "clicking a dropdown row CLOSED the enclosing modal Settings popup");
-        QVERIFY2(!bench->property("selectedFilePath").toString().isEmpty(),
-                 "clicking a dropdown row did NOT set selectedFilePath");
+        QVERIFY2(!findByClassNamePrefix(bench, "ComboBox"),
+                 "the in-page file-picker ComboBox must be gone — the benchmark file follows the "
+                 "left-panel selection (currentFilePath) now");
     }
 };
 
-void TstBenchmarkPageFileCombo::buildModule()
+void TstBenchmarkPageFileSync::buildModule()
 {
     if (!m_driverQmlPath.isEmpty())
         return;
@@ -259,9 +212,9 @@ int main(int argc, char *argv[])
     qputenv("QT_QPA_PLATFORM", "offscreen");
     qputenv("QT_QUICK_CONTROLS_STYLE", "Basic");
     QCoreApplication::setOrganizationName(QStringLiteral("suopTranscriberTestHarness"));
-    QCoreApplication::setApplicationName(QStringLiteral("tst_benchmarkpage_filecombo"));
+    QCoreApplication::setApplicationName(QStringLiteral("tst_benchmarkpage_filesync"));
     QGuiApplication app(argc, argv);
-    TstBenchmarkPageFileCombo tc;
+    TstBenchmarkPageFileSync tc;
     return QTest::qExec(&tc, argc, argv);
 }
-#include "tst_benchmarkpage_filecombo.moc"
+#include "tst_benchmarkpage_filesync.moc"

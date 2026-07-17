@@ -180,14 +180,33 @@ Item {
             }
         }
 
-        // Any click anywhere while armed cancels, and is consumed rather than
-        // performing that button's normal action (Chrome's convention). Being
-        // topmost, this beats the click to every other handler in the window —
-        // including armTap, which therefore never has to handle the
-        // already-armed case itself.
+        // A left/middle click anywhere while armed cancels, and is consumed
+        // rather than performing that button's normal action (Chrome's
+        // convention). Being topmost, this beats the click to every other
+        // handler in the window — including armTap, which therefore never has
+        // to handle the already-armed case itself.
         TapHandler {
-            acceptedButtons: Qt.LeftButton | Qt.MiddleButton | Qt.RightButton
+            acceptedButtons: Qt.LeftButton | Qt.MiddleButton
             gesturePolicy: TapHandler.ReleaseWithinBounds
+            onPressedChanged: if (pressed) root.armed = false
+        }
+
+        // Right-click while armed ALSO cancels — but must NOT be swallowed.
+        // The app opens its file-tree / transcript context menus from a
+        // RightButton TapHandler UNDER this window-wide tracker, so consuming
+        // the press here (as the left/middle handler above does) is exactly the
+        // "right-click does nothing while autoscroll is invisibly armed" bug:
+        // a plain middle-click arms gesture 1 and leaves it armed until the
+        // next click, and because the tracker spans the whole window (across
+        // all three MiddleDragScroll instances), arming a scroll in ANY pane
+        // then ate the next right-click everywhere. DragThreshold keeps only a
+        // PASSIVE grab on the press, so onPressedChanged still fires to disarm,
+        // yet the press also propagates down to the context-menu handler.
+        // Disarming on press immediately makes this tracker inert
+        // (enabled/visible:false), so it can't then eat the menu's own clicks.
+        TapHandler {
+            acceptedButtons: Qt.RightButton
+            gesturePolicy: TapHandler.DragThreshold
             onPressedChanged: if (pressed) root.armed = false
         }
     }

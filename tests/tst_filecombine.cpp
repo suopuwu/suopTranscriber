@@ -20,6 +20,7 @@
 #include <QDir>
 #include <QFile>
 #include <QFileInfo>
+#include <QProcess>
 #include <QStandardPaths>
 #include <QTemporaryDir>
 #include <QtTest>
@@ -58,6 +59,42 @@ QString touchFile(const QString &dir, const QString &name, int secondsAgo)
     retime.setFileTime(QDateTime::currentDateTime().addSecs(-secondsAgo), QFileDevice::FileModificationTime);
     retime.close();
     return path;
+}
+
+// The merge itself shells out to ffmpeg (concat demuxer, stream copy), so the
+// end-to-end mtime tests below need it on PATH and need REAL audio — same
+// precedent as tst_audiodecoder.
+bool ffmpegOnPath()
+{
+    return !QStandardPaths::findExecutable(QStringLiteral("ffmpeg")).isEmpty();
+}
+
+// A real (tiny) wav ffmpeg's concat demuxer will actually accept, backdated
+// like touchFile(). Returns an empty string if ffmpeg couldn't produce it.
+QString makeWav(const QString &dir, const QString &name, int secondsAgo)
+{
+    const QString path = dir + "/" + name;
+    QProcess gen;
+    gen.start("ffmpeg", {"-y", "-loglevel", "error", "-f", "lavfi", "-i",
+                          "sine=frequency=440:sample_rate=16000:duration=1", path});
+    if (!gen.waitForFinished(15000) || gen.exitCode() != 0)
+        return {};
+
+    // Retime on a handle of its own, after ffmpeg's write handle is long
+    // closed — see touchFile()'s note on close() re-touching mtime.
+    QFile retime(path);
+    if (!retime.open(QIODevice::ReadWrite))
+        return {};
+    retime.setFileTime(QDateTime::currentDateTime().addSecs(-secondsAgo), QFileDevice::FileModificationTime);
+    retime.close();
+    return path;
+}
+
+// Combine jobs run on the worker thread; jobs() is the GUI-side view of them.
+QString combineJobStatus(TranscriptionController &controller)
+{
+    const QVariantList jobs = controller.jobs();
+    return jobs.isEmpty() ? QString() : jobs.first().toMap().value("status").toString();
 }
 
 QVariantMap findGroup(const QVariantList &groups, const QString &ruleName)
@@ -516,6 +553,83 @@ private slots:
         controller.combineGroup(rules, allPaths, group.value("outputPath").toString(), vaultUrl, false);
         controller.combineGroup(rules, allPaths, group.value("outputPath").toString(), vaultUrl, false);
         QCOMPARE(controller.jobs().size(), 1);
+    }
+
+    // Spec: the merged file inherits the FIRST part's mtime instead of taking
+    // "now". mtime is the vault's stand-in for when a recording happened (it's
+    // findCombineGroups()'s own default ordering signal, chosen because birth
+    // time doesn't survive a copy), so combining a week-old recording today
+    // must not make it look like today's. End-to-end on purpose: the restamp
+    // lives in combineJob(), and only a real merge proves it survives ffmpeg's
+    // own write of the output.
+    void combinedOutput_inheritsFirstPartMtime()
+    {
+        if (!ffmpegOnPath())
+            QSKIP("ffmpeg not on PATH — the combine merge shells out to ffmpeg by design");
+
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        const QString p1 = makeWav(dir.path(), "TX01_MIC001_orig.wav", 3600);
+        const QString p2 = makeWav(dir.path(), "TX01_MIC002_orig.wav", 1800);
+        QVERIFY2(!p1.isEmpty() && !p2.isEmpty(), "ffmpeg failed to generate the test parts");
+
+        // Read before the merge — the parts move into .combined/ afterwards.
+        const QDateTime firstPartMtime = QFileInfo(p1).lastModified();
+
+        TranscriptionController controller;
+        const QVariantList rules = {rule("mtime rule", "^(TX\\d{2})_MIC\\d{3}_orig\\.wav$")};
+        const QStringList allPaths = {p1, p2};
+        const QVariantMap group = findGroup(controller.detectCombineGroups(rules, allPaths), "mtime rule");
+        QCOMPARE(group.value("status").toString(), QStringLiteral("ready"));
+        QCOMPARE(group.value("files").toStringList(), QStringList({p1, p2}));
+        const QString outputPath = group.value("outputPath").toString();
+
+        controller.combineGroup(rules, allPaths, outputPath, QUrl::fromLocalFile(dir.path()), false);
+        QTRY_VERIFY_WITH_TIMEOUT(combineJobStatus(controller) == QLatin1String("done")
+                                     || combineJobStatus(controller) == QLatin1String("failed"),
+                                 30000);
+        QCOMPARE(combineJobStatus(controller), QStringLiteral("done"));
+
+        QVERIFY(QFileInfo::exists(outputPath));
+        QCOMPARE(QFileInfo(outputPath).lastModified(), firstPartMtime);
+    }
+
+    // "First" means first in COMBINE order, not oldest on disk — the two only
+    // coincide under the default mtime ordering. Here a sort differentiator
+    // puts PART1 first while PART1 is the NEWEST file, so an implementation
+    // that just took the group's minimum mtime would land on PART2's and be
+    // provably wrong. Mirrors sortDifferentiator_numericOverridesMtimeOrder.
+    void combinedOutput_firstMeansCombineOrderNotOldest()
+    {
+        if (!ffmpegOnPath())
+            QSKIP("ffmpeg not on PATH — the combine merge shells out to ffmpeg by design");
+
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        const QString p2 = makeWav(dir.path(), "TX01_PART2.wav", 3600);
+        const QString p1 = makeWav(dir.path(), "TX01_PART1.wav", 1800);
+        QVERIFY2(!p1.isEmpty() && !p2.isEmpty(), "ffmpeg failed to generate the test parts");
+
+        const QDateTime part1Mtime = QFileInfo(p1).lastModified();
+        const QDateTime part2Mtime = QFileInfo(p2).lastModified();
+        QVERIFY2(part2Mtime < part1Mtime, "PART1 must be the NEWER file for this test to prove anything");
+
+        TranscriptionController controller;
+        const QVariantList rules = {
+            rule("numbered parts", "^(TX\\d{2})_PART(\\d+)\\.wav$", /*enabled=*/true, /*sortGroupIndex=*/2)};
+        const QStringList allPaths = {p2, p1};
+        const QVariantMap group = findGroup(controller.detectCombineGroups(rules, allPaths), "numbered parts");
+        QCOMPARE(group.value("status").toString(), QStringLiteral("ready"));
+        QCOMPARE(group.value("files").toStringList(), QStringList({p1, p2}));
+        const QString outputPath = group.value("outputPath").toString();
+
+        controller.combineGroup(rules, allPaths, outputPath, QUrl::fromLocalFile(dir.path()), false);
+        QTRY_VERIFY_WITH_TIMEOUT(combineJobStatus(controller) == QLatin1String("done")
+                                     || combineJobStatus(controller) == QLatin1String("failed"),
+                                 30000);
+        QCOMPARE(combineJobStatus(controller), QStringLiteral("done"));
+
+        QCOMPARE(QFileInfo(outputPath).lastModified(), part1Mtime);
     }
 };
 
