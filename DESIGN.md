@@ -199,20 +199,26 @@ threshold — no "number of speakers" UI.
 
 It runs one full pass over the same 16 kHz mono PCM whisper transcribes,
 producing `DiarizedTurn`s (`{start, end, speaker}`), and each segment is tagged
-with the diarized turn it overlaps most (`labelForSegment`). Two ways to invoke
-it, both through `TranscriptionController`'s single worker thread and sharing one
+with the diarized turn it overlaps most (`labelForSegment`). Diarization is a
+**standalone task, never bundled into transcription** — **Transcribe is pure
+ASR** (plus its intrinsic VAD windowing; see below). It's invoked two ways, both
+through `TranscriptionController`'s single worker thread and sharing one
 diarization-core routine (`TranscriptionWorker::runDiarizationPass`):
 
-- **Inline, at transcribe time** — the `speakerDetection` toggle. Diarization
-  runs *before* whisper so the real speaker-label set is known when frontmatter
-  is written; each segment is labeled as it streams in. A failure here never
-  blocks transcription — ASR still runs, ASR-only, and frontmatter records
-  `speakerDetection: false` + `speakerDetectionError` (never-misrepresent).
-- **Standalone, after the fact** — the `diarizeOnly` job (`diarizeFile()`, the
-  MainPanel "Detect speakers" action). Re-runs (or adds) speaker detection on an
-  already-transcribed file *without* re-transcribing: reads the existing `.md`'s
-  segments, decodes the audio, diarizes, and splices the speaker tags back in
-  (`spliceBodySpeakers`). A diarization failure here *is* the job's result.
+- **Standalone** — the `diarizeOnly` job (`diarizeFile()`, the MainPanel /
+  Sidebar-ribbon "Detect speakers" action). Runs (or re-runs) speaker detection
+  on an already-transcribed file *without* re-transcribing: reads the existing
+  `.md`'s segments, decodes the audio, diarizes, and splices the speaker tags +
+  `speakerDetection: true`/`speakers:` back in (`spliceBodySpeakers`). A
+  diarization failure here *is* the job's result.
+- **As a `runAllJobs()` pipeline step** — the one-click "do everything" path
+  queues transcribe → **detect speakers** → label → chapters as separate FIFO
+  jobs (the diarize step reads the `.md` the transcribe job just wrote). This
+  replaced the old inline `speakerDetection` toggle on transcribe.
+
+A fresh transcript is therefore always written speaker-less
+(`speakerDetection: false`, no `[Speaker N]` tags); the diarize job adds them
+later.
 
 Speakers are written **into the `.md`**: a leading `[Speaker N]` tag on each
 segment line (the tag text is the display name — renaming rewrites the tags in
@@ -232,7 +238,14 @@ Independent of highlighting granularity — this exists for the resume requireme
   Degrades gracefully to a single whole-file window (today's pre-chunking
   behavior) if the VAD model can't be downloaded/loaded — recorded honestly
   via the `.md`'s `vad`/`vadError` frontmatter fields, never a silent
-  substitution.
+  substitution. This VAD windowing is intrinsic to every Transcribe job (it
+  does nothing standalone, so it's *not* a separate task) and is surfaced as
+  its own visible **`detecting-speech`** progress phase — the transcribe
+  job's phases are `loading → decoding → detecting-speech → transcribing`
+  (each weighted into the progress bar by its rolling-average duration; VAD,
+  like loading/decoding, has no native progress callback so its within-phase
+  fraction is synthesized). Distinct from the standalone diarize job's
+  `detecting-speakers` phase.
 - **BUILT:** the app-side offset merge is now real (not a no-op) — each
   window is its own `AudioChunk` with `offsetSeconds` set to the window's
   start, and `TranscriptionController`'s `onSegment` adds that offset before

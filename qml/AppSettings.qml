@@ -155,10 +155,6 @@ Item {
     // of podcast episodes). Matches ModelManager::kDefaultModelId.
     property string defaultModel: "base.en"
 
-    // Default state of the speaker-detection toggle for new transcriptions.
-    // Matches the previous hardcoded fallback in MainPanel.qml.
-    property bool defaultSpeakerDetection: true
-
     // Sidebar file-tree order: "name" (default, alphabetical dirs-first —
     // matches this app's original/only behavior), "dateDesc" (Date Modified,
     // newest first), "dateAsc" (Date Modified, oldest first). Combine
@@ -287,7 +283,6 @@ Item {
         sidebarRightMargin: 17,
         timestampDecimalPlaces: 0,
         defaultModel: "base.en",
-        defaultSpeakerDetection: true,
         sortMode: "name",
         iconPack: "material",
         progressGlowEnabled: true,
@@ -408,7 +403,6 @@ Item {
         function onSidebarRightMarginChanged() { appSettings.scheduleSave() }
         function onTimestampDecimalPlacesChanged() { appSettings.scheduleSave() }
         function onDefaultModelChanged() { appSettings.scheduleSave() }
-        function onDefaultSpeakerDetectionChanged() { appSettings.scheduleSave() }
         function onSortModeChanged() { appSettings.scheduleSave() }
         function onIconPackChanged() { appSettings.scheduleSave() }
         function onProgressGlowEnabledChanged() { appSettings.scheduleSave() }

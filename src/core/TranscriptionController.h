@@ -332,11 +332,13 @@ public:
     // complete before even one recomputeOverallProgress() timer tick fires,
     // masking the bug entirely regardless of whether it's fixed.
     static double defaultPhaseDurationMs(const QString &phase);
-    // The four phase names m_phaseTimings/QSettings' "phaseTimings" group/
-    // defaultPhaseDurationMs() all key on. "detecting-speakers" is included
-    // even though it's conditional per-job (see m_activeSpeakerDetection) —
-    // it's still one of the four things worth separately timing. Public for
-    // the same testability reason as defaultPhaseDurationMs() above.
+    // The phase names m_phaseTimings/QSettings' "phaseTimings" group/
+    // defaultPhaseDurationMs() all key on. "detecting-speech" (VAD windowing,
+    // part of every transcribe job) and "detecting-speakers" (the standalone
+    // diarize job — see m_activeSpeakerDetection) are both included even though
+    // each is specific to a job shape — they're still things worth separately
+    // timing. Public for the same testability reason as defaultPhaseDurationMs()
+    // above.
     static const QStringList kTimedPhases;
 
     explicit TranscriptionController(QObject *parent = nullptr);
@@ -459,14 +461,14 @@ public:
     // wordiness (Feature 1): 0.0-1.0 soft nudge on how verbose the generated
     // label and prelude are, independent of the tag settings above.
     Q_INVOKABLE void transcribe(const QUrl &fileUrl, const QUrl &vaultUrl, const QString &modelId,
-                                 bool speakerDetection, bool autoLabel = false, bool restrictTagsToExisting = false,
+                                 bool autoLabel = false, bool restrictTagsToExisting = false,
                                  double tagReuseBias = 0.5, double wordiness = 0.5);
 
     // Convenience batch wrapper: calls transcribe() for each url. Dedup is
     // entirely delegated to transcribe(); the caller decides which files are
     // actually untranscribed.
     Q_INVOKABLE void transcribeAll(const QVariantList &fileUrls, const QUrl &vaultUrl, const QString &modelId,
-                                    bool speakerDetection, bool autoLabel = false,
+                                    bool autoLabel = false,
                                     bool restrictTagsToExisting = false, double tagReuseBias = 0.5,
                                     double wordiness = 0.5);
 
@@ -518,14 +520,15 @@ public:
     Q_INVOKABLE bool isQueued(const QUrl &fileUrl) const;
 
     // True if fileUrl's stored transcription (frontmatter) already used
-    // modelId + speakerDetection — i.e. re-running would reproduce the same
-    // result. Used by "transcribe all" (bulk) to skip files that are already
-    // current, WITHOUT blocking an explicit single-file manual re-run
-    // request (transcribe() itself never checks this — a user clicking
-    // Transcribe on one file always re-runs it, regardless of whether
-    // settings match). False for an untranscribed file (nothing to match).
-    Q_INVOKABLE bool matchesExistingTranscription(const QUrl &fileUrl, const QString &modelId,
-                                                   bool speakerDetection) const;
+    // modelId — i.e. re-running would reproduce the same result. Used by
+    // "transcribe all" (bulk) to skip files that are already current, WITHOUT
+    // blocking an explicit single-file manual re-run request (transcribe()
+    // itself never checks this — a user clicking Transcribe on one file always
+    // re-runs it, regardless of whether the model matches). False for an
+    // untranscribed file (nothing to match). Speaker detection is no longer a
+    // transcribe-time option (it's the standalone diarizeFile() job), so it's
+    // not part of this equality check.
+    Q_INVOKABLE bool matchesExistingTranscription(const QUrl &fileUrl, const QString &modelId) const;
 
     // "Regenerate auto-title" (item 9): re-runs just the AI auto-labeling
     // pass on an already-transcribed file — reads the EXISTING transcript
@@ -572,36 +575,41 @@ public:
     Q_INVOKABLE void generateChaptersAll(const QVariantList &fileUrls, const QUrl &vaultUrl, double density = 0.5);
 
     // Items 24/53 ("run all jobs"): enqueues the FULL per-file pipeline for
-    // one file, IN ORDER — transcribe, then label (relabel), then chapters —
-    // as three separate queued jobs so the single background worker runs them
-    // strictly transcribe->label->chapters (FIFO, one at a time). Because the
-    // worker never starts job N+1 until job N finishes, the label job reads
-    // the .md the transcribe job just wrote and the chapters job reads the
-    // labeled .md — no explicit prerequisite tracking needed beyond queue
-    // order. Note this deliberately builds and inserts all three jobs itself
-    // rather than calling transcribe()/relabel()/generateChapters() in
+    // one file, IN ORDER — transcribe, then detect speakers (diarize), then
+    // label (relabel), then chapters — as separate queued jobs so the single
+    // background worker runs them strictly in that order (FIFO, one at a time).
+    // Because the worker never starts job N+1 until job N finishes, the diarize
+    // job reads the .md the transcribe job just wrote (splicing in speaker
+    // tags), the label job reads that, and the chapters job reads the labeled
+    // .md — no explicit prerequisite tracking needed beyond queue order. Note
+    // this deliberately builds and inserts all the jobs itself rather than
+    // calling transcribe()/diarizeFile()/relabel()/generateChapters() in
     // sequence: each of those inserts at the FRONT of the queue
-    // (frontOfQueueInsertIndex()), so three sequential calls would REVERSE the
-    // 2nd/3rd relative to the 1st; inserting here at one forward-advancing
-    // index keeps them contiguous and correctly ordered.
+    // (frontOfQueueInsertIndex()), so sequential calls would REVERSE the later
+    // ones relative to the first; inserting here at one forward-advancing index
+    // keeps them contiguous and correctly ordered.
+    //
+    // This is the one-click "do everything" path that replaced the old inline
+    // speaker-detection toggle on transcribe() — Transcribe alone is now pure
+    // ASR (see transcribe()), and speaker detection is only ever a separate
+    // job (diarizeFile() standalone, or this pipeline's diarize step).
     //
     // Already-transcribed decision (documented per items 24/53): if fileUrl
     // already has a sibling .md, the transcribe step is SKIPPED and only
-    // label+chapters are queued — re-transcribing a file that's already done
-    // is the surprising choice; "run all" on a done file just refreshes its
-    // derived label+chapters. An UNtranscribed file gets all three. (An
-    // orphaned .md — passed as its own path — is "already transcribed" by this
-    // rule, so it too gets label+chapters only, which is correct since there's
-    // no audio to transcribe.)
+    // diarize+label+chapters are queued — re-transcribing a file that's already
+    // done is the surprising choice; "run all" on a done file just re-detects
+    // speakers and refreshes its derived label+chapters. An UNtranscribed file
+    // gets all four. (An orphaned .md — passed as its own path — is "already
+    // transcribed" by this rule; it too skips transcribe, and its diarize step
+    // is a no-op result since there's no audio to decode.)
     //
     // Params mirror the union of transcribe()'s + generateChapters()' inputs
-    // (the QML call sites read them from AppSettings / the model combo /
-    // speaker-detection toggle, same as the individual actions do). No-op if
-    // fileUrl already has a Queued/Active entry, same dedup gate as the
-    // individual actions (checked once, up front, before any of the three
-    // jobs is inserted).
+    // (the QML call sites read them from AppSettings / the model combo, same as
+    // the individual actions do). No-op if fileUrl already has a Queued/Active
+    // entry, same dedup gate as the individual actions (checked once, up front,
+    // before any of the jobs is inserted).
     Q_INVOKABLE void runAllJobs(const QUrl &fileUrl, const QUrl &vaultUrl, const QString &modelId,
-                                 bool speakerDetection, bool restrictTagsToExisting = false,
+                                 bool restrictTagsToExisting = false,
                                  double tagReuseBias = 0.5, double wordiness = 0.5, double chapterDensity = 0.5);
 
     // Bulk wrapper mirroring transcribeAll()/relabelAll(): calls runAllJobs()
@@ -609,7 +617,7 @@ public:
     // the caller (Sidebar's ribbon / search / multi-select) decides which
     // files to run the full pipeline on.
     Q_INVOKABLE void runAllJobsForPaths(const QVariantList &fileUrls, const QUrl &vaultUrl, const QString &modelId,
-                                         bool speakerDetection, bool restrictTagsToExisting = false,
+                                         bool restrictTagsToExisting = false,
                                          double tagReuseBias = 0.5, double wordiness = 0.5,
                                          double chapterDensity = 0.5);
 
@@ -1165,7 +1173,6 @@ private:
         QUrl fileUrl;
         QUrl vaultUrl;
         QString modelId;
-        bool speakerDetection = false;
         bool autoLabel = false;
         bool relabelOnly = false;
         // Item P21: true only for the automatic follow-up label pass
@@ -1502,10 +1509,13 @@ private:
     // per-key as jobs complete each phase (recordPhaseDuration()/
     // savePhaseTiming()).
     QMap<QString, RollingAverage> m_phaseTimings;
-    // Whether the Active job requested speaker detection — set in startJob()
-    // from job.speakerDetection so recomputeOverallProgress() knows whether
-    // "detecting-speakers" belongs in the active-phase set before (or even
-    // absent) the worker's first phase() signal.
+    // Whether the Active job is the standalone diarize job — set in startJob()
+    // from job.diarizeOnly so recomputeOverallProgress() knows whether the
+    // active-phase set is the diarize shape (decoding/detecting-speakers) or
+    // the transcribe shape (loading/decoding/detecting-speech/transcribing),
+    // before (or even absent) the worker's first phase() signal. A pure-ASR
+    // transcribe never runs diarization, so this is only ever true for the
+    // diarize job.
     bool m_activeSpeakerDetection = false;
     // activeElapsedMs() at the moment m_phase last changed — see
     // phaseRelativeSyntheticProgress()'s doc comment.

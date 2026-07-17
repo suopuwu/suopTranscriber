@@ -47,7 +47,30 @@ Rectangle {
     property bool awaitingFirstSegment: false
     readonly property bool showTranscribingOverlay: mainPanel.transcribingThisFile
         && mainPanel.awaitingFirstSegment
-    onTranscribingThisFileChanged: mainPanel.awaitingFirstSegment = mainPanel.transcribingThisFile
+    onTranscribingThisFileChanged: {
+        mainPanel.awaitingFirstSegment = mainPanel.transcribingThisFile
+        // Start following the tail the moment this file begins transcribing.
+        // NOT cleared when transcribingThisFile flips false again — the final
+        // batch of segments (and Parakeet's whole last window) lands via
+        // onFinished AFTER busy drops, and must still scroll into view; the
+        // flag is reset instead on the next file open (see onSourceChanged /
+        // onOrphanedMdPathChanged). See the transcriptScrollView follow below.
+        if (mainPanel.transcribingThisFile)
+            mainPanel.followingTail = true
+    }
+
+    // Sticky "keep the newest line in view while this file transcribes." A
+    // persistent flag + a reaction to the flickable's own contentHeight (see
+    // the transcriptScrollView.contentItem Connections below) — NOT a
+    // per-body-change Qt.callLater, which silently stopped following the moment
+    // one update added more than the near-bottom threshold (a multi-segment
+    // whisper tick, or a whole Parakeet window burst): it measured "am I at the
+    // bottom?" against the ALREADY-grown contentHeight, so any big jump read as
+    // "the user scrolled up." Reset on file switch; set at transcription start.
+    property bool followingTail: false
+    // The contentHeight as of the previous growth — the follow tests
+    // at-bottom-ness against THIS, not the live (already-grown) value.
+    property real lastFollowContentHeight: 0
 
     // The per-file action icons below (regenerate label, generate chapters,
     // detect speakers, the delete trio) grey out while a job for THEIR file is
@@ -186,17 +209,6 @@ Rectangle {
     function refreshMetadata() {
         storedMetadata = (player && player.source.toString() !== "" && transcriptionController)
             ? transcriptionController.readMetadata(player.source) : ({})
-        // An untranscribed file reflects the user's saved vault-wide default
-        // (AppSettings.defaultSpeakerDetection), exactly as the model picker
-        // effectively does — an already-transcribed file instead honors
-        // whatever was actually used last time, same as every other stored
-        // setting here. (This assignment is programmatic and never triggers
-        // the write-back at speakerDetectionToggle's TapHandler.onTapped —
-        // that fires only on a real user tap — so there's no churn/feedback
-        // loop with AppSettings.defaultSpeakerDetection.)
-        speakerDetectionToggle.checked =
-            mainPanel.hasStoredMetadata ? storedMetadata.speakerDetection === true
-                                        : AppSettings.defaultSpeakerDetection
         // titleField is always-editable (no display/edit swap — see its doc
         // comment), so its `text: displayTitle()` binding is a one-shot: it's
         // severed the first time the user types. Resync explicitly on every
@@ -1824,6 +1836,9 @@ Rectangle {
             // file switch so they never leak into a different note's chapters.
             mainPanel.collapsedChapters = ({})
             mainPanel.editingChapterTs = -1
+            // A fresh file opens at the top, not following — re-armed only when
+            // THIS file's own transcription starts (see onTranscribingThisFileChanged).
+            mainPanel.followingTail = false
         }
     }
     // Item P8/P16: showOrphanedMd() switches files by setting orphanedMdPath
@@ -1840,6 +1855,7 @@ Rectangle {
         mainPanel.collapsedChapters = ({})
         mainPanel.editingChapterTs = -1
         mainPanel.closedByDeleteUrl = "" // see onSourceChanged's identical line
+        mainPanel.followingTail = false // see onSourceChanged's identical line
     }
     Connections {
         target: mainPanel.transcriptionController
@@ -1856,24 +1872,14 @@ Rectangle {
             // collapses that burst to ONE tick — so every segment written after
             // it, up to the whole transcript for a sub-3-minute single-window
             // file, never lands on screen until a file switch reloads it. Reload
-            // the finished file's body here so the tail always shows, and — if
-            // the user was following at the bottom — keep them pinned there (the
-            // onTranscriptBodyChanged follow can't do it: busy is already false
-            // by the time finished() fires, so its own guard is off). Guarded on
-            // the finished file still being the open one so a background job for
-            // another file never yanks what you're reading.
+            // the finished file's body here so the tail always shows. The
+            // scroll-to-bottom is NOT done here: the reload's contentHeight
+            // growth drives the transcriptScrollView follow above, which is
+            // still armed (followingTail stays set until the next file open), so
+            // the final segments scroll into view through the one code path.
             if (ok && mainPanel.player
-                    && fileUrl.toString() === mainPanel.player.source.toString()) {
-                const flick = transcriptScrollView.contentItem
-                const nearBottomThreshold = 40
-                const wasAtBottom = flick.contentY >= flick.contentHeight - flick.height - nearBottomThreshold
+                    && fileUrl.toString() === mainPanel.player.source.toString())
                 mainPanel.refreshTranscriptSync()
-                if (wasAtBottom) {
-                    Qt.callLater(function () {
-                        flick.contentY = Math.max(0, flick.contentHeight - flick.height)
-                    })
-                }
-            }
         }
         // Item 10: frontmatter is written at job START (durability, see
         // TranscriptionController), before any segment lines exist — so
@@ -2026,38 +2032,33 @@ Rectangle {
         if (mainPanel.transcriptWasEmpty && mainPanel.transcriptBody !== "")
             transcriptRepaintNudgeTimer.restart()
         mainPanel.transcriptWasEmpty = mainPanel.transcriptBody === ""
+        // Scroll-follow no longer lives here — reacting to transcriptBody meant
+        // measuring against a contentHeight that had already grown (see the
+        // transcriptScrollView.contentItem Connections below, which reacts to
+        // contentHeight itself and so never races the layout).
+    }
 
-        if (mainPanel.transcriptionController && mainPanel.player && mainPanel.transcriptionController.busy
-                && mainPanel.transcriptionController.currentFile.toString() === mainPanel.player.source.toString()) {
-            // Item 56 investigation (NEEDS LIVE REPRO — no concrete defect
-            // found in static analysis): the scroll-follow reads the correct
-            // object — transcriptScrollView.contentItem is the ScrollView's
-            // internal Flickable, where contentY/contentHeight/height live —
-            // the same one middleDragScrollArea and locateMatch() drive. The
-            // "am I at the bottom?" test is measured against the PRE-growth
-            // geometry (before Qt.callLater/re-layout), which is intentional
-            // (O6: don't yank a user who scrolled up). commit b72b365's
-            // editable-TextArea change (background: UnderlineField{
-            // implicitHeight: 0 } + zeroed padding) was explicitly sized "to
-            // match the old read-only TextArea's sizing" (see transcriptArea's
-            // padding comment), so transcriptArea.implicitHeight — and thus
-            // contentHeight — should be unchanged by it; the threshold is not
-            // comparing against a stale/zeroed height here. No defect found,
-            // so per CLAUDE.md this is deliberately NOT changed speculatively.
-            // If follow still misbehaves in a live run, the likely culprit is
-            // a transiently-wrong contentHeight for one frame right as
-            // transcriptArea's `visible: transcriptBody !== ""` flips true
-            // (the same repaint race transcriptRepaintNudgeTimer works around)
-            // — reproduce live and re-check contentHeight timing before
-            // touching this.
+    // Race-free follow-to-bottom while a file is being transcribed. Fires on the
+    // flickable's OWN contentHeight — which, by the time this runs, has already
+    // settled to the post-growth value, so there's no Qt.callLater guesswork
+    // about whether layout caught up. "Was the user parked at the bottom before
+    // this growth?" is tested against lastFollowContentHeight (the PREVIOUS
+    // contentHeight), never the live one: the live value is already grown, so
+    // testing against it would classify any jump bigger than the threshold as
+    // "the user scrolled up" and stop following — the exact defect that left a
+    // multi-segment whisper tick or a whole-window Parakeet burst stranded above
+    // the fold. Gated on followingTail so ordinary browsing, a file open, or a
+    // window resize never yanks the view to the bottom.
+    Connections {
+        target: transcriptScrollView.contentItem
+        function onContentHeightChanged() {
             const flick = transcriptScrollView.contentItem
             const nearBottomThreshold = 40
-            const wasAtBottom = flick.contentY >= flick.contentHeight - flick.height - nearBottomThreshold
-            if (wasAtBottom) {
-                Qt.callLater(function () {
-                    flick.contentY = Math.max(0, flick.contentHeight - flick.height)
-                })
-            }
+            const prevBottom = Math.max(0, mainPanel.lastFollowContentHeight - flick.height)
+            const wasAtBottom = flick.contentY >= prevBottom - nearBottomThreshold
+            mainPanel.lastFollowContentHeight = flick.contentHeight
+            if (mainPanel.followingTail && wasAtBottom)
+                flick.contentY = Math.max(0, flick.contentHeight - flick.height)
         }
     }
 
@@ -2418,9 +2419,9 @@ Rectangle {
             // full-width text Button that lived down in the scrollable
             // content below the model combo. Same enable/tooltip logic the
             // old Button had (Wave F: a manual click always re-runs,
-            // regardless of stored-metadata match) — modelCombo/
-            // speakerDetectionToggle are declared lower in this file but
-            // still resolve fine since ids are scoped to the whole document.
+            // regardless of stored-metadata match) — modelCombo is declared
+            // lower in this file but still resolves fine since ids are scoped
+            // to the whole document.
             Item {
                 id: transcribeIconButton
                 Layout.preferredWidth: 22
@@ -2455,7 +2456,6 @@ Rectangle {
                     enabled: transcribeIconButton.enabled
                     onTapped: mainPanel.transcriptionController.transcribe(mainPanel.player.source, mainPanel.vaultPath,
                                                                              modelCombo.currentValue,
-                                                                             speakerDetectionToggle.checked,
                                                                              AppSettings.autoLabelEnabled,
                                                                              AppSettings.restrictTagsToExisting,
                                                                              AppSettings.tagReuseBias,
@@ -2508,7 +2508,6 @@ Rectangle {
                     enabled: runAllIconButton.enabled
                     onTapped: mainPanel.transcriptionController.runAllJobs(mainPanel.player.source, mainPanel.vaultPath,
                                                                             modelCombo.currentValue,
-                                                                            speakerDetectionToggle.checked,
                                                                             AppSettings.restrictTagsToExisting,
                                                                             AppSettings.tagReuseBias,
                                                                             AppSettings.wordiness,
@@ -2900,8 +2899,8 @@ Rectangle {
             }
 
             // Item 7: the checkbox that arms replace. Minimal pill toggle
-            // (same idiom as speakerDetectionToggle below and Sidebar.qml's
-            // search-scope toggle) rather than a QQC2 CheckBox — which would
+            // (same idiom as Sidebar.qml's search-scope toggle) rather than a
+            // QQC2 CheckBox — which would
             // also steal focus from searchField on press, per the
             // focusable-control-beside-a-TextField hazard this file already
             // avoids everywhere else.
@@ -3138,6 +3137,7 @@ Rectangle {
 
         ScrollView {
             id: transcriptScrollView
+            objectName: "transcriptScrollView"
             anchors.fill: parent
             clip: true
             // Item 55: while a (re)transcription for THIS file has started but
@@ -3915,49 +3915,10 @@ Rectangle {
                     spacing: 12
                     visible: mainPanel.orphanedMdPath === ""
 
-                    // Minimal pill toggle, matching Sidebar.qml's
-                    // "Transcriptions" search-scope toggle (item 1, Wave E)
-                    // rather than a QQC2 CheckBox — same on/off read via
-                    // background+outline (green when on) as every other
-                    // toggle-shaped control in this app.
-                    Item {
-                        id: speakerDetectionToggle
-                        property bool checked: false
-                        Layout.preferredWidth: speakerDetectionLabel.implicitWidth + 16
-                        Layout.preferredHeight: 24
-
-                        HoverHandler {
-                            id: speakerDetectionHover
-                            cursorShape: Qt.PointingHandCursor
-                        }
-                        TapHandler {
-                            onTapped: {
-                                speakerDetectionToggle.checked = !speakerDetectionToggle.checked
-                                // Mirrors modelCombo's onActivated below —
-                                // a manual toggle is remembered as the new
-                                // vault-wide default going forward.
-                                AppSettings.defaultSpeakerDetection = speakerDetectionToggle.checked
-                            }
-                        }
-                        Rectangle {
-                            anchors.fill: parent
-                            radius: AppSettings.borderRadius
-                            color: speakerDetectionToggle.checked
-                                   ? (speakerDetectionHover.hovered ? "#2ecc71" : "#25a25a")
-                                   : (speakerDetectionHover.hovered ? "#3a3a3a" : "#2a2a2a")
-                            border.width: 1
-                            border.color: speakerDetectionToggle.checked ? "#2ecc71" : "#4a4a4a"
-
-                            Behavior on color { ColorAnimation { duration: AppSettings.animationsEnabled ? 100 : 0 } }
-                        }
-                        Label {
-                            id: speakerDetectionLabel
-                            anchors.centerIn: parent
-                            text: qsTr("Speaker detection")
-                            color: speakerDetectionToggle.checked ? "white" : "#aaaaaa"
-                            font.pixelSize: 11
-                        }
-                    }
+                    // Speaker detection is no longer a transcribe-time toggle —
+                    // it's the standalone "Detect speakers" action (the
+                    // detectSpeakersButton icon in the cluster above) / the
+                    // runAllJobs pipeline step. Transcribe here is pure ASR.
 
                     Label {
                         text: qsTr("Model")

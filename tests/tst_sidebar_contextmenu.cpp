@@ -66,7 +66,7 @@ public:
                             { QStringLiteral("tags"), QStringList{ QStringLiteral("meeting") } },
                             { QStringLiteral("speakers"), QStringList{} } };
     }
-    Q_INVOKABLE bool matchesExistingTranscription(const QUrl &, const QString &, bool) const
+    Q_INVOKABLE bool matchesExistingTranscription(const QUrl &, const QString &) const
     {
         return false;
     }

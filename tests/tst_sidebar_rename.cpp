@@ -95,7 +95,7 @@ public:
         ++setLabelCalls;
         return true;
     }
-    Q_INVOKABLE bool matchesExistingTranscription(const QUrl &, const QString &, bool) const
+    Q_INVOKABLE bool matchesExistingTranscription(const QUrl &, const QString &) const
     {
         return false;
     }
@@ -398,68 +398,6 @@ private slots:
                  "the transcript sidecar must follow the audio's new name");
         QVERIFY(!QFileInfo::exists(vault.filePath(QStringLiteral("talk.mp3"))));
         QVERIFY(!QFileInfo::exists(vault.filePath(QStringLiteral("talk.mp3.md"))));
-    }
-
-    // The per-row hover icons paint ON TOP of the row (they reserve no layout
-    // space — see rowNameText's doc comment), so while the inline editor is
-    // open they cover the tail of a long name being typed. The gesture that
-    // opens the editor is a click on the row, which necessarily leaves the
-    // mouse hovering it, so "hover-only" alone never hides them here (user
-    // report). Drives a REAL hover -> rename -> Escape cycle rather than
-    // poking renamingPath: the whole point is that hover and rename are
-    // simultaneous, which only the real gesture reproduces.
-    void openRename_hidesTheRowsHoverActionIcons()
-    {
-        QTemporaryDir vault;
-        QVERIFY(vault.isValid());
-        QVERIFY(touch(vault.filePath(QStringLiteral("talk.mp3"))));
-
-        QQuickView view;
-        QQuickItem *treeItem = openVault(&view, vault.path());
-        QVERIFY2(treeItem, "could not load Sidebar.qml / locate its TreeView");
-        QTRY_VERIFY(treeItem->property("rows").toInt() > 0);
-        expandEverything(treeItem);
-
-        const int row = rowForPath(treeItem, vault.filePath(QStringLiteral("talk.mp3")));
-        QVERIFY2(row >= 0, "talk.mp3 must be a visible row");
-        QQuickItem *item = rowItem(treeItem, row);
-        QVERIFY(item);
-        QQuickItem *icon = item->findChild<QQuickItem *>(QStringLiteral("rowTranscribeButton"));
-        QVERIFY2(icon, "an audio row must carry the transcribe icon");
-
-        // The hover must be driven by a real mouseMove: QTest::mouseClick
-        // sends only press/release, so clicking a row never activates its
-        // HoverHandler. Prime the pointer off the rows first — see
-        // tst_sidebar_dragmove's identical note: a move to the coordinates the
-        // pointer already occupies (carried over from an earlier test, these
-        // run in one process) delivers no event at all.
-        QTest::mouseMove(&view, QPoint(5, view.height() - 5));
-        QTest::qWait(20);
-
-        // Baseline: hovering the row reveals the icons. Without this the
-        // opacity-0 assert below would also pass if they never showed at all.
-        const QPoint namePoint = nameTextPoint(item);
-        QTest::mouseMove(&view, namePoint);
-        QTRY_VERIFY2(icon->opacity() > 0.99,
-                     "hovering a row must reveal its action icons when no rename is open");
-
-        // First click selects + opens; the pointer never leaves the row, so
-        // the icons stay up. Second click on the name opens the editor — same
-        // unbroken hover, icons must go.
-        clickAt(&view, namePoint);
-        clickAt(&view, namePoint);
-        QTRY_VERIFY(renameFieldVisibleOn(item));
-        QTRY_VERIFY2(icon->opacity() < 0.01,
-                     "the row's hover icons must hide while its inline rename is open");
-        QVERIFY2(!icon->isEnabled(),
-                 "a faded-out icon must not stay clickable over the rename editor");
-
-        // ...and come back once the edit is over: the gate is the rename, not
-        // a one-way teardown of the hover reveal.
-        QTest::keyClick(&view, Qt::Key_Escape);
-        QTRY_VERIFY(!renameFieldVisibleOn(item));
-        QTRY_VERIFY2(icon->opacity() > 0.99,
-                     "closing the editor must restore the icons for the still-hovered row");
     }
 
     // Escape abandons the edit: nothing is written, and the editor closes

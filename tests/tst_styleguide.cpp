@@ -189,8 +189,7 @@ private slots:
     // Regression: treeDelegate's filename Text had no width bound at all, so
     // a long filename (routine for split-recording combine candidates — the
     // very files Item 51's groupMergeButton targets) painted straight
-    // through the per-row icon cluster on the right (rowTranscribeButton/
-    // rowRelabelButton/rowChaptersButton/groupMergeButton) instead of
+    // through the per-row groupMergeButton overlay on the right instead of
     // stopping short of it, so the "⊕" combine button rendered on top of
     // mid-filename characters instead of in its own clear space — reading as
     // "no combine icon" rather than a garbled one. No QQuickView in this
@@ -211,17 +210,17 @@ private slots:
     {
         const QString src = readAll(QStringLiteral(SUOP_QML_DIR "/Sidebar.qml"));
         QVERIFY2(!src.isEmpty(), "qml/Sidebar.qml must exist");
-        const int rowIdx = src.indexOf(QStringLiteral("id: rowTranscribeButton"));
-        QVERIFY2(rowIdx >= 0, "rowTranscribeButton must exist in Sidebar.qml's treeDelegate");
+        const int rowIdx = src.indexOf(QStringLiteral("id: groupMergeButton"));
+        QVERIFY2(rowIdx >= 0, "groupMergeButton must exist in Sidebar.qml's treeDelegate");
         const QString before = src.left(rowIdx);
         const int textIdx = before.indexOf(QStringLiteral("useLabelsSidebar"));
         QVERIFY2(textIdx >= 0, "treeDelegate's filename Text (AppSettings.useLabelsSidebar) must exist "
-                               "before the per-row icon cluster");
+                               "before the per-row groupMergeButton overlay");
         const QString filenameTextBlock = before.mid(textIdx, before.length() - textIdx);
         QVERIFY2(filenameTextBlock.contains(QStringLiteral("Text.ElideRight"))
                      && filenameTextBlock.contains(QStringLiteral("Text.ElideNone")),
                  "treeDelegate's filename Text must elide when plain text (otherwise a long filename "
-                 "overlaps the per-row icon cluster) but must be able to go elide-less too (needed "
+                 "overlaps the per-row groupMergeButton) but must be able to go elide-less too (needed "
                  "whenever textFormat is StyledText — see below)");
         QVERIFY2(filenameTextBlock.contains(QStringLiteral("elide: textFormat === Text.PlainText "
                                                             "? Text.ElideRight : Text.ElideNone")),
@@ -1567,29 +1566,6 @@ private slots:
                  "tagChipHover must set cursorShape: Qt.PointingHandCursor (StyleGuide.md hover convention)");
     }
 
-    // Item 5: an untranscribed note's speaker-detection toggle must reflect
-    // the user's saved vault-wide default (AppSettings.defaultSpeakerDetection),
-    // exactly as the model picker effectively does — NOT a hardcoded `true`,
-    // which discarded the saved default on every fresh-note switch. No
-    // QQuickView in this suite to drive refreshMetadata() across a file
-    // switch, so this is a source-scan guard that the fallback reads the
-    // setting rather than a literal.
-    void mainPanel_speakerDetectionFallbackHonorsSavedDefault()
-    {
-        const QString src = readAll(QStringLiteral(SUOP_QML_DIR "/MainPanel.qml"));
-        QVERIFY2(!src.isEmpty(), "qml/MainPanel.qml must exist");
-
-        const int idx = src.indexOf(QStringLiteral("speakerDetectionToggle.checked ="));
-        QVERIFY2(idx >= 0, "refreshMetadata() must set speakerDetectionToggle.checked");
-        const QString block = src.mid(idx, 200);
-        QVERIFY2(block.contains(QStringLiteral("storedMetadata.speakerDetection === true")),
-                 "an already-transcribed note must still honor its stored speakerDetection");
-        QVERIFY2(block.contains(QStringLiteral("AppSettings.defaultSpeakerDetection")),
-                 "the !hasStoredMetadata fallback must reflect AppSettings.defaultSpeakerDetection, "
-                 "not a hardcoded true — otherwise a fresh-note switch discards the user's saved default "
-                 "(item 5)");
-    }
-
     // Item 4: the model picker's CLOSED-state box must round its corners with
     // AppSettings.borderRadius — QQC2's default ComboBox background is
     // square-cornered, so modelCombo needs its own background: Rectangle
@@ -1828,6 +1804,12 @@ private slots:
         QVERIFY2(bar.mid(phaseIdx, 1000).contains(QStringLiteral("case \"chaptering\":")),
                  "phaseLabel() must have a \"chaptering\" case (item 26/31) so an active "
                  "chapter-generation phase shows a phase label instead of a blank");
+        // The VAD speech-detection pass is now a visible phase of every
+        // transcribe job (Transcribe is pure ASR + VAD), distinct from the
+        // diarize job's "detecting-speakers".
+        QVERIFY2(bar.mid(phaseIdx, 1000).contains(QStringLiteral("case \"detecting-speech\":")),
+                 "phaseLabel() must have a \"detecting-speech\" case so the VAD pass shows a "
+                 "phase label instead of a blank during transcription");
     }
 
     // Item 29 + item 21: the popup is widened so descriptions fit, and its
@@ -2060,121 +2042,12 @@ private slots:
                  "locateMatch() must not fall back to a literal indexOf scan (item 7)");
     }
 
-    // Item 41: full keyboard navigation in the focused file panel. No
-    // QQuickView in this suite to deliver key events to a TreeView delegate,
-    // so these are source-scan guards that the Shortcuts, their focus gating,
-    // and the backing functions all exist.
-
-    // Left/Right move keyboard focus into and along the current row's per-row
-    // action-button cluster; Enter/Return/Space activate the focused one.
-    void sidebar_keyboardFocusesActionButtonCluster()
-    {
-        const QString src = readAll(QStringLiteral(SUOP_QML_DIR "/Sidebar.qml"));
-        QVERIFY2(!src.isEmpty(), "qml/Sidebar.qml must exist");
-
-        // The focus-state property and its nav/activation functions.
-        QVERIFY2(src.contains(QStringLiteral("property string actionButtonFocus:")),
-                 "Sidebar.qml must hold actionButtonFocus (which action button the keyboard is on)");
-        QVERIFY2(src.contains(QStringLiteral("function focusActionButton(direction)")),
-                 "focusActionButton() must move focus into/along the action cluster");
-        QVERIFY2(src.contains(QStringLiteral("function currentRowActionButtons()")),
-                 "currentRowActionButtons() must list the current row's available action buttons");
-        QVERIFY2(src.contains(QStringLiteral("function activateFocusedActionButton()")),
-                 "activateFocusedActionButton() must replay the focused button's controller call");
-
-        // Left/Right wired as tree-only Shortcuts (search-results view has no
-        // action cluster) driving focusActionButton in each direction.
-        const int rightIdx = src.indexOf(QStringLiteral("sequence: \"Right\""));
-        const int leftIdx = src.indexOf(QStringLiteral("sequence: \"Left\""));
-        QVERIFY2(rightIdx >= 0, "Right must be wired as a Shortcut");
-        QVERIFY2(leftIdx >= 0, "Left must be wired as a Shortcut");
-        const QString rightBlock = src.mid(rightIdx, 200);
-        const QString leftBlock = src.mid(leftIdx, 200);
-        QVERIFY2(rightBlock.contains(QStringLiteral("enabled: tree.activeFocus"))
-                     && !rightBlock.contains(QStringLiteral("searchResultsView.activeFocus")),
-                 "Right must be gated on tree focus only (search-results view has no per-row cluster)");
-        QVERIFY2(leftBlock.contains(QStringLiteral("enabled: tree.activeFocus"))
-                     && !leftBlock.contains(QStringLiteral("searchResultsView.activeFocus")),
-                 "Left must be gated on tree focus only");
-        QVERIFY2(rightBlock.contains(QStringLiteral("focusActionButton(1)")), "Right must move into/forward");
-        QVERIFY2(leftBlock.contains(QStringLiteral("focusActionButton(-1)")), "Left must move backward/out");
-
-        // focusActionButton walks currentRowActionButtons() by index, so that
-        // list must be in ON-SCREEN left-to-right order or Right moves left
-        // (the actual bug this guards). actionButtonRow is RightToLeft, so the
-        // declaration order the list is built in runs right-to-left and has to
-        // be reversed. tst_sidebar_keynav proves the resulting direction
-        // against real button geometry; this just keeps the two coupled.
-        QVERIFY2(src.contains(QStringLiteral("layoutDirection: Qt.RightToLeft")),
-                 "actionButtonRow is expected to lay out RightToLeft — if that changed, "
-                 "currentRowActionButtons()'s reverse() below is now backwards");
-        QVERIFY2(src.contains(QStringLiteral("return list.reverse()")),
-                 "currentRowActionButtons() must reverse its declaration-order list into visual "
-                 "left-to-right order (actionButtonRow lays out RightToLeft), else Right moves left");
-
-        // Enter/Return/Space activate the focused button, only while one is
-        // actually focused (so they don't shadow other uses otherwise).
-        const int actIdx = src.indexOf(QStringLiteral("sequences: [\"Return\", \"Enter\", \"Space\"]"));
-        QVERIFY2(actIdx >= 0, "Return/Enter/Space must be wired to activate the focused action button");
-        const QString actBlock = src.mid(actIdx, 220);
-        QVERIFY2(actBlock.contains(QStringLiteral("tree.activeFocus"))
-                     && actBlock.contains(QStringLiteral("sidebar.actionButtonFocus !== \"\"")),
-                 "the activate shortcut must be gated on tree focus AND a button actually being focused");
-        QVERIFY2(actBlock.contains(QStringLiteral("activateFocusedActionButton()")),
-                 "the activate shortcut must call activateFocusedActionButton()");
-    }
-
-    // The action cluster is hover-only, EXCEPT while the keyboard is actually
-    // inside this row's cluster (Left/Right established a focused button) — so
-    // the focused button has a visible target. Selecting a row alone must NOT
-    // reveal its icons. The focused button also shows an outline.
-    void sidebar_selectedRowRevealsActionButtons()
-    {
-        const QString src = readAll(QStringLiteral(SUOP_QML_DIR "/Sidebar.qml"));
-        QVERIFY2(!src.isEmpty(), "qml/Sidebar.qml must exist");
-
-        const int idx = src.indexOf(QStringLiteral("property bool rowActionsRevealed:"));
-        QVERIFY2(idx >= 0, "treeDelegate must expose rowActionsRevealed for the per-row action cluster");
-        const QString block = src.mid(idx, 400);
-        QVERIFY2(block.contains(QStringLiteral("rowHover.hovered")),
-                 "rowActionsRevealed must still reveal on mouse hover");
-        // An open inline rename beats every reveal path: the icons overlay the
-        // row (no reserved layout space), so they cover the tail of the name
-        // being typed — and the click that opens the editor leaves the mouse
-        // hovering, so hover-only would never hide them. See
-        // tst_sidebar_rename's openRename_hidesTheRowsHoverActionIcons.
-        QVERIFY2(block.contains(QStringLiteral("!treeDelegate.renamingThisRow")),
-                 "rowActionsRevealed must suppress the cluster while this row's inline rename is open");
-        QVERIFY2(block.contains(QStringLiteral("treeDelegate.path === sidebar.currentPath")),
-                 "rowActionsRevealed must reveal the current row's cluster while the keyboard is in it");
-        // The crux: currentPath alone must NOT reveal the cluster — the icons
-        // may only appear once Left/Right actually focused a button in it
-        // (otherwise they sit permanently on the open file).
-        QVERIFY2(block.contains(QStringLiteral("sidebar.actionButtonFocus !== \"\"")),
-                 "rowActionsRevealed must gate the current row's reveal on a keyboard-focused action "
-                 "button (arrow-key entry), not reveal for the selected row unconditionally");
-        QVERIFY2(block.contains(QStringLiteral("tree.activeFocus")),
-                 "the current row's keyboard reveal must be gated on tree focus, matching the Left/Right "
-                 "Shortcuts' own gating (focus leaving the tree re-hides the icons)");
-
-        // The action buttons' opacity must be driven by rowActionsRevealed,
-        // not the old hover-only expression. (The second term is the
-        // collapse — see sidebar_actionClusterCollapsesToRightmostIcon.)
-        QVERIFY2(src.contains(QStringLiteral(
-                     "opacity: treeDelegate.rowActionsRevealed && !rowTranscribeButton.collapsedAway ? 1 : 0")),
-                 "the per-row action buttons must key their opacity off rowActionsRevealed");
-        QVERIFY2(!src.contains(QStringLiteral("opacity: rowHover.hovered ? 1 : 0")),
-                 "no per-row action button should remain hover-only (item 41 reveals them for the "
-                 "selected row too)");
-
-        // The keyboard-focused button gets a HoverBorder outline.
-        QVERIFY2(src.contains(QStringLiteral("sidebar.actionButtonFocus === \"transcribe\"")),
-                 "the transcribe button must outline when it holds keyboard focus");
-        QVERIFY2(src.contains(QStringLiteral("sidebar.actionButtonFocus === \"relabel\"")),
-                 "the relabel button must outline when it holds keyboard focus");
-        QVERIFY2(src.contains(QStringLiteral("sidebar.actionButtonFocus === \"chapters\"")),
-                 "the chapters button must outline when it holds keyboard focus");
-    }
+    // Item 41: note-list keyboard navigation (Up/Down, Shift+Up/Down,
+    // Ctrl+Up/Down). No QQuickView in this suite to deliver key events to a
+    // TreeView delegate, so these are source-scan guards that the Shortcuts,
+    // their focus gating, and the backing functions all exist. (The old
+    // Left/Right per-row action-button cluster nav was removed — those actions
+    // live in the ribbon + MainPanel clusters now, see CLAUDE.md parity note.)
 
     // Shift+Up/Down extend the selection range from the anchor; Ctrl+Up/Down
     // jump to the current group's (parent-folder's) boundary — both gated on
@@ -2688,11 +2561,12 @@ private slots:
     }
 
     // Items 24/53 + CLAUDE.md per-file-action-parity: "run all jobs"
-    // (transcribe->label->chapters) must exist in ALL required button sets —
-    // Sidebar's ribbon (bulk), Sidebar's per-row hover cluster, Sidebar's
-    // search-scoped run-all group, and MainPanel's icon cluster (open file) —
-    // each wired to the runAllJobs()/runAllJobsForPaths() controller
-    // invokables. No QQuickView here, so this is a source-scan guard.
+    // (transcribe->detect speakers->label->chapters) must exist in the required
+    // button sets — Sidebar's ribbon (bulk), Sidebar's search-scoped run-all
+    // group, and MainPanel's icon cluster (open file) — each wired to the
+    // runAllJobs()/runAllJobsForPaths() controller invokables. (The per-row
+    // hover cluster was removed — CLAUDE.md parity is now two sets, not three.)
+    // No QQuickView here, so this is a source-scan guard.
     void sidebar_runAllJobsActionParityAcrossAllSites()
     {
         const QString sidebar = readAll(QStringLiteral(SUOP_QML_DIR "/Sidebar.qml"));
@@ -2711,25 +2585,7 @@ private slots:
         QVERIFY2(ribbonBlock.contains(QStringLiteral("transcriptionController.runAllJobsForPaths(")),
                  "the ribbon run-all button must call the bulk runAllJobsForPaths() invokable");
 
-        // (2) Per-row hover-cluster run-all button in treeDelegate. The window
-        // must span the WHOLE button block down to its TapHandler — it's sized
-        // well past the block's current length because a fixed char count
-        // shrinks into a false failure as the block's doc comments grow (it
-        // did, when the cluster gained its collapse). Overshooting is safe:
-        // runAllJobs() has no other call site anywhere near this one.
-        const int rowIdx = sidebar.indexOf(QStringLiteral("id: rowRunAllButton"));
-        QVERIFY2(rowIdx >= 0, "treeDelegate must have a per-row rowRunAllButton (items 24/53)");
-        QVERIFY2(sidebar.mid(rowIdx, 2600).contains(QStringLiteral("transcriptionController.runAllJobs(")),
-                 "the per-row run-all button must call runAllJobs() for that one file");
-
-        // Keyboard-nav cluster reachability: "runAll" must be a focusable
-        // action in the cluster order and dispatched on activation.
-        QVERIFY2(sidebar.contains(QStringLiteral("list.push(\"runAll\")")),
-                 "runAll must be part of currentRowActionButtons() so Left/Right can focus it (items 24/53)");
-        QVERIFY2(sidebar.contains(QStringLiteral("sidebar.actionButtonFocus === \"runAll\"")),
-                 "activating a keyboard-focused runAll button must dispatch runAllJobs() (items 24/53)");
-
-        // (3) Search-scoped run-all button + its eligibility helper, inside the
+        // (2) Search-scoped run-all button + its eligibility helper, inside the
         // search-expanded block.
         QVERIFY2(sidebar.contains(QStringLiteral("function searchRunAllPaths(")),
                  "a search-scoped searchRunAllPaths() eligibility helper must exist (items 24/53)");
@@ -2743,7 +2599,7 @@ private slots:
                             QStringLiteral("transcriptionController.runAllJobsForPaths(")),
                  "the filtered run-all button must run runAllJobsForPaths() over searchRunAllPaths()");
 
-        // (4) MainPanel icon cluster run-all button — per the user's spec,
+        // (3) MainPanel icon cluster run-all button — per the user's spec,
         // shown only when there's no transcription yet (untranscribed open
         // file), and wired to runAllJobs() for that file.
         const int mpIdx = mainPanel.indexOf(QStringLiteral("id: runAllIconButton"));
@@ -2890,17 +2746,18 @@ private slots:
             ++found;
             idx = close;
         }
-        QVERIFY2(found >= 4,
-                 "expected all four Sidebar generateChapters call sites (keyboard-nav, ribbon "
-                 "chaptersAll, search chapters, per-row rowChapters) to be present");
+        QVERIFY2(found >= 2,
+                 "expected both Sidebar generateChapters call sites (ribbon chaptersAll, search "
+                 "chapters) to be present — the per-row/keyboard-nav sites were removed with the "
+                 "per-row hover cluster");
     }
 
     // Item 52 (CLAUDE.md per-file-action parity): the standalone "detect
-    // speakers" (diarization) action must exist in all three Sidebar sites
-    // mirroring MainPanel's detectSpeakersButton — the ribbon bulk button, the
-    // per-row hover cluster, and the search-scoped run group — plus be
-    // reachable via keyboard-nav. Ribbon/search bulk sites call
-    // diarizeFilesForPaths(); the per-row/keyboard sites call diarizeFile().
+    // speakers" (diarization) action must exist in the Sidebar sites mirroring
+    // MainPanel's detectSpeakersButton — the ribbon bulk button and the
+    // search-scoped run group. (The per-row hover cluster was removed —
+    // CLAUDE.md parity is now two sets.) Ribbon/search bulk sites call
+    // diarizeFilesForPaths().
     void sidebar_detectSpeakersActionParityAcrossAllSites()
     {
         const QString sidebar = readAll(QStringLiteral(SUOP_QML_DIR "/Sidebar.qml"));
@@ -2917,25 +2774,7 @@ private slots:
         QVERIFY2(ribbonBlock.contains(QStringLiteral("transcriptionController.diarizeFilesForPaths(")),
                  "the ribbon detect-speakers button must call the bulk diarizeFilesForPaths() invokable");
 
-        // (2) Per-row hover-cluster detect-speakers button in treeDelegate.
-        // See the run-all parity test above on why this window overshoots the
-        // block rather than hugging it.
-        const int rowIdx = sidebar.indexOf(QStringLiteral("id: rowDetectSpeakersButton"));
-        QVERIFY2(rowIdx >= 0, "treeDelegate must have a per-row rowDetectSpeakersButton (item 52)");
-        const QString rowBlock = sidebar.mid(rowIdx, 2600);
-        QVERIFY2(rowBlock.contains(QStringLiteral("treeDelegate.relabelEligible")),
-                 "the per-row detect-speakers button must be gated on a transcribed audio row");
-        QVERIFY2(rowBlock.contains(QStringLiteral("transcriptionController.diarizeFile(")),
-                 "the per-row detect-speakers button must call diarizeFile() for that one file");
-
-        // Keyboard-nav cluster reachability: "detectSpeakers" must be a
-        // focusable action in the cluster order and dispatched on activation.
-        QVERIFY2(sidebar.contains(QStringLiteral("list.push(\"detectSpeakers\")")),
-                 "detectSpeakers must be part of currentRowActionButtons() so Left/Right can focus it (item 52)");
-        QVERIFY2(sidebar.contains(QStringLiteral("sidebar.actionButtonFocus === \"detectSpeakers\"")),
-                 "activating a keyboard-focused detectSpeakers button must dispatch diarizeFile() (item 52)");
-
-        // (3) Search-scoped detect-speakers button + its eligibility helper.
+        // (2) Search-scoped detect-speakers button + its eligibility helper.
         QVERIFY2(sidebar.contains(QStringLiteral("function searchDetectSpeakersPaths(")),
                  "a search-scoped searchDetectSpeakersPaths() eligibility helper must exist (item 52)");
         const int expandedIdx = sidebar.indexOf(QStringLiteral("id: expandedColumn"));
@@ -2950,7 +2789,7 @@ private slots:
                  "searchDetectSpeakersPaths()");
     }
 
-    // Regression: "regenerate chapters" was reachable from all three
+    // Regression: "regenerate chapters" was reachable from the
     // per-file-action-parity sites, but every one of them gated on
     // relabelEligible (isAudio required), so an orphaned .md (audio deleted,
     // text/transcript still present) could never reach it — even though
@@ -2958,10 +2797,10 @@ private slots:
     // .md's existing frontmatter/body and never touches audio (same as
     // relabelJob(), which MainPanel's regenerateLabelButton already exercises
     // for orphaned .md via orphanedMdPath/targetUrl). searchChaptersPaths()
-    // and currentRowActionButtons() already expected `relabelEligible ||
-    // isOrphanedMd` for chapters eligibility (see their existing bodies
-    // below) — the ribbon/per-row/MainPanel sites just hadn't been wired to
-    // match. No QQuickView here, so this is a source-scan guard.
+    // already expected `relabelEligible || isOrphanedMd` for chapters
+    // eligibility (see its existing body) — the ribbon/MainPanel sites just
+    // hadn't been wired to match. No QQuickView here, so this is a source-scan
+    // guard.
     void generateChapters_orphanedMdEligibleAcrossAllSites()
     {
         const QString sidebar = readAll(QStringLiteral(SUOP_QML_DIR "/Sidebar.qml"));
@@ -2971,8 +2810,8 @@ private slots:
 
         // treeDelegate's own chaptersEligible must be a strict superset of
         // relabelEligible, adding isOrphanedMd — matching the inline
-        // `relabelEligible || isOrphanedMd` expression currentRowActionButtons()
-        // and the search-results delegate already use for this same purpose.
+        // `relabelEligible || isOrphanedMd` expression the search-results
+        // delegate already uses for this same purpose.
         const int eligIdx = sidebar.indexOf(QStringLiteral("readonly property bool chaptersEligible"));
         QVERIFY2(eligIdx >= 0, "treeDelegate must expose a chaptersEligible property");
         const QString eligLine = sidebar.mid(eligIdx, 200);
@@ -2990,16 +2829,7 @@ private slots:
                  "the ribbon chapters button must target chaptersPaths (orphaned-inclusive), not "
                  "transcribedPaths (audio-only)");
 
-        // (2) Per-row hover-cluster rowChaptersButton must gate on
-        // chaptersEligible, not relabelEligible.
-        const int rowIdx = sidebar.indexOf(QStringLiteral("id: rowChaptersButton"));
-        QVERIFY2(rowIdx >= 0, "treeDelegate must have a per-row rowChaptersButton");
-        const QString rowBlock = sidebar.mid(rowIdx, 800);
-        QVERIFY2(rowBlock.contains(QStringLiteral("treeDelegate.chaptersEligible")),
-                 "the per-row chapters button must be gated on chaptersEligible so orphaned .md rows "
-                 "can reach it");
-
-        // (3) MainPanel's generateChaptersButton must support orphaned .md the
+        // (2) MainPanel's generateChaptersButton must support orphaned .md the
         // same way regenerateLabelButton already does: visible whenever
         // orphanedMdPath is set (not excluded), and dispatching against a
         // targetUrl that resolves to the orphaned path rather than

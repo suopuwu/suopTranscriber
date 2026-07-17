@@ -140,6 +140,16 @@ suop_add_test(tst_mainpanel_buttonstate LINK_QUICK LINK_SVG ICON_ASSETS LINK_GUI
     SOURCES IconTheme.cpp Clipboard.cpp TranscriptionController.cpp WhisperCppEngine.cpp VadChunker.cpp
             ModelManager.cpp AudioDecoder.cpp LabelingEngine.cpp DiarizationEngine.cpp
             EngineManifest.cpp GpuProbe.cpp SubprocessEngine.cpp EngineRegistry.cpp ParakeetEngine.cpp)
+# Loads the real MainPanel.qml and proves the live transcript follows the tail
+# as content streams in — including a single large (>threshold) growth, the case
+# that regressed. Drives the follow deterministically (no model) plus one real
+# whisper job (model-gated). Same link deps as the other real-controller
+# MainPanel harnesses. See its top-of-file comment.
+suop_add_test(tst_mainpanel_livescroll LINK_QUICK LINK_SVG ICON_ASSETS LINK_GUI
+    LINK_WHISPER LINK_LLAMA LINK_SHERPA_ONNX
+    SOURCES IconTheme.cpp Clipboard.cpp TranscriptionController.cpp WhisperCppEngine.cpp VadChunker.cpp
+            ModelManager.cpp AudioDecoder.cpp LabelingEngine.cpp DiarizationEngine.cpp
+            EngineManifest.cpp GpuProbe.cpp SubprocessEngine.cpp EngineRegistry.cpp ParakeetEngine.cpp)
 suop_add_test(tst_mainpanel_deleteundo LINK_QUICK LINK_SVG ICON_ASSETS LINK_GUI
     LINK_WHISPER LINK_LLAMA LINK_SHERPA_ONNX
     SOURCES IconTheme.cpp Clipboard.cpp VaultTreeModel.cpp TranscriptionController.cpp

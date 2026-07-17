@@ -282,6 +282,7 @@ Item {
         switch (phase) {
         case "loading": return qsTr("loading model…")
         case "decoding": return qsTr("decoding audio…")
+        case "detecting-speech": return qsTr("detecting speech…")
         case "detecting-speakers": return qsTr("detecting speakers…")
         case "detecting-speakers-segmenting": return qsTr("finding speech…")
         case "detecting-speakers-identifying": return qsTr("identifying speakers…")

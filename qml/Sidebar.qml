@@ -265,19 +265,6 @@ Rectangle {
     // the same row (single selection); Shift+arrow walks this cursor while
     // the anchor stays put, exactly like Shift+click's moving end.
     property string selectionCursorPath: ""
-    // Item 41: which of the current row's per-row action buttons currently
-    // holds keyboard focus — "" means focus is on the tree row itself (no
-    // button focused), otherwise one of "transcribe"/"relabel"/"chapters"
-    // (the actionButtonRow's declaration order). Left/Right move this in/out
-    // and along the cluster; Enter/Return/Space activate the named button for
-    // sidebar.currentPath. Kept as sidebar-level state (not real activeFocus
-    // on a delegate child) because TreeView recycles delegates, so a focused
-    // button would be lost the moment its row scrolls out of the pool.
-    property string actionButtonFocus: ""
-    // Reset button focus whenever the keyboard-current row changes (plain
-    // arrow, group-jump, or a click that opens a different file) — leaving
-    // the row must drop out of its action cluster back onto the row itself.
-    onCurrentPathChanged: sidebar.actionButtonFocus = ""
 
     // Notes (audio/orphaned .md — never directories) in on-screen order,
     // exactly as a user could click them. Same shape as moveNoteSelection's
@@ -411,7 +398,7 @@ Rectangle {
         return sidebar.searchResultNotes()
             .filter((n) => n.isAudio
                     && !sidebar.transcriptionController.matchesExistingTranscription(
-                           "file://" + n.path, AppSettings.defaultModel, false))
+                           "file://" + n.path, AppSettings.defaultModel))
             .map((n) => n.path)
     }
     function searchRelabelPaths() {
@@ -443,7 +430,7 @@ Rectangle {
         return sidebar.searchResultNotes()
             .filter((n) => n.isAudio
                     && !sidebar.transcriptionController.matchesExistingTranscription(
-                           "file://" + n.path, AppSettings.defaultModel, false))
+                           "file://" + n.path, AppSettings.defaultModel))
             .map((n) => n.path)
     }
 
@@ -518,7 +505,6 @@ Rectangle {
     // Shift-click's contiguous range. Does NOT open a file (matches
     // handleNoteClick's shift branch, which only changes selectedPaths).
     function extendNoteSelection(direction) {
-        sidebar.actionButtonFocus = ""
         const order = sidebar.visibleNotePaths()
         if (order.length === 0)
             return
@@ -570,91 +556,6 @@ Rectangle {
                 j = k
         }
         sidebar.selectAndOpenNote(order[j])
-    }
-
-    // Right/Left move keyboard focus into and along the current row's action-
-    // button cluster; Left off the first button (direction -1 from index 0)
-    // returns to the row. currentRowActionButtons() lists exactly the buttons
-    // the treeDelegate renders for currentPath, in VISUAL left-to-right order
-    // — actionButtonRow is layoutDirection: Qt.RightToLeft, so its declaration
-    // order (transcribe first) runs RIGHT-to-left on screen and this function
-    // reverses it at the end. That reversal is what makes Right actually move
-    // right: the cluster is anchored to the row's right edge, so walking
-    // rightward from the label enters at the cluster's LEFTMOST button and
-    // ends on transcribe (rightmost), and Left off the leftmost drops back to
-    // the row — one continuous left-to-right axis from the filename outward.
-    function currentRowActionButtons() {
-        if (sidebar.currentPath === "" || sidebar.searchQuery !== "")
-            return []
-        for (let row = 0; row < tree.rows; row++) {
-            const ri = tree.index(row, 0)
-            if (searchProxy.data(ri, VaultTreeModel.PathRole) !== sidebar.currentPath)
-                continue
-            const isAudio = searchProxy.data(ri, VaultTreeModel.IsAudioRole)
-            const isOrphanedMd = searchProxy.data(ri, VaultTreeModel.IsOrphanedMdRole)
-            const relabelEligible = isAudio && searchProxy.data(ri, VaultTreeModel.StatusRole) === 2
-            const chaptersEligible = relabelEligible || isOrphanedMd
-            const list = []
-            if (isAudio)
-                list.push("transcribe")
-            if (relabelEligible)
-                list.push("relabel")
-            if (chaptersEligible)
-                list.push("chapters")
-            // Item 52: detect-speakers matches rowDetectSpeakersButton's own
-            // visibility (transcribed audio only — diarization decodes the
-            // audio, so no orphaned .md, same rule as relabelEligible).
-            if (relabelEligible)
-                list.push("detectSpeakers")
-            // Items 24/53: run-all matches rowRunAllButton's own visibility
-            // (any note — audio or orphaned .md).
-            if (isAudio || isOrphanedMd)
-                list.push("runAll")
-            // Built above in actionButtonRow's declaration order (so the
-            // eligibility rules read alongside the buttons they mirror);
-            // reversed here into the on-screen left-to-right order Left/Right
-            // navigate along — see this function's doc comment.
-            return list.reverse()
-        }
-        return []
-    }
-    function focusActionButton(direction) {
-        const order = sidebar.currentRowActionButtons()
-        if (order.length === 0)
-            return
-        const next = order.indexOf(sidebar.actionButtonFocus) + direction
-        if (next < 0) {
-            sidebar.actionButtonFocus = ""    // Left out of the cluster, back to the row
-            return
-        }
-        sidebar.actionButtonFocus = order[Math.min(next, order.length - 1)]
-    }
-    // Enter/Return/Space on a keyboard-focused action button — replays the
-    // exact controller call that button's own TapHandler makes, for
-    // currentPath.
-    function activateFocusedActionButton() {
-        if (sidebar.actionButtonFocus === "" || sidebar.currentPath === ""
-                || !sidebar.transcriptionController)
-            return
-        const url = "file://" + sidebar.currentPath
-        if (sidebar.actionButtonFocus === "transcribe")
-            sidebar.transcriptionController.transcribe(
-                url, sidebar.vaultPath, AppSettings.defaultModel, false,
-                AppSettings.autoLabelEnabled, AppSettings.restrictTagsToExisting,
-                AppSettings.tagReuseBias, AppSettings.wordiness)
-        else if (sidebar.actionButtonFocus === "relabel")
-            sidebar.transcriptionController.relabel(
-                url, sidebar.vaultPath, AppSettings.restrictTagsToExisting,
-                AppSettings.tagReuseBias, AppSettings.wordiness)
-        else if (sidebar.actionButtonFocus === "chapters")
-            sidebar.transcriptionController.generateChapters(url, sidebar.vaultPath, AppSettings.chapterDensity)
-        else if (sidebar.actionButtonFocus === "detectSpeakers")
-            sidebar.transcriptionController.diarizeFile(url, sidebar.vaultPath)
-        else if (sidebar.actionButtonFocus === "runAll")
-            sidebar.transcriptionController.runAllJobs(
-                url, sidebar.vaultPath, AppSettings.defaultModel, false,
-                AppSettings.restrictTagsToExisting, AppSettings.tagReuseBias,
-                AppSettings.wordiness, AppSettings.chapterDensity)
     }
 
     // Backs the Up/Down Shortcut items near Ctrl+F's: moves to the
@@ -731,7 +632,6 @@ Rectangle {
         sidebar.selectedPaths = []
         sidebar.lastClickedPath = ""
         sidebar.selectionCursorPath = ""
-        sidebar.actionButtonFocus = ""
         // The tree swaps out for the flat results list (and back) on this
         // change, destroying the row being renamed along with it.
         sidebar.cancelRename()
@@ -759,7 +659,6 @@ Rectangle {
             sidebar.selectedPaths = []
             sidebar.lastClickedPath = ""
             sidebar.selectionCursorPath = ""
-            sidebar.actionButtonFocus = ""
             // Item 40 (drag-to-move): a reset recreates every delegate,
             // including the one whose DragHandler is driving an in-flight
             // drag. The vault watcher fires on any vault change (a
@@ -1230,7 +1129,7 @@ Rectangle {
         if (paths.length === 0)
             return
         const urls = paths.map((p) => "file://" + p)
-        sidebar.transcriptionController.transcribeAll(urls, sidebar.vaultPath, AppSettings.defaultModel, false,
+        sidebar.transcriptionController.transcribeAll(urls, sidebar.vaultPath, AppSettings.defaultModel,
                                                         AppSettings.autoLabelEnabled, AppSettings.restrictTagsToExisting,
                                                         AppSettings.tagReuseBias, AppSettings.wordiness)
     }
@@ -1771,36 +1670,6 @@ Rectangle {
         onActivated: sidebar.jumpToGroupBoundary(1)
     }
 
-    // Item 41: Left/Right move keyboard focus into/along the current row's
-    // per-row action-button cluster (transcribe/relabel/chapters). Tree-only:
-    // the flat search-results view has no such cluster. Right enters the
-    // first button; Left off the first button returns to the row.
-    Shortcut {
-        sequence: "Right"
-        enabled: tree.activeFocus
-        onActivated: sidebar.focusActionButton(1)
-    }
-    Shortcut {
-        sequence: "Left"
-        enabled: tree.activeFocus
-        onActivated: sidebar.focusActionButton(-1)
-    }
-    // Enter/Return/Space activate the keyboard-focused action button; inert
-    // (falls through to any other handler) unless a button is actually
-    // focused, so they don't shadow unrelated Space/Return uses otherwise.
-    Shortcut {
-        sequences: ["Return", "Enter", "Space"]
-        enabled: tree.activeFocus && sidebar.actionButtonFocus !== ""
-        onActivated: sidebar.activateFocusedActionButton()
-    }
-    // Escape drops out of the action cluster back onto the row (only while a
-    // button is focused, so it still reaches search-close etc. otherwise).
-    Shortcut {
-        sequence: "Escape"
-        enabled: tree.activeFocus && sidebar.actionButtonFocus !== ""
-        onActivated: sidebar.actionButtonFocus = ""
-    }
-
     Item {
         id: ribbon
         anchors.top: parent.top
@@ -1848,7 +1717,7 @@ Rectangle {
                         // silently returns empty.
                         const urls = paths.map((p) => "file://" + p)
                         sidebar.transcriptionController.transcribeAll(urls, sidebar.vaultPath, AppSettings.defaultModel,
-                                                                        false, AppSettings.autoLabelEnabled,
+                                                                        AppSettings.autoLabelEnabled,
                                                                         AppSettings.restrictTagsToExisting,
                                                                         AppSettings.tagReuseBias, AppSettings.wordiness)
                     }
@@ -1956,8 +1825,7 @@ Rectangle {
             // — runs standalone diarization over the transcribed audio files
             // (same transcribedPaths eligibility relabelAllButton uses, since
             // diarization needs an existing transcript), calling
-            // diarizeFilesForPaths(). Mirrors MainPanel's detectSpeakersButton
-            // and the per-row rowDetectSpeakersButton below.
+            // diarizeFilesForPaths(). Mirrors MainPanel's detectSpeakersButton.
             Item {
                 id: detectSpeakersAllButton
                 Layout.preferredWidth: 22
@@ -2020,7 +1888,7 @@ Rectangle {
                             return
                         const urls = paths.map((p) => "file://" + p)
                         sidebar.transcriptionController.runAllJobsForPaths(urls, sidebar.vaultPath,
-                                                                            AppSettings.defaultModel, false,
+                                                                            AppSettings.defaultModel,
                                                                             AppSettings.restrictTagsToExisting,
                                                                             AppSettings.tagReuseBias,
                                                                             AppSettings.wordiness,
@@ -2613,7 +2481,7 @@ Rectangle {
                             return
                         const urls = paths.map((p) => "file://" + p)
                         sidebar.transcriptionController.transcribeAll(urls, sidebar.vaultPath, AppSettings.defaultModel,
-                                                                        false, AppSettings.autoLabelEnabled,
+                                                                        AppSettings.autoLabelEnabled,
                                                                         AppSettings.restrictTagsToExisting,
                                                                         AppSettings.tagReuseBias, AppSettings.wordiness)
                     }
@@ -2711,8 +2579,7 @@ Rectangle {
 
             // Item 52 (CLAUDE.md per-file-action parity): search-scoped
             // "detect speakers", parity with the ribbon's detectSpeakersAllButton
-            // and treeDelegate's rowDetectSpeakersButton — over the transcribed
-            // audio in the filtered result set.
+            // — over the transcribed audio in the filtered result set.
             Item {
                 id: searchDetectSpeakersButton
                 Layout.preferredWidth: 22
@@ -2750,8 +2617,8 @@ Rectangle {
             }
 
             // Items 24/53: search-scoped "run all jobs", parity with the
-            // ribbon's runAllButton and treeDelegate's rowRunAllButton — over
-            // the untranscribed audio in the filtered result set.
+            // ribbon's runAllButton — over the untranscribed audio in the
+            // filtered result set.
             Item {
                 id: searchRunAllButton
                 Layout.preferredWidth: 22
@@ -2772,7 +2639,7 @@ Rectangle {
                             return
                         const urls = paths.map((p) => "file://" + p)
                         sidebar.transcriptionController.runAllJobsForPaths(urls, sidebar.vaultPath,
-                                                                            AppSettings.defaultModel, false,
+                                                                            AppSettings.defaultModel,
                                                                             AppSettings.restrictTagsToExisting,
                                                                             AppSettings.tagReuseBias,
                                                                             AppSettings.wordiness,
@@ -3221,7 +3088,7 @@ Rectangle {
             // speakerDetection=false (see transcribeAllButton's TapHandler).
             readonly property bool bulkEligible: treeDelegate.isAudio && sidebar.transcriptionController
                 && !sidebar.transcriptionController.matchesExistingTranscription(
-                       "file://" + treeDelegate.path, AppSettings.defaultModel, false)
+                       "file://" + treeDelegate.path, AppSettings.defaultModel)
             onBulkEligibleChanged: sidebar.setBulkEligible(treeDelegate.path, treeDelegate.bulkEligible)
 
             // Wave D item 7: inverse of bulkEligible — already-transcribed
@@ -3289,56 +3156,11 @@ Rectangle {
             // sidebar.renamingPath for why the gate is that explicit property
             // and never the editor's activeFocus. Every hover-revealed overlay
             // on the row keys off this to stay hidden for the duration of the
-            // edit (see rowActionsRevealed below, groupMergeButton,
-            // combineOrderBadge), since they all paint ON TOP of the row's
+            // edit (see groupMergeButton, combineOrderBadge), since they all paint ON TOP of the row's
             // content rather than reserving layout space: a rename is the one
             // time the row's full width is the user's to read and type in, and
             // the icons were covering the tail of a long name (user report).
             readonly property bool renamingThisRow: sidebar.renamingPath === treeDelegate.path
-
-            // Item 41: the per-row action cluster is hover-only, EXCEPT while
-            // the keyboard is actually inside this row's cluster (currentPath
-            // + a focused button, which only Left/Right can establish) — then
-            // it stays revealed without a mouse hover so the focused button
-            // has a visible target. Merely selecting/opening a row does NOT
-            // reveal its icons: they'd then sit permanently on the open file
-            // (user report), so entering the cluster is an explicit Right
-            // press. tree.activeFocus mirrors the nav Shortcuts' own gating,
-            // so focus leaving the tree re-hides them rather than stranding
-            // the icons on a row the arrows no longer drive. An open rename on
-            // this row suppresses the whole cluster regardless — the mouse
-            // necessarily sits on the row it just clicked to start the edit, so
-            // without this the icons are always up for exactly the gesture that
-            // needs the width most.
-            // (rowHover is declared further down the delegate; QML resolves id
-            // references regardless of textual order.)
-            readonly property bool rowActionsRevealed: !treeDelegate.renamingThisRow
-                    && (rowHover.hovered
-                        || (tree.activeFocus && treeDelegate.path === sidebar.currentPath
-                            && sidebar.actionButtonFocus !== ""))
-
-            // Revealing the cluster only shows its RIGHTMOST icon; the rest fan
-            // out leftward once the cursor is actually inside the cluster (or
-            // the keyboard is — Left/Right nav needs real, non-zero-width
-            // targets to focus). Merely hovering a row used to drop five icons
-            // over the tail of its filename, so the width the name lost scaled
-            // with how much work the row was eligible for. Collapsed icons
-            // animate to width 0 (not just opacity 0) and actionButtonRow's
-            // spacing animates with them, so the cluster genuinely shrinks to
-            // one icon instead of leaving a gap where the hidden ones were.
-            readonly property bool rowActionsExpanded: treeDelegate.rowActionsRevealed
-                    && (actionsHover.hovered
-                        || (tree.activeFocus && treeDelegate.path === sidebar.currentPath
-                            && sidebar.actionButtonFocus !== ""))
-
-            // Which icon survives the collapse: the rightmost VISIBLE one, in
-            // actionButtonRow's declaration order (that Row is RightToLeft, so
-            // the first declared child is the rightmost). Audio rows always
-            // have transcribe; an orphaned .md has no transcribe/relabel, so
-            // its rightmost is chapters. Directory rows have no cluster at all.
-            readonly property string rowActionsPrimary: treeDelegate.isAudio
-                    ? "transcribe"
-                    : (treeDelegate.chaptersEligible ? "chapters" : "")
 
             // Item 51: true iff this row is a member of a "ready" (would-
             // combine-if-run) split-recording group per
@@ -4118,12 +3940,9 @@ Rectangle {
                         // instead of stopping short of it. Fills whatever
                         // width the RowLayout above has left after its other,
                         // actually-visible children (see RowLayout's own doc
-                        // comment) — not shrunk to dodge the per-row
-                        // action-icon cluster (rowTranscribeButton/
-                        // rowRelabelButton/rowChaptersButton/groupMergeButton)
-                        // — those icons are hover-only overlays (declared
-                        // after this Column, so they already paint on top —
-                        // see actionButtonRow below) rather than reserved
+                        // comment) — not shrunk to dodge the hover-only
+                        // groupMergeButton overlay (declared after this Column,
+                        // so it already paints on top) rather than reserved
                         // layout space, so there's nothing to truncate for
                         // even while they're showing (user report: reserving
                         // space for them made names truncate the instant the
@@ -4268,379 +4087,6 @@ Rectangle {
                 }
             }
 
-            // Per-row action-icon cluster (transcribe/relabel/chapters) — a
-            // Row rather than each Item individually anchored to its
-            // neighbor's .left, so the cluster's actual width tracks
-            // whichever icons THIS row is actually eligible for. An
-            // untranscribed row is only ever eligible for transcribe, not
-            // relabel/chapters — with the old fixed anchor chain, the
-            // ineligible ones still occupied their 20px+4px slot (just
-            // invisible via opacity 0), so groupMergeButton (anchored off
-            // rowChaptersButton.left) always sat 3 icons' worth of gap away
-            // regardless of how many icons this row actually had (user
-            // report). `visible` here is the row's PERMANENT eligibility
-            // (isAudio/relabelEligible/chaptersEligible) — Row only reserves
-            // space for visible children — so an ineligible icon never
-            // occupies a slot at all, at any hover state. Eligible-but-
-            // collapsed icons are a separate axis: they stay `visible` and
-            // animate their own width to 0 (see each button's collapsedAway
-            // and treeDelegate.rowActionsExpanded), so the cluster fans out
-            // and back smoothly rather than snapping between eligibility
-            // sets. layoutDirection: RightToLeft keeps declaration order
-            // matching visual order (transcribe rightmost, same as before) —
-            // which also makes the FIRST declared eligible icon the one that
-            // survives the collapse (treeDelegate.rowActionsPrimary).
-            Row {
-                id: actionButtonRow
-                // Lets tst_sidebar_keynav read the whole cluster's real width,
-                // so "collapsed" can be checked as one-icon-wide rather than
-                // just as its hidden icons' own properties.
-                objectName: "actionButtonRow"
-                anchors.right: parent.right
-                anchors.rightMargin: 8
-                anchors.verticalCenter: parent.verticalCenter
-                layoutDirection: Qt.RightToLeft
-                // Collapses with the icons themselves (see
-                // treeDelegate.rowActionsExpanded) — Row inserts spacing
-                // between VISIBLE children regardless of their width, so
-                // leaving this at 4 would strand a 4px gap per collapsed icon.
-                spacing: treeDelegate.rowActionsExpanded ? 4 : 0
-
-                Behavior on spacing {
-                    NumberAnimation { duration: AppSettings.animationsEnabled ? 120 : 0 }
-                }
-
-                // The expand trigger. Sized by the Row's own contents, so while
-                // collapsed the hover region IS the lone rightmost icon, and
-                // once expanded it covers the whole fanned-out cluster
-                // (including the gaps between icons) — the cluster grows
-                // leftward, away from the cursor, so expanding can never pull
-                // the Row out from under the pointer and flip-flop.
-                HoverHandler {
-                    id: actionsHover
-                }
-
-                Item {
-                    id: rowTranscribeButton
-                    // objectName (here and on the four buttons below): lets
-                    // tst_sidebar_keynav find these by name and read their
-                    // real x, so it can check Left/Right against actual
-                    // on-screen order instead of trusting
-                    // currentRowActionButtons()'s own list order.
-                    objectName: "rowTranscribeButton"
-                    // Always available for any audio row, transcribed or
-                    // not — a manual, explicit re-run should never be
-                    // blocked (only "transcribe all"/bulkEligible above
-                    // skips already-current files; this per-row icon is a
-                    // deliberate single-file request, so it always fires).
-                    visible: treeDelegate.isAudio
-                    // Collapsed to nothing unless the cluster is expanded or
-                    // this is the row's surviving rightmost icon. clip keeps
-                    // the glyph inside the shrinking box (this Item's children
-                    // are centered in it, not sized by it). Every button below
-                    // repeats this trio with its own action key.
-                    readonly property bool collapsedAway: !treeDelegate.rowActionsExpanded
-                            && treeDelegate.rowActionsPrimary !== "transcribe"
-                    width: rowTranscribeButton.collapsedAway ? 0 : 20
-                    height: 20
-                    clip: true
-                    opacity: treeDelegate.rowActionsRevealed && !rowTranscribeButton.collapsedAway ? 1 : 0
-                    enabled: opacity > 0
-
-                    Behavior on opacity {
-                        NumberAnimation { duration: AppSettings.animationsEnabled ? 120 : 0 }
-                    }
-                    Behavior on width {
-                        NumberAnimation { duration: AppSettings.animationsEnabled ? 120 : 0 }
-                    }
-
-                    ToolTip.visible: rowTranscribeHover.hovered
-                    ToolTip.text: treeDelegate.status === 2 ? qsTr("Re-transcribe") : qsTr("Transcribe")
-                    ToolTip.delay: 500
-
-                    HoverHandler {
-                        id: rowTranscribeHover
-                        cursorShape: Qt.PointingHandCursor
-                        enabled: rowTranscribeButton.enabled
-                    }
-                    TapHandler {
-                        enabled: rowTranscribeButton.enabled
-                        onTapped: sidebar.transcriptionController.transcribe(
-                                      "file://" + treeDelegate.path, sidebar.vaultPath, AppSettings.defaultModel,
-                                      false, AppSettings.autoLabelEnabled, AppSettings.restrictTagsToExisting,
-                                      AppSettings.tagReuseBias, AppSettings.wordiness)
-                    }
-                    // Opaque backdrop so the glyph reads clearly against
-                    // whatever filename text it's overlapping (these icons
-                    // sit ON TOP of the label Text now, not beside it in
-                    // reserved space — see that Text's own doc comment) —
-                    // fades in/out together with this Item since Qt Quick
-                    // multiplies a child's opacity by its parent's, so no
-                    // separate Behavior needed here.
-                    Rectangle {
-                        anchors.fill: parent
-                        radius: AppSettings.borderRadius
-                        color: AppSettings.sidebarBackgroundColor
-                    }
-                    HoverBorder {
-                        anchors.fill: parent
-                        // Item 41: also outline when this button holds
-                        // keyboard focus (Left/Right cluster nav) on the
-                        // current row.
-                        active: (rowTranscribeButton.enabled && rowTranscribeHover.hovered)
-                                || (tree.activeFocus && treeDelegate.path === sidebar.currentPath
-                                    && sidebar.actionButtonFocus === "transcribe")
-                    }
-                    AppIcon {
-                        anchors.centerIn: parent
-                        name: "transcribe"
-                        color: "#dddddd"
-                        iconSize: 13
-                    }
-                }
-
-                // Wave D item 7: per-row "regenerate auto-title", same
-                // fade-in pattern as rowTranscribeButton but for
-                // already-transcribed rows.
-                Item {
-                    id: rowRelabelButton
-                    objectName: "rowRelabelButton"
-                    visible: treeDelegate.relabelEligible
-                    // See rowTranscribeButton's collapsedAway above.
-                    readonly property bool collapsedAway: !treeDelegate.rowActionsExpanded
-                            && treeDelegate.rowActionsPrimary !== "relabel"
-                    width: rowRelabelButton.collapsedAway ? 0 : 20
-                    height: 20
-                    clip: true
-                    opacity: treeDelegate.rowActionsRevealed && !rowRelabelButton.collapsedAway ? 1 : 0
-                    enabled: opacity > 0
-
-                    Behavior on opacity {
-                        NumberAnimation { duration: AppSettings.animationsEnabled ? 120 : 0 }
-                    }
-                    Behavior on width {
-                        NumberAnimation { duration: AppSettings.animationsEnabled ? 120 : 0 }
-                    }
-
-                    ToolTip.visible: rowRelabelHover.hovered
-                    ToolTip.text: qsTr("Regenerate auto-title")
-                    ToolTip.delay: 500
-
-                    HoverHandler {
-                        id: rowRelabelHover
-                        cursorShape: Qt.PointingHandCursor
-                        enabled: rowRelabelButton.enabled
-                    }
-                    TapHandler {
-                        enabled: rowRelabelButton.enabled
-                        onTapped: sidebar.transcriptionController.relabel(
-                                      "file://" + treeDelegate.path, sidebar.vaultPath,
-                                      AppSettings.restrictTagsToExisting, AppSettings.tagReuseBias,
-                                      AppSettings.wordiness)
-                    }
-                    // See rowTranscribeButton's identical backdrop above.
-                    Rectangle {
-                        anchors.fill: parent
-                        radius: AppSettings.borderRadius
-                        color: AppSettings.sidebarBackgroundColor
-                    }
-                    HoverBorder {
-                        anchors.fill: parent
-                        active: (rowRelabelButton.enabled && rowRelabelHover.hovered)
-                                || (tree.activeFocus && treeDelegate.path === sidebar.currentPath
-                                    && sidebar.actionButtonFocus === "relabel")
-                    }
-                    AppIcon {
-                        anchors.centerIn: parent
-                        name: "relabel"
-                        color: "#dddddd"
-                        iconSize: 13
-                    }
-                }
-
-                // Per-row "regenerate chapters", same fade-in shape as
-                // rowRelabelButton but gated on chaptersEligible instead of
-                // relabelEligible — orphaned .md rows qualify too, since
-                // chapter generation never touches audio (see
-                // chaptersEligible's doc comment above).
-                Item {
-                    id: rowChaptersButton
-                    objectName: "rowChaptersButton"
-                    visible: treeDelegate.chaptersEligible
-                    // See rowTranscribeButton's collapsedAway above.
-                    readonly property bool collapsedAway: !treeDelegate.rowActionsExpanded
-                            && treeDelegate.rowActionsPrimary !== "chapters"
-                    width: rowChaptersButton.collapsedAway ? 0 : 20
-                    height: 20
-                    clip: true
-                    opacity: treeDelegate.rowActionsRevealed && !rowChaptersButton.collapsedAway ? 1 : 0
-                    enabled: opacity > 0
-
-                    Behavior on opacity {
-                        NumberAnimation { duration: AppSettings.animationsEnabled ? 120 : 0 }
-                    }
-                    Behavior on width {
-                        NumberAnimation { duration: AppSettings.animationsEnabled ? 120 : 0 }
-                    }
-
-                    ToolTip.visible: rowChaptersHover.hovered
-                    ToolTip.text: qsTr("Regenerate chapters")
-                    ToolTip.delay: 500
-
-                    HoverHandler {
-                        id: rowChaptersHover
-                        cursorShape: Qt.PointingHandCursor
-                        enabled: rowChaptersButton.enabled
-                    }
-                    TapHandler {
-                        enabled: rowChaptersButton.enabled
-                        onTapped: sidebar.transcriptionController.generateChapters(
-                                      "file://" + treeDelegate.path, sidebar.vaultPath, AppSettings.chapterDensity)
-                    }
-                    // See rowTranscribeButton's identical backdrop above.
-                    Rectangle {
-                        anchors.fill: parent
-                        radius: AppSettings.borderRadius
-                        color: AppSettings.sidebarBackgroundColor
-                    }
-                    HoverBorder {
-                        anchors.fill: parent
-                        active: (rowChaptersButton.enabled && rowChaptersHover.hovered)
-                                || (tree.activeFocus && treeDelegate.path === sidebar.currentPath
-                                    && sidebar.actionButtonFocus === "chapters")
-                    }
-                    AppIcon {
-                        anchors.centerIn: parent
-                        name: "chapters"
-                        color: "#dddddd"
-                        iconSize: 13
-                    }
-                }
-
-                // Item 52 (CLAUDE.md per-file-action parity): per-row "detect
-                // speakers", same fade-in shape as rowChaptersButton but gated
-                // on relabelEligible (transcribed audio only — diarization
-                // decodes the audio, so no orphaned .md). Calls diarizeFile()
-                // like MainPanel's detectSpeakersButton.
-                Item {
-                    id: rowDetectSpeakersButton
-                    objectName: "rowDetectSpeakersButton"
-                    visible: treeDelegate.relabelEligible
-                    // See rowTranscribeButton's collapsedAway above.
-                    readonly property bool collapsedAway: !treeDelegate.rowActionsExpanded
-                            && treeDelegate.rowActionsPrimary !== "detectSpeakers"
-                    width: rowDetectSpeakersButton.collapsedAway ? 0 : 20
-                    height: 20
-                    clip: true
-                    opacity: treeDelegate.rowActionsRevealed && !rowDetectSpeakersButton.collapsedAway ? 1 : 0
-                    enabled: opacity > 0
-
-                    Behavior on opacity {
-                        NumberAnimation { duration: AppSettings.animationsEnabled ? 120 : 0 }
-                    }
-                    Behavior on width {
-                        NumberAnimation { duration: AppSettings.animationsEnabled ? 120 : 0 }
-                    }
-
-                    ToolTip.visible: rowDetectSpeakersHover.hovered
-                    ToolTip.text: qsTr("Detect speakers")
-                    ToolTip.delay: 500
-
-                    HoverHandler {
-                        id: rowDetectSpeakersHover
-                        cursorShape: Qt.PointingHandCursor
-                        enabled: rowDetectSpeakersButton.enabled
-                    }
-                    TapHandler {
-                        enabled: rowDetectSpeakersButton.enabled
-                        onTapped: sidebar.transcriptionController.diarizeFile(
-                                      "file://" + treeDelegate.path, sidebar.vaultPath)
-                    }
-                    // See rowTranscribeButton's identical backdrop above.
-                    Rectangle {
-                        anchors.fill: parent
-                        radius: AppSettings.borderRadius
-                        color: AppSettings.sidebarBackgroundColor
-                    }
-                    HoverBorder {
-                        anchors.fill: parent
-                        active: (rowDetectSpeakersButton.enabled && rowDetectSpeakersHover.hovered)
-                                || (tree.activeFocus && treeDelegate.path === sidebar.currentPath
-                                    && sidebar.actionButtonFocus === "detectSpeakers")
-                    }
-                    AppIcon {
-                        anchors.centerIn: parent
-                        name: "speakers"
-                        color: "#dddddd"
-                        iconSize: 13
-                    }
-                }
-
-                // Items 24/53: per-row "run all jobs" — full transcribe->
-                // label->chapters pipeline for THIS one file. Visible for any
-                // note (audio or orphaned .md); runAllJobs() skips the
-                // transcribe step for anything already transcribed (incl. an
-                // orphaned .md), so it's the right action regardless of status.
-                Item {
-                    id: rowRunAllButton
-                    objectName: "rowRunAllButton"
-                    visible: treeDelegate.isAudio || treeDelegate.isOrphanedMd
-                    // See rowTranscribeButton's collapsedAway above. runAll is
-                    // never a row's rightmost icon (anything eligible for it is
-                    // eligible for transcribe or chapters, both declared before
-                    // it), so it always collapses.
-                    readonly property bool collapsedAway: !treeDelegate.rowActionsExpanded
-                            && treeDelegate.rowActionsPrimary !== "runAll"
-                    width: rowRunAllButton.collapsedAway ? 0 : 20
-                    height: 20
-                    clip: true
-                    opacity: treeDelegate.rowActionsRevealed && !rowRunAllButton.collapsedAway ? 1 : 0
-                    enabled: opacity > 0
-
-                    Behavior on opacity {
-                        NumberAnimation { duration: AppSettings.animationsEnabled ? 120 : 0 }
-                    }
-                    Behavior on width {
-                        NumberAnimation { duration: AppSettings.animationsEnabled ? 120 : 0 }
-                    }
-
-                    ToolTip.visible: rowRunAllHover.hovered
-                    ToolTip.text: qsTr("Run all jobs (transcribe, label, chapters)")
-                    ToolTip.delay: 500
-
-                    HoverHandler {
-                        id: rowRunAllHover
-                        cursorShape: Qt.PointingHandCursor
-                        enabled: rowRunAllButton.enabled
-                    }
-                    TapHandler {
-                        enabled: rowRunAllButton.enabled
-                        onTapped: sidebar.transcriptionController.runAllJobs(
-                                      "file://" + treeDelegate.path, sidebar.vaultPath, AppSettings.defaultModel,
-                                      false, AppSettings.restrictTagsToExisting, AppSettings.tagReuseBias,
-                                      AppSettings.wordiness, AppSettings.chapterDensity)
-                    }
-                    // See rowTranscribeButton's identical backdrop above.
-                    Rectangle {
-                        anchors.fill: parent
-                        radius: AppSettings.borderRadius
-                        color: AppSettings.sidebarBackgroundColor
-                    }
-                    HoverBorder {
-                        anchors.fill: parent
-                        active: (rowRunAllButton.enabled && rowRunAllHover.hovered)
-                                || (tree.activeFocus && treeDelegate.path === sidebar.currentPath
-                                    && sidebar.actionButtonFocus === "runAll")
-                    }
-                    AppIcon {
-                        anchors.centerIn: parent
-                        name: "run-all"
-                        color: "#dddddd"
-                        iconSize: 13
-                    }
-                }
-            }
-
             // Item 51 refinement: ONE "combine this group now" button per
             // group, not one per row — it used to live in this row's
             // already-busy per-file action cluster (transcribe/relabel/
@@ -4656,10 +4102,8 @@ Rectangle {
             // group has one action," not another per-row icon.
             Item {
                 id: groupMergeButton
-                // Fixed to the row's top-left corner instead of anchored
-                // off actionButtonRow (rowTranscribeButton/rowRelabelButton/
-                // rowChaptersButton) — this button only ever renders on the
-                // group's TOP row (see visible below), but the hover that
+                // Fixed to the row's top-left corner — this button only ever
+                // renders on the group's TOP row (see visible below), but the hover that
                 // reveals it (sidebar.hoveredCombineGroup) can be triggered
                 // by ANY row in the group, not just this one. Anchoring
                 // relative to a sibling cluster whose own layout can shift
@@ -4697,7 +4141,8 @@ Rectangle {
                                   treeDelegate.combineOutputPath, sidebar.vaultPath,
                                   AppSettings.deleteOriginalsAfterCombine)
                 }
-                // See rowTranscribeButton's identical backdrop doc comment.
+                // Opaque backdrop so the icon stays readable painted over the
+                // row's own content (name/status) rather than blending into it.
                 Rectangle {
                     anchors.fill: parent
                     radius: AppSettings.borderRadius

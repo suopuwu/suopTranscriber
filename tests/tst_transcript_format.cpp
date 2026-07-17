@@ -990,7 +990,7 @@ private slots:
 
         {
             QSignalSpy spy(&controller, &TranscriptionController::finished);
-            controller.transcribe(audioUrl, vaultUrl, QStringLiteral("base.en"), false, /*autoLabel=*/false);
+            controller.transcribe(audioUrl, vaultUrl, QStringLiteral("base.en"));
             QVERIFY(spy.wait(30000));
             QVERIFY2(spy.at(0).at(1).toBool(), qPrintable(spy.at(0).at(2).toString()));
         }
@@ -1296,12 +1296,15 @@ private slots:
         QVERIFY(dir.isValid());
         TranscriptionController controller;
         QVERIFY(!controller.matchesExistingTranscription(QUrl::fromLocalFile(dir.path() + "/nothing.wav"),
-                                                           QStringLiteral("base.en"), false));
+                                                           QStringLiteral("base.en")));
     }
 
-    // Same modelId (mapped to the same ggml file) and same speakerDetection
-    // (false) as what's stored -> matches; a DIFFERENT modelId -> doesn't.
-    void matchesExistingTranscription_comparesModelAndSpeakerDetection()
+    // Same modelId (mapped to the same ggml file) as what's stored -> matches;
+    // a DIFFERENT modelId -> doesn't. Speaker detection is a separate task now
+    // (diarizeFile()), not something Transcribe produces, so it's NOT part of
+    // this equality check — a file's stored speakerDetection flag never affects
+    // whether "transcribe all" considers it already current.
+    void matchesExistingTranscription_comparesModelOnly()
     {
         QTemporaryDir dir;
         QVERIFY(dir.isValid());
@@ -1311,18 +1314,14 @@ private slots:
         const QUrl audioUrl = QUrl::fromLocalFile(dir.path() + "/meeting.wav");
         TranscriptionController controller;
 
-        QVERIFY(controller.matchesExistingTranscription(audioUrl, QStringLiteral("base.en"), false));
-        QVERIFY(!controller.matchesExistingTranscription(audioUrl, QStringLiteral("small.en"), false));
-        // Same modelId, but speakerDetection differs from what's stored.
-        QVERIFY(!controller.matchesExistingTranscription(audioUrl, QStringLiteral("base.en"), true));
+        QVERIFY(controller.matchesExistingTranscription(audioUrl, QStringLiteral("base.en")));
+        QVERIFY(!controller.matchesExistingTranscription(audioUrl, QStringLiteral("small.en")));
     }
 
-    // Speaker diarization is a separate pass, independent of which whisper
-    // model is selected (see DESIGN.md "Speaker diarization" — unlike the
-    // removed tdrz override, it no longer forces a specific model file). So
-    // a DIFFERENT modelId genuinely means "differs" even when
-    // speakerDetection matches on both sides.
-    void matchesExistingTranscription_speakerDetectionNoLongerOverridesModelId()
+    // Speaker detection state is irrelevant to the match — even a file stored
+    // WITH speakers detected (speakerDetection: true) matches on modelId alone,
+    // and a DIFFERENT modelId genuinely means "differs".
+    void matchesExistingTranscription_ignoresStoredSpeakerDetection()
     {
         QTemporaryDir dir;
         QVERIFY(dir.isValid());
@@ -1333,8 +1332,8 @@ private slots:
         const QUrl audioUrl = QUrl::fromLocalFile(dir.path() + "/interview.wav");
         TranscriptionController controller;
 
-        QVERIFY(controller.matchesExistingTranscription(audioUrl, QStringLiteral("tiny.en"), true));
-        QVERIFY(!controller.matchesExistingTranscription(audioUrl, QStringLiteral("medium.en"), true));
+        QVERIFY(controller.matchesExistingTranscription(audioUrl, QStringLiteral("tiny.en")));
+        QVERIFY(!controller.matchesExistingTranscription(audioUrl, QStringLiteral("medium.en")));
     }
 
     // "no separate JSON sidecar" — the one .md is the entire durable record.
@@ -1507,10 +1506,17 @@ private slots:
     // (corrupt/incompatible file — the deterministic, network-independent
     // way to exercise this: plant EMPTY files at the exact expected paths,
     // so ensureDiarizationModels() finds them "already downloaded" but
-    // DiarizationEngine's Create() fails to load them as real ONNX), ASR
-    // must still complete successfully — speakerDetection reads false and
-    // speakerDetectionError explains why, rather than failing the whole job.
-    void speakerDetection_modelsUnavailable_degradesGracefully()
+    // DiarizationEngine's Create() fails to load them as real ONNX):
+    // Transcribe itself is pure ASR now and completely unaffected (it never
+    // touches diarization models at all) — it's the SEPARATE standalone
+    // diarizeFile() job that fails, cleanly, without corrupting the already
+    // -written transcript. Unlike the old inline transcribe-time toggle this
+    // replaced, the standalone job does NOT degrade gracefully (detecting
+    // speakers is its only purpose — see diarizeJob()'s doc comment): a
+    // model-load failure is reported via finished(ok=false) and the .md is
+    // left completely untouched (no speakerDetection/speakerDetectionError
+    // frontmatter change, since the failure happens before any write).
+    void detectSpeakers_modelsUnavailable_failsJobWithoutTouchingTranscript()
     {
         const QString modelPath = locateRealModel();
         if (modelPath.isEmpty())
@@ -1526,8 +1532,8 @@ private slots:
         // Fake (empty, unloadable) diarization models — see comment above:
         // this makes ensureDiarizationModels() skip its (network-dependent)
         // download entirely, while DiarizationEngine still fails to load
-        // them, deterministically exercising the degrade-gracefully path
-        // without depending on network being unavailable in this environment.
+        // them, deterministically exercising the failure path without
+        // depending on network being unavailable in this environment.
         QFile fakeSeg(modelsDir + "/pyannote-segmentation-3.0-int8.onnx");
         QVERIFY(fakeSeg.open(QIODevice::WriteOnly));
         fakeSeg.close();
@@ -1539,21 +1545,34 @@ private slots:
         QVERIFY(QFile::copy(QStringLiteral(SUOP_SAMPLES_DIR "/jfk.wav"), samplePath));
 
         TranscriptionController controller;
-        QSignalSpy finishedSpy(&controller, &TranscriptionController::finished);
+        const QUrl vaultUrl = QUrl::fromLocalFile(vault.path());
         const QUrl audioUrl = QUrl::fromLocalFile(samplePath);
-        controller.transcribe(audioUrl, QUrl::fromLocalFile(vault.path()), QStringLiteral("base.en"),
-                               /*speakerDetection=*/true);
 
-        QVERIFY(finishedSpy.wait(30000));
-        // ASR itself must still succeed — a diarization failure never blocks
-        // the transcription.
-        QVERIFY2(finishedSpy.at(0).at(1).toBool(), qPrintable(finishedSpy.at(0).at(2).toString()));
+        // Transcribe first (pure ASR — never touches diarization models).
+        QSignalSpy transcribeSpy(&controller, &TranscriptionController::finished);
+        controller.transcribe(audioUrl, vaultUrl, QStringLiteral("base.en"));
+        QVERIFY(transcribeSpy.wait(30000));
+        QVERIFY2(transcribeSpy.at(0).at(1).toBool(), qPrintable(transcribeSpy.at(0).at(2).toString()));
 
-        const QVariantMap meta = controller.readMetadata(audioUrl);
-        QCOMPARE(meta.value("speakerDetection"), QVariant(false));
-        QVERIFY2(!meta.value("speakerDetectionError").toString().isEmpty(),
-                 "expected a non-empty speakerDetectionError explaining why detection didn't run");
-        QVERIFY(!controller.readTranscriptBody(audioUrl).isEmpty());
+        const QVariantMap metaBefore = controller.readMetadata(audioUrl);
+        QCOMPARE(metaBefore.value("speakerDetection"), QVariant(false));
+        QVERIFY(metaBefore.value("speakerDetectionError").toString().isEmpty());
+        const QString bodyBefore = controller.readTranscriptBody(audioUrl);
+        QVERIFY(!bodyBefore.isEmpty());
+
+        // Now the standalone detect-speakers job — must fail cleanly, and
+        // must not touch the transcript it already read.
+        QSignalSpy diarizeSpy(&controller, &TranscriptionController::finished);
+        controller.diarizeFile(audioUrl, vaultUrl);
+        QVERIFY(diarizeSpy.wait(30000));
+        QVERIFY2(!diarizeSpy.at(0).at(1).toBool(),
+                 "detect-speakers must fail (not degrade gracefully) when its models are unloadable");
+        QVERIFY(!diarizeSpy.at(0).at(2).toString().isEmpty());
+
+        const QVariantMap metaAfter = controller.readMetadata(audioUrl);
+        QCOMPARE(metaAfter.value("speakerDetection"), QVariant(false));
+        QVERIFY(metaAfter.value("speakerDetectionError").toString().isEmpty());
+        QCOMPARE(controller.readTranscriptBody(audioUrl), bodyBefore);
     }
 
     // Full auto-labeling wiring, end to end: transcribe(..., autoLabel=true)
@@ -1586,7 +1605,7 @@ private slots:
         TranscriptionController controller;
         QSignalSpy finishedSpy(&controller, &TranscriptionController::finished);
         const QUrl audioUrl = QUrl::fromLocalFile(samplePath);
-        controller.transcribe(audioUrl, QUrl::fromLocalFile(vault.path()), QStringLiteral("base.en"), false,
+        controller.transcribe(audioUrl, QUrl::fromLocalFile(vault.path()), QStringLiteral("base.en"),
                                /*autoLabel=*/true);
 
         // Both the transcribe AND its follow-up label job appear immediately
@@ -1656,7 +1675,7 @@ private slots:
         // don't exist yet.
         {
             QSignalSpy spy(&controller, &TranscriptionController::finished);
-            controller.transcribe(audioUrl, vaultUrl, QStringLiteral("base.en"), false, /*autoLabel=*/false);
+            controller.transcribe(audioUrl, vaultUrl, QStringLiteral("base.en"));
             QVERIFY(spy.wait(30000));
             QVERIFY2(spy.at(0).at(1).toBool(), qPrintable(spy.at(0).at(2).toString()));
         }
@@ -1741,7 +1760,7 @@ private slots:
 
         {
             QSignalSpy spy(&controller, &TranscriptionController::finished);
-            controller.transcribe(audioUrl, vaultUrl, QStringLiteral("base.en"), false, /*autoLabel=*/false);
+            controller.transcribe(audioUrl, vaultUrl, QStringLiteral("base.en"));
             QVERIFY(spy.wait(30000));
             QVERIFY2(spy.at(0).at(1).toBool(), qPrintable(spy.at(0).at(2).toString()));
         }

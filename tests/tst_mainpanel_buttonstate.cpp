@@ -204,8 +204,8 @@ private slots:
         // Deterministic pre-event-loop snapshot (see tst_transcription_queue):
         // startJob() runs synchronously in transcribe(), so A is Active and B
         // Queued before the worker's cross-thread finished() can arrive.
-        controller->transcribe(fileA, QUrl::fromLocalFile(m_vaultDir.path()), kModelId, false);
-        controller->transcribe(fileB, QUrl::fromLocalFile(m_vaultDir.path()), kModelId, false);
+        controller->transcribe(fileA, QUrl::fromLocalFile(m_vaultDir.path()), kModelId);
+        controller->transcribe(fileB, QUrl::fromLocalFile(m_vaultDir.path()), kModelId);
 
         const QStringList active = busyOrQueuedUrls(panel);
         QVERIFY2(active.contains(fileA.toString()),
@@ -259,11 +259,12 @@ private slots:
     }
 
     // Bug 2: onFinished() must reload the transcript BODY (nothing else does —
-    // the metadata refreshes leave it stale) and, when the finished file is the
-    // open one, follow to the bottom. Real transcription needs a model and the
-    // scroll is geometry-dependent, so this is a source-scan guard on the
-    // handler body (see this file's top comment for why).
-    void onFinished_reloadsBodyAndFollowsToBottom()
+    // the metadata refreshes leave it stale), guarded on the finished file still
+    // being the open one. That reload's contentHeight growth is what drives the
+    // follow-to-bottom (armed via followingTail) — the scroll itself is proven
+    // end-to-end in tst_mainpanel_livescroll, not here. Source-scan guard because
+    // a real transcription needs a model (see this file's top comment).
+    void onFinished_reloadsBodyForTheOpenFile()
     {
         QFile src(QStringLiteral(SUOP_QML_DIR "/MainPanel.qml"));
         QVERIFY2(src.open(QIODevice::ReadOnly), "MainPanel.qml must be readable");
@@ -279,10 +280,8 @@ private slots:
         QVERIFY2(body.contains(QStringLiteral("refreshTranscriptSync()")),
                  "onFinished must reload the transcript body — otherwise a burst-emitting engine's "
                  "tail (Parakeet) never appears until the file is reopened");
-        QVERIFY2(body.contains(QStringLiteral("contentHeight - flick.height")),
-                 "onFinished must follow to the bottom so the final segments scroll into view");
         QVERIFY2(body.contains(QStringLiteral("mainPanel.player.source.toString()")),
-                 "onFinished's body reload/scroll must be guarded on the finished file still being open");
+                 "onFinished's body reload must be guarded on the finished file still being open");
     }
 };
 

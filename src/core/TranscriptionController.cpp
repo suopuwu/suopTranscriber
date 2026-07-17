@@ -1551,7 +1551,7 @@ public:
     bool isCancelRequested() const { return m_cancelRequested.load(); }
 
 public slots:
-    void run(const QString &filePath, const QString &vaultPath, const QString &modelId, bool speakerDetection)
+    void run(const QString &filePath, const QString &vaultPath, const QString &modelId)
     {
         // GPU memory hygiene: transcribe and label jobs never run
         // concurrently (this worker runs at most one job at a time), so
@@ -1694,94 +1694,24 @@ public slots:
             return;
         }
 
-        // Speaker diarization (see DESIGN.md "Speaker diarization") is a
-        // full pass over the WHOLE file's audio, run BEFORE whisper
-        // transcription starts — unlike tdrz, it's independent of which
-        // whisper model is selected. Running it first means the real
-        // speaker-label set is already known by the time frontmatter is
-        // written below (no post-hoc splice needed), and each whisper
-        // segment can be labeled via a simple time-overlap lookup as it
-        // streams in. A failure here NEVER blocks the transcription — ASR
-        // still runs, frontmatter honestly records speakerDetection: false
-        // + why (see writeFrontmatter()'s doc comment).
-        std::vector<DiarizedTurn> diarizedTurns;
-        bool effectiveSpeakerDetection = false;
-        QString speakerDetectionError;
-        if (speakerDetection) {
-            // GPU memory hygiene: whisper's GPU-resident weights + KV cache
-            // have no reason to sit warm through diarization — it's a
-            // separate pass that doesn't touch m_engine at all (see below),
-            // and leaving them resident means whisper.cpp's own CUDA
-            // allocator and onnxruntime's CUDA allocator (DiarizationEngine)
-            // are both live on the same device at once. Two independent
-            // allocators fragmenting one device's address space is exactly
-            // what let a real "Failed to allocate memory for requested
-            // buffer" BFCArena error through even with plenty of aggregate
-            // free VRAM (see patches/sherpa-onnx-batch-segmentation.patch's
-            // item 5, a companion fix for the same failure). Reloaded right
-            // after diarization finishes below — costs one extra model load
-            // (a few seconds), the same trade already accepted for
-            // m_labelingEngine at the top of this job.
-            m_engine.reset();
+        // Transcribe is pure ASR — speaker diarization is a SEPARATE task now
+        // (the standalone diarizeFile() job / "Detect speakers" action, or the
+        // diarize step of the runAllJobs() pipeline), never run inline here.
+        // A fresh transcript is therefore always written speaker-less; the
+        // diarize job later splices "[Speaker N]" tags + "speakers:" into the
+        // .md in place (see spliceBodySpeakers()). See DESIGN.md "Speaker
+        // diarization".
 
-            // Item 52: the diarization core is shared with the standalone
-            // diarizeJob() — see runDiarizationPass()'s doc comment for the
-            // phase/sub-phase reporting, pause-blocks/cancel-not-actionable
-            // semantics, and the never-misrepresent (effective/error) contract
-            // this branch relies on.
-            diarizedTurns = runDiarizationPass(*pcm, vaultPath, &effectiveSpeakerDetection, &speakerDetectionError);
-        }
-        // Diarization only contributes a rolling-average timing sample when
-        // it actually ran successfully — a failed/unavailable-models attempt
-        // is fast and not representative of a real diarization pass (see
-        // speakerDetectionError above), so recording it would drag the
-        // average down for every future job's bar proportions. Restarted
-        // unconditionally either way — this is also "transcribing"'s start
-        // baseline when speaker detection wasn't requested at all.
-        const qint64 detectingSpeakersMs = phaseTimer.restart();
-        if (effectiveSpeakerDetection)
-            emit phaseDurationMs(QStringLiteral("detecting-speakers"), detectingSpeakersMs);
-        // Diarization is a one-shot pass at the START of this job (above) —
-        // nothing from here to the end of run() touches it again, so its
-        // GPU/CPU resources are freed now rather than left resident through
-        // the whole (often much longer) transcription phase that follows.
-        // runDiarizationPass() already evicts on the speaker-detection path;
-        // this defensive reset also covers the speakerDetection==false path
-        // (where the helper never ran) — resetting an already-null pointer is
-        // a no-op.
-        m_diarizationEngine.reset();
-
-        // Reload the engine now that diarization's GPU footprint is gone (see
-        // the eviction above) — a no-op if speaker detection wasn't requested,
-        // since m_engine was never evicted in that case. Same engine:model
-        // branch as the first construction above.
-        if (!m_engine || !m_engine->isValid() || m_modelPath != modelPath) {
-            if (useSubprocessEngine)
-                m_engine = std::make_unique<SubprocessEngine>(engineDesc.manifest, engineDesc.dir);
-            else if (useParakeet) {
-                const ModelManager::ParakeetModelPaths p =
-                    ModelManager::parakeetModelPaths(QUrl::fromLocalFile(vaultPath));
-                m_engine = std::make_unique<ParakeetEngine>(p.encoder, p.decoder, p.joiner, p.tokens);
-            } else
-                m_engine = std::make_unique<WhisperCppEngine>(modelPath);
-            m_modelPath = modelPath;
-        }
-        if (!m_engine->isValid()) {
-            emit finished(false, QStringLiteral("failed to load model at %1").arg(modelPath));
-            return;
-        }
-
-        // Wave N (task system): a cancel requested DURING diarization (which
-        // has no mid-pass abort hook — see the diarize() lambda's doc
-        // comment above) takes effect here instead, right before any file
-        // I/O happens — also doubles as a normal pause checkpoint between
-        // phases for a job that wasn't paused during diarization at all.
+        // Wave N (task system): a cancel (or pause) requested during "loading"
+        // or "decoding" takes effect here, right after the decode finishes and
+        // before any file I/O happens — a normal pause/cancel checkpoint
+        // between phases.
         if (waitWhilePausedOrCancelled()) {
             emit finished(false, QStringLiteral("Cancelled"));
             return;
         }
 
-        // VAD (this feature — DESIGN.md "Durable / resumable transcription",
+        // "detecting-speech": VAD windowing (DESIGN.md "Durable / resumable transcription",
         // chunking half; see VadChunker.h): one small model does double duty —
         // (a) whisper.cpp's own per-window silence gating (set on m_engine
         // below) and (b) finding VAD-aligned window boundaries so a long file
@@ -1789,8 +1719,16 @@ public slots:
         // one unbounded one (reduces long-context hallucination drift). A
         // download/load failure degrades gracefully to today's single
         // whole-file window with no gating — never blocks the job — recorded
-        // honestly in frontmatter below, same contract as speaker detection's
-        // speakerDetectionError.
+        // honestly in frontmatter below.
+        //
+        // Given its own visible phase (VAD is a real, sometimes-slow step:
+        // one small-model download on first run + one blocking computeWindows()
+        // call with no native progress hook — so its bar fraction is
+        // synthesized elapsed-vs-average, like "loading"/"decoding", see
+        // phaseRelativeSyntheticProgress()). The timer is restarted here so its
+        // duration is recorded separately from "transcribing" below.
+        emit phase(QStringLiteral("detecting-speech"));
+        phaseTimer.restart();
         QString vadError;
         std::vector<VadChunker::Window> windows;
         bool vadActive = false;
@@ -1823,18 +1761,21 @@ public slots:
                 whisper->setVadModelPath(vadActive ? vadModelPath : QString());
         }
 
+        // Record the VAD phase's duration for the rolling-average bar
+        // weighting (recomputeOverallProgress()) and restart for "transcribing".
+        emit phaseDurationMs(QStringLiteral("detecting-speech"), phaseTimer.restart());
+
         QFile mdFile(sidecarPath(filePath));
         if (!mdFile.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
             emit finished(false, QStringLiteral("could not open %1 for writing").arg(mdFile.fileName()));
             return;
         }
 
-        QStringList speakerLabels;
-        for (int i = 1; i <= distinctSpeakerCount(diarizedTurns); ++i)
-            speakerLabels.append(QStringLiteral("Speaker %1").arg(i));
-
-        writeFrontmatter(mdFile, modelUsedName, effectiveSpeakerDetection, modelFallback, modelId,
-                          speakerLabels, speakerDetectionError, vadActive, vadError);
+        // Pure-ASR transcript: no speaker detection at transcribe time, so
+        // frontmatter records speakerDetection: false with an empty speaker
+        // list (the standalone diarize job splices real speakers in later).
+        writeFrontmatter(mdFile, modelUsedName, /*speakerDetection=*/false, modelFallback, modelId,
+                          /*speakerLabels=*/{}, /*speakerDetectionError=*/QString(), vadActive, vadError);
         SegmentLineWriter lineWriter(mdFile);
 
         // "transcribing": whisper's own per-segment progress, blended across
@@ -1893,7 +1834,7 @@ public slots:
                     totalFileSeconds > 0 ? (secondsDoneInPriorWindows + done) / totalFileSeconds : 0.0;
                 emit progress(fraction);
             };
-            SegmentCallback onSegment = [&lineWriter, &diarizedTurns, effectiveSpeakerDetection, &liveTimer,
+            SegmentCallback onSegment = [&lineWriter, &liveTimer,
                                           &lastLiveTickMs, &chunk, this](const Segment &rawSegment) {
                 // Chunk offset merge is the app's job (see
                 // WhisperCppEngine.cpp/DESIGN.md "Engine architecture") — this
@@ -1902,13 +1843,9 @@ public slots:
                 Segment segment = rawSegment;
                 segment.t0 += chunk.offsetSeconds;
                 segment.t1 += chunk.offsetSeconds;
-                // See isNonSpeechAnnotation()'s doc comment: a hallucinated
-                // "[APPLAUSE]"/"[MUSIC]"/etc. segment never gets a speaker
-                // label, regardless of what diarization found nearby.
-                const bool isSpeech = !isNonSpeechAnnotation(QString::fromStdString(segment.text).trimmed());
-                const QString label = (effectiveSpeakerDetection && isSpeech)
-                    ? labelForSegment(diarizedTurns, segment.t0, segment.t1) : QString();
-                lineWriter.append(segment, label);
+                // Pure ASR — no speaker label written at transcribe time (the
+                // standalone diarize job adds "[Speaker N]" tags later).
+                lineWriter.append(segment, QString());
 
                 const qint64 nowMs = liveTimer.elapsed();
                 if (nowMs - lastLiveTickMs >= kLiveUpdateThrottleMs) {
@@ -1925,12 +1862,9 @@ public slots:
         }
         mdFile.close();
 
-        // See syncSpeakersFrontmatterToBody()'s doc comment — the
-        // "speakers:" list written above (before any segment existed) can
-        // list a cluster that never actually won a single body tag. Only
-        // knowable now that every segment line has actually been written.
-        if (effectiveSpeakerDetection)
-            syncSpeakersFrontmatterToBody(sidecarPath(filePath));
+        // No transcribe-time speaker detection, so no "speakers:" frontmatter
+        // to reconcile against body tags here (that reconciliation lives in the
+        // standalone diarize job — see syncSpeakersFrontmatterToBody()).
 
         // AI auto-labeling (opt-in, see DESIGN.md "Model management") is no
         // longer run as a bonus pass here — TranscriptionController::
@@ -3126,7 +3060,8 @@ TranscriptionController::~TranscriptionController()
 const QStringList TranscriptionController::kTimedPhases = {
     QStringLiteral("loading"),
     QStringLiteral("decoding"),
-    QStringLiteral("detecting-speakers"),
+    QStringLiteral("detecting-speech"),   // VAD windowing (every transcribe job)
+    QStringLiteral("detecting-speakers"), // diarization (standalone diarize job)
     QStringLiteral("transcribing"),
 };
 
@@ -3218,20 +3153,27 @@ void TranscriptionController::recordPhaseDuration(const QString &phase, qint64 d
 // See this method's header doc comment. "detecting-speakers"/"transcribing"
 // share the same estimate so their DEFAULT split is exactly 50/50 (the fixed
 // split this whole feature replaced) until real per-machine/per-model timing
-// data overrides it; "loading"/"decoding" get their own modest estimates
-// instead of being folded into that 50/50.
+// data overrides it; "loading"/"decoding"/"detecting-speech" (VAD) get their
+// own modest estimates instead of being folded into that 50/50.
 double TranscriptionController::defaultPhaseDurationMs(const QString &phase)
 {
     if (phase == QStringLiteral("loading"))
         return 2000.0;
     if (phase == QStringLiteral("decoding"))
         return 1500.0;
+    if (phase == QStringLiteral("detecting-speech"))
+        return 1500.0; // VAD windowing — a small model + one computeWindows() pass
     return 10000.0; // "detecting-speakers" / "transcribing"
 }
 
 double TranscriptionController::phaseRelativeSyntheticProgress() const
 {
-    if (m_phase != QStringLiteral("loading") && m_phase != QStringLiteral("decoding"))
+    // "loading"/"decoding"/"detecting-speech" have no native per-item progress
+    // callback (each is one blocking call), so their within-phase fraction is
+    // synthesized from elapsed-vs-historical-average; every other phase reports
+    // real progress via m_progress.
+    if (m_phase != QStringLiteral("loading") && m_phase != QStringLiteral("decoding")
+        && m_phase != QStringLiteral("detecting-speech"))
         return m_progress;
     const QString key = canonicalPhaseKey(m_phase, activeModelIdForTiming(), m_activeSpeakerDetection);
     const double avg = m_phaseTimings.value(key).average(defaultPhaseDurationMs(m_phase));
@@ -3251,10 +3193,17 @@ void TranscriptionController::recomputeOverallProgress()
         || m_phase == QStringLiteral("chaptering"))
         return;
 
-    QStringList active = {QStringLiteral("loading"), QStringLiteral("decoding")};
+    // The ordered phase set for whichever kind of job is Active, so each
+    // phase gets its rolling-average-proportioned slice of the 0..1 bar:
+    //   - Standalone diarize job (m_activeSpeakerDetection): decode then
+    //     diarize — no whisper model load, no ASR.
+    //   - Transcribe job (pure ASR): load, decode, VAD speech-detection, ASR.
+    QStringList active;
     if (m_activeSpeakerDetection)
-        active.append(QStringLiteral("detecting-speakers"));
-    active.append(QStringLiteral("transcribing"));
+        active = {QStringLiteral("decoding"), QStringLiteral("detecting-speakers")};
+    else
+        active = {QStringLiteral("loading"), QStringLiteral("decoding"),
+                  QStringLiteral("detecting-speech"), QStringLiteral("transcribing")};
 
     const QString modelId = activeModelIdForTiming();
 
@@ -3316,16 +3265,15 @@ int TranscriptionController::jobStatusForPath(const QString &path) const
     return it == m_jobStatusByPath.constEnd() ? static_cast<int>(JobStatus::None) : static_cast<int>(it.value());
 }
 
-bool TranscriptionController::matchesExistingTranscription(const QUrl &fileUrl, const QString &modelId,
-                                                            bool speakerDetection) const
+bool TranscriptionController::matchesExistingTranscription(const QUrl &fileUrl, const QString &modelId) const
 {
     const QVariantMap meta = readMetadata(fileUrl);
     if (meta.isEmpty())
         return false; // not transcribed yet — nothing to match
 
-    if (meta.value(QStringLiteral("speakerDetection")).toBool() != speakerDetection)
-        return false;
-
+    // Speaker detection is a separate task (diarizeFile()), not part of what
+    // Transcribe produces, so it's not part of this equality check — only the
+    // whisper model that actually ran matters.
     // Same model-resolution logic as ModelManager::ensureModel(), minus the
     // disk/network side effects — look up modelId's file name, falling back
     // to the default model's for an unrecognized id (mirroring ensureModel's
@@ -3347,7 +3295,7 @@ bool TranscriptionController::matchesExistingTranscription(const QUrl &fileUrl, 
 }
 
 void TranscriptionController::transcribe(const QUrl &fileUrl, const QUrl &vaultUrl, const QString &modelId,
-                                          bool speakerDetection, bool autoLabel, bool restrictTagsToExisting,
+                                          bool autoLabel, bool restrictTagsToExisting,
                                           double tagReuseBias, double wordiness)
 {
     // Done/Failed entries for the same fileUrl deliberately do NOT block
@@ -3372,16 +3320,12 @@ void TranscriptionController::transcribe(const QUrl &fileUrl, const QUrl &vaultU
     // maybeQueueDownloadJob()'s doc comment.
     if (maybeQueueDownloadJob(DownloadTarget::WhisperModel, vaultUrl, modelId, insertAt) >= 0)
         ++insertAt;
-    if (speakerDetection
-        && maybeQueueDownloadJob(DownloadTarget::DiarizationModels, vaultUrl, QString(), insertAt) >= 0)
-        ++insertAt;
 
     Job job;
     job.id = m_nextJobId++;
     job.fileUrl = fileUrl;
     job.vaultUrl = vaultUrl;
     job.modelId = modelId;
-    job.speakerDetection = speakerDetection;
     job.autoLabel = autoLabel;
     job.restrictTagsToExisting = restrictTagsToExisting;
     job.tagReuseBias = tagReuseBias;
@@ -3409,11 +3353,11 @@ void TranscriptionController::transcribe(const QUrl &fileUrl, const QUrl &vaultU
 }
 
 void TranscriptionController::transcribeAll(const QVariantList &fileUrls, const QUrl &vaultUrl,
-                                             const QString &modelId, bool speakerDetection, bool autoLabel,
+                                             const QString &modelId, bool autoLabel,
                                              bool restrictTagsToExisting, double tagReuseBias, double wordiness)
 {
     for (const QVariant &v : fileUrls)
-        transcribe(v.toUrl(), vaultUrl, modelId, speakerDetection, autoLabel, restrictTagsToExisting, tagReuseBias,
+        transcribe(v.toUrl(), vaultUrl, modelId, autoLabel, restrictTagsToExisting, tagReuseBias,
                    wordiness);
 }
 
@@ -3453,8 +3397,8 @@ void TranscriptionController::diarizeFile(const QUrl &fileUrl, const QUrl &vault
 
     // Item O15: jump ahead of whatever's already Queued — see transcribe()'s
     // frontOfQueueInsertIndex() use. The diarization models are queued as
-    // their own download job ahead of this one if not already on disk, same
-    // as transcribe()'s speakerDetection path.
+    // their own download job ahead of this one if not already on disk (same
+    // pattern the runAllJobs() diarize step uses).
     int insertAt = frontOfQueueInsertIndex();
     const int startIndex = insertAt;
     if (maybeQueueDownloadJob(DownloadTarget::DiarizationModels, vaultUrl, QString(), insertAt) >= 0)
@@ -3553,52 +3497,53 @@ void TranscriptionController::generateChaptersAll(const QVariantList &fileUrls, 
 }
 
 void TranscriptionController::runAllJobs(const QUrl &fileUrl, const QUrl &vaultUrl, const QString &modelId,
-                                          bool speakerDetection, bool restrictTagsToExisting, double tagReuseBias,
+                                          bool restrictTagsToExisting, double tagReuseBias,
                                           double wordiness, double chapterDensity)
 {
     // See this method's header doc comment for the full ordering /
     // already-transcribed-skip / dedup contract. Same Queued/Active dedup gate
     // as the individual actions — checked once, up front, so re-entrancy from
-    // the three inserts below (which make fileUrl "queued") can't matter.
+    // the inserts below (which make fileUrl "queued") can't matter.
     if (isQueued(fileUrl))
         return;
 
     // Skip the transcribe step for a file that already has a sibling .md (the
     // friendly, least-surprising "run all" on an already-done file — just
-    // refresh its label+chapters; see header doc comment). An orphaned .md's
-    // sidecarPath() is itself, so this is true for those too.
+    // re-detect speakers and refresh its label+chapters; see header doc
+    // comment). An orphaned .md's sidecarPath() is itself, so this is true for
+    // those too.
     const bool alreadyTranscribed = QFileInfo::exists(sidecarPath(fileUrl.toLocalFile()));
 
     // Item O15 (same as every other enqueue path): jump ahead of whatever's
-    // already Queued, but keep this file's three jobs CONTIGUOUS and IN ORDER
-    // by walking insertAt forward as each is inserted (rather than each new
-    // job re-jumping to the very front — which is exactly why this doesn't
-    // just call transcribe()/relabel()/generateChapters() in sequence).
+    // already Queued, but keep this file's jobs CONTIGUOUS and IN ORDER by
+    // walking insertAt forward as each is inserted (rather than each new job
+    // re-jumping to the very front — which is exactly why this doesn't just
+    // call transcribe()/diarizeFile()/relabel()/generateChapters() in sequence).
     int insertAt = frontOfQueueInsertIndex();
     const int startIndex = insertAt;
 
     // Models this pipeline needs, queued ahead as their own jobs if absent
-    // (mirrors transcribe()/relabel()). maybeQueueDownloadJob() dedups, so the
-    // single LabelModel request here covers BOTH the later label and chapters
-    // jobs.
+    // (mirrors transcribe()/diarizeFile()/relabel()). maybeQueueDownloadJob()
+    // dedups, so the single LabelModel request here covers BOTH the later label
+    // and chapters jobs. The diarization models are needed regardless of
+    // alreadyTranscribed (the diarize step always runs); the whisper model only
+    // when transcription itself runs.
     if (!alreadyTranscribed) {
         if (maybeQueueDownloadJob(DownloadTarget::WhisperModel, vaultUrl, modelId, insertAt) >= 0)
             ++insertAt;
-        if (speakerDetection
-            && maybeQueueDownloadJob(DownloadTarget::DiarizationModels, vaultUrl, QString(), insertAt) >= 0)
-            ++insertAt;
     }
+    if (maybeQueueDownloadJob(DownloadTarget::DiarizationModels, vaultUrl, QString(), insertAt) >= 0)
+        ++insertAt;
     if (maybeQueueDownloadJob(DownloadTarget::LabelModel, vaultUrl, QString(), insertAt) >= 0)
         ++insertAt;
 
-    // (1) transcribe — skipped if already transcribed.
+    // (1) transcribe (pure ASR) — skipped if already transcribed.
     if (!alreadyTranscribed) {
         Job job;
         job.id = m_nextJobId++;
         job.fileUrl = fileUrl;
         job.vaultUrl = vaultUrl;
         job.modelId = modelId;
-        job.speakerDetection = speakerDetection;
         job.restrictTagsToExisting = restrictTagsToExisting;
         job.tagReuseBias = tagReuseBias;
         job.wordiness = wordiness;
@@ -3607,7 +3552,21 @@ void TranscriptionController::runAllJobs(const QUrl &fileUrl, const QUrl &vaultU
         ++insertAt;
     }
 
-    // (2) label — reads the .md the transcribe job (if any) just wrote.
+    // (2) detect speakers — reads the .md the transcribe job (if any) just
+    // wrote and splices "[Speaker N]" tags in (see diarizeFile()). This is the
+    // step that replaced transcribe()'s old inline speakerDetection toggle.
+    {
+        Job job;
+        job.id = m_nextJobId++;
+        job.fileUrl = fileUrl;
+        job.vaultUrl = vaultUrl;
+        job.diarizeOnly = true;
+        job.status = JobStatus::Queued;
+        m_jobs.insert(insertAt, job);
+        ++insertAt;
+    }
+
+    // (3) label — reads the .md the diarize job just updated.
     {
         Job job;
         job.id = m_nextJobId++;
@@ -3622,7 +3581,7 @@ void TranscriptionController::runAllJobs(const QUrl &fileUrl, const QUrl &vaultU
         ++insertAt;
     }
 
-    // (3) chapters — reads the labeled .md.
+    // (4) chapters — reads the labeled .md.
     {
         Job job;
         job.id = m_nextJobId++;
@@ -3642,12 +3601,12 @@ void TranscriptionController::runAllJobs(const QUrl &fileUrl, const QUrl &vaultU
 }
 
 void TranscriptionController::runAllJobsForPaths(const QVariantList &fileUrls, const QUrl &vaultUrl,
-                                                  const QString &modelId, bool speakerDetection,
+                                                  const QString &modelId,
                                                   bool restrictTagsToExisting, double tagReuseBias, double wordiness,
                                                   double chapterDensity)
 {
     for (const QVariant &v : fileUrls)
-        runAllJobs(v.toUrl(), vaultUrl, modelId, speakerDetection, restrictTagsToExisting, tagReuseBias, wordiness,
+        runAllJobs(v.toUrl(), vaultUrl, modelId, restrictTagsToExisting, tagReuseBias, wordiness,
                    chapterDensity);
 }
 
@@ -3676,12 +3635,13 @@ void TranscriptionController::startJob(int index)
     m_activeSegmentTimer.start();
     m_overallProgress = 0.0;
     emit overallProgressChanged();
-    // See recomputeOverallProgress()'s doc comment — a "transcribe" job sets
-    // this via job.speakerDetection, and a standalone "diarize" job (Item 52)
-    // always runs the detecting-speakers phase, so both make that phase count
-    // toward the progress bar's weighting. Every other kind never emits
-    // phase() at all, so this is simply never read for them.
-    m_activeSpeakerDetection = job.speakerDetection || job.diarizeOnly;
+    // See recomputeOverallProgress()'s doc comment — true ONLY for the
+    // standalone "diarize" job, whose progress bar is weighted around the
+    // detecting-speakers phase. A "transcribe" job is pure ASR now (its bar is
+    // weighted around loading/decoding/detecting-speech/transcribing instead).
+    // Every other kind never emits phase() at all, so this is simply never
+    // read for them.
+    m_activeSpeakerDetection = job.diarizeOnly;
     m_phaseStartMs = 0;
     m_indeterminatePhaseTimer->stop();
 
@@ -3744,8 +3704,7 @@ void TranscriptionController::startJob(int index)
     } else {
         QMetaObject::invokeMethod(m_worker, "run", Qt::QueuedConnection,
                                    Q_ARG(QString, job.fileUrl.toLocalFile()),
-                                   Q_ARG(QString, job.vaultUrl.toLocalFile()), Q_ARG(QString, job.modelId),
-                                   Q_ARG(bool, job.speakerDetection));
+                                   Q_ARG(QString, job.vaultUrl.toLocalFile()), Q_ARG(QString, job.modelId));
     }
 }
 
@@ -4486,7 +4445,6 @@ void TranscriptionController::persistQueue() const
         obj["fileUrl"] = job.fileUrl.toString();
         obj["vaultUrl"] = job.vaultUrl.toString();
         obj["modelId"] = job.modelId;
-        obj["speakerDetection"] = job.speakerDetection;
         obj["restrictTagsToExisting"] = job.restrictTagsToExisting;
         obj["tagReuseBias"] = job.tagReuseBias;
         obj["wordiness"] = job.wordiness;
@@ -4615,7 +4573,6 @@ void TranscriptionController::enqueueReplayedJob(const QString &kind, const QJso
         job.deleteOriginalsAfterCombine = obj.value("deleteOriginalsAfterCombine").toBool();
     } else {
         job.modelId = obj.value("modelId").toString();
-        job.speakerDetection = obj.value("speakerDetection").toBool();
     }
     job.status = JobStatus::Queued;
     m_jobs.push_back(job);

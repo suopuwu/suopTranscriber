@@ -27,6 +27,26 @@ constexpr int kSampleRate = 16000;
 // window length.
 constexpr std::size_t kMaxChunkSamples = static_cast<std::size_t>(300.0 * kSampleRate);
 
+// The window length transcribe() actually decodes at — deliberately far below
+// the kMaxChunkSamples *ceiling*. sherpa-onnx's offline transducer only calls
+// onSegment after a whole Decode() returns, so the decode granularity is also
+// the LIVE-UPDATE granularity: at the 300 s ceiling a typical (sub-5-minute)
+// file decodes in one blocking pass and its entire transcript lands in a single
+// burst at the end — nothing streams, nothing scrolls-to-follow until it's done
+// (unlike whisper.cpp, which emits segments continuously mid-decode). Decoding
+// in ~30 s pieces instead makes a window's worth of segments appear roughly
+// every second of wall-clock (Parakeet's RTF is well under 1), so the
+// transcript grows and follows visibly. 30 s is a standard NeMo long-audio
+// chunk size and stays a full utterance's worth of context, so accuracy is
+// unaffected in practice; the cost is one extra OfflineStream Decode() per 30 s
+// (cheap) and, like the ceiling split, a boundary that pause-seeking lands in a
+// natural gap (quietestBoundary) rather than mid-word. Tune here if the
+// streaming feels too coarse (smaller) or the per-window overhead shows on very
+// long files (larger).
+constexpr std::size_t kLiveChunkSamples = static_cast<std::size_t>(30.0 * kSampleRate);
+static_assert(kLiveChunkSamples <= kMaxChunkSamples,
+              "the decode granularity must stay under the attention ceiling or onnxruntime throws");
+
 // A sub-window boundary is nudged onto the quietest short frame within this
 // radius of its nominal position, so a split lands in a natural pause instead
 // of mid-word. 8 s each way is generous enough to find a real gap without
@@ -284,13 +304,17 @@ std::vector<Segment> ParakeetEngine::transcribe(const AudioChunk &chunk, const P
     if (onProgress)
         onProgress(0.0, totalSeconds);
 
-    // sherpa-onnx's offline transducer decodes each window in a single pass
-    // with no internal chunking, and Parakeet's exported attention overruns
-    // past ~400 s (see kMaxChunkSamples' doc comment) — so a long VAD window,
-    // or the benchmark's whole-file chunk, must be split here rather than fed
-    // whole. Short inputs yield exactly one range: unchanged single-Decode path.
+    // sherpa-onnx's offline transducer decodes each window in a single pass with
+    // no internal chunking, emitting this window's segments only once Decode()
+    // returns — so the split here sets BOTH the attention-ceiling safety (never
+    // exceed kMaxChunkSamples, or onnxruntime throws) AND the live-update
+    // cadence. Splitting at kLiveChunkSamples (30 s, well under the ceiling) is
+    // what makes segments stream in gradually instead of the whole transcript
+    // landing in one end-of-file burst — see kLiveChunkSamples' doc comment.
+    // Inputs shorter than one live chunk yield exactly one range: unchanged
+    // single-Decode path.
     const std::vector<std::pair<std::size_t, std::size_t>> ranges =
-        subChunkRanges(pcm, kMaxChunkSamples, kBoundarySearchSamples);
+        subChunkRanges(pcm, kLiveChunkSamples, kBoundarySearchSamples);
 
     for (const auto &range : ranges) {
         if (onAbort && onAbort())

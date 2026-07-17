@@ -197,6 +197,40 @@ private slots:
         QVERIFY(ranges[0].second < quietEnd);
     }
 
+    // Spec: transcribe() must decode at the LIVE granularity, not the attention
+    // ceiling. sherpa-onnx emits a window's segments only after its Decode()
+    // returns, so decoding at the 300 s ceiling means a typical file's whole
+    // transcript arrives in one end-of-file burst (nothing streams / follows).
+    // Splitting at kLiveChunkSamples (~30 s) is what makes it gradual. No
+    // model-free way to observe the streaming cadence end-to-end (the real
+    // decode below is gated on the ~630 MB bundle), so this is a source-scan
+    // guard — same technique as tst_styleguide / tst_transcription_queue's
+    // benchmarkJob guard — pinning that the finer granularity stays wired.
+    void transcribe_decodesAtLiveGranularity_notTheCeiling()
+    {
+        QFile src(QStringLiteral(SUOP_SRC_DIR "/core/ParakeetEngine.cpp"));
+        QVERIFY2(src.open(QIODevice::ReadOnly), "ParakeetEngine.cpp must be readable");
+        const QString all = QString::fromUtf8(src.readAll());
+
+        // The live-chunk constant exists and is meaningfully smaller than the
+        // ceiling (30 s vs 300 s) — otherwise a "gradual" split is a no-op.
+        QVERIFY2(all.contains(QStringLiteral("kLiveChunkSamples = static_cast<std::size_t>(30.0 * kSampleRate)")),
+                 "kLiveChunkSamples (the ~30 s streaming decode granularity) must exist");
+        QVERIFY2(all.contains(QStringLiteral("kMaxChunkSamples = static_cast<std::size_t>(300.0 * kSampleRate)")),
+                 "kMaxChunkSamples (the ~300 s attention ceiling) must exist");
+
+        // transcribe() must feed subChunkRanges the LIVE granularity, not the
+        // ceiling — the exact regression that leaves Parakeet emitting one burst.
+        const int t = all.indexOf(QStringLiteral("::transcribe("));
+        QVERIFY2(t >= 0, "transcribe() must exist");
+        const int call = all.indexOf(QStringLiteral("subChunkRanges(pcm,"), t);
+        QVERIFY2(call > t, "transcribe() must call subChunkRanges(pcm, ...)");
+        const QString callLine = all.mid(call, all.indexOf(QLatin1Char('\n'), call) - call);
+        QVERIFY2(callLine.contains(QStringLiteral("kLiveChunkSamples")),
+                 "transcribe() must decode at kLiveChunkSamples so segments stream; "
+                 "decoding at kMaxChunkSamples brings back the end-of-file burst");
+    }
+
     // End-to-end real decode, gated on the actual ONNX bundle being present
     // (SUOP_PARAKEET_DIR points at a dir with encoder/decoder/joiner.int8.onnx
     // + tokens.txt). Proves the sherpa-onnx config (model_type="nemo_transducer",
