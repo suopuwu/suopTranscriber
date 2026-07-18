@@ -1,5 +1,7 @@
 #include "TranscriptionController.h"
 
+#include "MdFrontmatter.h"
+
 #include <QCoreApplication>
 #include <QDateTime>
 #include <QDebug>
@@ -868,35 +870,10 @@ bool writeFrontmatterBlock(const QString &path, const QStringList &frontmatterLi
 // TranscriptionWorker::generateChaptersJob()).
 bool writeChaptersField(const QString &mdPath, const QList<ResolvedChapter> &chapters, QString *errorOut)
 {
-    QFile mdFile(mdPath);
-    if (!mdFile.open(QIODevice::ReadOnly | QIODevice::Text)) {
-        if (errorOut)
-            *errorOut = QStringLiteral("could not reopen %1 to write chapters").arg(mdPath);
-        return false;
-    }
-    QTextStream in(&mdFile);
-    if (in.readLine() != QStringLiteral("---")) {
-        if (errorOut)
-            *errorOut = QStringLiteral("%1 has no frontmatter block").arg(mdPath);
-        return false;
-    }
     QStringList frontmatterLines;
-    QString line;
-    bool closed = false;
-    while (!(line = in.readLine()).isNull()) {
-        if (line == QStringLiteral("---")) {
-            closed = true;
-            break;
-        }
-        frontmatterLines.append(line);
-    }
-    if (!closed) {
-        if (errorOut)
-            *errorOut = QStringLiteral("%1 has a malformed frontmatter block").arg(mdPath);
+    QString body;
+    if (!MdFrontmatter::read(mdPath, &frontmatterLines, &body, errorOut))
         return false;
-    }
-    const QString body = in.readAll();
-    mdFile.close();
 
     return writeFrontmatterBlock(mdPath, frontmatterLines, spliceBodyChapters(body, chapters), errorOut);
 }
@@ -3150,66 +3127,20 @@ bool TranscriptionController::setLabel(const QUrl &fileUrl, const QString &label
     const QFileInfo fi(fileUrl.toLocalFile());
     const QString path = sidecarPath(fileUrl.toLocalFile());
 
-    QFile mdFile(path);
-    if (!mdFile.exists()) {
+    if (!QFileInfo::exists(path)) {
         if (errorOut)
             *errorOut = QStringLiteral("%1 has not been transcribed yet").arg(fi.fileName());
         return false;
     }
 
-    if (!mdFile.open(QIODevice::ReadOnly | QIODevice::Text)) {
-        if (errorOut)
-            *errorOut = QStringLiteral("could not open %1 for reading").arg(path);
-        return false;
-    }
-
-    QTextStream in(&mdFile);
-    if (in.readLine() != QStringLiteral("---")) {
-        mdFile.close();
-        if (errorOut)
-            *errorOut = QStringLiteral("%1 has no frontmatter block").arg(mdFile.fileName());
-        return false;
-    }
-
-    // Mirror readMetadata()'s frontmatter-scanning shape, but keep the raw
-    // lines (not parsed key/value pairs) so we can rewrite the block without
-    // reformatting keys we don't care about.
     QStringList frontmatterLines;
-    QString line;
-    bool closed = false;
-    while (!(line = in.readLine()).isNull()) {
-        if (line == QStringLiteral("---")) {
-            closed = true;
-            break;
-        }
-        frontmatterLines.append(line);
-    }
-    if (!closed) {
-        mdFile.close();
-        if (errorOut)
-            *errorOut = QStringLiteral("%1 has a malformed frontmatter block").arg(mdFile.fileName());
+    QString body;
+    if (!MdFrontmatter::read(path, &frontmatterLines, &body, errorOut))
         return false;
-    }
 
-    // Everything after the closing "---" line, byte-for-byte — including
-    // its leading blank line (writeFrontmatter() emits "---\n\n" before the
-    // first segment line) — so the transcript body is left untouched.
-    const QString body = in.readAll();
-    mdFile.close();
+    MdFrontmatter::upsertKey(&frontmatterLines, QStringLiteral("label"), label);
 
-    bool replaced = false;
-    for (QString &fmLine : frontmatterLines) {
-        const int colon = fmLine.indexOf(':');
-        if (colon >= 0 && fmLine.left(colon).trimmed() == QStringLiteral("label")) {
-            fmLine = QStringLiteral("label: ") + label;
-            replaced = true;
-            break;
-        }
-    }
-    if (!replaced)
-        frontmatterLines.append(QStringLiteral("label: ") + label);
-
-    if (!writeFrontmatterBlock(mdFile.fileName(), frontmatterLines, body, errorOut))
+    if (!writeFrontmatterBlock(path, frontmatterLines, body, errorOut))
         return false;
     // Item P19: this manual (non-queued) rewrite otherwise leaves the
     // sidebar's cached per-row metadata stale until an unrelated job
@@ -3228,62 +3159,20 @@ bool TranscriptionController::setTags(const QUrl &fileUrl, const QStringList &ta
     const QFileInfo fi(fileUrl.toLocalFile());
     const QString path = sidecarPath(fileUrl.toLocalFile());
 
-    QFile mdFile(path);
-    if (!mdFile.exists()) {
+    if (!QFileInfo::exists(path)) {
         if (errorOut)
             *errorOut = QStringLiteral("%1 has not been transcribed yet").arg(fi.fileName());
         return false;
     }
 
-    if (!mdFile.open(QIODevice::ReadOnly | QIODevice::Text)) {
-        if (errorOut)
-            *errorOut = QStringLiteral("could not open %1 for reading").arg(path);
-        return false;
-    }
-
-    QTextStream in(&mdFile);
-    if (in.readLine() != QStringLiteral("---")) {
-        mdFile.close();
-        if (errorOut)
-            *errorOut = QStringLiteral("%1 has no frontmatter block").arg(mdFile.fileName());
-        return false;
-    }
-
-    // Mirror setLabel()'s frontmatter-scanning shape.
     QStringList frontmatterLines;
-    QString line;
-    bool closed = false;
-    while (!(line = in.readLine()).isNull()) {
-        if (line == QStringLiteral("---")) {
-            closed = true;
-            break;
-        }
-        frontmatterLines.append(line);
-    }
-    if (!closed) {
-        mdFile.close();
-        if (errorOut)
-            *errorOut = QStringLiteral("%1 has a malformed frontmatter block").arg(mdFile.fileName());
+    QString body;
+    if (!MdFrontmatter::read(path, &frontmatterLines, &body, errorOut))
         return false;
-    }
 
-    const QString body = in.readAll();
-    mdFile.close();
+    MdFrontmatter::upsertKey(&frontmatterLines, QStringLiteral("tags"), tags.join(QStringLiteral(", ")));
 
-    const QString joined = tags.join(QStringLiteral(", "));
-    bool replaced = false;
-    for (QString &fmLine : frontmatterLines) {
-        const int colon = fmLine.indexOf(':');
-        if (colon >= 0 && fmLine.left(colon).trimmed() == QStringLiteral("tags")) {
-            fmLine = QStringLiteral("tags: ") + joined;
-            replaced = true;
-            break;
-        }
-    }
-    if (!replaced)
-        frontmatterLines.append(QStringLiteral("tags: ") + joined);
-
-    if (!writeFrontmatterBlock(mdFile.fileName(), frontmatterLines, body, errorOut))
+    if (!writeFrontmatterBlock(path, frontmatterLines, body, errorOut))
         return false;
     // Item P19-style notification: sidebar's tag-derived display (if any)
     // should refresh the same way a label edit does — see setLabel()'s
@@ -3297,67 +3186,23 @@ bool TranscriptionController::setCollapsedChapters(const QUrl &fileUrl, const QS
     const QFileInfo fi(fileUrl.toLocalFile());
     const QString path = sidecarPath(fileUrl.toLocalFile());
 
-    QFile mdFile(path);
-    if (!mdFile.exists()) {
+    if (!QFileInfo::exists(path)) {
         if (errorOut)
             *errorOut = QStringLiteral("%1 has not been transcribed yet").arg(fi.fileName());
         return false;
     }
 
-    if (!mdFile.open(QIODevice::ReadOnly | QIODevice::Text)) {
-        if (errorOut)
-            *errorOut = QStringLiteral("could not open %1 for reading").arg(path);
-        return false;
-    }
-
-    QTextStream in(&mdFile);
-    if (in.readLine() != QStringLiteral("---")) {
-        mdFile.close();
-        if (errorOut)
-            *errorOut = QStringLiteral("%1 has no frontmatter block").arg(mdFile.fileName());
-        return false;
-    }
-
-    // Mirror setLabel()/setTags()'s frontmatter-scanning shape.
     QStringList frontmatterLines;
-    QString line;
-    bool closed = false;
-    while (!(line = in.readLine()).isNull()) {
-        if (line == QStringLiteral("---")) {
-            closed = true;
-            break;
-        }
-        frontmatterLines.append(line);
-    }
-    if (!closed) {
-        mdFile.close();
-        if (errorOut)
-            *errorOut = QStringLiteral("%1 has a malformed frontmatter block").arg(mdFile.fileName());
+    QString body;
+    if (!MdFrontmatter::read(path, &frontmatterLines, &body, errorOut))
         return false;
-    }
-
-    const QString body = in.readAll();
-    mdFile.close();
 
     // Empty list REMOVES the key (no blank `collapsedChapters:` left behind);
     // a non-empty list upserts it with the comma-joined keys.
-    const QString joined = chapterKeys.join(QLatin1Char(','));
-    bool replaced = false;
-    for (int i = 0; i < frontmatterLines.size(); ++i) {
-        const int colon = frontmatterLines[i].indexOf(':');
-        if (colon >= 0 && frontmatterLines[i].left(colon).trimmed() == QStringLiteral("collapsedChapters")) {
-            if (joined.isEmpty())
-                frontmatterLines.removeAt(i);
-            else
-                frontmatterLines[i] = QStringLiteral("collapsedChapters: ") + joined;
-            replaced = true;
-            break;
-        }
-    }
-    if (!replaced && !joined.isEmpty())
-        frontmatterLines.append(QStringLiteral("collapsedChapters: ") + joined);
+    MdFrontmatter::upsertKey(&frontmatterLines, QStringLiteral("collapsedChapters"),
+                             chapterKeys.join(QLatin1Char(',')), /*removeIfEmpty=*/true);
 
-    if (!writeFrontmatterBlock(mdFile.fileName(), frontmatterLines, body, errorOut))
+    if (!writeFrontmatterBlock(path, frontmatterLines, body, errorOut))
         return false;
     // No finished() emit — see the header doc comment (collapse is pure view
     // state, must not trigger a metadata/transcript reload on every toggle).
@@ -3455,53 +3300,22 @@ bool TranscriptionController::setPrelude(const QUrl &fileUrl, const QString &pre
     const QFileInfo fi(fileUrl.toLocalFile());
     const QString path = sidecarPath(fileUrl.toLocalFile());
 
-    QFile mdFile(path);
-    if (!mdFile.exists()) {
+    if (!QFileInfo::exists(path)) {
         if (errorOut)
             *errorOut = QStringLiteral("%1 has not been transcribed yet").arg(fi.fileName());
         return false;
     }
 
-    if (!mdFile.open(QIODevice::ReadOnly | QIODevice::Text)) {
-        if (errorOut)
-            *errorOut = QStringLiteral("could not open %1 for reading").arg(path);
-        return false;
-    }
-
-    QTextStream in(&mdFile);
-    if (in.readLine() != QStringLiteral("---")) {
-        mdFile.close();
-        if (errorOut)
-            *errorOut = QStringLiteral("%1 has no frontmatter block").arg(mdFile.fileName());
-        return false;
-    }
-
-    // Mirror setLabel()'s frontmatter-scanning shape, but this method never
-    // touches a frontmatter key — the raw lines are only carried through
-    // untouched to the rewrite below.
+    // This method never touches a frontmatter key — the raw lines are carried
+    // through untouched; only the body's prelude changes.
     QStringList frontmatterLines;
-    QString line;
-    bool closed = false;
-    while (!(line = in.readLine()).isNull()) {
-        if (line == QStringLiteral("---")) {
-            closed = true;
-            break;
-        }
-        frontmatterLines.append(line);
-    }
-    if (!closed) {
-        mdFile.close();
-        if (errorOut)
-            *errorOut = QStringLiteral("%1 has a malformed frontmatter block").arg(mdFile.fileName());
+    QString body;
+    if (!MdFrontmatter::read(path, &frontmatterLines, &body, errorOut))
         return false;
-    }
-
-    const QString body = in.readAll();
-    mdFile.close();
 
     const QString newBody = spliceBodyPrelude(body, prelude);
 
-    if (!writeFrontmatterBlock(mdFile.fileName(), frontmatterLines, newBody, errorOut))
+    if (!writeFrontmatterBlock(path, frontmatterLines, newBody, errorOut))
         return false;
     // Item P19: see setLabel()'s matching emit for why
     // (VaultTreeModel::refreshFile(fileUrl)).
@@ -3543,42 +3357,15 @@ bool TranscriptionController::editChapterMarker(const QUrl &fileUrl, ChapterEdit
     const QFileInfo fi(fileUrl.toLocalFile());
     const QString path = sidecarPath(fileUrl.toLocalFile());
 
-    QFile mdFile(path);
-    if (!mdFile.exists()) {
+    if (!QFileInfo::exists(path)) {
         if (errorOut)
             *errorOut = QStringLiteral("%1 has not been transcribed yet").arg(fi.fileName());
         return false;
     }
-    if (!mdFile.open(QIODevice::ReadOnly | QIODevice::Text)) {
-        if (errorOut)
-            *errorOut = QStringLiteral("could not open %1 for reading").arg(path);
-        return false;
-    }
-    QTextStream in(&mdFile);
-    if (in.readLine() != QStringLiteral("---")) {
-        mdFile.close();
-        if (errorOut)
-            *errorOut = QStringLiteral("%1 has no frontmatter block").arg(mdFile.fileName());
-        return false;
-    }
     QStringList frontmatterLines;
-    QString line;
-    bool closed = false;
-    while (!(line = in.readLine()).isNull()) {
-        if (line == QStringLiteral("---")) {
-            closed = true;
-            break;
-        }
-        frontmatterLines.append(line);
-    }
-    if (!closed) {
-        mdFile.close();
-        if (errorOut)
-            *errorOut = QStringLiteral("%1 has a malformed frontmatter block").arg(mdFile.fileName());
+    QString body;
+    if (!MdFrontmatter::read(path, &frontmatterLines, &body, errorOut))
         return false;
-    }
-    QString body = in.readAll();
-    mdFile.close();
 
     const QString tsText = formatTimestamp(timestampSeconds);
     switch (op) {
@@ -3619,7 +3406,7 @@ bool TranscriptionController::editChapterMarker(const QUrl &fileUrl, ChapterEdit
     }
     }
 
-    if (!writeFrontmatterBlock(mdFile.fileName(), frontmatterLines, body, errorOut))
+    if (!writeFrontmatterBlock(path, frontmatterLines, body, errorOut))
         return false;
     return true;
 }

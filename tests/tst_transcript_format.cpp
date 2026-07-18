@@ -730,6 +730,58 @@ private slots:
                     .contains(QStringLiteral("[00:00:00.000 - 00:00:11.000] hello world")));
     }
 
+    // setTags upserts a comma-joined `tags:` key (add then replace, never
+    // duplicate) and leaves the body byte-for-byte. Round-trips through
+    // readMetadata. (Shares the MdFrontmatter read/upsert path with setLabel;
+    // this closes the direct-coverage gap.)
+    void setTags_upsertsCommaJoinedKey_preservingBody()
+    {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        const QString mdPath = writeFixture(dir.path(), "meeting.wav.md", kFixtureMd);
+        const QUrl audioUrl = QUrl::fromLocalFile(dir.path() + "/meeting.wav");
+
+        TranscriptionController controller;
+        QString error;
+        QVERIFY2(controller.setTags(audioUrl, {QStringLiteral("work"), QStringLiteral("sync")}, &error),
+                 qPrintable(error));
+        QString raw = readAllBytes(mdPath);
+        QVERIFY2(raw.contains(QStringLiteral("tags: work, sync\n")), qPrintable(raw));
+        QVERIFY(raw.contains(QStringLiteral("[00:00:00.000 - 00:00:11.000] hello world\n")));
+
+        // Replace, not duplicate.
+        QVERIFY(controller.setTags(audioUrl, {QStringLiteral("personal")}, &error));
+        raw = readAllBytes(mdPath);
+        QCOMPARE(raw.count(QStringLiteral("tags:")), 1);
+        QVERIFY(raw.contains(QStringLiteral("tags: personal\n")));
+        QCOMPARE(controller.readMetadata(audioUrl).value("tags").toString(), QStringLiteral("personal"));
+    }
+
+    // setCollapsedChapters upserts the key for a non-empty list and REMOVES it
+    // for an empty one (no blank `collapsedChapters:` left behind) — the
+    // MdFrontmatter::upsertKey removeIfEmpty path.
+    void setCollapsedChapters_upsertsThenRemovesOnEmpty()
+    {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        const QString mdPath = writeFixture(dir.path(), "meeting.wav.md", kFixtureMd);
+        const QUrl audioUrl = QUrl::fromLocalFile(dir.path() + "/meeting.wav");
+
+        TranscriptionController controller;
+        QString error;
+        QVERIFY2(controller.setCollapsedChapters(audioUrl, {QStringLiteral("0"), QStringLiteral("42")}, &error),
+                 qPrintable(error));
+        QString raw = readAllBytes(mdPath);
+        QVERIFY2(raw.contains(QStringLiteral("collapsedChapters: 0,42\n")), qPrintable(raw));
+
+        // Empty list removes the key entirely.
+        QVERIFY(controller.setCollapsedChapters(audioUrl, {}, &error));
+        raw = readAllBytes(mdPath);
+        QVERIFY2(!raw.contains(QStringLiteral("collapsedChapters")), qPrintable(raw));
+        // Body still intact.
+        QVERIFY(raw.contains(QStringLiteral("[00:00:00.000 - 00:00:11.000] hello world\n")));
+    }
+
     // setLabel refuses to touch anything that isn't a well-formed transcript
     // sidecar: a missing .md means "not transcribed yet"; an existing .md
     // whose first line is not "---" is reported as having no frontmatter

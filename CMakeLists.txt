@@ -278,6 +278,7 @@ qt_add_qml_module(suopTranscriber
         src/core/DiarizationEngine.cpp
         src/core/ModelManager.h
         src/core/ModelManager.cpp
+        src/core/MdFrontmatter.h
         src/core/TranscriptionController.h
         src/core/TranscriptionController.cpp
         src/core/tasks/TaskControl.h

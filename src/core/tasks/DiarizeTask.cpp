@@ -5,6 +5,7 @@
 
 #include "../AudioDecoder.h"
 #include "../DiarizationEngine.h"
+#include "../MdFrontmatter.h"
 #include "../TranscriptionController.h"
 #include "EngineCache.h"
 
@@ -143,31 +144,12 @@ void DiarizeTask::run(TaskContext &ctx)
     // exactly the labels that actually landed on a body line, and drop any
     // stale speakerDetectionError from an earlier failed attempt. Every
     // other frontmatter key is left untouched.
-    const auto setKey = [&frontmatterLines](const QString &key, const QString &value) {
-        for (int i = 0; i < frontmatterLines.size(); ++i) {
-            const int c = frontmatterLines[i].indexOf(QLatin1Char(':'));
-            if (c >= 0 && frontmatterLines[i].left(c).trimmed() == key) {
-                frontmatterLines[i] = key + QStringLiteral(": ") + value;
-                return;
-            }
-        }
-        frontmatterLines.append(key + QStringLiteral(": ") + value);
-    };
-    const auto removeKey = [&frontmatterLines](const QString &key) {
-        for (int i = 0; i < frontmatterLines.size(); ++i) {
-            const int c = frontmatterLines[i].indexOf(QLatin1Char(':'));
-            if (c >= 0 && frontmatterLines[i].left(c).trimmed() == key) {
-                frontmatterLines.removeAt(i);
-                return;
-            }
-        }
-    };
-    setKey(QStringLiteral("speakerDetection"), QStringLiteral("true"));
-    removeKey(QStringLiteral("speakerDetectionError"));
-    if (appliedSpeakers.isEmpty())
-        removeKey(QStringLiteral("speakers"));
-    else
-        setKey(QStringLiteral("speakers"), appliedSpeakers.join(QStringLiteral(", ")));
+    MdFrontmatter::upsertKey(&frontmatterLines, QStringLiteral("speakerDetection"), QStringLiteral("true"));
+    MdFrontmatter::upsertKey(&frontmatterLines, QStringLiteral("speakerDetectionError"), QString(),
+                             /*removeIfEmpty=*/true);
+    // Empty applied set removes the "speakers:" allowlist; otherwise upserts it.
+    MdFrontmatter::upsertKey(&frontmatterLines, QStringLiteral("speakers"),
+                             appliedSpeakers.join(QStringLiteral(", ")), /*removeIfEmpty=*/true);
 
     QString writeError;
     if (!writeFrontmatterBlock(mdPath, frontmatterLines, newBody, &writeError))
