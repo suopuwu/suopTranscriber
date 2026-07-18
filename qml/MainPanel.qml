@@ -2770,11 +2770,11 @@ Rectangle {
             // real audio-backed transcribed file — not an orphaned .md (no
             // audio to diarize). See DESIGN.md "Speaker diarization".
             //
-            // NOTE (OWED, CLAUDE.md per-file-action parity): the Sidebar ribbon
-            // ("detect speakers for all") and per-row hover "detect speakers"
-            // buttons are not added this wave (another agent owns Sidebar.qml).
-            // They should call diarizeFile() / diarizeFilesForPaths() (already
-            // added to TranscriptionController) as a follow-up.
+            // Parity (CLAUDE.md): the bulk counterparts exist on the Sidebar
+            // ribbon (detectSpeakersAllButton) and its search-scoped mirror
+            // (searchDetectSpeakersButton); the old per-row hover cluster was
+            // intentionally removed. Enforced by tst_styleguide's
+            // sidebar_detectSpeakersActionParityAcrossAllSites.
             Item {
                 id: detectSpeakersButton
                 Layout.preferredWidth: 22
