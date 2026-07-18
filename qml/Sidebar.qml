@@ -174,12 +174,11 @@ Rectangle {
     // VaultSearchProxyModel dim+sort above — that stays exactly as-is,
     // still driving tag-filter row-hiding) is shown instead. A plain
     // property + explicit refresh function, not a reactive binding that
-    // reads metadataRevision/etc. as a dependency trick — this codebase has
+    // reads jobStatusRevision/etc. as a dependency trick — this codebase has
     // already been bitten once by qmlcachegen (AOT) silently dropping an
     // unused dummy-property read meant only to force binding
-    // re-evaluation (see treeDelegate.metadata's own comment above), so
-    // every other "recompute on X" case in this file uses an explicit push
-    // instead, and this follows the same idiom.
+    // re-evaluation, so every other "recompute on X" case in this file uses
+    // an explicit push instead, and this follows the same idiom.
     //
     // Edge case (tag filter + text search both active at once): the two are
     // separate, orthogonal features, and this flat list intentionally does
@@ -652,10 +651,6 @@ Rectangle {
     }
     onSearchIncludeTranscriptionsChanged: sidebar.refreshSearchResults()
     Connections {
-        target: sidebar
-        function onMetadataRevisionChanged() { sidebar.refreshSearchResults() }
-    }
-    Connections {
         // Vault contents changed (file added/removed/renamed) — re-run the
         // search against the fresh tree. sidebar.model is itself the
         // VaultTreeModel (searchProxy.sourceModel via the alias), and
@@ -692,17 +687,13 @@ Rectangle {
         }
     }
 
-    // O9: bumped on every transcribe/relabel completion so each realized
-    // delegate's metadata (label/tags/etc., read fresh off disk) can push
-    // itself up to date instead of staying frozen at delegate-creation time
-    // — see treeDelegate.refreshMetadata()/metadata below for why this is a
-    // push (explicit assignment) rather than a binding-dependency trick.
-    property int metadataRevision: 0
-    // P6: same push idiom as metadataRevision above, but for job-status
-    // (queued/active/paused/etc.) — jobStatusForPath() is a plain
-    // Q_INVOKABLE lookup, not a reactive property, so delegates need an
-    // explicit nudge (via jobStatusRevision below) whenever the controller
-    // says some path's resolved status may have changed.
+    // P6: push idiom for job-status (queued/active/paused/etc.) —
+    // jobStatusForPath() is a plain Q_INVOKABLE lookup, not a reactive
+    // property, so delegates need an explicit nudge (via jobStatusRevision
+    // below) whenever the controller says some path's resolved status may have
+    // changed. (Label/tags/etc. used to have a matching metadataRevision, now
+    // gone: the delegate binds VaultTreeModel::LabelRole directly, refreshed
+    // reactively by the model.refreshFile() call below.)
     property int jobStatusRevision: 0
     Connections {
         target: sidebar.transcriptionController
@@ -712,14 +703,17 @@ Rectangle {
         // which is what makes it safe to call on a signal this chatty.
         function onQueueChanged() { sidebar.pushPendingCombines() }
         function onFinished(fileUrl, ok, error) {
-            sidebar.metadataRevision += 1
             sidebar.refreshTreeOrdering()
+            // A label/tag/transcript change can change what the active search
+            // matches, so re-run it (was previously driven by metadataRevision).
+            sidebar.refreshSearchResults()
             // Item 6: labels/tags/chapters are written in-place into an
             // already-existing .md, which QFileSystemWatcher::directoryChanged
             // never fires for — so the tree row would stay stale until some
             // unrelated directory event (e.g. the NEXT file's .md being
             // created) triggered a rebuild ("delayed by one"). Nudge the model
-            // to re-query just this row now that its file finished writing.
+            // to re-query just this row now that its file finished writing —
+            // this is also what refreshes the delegate's bound LabelRole.
             if (ok && sidebar.model && sidebar.model.refreshFile)
                 sidebar.model.refreshFile(fileUrl)
         }
@@ -1182,20 +1176,6 @@ Rectangle {
             delete sidebar.chaptersPaths[path]
     }
 
-    // P6: path -> JobStatus int (Queued/Active/Paused only — see setJobStatus),
-    // same keyed-hash idiom as untranscribedPaths/transcribedPaths above,
-    // populated by each realized delegate's own jobStatus property.
-    property var jobStatuses: ({})
-    function setJobStatus(path, status) {
-        // Only Queued(0)/Active(1)/Paused(2) are "in progress" — None(-1),
-        // Done(3) and Failed(4) aren't interesting for this indicator (see
-        // treeDelegate's existing transcribed/untranscribed status dot).
-        if (status === 0 || status === 1 || status === 2)
-            sidebar.jobStatuses[path] = status
-        else
-            delete sidebar.jobStatuses[path]
-    }
-
     // TitleBar's "⋯" menu action: unlike transcribeAllButton (which only
     // targets untranscribedPaths/bulkEligible files realized in the current
     // TreeView viewport), this queues every audio file in the vault,
@@ -1429,8 +1409,8 @@ Rectangle {
         }
 
         // Editing a displayed label rewrites the .md's frontmatter, not the
-        // filename. setLabel() emits finished(), which already bumps
-        // metadataRevision and refreshes the row (see the Connections above) —
+        // filename. setLabel() emits finished(), which already refreshes the
+        // row's LabelRole via model.refreshFile() (see the Connections above) —
         // no rebuild, so nothing extra to nudge here.
         if (AppSettings.useLabelsSidebar && label) {
             if (sidebar.transcriptionController)
@@ -3495,6 +3475,11 @@ Rectangle {
             required property bool isAudio
             required property int status
             required property bool isOrphanedMd
+            // VaultTreeModel::LabelRole — read live from the sidecar .md's
+            // frontmatter per data() call, so a relabel's finished() ->
+            // model.refreshFile() -> dataChanged updates it reactively with no
+            // revision-counter push (see the onFinished handler above).
+            required property string label
             // The synthetic in-progress row standing in for a combine that
             // hasn't produced its file yet — see VaultTreeModel::
             // setPendingCombines(). It is not a file: isDir/isAudio/
@@ -3658,15 +3643,13 @@ Rectangle {
             // Paused/Done/Failed, see TranscriptionController::JobStatus) —
             // unlike bulkEligible/relabelEligible above this can't be a
             // readonly binding (jobStatusForPath() is a plain Q_INVOKABLE
-            // call, not a bound property), so it's explicitly refreshed —
-            // same push idiom as refreshMetadata() below — on completion and
-            // whenever sidebar.jobStatusRevision bumps.
+            // call, not a bound property), so it's explicitly refreshed on
+            // path reassignment and whenever sidebar.jobStatusRevision bumps.
             property int jobStatus: -1
             function refreshJobStatus() {
                 treeDelegate.jobStatus = (treeDelegate.isAudio && sidebar.transcriptionController)
                     ? sidebar.transcriptionController.jobStatusForPath(treeDelegate.path) : -1
             }
-            onJobStatusChanged: sidebar.setJobStatus(treeDelegate.path, treeDelegate.jobStatus)
             Connections {
                 target: sidebar
                 function onJobStatusRevisionChanged() { treeDelegate.refreshJobStatus() }
@@ -3674,18 +3657,17 @@ Rectangle {
 
             // Bug: TreeView recycles a fixed pool of delegate Items as rows
             // scroll in/out of view (reuseItems defaults to true) — required
-            // properties like path/isAudio/isOrphanedMd get reassigned to the
-            // recycled Item for its new row, but metadata/jobStatus above are
-            // plain imperative properties that were only ever pushed once, at
-            // Component.onCompleted (i.e. whichever row this Item instance
-            // FIRST rendered). Every recycled reuse of that same instance kept
-            // showing that original row's label/jobStatus forever after,
-            // regardless of which file it now represents — this is why one
-            // label appeared to "repeat" at a fixed interval (the pool size)
-            // throughout the whole tree, not just in search. Refresh on every
-            // reassignment, not just first creation.
+            // properties like path/isAudio/isOrphanedMd (and now label) get
+            // reassigned to the recycled Item for its new row, but jobStatus
+            // above is a plain imperative property that was only ever pushed
+            // once, at Component.onCompleted (i.e. whichever row this Item
+            // instance FIRST rendered). Every recycled reuse of that same
+            // instance kept showing that original row's jobStatus forever
+            // after, regardless of which file it now represents. Refresh on
+            // every path reassignment, not just first creation. (metadata/label
+            // no longer needs this — it's a model role that auto-updates on
+            // recycle like the other required properties.)
             onPathChanged: {
-                treeDelegate.refreshMetadata()
                 treeDelegate.refreshJobStatus()
             }
 
@@ -3693,14 +3675,12 @@ Rectangle {
                 sidebar.setBulkEligible(treeDelegate.path, treeDelegate.bulkEligible)
                 sidebar.setRelabelEligible(treeDelegate.path, treeDelegate.relabelEligible)
                 sidebar.setChaptersEligible(treeDelegate.path, treeDelegate.chaptersEligible)
-                treeDelegate.refreshMetadata()
                 treeDelegate.refreshJobStatus()
             }
             Component.onDestruction: {
                 sidebar.setBulkEligible(treeDelegate.path, false)
                 sidebar.setRelabelEligible(treeDelegate.path, false)
                 sidebar.setChaptersEligible(treeDelegate.path, false)
-                sidebar.setJobStatus(treeDelegate.path, -1)
                 // Balance the hover count if this row is destroyed (e.g.
                 // TreeView recycling) WHILE still counted as hovering —
                 // otherwise that increment would never be decremented and
@@ -3709,32 +3689,6 @@ Rectangle {
                     sidebar.leaveCombineGroupHover(treeDelegate.activeHoverGroupPath)
                     treeDelegate.activeHoverGroupPath = ""
                 }
-            }
-
-            // O9: was a pure readonly binding (isAudio/isOrphanedMd/
-            // transcriptionController only) — none of those change on
-            // relabel/transcribe completion, so it froze at delegate
-            // creation and only "caught up" whenever an unrelated vault
-            // event forced VaultTreeModel::rebuild() (recreating every
-            // delegate from scratch). A dummy-property read inside this
-            // binding to force re-evaluation on completion would risk being
-            // silently dropped by AOT (qmlcachegen) if the read result is
-            // otherwise unused — see a prior bug in this exact codebase.
-            // Instead this is now a plain property, explicitly (re)assigned
-            // by refreshMetadata() — a genuine push, not a binding trick.
-            // readMetadata() resolves the sidecar .md regardless of whether
-            // the given path is the audio file or the .md itself
-            // (sidecarPath() is self-referential when the path already ends
-            // in .md), so this covers both audio and orphaned rows.
-            property var metadata: ({})
-            function refreshMetadata() {
-                treeDelegate.metadata = ((treeDelegate.isAudio || treeDelegate.isOrphanedMd)
-                                          && sidebar.transcriptionController)
-                    ? sidebar.transcriptionController.readMetadata("file://" + treeDelegate.path) : ({})
-            }
-            Connections {
-                target: sidebar
-                function onMetadataRevisionChanged() { treeDelegate.refreshMetadata() }
             }
 
             // Item 9: ellipsis-bounded transcript snippet around the first
@@ -3821,7 +3775,7 @@ Rectangle {
                                              treeDelegate.isAudio || treeDelegate.isOrphanedMd,
                                              treeDelegate.isAudio, treeDelegate.status,
                                              createIn,
-                                             treeDelegate.metadata ? treeDelegate.metadata.label : "",
+                                             treeDelegate.label,
                                              p.x, p.y)
                 }
             }
@@ -3937,8 +3891,7 @@ Rectangle {
                                 && sidebar.selectedPaths[0] === treeDelegate.path
                         if (plainTap && soleSelection
                                 && treeDelegate.tapIsOnRowName(treeRowTap.point.position)) {
-                            sidebar.beginRename(treeDelegate.path, false,
-                                                treeDelegate.metadata ? treeDelegate.metadata.label : "")
+                            sidebar.beginRename(treeDelegate.path, false, treeDelegate.label)
                             return
                         }
                         // Item 3: Shift/Ctrl-click multi-select — see
@@ -4355,7 +4308,8 @@ Rectangle {
                     // overloading it, since a Done/Failed job alongside an
                     // already-transcribed file would be redundant to show and
                     // this dot only ever appears for the 3 "in progress"
-                    // statuses (see sidebar.setJobStatus's gating).
+                    // statuses (Queued/Active/Paused — see the visible: binding
+                    // below, which gates on 0 <= jobStatus <= 2).
                     Rectangle {
                         id: jobStatusDot
                         Layout.alignment: Qt.AlignVCenter
@@ -4475,8 +4429,8 @@ Rectangle {
                                         && sidebar.optimisticRenamePath === treeDelegate.path)
                                     return sidebar.optimisticRenameName
                                 if (!treeDelegate.isDir && AppSettings.useLabelsSidebar
-                                        && treeDelegate.metadata && treeDelegate.metadata.label)
-                                    return treeDelegate.metadata.label
+                                        && treeDelegate.label)
+                                    return treeDelegate.label
                                 if (treeDelegate.isDir || !AppSettings.hideExtensionsSidebar)
                                     return treeDelegate.name
                                 const dot = treeDelegate.name.lastIndexOf(".")
