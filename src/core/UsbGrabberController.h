@@ -228,6 +228,20 @@ signals:
     // non-empty only on a guard-check failure, in which case entries is empty.
     void grabPreviewReady(const QString &deviceSerial, const QVariantList &entries, const QString &error);
 
+public slots:
+    // Re-evaluates every CURRENTLY-mounted device for an auto-grab, for the
+    // gap where the app was closed while a device stayed plugged in the whole
+    // time: no hotplug (InterfacesAdded) fires on restart for a device that
+    // never left, so handleDeviceAdded() never runs and the auto-grab a rule
+    // asks for silently never happens. This closes that by walking
+    // UsbDeviceMonitor::currentlyMountedDevices() through the SAME auto-grab
+    // gate a hotplug uses. Idempotent — runUsbGrabScan() skips files already
+    // copied — so re-grabbing an already-grabbed device is a no-op, and it
+    // evaluates against the device that is ACTUALLY mounted now rather than a
+    // remembered (possibly stale) path. Fired on vault-open (see
+    // setVaultTreeModel()); also exposed as a slot so QML/tests can invoke it.
+    void rescanForAutoGrab();
+
 private slots:
     // Bound to m_deviceMonitor's deviceAdded signal at construction — see
     // the class doc comment for the enable-check/vault-open-check logic.
@@ -260,6 +274,12 @@ private slots:
     void reconcileInFlightJobs();
 
 private:
+    // The auto-grab gate shared by handleDeviceAdded() (hotplug) and
+    // rescanForAutoGrab() (startup / already-mounted): both gates in order
+    // (enabled + autoGrab), then startGrabJob(). Extracted so the two entry
+    // points can never drift apart.
+    void maybeAutoGrab(const QVariantMap &info);
+
     // Shared by triggerManualGrab() and handleDeviceAdded(): the device-
     // specific rule if enabled, else the "*" catch-all rule (with
     // deviceSerial/deviceLabel overridden to this device's own identity, so

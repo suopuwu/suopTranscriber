@@ -101,6 +101,38 @@ private slots:
               "NOT BUILT: native segments are used as-is.");
     }
 
+    void instantLane_runsInParallelWithSerialQueue_deferringOnlyOnSameFile()
+    {
+        QSKIP("Task system (DESIGN.md 'Task system'): a Lane::Instant task (rename/merge — a "
+              "single .md rewrite) runs on a SEPARATE worker thread in parallel with the serial "
+              "GPU queue, so it never waits behind a transcription; the scheduler defers it ONLY "
+              "when a serial task on the SAME file is active (both would rewrite that .md). BUILT "
+              "and unit-tested at the edges: Task::lane()==Instant (tst_task_speaker_edits), the "
+              "instant tasks execute+complete end-to-end through the controller "
+              "(tst_transcription_queue's renameSpeaker/mergeSpeakers cases), and "
+              "serialActiveConflictsWith() is the pure conflict predicate. What has NO clean "
+              "deterministic unit-test path is the cross-THREAD timing itself — proving 'the "
+              "rename finished while the transcription was still mid-run' needs a serial task "
+              "held reliably active, which requires a real model/long download; verified by "
+              "inspection + live use instead of a flaky wall-clock race.");
+    }
+
+    // everyFileOpIsATask: BUILT. CLAUDE.md 'Every file/vault operation is a
+    // Task' is now fully realized — file rename/move (RenameFileTask/MoveTask),
+    // trash/permanent-delete/restore (TrashTask/DeleteTask/RestoreTask over the
+    // VaultFileScope variants), model import/export (ModelIoTask), and FOLDER
+    // rename/move (FolderRenameTask/FolderMoveTask) are all instant/serial-lane
+    // tasks, undoable via the generic snackbar where reversible (undo = the
+    // inverse task; trash's is a RestoreTask over the captured restorable set).
+    // The pure filesystem work lives in FileRename.h/VaultFileOps.h so it runs
+    // off the GUI thread; trash/delete/restore keep the per-file delete/restore
+    // signal emission in the model (applyRemovalOutcome/applyRestoreOutcome,
+    // called by the controller on completion) so MainPanel's open-file
+    // view-state handlers are unchanged. Coverage: tst_task_renamefile,
+    // tst_task_move, tst_task_trash, tst_task_folder, tst_transcription_queue
+    // (batch undo), plus tst_styleguide's controller-routing guards. The
+    // synchronous VaultTreeModel methods survive only as no-controller fallbacks.
+
     void perAppAudioCapture_singleApplicationIsolation()
     {
         QSKIP("Recording feature: capturing ONE specific application's audio individually (e.g. "

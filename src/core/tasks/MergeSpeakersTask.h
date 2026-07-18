@@ -16,7 +16,10 @@ public:
     MergeSpeakersTask(QUrl audioUrl, QString sourceName, QString targetName, QObject *parent = nullptr);
 
     QString kind() const override { return QStringLiteral("merge"); }
+    QString kindLabel() const override { return QStringLiteral("Merge speakers"); }
     QString displayName() const override;
+    // Instant lane — see RenameSpeakerTask (same single-.md-rewrite reasoning).
+    Lane lane() const override { return Lane::Instant; }
     // isPersistable(): see RenameSpeakerTask's doc comment — same reasoning.
     bool isPersistable() const override { return true; }
     QJsonObject toJson() const override;

@@ -153,6 +153,28 @@ private slots:
         QVERIFY(!controller.lastError().isEmpty());
     }
 
+    // rescanForAutoGrab() (app-closed-while-plugged-in gap) routes every
+    // already-mounted device through the SAME maybeAutoGrab() gate a hotplug
+    // uses, so its enabled/autoGrab/vault-open guards are exactly the ones the
+    // handleDeviceAdded_* tests above already cover. What's NOT unit-testable
+    // is the enumeration itself (currentlyMountedDevices() hits real UDisks2 —
+    // no fake-monitor injection point). This guards the null-safety: rescan
+    // with no vault/controller wired must be a silent no-op, not a crash.
+    void rescanForAutoGrab_withNothingWired_isSafeNoOp()
+    {
+        UsbGrabberController controller;
+        controller.rescanForAutoGrab(); // no vault, no transcription controller
+        QVERIFY(controller.lastError().isEmpty());
+
+        QTemporaryDir vault;
+        QVERIFY(vault.isValid());
+        VaultTreeModel vaultModel;
+        vaultModel.setVaultPath(QUrl::fromLocalFile(vault.path()));
+        controller.setVaultTreeModel(&vaultModel);
+        controller.rescanForAutoGrab(); // vault but no transcription controller -> still safe
+        QVERIFY(controller.lastError().isEmpty());
+    }
+
     void vaultOpenButDeviceNotConnected_triggerManualGrab_setsLastError()
     {
         QTemporaryDir vault;

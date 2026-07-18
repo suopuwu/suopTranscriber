@@ -19,6 +19,7 @@ public:
     ChaptersTask(QUrl fileUrl, QUrl vaultUrl, double density, QObject *parent = nullptr);
 
     QString kind() const override { return QStringLiteral("chapters"); }
+    QString kindLabel() const override { return QStringLiteral("Generate chapters"); }
     QString displayName() const override;
     // Pausable BETWEEN windows (an in-flight single generateChapters() LLM
     // call can't itself be interrupted — no llama.cpp abort hook for a

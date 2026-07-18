@@ -259,7 +259,11 @@ private slots:
     }
 
     // Item: the full-panel blocking overlay must name the ACTUAL task (keyed
-    // off currentPhase), not a hardcoded "Transcribing…".
+    // off currentPhase), not a hardcoded "Transcribing…". The phase→title
+    // mapping now lives in the controller's phase registry
+    // (phaseOverlayLabel), not a switch here — see phaseLabelSwitchesStayRetired
+    // for the no-switch guard and phaseRegistryCoversEveryEmittedPhase for
+    // coverage.
     void mainPanel_blockingOverlayNamesTheTask()
     {
         const QString src = readAll(QStringLiteral(SUOP_QML_DIR "/MainPanel.qml"));
@@ -267,8 +271,9 @@ private slots:
                  "the overlay label must be derived (transcribingOverlayLabel), not fixed");
         QVERIFY2(src.contains(QStringLiteral("text: mainPanel.transcribingOverlayLabel")),
                  "the overlay's Label must bind to the derived task label");
-        QVERIFY2(src.contains(QStringLiteral("case \"detecting-speakers\"")),
-                 "the overlay label must map the actual phases (e.g. detecting-speakers)");
+        QVERIFY2(src.contains(QStringLiteral("phaseOverlayLabel(")),
+                 "the overlay label must derive its title from the controller's phase registry "
+                 "(phaseOverlayLabel), not a QML phase switch");
     }
 
     // Item: timestamps show on EVERY sentence line; speaker names stay one per
@@ -1067,8 +1072,16 @@ private slots:
         QVERIFY2(src.contains(QStringLiteral("sidebar.model.trashFolder(")),
                  "Delete folder must call VaultTreeModel.trashFolder() — the trash-first call. "
                  "deleteFolderPermanently() is only for the confirmed, untrashable case");
+        // Move to… goes through the controller's instant-lane MoveTask when a
+        // controller is present (async, undoable, visible in the Tasks list),
+        // and falls back to the synchronous VaultTreeModel.moveFile() only when
+        // there's no controller (plain-model harness) — same split as the
+        // rename guard below.
+        QVERIFY2(src.contains(QStringLiteral("sidebar.transcriptionController.moveFiles(")),
+                 "Move to… (with a controller) must go through TranscriptionController.moveFiles() so it's "
+                 "an instant-lane task visible in the Tasks list");
         QVERIFY2(src.contains(QStringLiteral("sidebar.model.moveFile(")),
-                 "Move to… must call VaultTreeModel.moveFile()");
+                 "Move to… must still fall back to VaultTreeModel.moveFile() when there's no controller");
         QVERIFY2(src.contains(QStringLiteral("sidebar.model.vaultFolders()")),
                  "the Move to… picker must enumerate destinations via VaultTreeModel.vaultFolders()");
         QVERIFY2(src.contains(QStringLiteral("\"file://\" + sidebar.ctxCreateInDir"))
@@ -1138,12 +1151,26 @@ private slots:
                  "with 2+ rows selected the menu must read \"Delete N items\", not a bare \"Delete file\" "
                  "that hides how many rows it will take");
 
-        // The batch must go through the single-rebuild C++ invokable, not a
-        // QML loop (one full vault rescan + model reset per file). beginDeleteFile()
-        // is where that happens now.
-        QVERIFY2(functionBody(src, QStringLiteral("function beginDeleteFile("))
-                     .contains(QStringLiteral("sidebar.model.trashFiles(")),
-                 "a multi-delete must call VaultTreeModel.trashFiles() so the batch costs one rebuild()");
+        // The batch is ONE call for the whole selection (not a per-file QML
+        // loop — that's a full vault rescan + model reset each). With a
+        // controller it's the async instant-lane TrashTask
+        // (transcriptionController.trash), undoable via the generic snackbar; the
+        // synchronous VaultTreeModel.trashFiles() stays as the no-controller
+        // fallback (same split as performRename/performRowMove/beginDeleteFolder).
+        {
+            const QString body = functionBody(src, QStringLiteral("function beginDeleteFile("));
+            QVERIFY2(body.contains(QStringLiteral("sidebar.transcriptionController.trash(")),
+                     "a delete (with a controller) must route through TranscriptionController.trash() so it's "
+                     "an instant-lane task visible in the Tasks list + undoable via the generic snackbar");
+            QVERIFY2(body.contains(QStringLiteral("sidebar.model.trashFiles(")),
+                     "a delete must still fall back to VaultTreeModel.trashFiles() when there's no controller");
+        }
+        // The confirm-then-permanent path (only for entries the trash refused)
+        // likewise prefers the async DeleteTask.
+        QVERIFY2(functionBody(src, QStringLiteral("function confirmFileDelete("))
+                     .contains(QStringLiteral("sidebar.transcriptionController.deletePermanently(")),
+                 "a confirmed permanent delete (with a controller) must route through "
+                 "TranscriptionController.deletePermanently()");
 
         // Destructive, so still confirmed — and the confirmation must be
         // count-aware too, not name a single file while deleting several.
@@ -1233,10 +1260,25 @@ private slots:
                  "never blurs the editor (FocusScope), so nothing else will");
 
         // Folder rows rename through the folder-specific invokable.
+        // Folder rename goes through the async FolderRenameTask with a
+        // controller (undoable, visible), falling back to the synchronous
+        // VaultTreeModel.renameFolder() with none — same split as the file paths.
+        QVERIFY2(src.contains(QStringLiteral("sidebar.transcriptionController.renameFolder(")),
+                 "renaming a directory row (with a controller) must go through "
+                 "TranscriptionController.renameFolder() so it's an instant-lane task");
         QVERIFY2(src.contains(QStringLiteral("sidebar.model.renameFolder(")),
-                 "renaming a directory row must call VaultTreeModel.renameFolder()");
+                 "renaming a directory row must still fall back to VaultTreeModel.renameFolder() with no controller");
+        // Note rows rename through the controller's instant-lane task when one
+        // is wired (the real app — visible in the Tasks list, deferred behind a
+        // same-file transcription), falling back to the synchronous
+        // VaultTreeModel.renameFile() only when there's no controller (plain
+        // filename mode). BOTH call sites must still exist.
+        QVERIFY2(src.contains(QStringLiteral("sidebar.transcriptionController.renameFile(")),
+                 "renaming a note row (with a controller) must go through TranscriptionController.renameFile() "
+                 "so it's an instant-lane task visible in the Tasks list");
         QVERIFY2(src.contains(QStringLiteral("sidebar.model.renameFile(")),
-                 "renaming a note row must call VaultTreeModel.renameFile()");
+                 "renaming a note row must still fall back to VaultTreeModel.renameFile() when there's no "
+                 "controller (plain filename mode)");
     }
 
     // Item 40 (drag-to-move): dragging a tree row must move the file/folder,
@@ -1282,10 +1324,20 @@ private slots:
         // A drop must go through the same C++ invokables the "Move to…" menu
         // uses — including moveFolder(), which no other UI reaches (ctxMoveRow
         // is note-only).
+        QVERIFY2(src.contains(QStringLiteral("sidebar.transcriptionController.moveFolder(")),
+                 "dragging a directory row (with a controller) must go through "
+                 "TranscriptionController.moveFolder() so it's an instant-lane task");
         QVERIFY2(src.contains(QStringLiteral("sidebar.model.moveFolder(")),
-                 "dragging a directory row must call VaultTreeModel.moveFolder()");
+                 "dragging a directory row must still fall back to VaultTreeModel.moveFolder() with no controller");
         QVERIFY2(src.contains(QStringLiteral("sidebar.performRowMove(")),
                  "drops must route through performRowMove()");
+        // A dragged FILE move goes through the instant-lane task queue (one undo
+        // batch) when a controller is present — a folder move stays synchronous
+        // (folder-as-task isn't built yet), and a no-controller harness falls
+        // back to the synchronous model calls.
+        QVERIFY2(src.contains(QStringLiteral("sidebar.transcriptionController.moveFiles(")),
+                 "performRowMove must route file moves through TranscriptionController.moveFiles() when a "
+                 "controller is present, so a drag-move is an instant-lane task visible in the Tasks list");
 
         // The move must be deferred out of the drop callback: it rebuilds the
         // model, destroying the very delegate whose handler is mid-execution
@@ -1330,40 +1382,67 @@ private slots:
                  "must surface as failure, not a silently orphaned .part (item 1d)");
     }
 
-    // Item 5 (living doc): every job phase the C++ side announces via
-    // `emit phase(QStringLiteral("X"))` must have a human label in
-    // BottomBar.phaseLabel(), or that phase renders blank in the bottom bar
-    // (the label is hidden when phaseLabel returns ""). This caught two real
-    // gaps — "labeling" (relabel jobs) and "benchmarking" (benchmark/sweep) —
-    // that fell through to the empty default. It scans src/core for the
-    // emitted phase vocabulary so a newly-added phase can't silently ship
-    // unlabeled.
-    void bottomBar_phaseLabelCoversEveryEmittedPhase()
+    // Item 5 / design-review #4 (living doc): every job phase a Task announces
+    // via phase() must have a row in the ONE phase registry
+    // (TranscriptionController::phaseInfoFor's table, surfaced through
+    // phaseLabel/phaseOverlayLabel) — a phase with no row renders blank in the
+    // bottom bar. This caught two real gaps historically ("labeling",
+    // "benchmarking"). The label used to live in a BottomBar.qml switch (plus
+    // a second, drifting switch in MainPanel); both are gone, so the guard now
+    // scans src/core/tasks for the emitted phase vocabulary and checks the C++
+    // registry. It reads BOTH the direct `phase(QStringLiteral("X"))` sites AND
+    // DiarizeTask's indirect sub-phase literals (it emits `phase(subPhase)`).
+    void phaseRegistryCoversEveryEmittedPhase()
     {
         QSet<QString> emitted;
-        const QRegularExpression phaseEmit(
-            QStringLiteral("emit phase\\(QStringLiteral\\(\"([^\"]+)\"\\)\\)"));
-        QDirIterator it(QStringLiteral(SUOP_SRC_DIR "/core"), {QStringLiteral("*.cpp")}, QDir::Files,
-                        QDirIterator::Subdirectories);
+        const QRegularExpression directEmit(QStringLiteral("phase\\(QStringLiteral\\(\"([^\"]+)\"\\)\\)"));
+        // DiarizeTask emits `phase(subPhase)` where subPhase is one of these
+        // two literals — the direct regex can't see the indirection, so pick
+        // the "detecting-speakers-*" sub-phase literals up explicitly.
+        const QRegularExpression subPhaseLiteral(
+            QStringLiteral("QStringLiteral\\(\"(detecting-speakers-[a-z]+)\"\\)"));
+        QDirIterator it(QStringLiteral(SUOP_SRC_DIR "/core/tasks"), {QStringLiteral("*.cpp")}, QDir::Files);
         while (it.hasNext()) {
             const QString src = readAll(it.next());
-            auto m = phaseEmit.globalMatch(src);
-            while (m.hasNext())
-                emitted.insert(m.next().captured(1));
+            for (const QRegularExpression &re : {directEmit, subPhaseLiteral}) {
+                auto m = re.globalMatch(src);
+                while (m.hasNext())
+                    emitted.insert(m.next().captured(1));
+            }
         }
-        QVERIFY2(!emitted.isEmpty(), "found no `emit phase(...)` sites — scan regex/path drifted");
+        QVERIFY2(emitted.size() >= 12, "found too few emitted phases — scan regex/path drifted");
+        QVERIFY2(emitted.contains(QStringLiteral("detecting-speakers-segmenting")),
+                 "sub-phase scan drifted — DiarizeTask's finer detecting-speakers phases not seen");
 
-        const QString label =
-            stripComments(readAll(QStringLiteral(SUOP_QML_DIR "/BottomBar.qml")));
-        const QString body = functionBody(label, QStringLiteral("function phaseLabel(phase)"));
-        QVERIFY2(!body.isEmpty(), "could not locate BottomBar.phaseLabel()");
+        // The registry lives in the controller (not BottomBar/MainBar), so read
+        // it there. A row is `{QStringLiteral("slug"), TranscriptionController::tr(`.
+        const QString registry = readAll(QStringLiteral(SUOP_SRC_DIR "/core/TranscriptionController.cpp"));
         for (const QString &phase : emitted) {
-            const QString needle = QStringLiteral("case \"%1\"").arg(phase);
-            QVERIFY2(body.contains(needle),
-                     qPrintable(QStringLiteral("BottomBar.phaseLabel() has no case for the C++-emitted "
-                                               "phase \"%1\" — it would render blank (item 5)")
+            const QString row = QStringLiteral("{QStringLiteral(\"%1\"), TranscriptionController::tr(").arg(phase);
+            QVERIFY2(registry.contains(row),
+                     qPrintable(QStringLiteral("phase \"%1\" is emitted by a Task but has no row in "
+                                               "TranscriptionController's phase registry — phaseLabel() "
+                                               "would return blank (design-review #4)")
                                     .arg(phase)));
         }
+    }
+
+    // Design-review #4 corollary: the two per-phase switches the registry
+    // replaced must stay gone. A reintroduced `phaseLabel(` switch in
+    // BottomBar or `case "transcribing"`-style phase switch in MainPanel's
+    // overlay label would reopen the drift the registry closed.
+    void phaseLabelSwitchesStayRetired()
+    {
+        const QString bottom = stripComments(readAll(QStringLiteral(SUOP_QML_DIR "/BottomBar.qml")));
+        QVERIFY2(!bottom.contains(QStringLiteral("function phaseLabel(")),
+                 "BottomBar.qml reintroduced a phaseLabel() switch — the phase→label map is the "
+                 "controller's phaseLabel(), call transcriptionController.phaseLabel() instead");
+        const QString main = stripComments(readAll(QStringLiteral(SUOP_QML_DIR "/MainPanel.qml")));
+        const QString overlay = functionBody(main, QStringLiteral("readonly property string transcribingOverlayLabel"));
+        QVERIFY2(!overlay.isEmpty(), "could not locate MainPanel.transcribingOverlayLabel");
+        QVERIFY2(!overlay.contains(QStringLiteral("case \"")),
+                 "MainPanel.transcribingOverlayLabel reintroduced a phase switch — use the controller's "
+                 "phaseOverlayLabel() (the overlay column of the one phase registry) instead");
     }
 
     // Item 7 (drift fix): ModelsPage's delete-confirm popup must match its
@@ -2171,84 +2250,59 @@ private slots:
                  "the bottom bar backend indicator must use activeBackendKind (item 25)");
     }
 
-    // Item 37: the async drag-and-drop "import" job kind flows through the
-    // same job-list rendering as every other kind, so its kind badge
-    // (kindLabel) and phase label (phaseLabel) must both handle it — no
-    // QQuickView here to render the delegate, so scan the two switch helpers'
-    // source instead (same technique the other BottomBar guards use).
-    void bottomBar_importKindHasBadgeAndPhaseLabel()
+    // The kind BADGE label now lives on the Task primitive — each kind authors
+    // its own Task::kindLabel() (the single source of truth that replaced
+    // BottomBar's kindLabel() switch, which a new kind could forget). The bottom
+    // bar must render that authored label (jobs()' "kindLabel" field /
+    // currentJobKindLabel), never re-derive it from the slug. (The PHASE label
+    // moved the same way — into the controller's phase registry; its coverage
+    // is guarded by phaseRegistryCoversEveryEmittedPhase, no longer here.)
+    void bottomBar_rendersTaskAuthoredKindLabel_notASwitch()
     {
         const QString bar = readAll(QStringLiteral(SUOP_QML_DIR "/BottomBar.qml"));
         QVERIFY2(!bar.isEmpty(), "qml/BottomBar.qml must exist");
+        QVERIFY2(!bar.contains(QStringLiteral("function kindLabel")),
+                 "BottomBar must NOT re-implement a kindLabel(kind) switch — the label is authored per-kind "
+                 "on the Task (Task::kindLabel()); a switch here is the drift that mislabeled new kinds "
+                 "\"Transcribe\"");
+        QVERIFY2(bar.contains(QStringLiteral("modelData.kindLabel")),
+                 "the Tasks-row badge must read the Task-authored jobs() \"kindLabel\" field");
+        QVERIFY2(bar.contains(QStringLiteral("currentJobKindLabel")),
+                 "the active-job badge must read the controller's currentJobKindLabel (the active task's "
+                 "Task::kindLabel())");
 
-        const int kindIdx = bar.indexOf(QStringLiteral("function kindLabel"));
-        QVERIFY2(kindIdx >= 0, "kindLabel() must exist");
-        const QString kindBlock = bar.mid(kindIdx, 600);
-        QVERIFY2(kindBlock.contains(QStringLiteral("case \"import\":")),
-                 "kindLabel() must have an \"import\" case (item 37) so import jobs get a "
-                 "readable kind badge in the Tasks popup");
-
-        const int phaseIdx = bar.indexOf(QStringLiteral("function phaseLabel"));
-        QVERIFY2(phaseIdx >= 0, "phaseLabel() must exist");
-        const QString phaseBlock = bar.mid(phaseIdx, 900);
-        QVERIFY2(phaseBlock.contains(QStringLiteral("case \"importing\":")),
-                 "phaseLabel() must have an \"importing\" case (item 37) so an active import "
-                 "shows a phase label instead of a blank");
+        // Item 37: the import kind authors its own badge label.
+        const QString importTask = readAll(QStringLiteral(SUOP_SRC_DIR "/core/tasks/ImportTask.h"));
+        QVERIFY2(importTask.contains(QStringLiteral("kindLabel")),
+                 "ImportTask must author its own kindLabel() (item 37) so import jobs get a readable badge");
     }
 
     // A USB grab is a normal queued job now (see DESIGN.md "USB import"), so it
-    // renders through the same Tasks rows as every other kind — and a kind with
-    // no case here doesn't degrade, it actively LIES: kindLabel()'s default arm
-    // is "Transcribe", so an unlabelled grab would show up claiming to be a
-    // transcription of the destination folder.
-    void bottomBar_usbGrabKindHasBadgeAndPhaseLabel()
+    // renders through the same Tasks rows as every other kind. The badge label
+    // is authored on the Task (UsbGrabTask::kindLabel()) — the whole point of
+    // moving it off the QML switch is that a kind can't forget it and fall to a
+    // default that LIES (the old default arm was "Transcribe", so an unlabelled
+    // grab claimed to be a transcription of the destination folder). (Its
+    // "grabbing" PHASE label lives in the controller's phase registry now,
+    // guarded by phaseRegistryCoversEveryEmittedPhase.)
+    void bottomBar_usbGrabKindHasBadge()
     {
-        // functionBody() rather than the fixed-width mid() windows the older
-        // BottomBar guards use: those silently stop covering the last case as
-        // soon as a kind is added above it, which is exactly what adding this
-        // kind does to them.
-        const QString bar = stripComments(readAll(QStringLiteral(SUOP_QML_DIR "/BottomBar.qml")));
-        QVERIFY2(!bar.isEmpty(), "qml/BottomBar.qml must exist");
-
-        const QString kindFn = functionBody(bar, QStringLiteral("function kindLabel"));
-        QVERIFY2(!kindFn.isEmpty(), "kindLabel() must exist");
-        QVERIFY2(kindFn.contains(QStringLiteral("case \"usbGrab\":")),
-                 "kindLabel() must have a \"usbGrab\" case — without one the default arm labels a grab "
-                 "\"Transcribe\", which is worse than blank: it's wrong");
-
-        const QString phaseFn = functionBody(bar, QStringLiteral("function phaseLabel"));
-        QVERIFY2(!phaseFn.isEmpty(), "phaseLabel() must exist");
-        QVERIFY2(phaseFn.contains(QStringLiteral("case \"grabbing\":")),
-                 "phaseLabel() must have a \"grabbing\" case so an active grab shows a phase label instead "
-                 "of a blank (UsbGrabTask::run() emits phase \"grabbing\")");
+        const QString grabTask = readAll(QStringLiteral(SUOP_SRC_DIR "/core/tasks/UsbGrabTask.h"));
+        QVERIFY2(grabTask.contains(QStringLiteral("kindLabel")),
+                 "UsbGrabTask must author its own kindLabel() so a grab isn't mislabelled");
     }
 
-    // Item 52 (diarize kind) + item 26/31 (chaptering phase): the two recently
-    // added job kinds/phases must have label cases so their Tasks badge / phase
-    // text isn't blank. The standalone diarize job is kind "diarize"; chapter
-    // generation runs a "chaptering" phase.
-    void bottomBar_diarizeKindAndChapteringPhaseLabels()
+    // Item 52 (diarize kind): the standalone diarize job (kind "diarize") must
+    // author its own kind badge so it isn't blank/mislabelled in the Tasks
+    // popup. (Its phases — and chaptering/detecting-speech — are labelled via
+    // the controller's phase registry, guarded by
+    // phaseRegistryCoversEveryEmittedPhase.)
+    void bottomBar_diarizeKindHasBadge()
     {
-        const QString bar = readAll(QStringLiteral(SUOP_QML_DIR "/BottomBar.qml"));
-        QVERIFY2(!bar.isEmpty(), "qml/BottomBar.qml must exist");
-
-        const int kindIdx = bar.indexOf(QStringLiteral("function kindLabel"));
-        QVERIFY2(kindIdx >= 0, "kindLabel() must exist");
-        QVERIFY2(bar.mid(kindIdx, 500).contains(QStringLiteral("case \"diarize\":")),
-                 "kindLabel() must have a \"diarize\" case (item 52) so standalone "
-                 "detect-speakers jobs get a readable kind badge in the Tasks popup");
-
-        const int phaseIdx = bar.indexOf(QStringLiteral("function phaseLabel"));
-        QVERIFY2(phaseIdx >= 0, "phaseLabel() must exist");
-        QVERIFY2(bar.mid(phaseIdx, 1000).contains(QStringLiteral("case \"chaptering\":")),
-                 "phaseLabel() must have a \"chaptering\" case (item 26/31) so an active "
-                 "chapter-generation phase shows a phase label instead of a blank");
-        // The VAD speech-detection pass is now a visible phase of every
-        // transcribe job (Transcribe is pure ASR + VAD), distinct from the
-        // diarize job's "detecting-speakers".
-        QVERIFY2(bar.mid(phaseIdx, 1000).contains(QStringLiteral("case \"detecting-speech\":")),
-                 "phaseLabel() must have a \"detecting-speech\" case so the VAD pass shows a "
-                 "phase label instead of a blank during transcription");
+        const QString diarizeTask = readAll(QStringLiteral(SUOP_SRC_DIR "/core/tasks/DiarizeTask.h"));
+        QVERIFY2(diarizeTask.contains(QStringLiteral("kindLabel")),
+                 "DiarizeTask must author its own kindLabel() (item 52) so standalone detect-speakers "
+                 "jobs get a readable kind badge in the Tasks popup");
     }
 
     // Item 29 + item 21: the popup is widened so descriptions fit, and its
@@ -3166,11 +3220,19 @@ private slots:
         QVERIFY2(mainPanelCode.contains(QStringLiteral("id: deleteAudioOnlyButton")),
                  "MainPanel icon cluster must have a 'Delete audio only' action for the open file, "
                  "matching the Sidebar's ctxDeleteAudioOnlyRow");
+        // With a controller the open-file deletes go through the async
+        // TrashTask (transcriptionController.trash) — undoable via the generic
+        // snackbar, visible in the Tasks list, deferred behind a same-file
+        // transcribe. The synchronous VaultTreeModel.trash* calls stay as the
+        // no-controller fallback (plain-model harnesses).
+        QVERIFY2(mainPanelCode.contains(QStringLiteral("transcriptionController.trash(")),
+                 "MainPanel's open-file deletes (with a controller) must route through "
+                 "TranscriptionController.trash() — the async, undoable instant-lane task");
         QVERIFY2(mainPanelCode.contains(QStringLiteral(".trashTranscript("))
                      && mainPanelCode.contains(QStringLiteral(".trashAudioOnly("))
                      && mainPanelCode.contains(QStringLiteral(".trashFiles(")),
-                 "MainPanel must call VaultTreeModel.trashTranscript()/trashAudioOnly()/trashFiles() "
-                 "— the trash-first calls, not the *Permanently() ones");
+                 "MainPanel must still fall back to VaultTreeModel.trashTranscript()/trashAudioOnly()/"
+                 "trashFiles() — the trash-first calls, not the *Permanently() ones — with no controller");
         // Still present, but now reached ONLY when the trash refused.
         QVERIFY2(mainPanelCode.contains(QStringLiteral("id: deleteFileConfirmPopup")),
                  "MainPanel must still confirm a delete the trash refused (the permanent case)");
@@ -3425,14 +3487,18 @@ private slots:
         const QString src = stripComments(readAll(QStringLiteral(SUOP_SRC_DIR "/core/UsbGrabberController.cpp")));
         QVERIFY2(!src.isEmpty(), "src/core/UsbGrabberController.cpp must exist");
 
-        const QString handler = functionBody(src, QStringLiteral("void UsbGrabberController::handleDeviceAdded("));
-        QVERIFY2(!handler.isEmpty(), "handleDeviceAdded must still exist — it IS the hotplug auto-grab path");
+        // The gate moved into maybeAutoGrab() (2026-07: shared by hotplug
+        // handleDeviceAdded AND the startup rescanForAutoGrab, so both apply it
+        // identically). Scan that helper now — handleDeviceAdded is just a
+        // one-line delegate to it.
+        const QString handler = functionBody(src, QStringLiteral("void UsbGrabberController::maybeAutoGrab("));
+        QVERIFY2(!handler.isEmpty(), "maybeAutoGrab must exist — it IS the shared auto-grab gate");
 
         QVERIFY2(handler.contains(QStringLiteral(".autoGrab")),
-                 "handleDeviceAdded() must gate on rule.autoGrab as well as rule.enabled: a hotplug may only "
-                 "grab by itself for a device whose owner opted that device into auto-grabbing");
+                 "maybeAutoGrab() must gate on rule.autoGrab as well as rule.enabled: a device may only "
+                 "grab by itself when its owner opted that device into auto-grabbing");
         QVERIFY2(handler.contains(QStringLiteral(".enabled")),
-                 "handleDeviceAdded() must still ALSO gate on rule.enabled — autoGrab is narrower than "
+                 "maybeAutoGrab() must still ALSO gate on rule.enabled — autoGrab is narrower than "
                  "enabled, never a way around it");
     }
 

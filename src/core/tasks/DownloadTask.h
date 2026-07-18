@@ -19,6 +19,7 @@ public:
     DownloadTask(ModelDownloadTarget target, QString modelId, QObject *parent = nullptr);
 
     QString kind() const override { return QStringLiteral("download"); }
+    QString kindLabel() const override { return QStringLiteral("Download"); }
     QString displayName() const override;
     // Background: a predownload or an explicit model-page download has no
     // business hijacking the main panel overlay.
@@ -31,6 +32,8 @@ public:
     // queued state next launch (unlike import/usbGrab, nothing here names an
     // external/removable path that might be gone).
     bool isPersistable() const override { return true; }
+    // A landed download adds a model file — the Models page must refresh.
+    bool completionChangesModelSet() const override { return true; }
     QJsonObject toJson() const override;
     QVariantMap toVariantMap() const override;
 

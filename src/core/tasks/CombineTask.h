@@ -18,6 +18,7 @@ public:
     CombineTask(QStringList sourcePaths, QUrl outputUrl, bool deleteOriginals, QObject *parent = nullptr);
 
     QString kind() const override { return QStringLiteral("combine"); }
+    QString kindLabel() const override { return QStringLiteral("Combine"); }
     QString displayName() const override;
     // capabilities: pausable via SIGSTOP/SIGCONT on the ffmpeg subprocess —
     // a real, killable/pausable process, same shape as decode. See

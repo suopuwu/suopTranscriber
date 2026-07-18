@@ -35,6 +35,30 @@ ApplicationWindow {
 
     TranscriptionController {
         id: transcriptionController
+        // So a trash/delete/restore task can call back to the model on the GUI
+        // thread (applyRemovalOutcome/applyRestoreOutcome) to rebuild the tree +
+        // emit the per-file delete/restore signals MainPanel reacts to — the
+        // model owns the orphaned-vs-audio classification. Same wiring as
+        // UsbGrabberController's vaultTreeModel binding.
+        vaultTreeModel: vaultModel
+    }
+
+    // Auto undo-snackbar for ANY undoable task (Task::undoLabel/makeUndoTask) —
+    // rename today, move/trash later — so an undoable op gets consistent undo
+    // UI for free, no per-kind QML. Undo just enqueues the inverse task (which
+    // is itself reported and re-undoable).
+    Connections {
+        target: transcriptionController
+        function onUndoAvailable(taskId, label) {
+            Notifications.post({
+                text: label,
+                kind: "info",
+                actions: [{
+                    label: qsTr("Undo"),
+                    onTriggered: function() { transcriptionController.undoTask(taskId) }
+                }]
+            })
+        }
     }
 
     UsbGrabberController {

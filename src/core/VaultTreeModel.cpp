@@ -1,5 +1,8 @@
 #include "VaultTreeModel.h"
 
+#include "AudioExtensions.h"
+#include "FileRename.h"
+
 #include <QDir>
 #include <QFile>
 #include <QSaveFile>
@@ -15,19 +18,6 @@
 #include <vector>
 
 namespace {
-
-const QSet<QString> &audioExtensions()
-{
-    static const QSet<QString> exts = {
-        "mp3", "wav", "m4a", "flac", "ogg", "opus", "aac", "wma", "aiff", "alac",
-    };
-    return exts;
-}
-
-bool isAudioFile(const QFileInfo &info)
-{
-    return audioExtensions().contains(info.suffix().toLower());
-}
 
 // Shared name validator for a single filesystem entry the user typed
 // (createFolder()'s new folder, renameFolder()'s new name). The invalid-char
@@ -51,67 +41,6 @@ bool isValidEntryName(const QString &name)
     // than a new child — reject explicitly rather than rely on a collision
     // check, which they'd pass.
     return trimmed != QStringLiteral(".") && trimmed != QStringLiteral("..");
-}
-
-// Trash a path, RECOVERABLY, and report where it landed. Never falls back to a
-// permanent delete — that's removePermanently()'s job, and keeping the two
-// apart is what lets the UI offer Undo for the recoverable case and ask for
-// confirmation only for the irreversible one.
-//
-// On success *trashPathOut is the file's new location in the trash, which is
-// the ONLY handle a later restoreFromTrash() has. QFile::moveToTrash() rewrites
-// fileName() to it, and that value is unrecoverable once the QFile goes out of
-// scope, so it's captured here rather than rediscovered.
-//
-// A FAILED moveToTrash() is non-destructive — the original is left fully
-// intact (verified empirically on Qt 6.11; an older comment here claimed
-// fileName() could be left pointing at a partial trash path on failure, which
-// did not reproduce). That guarantee is load-bearing: it's what makes
-// "attempt the trash, and only ask about a permanent delete if it fails" safe,
-// and it's why nothing here tries to PREDICT trash-ability (which would mean
-// reimplementing the freedesktop spec's device/top-dir rules and hoping we
-// match Qt's).
-//
-// Takes directories as well as files — moveToTrash() trashes a whole tree
-// intact. Returns false if the path doesn't exist to begin with (an absent
-// optional sidecar isn't a failure — callers ignore the result for those).
-bool trashOnly(const QString &path, QString *trashPathOut = nullptr)
-{
-    const QFileInfo info(path);
-    if (!info.exists())
-        return false;
-    QFile file(path);
-    if (!file.moveToTrash())
-        return false;
-    if (trashPathOut)
-        *trashPathOut = file.fileName();
-    return true;
-}
-
-// Irreversible. Only ever reached once the user has confirmed a delete that
-// could NOT be trashed. QFile::remove() refuses a directory, so this branches.
-bool removePermanently(const QString &path)
-{
-    const QFileInfo info(path);
-    if (!info.exists())
-        return false;
-    return info.isDir() ? QDir(path).removeRecursively() : QFile::remove(path);
-}
-
-// The freedesktop trash spec pairs every trashed file with an info entry:
-//   <trashroot>/files/<name>  <->  <trashroot>/info/<name>.trashinfo
-// Qt gives us the former and has no restore API at all, so a restore has to
-// derive and delete the latter itself — renaming only the file back would
-// orphan the info entry and leave a phantom row in the desktop's trash UI.
-QString trashInfoPathFor(const QString &trashedFilePath)
-{
-    const QFileInfo info(trashedFilePath);
-    QDir filesDir(info.absolutePath());
-    if (filesDir.dirName() != QLatin1String("files"))
-        return {}; // not a spec-shaped trash location — nothing to clean up
-    filesDir.cdUp();
-    return filesDir.absoluteFilePath(QStringLiteral("info/") + info.fileName()
-                                     + QStringLiteral(".trashinfo"));
 }
 
 } // namespace
@@ -530,84 +459,11 @@ QHash<int, QByteArray> VaultTreeModel::roleNames() const
 
 bool VaultTreeModel::renameFile(const QUrl &fileUrl, const QString &newBaseName, QString *errorOut)
 {
-    auto fail = [&](const QString &msg) {
-        if (errorOut)
-            *errorOut = msg;
+    // The filesystem rename now lives in renameRecordingFile() (FileRename.h)
+    // so a worker thread (RenameFileTask) can share it; this instance method
+    // is the synchronous wrapper that also refreshes the model.
+    if (!renameRecordingFile(fileUrl, newBaseName, nullptr, errorOut))
         return false;
-    };
-
-    if (newBaseName.isEmpty())
-        return fail(QStringLiteral("New name must not be empty."));
-
-    const QString trimmed = newBaseName.trimmed();
-    if (trimmed.isEmpty())
-        return fail(QStringLiteral("New name must not be empty."));
-
-    static const QString invalidChars = QStringLiteral("/\\:*?\"<>|");
-    for (const QChar &c : newBaseName) {
-        if (invalidChars.contains(c))
-            return fail(QStringLiteral("New name contains an invalid character: '%1'").arg(c));
-    }
-
-    const QString path = fileUrl.toLocalFile();
-    const QFileInfo info(path);
-    if (!info.exists())
-        return fail(QStringLiteral("File does not exist."));
-
-    const QString dirPath = info.absolutePath();
-
-    // Determine which file(s) participate in the rename: an audio file (and
-    // its sibling .md, if present) or a standalone orphaned .md file.
-    QString audioOldPath;
-    QString audioExt;
-    QString mdOldPath;
-
-    if (isAudioFile(info)) {
-        audioOldPath = info.absoluteFilePath();
-        audioExt = info.suffix();
-        // Item P7: the sidecar's name is the FULL audio filename + ".md",
-        // not just the stripped stem — see sidecarMdPath()'s doc comment.
-        const QString candidateMd = dirPath + '/' + info.fileName() + ".md";
-        if (QFileInfo::exists(candidateMd))
-            mdOldPath = candidateMd;
-    } else if (info.suffix().toLower() == "md") {
-        mdOldPath = info.absoluteFilePath();
-    } else {
-        return fail(QStringLiteral("Unsupported file type."));
-    }
-
-    const QString newAudioPath = audioOldPath.isEmpty() ? QString() : dirPath + '/' + trimmed + '.' + audioExt;
-    // When renaming an audio file with an existing sidecar, the new sidecar
-    // name must track the new FULL audio filename (stem+ext+".md"), matching
-    // the fileName()+".md" convention above — NOT just trimmed+".md", which
-    // would silently revert to the old (collision-prone) stripped-stem
-    // naming. A standalone orphaned .md being renamed directly (no audio
-    // file involved) keeps the simple trimmed+".md" form, since there's no
-    // audio extension to fold in.
-    const QString newMdPath = mdOldPath.isEmpty()
-        ? QString()
-        : (audioOldPath.isEmpty() ? dirPath + '/' + trimmed + ".md" : newAudioPath + ".md");
-
-    if ((!newAudioPath.isEmpty() && QFileInfo::exists(newAudioPath))
-        || (!newMdPath.isEmpty() && QFileInfo::exists(newMdPath))) {
-        return fail(QStringLiteral("A file with that name already exists."));
-    }
-
-    bool audioRenamed = false;
-    if (!audioOldPath.isEmpty()) {
-        if (!QFile::rename(audioOldPath, newAudioPath))
-            return fail(QStringLiteral("Failed to rename audio file."));
-        audioRenamed = true;
-    }
-
-    if (!mdOldPath.isEmpty()) {
-        if (!QFile::rename(mdOldPath, newMdPath)) {
-            if (audioRenamed)
-                QFile::rename(newAudioPath, audioOldPath); // best-effort rollback
-            return fail(QStringLiteral("Failed to rename markdown file; changes rolled back."));
-        }
-    }
-
     rebuild();
     return true;
 }
@@ -671,192 +527,38 @@ bool VaultTreeModel::createFolder(const QUrl &parentDirUrl, const QString &name)
     return true;
 }
 
-QString VaultTreeModel::guardedLocalPath(const QUrl &url, EntryKind kind) const
-{
-    const QString path = url.toLocalFile();
-    if (path.isEmpty())
-        return {};
-
-    const QFileInfo info(path);
-    if (!info.exists())
-        return {};
-    // Files and folders stay strictly separate, and this is a safety guard, not
-    // tidiness: a folder delete is recursive and takes every transcript under
-    // it, so it must never be reachable from the call that handles a file
-    // SELECTION — one stray folder path leaking into a multi-select would
-    // otherwise silently destroy a whole tree.
-    if (kind == EntryKind::File && !info.isFile())
-        return {};
-    if (kind == EntryKind::Folder && !info.isDir())
-        return {};
-
-    const QString canonical = info.canonicalFilePath();
-    const QString vaultCanonical = QFileInfo(vaultLocalPath()).canonicalFilePath();
-    if (canonical.isEmpty() || vaultCanonical.isEmpty())
-        return {};
-    // Never the vault root itself — deleting it would take the whole vault out
-    // from under the open window...
-    if (canonical == vaultCanonical)
-        return {};
-    // ...nor anything outside the vault (isPathInsideVault also accepts the
-    // root, hence the explicit equality guard above).
-    if (!isPathInsideVault(path))
-        return {};
-
-    return path;
-}
-
 bool VaultTreeModel::renameFolder(const QUrl &folderUrl, const QString &newName, QString *errorOut)
 {
-    auto fail = [&](const QString &msg) {
-        if (errorOut)
-            *errorOut = msg;
+    // Thin wrapper over the pure filesystem rename (shared with FolderRenameTask's
+    // worker-thread path) + an inline rebuild — mirrors moveFile()/renameFile().
+    // QML routes folder rename through TranscriptionController::renameFolder() (an
+    // instant-lane task); this stays for direct/synchronous callers + tests.
+    if (!renameVaultFolder(folderUrl, newName, vaultLocalPath(), nullptr, errorOut))
         return false;
-    };
-
-    if (!isValidEntryName(newName))
-        return fail(QStringLiteral("Invalid folder name."));
-    const QString trimmed = newName.trimmed();
-
-    const QString path = folderUrl.toLocalFile();
-    if (path.isEmpty())
-        return fail(QStringLiteral("Folder does not exist."));
-
-    const QFileInfo info(path);
-    if (!info.exists() || !info.isDir())
-        return fail(QStringLiteral("Folder does not exist."));
-
-    const QString canonical = info.canonicalFilePath();
-    const QString vaultCanonical = QFileInfo(vaultLocalPath()).canonicalFilePath();
-    if (canonical.isEmpty() || vaultCanonical.isEmpty())
-        return fail(QStringLiteral("Folder does not exist."));
-    // Same two guards as deleteFolder(): never the vault root itself (renaming
-    // it would move the whole vault out from under the open window), and never
-    // anything outside the vault. isPathInsideVault() also accepts the root,
-    // hence the explicit equality guard first.
-    if (canonical == vaultCanonical)
-        return fail(QStringLiteral("Can't rename the vault root."));
-    if (!isPathInsideVault(path))
-        return fail(QStringLiteral("Folder is outside the vault."));
-
-    // A pure rename in place — the parent never changes (moveFolder() owns
-    // reparenting), so a validated name can only ever land beside itself.
-    const QString newPath = info.absolutePath() + '/' + trimmed;
-    if (newPath == info.absoluteFilePath())
-        return true; // no-op: same name, not a failure worth reporting
-    if (QFileInfo::exists(newPath))
-        return fail(QStringLiteral("A folder with that name already exists."));
-
-    if (!QDir().rename(path, newPath))
-        return fail(QStringLiteral("Failed to rename folder."));
-
     rebuild();
     return true;
 }
 
 bool VaultTreeModel::moveFile(const QUrl &fileUrl, const QUrl &destDirUrl)
 {
-    const QString srcPath = fileUrl.toLocalFile();
-    const QString destDir = destDirUrl.toLocalFile();
-    if (srcPath.isEmpty() || destDir.isEmpty())
+    // Thin wrapper over the pure filesystem move (shared with MoveTask's
+    // worker-thread path) + an inline rebuild — mirrors renameFile(). Direct
+    // callers/tests and the Sidebar's no-controller fallback use this; the
+    // controller's moveFiles() runs moveRecordingFile() itself off-thread.
+    if (!moveRecordingFile(fileUrl, destDirUrl, vaultLocalPath(), nullptr, nullptr))
         return false;
-
-    const QFileInfo srcInfo(srcPath);
-    if (!srcInfo.exists() || !srcInfo.isFile())
-        return false;
-
-    const QFileInfo destDirInfo(destDir);
-    if (!destDirInfo.exists() || !destDirInfo.isDir())
-        return false;
-
-    // Both ends must stay inside the vault.
-    if (!isPathInsideVault(srcPath) || !isPathInsideVault(destDir))
-        return false;
-
-    // No-op guard: destination is the file's current directory.
-    if (QFileInfo(srcInfo.absolutePath()).canonicalFilePath() == destDirInfo.canonicalFilePath())
-        return false;
-
-    // The set of files that move together: the file itself, plus — when it's
-    // an audio file — its <fileName>.md sidecar and, if present, its
-    // .<fileName>.partial.jsonl resume state (same full-filename convention as
-    // sidecarMdPath(); see item P7). A standalone .md moves alone.
-    std::vector<std::pair<QString, QString>> moves;
-    moves.emplace_back(srcPath, destDir + '/' + srcInfo.fileName());
-
-    if (isAudioFile(srcInfo)) {
-        const QString dirPath = srcInfo.absolutePath();
-        const QString mdFrom = dirPath + '/' + srcInfo.fileName() + ".md";
-        if (QFileInfo::exists(mdFrom))
-            moves.emplace_back(mdFrom, destDir + '/' + srcInfo.fileName() + ".md");
-        const QString partialFrom = dirPath + "/." + srcInfo.fileName() + ".partial.jsonl";
-        if (QFileInfo::exists(partialFrom))
-            moves.emplace_back(partialFrom, destDir + "/." + srcInfo.fileName() + ".partial.jsonl");
-    }
-
-    // Check every destination for a collision BEFORE moving anything, so a
-    // half-done move never splits the audio/.md pair across two folders.
-    for (const auto &m : moves) {
-        if (QFileInfo::exists(m.second))
-            return false;
-    }
-
-    std::vector<std::pair<QString, QString>> done;
-    for (const auto &m : moves) {
-        if (!QFile::rename(m.first, m.second)) {
-            for (const auto &d : done)
-                QFile::rename(d.second, d.first); // best-effort rollback
-            return false;
-        }
-        done.push_back(m);
-    }
-
     rebuild();
     return true;
 }
 
 bool VaultTreeModel::moveFolder(const QUrl &folderUrl, const QUrl &destParentUrl)
 {
-    const QString srcPath = folderUrl.toLocalFile();
-    const QString destParent = destParentUrl.toLocalFile();
-    if (srcPath.isEmpty() || destParent.isEmpty())
+    // Thin wrapper over the pure filesystem move (shared with FolderMoveTask) +
+    // an inline rebuild — mirrors moveFile(). QML routes folder move through
+    // TranscriptionController::moveFolder() (an instant-lane task); this stays
+    // for direct/synchronous callers + tests.
+    if (!moveVaultFolder(folderUrl, destParentUrl, vaultLocalPath(), nullptr, nullptr))
         return false;
-
-    const QFileInfo srcInfo(srcPath);
-    if (!srcInfo.exists() || !srcInfo.isDir())
-        return false;
-    const QFileInfo destParentInfo(destParent);
-    if (!destParentInfo.exists() || !destParentInfo.isDir())
-        return false;
-
-    const QString srcCanonical = srcInfo.canonicalFilePath();
-    const QString destParentCanonical = destParentInfo.canonicalFilePath();
-    const QString vaultCanonical = QFileInfo(vaultLocalPath()).canonicalFilePath();
-    if (srcCanonical.isEmpty() || destParentCanonical.isEmpty() || vaultCanonical.isEmpty())
-        return false;
-
-    // Never move the vault root itself, and keep both ends inside the vault.
-    if (srcCanonical == vaultCanonical)
-        return false;
-    if (!isPathInsideVault(srcPath) || !isPathInsideVault(destParent))
-        return false;
-
-    // Refuse moving a folder into itself or one of its own descendants — that
-    // would orphan the subtree.
-    if (destParentCanonical == srcCanonical || destParentCanonical.startsWith(srcCanonical + '/'))
-        return false;
-
-    // No-op guard: already directly inside destParent.
-    if (QFileInfo(srcInfo.absolutePath()).canonicalFilePath() == destParentCanonical)
-        return false;
-
-    const QString destPath = destParent + '/' + srcInfo.fileName();
-    if (QFileInfo::exists(destPath))
-        return false; // collision
-
-    if (!QDir().rename(srcPath, destPath))
-        return false;
-
     rebuild();
     return true;
 }
@@ -881,83 +583,6 @@ static bool transcriptPathsFor(const QFileInfo &info, QString *mdOut, QString *p
     return false;
 }
 
-// Records one trashed path so restoreFromTrash() can put it back. The trash
-// path is only knowable at trash time — nothing can reconstruct it later.
-static void recordRestorable(QVariantList *restorable, const QString &trashPath,
-                             const QString &originalPath)
-{
-    if (!restorable || trashPath.isEmpty())
-        return;
-    restorable->append(QVariantMap{ { QStringLiteral("trashPath"), trashPath },
-                                    { QStringLiteral("originalPath"), originalPath } });
-}
-
-VaultTreeModel::TrashOutcome VaultTreeModel::trashEntry(const QUrl &url, EntryKind kind,
-                                                        QVariantList *restorable)
-{
-    const QString path = guardedLocalPath(url, kind);
-    if (path.isEmpty())
-        return TrashOutcome::Invalid;
-
-    // Resolve the sidecar set BEFORE trashing anything. QFileInfo stats lazily,
-    // so asking info.isFile() after the file has already moved to the trash
-    // stats a path that no longer exists and answers false — silently stranding
-    // every .md sidecar in the vault. Read what we need while it's still there.
-    const QFileInfo info(path);
-    const bool isAudio = info.isFile() && isAudioFile(info);
-    QString mdPath, partialPath;
-    if (isAudio)
-        transcriptPathsFor(info, &mdPath, &partialPath);
-
-    // The entry itself first. If the filesystem refuses, STOP — the entry is
-    // untouched and the caller will ask the user about a permanent delete. In
-    // particular don't trash the sidecars of a file that itself survived: that
-    // would leave the audio stranded without its transcript.
-    QString trashPath;
-    if (!trashOnly(path, &trashPath))
-        return TrashOutcome::Untrashable;
-    recordRestorable(restorable, trashPath, path);
-
-    // Carry the sidecars off with an audio file, mirroring moveFile()'s set. A
-    // folder took its contents with it; an orphaned .md has none.
-    if (isAudio) {
-        // Best-effort: an absent sidecar isn't a failure, and a sidecar that
-        // won't trash isn't worth stranding the whole delete over — it just
-        // doesn't come back on undo.
-        QString sidecarTrash;
-        if (trashOnly(mdPath, &sidecarTrash))
-            recordRestorable(restorable, sidecarTrash, mdPath);
-        if (trashOnly(partialPath, &sidecarTrash))
-            recordRestorable(restorable, sidecarTrash, partialPath);
-    }
-
-    return TrashOutcome::Trashed;
-}
-
-bool VaultTreeModel::removeEntryPermanently(const QUrl &url, EntryKind kind)
-{
-    const QString path = guardedLocalPath(url, kind);
-    if (path.isEmpty())
-        return false;
-
-    // Same lazy-stat trap as trashEntry(): resolve the sidecar set while the
-    // file still exists, not after removePermanently() has unlinked it.
-    const QFileInfo info(path);
-    const bool isAudio = info.isFile() && isAudioFile(info);
-    QString mdPath, partialPath;
-    if (isAudio)
-        transcriptPathsFor(info, &mdPath, &partialPath);
-
-    if (!removePermanently(path))
-        return false;
-
-    if (isAudio) {
-        removePermanently(mdPath);      // best-effort; absent sidecars aren't failures
-        removePermanently(partialPath);
-    }
-    return true;
-}
-
 QVariantMap VaultTreeModel::makeTrashResult(int trashed, const QVariantList &restorable,
                                             const QVariantList &untrashable, const QVariantList &invalid)
 {
@@ -969,179 +594,46 @@ QVariantMap VaultTreeModel::makeTrashResult(int trashed, const QVariantList &res
 
 QVariantMap VaultTreeModel::trashFiles(const QList<QUrl> &urls)
 {
-    // One rebuild() for the whole batch, not one per entry: rebuild() rescans
-    // the vault recursively AND resets the model (destroying/recreating every
-    // realized delegate), so looping over a 20-file selection would pay both
-    // costs 20 times over for a single user action.
-    QVariantList restorable;
-    QList<QUrl> trashed;
-    QVariantList untrashable;
-    QVariantList invalid;
-    trashed.reserve(urls.size());
-
-    for (const QUrl &url : urls) {
-        switch (trashEntry(url, EntryKind::File, &restorable)) {
-        case TrashOutcome::Trashed:
-            trashed.append(url);
-            break;
-        case TrashOutcome::Untrashable:
-            untrashable.append(url.toString());
-            break;
-        case TrashOutcome::Invalid:
-            invalid.append(url.toString());
-            break;
-        }
-    }
-
-    if (!trashed.isEmpty()) {
-        rebuild();
-        // Emitted only after the single rebuild, so a listener that re-reads
-        // the tree (MainPanel closing the deleted file) never sees a model
-        // still advertising rows whose files are already gone. Per surviving
-        // file, not once for the batch — fileDeleted's contract is one file per
-        // emission, and MainPanel matches it against the file it has open.
-        for (const QUrl &url : trashed)
-            emit fileDeleted(url);
-    }
-
-    return makeTrashResult(int(trashed.size()), restorable, untrashable, invalid);
+    // Thin wrapper: the pure batch does the filesystem work off any model, then
+    // applyRemovalOutcome() does the single rebuild() + the per-file signals.
+    TrashBatchResult r = trashVaultEntries(urls, VaultFileScope::Files, vaultLocalPath());
+    applyRemovalOutcome(VaultFileScope::Files, r.trashed);
+    return makeTrashResult(int(r.trashed.size()), r.restorable, r.untrashable, r.invalid);
 }
 
 int VaultTreeModel::deleteFilesPermanently(const QList<QUrl> &urls)
 {
-    QList<QUrl> deleted;
-    deleted.reserve(urls.size());
-    for (const QUrl &url : urls) {
-        if (removeEntryPermanently(url, EntryKind::File))
-            deleted.append(url);
-    }
-
-    if (deleted.isEmpty())
-        return 0;
-
-    rebuild();
-    for (const QUrl &url : deleted)
-        emit fileDeleted(url);
-    return deleted.size();
+    auto removed = deleteVaultEntriesPermanently(urls, VaultFileScope::Files, vaultLocalPath());
+    applyRemovalOutcome(VaultFileScope::Files, removed);
+    return removed.size();
 }
 
 QVariantMap VaultTreeModel::trashFolder(const QUrl &folderUrl)
 {
-    QVariantList restorable;
-    QVariantMap result{ { QStringLiteral("trashed"), 0 },
-                        { QStringLiteral("restorable"), QVariantList{} },
-                        { QStringLiteral("untrashable"), QVariantList{} },
-                        { QStringLiteral("invalid"), QVariantList{} } };
-
-    switch (trashEntry(folderUrl, EntryKind::Folder, &restorable)) {
-    case TrashOutcome::Trashed:
-        rebuild();
-        result[QStringLiteral("trashed")] = 1;
-        result[QStringLiteral("restorable")] = restorable;
-        break;
-    case TrashOutcome::Untrashable:
-        result[QStringLiteral("untrashable")] = QVariantList{ folderUrl.toString() };
-        break;
-    case TrashOutcome::Invalid:
-        result[QStringLiteral("invalid")] = QVariantList{ folderUrl.toString() };
-        break;
-    }
-    return result;
+    TrashBatchResult r = trashVaultEntries({ folderUrl }, VaultFileScope::Folder, vaultLocalPath());
+    applyRemovalOutcome(VaultFileScope::Folder, r.trashed);
+    return makeTrashResult(int(r.trashed.size()), r.restorable, r.untrashable, r.invalid);
 }
 
 bool VaultTreeModel::deleteFolderPermanently(const QUrl &folderUrl)
 {
-    if (!removeEntryPermanently(folderUrl, EntryKind::Folder))
-        return false;
-    rebuild();
-    return true;
-}
-
-VaultTreeModel::TrashOutcome VaultTreeModel::trashTranscriptEntry(const QUrl &fileUrl,
-                                                                  QVariantList *restorable)
-{
-    const QString path = fileUrl.toLocalFile();
-    const QFileInfo info(path);
-    QString mdPath, partialPath;
-    // NOT guardedLocalPath(): the transcript of an audio file is what's being
-    // removed, so it's the .md that must be inside the vault, and the audio
-    // itself is never touched. isPathInsideVault covers it.
-    if (path.isEmpty() || !info.exists() || !info.isFile() || !isPathInsideVault(path)
-        || !transcriptPathsFor(info, &mdPath, &partialPath))
-        return TrashOutcome::Invalid;
-    // Nothing transcribed here — a no-op, not a failure, and emphatically not
-    // Untrashable: the filesystem refused nothing, so there is nothing for the
-    // caller to offer a permanent delete of.
-    if (!QFileInfo::exists(mdPath))
-        return TrashOutcome::Invalid;
-
-    QString trashPath;
-    if (!trashOnly(mdPath, &trashPath))
-        return TrashOutcome::Untrashable;
-    recordRestorable(restorable, trashPath, mdPath);
-    if (trashOnly(partialPath, &trashPath)) // best-effort; an absent partial is fine
-        recordRestorable(restorable, trashPath, partialPath);
-    return TrashOutcome::Trashed;
+    auto removed = deleteVaultEntriesPermanently({ folderUrl }, VaultFileScope::Folder, vaultLocalPath());
+    applyRemovalOutcome(VaultFileScope::Folder, removed);
+    return !removed.isEmpty();
 }
 
 QVariantMap VaultTreeModel::trashTranscript(const QList<QUrl> &urls)
 {
-    QVariantList restorable;
-    QList<QUrl> trashed;
-    QVariantList untrashable;
-    QVariantList invalid;
-    trashed.reserve(urls.size());
-
-    for (const QUrl &url : urls) {
-        switch (trashTranscriptEntry(url, &restorable)) {
-        case TrashOutcome::Trashed:
-            trashed.append(url);
-            break;
-        case TrashOutcome::Untrashable:
-            untrashable.append(url.toString());
-            break;
-        case TrashOutcome::Invalid:
-            invalid.append(url.toString());
-            break;
-        }
-    }
-
-    if (!trashed.isEmpty()) {
-        rebuild(); // once for the batch — see trashFiles()
-        for (const QUrl &url : trashed)
-            emit transcriptDeleted(url);
-    }
-
-    return makeTrashResult(int(trashed.size()), restorable, untrashable, invalid);
+    TrashBatchResult r = trashVaultEntries(urls, VaultFileScope::Transcript, vaultLocalPath());
+    applyRemovalOutcome(VaultFileScope::Transcript, r.trashed);
+    return makeTrashResult(int(r.trashed.size()), r.restorable, r.untrashable, r.invalid);
 }
 
 int VaultTreeModel::deleteTranscriptPermanently(const QList<QUrl> &urls)
 {
-    QList<QUrl> deleted;
-    deleted.reserve(urls.size());
-
-    for (const QUrl &url : urls) {
-        const QString path = url.toLocalFile();
-        const QFileInfo info(path);
-        QString mdPath, partialPath;
-        if (path.isEmpty() || !info.exists() || !info.isFile() || !isPathInsideVault(path)
-            || !transcriptPathsFor(info, &mdPath, &partialPath))
-            continue;
-        if (!QFileInfo::exists(mdPath))
-            continue;
-        if (!removePermanently(mdPath))
-            continue;
-        removePermanently(partialPath); // best-effort
-        deleted.append(url);
-    }
-
-    if (deleted.isEmpty())
-        return 0;
-
-    rebuild();
-    for (const QUrl &url : deleted)
-        emit transcriptDeleted(url);
-    return deleted.size();
+    auto removed = deleteVaultEntriesPermanently(urls, VaultFileScope::Transcript, vaultLocalPath());
+    applyRemovalOutcome(VaultFileScope::Transcript, removed);
+    return removed.size();
 }
 
 // Which signal an audio-only delete ends on — shared by the trash and permanent
@@ -1160,96 +652,18 @@ void VaultTreeModel::emitAudioOnlyDeleted(const QUrl &fileUrl, const QString &md
         emit fileDeleted(fileUrl); // nothing survived — an ordinary delete
 }
 
-VaultTreeModel::TrashOutcome VaultTreeModel::trashAudioOnlyEntry(const QUrl &fileUrl,
-                                                                 QVariantList *restorable,
-                                                                 QString *mdPathOut)
-{
-    const QString path = guardedLocalPath(fileUrl, EntryKind::File);
-    // Audio only: "drop the audio, keep the transcript" is meaningless for an
-    // orphaned .md (there's no audio) and for a non-audio file (there's no
-    // transcript), so both are rejected rather than silently doing something else.
-    const QFileInfo info(path);
-    if (path.isEmpty() || !isAudioFile(info))
-        return TrashOutcome::Invalid;
-
-    // Same lazy-stat trap as trashEntry(): resolve the partial's path while the
-    // audio still exists, not after it has moved to the trash.
-    QString partialPath;
-    transcriptPathsFor(info, mdPathOut, &partialPath);
-
-    QString trashPath;
-    if (!trashOnly(path, &trashPath))
-        return TrashOutcome::Untrashable;
-    recordRestorable(restorable, trashPath, path);
-
-    // The partial follows the audio; *mdPathOut is deliberately never touched.
-    if (trashOnly(partialPath, &trashPath)) // best-effort; an absent partial is fine
-        recordRestorable(restorable, trashPath, partialPath);
-    return TrashOutcome::Trashed;
-}
-
 QVariantMap VaultTreeModel::trashAudioOnly(const QList<QUrl> &urls)
 {
-    QVariantList restorable;
-    QVariantList untrashable;
-    QVariantList invalid;
-    // Each surviving entry's .md, paired with its url: which signal the entry
-    // earns can only be decided after the rebuild, but the path has to be
-    // resolved before the audio moves — so carry it across.
-    QList<std::pair<QUrl, QString>> trashed;
-    trashed.reserve(urls.size());
-
-    for (const QUrl &url : urls) {
-        QString mdPath;
-        switch (trashAudioOnlyEntry(url, &restorable, &mdPath)) {
-        case TrashOutcome::Trashed:
-            trashed.append({ url, mdPath });
-            break;
-        case TrashOutcome::Untrashable:
-            untrashable.append(url.toString());
-            break;
-        case TrashOutcome::Invalid:
-            invalid.append(url.toString());
-            break;
-        }
-    }
-
-    if (!trashed.isEmpty()) {
-        rebuild(); // once for the batch — see trashFiles()
-        for (const auto &[url, mdPath] : trashed)
-            emitAudioOnlyDeleted(url, mdPath);
-    }
-
-    return makeTrashResult(int(trashed.size()), restorable, untrashable, invalid);
+    TrashBatchResult r = trashVaultEntries(urls, VaultFileScope::AudioOnly, vaultLocalPath());
+    applyRemovalOutcome(VaultFileScope::AudioOnly, r.trashed);
+    return makeTrashResult(int(r.trashed.size()), r.restorable, r.untrashable, r.invalid);
 }
 
 int VaultTreeModel::deleteAudioOnlyPermanently(const QList<QUrl> &urls)
 {
-    QList<std::pair<QUrl, QString>> deleted;
-    deleted.reserve(urls.size());
-
-    for (const QUrl &url : urls) {
-        const QString path = guardedLocalPath(url, EntryKind::File);
-        const QFileInfo info(path);
-        if (path.isEmpty() || !isAudioFile(info))
-            continue;
-
-        QString mdPath, partialPath;
-        transcriptPathsFor(info, &mdPath, &partialPath);
-
-        if (!removePermanently(path))
-            continue;
-        removePermanently(partialPath); // best-effort; mdPath is left alone on purpose
-        deleted.append({ url, mdPath });
-    }
-
-    if (deleted.isEmpty())
-        return 0;
-
-    rebuild();
-    for (const auto &[url, mdPath] : deleted)
-        emitAudioOnlyDeleted(url, mdPath);
-    return int(deleted.size());
+    auto removed = deleteVaultEntriesPermanently(urls, VaultFileScope::AudioOnly, vaultLocalPath());
+    applyRemovalOutcome(VaultFileScope::AudioOnly, removed);
+    return int(removed.size());
 }
 
 // Unlike the delete side, a restore isn't told what it is undoing: entries
@@ -1313,49 +727,59 @@ void VaultTreeModel::emitRestored(const QStringList &originalPaths)
 
 int VaultTreeModel::restoreFromTrash(const QVariantList &entries)
 {
-    QStringList restoredPaths;
-    for (const QVariant &v : entries) {
-        const QVariantMap entry = v.toMap();
-        const QString trashPath = entry.value(QStringLiteral("trashPath")).toString();
-        const QString originalPath = entry.value(QStringLiteral("originalPath")).toString();
-        if (trashPath.isEmpty() || originalPath.isEmpty())
-            continue;
-        // Same containment guard as the delete side — a restore must not be a
-        // way to write outside the vault, however the entry list got here.
-        if (!isPathInsideVault(originalPath))
-            continue;
-        if (!QFileInfo::exists(trashPath))
-            continue; // the user emptied the trash in the meantime
-        if (QFileInfo::exists(originalPath))
-            continue; // something took the name back — never clobber it
+    // Thin wrapper: the pure restore does the filesystem work off any model,
+    // then applyRestoreOutcome() does the single rebuild() + restore signals.
+    QStringList restored = restoreVaultEntries(entries, vaultLocalPath());
+    applyRestoreOutcome(restored);
+    return int(restored.size());
+}
 
-        // The original's folder can be gone: undoing a folder delete restores
-        // the folder itself first (entries are in trash order, parents before
-        // children), but a file whose parent was separately removed needs it
-        // recreated or the rename fails.
-        QDir().mkpath(QFileInfo(originalPath).absolutePath());
-        if (!QFile::rename(trashPath, originalPath))
-            continue;
+void VaultTreeModel::applyRemovalOutcome(VaultFileScope scope, const QList<RemovedEntry> &removed)
+{
+    if (removed.isEmpty())
+        return; // nothing changed — no rebuild, no signals
 
-        // Drop the freedesktop info record that moveToTrash() wrote alongside
-        // it — see trashInfoPathFor(). Best-effort: a leftover .trashinfo is
-        // cosmetic (a phantom row in the desktop's trash UI), never a reason to
-        // report the restore itself as failed.
-        const QString infoPath = trashInfoPathFor(trashPath);
-        if (!infoPath.isEmpty())
-            QFile::remove(infoPath);
-
-        restoredPaths << originalPath;
+    // One rebuild() for the whole batch, not one per entry: rebuild() rescans
+    // the vault recursively AND resets the model (destroying/recreating every
+    // realized delegate), so paying it per entry would cost 20x over for a
+    // single 20-file user action. Signals come AFTER, so a listener that
+    // re-reads the tree (MainPanel closing the deleted file) never sees a model
+    // still advertising rows whose files are already gone.
+    rebuild();
+    for (const RemovedEntry &entry : removed) {
+        const QUrl &url = entry.first;
+        switch (scope) {
+        case VaultFileScope::Files:
+            // Per surviving file, not once for the batch — fileDeleted's
+            // contract is one file per emission, and MainPanel matches it
+            // against the file it has open.
+            emit fileDeleted(url);
+            break;
+        case VaultFileScope::Transcript:
+            emit transcriptDeleted(url);
+            break;
+        case VaultFileScope::AudioOnly:
+            // audioDeletedTranscriptKept if the .md survived, plain fileDeleted
+            // if there was nothing to keep — mdPath was resolved before the
+            // audio moved (see VaultFileOps' trashAudioOnlyEntry()).
+            emitAudioOnlyDeleted(url, entry.second);
+            break;
+        case VaultFileScope::Folder:
+            break; // a folder delete emits no per-file signal — the rebuild covers it
+        }
     }
+}
 
-    if (!restoredPaths.isEmpty()) {
-        rebuild();
-        // After the single rebuild, never between — the same ordering rule the
-        // trash side follows (see trashFiles()): a listener that re-reads the
-        // tree must not see it still advertising the pre-restore shape.
-        emitRestored(restoredPaths);
-    }
-    return int(restoredPaths.size());
+void VaultTreeModel::applyRestoreOutcome(const QStringList &restoredPaths)
+{
+    if (restoredPaths.isEmpty())
+        return;
+
+    rebuild();
+    // After the single rebuild, never between — the same ordering rule the
+    // trash side follows: a listener that re-reads the tree must not see it
+    // still advertising the pre-restore shape.
+    emitRestored(restoredPaths);
 }
 
 QStringList VaultTreeModel::vaultFolders() const
@@ -1384,42 +808,10 @@ void VaultTreeModel::collectFolderPaths(const QString &dirPath, QStringList &out
 
 bool VaultTreeModel::isPathInsideVault(const QString &candidatePath) const
 {
-    const QString localPath = vaultLocalPath();
-    if (localPath.isEmpty() || candidatePath.isEmpty())
-        return false;
-
-    // The vault root itself must exist (it always does once opened) for
-    // canonicalization to mean anything.
-    const QString vaultCanonical = QFileInfo(localPath).canonicalFilePath();
-    if (vaultCanonical.isEmpty())
-        return false;
-
-    // candidatePath may not exist yet (e.g. a folder the user is about to
-    // create/select in a dialog) — QFileInfo::canonicalFilePath() returns
-    // empty for a nonexistent path, so walk up to the nearest existing
-    // ancestor, canonicalize THAT (resolving any ".."/symlinks along the
-    // existing portion), then re-append the not-yet-created tail.
-    QString ancestor = QFileInfo(candidatePath).absoluteFilePath();
-    QString tail;
-    while (!QFileInfo::exists(ancestor)) {
-        const QString parent = QFileInfo(ancestor).absolutePath();
-        if (parent == ancestor)
-            return false; // walked past the filesystem root without finding anything real
-        const QString name = QFileInfo(ancestor).fileName();
-        tail = tail.isEmpty() ? name : name + '/' + tail;
-        ancestor = parent;
-    }
-
-    const QString ancestorCanonical = QFileInfo(ancestor).canonicalFilePath();
-    if (ancestorCanonical.isEmpty())
-        return false;
-    const QString candidateCanonical = tail.isEmpty() ? ancestorCanonical : ancestorCanonical + '/' + tail;
-
-    if (candidateCanonical == vaultCanonical)
-        return true;
-
-    const QString relative = QDir(vaultCanonical).relativeFilePath(candidateCanonical);
-    return !relative.startsWith(QStringLiteral("..")) && !QDir::isAbsolutePath(relative);
+    // Delegates to the pure free function (shared with the worker-thread move
+    // helper in FileRename.cpp) so there is ONE implementation of the
+    // canonical-prefix / not-yet-existing-path logic.
+    return pathIsInsideVault(candidatePath, vaultLocalPath());
 }
 
 QVariantMap VaultTreeModel::readVaultSettings() const

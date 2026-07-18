@@ -28,8 +28,11 @@
 // for its jobs to settle before returning.
 
 #include <QCoreApplication>
+#include <QDirIterator>
 #include <QElapsedTimer>
+#include <QJsonObject>
 #include <QProcess>
+#include <QRegularExpression>
 #include <QSettings>
 #include <QStandardPaths>
 #include <QtTest>
@@ -37,6 +40,19 @@
 #include "DiarizationEngine.h" // DiarizedTurn for the spliceBodySpeakers test (item 52)
 #include "LabelingEngine.h" // kMaxChapterInputChars for the item-28 window test
 #include "TranscriptionController.h"
+// Persistence round-trip guard (everyPersistableKind_roundTripsThroughFactory):
+// build a representative of each persistable kind and rebuild it via the factory.
+#include "tasks/ChaptersTask.h"
+#include "tasks/CombineTask.h"
+#include "tasks/DiarizeTask.h"
+#include "tasks/DownloadTask.h"
+#include "tasks/MergeSpeakersTask.h"
+#include "tasks/ModelDownloadTarget.h"
+#include "tasks/ModelIoTask.h"
+#include "tasks/RelabelTask.h"
+#include "tasks/RenameSpeakerTask.h"
+#include "tasks/TaskFactory.h"
+#include "tasks/TranscribeTask.h"
 
 namespace {
 
@@ -555,6 +571,83 @@ private slots:
         QVERIFY(mergedSpy.wait(5000));
         QTRY_COMPARE(statusOf(controller, audioUrl), QStringLiteral("done"));
         QCOMPARE(controller.tasksCompleted(), 1);
+    }
+
+    // Undo primitive (Task::undoLabel/makeUndoTask): a file rename is
+    // undoable, and undo is just the inverse task. Renaming a.wav -> b, then
+    // undoTask() on it, must put a.wav back — the whole "undo = enqueue the
+    // inverse" design, end to end through the instant lane.
+    void renameFile_isUndoable_undoTaskRestoresOriginalName()
+    {
+        VaultFixture vault;
+        QFile audio(vault.dir.path() + "/a.wav");
+        QVERIFY(audio.open(QIODevice::WriteOnly));
+        audio.write("audio");
+        audio.close();
+        const QUrl audioUrl = QUrl::fromLocalFile(vault.dir.path() + "/a.wav");
+
+        TranscriptionController controller;
+        QSignalSpy renamedSpy(&controller, &TranscriptionController::fileRenamed);
+        QSignalSpy undoSpy(&controller, &TranscriptionController::undoAvailable);
+
+        controller.renameFile(audioUrl, QStringLiteral("b"));
+        QVERIFY(renamedSpy.wait(5000));
+        QVERIFY(QFileInfo::exists(vault.dir.path() + "/b.wav"));
+        QVERIFY(!QFileInfo::exists(vault.dir.path() + "/a.wav"));
+
+        // The completed rename advertised an undo.
+        QTRY_COMPARE(undoSpy.count(), 1);
+        const int undoableId = undoSpy.constFirst().at(0).toInt();
+        QVERIFY(!undoSpy.constFirst().at(1).toString().isEmpty()); // has a label
+
+        // Undo it — the inverse rename runs and a.wav comes back.
+        renamedSpy.clear();
+        controller.undoTask(undoableId);
+        QVERIFY(renamedSpy.wait(5000));
+        QTRY_VERIFY(QFileInfo::exists(vault.dir.path() + "/a.wav"));
+        QVERIFY(!QFileInfo::exists(vault.dir.path() + "/b.wav"));
+    }
+
+    // Batch undo (moveFiles/enqueueBatch): moving N files at once must produce
+    // exactly ONE undo snackbar ("Moved N files"), and undoTask() on that batch
+    // token must move ALL of them back — the whole multi-select collapses into
+    // a single reversible action, not N separate ones.
+    void moveFiles_batchUndo_oneSnackbarRestoresAllFiles()
+    {
+        VaultFixture vault;
+        QVERIFY(QDir(vault.dir.path()).mkdir("sub"));
+        for (const char *name : {"a.wav", "b.wav"}) {
+            QFile f(vault.dir.path() + "/" + name);
+            QVERIFY(f.open(QIODevice::WriteOnly));
+            f.write("audio");
+            f.close();
+        }
+        const QUrl destDir = QUrl::fromLocalFile(vault.dir.path() + "/sub");
+
+        TranscriptionController controller;
+        QSignalSpy movedSpy(&controller, &TranscriptionController::fileMoved);
+        QSignalSpy undoSpy(&controller, &TranscriptionController::undoAvailable);
+
+        controller.moveFiles({vault.audioUrl("a.wav"), vault.audioUrl("b.wav")}, destDir, vault.vaultUrl);
+
+        // Both files move...
+        QTRY_COMPARE(movedSpy.count(), 2);
+        QVERIFY(QFileInfo::exists(vault.dir.path() + "/sub/a.wav"));
+        QVERIFY(QFileInfo::exists(vault.dir.path() + "/sub/b.wav"));
+
+        // ...but the whole batch offers exactly ONE undo, summarizing the count.
+        QTRY_COMPARE(undoSpy.count(), 1);
+        const int batchToken = undoSpy.constFirst().at(0).toInt();
+        QCOMPARE(undoSpy.constFirst().at(1).toString(), QStringLiteral("Moved 2 files"));
+
+        // Undoing the batch moves BOTH back in one action.
+        movedSpy.clear();
+        controller.undoTask(batchToken);
+        QTRY_COMPARE(movedSpy.count(), 2);
+        QTRY_VERIFY(QFileInfo::exists(vault.dir.path() + "/a.wav"));
+        QVERIFY(QFileInfo::exists(vault.dir.path() + "/b.wav"));
+        QVERIFY(!QFileInfo::exists(vault.dir.path() + "/sub/a.wav"));
+        QVERIFY(!QFileInfo::exists(vault.dir.path() + "/sub/b.wav"));
     }
 
     // jobs()' new "kind" key lets the UI tell a full transcription apart
@@ -1291,6 +1384,112 @@ private slots:
         QTRY_COMPARE(fresh.tasksTotal(), 2);
         QCOMPARE(fresh.jobs().at(0).toMap().value("kind").toString(), QStringLiteral("transcribe"));
         QCOMPARE(fresh.jobs().at(1).toMap().value("kind").toString(), QStringLiteral("relabel"));
+    }
+
+    // Design-review #1 + #2: the per-kind progress shape and the
+    // "completion changes the model set" side-effect are authored ON the Task
+    // now (they used to be hardcoded phase-name lists / kind checks in the
+    // controller, in two places each that drifted). This pins the authorship.
+    void progressAndModelSetHooks_areAuthoredPerKind()
+    {
+        const QUrl file = QUrl::fromLocalFile(QStringLiteral("/vault/a.wav"));
+        const QUrl vaultUrl = QUrl::fromLocalFile(QStringLiteral("/vault"));
+
+        // WeightedPhases kinds own their ordered phase set — the SINGLE source
+        // recomputeOverallProgress() now reads (no controller-side copy).
+        TranscribeTask transcribe(file, vaultUrl, QStringLiteral("ggml-base.en.bin"));
+        QCOMPARE(transcribe.progressModel(), Task::ProgressModel::WeightedPhases);
+        QCOMPARE(transcribe.progressPhases(),
+                 (QStringList{QStringLiteral("loading"), QStringLiteral("decoding"),
+                              QStringLiteral("detecting-speech"), QStringLiteral("transcribing")}));
+        QVERIFY(!transcribe.completionChangesModelSet());
+
+        DiarizeTask diarize(file, vaultUrl, QStringLiteral("seg"), QStringLiteral("emb"), 0.5);
+        QCOMPARE(diarize.progressModel(), Task::ProgressModel::WeightedPhases);
+        QCOMPARE(diarize.progressPhases(),
+                 (QStringList{QStringLiteral("decoding"), QStringLiteral("detecting-speakers")}));
+
+        // SelfCumulative kinds emit an already-cumulative fraction — no phase
+        // set, so the controller assigns it directly.
+        ChaptersTask chapters(file, vaultUrl, 0.5);
+        QCOMPARE(chapters.progressModel(), Task::ProgressModel::SelfCumulative);
+        QVERIFY(chapters.progressPhases().isEmpty());
+
+        // completionChangesModelSet(): the one hook the central modelsChanged()
+        // emit keys off. Download + model-import say yes; export + everything
+        // else says no.
+        DownloadTask download(ModelDownloadTarget::WhisperModel, QStringLiteral("ggml-base.en.bin"));
+        QCOMPARE(download.progressModel(), Task::ProgressModel::SelfCumulative);
+        QVERIFY(download.completionChangesModelSet());
+
+        ModelIoTask importTask(ModelIoTask::Direction::Import, QStringLiteral("m"), file);
+        ModelIoTask exportTask(ModelIoTask::Direction::Export, QStringLiteral("m"), vaultUrl);
+        QVERIFY(importTask.completionChangesModelSet());
+        QVERIFY(!exportTask.completionChangesModelSet());
+        QVERIFY(!chapters.completionChangesModelSet());
+    }
+
+    // Design-review #3: persistence is opt-IN per kind (Task::isPersistable),
+    // but the REBUILD side is one central switch (createTaskFromJson). A
+    // persistable kind that forgets its factory branch would persist fine and
+    // then be SILENTLY DROPPED on restart — the exact "work goes missing"
+    // class the task refactor exists to kill. This round-trips a representative
+    // of every persistable kind through persistQueue()'s exact serialization +
+    // the factory, and the completeness tripwire at the end fails if a NEW
+    // persistable kind is ever added without being listed here (which is also
+    // where it'd be checked against the factory).
+    void everyPersistableKind_roundTripsThroughFactory()
+    {
+        const QUrl file = QUrl::fromLocalFile(QStringLiteral("/vault/a.wav"));
+        const QUrl vaultUrl = QUrl::fromLocalFile(QStringLiteral("/vault"));
+
+        std::vector<std::unique_ptr<Task>> reps;
+        reps.push_back(std::make_unique<TranscribeTask>(file, vaultUrl, QStringLiteral("ggml-base.en.bin")));
+        reps.push_back(std::make_unique<RelabelTask>(file, vaultUrl, /*restrictTags=*/false, /*reuseBias=*/0.5,
+                                                     /*wordiness=*/0.5, /*skipIfLabeled=*/false));
+        reps.push_back(std::make_unique<ChaptersTask>(file, vaultUrl, /*density=*/0.5));
+        reps.push_back(std::make_unique<DiarizeTask>(file, vaultUrl, QStringLiteral("seg"), QStringLiteral("emb"),
+                                                     /*threshold=*/0.5));
+        reps.push_back(std::make_unique<RenameSpeakerTask>(file, QStringLiteral("A"), QStringLiteral("B")));
+        reps.push_back(std::make_unique<MergeSpeakersTask>(file, QStringLiteral("A"), QStringLiteral("B")));
+        reps.push_back(std::make_unique<CombineTask>(QStringList{QStringLiteral("/vault/a.wav"),
+                                                                 QStringLiteral("/vault/b.wav")},
+                                                     file, /*deleteOriginals=*/false));
+        reps.push_back(
+            std::make_unique<DownloadTask>(ModelDownloadTarget::WhisperModel, QStringLiteral("ggml-base.en.bin")));
+
+        for (const auto &task : reps) {
+            QVERIFY2(task->isPersistable(),
+                     qPrintable(QStringLiteral("test rep '%1' is not persistable — wrong list").arg(task->kind())));
+            // Mirror persistQueue()'s exact on-disk serialization.
+            QJsonObject obj = task->toJson();
+            obj[QStringLiteral("kind")] = task->kind();
+            obj[QStringLiteral("fileUrl")] = task->fileUrl.toString();
+            obj[QStringLiteral("vaultUrl")] = task->vaultUrl.toString();
+
+            std::unique_ptr<Task> rebuilt = createTaskFromJson(task->kind(), obj);
+            QVERIFY2(rebuilt != nullptr,
+                     qPrintable(QStringLiteral("persistable kind '%1' has no createTaskFromJson branch — a "
+                                               "persisted entry would be SILENTLY DROPPED on restart")
+                                    .arg(task->kind())));
+            QCOMPARE(rebuilt->kind(), task->kind());
+        }
+
+        // Completeness tripwire: the number of kinds that opt into persistence
+        // (grepped from the task headers) must equal the number round-tripped
+        // above. A NEW persistable kind trips this until it's added here AND
+        // shown to survive the factory — closing the "forgot the branch" gap
+        // for future kinds, not just today's eight.
+        int persistableInSource = 0;
+        QDirIterator it(QStringLiteral(SUOP_SRC_DIR "/core/tasks"), {QStringLiteral("*.h")}, QDir::Files);
+        const QRegularExpression optIn(QStringLiteral("bool isPersistable\\(\\) const override \\{ return true"));
+        while (it.hasNext()) {
+            QFile header(it.next());
+            if (header.open(QIODevice::ReadOnly | QIODevice::Text)
+                && optIn.match(QString::fromUtf8(header.readAll())).hasMatch())
+                ++persistableInSource;
+        }
+        QCOMPARE(static_cast<int>(reps.size()), persistableInSource);
     }
 
     // Bug report (2026-07-10): "my first run seems to have the whole bar

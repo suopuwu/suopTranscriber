@@ -168,6 +168,12 @@ private:
         m_controller = new TranscriptionController(this);
         m_model = new VaultTreeModel(this);
         m_player = new AudioPlayerStub(this);
+        // The live app wires this via Main.qml's `vaultTreeModel: vaultModel` on
+        // the controller — it's what lets a trash/delete/restore TASK call back
+        // to the model (applyRemovalOutcome/applyRestoreOutcome) so the per-file
+        // delete/restore signals fire. Without it the ASYNC controller.trash()
+        // path is silent (the bug the async test below guards).
+        m_controller->setVaultTreeModel(m_model);
         m_model->setVaultPath(QUrl::fromLocalFile(m_vaultDir.path()));
         panel->setProperty("transcriptionController", QVariant::fromValue(m_controller));
         panel->setProperty("vaultTreeModel", QVariant::fromValue(m_model));
@@ -346,6 +352,35 @@ private slots:
 
         QCOMPARE(m_model->restoreFromTrash(result.value(QStringLiteral("restorable")).toList()), 1);
         QTRY_COMPARE_WITH_TIMEOUT(playerSource(), QUrl::fromLocalFile(m_audioPath), 2000);
+    }
+
+    // The ASYNC controller path — what the live app actually does now: the
+    // panel's delete action calls transcriptionController.trash(), a worker-thread
+    // TrashTask whose completion calls back into the model (applyRemovalOutcome)
+    // to fire fileDeleted. The sync tests above call m_model->trash*() directly
+    // and so never exercised this hop; the "open file stays open after delete"
+    // bug lived exactly here (a missing controller->model wiring makes the whole
+    // path silent). Undo (the generic snackbar) then restores + reopens.
+    void asyncControllerDelete_closesOpenFile_andUndoReopensIt()
+    {
+        QQuickView view;
+        QVERIFY2(openPanel(&view), "could not load MainPanel.qml / locate it");
+
+        m_player->setSource(QUrl::fromLocalFile(m_audioPath));
+        QSignalSpy undoSpy(m_controller, &TranscriptionController::undoAvailable);
+
+        // The panel's own "Delete file" — the async controller.trash() path.
+        QVERIFY(QMetaObject::invokeMethod(m_panel, "requestDeleteFile"));
+
+        // Task runs on the instant worker thread; applyRemovalOutcome then fires
+        // fileDeleted on the GUI thread and the panel clears. If the controller
+        // isn't wired to the model, this never happens (the reported bug).
+        QTRY_COMPARE_WITH_TIMEOUT(playerSource(), QUrl(), 5000);
+
+        // The completed trash advertised one undo; undoing it restores + reopens.
+        QTRY_COMPARE(undoSpy.count(), 1);
+        m_controller->undoTask(undoSpy.constFirst().at(0).toInt());
+        QTRY_COMPARE_WITH_TIMEOUT(playerSource(), QUrl::fromLocalFile(m_audioPath), 5000);
     }
 
     // An orphaned .md is a file too, and reopening it needs the text-only view —

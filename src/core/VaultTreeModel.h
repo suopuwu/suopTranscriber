@@ -12,6 +12,9 @@
 #include <memory>
 #include <vector>
 
+#include "VaultFileOps.h" // VaultFileScope / RemovedEntry — the pure trash/delete/restore
+                          // fns' shared vocabulary, used by applyRemovalOutcome() below.
+
 // Sidebar tree over a vault root. Every directory is shown, including empty
 // ones and ones holding only unrelated files — the tree mirrors the vault's
 // real folder structure so a folder you make is somewhere you can see and
@@ -69,7 +72,11 @@ public:
     // newBaseName, preserving each file's extension. Also handles orphaned
     // .md-only nodes (Feature: Milestone 5 item 19 "forgo labels" mode).
     // Returns false and sets *errorOut on validation or filesystem failure,
-    // without leaving the audio/.md pair mismatched.
+    // without leaving the audio/.md pair mismatched. Synchronous convenience
+    // wrapper: calls renameFileOnDisk() then rebuild(). QML now routes rename
+    // through TranscriptionController::renameFile() (an instant-lane task) so
+    // it's visible in the Tasks list and defers behind a same-file transcribe;
+    // this instance method stays for any direct/synchronous caller + tests.
     Q_INVOKABLE bool renameFile(const QUrl &fileUrl, const QString &newBaseName, QString *errorOut = nullptr);
 
     // Item 37: synchronous, cheap VALIDATOR for a drag-and-drop / external
@@ -140,7 +147,7 @@ public:
     //
     // What makes that split work is that a FAILED QFile::moveToTrash() is
     // non-destructive — it leaves the original fully intact (verified
-    // empirically; see trashOnly()'s comment in the .cpp). So the UI never has
+    // empirically; see trashOnly()'s comment in VaultFileOps.cpp). So the UI never has
     // to PREDICT trash-ability: it calls trashFiles()/trashFolder() first, and only
     // the entries that come back "untrashable" (still on disk, untouched) need a
     // confirmation prompt, because only those would be irreversible. See
@@ -248,6 +255,24 @@ public:
     // number restored — callers compare against entries.size() for partial
     // failure.
     Q_INVOKABLE int restoreFromTrash(const QVariantList &entries);
+
+    // Rebuild + emit the per-file removal signals for an ALREADY-DONE trash or
+    // permanent delete — the FS work was done by trashVaultEntries() /
+    // deleteVaultEntriesPermanently() (VaultFileOps.h), either here on the GUI
+    // thread (the synchronous trash*/delete* wrappers) or on a TrashTask/
+    // DeleteTask worker thread, with TranscriptionController calling this on the
+    // GUI thread once the task completes. Emits fileDeleted/transcriptDeleted/
+    // audioDeletedTranscriptKept per entry by scope (Folder emits none — the
+    // rebuild covers it); no-op for an empty batch. Not Q_INVOKABLE: the async
+    // caller is C++ (the controller), and the RemovedEntry list isn't a
+    // QML-marshalable type. The model keeps ownership of this emission (not the
+    // controller) because it owns the orphaned-.md-vs-audio classification
+    // MainPanel's delete handlers depend on.
+    void applyRemovalOutcome(VaultFileScope scope, const QList<RemovedEntry> &removed);
+    // Rebuild + emit the restore signals (emitRestored) for an already-done
+    // restore — the FS work was done by restoreVaultEntries(). Same GUI-thread
+    // contract as applyRemovalOutcome().
+    void applyRestoreOutcome(const QStringList &restoredPaths);
 
     // Item 40: every real directory inside the vault (walks the filesystem
     // directly, NOT the pruned tree — a freshly-created empty folder must be a
@@ -519,54 +544,22 @@ private:
     // output lands directly in `dirPath`.
     void appendCombinePlaceholders(Node *parent, const QString &dirPath) const;
 
-    // What became of one entry in a batch. Untrashable is emphatically NOT a
-    // failure: the entry is still on disk, untouched, and is exactly what the
-    // UI must ask the user to confirm a permanent delete for.
-    enum class TrashOutcome { Trashed, Untrashable, Invalid };
-
-    // Files and folders are handled by separate public calls on purpose (see
-    // guardedLocalPath()): a folder delete is recursive, so it must never be
-    // reachable from the file-selection path.
-    enum class EntryKind { File, Folder };
-
     // Ends an audio-only delete on the right signal — audioDeletedTranscriptKept
     // if `mdPath` survived, plain fileDeleted if there was nothing to keep.
+    // Driven per entry by applyRemovalOutcome() for the AudioOnly scope.
     void emitAudioOnlyDeleted(const QUrl &fileUrl, const QString &mdPath);
 
     // Announces a batch of restored paths in the same terms the delete signals
     // used to announce their removal, so a listener that followed the delete can
     // follow the undo. Takes the whole batch, not one path: the batch is the only
-    // record of WHICH delete is being undone — see the definition.
+    // record of WHICH delete is being undone — see the definition. Driven by
+    // applyRestoreOutcome().
     void emitRestored(const QStringList &originalPaths);
-
-    // The guards + trash of ONE entry (file or folder), WITHOUT the rebuild()/
-    // fileDeleted() that must happen once for a whole batch — shared by
-    // trashFiles()/trashFolder(). Appends a {trashPath, originalPath}
-    // map to *restorable for every path it actually trashed, sidecars included.
-    TrashOutcome trashEntry(const QUrl &url, EntryKind kind, QVariantList *restorable);
-    // Irreversible counterpart, same guards and same sidecar set.
-    bool removeEntryPermanently(const QUrl &url, EntryKind kind);
-
-    // The per-entry halves of trashTranscript()/trashAudioOnly(), split out for
-    // the same reason trashEntry() is: the batch call owns the single rebuild()
-    // and the post-rebuild signals, so these must do neither. A no-op entry
-    // (audio with no .md to remove) reports Trashed == false with an empty
-    // *restorable rather than Untrashable — there was nothing to refuse.
-    TrashOutcome trashTranscriptEntry(const QUrl &fileUrl, QVariantList *restorable);
-    // *mdPathOut carries the .md path back for the caller's post-rebuild
-    // emitAudioOnlyDeleted(): whether the transcript survived decides which
-    // signal the entry earns, and the path must be resolved before the audio
-    // moves (see trashEntry()'s lazy-stat comment).
-    TrashOutcome trashAudioOnlyEntry(const QUrl &fileUrl, QVariantList *restorable,
-                                      QString *mdPathOut);
 
     // The one result-map shape every trash* call returns — see trashFiles()'s
     // doc comment for what each key means.
     static QVariantMap makeTrashResult(int trashed, const QVariantList &restorable,
                                         const QVariantList &untrashable, const QVariantList &invalid);
-    // Shared guard set for both of the above: inside the vault, never the vault
-    // root itself. Returns the resolved local path, or empty if refused.
-    QString guardedLocalPath(const QUrl &url, EntryKind kind) const;
     std::unique_ptr<Node> scanDirectory(const QString &dirPath, Node *parent) const;
     Node *nodeFromIndex(const QModelIndex &index) const;
     // Backs refreshFile() — plain depth-first search by absolute path (the

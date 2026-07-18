@@ -15,7 +15,10 @@ set(SUOP_TASK_SOURCES
     tasks/Task.cpp tasks/TaskContext.cpp tasks/EngineCache.cpp tasks/TaskRunner.cpp tasks/TaskFactory.cpp
     tasks/DownloadTask.cpp tasks/TranscribeTask.cpp tasks/RelabelTask.cpp tasks/ChaptersTask.cpp
     tasks/DiarizeTask.cpp tasks/RenameSpeakerTask.cpp tasks/MergeSpeakersTask.cpp tasks/CombineTask.cpp
-    tasks/ImportTask.cpp tasks/UsbGrabTask.cpp tasks/BenchmarkTask.cpp tasks/DiarizationSweepTask.cpp)
+    tasks/ImportTask.cpp tasks/UsbGrabTask.cpp tasks/BenchmarkTask.cpp tasks/DiarizationSweepTask.cpp
+    tasks/RenameFileTask.cpp tasks/MoveTask.cpp tasks/ModelIoTask.cpp
+    tasks/TrashTask.cpp tasks/DeleteTask.cpp tasks/RestoreTask.cpp
+    tasks/FolderRenameTask.cpp tasks/FolderMoveTask.cpp FileRename.cpp VaultFileOps.cpp)
 
 # Each test compiles the core sources it needs directly — no core static lib,
 # so the app target stays untouched. QML_ELEMENT headers compile outside the
@@ -123,7 +126,7 @@ suop_add_test(tst_rollingaverage)
 # Header-only helper (ProcessRunner.h) — no SOURCES, just needs SUOP_CORE_DIR
 # on the include path (added for every test above) and a real child process.
 suop_add_test(tst_processrunner)
-suop_add_test(tst_vaulttreemodel SOURCES VaultTreeModel.cpp)
+suop_add_test(tst_vaulttreemodel SOURCES VaultTreeModel.cpp FileRename.cpp VaultFileOps.cpp)
 suop_add_test(tst_desktopintegration LINK_DBUS LINK_KWINDOWSYSTEM SOURCES DesktopIntegration.cpp)
 suop_add_test(tst_clipboard LINK_GUI SOURCES Clipboard.cpp)
 # Loads the real BottomBar.qml in a QQuickView. Deliberately does NOT compile
@@ -141,7 +144,7 @@ suop_add_test(tst_scratch_headingrepro LINK_QUICK LINK_SVG ICON_ASSETS LINK_GUI 
 # Loads the real BenchmarkPage.qml inside a modal Popup -> ScrollView (its
 # SettingsPopup nesting) and proves the benchmark file follows the left panel's
 # currentFilePath (the in-page file-picker ComboBox was removed).
-suop_add_test(tst_benchmarkpage_filesync LINK_QUICK SOURCES VaultTreeModel.cpp VaultSearchProxyModel.cpp)
+suop_add_test(tst_benchmarkpage_filesync LINK_QUICK SOURCES VaultTreeModel.cpp VaultSearchProxyModel.cpp FileRename.cpp VaultFileOps.cpp)
 # Loads the real MainPanel.qml in a QQuickView AND wires a REAL
 # TranscriptionController into it — the assertion is what the panel reads back
 # off disk for the file that's actually open, so a stubbed readChapters() would
@@ -152,7 +155,7 @@ suop_add_test(tst_mainpanel_chapterrefresh LINK_QUICK LINK_SVG ICON_ASSETS LINK_
     SOURCES IconTheme.cpp Clipboard.cpp TranscriptionController.cpp WhisperCppEngine.cpp VadChunker.cpp
             ModelManager.cpp AudioDecoder.cpp LabelingEngine.cpp DiarizationEngine.cpp
             EngineManifest.cpp GpuProbe.cpp SubprocessEngine.cpp EngineRegistry.cpp ParakeetEngine.cpp
-            UsbGrabJob.cpp UsbRuleStore.cpp
+            UsbGrabJob.cpp UsbRuleStore.cpp VaultTreeModel.cpp
             ${SUOP_TASK_SOURCES})
 # Loads the real MainPanel.qml + a REAL TranscriptionController and drives the
 # queue (fake zero-byte model → fast-fail jobs) to prove busyOrQueuedUrls clears
@@ -163,7 +166,7 @@ suop_add_test(tst_mainpanel_buttonstate LINK_QUICK LINK_SVG ICON_ASSETS LINK_GUI
     SOURCES IconTheme.cpp Clipboard.cpp TranscriptionController.cpp WhisperCppEngine.cpp VadChunker.cpp
             ModelManager.cpp AudioDecoder.cpp LabelingEngine.cpp DiarizationEngine.cpp
             EngineManifest.cpp GpuProbe.cpp SubprocessEngine.cpp EngineRegistry.cpp ParakeetEngine.cpp
-            UsbGrabJob.cpp UsbRuleStore.cpp
+            UsbGrabJob.cpp UsbRuleStore.cpp VaultTreeModel.cpp
             ${SUOP_TASK_SOURCES})
 # Loads the real MainPanel.qml and proves the live transcript follows the tail
 # as content streams in — including a single large (>threshold) growth, the case
@@ -175,7 +178,7 @@ suop_add_test(tst_mainpanel_livescroll LINK_QUICK LINK_SVG ICON_ASSETS LINK_GUI
     SOURCES IconTheme.cpp Clipboard.cpp TranscriptionController.cpp WhisperCppEngine.cpp VadChunker.cpp
             ModelManager.cpp AudioDecoder.cpp LabelingEngine.cpp DiarizationEngine.cpp
             EngineManifest.cpp GpuProbe.cpp SubprocessEngine.cpp EngineRegistry.cpp ParakeetEngine.cpp
-            UsbGrabJob.cpp UsbRuleStore.cpp
+            UsbGrabJob.cpp UsbRuleStore.cpp VaultTreeModel.cpp
             ${SUOP_TASK_SOURCES})
 suop_add_test(tst_mainpanel_deleteundo LINK_QUICK LINK_SVG ICON_ASSETS LINK_GUI
     LINK_WHISPER LINK_LLAMA LINK_SHERPA_ONNX
@@ -185,22 +188,22 @@ suop_add_test(tst_mainpanel_deleteundo LINK_QUICK LINK_SVG ICON_ASSETS LINK_GUI
             EngineManifest.cpp GpuProbe.cpp SubprocessEngine.cpp EngineRegistry.cpp ParakeetEngine.cpp
             UsbGrabJob.cpp UsbRuleStore.cpp
             ${SUOP_TASK_SOURCES})
-suop_add_test(tst_vaultsearchproxymodel SOURCES VaultTreeModel.cpp VaultSearchProxyModel.cpp)
+suop_add_test(tst_vaultsearchproxymodel SOURCES VaultTreeModel.cpp VaultSearchProxyModel.cpp FileRename.cpp VaultFileOps.cpp)
 suop_add_test(tst_modelmanager SOURCES ModelManager.cpp)
 suop_add_test(tst_transcript_format LINK_WHISPER LINK_LLAMA LINK_SHERPA_ONNX
     SOURCES TranscriptionController.cpp WhisperCppEngine.cpp VadChunker.cpp ModelManager.cpp AudioDecoder.cpp LabelingEngine.cpp DiarizationEngine.cpp
             EngineManifest.cpp GpuProbe.cpp SubprocessEngine.cpp EngineRegistry.cpp ParakeetEngine.cpp
-            UsbGrabJob.cpp UsbRuleStore.cpp
+            UsbGrabJob.cpp UsbRuleStore.cpp VaultTreeModel.cpp
             ${SUOP_TASK_SOURCES})
 suop_add_test(tst_transcription_queue LINK_WHISPER LINK_LLAMA LINK_SHERPA_ONNX
     SOURCES TranscriptionController.cpp WhisperCppEngine.cpp VadChunker.cpp ModelManager.cpp AudioDecoder.cpp LabelingEngine.cpp DiarizationEngine.cpp
             EngineManifest.cpp GpuProbe.cpp SubprocessEngine.cpp EngineRegistry.cpp ParakeetEngine.cpp
-            UsbGrabJob.cpp UsbRuleStore.cpp
+            UsbGrabJob.cpp UsbRuleStore.cpp VaultTreeModel.cpp
             ${SUOP_TASK_SOURCES})
 suop_add_test(tst_filecombine LINK_WHISPER LINK_LLAMA LINK_SHERPA_ONNX
     SOURCES TranscriptionController.cpp WhisperCppEngine.cpp VadChunker.cpp ModelManager.cpp AudioDecoder.cpp LabelingEngine.cpp DiarizationEngine.cpp
             EngineManifest.cpp GpuProbe.cpp SubprocessEngine.cpp EngineRegistry.cpp ParakeetEngine.cpp
-            UsbGrabJob.cpp UsbRuleStore.cpp
+            UsbGrabJob.cpp UsbRuleStore.cpp VaultTreeModel.cpp
             ${SUOP_TASK_SOURCES})
 suop_add_test(tst_engine_contract LINK_WHISPER
     SOURCES WhisperCppEngine.cpp AudioDecoder.cpp)
@@ -219,7 +222,39 @@ suop_add_test(tst_enginemanifest SOURCES EngineManifest.cpp)
 suop_add_test(tst_task_download LINK_WHISPER LINK_LLAMA LINK_SHERPA_ONNX
     SOURCES TranscriptionController.cpp WhisperCppEngine.cpp VadChunker.cpp ModelManager.cpp AudioDecoder.cpp
             LabelingEngine.cpp DiarizationEngine.cpp EngineManifest.cpp GpuProbe.cpp SubprocessEngine.cpp
-            EngineRegistry.cpp ParakeetEngine.cpp UsbGrabJob.cpp UsbRuleStore.cpp
+            EngineRegistry.cpp ParakeetEngine.cpp UsbGrabJob.cpp UsbRuleStore.cpp VaultTreeModel.cpp
+            ${SUOP_TASK_SOURCES})
+# RenameFileTask itself is pure filesystem, but the test constructs a
+# TaskContext (which references an EngineCache whose out-of-line ctor pulls in
+# the engine chain), so it needs the same full dep set as the other task tests.
+suop_add_test(tst_task_renamefile LINK_WHISPER LINK_LLAMA LINK_SHERPA_ONNX
+    SOURCES TranscriptionController.cpp WhisperCppEngine.cpp VadChunker.cpp ModelManager.cpp AudioDecoder.cpp
+            LabelingEngine.cpp DiarizationEngine.cpp EngineManifest.cpp GpuProbe.cpp SubprocessEngine.cpp
+            EngineRegistry.cpp ParakeetEngine.cpp UsbGrabJob.cpp UsbRuleStore.cpp VaultTreeModel.cpp
+            ${SUOP_TASK_SOURCES})
+# MoveTask: same story as tst_task_renamefile — pure filesystem run(), but the
+# test builds a TaskContext (EngineCache ctor pulls the engine chain), so it
+# carries the same full dependency set.
+suop_add_test(tst_task_move LINK_WHISPER LINK_LLAMA LINK_SHERPA_ONNX
+    SOURCES TranscriptionController.cpp WhisperCppEngine.cpp VadChunker.cpp ModelManager.cpp AudioDecoder.cpp
+            LabelingEngine.cpp DiarizationEngine.cpp EngineManifest.cpp GpuProbe.cpp SubprocessEngine.cpp
+            EngineRegistry.cpp ParakeetEngine.cpp UsbGrabJob.cpp UsbRuleStore.cpp VaultTreeModel.cpp
+            ${SUOP_TASK_SOURCES})
+# TrashTask/DeleteTask/RestoreTask: pure filesystem run() over VaultFileOps, but
+# the test builds a TaskContext (EngineCache), so it carries the same full
+# dependency set — plus VaultTreeModel.cpp, which TranscriptionController.cpp now
+# links (applyRemovalOutcome/setVaultTreeModel).
+suop_add_test(tst_task_trash LINK_WHISPER LINK_LLAMA LINK_SHERPA_ONNX
+    SOURCES TranscriptionController.cpp WhisperCppEngine.cpp VadChunker.cpp ModelManager.cpp AudioDecoder.cpp
+            LabelingEngine.cpp DiarizationEngine.cpp EngineManifest.cpp GpuProbe.cpp SubprocessEngine.cpp
+            EngineRegistry.cpp ParakeetEngine.cpp UsbGrabJob.cpp UsbRuleStore.cpp VaultTreeModel.cpp
+            ${SUOP_TASK_SOURCES})
+# FolderRenameTask/FolderMoveTask: same dependency set (EngineCache pulls the
+# engine chain + TranscriptionController, which links VaultTreeModel.cpp).
+suop_add_test(tst_task_folder LINK_WHISPER LINK_LLAMA LINK_SHERPA_ONNX
+    SOURCES TranscriptionController.cpp WhisperCppEngine.cpp VadChunker.cpp ModelManager.cpp AudioDecoder.cpp
+            LabelingEngine.cpp DiarizationEngine.cpp EngineManifest.cpp GpuProbe.cpp SubprocessEngine.cpp
+            EngineRegistry.cpp ParakeetEngine.cpp UsbGrabJob.cpp UsbRuleStore.cpp VaultTreeModel.cpp
             ${SUOP_TASK_SOURCES})
 # RenameSpeakerTask/MergeSpeakersTask call the shared transcript-format
 # helpers TranscriptionController.h now exposes (renameSpeakerInFile() etc,
@@ -228,7 +263,7 @@ suop_add_test(tst_task_download LINK_WHISPER LINK_LLAMA LINK_SHERPA_ONNX
 suop_add_test(tst_task_speaker_edits LINK_WHISPER LINK_LLAMA LINK_SHERPA_ONNX
     SOURCES TranscriptionController.cpp WhisperCppEngine.cpp VadChunker.cpp ModelManager.cpp AudioDecoder.cpp
             LabelingEngine.cpp DiarizationEngine.cpp EngineManifest.cpp GpuProbe.cpp SubprocessEngine.cpp
-            EngineRegistry.cpp ParakeetEngine.cpp UsbGrabJob.cpp UsbRuleStore.cpp
+            EngineRegistry.cpp ParakeetEngine.cpp UsbGrabJob.cpp UsbRuleStore.cpp VaultTreeModel.cpp
             ${SUOP_TASK_SOURCES})
 # CombineTask/ImportTask/UsbGrabTask are self-contained (no shared
 # transcript-format helper, no TranscriptionController.cpp dependency) —
@@ -240,7 +275,7 @@ suop_add_test(tst_task_speaker_edits LINK_WHISPER LINK_LLAMA LINK_SHERPA_ONNX
 suop_add_test(tst_task_files LINK_WHISPER LINK_LLAMA LINK_SHERPA_ONNX
     SOURCES TranscriptionController.cpp WhisperCppEngine.cpp VadChunker.cpp ModelManager.cpp AudioDecoder.cpp
             LabelingEngine.cpp DiarizationEngine.cpp EngineManifest.cpp GpuProbe.cpp SubprocessEngine.cpp
-            EngineRegistry.cpp ParakeetEngine.cpp UsbGrabJob.cpp UsbRuleStore.cpp
+            EngineRegistry.cpp ParakeetEngine.cpp UsbGrabJob.cpp UsbRuleStore.cpp VaultTreeModel.cpp
             ${SUOP_TASK_SOURCES})
 # RelabelTask calls shared transcript-format helpers from
 # TranscriptionController.h (sidecarPath/parseSpeakersList/
@@ -249,27 +284,27 @@ suop_add_test(tst_task_files LINK_WHISPER LINK_LLAMA LINK_SHERPA_ONNX
 suop_add_test(tst_task_relabel LINK_WHISPER LINK_LLAMA LINK_SHERPA_ONNX
     SOURCES TranscriptionController.cpp WhisperCppEngine.cpp VadChunker.cpp ModelManager.cpp AudioDecoder.cpp
             LabelingEngine.cpp DiarizationEngine.cpp EngineManifest.cpp GpuProbe.cpp SubprocessEngine.cpp
-            EngineRegistry.cpp ParakeetEngine.cpp UsbGrabJob.cpp UsbRuleStore.cpp
+            EngineRegistry.cpp ParakeetEngine.cpp UsbGrabJob.cpp UsbRuleStore.cpp VaultTreeModel.cpp
             ${SUOP_TASK_SOURCES})
 suop_add_test(tst_task_chapters LINK_WHISPER LINK_LLAMA LINK_SHERPA_ONNX
     SOURCES TranscriptionController.cpp WhisperCppEngine.cpp VadChunker.cpp ModelManager.cpp AudioDecoder.cpp
             LabelingEngine.cpp DiarizationEngine.cpp EngineManifest.cpp GpuProbe.cpp SubprocessEngine.cpp
-            EngineRegistry.cpp ParakeetEngine.cpp UsbGrabJob.cpp UsbRuleStore.cpp
+            EngineRegistry.cpp ParakeetEngine.cpp UsbGrabJob.cpp UsbRuleStore.cpp VaultTreeModel.cpp
             ${SUOP_TASK_SOURCES})
 suop_add_test(tst_task_diarize LINK_WHISPER LINK_LLAMA LINK_SHERPA_ONNX
     SOURCES TranscriptionController.cpp WhisperCppEngine.cpp VadChunker.cpp ModelManager.cpp AudioDecoder.cpp
             LabelingEngine.cpp DiarizationEngine.cpp EngineManifest.cpp GpuProbe.cpp SubprocessEngine.cpp
-            EngineRegistry.cpp ParakeetEngine.cpp UsbGrabJob.cpp UsbRuleStore.cpp
+            EngineRegistry.cpp ParakeetEngine.cpp UsbGrabJob.cpp UsbRuleStore.cpp VaultTreeModel.cpp
             ${SUOP_TASK_SOURCES})
 suop_add_test(tst_task_transcribe LINK_WHISPER LINK_LLAMA LINK_SHERPA_ONNX
     SOURCES TranscriptionController.cpp WhisperCppEngine.cpp VadChunker.cpp ModelManager.cpp AudioDecoder.cpp
             LabelingEngine.cpp DiarizationEngine.cpp EngineManifest.cpp GpuProbe.cpp SubprocessEngine.cpp
-            EngineRegistry.cpp ParakeetEngine.cpp UsbGrabJob.cpp UsbRuleStore.cpp
+            EngineRegistry.cpp ParakeetEngine.cpp UsbGrabJob.cpp UsbRuleStore.cpp VaultTreeModel.cpp
             ${SUOP_TASK_SOURCES})
 suop_add_test(tst_task_benchmark LINK_WHISPER LINK_LLAMA LINK_SHERPA_ONNX
     SOURCES TranscriptionController.cpp WhisperCppEngine.cpp VadChunker.cpp ModelManager.cpp AudioDecoder.cpp
             LabelingEngine.cpp DiarizationEngine.cpp EngineManifest.cpp GpuProbe.cpp SubprocessEngine.cpp
-            EngineRegistry.cpp ParakeetEngine.cpp UsbGrabJob.cpp UsbRuleStore.cpp
+            EngineRegistry.cpp ParakeetEngine.cpp UsbGrabJob.cpp UsbRuleStore.cpp VaultTreeModel.cpp
             ${SUOP_TASK_SOURCES})
 suop_add_test(tst_subprocessengine SOURCES SubprocessEngine.cpp EngineManifest.cpp)
 suop_add_test(tst_engineregistry SOURCES EngineRegistry.cpp EngineManifest.cpp GpuProbe.cpp)
@@ -298,20 +333,20 @@ suop_add_test(tst_titlebar_buttons LINK_QUICK LINK_SVG ICON_ASSETS SOURCES IconT
 # AppIcon — so they need IconTheme (its singleton + image provider) and the
 # icon-pack resources, exactly as the app does, or AppIcon.qml throws
 # "IconTheme is not defined" at load.
-suop_add_test(tst_sidebar_keynav LINK_QUICK LINK_SVG ICON_ASSETS SOURCES VaultTreeModel.cpp VaultSearchProxyModel.cpp IconTheme.cpp)
-suop_add_test(tst_sidebar_dragmove LINK_QUICK LINK_SVG ICON_ASSETS SOURCES VaultTreeModel.cpp VaultSearchProxyModel.cpp IconTheme.cpp)
-suop_add_test(tst_sidebar_rename LINK_QUICK LINK_SVG ICON_ASSETS SOURCES VaultTreeModel.cpp VaultSearchProxyModel.cpp IconTheme.cpp)
-suop_add_test(tst_sidebar_expand LINK_QUICK LINK_SVG ICON_ASSETS SOURCES VaultTreeModel.cpp VaultSearchProxyModel.cpp IconTheme.cpp)
-suop_add_test(tst_sidebar_guides LINK_QUICK LINK_SVG ICON_ASSETS SOURCES VaultTreeModel.cpp VaultSearchProxyModel.cpp IconTheme.cpp)
-suop_add_test(tst_sidebar_selectall LINK_QUICK LINK_SVG ICON_ASSETS SOURCES VaultTreeModel.cpp VaultSearchProxyModel.cpp IconTheme.cpp)
+suop_add_test(tst_sidebar_keynav LINK_QUICK LINK_SVG ICON_ASSETS SOURCES VaultTreeModel.cpp VaultSearchProxyModel.cpp IconTheme.cpp FileRename.cpp VaultFileOps.cpp)
+suop_add_test(tst_sidebar_dragmove LINK_QUICK LINK_SVG ICON_ASSETS SOURCES VaultTreeModel.cpp VaultSearchProxyModel.cpp IconTheme.cpp FileRename.cpp VaultFileOps.cpp)
+suop_add_test(tst_sidebar_rename LINK_QUICK LINK_SVG ICON_ASSETS SOURCES VaultTreeModel.cpp VaultSearchProxyModel.cpp IconTheme.cpp FileRename.cpp VaultFileOps.cpp)
+suop_add_test(tst_sidebar_expand LINK_QUICK LINK_SVG ICON_ASSETS SOURCES VaultTreeModel.cpp VaultSearchProxyModel.cpp IconTheme.cpp FileRename.cpp VaultFileOps.cpp)
+suop_add_test(tst_sidebar_guides LINK_QUICK LINK_SVG ICON_ASSETS SOURCES VaultTreeModel.cpp VaultSearchProxyModel.cpp IconTheme.cpp FileRename.cpp VaultFileOps.cpp)
+suop_add_test(tst_sidebar_selectall LINK_QUICK LINK_SVG ICON_ASSETS SOURCES VaultTreeModel.cpp VaultSearchProxyModel.cpp IconTheme.cpp FileRename.cpp VaultFileOps.cpp)
 # The ONLY sidebar harness that renders inside a real ApplicationWindow (hence a
 # real Overlay + SnackbarHost), which is what the context menu's modal dimming
 # needs — the QQuickView harnesses above structurally cannot show it. See its
 # top-of-file comment.
-suop_add_test(tst_sidebar_contextmenu LINK_QUICK LINK_SVG ICON_ASSETS SOURCES VaultTreeModel.cpp VaultSearchProxyModel.cpp IconTheme.cpp)
+suop_add_test(tst_sidebar_contextmenu LINK_QUICK LINK_SVG ICON_ASSETS SOURCES VaultTreeModel.cpp VaultSearchProxyModel.cpp IconTheme.cpp FileRename.cpp VaultFileOps.cpp)
 suop_add_test(tst_usbdevicemonitor LINK_DBUS SOURCES UsbDeviceMonitor.cpp)
 suop_add_test(tst_usbrulestore SOURCES UsbRuleStore.cpp)
-suop_add_test(tst_usbgrabjob SOURCES UsbGrabJob.cpp UsbRuleStore.cpp VaultTreeModel.cpp)
+suop_add_test(tst_usbgrabjob SOURCES UsbGrabJob.cpp UsbRuleStore.cpp VaultTreeModel.cpp FileRename.cpp VaultFileOps.cpp)
 # UsbGrabberController now enqueues every grab onto TranscriptionController's
 # task queue (see its class doc comment), so these two drag in the controller
 # and its whole engine dependency chain — the same set the other real-controller

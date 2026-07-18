@@ -110,6 +110,13 @@ Item {
     readonly property bool hasDisplayJob: bottomBar.busy || bottomBar.frontQueuedJob !== null
     readonly property string displayJobKind: bottomBar.busy ? bottomBar.currentJobKind
         : (bottomBar.frontQueuedJob ? bottomBar.frontQueuedJob.kind : "")
+    // The human category LABEL for displayJobKind — authored by each Task
+    // (Task::kindLabel()), read straight off the active task
+    // (currentJobKindLabel) or the front queued job's row (jobs()' kindLabel
+    // field), never re-derived from the slug in QML.
+    readonly property string displayJobKindLabel: bottomBar.busy
+        ? (bottomBar.transcriptionController ? bottomBar.transcriptionController.currentJobKindLabel : "")
+        : (bottomBar.frontQueuedJob ? bottomBar.frontQueuedJob.kindLabel : "")
     readonly property string displayJobFileName: {
         if (bottomBar.busy)
             return bottomBar.currentJobFileName
@@ -273,42 +280,19 @@ Item {
     }
     // Shared with the Tasks popup's per-row kind badge below — one case per
     // "kind" value (see TranscriptionController::jobKind()).
-    function kindLabel(kind) {
-        switch (kind) {
-        case "relabel": return qsTr("Label")
-        case "rename": return qsTr("Rename")
-        case "merge": return qsTr("Merge")
-        case "download": return qsTr("Download")
-        case "chapters": return qsTr("Generate chapters")
-        case "combine": return qsTr("Combine")
-        case "diarize": return qsTr("Detect speakers")
-        case "import": return qsTr("Import")
-        case "usbGrab": return qsTr("USB grab")
-        default: return qsTr("Transcribe")
-        }
-    }
+    // (The kind→label mapping now lives on the Task primitive — each kind
+    // authors its own Task::kindLabel(), exposed as jobs()' "kindLabel" field
+    // and the controller's currentJobKindLabel. This QML no longer maintains a
+    // switch that a new kind could forget, silently mislabeling itself.)
+
     // Appended to the kind/filename label so the "huge delay" before
     // transcription starts on bigger models (or with speaker detection on)
-    // reads as "doing something", not a hang.
-    function phaseLabel(phase) {
-        switch (phase) {
-        case "loading": return qsTr("loading model…")
-        case "decoding": return qsTr("decoding audio…")
-        case "detecting-speech": return qsTr("detecting speech…")
-        case "detecting-speakers": return qsTr("detecting speakers…")
-        case "detecting-speakers-segmenting": return qsTr("finding speech…")
-        case "detecting-speakers-identifying": return qsTr("identifying speakers…")
-        case "transcribing": return qsTr("transcribing…")
-        case "downloading": return qsTr("downloading…")
-        case "combining": return qsTr("combining…")
-        case "chaptering": return qsTr("chaptering…")
-        case "importing": return qsTr("importing…")
-        case "grabbing": return qsTr("grabbing…")
-        case "labeling": return qsTr("labeling…")
-        case "benchmarking": return qsTr("benchmarking…")
-        default: return ""
-        }
-    }
+    // reads as "doing something", not a hang. The phase→label mapping is the
+    // controller's single source of truth (TranscriptionController::phaseLabel)
+    // — this QML no longer keeps a switch a new emitted phase could forget,
+    // rendering blank. Empty for an unknown/absent phase.
+    readonly property string currentPhaseLabel: transcriptionController
+        ? transcriptionController.phaseLabel(bottomBar.currentPhase) : ""
 
     implicitHeight: 28
 
@@ -494,7 +478,7 @@ Item {
             Layout.preferredWidth: 160
             elide: Text.ElideMiddle
             visible: bottomBar.hasDisplayJob
-            text: bottomBar.kindLabel(bottomBar.displayJobKind) + ": " + bottomBar.displayJobFileName
+            text: bottomBar.displayJobKindLabel + ": " + bottomBar.displayJobFileName
             color: "#aaaaaa"
             font.pixelSize: 11
         }
@@ -506,7 +490,7 @@ Item {
         // above (which can legitimately be long) elides; this one sizes to
         // its own content instead of sharing a fixed-width elide box with it.
         Label {
-            visible: bottomBar.busy && bottomBar.phaseLabel(bottomBar.currentPhase) !== ""
+            visible: bottomBar.busy && bottomBar.currentPhaseLabel !== ""
             // 2026-07-10: taskProgress is now a real (if synthesized, for
             // "loading"/"decoding" — see currentPhase's doc comment) number
             // in every phase, so the percentage always shows instead of
@@ -515,7 +499,7 @@ Item {
                 ? qsTr("(stopping…)")
                 : bottomBar.activePaused
                     ? qsTr("(paused)")
-                    : "(" + bottomBar.phaseLabel(bottomBar.currentPhase) + " "
+                    : "(" + bottomBar.currentPhaseLabel + " "
                       + (bottomBar.taskProgress * 100).toFixed(1) + "%)"
             color: "#888888"
             font.pixelSize: 11
@@ -920,7 +904,7 @@ Item {
                         // renames, and (Wave N) model downloads, which
                         // otherwise look identical in this list (same
                         // status colors).
-                        readonly property string kindLabel: bottomBar.kindLabel(modelData.kind)
+                        readonly property string kindLabel: modelData.kindLabel
                         // Item 4/7: elapsed/ETA while this IS the active
                         // row (there's only ever one, so bottomBar's own
                         // elapsedEtaText is unambiguously about THIS row

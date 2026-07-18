@@ -69,7 +69,24 @@ void UsbGrabberController::setVaultTreeModel(VaultTreeModel *model)
 {
     if (model == m_vaultTreeModel)
         return;
+    if (m_vaultTreeModel)
+        disconnect(m_vaultTreeModel, nullptr, this, nullptr);
     m_vaultTreeModel = model;
+    if (m_vaultTreeModel) {
+        // When a vault opens (path becomes non-empty), re-scan already-mounted
+        // devices for auto-grabs — the app-was-closed-while-plugged-in gap (see
+        // rescanForAutoGrab()). Queued via a zero-timer so the grab lands after
+        // the vault model has fully settled its path, not mid-signal.
+        connect(m_vaultTreeModel, &VaultTreeModel::vaultPathChanged, this, [this] {
+            if (m_vaultTreeModel && !m_vaultTreeModel->vaultLocalPath().isEmpty())
+                QMetaObject::invokeMethod(this, &UsbGrabberController::rescanForAutoGrab, Qt::QueuedConnection);
+        });
+        // The vault may ALREADY be open by the time this controller is wired up
+        // (lastVaultPath restored at startup before this binding lands), so
+        // vaultPathChanged won't fire again — rescan once now too.
+        if (!m_vaultTreeModel->vaultLocalPath().isEmpty())
+            QMetaObject::invokeMethod(this, &UsbGrabberController::rescanForAutoGrab, Qt::QueuedConnection);
+    }
     emit vaultTreeModelChanged();
 }
 
@@ -85,6 +102,13 @@ void UsbGrabberController::setTranscriptionController(TranscriptionController *c
                 &UsbGrabberController::handleUsbGrabFinished);
         connect(m_transcriptionController, &TranscriptionController::queueChanged, this,
                 &UsbGrabberController::reconcileInFlightJobs);
+        // Startup wiring order isn't guaranteed: if the vault opened before
+        // THIS controller was set, setVaultTreeModel()'s rescan no-op'd
+        // (startGrabJob needs the transcription controller) and won't retry —
+        // so rescan once here too. Idempotent + queued, so a double-fire with
+        // setVaultTreeModel()'s own rescan is harmless.
+        if (m_vaultTreeModel && !m_vaultTreeModel->vaultLocalPath().isEmpty())
+            QMetaObject::invokeMethod(this, &UsbGrabberController::rescanForAutoGrab, Qt::QueuedConnection);
     }
     emit transcriptionControllerChanged();
 }
@@ -218,19 +242,42 @@ void UsbGrabberController::triggerManualGrab(const QString &deviceSerial)
 
 void UsbGrabberController::handleDeviceAdded(const QVariantMap &info)
 {
+    maybeAutoGrab(info);
+}
+
+void UsbGrabberController::maybeAutoGrab(const QVariantMap &info)
+{
     if (!m_vaultTreeModel || m_vaultTreeModel->vaultLocalPath().isEmpty())
         return;
 
     const QString deviceSerial = info.value(QStringLiteral("serial")).toString();
     const UsbGrabRule rule = resolveEffectiveRule(deviceSerial, info);
     // Both gates, in order — see the class doc comment. enabled says the device
-    // is grabbable at all; autoGrab says a hotplug may grab it with no click.
-    // An enabled-but-not-autoGrab device still mounted (that's enabled's job)
-    // and still shows up here to be grabbed on demand; it just isn't touched.
+    // is grabbable at all; autoGrab says it may be grabbed with no click.
+    // An enabled-but-not-autoGrab device still mounts (that's enabled's job)
+    // and shows up to be grabbed on demand; it just isn't touched here.
     if (!rule.enabled || !rule.autoGrab)
         return;
 
-    startGrabJob(rule, info.value(QStringLiteral("mountPath")).toString(), /*autoTriggered=*/true);
+    const QString mountPath = info.value(QStringLiteral("mountPath")).toString();
+    // A device present-but-unmounted has no path to walk yet — its own mount
+    // (handleUnmountedVolumeDetected) will re-surface it as a mounted device
+    // and this runs again. Skip rather than start a grab against an empty path.
+    if (mountPath.isEmpty())
+        return;
+
+    startGrabJob(rule, mountPath, /*autoTriggered=*/true);
+}
+
+void UsbGrabberController::rescanForAutoGrab()
+{
+    // See the header doc comment: re-evaluate every already-mounted device so
+    // one that stayed plugged in across an app restart still auto-grabs, even
+    // though no hotplug fires for it. Idempotent (the grab skips already-
+    // copied files).
+    const QVariantList mounted = m_deviceMonitor.currentlyMountedDevices();
+    for (const QVariant &v : mounted)
+        maybeAutoGrab(v.toMap());
 }
 
 void UsbGrabberController::handleUnmountedVolumeDetected(const QVariantMap &info)

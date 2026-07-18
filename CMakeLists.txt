@@ -235,6 +235,11 @@ qt_add_qml_module(suopTranscriber
         src/core/TranscriptionEngine.h
         src/core/VaultTreeModel.h
         src/core/VaultTreeModel.cpp
+        src/core/AudioExtensions.h
+        src/core/FileRename.h
+        src/core/FileRename.cpp
+        src/core/VaultFileOps.h
+        src/core/VaultFileOps.cpp
         src/core/VaultSearchProxyModel.h
         src/core/VaultSearchProxyModel.cpp
         src/core/AudioPlayer.h
@@ -297,8 +302,24 @@ qt_add_qml_module(suopTranscriber
         src/core/tasks/DownloadTask.cpp
         src/core/tasks/RenameSpeakerTask.h
         src/core/tasks/RenameSpeakerTask.cpp
+        src/core/tasks/RenameFileTask.h
+        src/core/tasks/RenameFileTask.cpp
         src/core/tasks/MergeSpeakersTask.h
         src/core/tasks/MergeSpeakersTask.cpp
+        src/core/tasks/MoveTask.h
+        src/core/tasks/MoveTask.cpp
+        src/core/tasks/ModelIoTask.h
+        src/core/tasks/ModelIoTask.cpp
+        src/core/tasks/TrashTask.h
+        src/core/tasks/TrashTask.cpp
+        src/core/tasks/DeleteTask.h
+        src/core/tasks/DeleteTask.cpp
+        src/core/tasks/RestoreTask.h
+        src/core/tasks/RestoreTask.cpp
+        src/core/tasks/FolderRenameTask.h
+        src/core/tasks/FolderRenameTask.cpp
+        src/core/tasks/FolderMoveTask.h
+        src/core/tasks/FolderMoveTask.cpp
         src/core/tasks/CombineTask.h
         src/core/tasks/CombineTask.cpp
         src/core/tasks/ImportTask.h

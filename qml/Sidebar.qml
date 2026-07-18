@@ -702,6 +702,47 @@ Rectangle {
         // here. setPendingCombines() no-ops unless the set genuinely changed,
         // which is what makes it safe to call on a signal this chatty.
         function onQueueChanged() { sidebar.pushPendingCombines() }
+        // File rename is an instant-lane task (see performRename): clear the
+        // optimistic override once the rename has actually landed on disk — by
+        // now the file-watcher rebuild is showing the real new name, so
+        // releasing the override can't reintroduce the flash. On failure,
+        // surface the error and drop the override so the row reverts to the
+        // (unchanged) on-disk name.
+        function onFileRenamed(oldUrl, newUrl, ok, error) {
+            if (!ok)
+                Notifications.error(error === "" ? qsTr("Couldn't rename — name taken or invalid.") : error)
+            sidebar.clearOptimisticRename()
+        }
+        // File move is an instant-lane task like rename (see performRowMove).
+        // On failure, surface the error; success needs nothing here — the
+        // file-watcher rebuild shows the file in its new folder, and the undo
+        // snackbar (auto-wired from undoAvailable) offers a one-click move-back.
+        function onFileMoved(oldUrl, newUrl, ok, error) {
+            if (!ok)
+                Notifications.error(error === "" ? qsTr("Couldn't move — name taken or invalid.") : error)
+        }
+        // Async trash completed (controller path): whatever went to the trash
+        // already offered its Undo via the generic undo snackbar (undoAvailable);
+        // here we only prompt for the entries the filesystem REFUSED (still on
+        // disk, untouched), exactly as the synchronous handleTrashResult did.
+        // scope ("files"/"transcript"/"audioOnly"/"folder") carries through to
+        // confirmFileDelete so the right permanent-delete runs.
+        function onTrashResult(scope, untrashable) {
+            sidebar.promptPermanentDelete(untrashable, scope)
+        }
+        // Folder rename/move are instant-lane tasks (FolderRenameTask/
+        // FolderMoveTask). Clear the optimistic rename override once the rename
+        // lands (deferred to avoid the flash — see performRename's isDir branch);
+        // surface an error on failure.
+        function onFolderRenamed(oldUrl, newUrl, ok, error) {
+            if (!ok)
+                Notifications.error(error === "" ? qsTr("Couldn't rename folder — name taken or invalid.") : error)
+            sidebar.clearOptimisticRename()
+        }
+        function onFolderMoved(oldUrl, newUrl, ok, error) {
+            if (!ok)
+                Notifications.error(error === "" ? qsTr("Couldn't move folder — name taken or invalid.") : error)
+        }
         function onFinished(fileUrl, ok, error) {
             sidebar.refreshTreeOrdering()
             // A label/tag/transcript change can change what the active search
@@ -1402,6 +1443,16 @@ Rectangle {
         }
 
         if (isDir) {
+            // Folder rename is an instant-lane FolderRenameTask with a controller
+            // (async, undoable) — the optimistic override is cleared by
+            // onFolderRenamed once the rename lands (deferring it avoids the
+            // flash, same as the file-rename path). The synchronous
+            // model.renameFolder() is the no-controller fallback (rebuild is
+            // immediate, so clear now).
+            if (sidebar.transcriptionController) {
+                sidebar.transcriptionController.renameFolder("file://" + path, trimmed, sidebar.vaultPath)
+                return
+            }
             if (sidebar.model && !sidebar.model.renameFolder("file://" + path, trimmed))
                 Notifications.error(qsTr("Couldn't rename folder — name taken or invalid."))
             sidebar.clearOptimisticRename()
@@ -1419,12 +1470,25 @@ Rectangle {
             return
         }
 
-        if (sidebar.model && !sidebar.model.renameFile("file://" + path, trimmed))
-            Notifications.error(qsTr("Couldn't rename — name taken or invalid."))
-        // renameFile() ran rebuild() synchronously (new delegates already show
-        // the new model name), so releasing the optimistic override now can't
-        // reintroduce the flash.
-        sidebar.clearOptimisticRename()
+        // File rename goes through the instant-lane task when a controller is
+        // wired (the real app) — visible in the Tasks list, deferred behind a
+        // same-file transcription. The optimistic override (set in
+        // commitActiveRename) is deliberately NOT cleared here on that path: it
+        // must hold the new name until the rename lands on disk and the model
+        // rebuilds (async via the file watcher), or the row flashes back to its
+        // old model name; onFileRenamed above clears it once the task reports.
+        //
+        // Sidebar also runs WITHOUT a controller (plain filename mode — see
+        // m_controller in tst_sidebar_rename): there, fall back to the
+        // synchronous VaultTreeModel.renameFile() (which rebuilds inline, so
+        // the override is safe to clear immediately).
+        if (sidebar.transcriptionController) {
+            sidebar.transcriptionController.renameFile("file://" + path, trimmed)
+        } else {
+            if (sidebar.model && !sidebar.model.renameFile("file://" + path, trimmed))
+                Notifications.error(qsTr("Couldn't rename — name taken or invalid."))
+            sidebar.clearOptimisticRename()
+        }
     }
 
     function openMoveTo() {
@@ -1435,7 +1499,14 @@ Rectangle {
     }
 
     function moveNoteTo(destDir) {
-        if (sidebar.model)
+        // Instant-lane task when a controller is present (async, undoable —
+        // see moveFiles()/onFileMoved); the synchronous model call is the
+        // no-controller fallback (plain-model harnesses), mirroring
+        // performRename()/performRowMove().
+        if (sidebar.transcriptionController)
+            sidebar.transcriptionController.moveFiles(["file://" + sidebar.ctxPath], "file://" + destDir,
+                                                       sidebar.vaultPath)
+        else if (sidebar.model)
             sidebar.model.moveFile("file://" + sidebar.ctxPath, "file://" + destDir)
         moveToPopup.close()
     }
@@ -1549,7 +1620,27 @@ Rectangle {
     // (a delegate array rebuilt underneath an in-flight click), so the move is
     // pushed to the next event-loop turn, after the gesture has fully unwound.
     function performRowMove(paths, isDir, destDir) {
-        if (!sidebar.model || destDir === "")
+        if (destDir === "")
+            return
+        // With a controller, moves are async instant-lane tasks (visible +
+        // undoable): FILE moves collapse into one undo BATCH for the whole drag
+        // (a single "Moved N files" snackbar — moveFiles); FOLDER moves are
+        // individual FolderMoveTasks (multi-folder drag is rare, so no batch).
+        // A refused move surfaces asynchronously via onFileMoved/onFolderMoved.
+        // A no-controller harness (tst_sidebar_*) falls back to the synchronous
+        // model calls below — same split as performRename().
+        if (sidebar.transcriptionController) {
+            if (isDir) {
+                for (let i = 0; i < paths.length; i++)
+                    sidebar.transcriptionController.moveFolder("file://" + paths[i], "file://" + destDir,
+                                                               sidebar.vaultPath)
+            } else {
+                sidebar.transcriptionController.moveFiles(paths.map((p) => "file://" + p), "file://" + destDir,
+                                                          sidebar.vaultPath)
+            }
+            return
+        }
+        if (!sidebar.model)
             return
         const failed = []
         for (let i = 0; i < paths.length; i++) {
@@ -1608,9 +1699,25 @@ Rectangle {
         return p.substring(p.lastIndexOf("/") + 1)
     }
 
-    // Shared tail for all three delete kinds: report what happened, offer Undo
-    // for whatever went to the trash, and prompt only for what didn't.
-    // `result` is a trashFiles()/trashFolder()/trashTranscript() result map.
+    // Opens the permanent-delete confirm prompt for exactly the entries the
+    // filesystem refused to trash — the ONLY ones a permanent delete is on the
+    // table for (they were left untouched, so nothing has happened to them yet).
+    // Shared by the async controller path (onTrashResult) and the synchronous
+    // no-controller fallback (handleTrashResult).
+    function promptPermanentDelete(untrashable, mode) {
+        if (untrashable.length > 0) {
+            sidebar.pendingDeletePaths = untrashable.map((u) => u.toString().replace("file://", ""))
+            sidebar.pendingDeleteMode = mode
+            fileDeleteConfirmPopup.open()
+        }
+    }
+
+    // Synchronous no-controller FALLBACK tail (plain-model harnesses): report
+    // what happened, offer Undo via the model's own restoreFromTrash, and prompt
+    // for what couldn't be trashed. With a controller the trash is an async
+    // TrashTask instead: the generic undo snackbar (Main.qml, from
+    // undoAvailable) replaces this Undo, and onTrashResult below replaces this
+    // prompt. `result` is a trashFiles()/trashFolder()/trashTranscript() map.
     function handleTrashResult(result, mode, trashedMessage) {
         const untrashable = result.untrashable || []
         const restorable = result.restorable || []
@@ -1631,15 +1738,7 @@ Rectangle {
             })
         }
 
-        // Only the entries the filesystem refused to trash reach the prompt —
-        // those are the only ones a permanent delete is on the table for. They
-        // were left untouched, so nothing has happened to them yet.
-        if (untrashable.length > 0) {
-            sidebar.pendingDeletePaths = untrashable.map(
-                (u) => u.toString().replace("file://", ""))
-            sidebar.pendingDeleteMode = mode
-            fileDeleteConfirmPopup.open()
-        }
+        sidebar.promptPermanentDelete(untrashable, mode)
     }
 
     // All three take a PATHS ARRAY, not a single path, so the three callers can
@@ -1658,10 +1757,21 @@ Rectangle {
         return path.substring(path.lastIndexOf("/") + 1)
     }
 
+    // Each begins a trash: with a controller it's an async, undoable TrashTask
+    // (the generic undo snackbar + onTrashResult's confirm prompt take over);
+    // without one (plain-model harnesses) it falls back to the synchronous
+    // model.trash* + handleTrashResult, mirroring performRename/performRowMove.
     function beginDeleteTranscript(paths) {
-        if (!sidebar.model || paths.length === 0)
+        if (paths.length === 0)
             return
-        const result = sidebar.model.trashTranscript(paths.map((p) => "file://" + p))
+        const urls = paths.map((p) => "file://" + p)
+        if (sidebar.transcriptionController) {
+            sidebar.transcriptionController.trash("transcript", urls, sidebar.vaultPath)
+            return
+        }
+        if (!sidebar.model)
+            return
+        const result = sidebar.model.trashTranscript(urls)
         // Keyed on the TARGET count, not on result.trashed: with several
         // targets and one success, paths[0] isn't necessarily the file that
         // succeeded, so naming it would name the wrong one.
@@ -1675,9 +1785,16 @@ Rectangle {
     // The complement of beginDeleteTranscript(): drops the audio, keeps the .md
     // (which becomes an orphaned-.md row).
     function beginDeleteAudioOnly(paths) {
-        if (!sidebar.model || paths.length === 0)
+        if (paths.length === 0)
             return
-        const result = sidebar.model.trashAudioOnly(paths.map((p) => "file://" + p))
+        const urls = paths.map((p) => "file://" + p)
+        if (sidebar.transcriptionController) {
+            sidebar.transcriptionController.trash("audioOnly", urls, sidebar.vaultPath)
+            return
+        }
+        if (!sidebar.model)
+            return
+        const result = sidebar.model.trashAudioOnly(urls)
         sidebar.handleTrashResult(
             result, "audioOnly",
             paths.length === 1
@@ -1688,18 +1805,31 @@ Rectangle {
     }
 
     function beginDeleteFile(paths) {
-        if (!sidebar.model || paths.length === 0)
+        if (paths.length === 0)
             return
-        const result = sidebar.model.trashFiles(paths.map((p) => "file://" + p))
+        const urls = paths.map((p) => "file://" + p)
+        if (sidebar.transcriptionController) {
+            sidebar.transcriptionController.trash("files", urls, sidebar.vaultPath)
+            return
+        }
+        if (!sidebar.model)
+            return
+        const result = sidebar.model.trashFiles(urls)
         sidebar.handleTrashResult(
-            result, "file",
+            result, "files",
             paths.length === 1
                 ? qsTr("Moved %1 to the trash.").arg(sidebar.baseNameOf(paths[0]))
                 : qsTr("Moved %1 items to the trash.").arg(result.trashed))
     }
 
     function beginDeleteFolder(path) {
-        if (!sidebar.model || path === "")
+        if (path === "")
+            return
+        if (sidebar.transcriptionController) {
+            sidebar.transcriptionController.trash("folder", ["file://" + path], sidebar.vaultPath)
+            return
+        }
+        if (!sidebar.model)
             return
         const name = path.substring(path.lastIndexOf("/") + 1)
         sidebar.handleTrashResult(
@@ -1711,23 +1841,34 @@ Rectangle {
     // the irreversible one, which is why it's the only path that prompts.
     function confirmFileDelete() {
         const paths = sidebar.pendingDeletePaths
-        if (sidebar.model && paths.length > 0) {
+        if (paths.length > 0) {
             const urls = paths.map((p) => "file://" + p)
-            // "folder" is the one single-target mode — see pendingDeletePaths'
-            // comment. The other three are batches, and each reports how many
-            // of the batch it actually removed.
-            if (sidebar.pendingDeleteMode === "folder") {
-                if (!sidebar.model.deleteFolderPermanently(urls[0]))
-                    Notifications.error(qsTr("Couldn't delete that folder."))
-            } else {
-                const deleted = sidebar.pendingDeleteMode === "transcript"
-                    ? sidebar.model.deleteTranscriptPermanently(urls)
-                    : sidebar.pendingDeleteMode === "audioOnly"
-                        ? sidebar.model.deleteAudioOnlyPermanently(urls)
-                        : sidebar.model.deleteFilesPermanently(urls)
-                if (deleted < paths.length)
-                    Notifications.error(qsTr("Couldn't delete %1 of %2 items.")
-                        .arg(paths.length - deleted).arg(paths.length))
+            // With a controller, the permanent delete is an async DeleteTask
+            // (visible in the Tasks list) — one scope-tagged call for the whole
+            // batch (a folder is a single-url batch). onModelReset / the model's
+            // per-file signals still fire via the task's applyRemovalOutcome, so
+            // the open-file view state reacts identically. Without a controller,
+            // fall back to the synchronous model.delete* calls (plain-model
+            // harnesses), mirroring the trash side.
+            if (sidebar.transcriptionController) {
+                sidebar.transcriptionController.deletePermanently(sidebar.pendingDeleteMode, urls, sidebar.vaultPath)
+            } else if (sidebar.model) {
+                // "folder" is the one single-target mode — see pendingDeletePaths'
+                // comment. The other three are batches, and each reports how many
+                // of the batch it actually removed.
+                if (sidebar.pendingDeleteMode === "folder") {
+                    if (!sidebar.model.deleteFolderPermanently(urls[0]))
+                        Notifications.error(qsTr("Couldn't delete that folder."))
+                } else {
+                    const deleted = sidebar.pendingDeleteMode === "transcript"
+                        ? sidebar.model.deleteTranscriptPermanently(urls)
+                        : sidebar.pendingDeleteMode === "audioOnly"
+                            ? sidebar.model.deleteAudioOnlyPermanently(urls)
+                            : sidebar.model.deleteFilesPermanently(urls)
+                    if (deleted < paths.length)
+                        Notifications.error(qsTr("Couldn't delete %1 of %2 items.")
+                            .arg(paths.length - deleted).arg(paths.length))
+                }
             }
         }
         // Nothing clears the selection here: a delete that removed anything

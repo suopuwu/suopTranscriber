@@ -55,10 +55,16 @@ struct UsbGrabScanResult {
 // queue's worker polls atomics and blocks on pause — neither shape belongs
 // inside the walk itself.
 struct UsbGrabScanHooks {
-    // Called once per CANDIDATE file considered (filter-rejected files don't
-    // count), with the running total and the total number of candidates the
-    // pre-count pass found. Coarse by design — no byte-level progress.
-    std::function<void(int filesProcessedSoFar, int totalCandidates)> onProgress;
+    // Byte-weighted progress: bytesDone is how many bytes of the whole grab
+    // have been accounted for (fully copied, or skipped-because-already-
+    // present), plus the partial bytes of the file currently copying;
+    // bytesTotal is the summed size of every candidate the pre-count pass
+    // found. Fires DURING a copy (sub-file granularity), not just once per
+    // file — so a grab of 15 small already-present files + 1 large new file
+    // shows the real ~progress of that large copy instead of jumping to 94%
+    // and stalling (the old per-candidate count did the latter). bytesTotal is
+    // 0 only when there are no candidates at all.
+    std::function<void(qint64 bytesDone, qint64 bytesTotal)> onProgress;
     // Polled between files. Returning true stops the walk where it stands and
     // sets UsbGrabScanResult::aborted. Also the hook where a caller that needs
     // to pump an event loop or block on a pause does so.

@@ -21,6 +21,7 @@ public:
     TranscribeTask(QUrl fileUrl, QUrl vaultUrl, QString modelId, QObject *parent = nullptr);
 
     QString kind() const override { return QStringLiteral("transcribe"); }
+    QString kindLabel() const override { return QStringLiteral("Transcribe"); }
     QString displayName() const override;
     // Pausable during decode/transcribing (real cooperative checkpoints);
     // "loading" (whisper's blocking, unhookable model-load call) has no
@@ -29,6 +30,14 @@ public:
     // layer (not this flag) is responsible for treating a pause click during
     // "loading" as a no-op rather than queuing it.
     Capabilities capabilities() const override { return {/*pausable=*/true, /*cancellableMidRun=*/true}; }
+    // Multi-stage ASR pipeline — the overall bar blends these four phases by
+    // their rolling-average durations (see Task::ProgressModel).
+    ProgressModel progressModel() const override { return ProgressModel::WeightedPhases; }
+    QStringList progressPhases() const override
+    {
+        return {QStringLiteral("loading"), QStringLiteral("decoding"), QStringLiteral("detecting-speech"),
+                QStringLiteral("transcribing")};
+    }
     bool isPersistable() const override { return true; }
     QJsonObject toJson() const override;
     QVariantMap toVariantMap() const override;

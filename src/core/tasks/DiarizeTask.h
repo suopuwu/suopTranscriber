@@ -24,6 +24,7 @@ public:
                 QObject *parent = nullptr);
 
     QString kind() const override { return QStringLiteral("diarize"); }
+    QString kindLabel() const override { return QStringLiteral("Detect speakers"); }
     QString displayName() const override;
     // Pausable (decode is a real killable/SIGSTOP-able ffmpeg subprocess;
     // the diarization pass itself blocks on pause between sherpa-onnx
@@ -31,6 +32,15 @@ public:
     // no abort hook, so a cancel requested during it only takes effect at
     // the checkpoint right after.
     Capabilities capabilities() const override { return {/*pausable=*/true, /*cancellableMidRun=*/false}; }
+    // No whisper load, no ASR: decode then the diarization pass. The overall
+    // bar weights these two phases (see Task::ProgressModel). The finer
+    // "detecting-speakers-segmenting"/"-identifying" sub-phases run() emits
+    // both fold into the "detecting-speakers" bucket for weighting.
+    ProgressModel progressModel() const override { return ProgressModel::WeightedPhases; }
+    QStringList progressPhases() const override
+    {
+        return {QStringLiteral("decoding"), QStringLiteral("detecting-speakers")};
+    }
     bool isPersistable() const override { return true; }
     QJsonObject toJson() const override;
     QVariantMap toVariantMap() const override;

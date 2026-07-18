@@ -16,7 +16,12 @@ public:
     RenameSpeakerTask(QUrl audioUrl, QString oldName, QString newName, QObject *parent = nullptr);
 
     QString kind() const override { return QStringLiteral("rename"); }
+    QString kindLabel() const override { return QStringLiteral("Rename speaker"); }
     QString displayName() const override;
+    // Instant lane: a single .md rewrite, no GPU — must not wait behind a
+    // transcription (the scheduler still makes it wait if a transcription of
+    // THIS SAME file is active, since both rewrite the .md). See Task::Lane.
+    Lane lane() const override { return Lane::Instant; }
     // capabilities(): default (not pausable, not mid-run-cancellable) —
     // matches pauseActive()'s old allowlist, which never included "rename".
     // isPersistable(): the old persistQueue() persisted every kind EXCEPT

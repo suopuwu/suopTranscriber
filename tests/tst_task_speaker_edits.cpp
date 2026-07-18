@@ -54,6 +54,10 @@ private slots:
         RenameSpeakerTask task(QUrl::fromLocalFile(audioPath), QStringLiteral("Speaker 1"), QStringLiteral("Alice"));
         QCOMPARE(task.kind(), QStringLiteral("rename"));
         QVERIFY(task.isPersistable());
+        // Instant lane: a single .md rewrite must not queue behind a
+        // transcription (the scheduler still defers it if a transcription of
+        // THIS file is active). See Task::Lane.
+        QCOMPARE(task.lane(), Task::Lane::Instant);
 
         QSignalSpy renamedSpy(&task, &RenameSpeakerTask::speakerRenamed);
         NullContextFixture fixture;
@@ -111,6 +115,7 @@ private slots:
 
         MergeSpeakersTask task(QUrl::fromLocalFile(audioPath), QStringLiteral("Speaker 1"), QStringLiteral("Speaker 2"));
         QCOMPARE(task.kind(), QStringLiteral("merge"));
+        QCOMPARE(task.lane(), Task::Lane::Instant);
 
         QSignalSpy mergedSpy(&task, &MergeSpeakersTask::speakersMerged);
         NullContextFixture fixture;

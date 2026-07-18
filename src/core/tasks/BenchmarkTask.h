@@ -24,6 +24,7 @@ public:
     BenchmarkTask(QUrl fileUrl, QUrl vaultUrl, QStringList modelIds, QObject *parent = nullptr);
 
     QString kind() const override { return QStringLiteral("benchmark"); }
+    QString kindLabel() const override { return QStringLiteral("Benchmark"); }
     QString displayName() const override;
     Presentation presentation() const override { return Presentation::Background; }
     // Cancellable (between models, and within one via the same abort-

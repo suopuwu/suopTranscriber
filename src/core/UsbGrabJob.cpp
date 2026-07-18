@@ -114,10 +114,35 @@ bool filenameRegexMatches(const QFileInfo &info, const QRegularExpression &filen
 // untouched — verified by SIGKILLing a 3 GB copy mid-flight and finding an empty
 // destination folder. Hand-rolled staging would only trade that for .partial
 // litter of our own to clean up.
-QString copyGrabbedFile(const QFileInfo &sourceInfo, const QString &destPath)
+QString copyGrabbedFile(const QFileInfo &sourceInfo, const QString &destPath,
+                         const std::function<void(qint64 bytesThisChunk)> &onBytesCopied = {})
 {
-    if (!QFile::copy(sourceInfo.absoluteFilePath(), destPath))
+    // Chunked copy (rather than QFile::copy) so onBytesCopied can report
+    // sub-file byte progress — the whole point of the accurate-progress fix.
+    // destPath is already collision-resolved to a non-existent path by the
+    // caller, so writing directly (no O_TMPFILE staging like QFile::copy) is
+    // safe; a failure below removes the partial before returning.
+    QFile src(sourceInfo.absoluteFilePath());
+    if (!src.open(QIODevice::ReadOnly))
+        return QStringLiteral("Failed to open \"%1\"").arg(sourceInfo.fileName());
+    QFile dst(destPath);
+    if (!dst.open(QIODevice::WriteOnly | QIODevice::Truncate))
         return QStringLiteral("Failed to copy \"%1\"").arg(sourceInfo.fileName());
+    constexpr qint64 kChunk = 1 << 20; // 1 MiB
+    while (true) {
+        const QByteArray buf = src.read(kChunk);
+        if (buf.isEmpty())
+            break; // EOF, or a read error (caught by the size check below)
+        if (dst.write(buf) != buf.size()) {
+            dst.close();
+            dst.remove();
+            return QStringLiteral("Failed to copy \"%1\"").arg(sourceInfo.fileName());
+        }
+        if (onBytesCopied)
+            onBytesCopied(buf.size());
+    }
+    dst.flush();
+    dst.close();
 
     if (QFileInfo(destPath).size() != sourceInfo.size()) {
         QFile::remove(destPath);
@@ -222,17 +247,22 @@ UsbGrabScanResult runUsbGrabScan(const UsbGrabRule &rule, const QString &mountPa
     // Cheap despite being a whole extra pass: this reads no file CONTENT, only
     // directory entries — the same reason the quick-check itself is instant
     // where a content hash took ~25 minutes (see alreadyPresentAtDestination()).
-    int totalCandidates = 0;
+    // Sum candidate BYTES (not just count) for a byte-weighted denominator —
+    // see UsbGrabScanHooks::onProgress. Stat-only, no content read, same cheap
+    // extra pass as before.
+    qint64 totalBytes = 0;
     if (hooks.onProgress) {
         QDirIterator countIt(scanRoot, QDir::Files, QDirIterator::Subdirectories);
         while (countIt.hasNext()) {
             const QFileInfo info(countIt.next());
             if (extensionMatches(info, rule.extensionFilter) && filenameRegexMatches(info, filenameRe))
-                ++totalCandidates;
+                totalBytes += info.size();
         }
     }
 
-    int filesProcessed = 0;
+    // Bytes fully accounted for so far (copied + skipped). onProgress reports
+    // this plus the in-flight file's partial bytes during a copy.
+    qint64 bytesAccounted = 0;
 
     QDirIterator it(scanRoot, QDir::Files, QDirIterator::Subdirectories);
     while (it.hasNext()) {
@@ -248,15 +278,17 @@ UsbGrabScanResult runUsbGrabScan(const UsbGrabRule &rule, const QString &mountPa
                 result.previewEntries.append(makePreviewEntry(QDir(scanRoot).relativeFilePath(sourcePath),
                                                                QStringLiteral("filtered")));
         } else {
-            ++filesProcessed;
-            if (hooks.onProgress)
-                hooks.onProgress(filesProcessed, totalCandidates);
-
             const bool alreadyPresent = alreadyPresentAtDestination(
                 sourceInfo, destFilesByBasename.value(sourceInfo.fileName()));
 
             if (alreadyPresent) {
                 ++result.filesSkipped;
+                // Skipped instantly, but its bytes ARE "done" — advance the
+                // byte-weighted progress so a folder of mostly-already-grabbed
+                // files reflects real remaining work, not a jump to near-100%.
+                bytesAccounted += sourceInfo.size();
+                if (hooks.onProgress && totalBytes > 0)
+                    hooks.onProgress(bytesAccounted, totalBytes);
                 if (dryRun)
                     result.previewEntries.append(makePreviewEntry(QDir(scanRoot).relativeFilePath(sourcePath),
                                                                    QStringLiteral("duplicate")));
@@ -296,7 +328,23 @@ UsbGrabScanResult runUsbGrabScan(const UsbGrabRule &rule, const QString &mountPa
                     } while (QFileInfo::exists(destPath));
                 }
 
-                const QString copyError = copyGrabbedFile(sourceInfo, destPath);
+                // Report sub-file progress during the copy: the bytes already
+                // accounted for, plus this file's running partial. bytesAccounted
+                // itself isn't advanced until the file finishes (below), so a
+                // failed/removed copy doesn't leave phantom progress.
+                const qint64 fileBase = bytesAccounted;
+                qint64 thisFileCopied = 0;
+                const QString copyError =
+                    copyGrabbedFile(sourceInfo, destPath, [&](qint64 chunkBytes) {
+                        thisFileCopied += chunkBytes;
+                        if (hooks.onProgress && totalBytes > 0)
+                            hooks.onProgress(fileBase + thisFileCopied, totalBytes);
+                    });
+                // Advance by the file's full size whether it copied or errored,
+                // so the bar always reaches 100% at the end of the walk.
+                bytesAccounted = fileBase + sourceInfo.size();
+                if (hooks.onProgress && totalBytes > 0)
+                    hooks.onProgress(bytesAccounted, totalBytes);
                 if (copyError.isEmpty()) {
                     ++result.filesCopied;
 

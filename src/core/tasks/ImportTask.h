@@ -16,6 +16,7 @@ public:
     ImportTask(QString sourcePath, QUrl destUrl, QObject *parent = nullptr);
 
     QString kind() const override { return QStringLiteral("import"); }
+    QString kindLabel() const override { return QStringLiteral("Import"); }
     QString displayName() const override;
     // Pausable between chunks (no subprocess to SIGSTOP, so the task just
     // blocks itself — see run()).

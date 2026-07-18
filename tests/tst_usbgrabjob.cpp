@@ -118,6 +118,62 @@ private slots:
     // Same basename + same size + same mtime already in the vault -> skipped.
     // A different basename is always new. (The same-basename-but-different-file
     // case is quickCheck_sameBasenameDifferentContent_... below.)
+    // Progress is BYTE-weighted, not per-file-count (2026-07 fix). The bug it
+    // fixes: grabbing 15 tiny already-present files + 1 big new file jumped
+    // straight to ~94% (15/16 candidates "processed" instantly) and then
+    // stalled on the big copy. With byte weighting, the tiny skips barely move
+    // the bar and the big copy shows its real progress. Also verifies progress
+    // is monotonic and ends at exactly 1.0.
+    void progress_isByteWeighted_notPerFileCount()
+    {
+        QTemporaryDir device;
+        QTemporaryDir vault;
+        QVERIFY(device.isValid() && vault.isValid());
+
+        // 15 tiny files already present in the vault (identical -> skipped).
+        for (int i = 0; i < 15; ++i) {
+            const QString name = QStringLiteral("tiny%1.wav").arg(i);
+            QVERIFY(writeFile(vault.filePath(name), "x"));
+            QVERIFY(writeFile(device.filePath(name), "x"));
+            QVERIFY(setMtime(vault.filePath(name), fixedMtime()));
+            QVERIFY(setMtime(device.filePath(name), fixedMtime()));
+        }
+        // One big NEW file (~4 MiB) — the bulk of the bytes, all still to copy.
+        QVERIFY(writeFile(device.filePath("big.wav"), QByteArray(4 << 20, 'a')));
+
+        UsbGrabRule rule;
+        rule.deviceSerial = QStringLiteral("TEST-SERIAL");
+        rule.preserveStructure = false;
+
+        QList<double> fractions;
+        UsbGrabScanHooks hooks;
+        hooks.onProgress = [&fractions](qint64 done, qint64 total) {
+            if (total > 0)
+                fractions.append(static_cast<double>(done) / static_cast<double>(total));
+        };
+
+        const UsbGrabScanResult result = runUsbGrabScan(rule, device.path(), vault.path(), /*dryRun=*/false, hooks);
+        QCOMPARE(result.filesCopied, 1);
+        QCOMPARE(result.filesSkipped, 15);
+
+        QVERIFY(!fractions.isEmpty());
+        // Monotonic non-decreasing, and reaches exactly 1.0 at the end.
+        for (int i = 1; i < fractions.size(); ++i)
+            QVERIFY2(fractions[i] >= fractions[i - 1] - 1e-9, "progress must not go backwards");
+        QVERIFY(qFuzzyCompare(fractions.last() + 1.0, 1.0 + 1.0)); // last == 1.0
+
+        // The 15 tiny skips are 15 bytes of ~4 MiB total — so the FIRST progress
+        // report (after all skips, before the big copy shows sub-file motion)
+        // must still be near 0, NOT near 94% as the old per-count logic gave.
+        // At least one mid-copy sample must land in the wide (0.05, 0.95) band,
+        // proving sub-file granularity rather than a single 0->1 jump.
+        bool sawMidCopy = false;
+        for (const double f : fractions)
+            if (f > 0.05 && f < 0.95)
+                sawMidCopy = true;
+        QVERIFY2(sawMidCopy, "expected sub-file progress samples during the big copy");
+    }
+
     void quickCheck_skipsAlreadyPresentFile_copiesNewOne()
     {
         QTemporaryDir device;

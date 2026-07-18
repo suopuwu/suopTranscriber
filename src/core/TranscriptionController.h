@@ -28,11 +28,21 @@
 #include "RollingAverage.h"
 #include "Segment.h"
 #include "UsbRuleStore.h"
+#include "VaultTreeModel.h" // full type (not just a forward decl) — the
+                            // Q_PROPERTY(VaultTreeModel*) below needs it complete
+                            // for moc's metatype registration, same as
+                            // UsbGrabberController. The controller calls its
+                            // applyRemovalOutcome()/applyRestoreOutcome() on the
+                            // GUI thread after a trash/delete/restore task ends,
+                            // so the model still owns the per-file signal emission.
 #include "tasks/ModelDownloadTarget.h"
 #include "tasks/Task.h"
 
 class QTimer;
 class TaskRunner;
+// (VaultTreeModel is included above, not forward-declared — see the include note.)
+                      // so the model still owns the per-file delete/restore
+                      // signal emission MainPanel depends on.
 struct DiarizedTurn; // DiarizationEngine.h — forward-declared so this header
                      // needn't pull in sherpa-onnx (spliceBodySpeakers only
                      // takes a const-ref to a vector of these).
@@ -373,6 +383,11 @@ class TranscriptionController : public QObject {
     // through, and the overlay label had to key off currentPhase to work
     // around it. A dedicated signal makes the property honest mid-pipeline.
     Q_PROPERTY(QString currentJobKind READ currentJobKind NOTIFY currentJobKindChanged)
+    // The Active task's human category label (Task::kindLabel(), e.g. "Move to
+    // trash") — what the bottom bar shows before the filename. Parallel to
+    // currentJobKind (the slug); same NOTIFY. Lets the bottom bar read the label
+    // straight off the task instead of re-deriving it from the slug in QML.
+    Q_PROPERTY(QString currentJobKindLabel READ currentJobKindLabel NOTIFY currentJobKindChanged)
     // Whether the Active task can be paused at all — read straight off its
     // Task::capabilities().pausable. Wave N: this REPLACES BottomBar's own
     // canPause(kind) string allowlist ("transcribe"/"download"/…), which was a
@@ -436,6 +451,14 @@ class TranscriptionController : public QObject {
     // lowercase) off ONE mapping instead of each re-deriving it. QML hides
     // its indicator on empty, same convention as activeBackendName.
     Q_PROPERTY(QString activeBackendKind READ activeBackendKind NOTIFY activeBackendNameChanged)
+    // The vault tree model, bound from Main.qml (`vaultTreeModel: vaultModel`),
+    // same as UsbGrabberController. The controller calls its applyRemovalOutcome()/
+    // applyRestoreOutcome() after a trash/delete/restore task completes so the
+    // model — which owns the orphaned-vs-audio classification — emits the per-file
+    // delete/restore signals MainPanel reacts to. Null in headless tests, which
+    // exercise the tasks' filesystem work directly; the apply* calls no-op then.
+    Q_PROPERTY(VaultTreeModel *vaultTreeModel READ vaultTreeModel WRITE setVaultTreeModel NOTIFY
+                   vaultTreeModelChanged)
 
 public:
     // Wave N (task system): the job status enum lives on Task now
@@ -493,11 +516,27 @@ public:
     bool activeIsForeground() const { return m_activeIsForeground; }
     bool activeCanPause() const;
     QString currentPhase() const { return m_phase; }
+    // Human-readable label for a phase slug ("loading" -> "loading model…"),
+    // the SINGLE source of truth for the phase vocabulary's display text.
+    // Replaced BottomBar's phaseLabel(phase) switch — a new emitted phase that
+    // forgot a QML case rendered blank; now the label lives next to the rest
+    // of the phase semantics (kTimedPhases/phaseBucket/canonicalPhaseKey), and
+    // tst_styleguide guards that every emitted phase slug is covered here.
+    // Returns empty for an unknown slug.
+    Q_INVOKABLE QString phaseLabel(const QString &phase) const;
+    // The blocking-overlay title for a phase ("loading" -> "Loading model…"),
+    // the title-case action variant of phaseLabel. Empty for a phase that
+    // never raises the main-panel overlay (a Background kind) or an unknown
+    // slug — MainPanel falls back to a generic "Transcribing…". Same single
+    // phase registry as phaseLabel(); this is its overlay column.
+    Q_INVOKABLE QString phaseOverlayLabel(const QString &phase) const;
     QUrl currentFile() const { return m_currentFile; }
     // See the liveUpdateTick Q_PROPERTY doc comment above.
     int liveUpdateTick() const { return m_liveUpdateTick; }
     // See the currentJobKind Q_PROPERTY doc comment above.
     QString currentJobKind() const;
+    // See the currentJobKindLabel Q_PROPERTY doc comment above.
+    QString currentJobKindLabel() const;
     // See the activePaused Q_PROPERTY doc comment above.
     bool isActivePaused() const { return m_activePaused; }
     // See the activeStopping Q_PROPERTY doc comment above.
@@ -1115,6 +1154,62 @@ public:
     // speakersMerged() fires.
     Q_INVOKABLE void mergeSpeakers(const QUrl &fileUrl, const QString &sourceName, const QString &targetName);
 
+    // Renames a recording file (+ its sibling .md) as an instant-lane task —
+    // visible in the Tasks list, run off the GUI thread, and deferred behind a
+    // transcribe of THIS SAME file if one is active (renaming would move the
+    // .md out from under it). Reports via fileRenamed(); QML repoints the
+    // player to newUrl on success and rolls back its optimistic field on
+    // failure. Replaces QML's old synchronous VaultTreeModel::renameFile()
+    // calls (that method stays for direct callers/tests).
+    Q_INVOKABLE void renameFile(const QUrl &fileUrl, const QString &newBaseName);
+
+    // Moves one or more recording files (each carrying its .md sidecar +
+    // .partial.jsonl resume state) into destDirUrl, as instant-lane tasks —
+    // one MoveTask per file, all in ONE undo batch (a single "Moved N files"
+    // snackbar; see enqueueBatch()/undoTask()). vaultUrl bounds the
+    // inside-vault check MoveTask enforces on both ends. Each task defers
+    // behind an active transcribe of its OWN file (moving the .md out from
+    // under it), exactly like renameFile(). Reports per file via fileMoved();
+    // QML repoints the player when the currently-open file is the one moved.
+    // Replaces QML's old synchronous VaultTreeModel::moveFile() loop (that
+    // method stays for direct callers/tests / the no-controller fallback).
+    Q_INVOKABLE void moveFiles(const QVariantList &fileUrls, const QUrl &destDirUrl, const QUrl &vaultUrl);
+
+    VaultTreeModel *vaultTreeModel() const { return m_vaultModel; }
+    void setVaultTreeModel(VaultTreeModel *model);
+
+    // Moves vault entries to the trash as an instant-lane TrashTask — the async,
+    // undoable replacement for QML's synchronous VaultTreeModel::trashFiles()/
+    // trashTranscript()/trashAudioOnly()/trashFolder() (which stay as the
+    // no-controller fallback). `scope` is "files" | "transcript" | "audioOnly" |
+    // "folder"; urls is the selection (a single folder url for "folder").
+    // vaultUrl bounds the containment guard. The whole batch is ONE task ⇒ ONE
+    // generic undo snackbar (undoAvailable → RestoreTask). Entries the filesystem
+    // refuses come back via trashResult() to drive the confirm-then-permanent
+    // flow. The tree refreshes via the model's file-watcher + applyRemovalOutcome().
+    Q_INVOKABLE void trash(const QString &scope, const QVariantList &urls, const QUrl &vaultUrl);
+    // The irreversible counterpart, only ever called (from QML) for the entries
+    // trashResult() reported as untrashable, after the user confirms. Same scope
+    // strings; a DeleteTask, not undoable.
+    Q_INVOKABLE void deletePermanently(const QString &scope, const QVariantList &urls, const QUrl &vaultUrl);
+
+    // Renames / moves a FOLDER as an instant-lane task (FolderRenameTask /
+    // FolderMoveTask) — the folder analogues of renameFile()/moveFiles(),
+    // undoable via the generic snackbar. Pure filesystem (no per-file model
+    // signals, unlike trash/delete — the tree refreshes via the watcher).
+    // vaultUrl bounds the guards. The synchronous VaultTreeModel::renameFolder()/
+    // moveFolder() stay as the no-controller fallback. Reports via
+    // folderRenamed()/folderMoved() so QML can surface an error.
+    Q_INVOKABLE void renameFolder(const QUrl &folderUrl, const QString &newName, const QUrl &vaultUrl);
+    Q_INVOKABLE void moveFolder(const QUrl &folderUrl, const QUrl &destParentUrl, const QUrl &vaultUrl);
+
+    // Undo a completed task OR batch: `token` is either a single Done task's id
+    // (enqueues that task's inverse) or a batchId (enqueues the inverse of
+    // every Done member of the batch, itself as a fresh one-snackbar-undoable
+    // batch). No-op if the token matches no undoable Done task/batch. The undo
+    // snackbar the UI shows (on undoAvailable) calls this.
+    Q_INVOKABLE void undoTask(int token);
+
     // Everything after the frontmatter's closing "---" line (i.e. the
     // segment text), for main-panel search. Empty string if untranscribed
     // or unreadable. Item O19: cached (see m_bodyCache) behind a cheap
@@ -1400,6 +1495,32 @@ signals:
     // multiple speakers/optimistic renames at once (see MainPanel.qml's
     // pendingSpeakerRenames) knows exactly which one this result belongs to.
     void speakerRenamed(const QUrl &fileUrl, const QString &oldName, bool ok, const QString &error);
+    // Fired when a renameFile() task completes. oldUrl is the original file;
+    // newUrl is the renamed primary file (empty on failure). QML repoints the
+    // player to newUrl on success, rolls back its optimistic filename field on
+    // failure.
+    void fileRenamed(const QUrl &oldUrl, const QUrl &newUrl, bool ok, const QString &error);
+    // Fired per file when a moveFiles() task completes. oldUrl is the file's
+    // original location; newUrl is its new location (empty on failure). QML
+    // repoints the player to newUrl when the moved file was the open one.
+    void fileMoved(const QUrl &oldUrl, const QUrl &newUrl, bool ok, const QString &error);
+    // Fired when a trash() task completes. `scope` echoes the request
+    // ("files"/"transcript"/"audioOnly"/"folder"); `untrashable` is the url
+    // strings the filesystem refused (STILL on disk, untouched). QML opens the
+    // confirm-then-permanent-delete prompt for exactly these. The undo snackbar
+    // for whatever DID go to the trash is the generic undoAvailable, not this.
+    void trashResult(const QString &scope, const QVariantList &untrashable);
+    // Fired when a renameFolder()/moveFolder() task completes. newUrl is the
+    // folder's new location (empty on failure); QML surfaces the error on !ok.
+    void folderRenamed(const QUrl &oldUrl, const QUrl &newUrl, bool ok, const QString &error);
+    void folderMoved(const QUrl &oldUrl, const QUrl &newUrl, bool ok, const QString &error);
+    void vaultTreeModelChanged();
+    // Emitted when an UNDOABLE task or batch finishes. `token` is the task id
+    // for a standalone undoable task, or the batchId for a multi-select batch
+    // (ONE snackbar for the whole set — see maybeEmitUndoAvailable()). The UI
+    // shows an undo snackbar labeled `label`; clicking Undo calls
+    // undoTask(token). Auto-wired for every undoable kind — no per-kind QML.
+    void undoAvailable(int token, const QString &label);
     // Fired when a mergeSpeakers() call's background rewrite completes — see
     // speakerRenamed()'s doc comment above for the shape/rationale, mirrored
     // here with both names (sourceName is echoed back so a caller tracking
@@ -1565,6 +1686,23 @@ private:
     // ~22 unioned signals), resets control, and invokes execute() across the
     // thread boundary.
     void startTask(int index);
+    // The scheduler's single entry point: dispatches the next runnable task in
+    // EACH lane. Serial: if the serial lane is idle, start the front-most
+    // Paused-then-Queued Serial task. Instant: if the instant lane is idle,
+    // start the front-most Queued Instant task that has no file conflict with
+    // the ACTIVE serial task (an Instant task on file X waits while a Serial
+    // task on X runs — they'd both rewrite X's .md). Called after every
+    // enqueue and every task completion.
+    void pumpQueues();
+    // Dispatch one Instant task to the instant runner. Unlike startTask()
+    // (serial), this deliberately does NOT touch m_busy/currentFile/m_phase/
+    // the overlay — an instant rewrite is background-ish and must not hijack
+    // the main-panel UI a serial task owns. The task still shows in the Tasks
+    // list via jobs().
+    void startInstantTask(int index);
+    // True iff the ACTIVE serial task targets fileUrl (non-empty) — the
+    // instant-lane conflict gate.
+    bool serialActiveConflictsWith(const QUrl &fileUrl) const;
     // Wires one task's generic (progress/phase/paused) + kind-specific result
     // signals to this controller. Called exactly once per task, right before
     // its first dispatch.
@@ -1580,6 +1718,22 @@ private:
     // cancelTaskAt() — does NOT emit queueChanged() or any report (callers do
     // whatever's appropriate for their case).
     void removeTaskAt(int index);
+    // Drives the undo snackbar. Called after EVERY task reaches a terminal
+    // state (Done or Failed, both lanes) — `ok` says which.
+    //   Standalone task (batchId==0): emits undoAvailable(id, undoLabel()) iff
+    //     ok AND the task is undoable (label non-empty + makeUndoTask non-null).
+    //   Batch member (batchId!=0): stays silent until the LAST member of the
+    //     batch finishes, then emits ONE undoAvailable(batchId,
+    //     batchUndoLabel(k)) covering all k undoable-Done members — so N
+    //     multi-selected ops collapse into a single snackbar (see undoTask()).
+    void maybeEmitUndoAvailable(const Task *task, bool ok);
+    // Enqueues several tasks as ONE undo batch: allocates a shared batchId
+    // (from the same counter as task ids, so it can't collide with one),
+    // stamps it on each, and appends them in order. Returns the batchId — the
+    // token undoAvailable()/undoTask() use to undo the whole set at once. Used
+    // for multi-select file ops (move/…); a single-item op is just a batch of
+    // one (still one snackbar, labelled via batchUndoLabel(1)).
+    int enqueueBatch(std::vector<std::unique_ptr<Task>> tasks);
     // The ONE way a task enters the queue. Assigns its id, queues any
     // prerequisites() ahead of it, inserts it, emits queueChanged(), and
     // auto-starts if idle. insertIndex: -1 (default) uses
@@ -1719,6 +1873,19 @@ private:
 
     QThread m_thread;
     TaskRunner *m_runner = nullptr;
+    // The instant lane (see Task::Lane): a SECOND worker thread + runner that
+    // executes Lane::Instant tasks (rename/merge — fast file rewrites) in
+    // parallel with the serial GPU queue, so a rename never waits behind a
+    // transcription. One instant task at a time (they're fast); the task
+    // currently running here is m_instantActive (a borrowed pointer into
+    // m_tasks, or null). Its own (unused) EngineCache costs nothing.
+    QThread m_instantThread;
+    TaskRunner *m_instantRunner = nullptr;
+    Task *m_instantActive = nullptr;
+    // Bound from QML (setVaultTreeModel); null in headless tests. Used only to
+    // call applyRemovalOutcome()/applyRestoreOutcome() after a trash/delete/
+    // restore task completes — see setVaultTreeModel()'s doc comment.
+    VaultTreeModel *m_vaultModel = nullptr;
     bool m_busy = false;
     double m_progress = 0.0;
     // Wave N (task system, item 6): the SAME 0..1 fraction run() used to

@@ -33,9 +33,9 @@ void UsbGrabTask::run(TaskContext &ctx)
 
     bool wasPaused = false;
     UsbGrabScanHooks hooks;
-    hooks.onProgress = [this](int processed, int total) {
-        if (total > 0)
-            emit progress(std::clamp(static_cast<double>(processed) / static_cast<double>(total), 0.0, 1.0));
+    hooks.onProgress = [this](qint64 bytesDone, qint64 bytesTotal) {
+        if (bytesTotal > 0)
+            emit progress(std::clamp(static_cast<double>(bytesDone) / static_cast<double>(bytesTotal), 0.0, 1.0));
     };
     hooks.shouldAbort = [&ctx, &wasPaused] {
         // Between files, not between bytes: a grab's unit of work is one

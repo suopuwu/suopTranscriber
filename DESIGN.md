@@ -145,6 +145,64 @@ all run through **one FIFO queue** owned by `TranscriptionController`, on one
 worker thread (`TaskRunner`), at most one at a time — so nothing contends for
 the GPU, and a warm model (`EngineCache`) is reused across consecutive tasks.
 
+**Two lanes** (`Task::lane()`). Most kinds are `Serial`: they run one-at-a-time
+because they're INTENSIVE on a scarce system resource. That's not only "needs
+the GPU / a warm model / exclusive access to a vault file" — it also covers a
+heavy CPU/IO job with no GPU at all, like a multi-GB model import/export
+(`ModelIoTask`), which queues behind a transcription rather than thrashing the
+disk against it (there is deliberately no third "parallel I/O" lane — the rule
+is simply "intensive ⇒ Serial"). `Instant` is for a fast, side-effect-light
+rewrite — a speaker rename/merge, a file rename, or a file move — that must NOT
+wait behind a long transcription: it runs on a SECOND worker thread in parallel
+with the serial queue. The one exception the scheduler enforces
+(`pumpQueues`/`serialActiveConflictsWith`): an `Instant` task on file X waits
+while a `Serial` task on X is active, since both would rewrite that file's
+`.md`. Both lanes feed the ONE task list (all the bookkeeping — the Tasks row,
+persistence, cancel, history — stays uniform); the "second lane" is only a
+second *runner*, not a second queue. A file rename is `RenameFileTask` and a
+file move is `MoveTask` (`renameRecordingFile()`/`moveRecordingFile()` do the
+pure filesystem work off the GUI thread; `VaultTreeModel` refreshes itself via
+its `QFileSystemWatcher`), reporting `fileRenamed`/`fileMoved(oldUrl, newUrl,
+ok, error)` that QML repoints the player on — the synchronous
+`VaultTreeModel::renameFile()`/`moveFile()` survive only as no-controller
+fallbacks (plain filename mode / test harnesses).
+
+**Undo is the inverse task** (`Task::undoLabel()`/`makeUndoTask()`). An undoable
+kind returns a label and a factory for its inverse (a rename-back, a move-back);
+when it finishes, the controller emits `undoAvailable(token, label)` and the UI
+shows one snackbar whose "Undo" calls `undoTask(token)`, which enqueues that
+inverse (itself reported + re-undoable like any task). A multi-select op is
+enqueued as a **batch** (`enqueueBatch()` — N tasks sharing a `batchId` drawn
+from the same counter as task ids, so a single `int` token is unambiguously a
+task id OR a batch id). The batch stays silent until its LAST member finishes,
+then emits ONE snackbar (`batchUndoLabel(k)` → "Moved 5 files") whose undo
+enqueues every member's inverse as a fresh one-snackbar-undoable batch — so N
+moves are one reversible action, not N.
+
+**Trash / delete / restore** are instant-lane tasks too — `TrashTask`,
+`DeleteTask`, `RestoreTask` over the four `VaultFileScope`s (files / transcript /
+audio-only / folder). The pure filesystem work lives in `VaultFileOps.h`
+(`trashVaultEntries`/`deleteVaultEntriesPermanently`/`restoreVaultEntries`), so a
+whole multi-select delete is ONE `TrashTask` ⇒ ONE generic undo snackbar (undo =
+a `RestoreTask` over the captured `restorable` set). But the tree rebuild and the
+delicate per-file signals `MainPanel` reacts to
+(`fileDeleted`/`transcriptDeleted`/`audioDeletedTranscriptKept` and their restore
+counterparts) stay in the model — `VaultTreeModel::applyRemovalOutcome()`/
+`applyRestoreOutcome()`, which the controller calls on the GUI thread once the
+task completes (it holds a `vaultTreeModel` binding, like `UsbGrabberController`).
+The model owns that emission because it owns the orphaned-.md-vs-audio
+classification; keeping it there means the async migration left every `MainPanel`
+delete/restore handler *unchanged*. Entries the filesystem refuses to trash
+(non-destructive — the original is untouched) come back via `trashResult(scope,
+untrashable)`, which the Sidebar turns into the confirm-then-`deletePermanently`
+prompt. The synchronous `VaultTreeModel::trash*`/`delete*`/`restoreFromTrash`
+survive as the no-controller fallback (test harnesses). **Folder rename/move**
+are instant-lane tasks too (`FolderRenameTask`/`FolderMoveTask` over
+`renameVaultFolder()`/`moveVaultFolder()`) — the folder analogues of the file
+rename/move, undoable via the generic snackbar, with no per-file model signals
+to re-emit (the tree just refreshes via the watcher). Every file/vault operation
+is now a `Task`.
+
 This replaced an earlier design where "a job" was a single 30-field `Job`
 struct with nine mutually-exclusive bool flags, a `jobKind()` flag-waterfall,
 a ten-branch `startJob()` that marshalled each kind's args into a string-named
@@ -152,8 +210,43 @@ slot on a monolithic `TranscriptionWorker`, and opt-*out* persistence. A
 kind's knowledge lived in five disjoint places and one could always be
 forgotten — which is exactly how work went missing (see below). Now the kind
 *is* the object: its `run()` (the doing-code), its typed result signals, its
-`toVariantMap()` Tasks-row fields, `capabilities()`, `presentation()`,
-`isPersistable()`, and `prerequisites()` all live in one file.
+`toVariantMap()` Tasks-row fields, its `displayName()`/`kindLabel()` (the row's
+full description + short category label — the latter replaced a QML
+`kindLabel(kind)` switch a new kind could forget, silently mislabeling itself
+"Transcribe"), `capabilities()`, `presentation()`, `isPersistable()`, and
+`prerequisites()` all live in one file.
+
+The same "author it on the kind, not in a disjoint controller site" rule
+governs three more per-kind facts the controller used to hardcode (each in
+*two* places that had already drifted apart):
+
+- **`progressModel()` + `progressPhases()`** — how a kind's `run()` drives the
+  overall (0..1) bar. `SelfCumulative` (the default: download/combine/chapters/
+  import/grab/benchmark) emits an already-cumulative fraction the controller
+  assigns straight to the bar; `WeightedPhases` (transcribe/diarize) declares
+  its ordered phase set, each phase weighted by its rolling-average duration.
+  This is now the *single* source of the phase set — it replaced a hand-kept
+  phase-name list in the `progress()` lambda **and** a diverging copy in
+  `recomputeOverallProgress()` (importing/grabbing/benchmarking were in one but
+  not the other, so those bars briefly mis-computed on each phase change).
+- **`completionChangesModelSet()`** — true iff a *successful* finish changes the
+  on-disk model set (a landed download, a model import), so the controller
+  fires `modelsChanged()` **once, centrally**, in `onTaskFinished()` keyed off
+  this hook — instead of a `kind=="download"` check there plus a second
+  `op=="import"` check in the `ModelIoTask` wiring.
+- **The phase→label vocabulary** — one registry in `TranscriptionController`
+  (`phaseLabel()` for the bottom bar, `phaseOverlayLabel()` for MainPanel's
+  blocking-overlay title) replaced *two* QML `switch`es (BottomBar's
+  `phaseLabel` + MainPanel's `transcribingOverlayLabel`) that each mapped the
+  same phase slugs with their own wording; a new emitted phase that forgot a
+  case rendered blank. `tst_styleguide` scans the task sources and fails if any
+  emitted phase lacks a registry row.
+
+Persistence is opt-in per kind (`isPersistable()`), but the *rebuild* side is
+one switch (`createTaskFromJson`); `tst_transcription_queue` round-trips a
+representative of every persistable kind through it, with a completeness
+tripwire that fails if a new persistable kind is added without a factory branch
+(else it would persist fine and be silently dropped on restart).
 
 **Load-bearing invariants** (the actual bug-killers, see `.task/plan.md`):
 
@@ -736,9 +829,15 @@ the overview, not a duplicate of it.
     the store so it resolves as downloaded with no network.
   - **Export** (`exportModel()`) — copies the file(s) to a chosen folder for
     backup, in the exact shape `importModel()` expects back.
-  - Import/export run the (possibly multi-GB) copy on a background thread and
-    answer via `modelOperationFinished`; `modelsChanged` also fires when a
-    (pre)download job completes so the page refreshes.
+  - Import/export are `ModelIoTask`s — real queued tasks (Serial lane, since a
+    multi-GB copy is heavy IO; Background presentation, since they're launched
+    from this settings page, not the main panel). They get a Tasks row + the
+    glow like any task and answer via `modelOperationFinished`; `modelsChanged`
+    fires on a successful import (and when a (pre)download job completes) so the
+    page refreshes — via the one central `completionChangesModelSet()` hook,
+    not a per-kind emit site (see the task-system section). (This replaced a
+    fire-and-forget `QThread` that had no Tasks row at all — exactly the
+    invisible-work failure the task system removes.)
 - Capability detection checks which model files are present, not just which engine
   binaries exist.
 - **Unrecognized model id → visible fallback, never a silent one.** If a

@@ -29,6 +29,7 @@ public:
     UsbGrabTask(UsbGrabRule rule, QString mountPath, QUrl destUrl, bool autoTriggered, QObject *parent = nullptr);
 
     QString kind() const override { return QStringLiteral("usbGrab"); }
+    QString kindLabel() const override { return QStringLiteral("USB grab"); }
     QString displayName() const override;
     // Pausable between files (QFile::copy() itself is uninterruptible, so a
     // pause/cancel lands at the next file boundary — see run()'s hooks).

@@ -21,6 +21,7 @@ public:
                 bool skipIfAlreadyLabeled, QObject *parent = nullptr);
 
     QString kind() const override { return QStringLiteral("relabel"); }
+    QString kindLabel() const override { return QStringLiteral("Label"); }
     QString displayName() const override;
     // Not pausable: one LLM call with no interruption point (see
     // pauseActive()'s old allowlist, which never included "relabel").

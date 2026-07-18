@@ -24,6 +24,7 @@ public:
     DiarizationSweepTask(QUrl fileUrl, QVariantList combos, QObject *parent = nullptr);
 
     QString kind() const override { return QStringLiteral("diarizationSweep"); }
+    QString kindLabel() const override { return QStringLiteral("Diarization sweep"); }
     QString displayName() const override;
     Presentation presentation() const override { return Presentation::Background; }
     // Cancellable between combos only — diarize() has no mid-pass abort hook

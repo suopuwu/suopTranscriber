@@ -62,25 +62,14 @@ Rectangle {
     // "Transcribing…". Keyed off currentPhase (whose currentPhaseChanged
     // fires on every phase transition, unlike currentJobKind which only
     // re-notifies on currentFileChanged and so would go stale across a
-    // runAllJobs pipeline on one file). Mirrors BottomBar's phaseLabel wording
-    // but in the spinner's title-case gerund style; falls back to
-    // "Transcribing…" for an empty/unknown phase.
+    // runAllJobs pipeline on one file). The phase→title mapping is the
+    // controller's single source of truth (phaseOverlayLabel — the overlay
+    // column of the one phase registry), not a switch here that a new phase
+    // could forget; empty/unknown phases fall back to "Transcribing…".
     readonly property string transcribingOverlayLabel: {
-        const phase = mainPanel.transcriptionController ? mainPanel.transcriptionController.currentPhase : ""
-        switch (phase) {
-        case "detecting-speakers":
-        case "detecting-speakers-segmenting":
-        case "detecting-speakers-identifying": return qsTr("Detecting speakers…")
-        case "chaptering": return qsTr("Generating chapters…")
-        case "combining": return qsTr("Combining…")
-        case "importing": return qsTr("Importing…")
-        case "loading": return qsTr("Loading model…")
-        case "decoding": return qsTr("Decoding audio…")
-        case "detecting-speech": return qsTr("Detecting speech…")
-        case "downloading": return qsTr("Downloading…")
-        case "transcribing": return qsTr("Transcribing…")
-        default: return qsTr("Transcribing…")
-        }
+        const label = mainPanel.transcriptionController
+            ? mainPanel.transcriptionController.phaseOverlayLabel(mainPanel.transcriptionController.currentPhase) : ""
+        return label !== "" ? label : qsTr("Transcribing…")
     }
     onTranscribingThisFileChanged: {
         mainPanel.awaitingFirstSegment = mainPanel.transcribingThisFile
@@ -599,16 +588,23 @@ Rectangle {
         return url.substring(url.lastIndexOf("/") + 1)
     }
 
+    // Each single-open-file delete: with a controller it's an async, undoable
+    // TrashTask (generic undo snackbar; the SIDEBAR's onTrashResult owns the
+    // untrashable-confirm prompt — trashResult is one global signal, so only one
+    // listener may prompt or the confirm would double-open). Without a controller
+    // (plain-model harnesses) it falls back to the synchronous model.trash* +
+    // handleTrashResult here. A 1-element list: these calls are batch-shaped and
+    // MainPanel's cluster is the single-open-file half of the CLAUDE.md parity.
     function requestDeleteTranscript() {
-        if (!mainPanel.vaultTreeModel)
-            return
         const url = mainPanel.currentFileUrl()
         if (String(url) === "")
             return
-        // A 1-element list: these calls are batch-shaped (one rebuild per user
-        // action — see trashFiles()' doc comment), and MainPanel's cluster is
-        // by definition the single-open-file half of the CLAUDE.md action
-        // parity, so its batch is always exactly one.
+        if (mainPanel.transcriptionController) {
+            mainPanel.transcriptionController.trash("transcript", [url], mainPanel.vaultTreeModel.vaultPath)
+            return
+        }
+        if (!mainPanel.vaultTreeModel)
+            return
         mainPanel.handleTrashResult(
             mainPanel.vaultTreeModel.trashTranscript([url]), "transcript",
             qsTr("Moved the transcript for %1 to the trash.").arg(mainPanel.currentFileName()))
@@ -618,10 +614,14 @@ Rectangle {
     // .md. fileDeleted (not transcriptDeleted) closes the open file — see
     // trashAudioOnly()'s comment for why the surviving .md is a different row.
     function requestDeleteAudioOnly() {
-        if (!mainPanel.vaultTreeModel)
-            return
         const url = mainPanel.currentFileUrl()
         if (String(url) === "")
+            return
+        if (mainPanel.transcriptionController) {
+            mainPanel.transcriptionController.trash("audioOnly", [url], mainPanel.vaultTreeModel.vaultPath)
+            return
+        }
+        if (!mainPanel.vaultTreeModel)
             return
         mainPanel.handleTrashResult(
             mainPanel.vaultTreeModel.trashAudioOnly([url]), "audioOnly",
@@ -630,17 +630,22 @@ Rectangle {
     }
 
     function requestDeleteFile() {
-        if (!mainPanel.vaultTreeModel)
-            return
         const url = mainPanel.currentFileUrl()
         if (String(url) === "")
             return
+        if (mainPanel.transcriptionController) {
+            mainPanel.transcriptionController.trash("files", [url], mainPanel.vaultTreeModel.vaultPath)
+            return
+        }
+        if (!mainPanel.vaultTreeModel)
+            return
         mainPanel.handleTrashResult(
-            mainPanel.vaultTreeModel.trashFiles([url]), "file",
+            mainPanel.vaultTreeModel.trashFiles([url]), "files",
             qsTr("Moved %1 to the trash.").arg(mainPanel.currentFileName()))
     }
 
-    // Reached ONLY when the trash refused — this really is the irreversible one.
+    // Reached ONLY when the trash refused (no-controller fallback path — with a
+    // controller the Sidebar owns the confirm). This really is the irreversible one.
     function confirmFileDelete() {
         if (mainPanel.vaultTreeModel) {
             const url = mainPanel.currentFileUrl()
@@ -696,6 +701,46 @@ Rectangle {
     // completes — see commitSpeakerRename()/pendingSpeakerRenames above.
     Connections {
         target: mainPanel.transcriptionController
+        // File rename is an instant-lane task now (TranscriptionController::
+        // renameFile) — the call sites fire it and this repoints on the
+        // result. The filename field / title stay optimistic (they already
+        // show the typed name); on success we repoint the player (or the
+        // orphaned-md path) to the real renamed file, on failure we revert.
+        function onFileRenamed(oldUrl, newUrl, ok, error) {
+            const oldStr = oldUrl.toString()
+            const isOpenAudio = mainPanel.player && mainPanel.player.source.toString() === oldStr
+            const isOrphaned = mainPanel.orphanedMdPath !== ""
+                && ("file://" + mainPanel.orphanedMdPath) === oldStr
+            if (!ok) {
+                Notifications.error(error)
+                if (isOpenAudio)
+                    filenameSubtitle.text = mainPanel.currentFileStem() // revert optimistic field
+                return
+            }
+            if (isOpenAudio)
+                mainPanel.player.source = newUrl // fires onSourceChanged -> refreshMetadata
+            if (isOrphaned) {
+                mainPanel.orphanedMdPath = newUrl.toString().replace("file://", "")
+                mainPanel.refreshOrphanedMetadata()
+            }
+        }
+        // File move is an instant-lane task like rename (see Sidebar's
+        // performRowMove/moveNoteTo). A move changes the file's FOLDER, not its
+        // name, so — unlike rename — there's no optimistic filename field to
+        // revert; we only repoint the player / orphaned-md path when the file
+        // that moved is the one currently open. Failure is surfaced by the
+        // Sidebar's own onFileMoved; nothing to do here.
+        function onFileMoved(oldUrl, newUrl, ok, error) {
+            if (!ok)
+                return
+            const oldStr = oldUrl.toString()
+            if (mainPanel.player && mainPanel.player.source.toString() === oldStr)
+                mainPanel.player.source = newUrl // fires onSourceChanged -> refreshMetadata
+            if (mainPanel.orphanedMdPath !== "" && ("file://" + mainPanel.orphanedMdPath) === oldStr) {
+                mainPanel.orphanedMdPath = newUrl.toString().replace("file://", "")
+                mainPanel.refreshOrphanedMetadata()
+            }
+        }
         function onSpeakerRenamed(fileUrl, oldName, ok, error) {
             if (fileUrl.toString() !== mainPanel.currentFileUrl().toString())
                 return
@@ -1031,11 +1076,10 @@ Rectangle {
                     mainPanel.pushUndo({type: "label", fileUrl: "file://" + mainPanel.orphanedMdPath, oldValue: oldLabel, newValue: trimmed})
                 mainPanel.transcriptionController.setLabel("file://" + mainPanel.orphanedMdPath, trimmed)
                 mainPanel.refreshOrphanedMetadata()
-            } else if (mainPanel.vaultTreeModel
-                       && mainPanel.vaultTreeModel.renameFile("file://" + mainPanel.orphanedMdPath, trimmed)) {
-                const dir = mainPanel.orphanedMdPath.substring(0, mainPanel.orphanedMdPath.lastIndexOf("/"))
-                mainPanel.orphanedMdPath = dir + "/" + trimmed + ".md"
-                mainPanel.refreshOrphanedMetadata()
+            } else if (mainPanel.transcriptionController) {
+                // Instant-lane rename task — onFileRenamed updates
+                // orphanedMdPath + refreshes on success.
+                mainPanel.transcriptionController.renameFile("file://" + mainPanel.orphanedMdPath, trimmed)
             }
             return
         }
@@ -1048,14 +1092,10 @@ Rectangle {
                 mainPanel.transcriptionController.setLabel(mainPanel.player.source, trimmed)
                 mainPanel.refreshMetadata()
                 mainPanel.refreshPreludeAndChapters()
-            } else if (mainPanel.vaultTreeModel) {
-                const oldPath = mainPanel.player.source.toString().replace("file://", "")
-                if (mainPanel.vaultTreeModel.renameFile(mainPanel.player.source, trimmed)) {
-                    const dir = oldPath.substring(0, oldPath.lastIndexOf("/"))
-                    const dot = oldPath.lastIndexOf(".")
-                    const ext = dot > 0 ? oldPath.substring(dot) : ""
-                    mainPanel.player.source = "file://" + dir + "/" + trimmed + ext
-                }
+            } else if (mainPanel.transcriptionController) {
+                // Instant-lane rename task — onFileRenamed repoints the player
+                // on success.
+                mainPanel.transcriptionController.renameFile(mainPanel.player.source, trimmed)
             }
         }
     }
@@ -1089,15 +1129,10 @@ Rectangle {
             filenameSubtitle.text = oldStem
             return
         }
-        const oldPath = mainPanel.player.source.toString().replace("file://", "")
-        if (mainPanel.vaultTreeModel.renameFile(mainPanel.player.source, trimmed)) {
-            const dir = oldPath.substring(0, oldPath.lastIndexOf("/"))
-            const dot = oldPath.lastIndexOf(".")
-            const ext = dot > 0 ? oldPath.substring(dot) : ""
-            mainPanel.player.source = "file://" + dir + "/" + trimmed + ext
-        } else {
-            filenameSubtitle.text = oldStem
-        }
+        // Instant-lane rename task (see onFileRenamed above): the field is
+        // already optimistic (shows `trimmed`); the player repoints on success
+        // and the field reverts on failure, both in onFileRenamed.
+        mainPanel.transcriptionController.renameFile(mainPanel.player.source, trimmed)
     }
 
     // Autosaves the prelude editor below on blur (see preludeArea's

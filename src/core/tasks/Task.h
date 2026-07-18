@@ -3,8 +3,11 @@
 #include <QJsonObject>
 #include <QObject>
 #include <QString>
+#include <QStringList>
 #include <QUrl>
 #include <QVariantMap>
+
+#include <memory>
 
 #include "ModelDownloadTarget.h"
 #include "TaskContext.h"
@@ -54,13 +57,71 @@ public:
 
     enum class Status { Queued, Active, Paused, Done, Failed };
 
+    // Which execution lane this kind runs in.
+    //   Serial (default): the one heavy-work queue — one at a time, so nothing
+    //     contends for a scarce system resource. "Heavy" is NOT just "uses the
+    //     GPU / a warm model": it's anything INTENSIVE on system resources,
+    //     which includes a big CPU/IO job like a multi-GB model import/export
+    //     (ModelIoTask) — that copy shouldn't thrash the disk against a running
+    //     transcription, so it queues behind it. Everything heavy is Serial.
+    //   Instant: a fast, side-effect-LIGHT kind (a speaker/file rename or move
+    //     — a handful of syscalls, no GPU, no heavy IO) that must NOT wait
+    //     behind a long transcription. Instant tasks run on a SEPARATE worker
+    //     thread in parallel with the Serial queue, one at a time among
+    //     themselves. The one exception the scheduler enforces: an Instant task
+    //     on file X waits if a Serial task on X is ACTIVE (they'd both rewrite
+    //     X's .md). See TranscriptionController::pumpQueues().
+    enum class Lane { Serial, Instant };
+
+    // How this kind's run() drives the OVERALL (0..1) progress bar, so the
+    // controller never hardcodes a per-kind phase list (it did, in two places
+    // that drifted out of sync — see progressPhases()):
+    //   SelfCumulative (default): each progress(fraction) is ALREADY the whole
+    //     task's fraction — a single linear pass (download, combine, chapters,
+    //     model import, USB grab, benchmark). The controller assigns it to the
+    //     overall bar directly.
+    //   WeightedPhases: the task moves through progressPhases() IN ORDER, each
+    //     phase weighted by its rolling-average duration, and within-phase
+    //     progress is blended across them (transcribe/diarize's multi-stage
+    //     pipeline). A kind returning this MUST also return its ordered phase
+    //     slugs from progressPhases().
+    enum class ProgressModel { SelfCumulative, WeightedPhases };
+
     using QObject::QObject;
 
     // --- The kind's identity (const; safe from any thread) ---
-    virtual QString kind() const = 0;        // stable slug, was jobKind()
-    virtual QString displayName() const = 0; // Tasks-popup row text
+    virtual QString kind() const = 0; // stable slug (logic/persistence key), was jobKind()
+    // Short human-readable CATEGORY label for the Tasks row / bottom bar (e.g.
+    // "Move to trash"), the noun a row shows before its filename. Each kind
+    // authors its own here — the single source of truth that replaced BottomBar's
+    // kindLabel(kind) switch, which every new kind could (and did) forget to
+    // update, silently mislabeling itself "Transcribe". Distinct from:
+    //   kind()        — the stable slug ("trash"), for logic/persistence;
+    //   displayName() — the fuller per-instance description ("Trash 3 items").
+    // Default returns the slug, so a kind that forgets to override is visibly
+    // its slug rather than masquerading as another kind.
+    virtual QString kindLabel() const { return kind(); }
+    virtual QString displayName() const = 0; // Tasks-popup row text (full description)
+    virtual Lane lane() const { return Lane::Serial; }
     virtual Presentation presentation() const { return Presentation::Foreground; }
     virtual Capabilities capabilities() const { return {}; }
+    // See the ProgressModel enum. Default SelfCumulative — the common single-
+    // pass shape; transcribe/diarize override to WeightedPhases.
+    virtual ProgressModel progressModel() const { return ProgressModel::SelfCumulative; }
+    // For a WeightedPhases kind: the ordered phase slugs run() moves through,
+    // so the overall bar can proportion each by its historical duration. This
+    // is the SINGLE source of a kind's phase set — it replaced two hand-kept
+    // phase-string lists in TranscriptionController (the progress lambda +
+    // recomputeOverallProgress()) that had already drifted apart. Empty for a
+    // SelfCumulative kind (which needs no per-phase weighting).
+    virtual QStringList progressPhases() const { return {}; }
+    // True iff this task's SUCCESSFUL completion changes the set of models on
+    // disk (so the Models page must refresh via modelsChanged()). The
+    // controller fires modelsChanged() ONCE, centrally, for any task that says
+    // so — replacing the two scattered emit sites (a kind=="download" check in
+    // onTaskFinished plus an op=="import" check in the ModelIoTask wiring) that
+    // a new model-affecting kind had to remember to join. Default: false.
+    virtual bool completionChangesModelSet() const { return false; }
     // Opt-IN persistence (default: not saved across a restart). A kind whose
     // inputs name an external/removable path (import, usbGrab) simply never
     // overrides this — no more persistQueue() opt-OUT that a new kind forgets.
@@ -82,6 +143,37 @@ public:
     // queue the right downloads for it. Default: needs nothing.
     virtual ModelPrerequisites prerequisites() const { return {}; }
 
+    // --- Undo (optional; a kind opts in by overriding both) ---
+    // Undo is just the INVERSE operation, expressed as another Task: a
+    // rename's undo is a rename-back, a move's is a move-back, a trash's is a
+    // restore. So an undoable kind returns a non-empty undoLabel() (the undo
+    // snackbar's text) AND a makeUndoTask() that builds the inverse — the queue
+    // shows the snackbar when this task finishes Done, and enqueues the inverse
+    // (reported + re-undoable like any task) if the user clicks Undo. Both
+    // must be consistent: a non-empty label with a null factory is a no-op.
+    //
+    // makeUndoTask() is called AFTER a successful run(), so a kind whose
+    // inverse depends on run()'s result (e.g. trash, which learns the
+    // .trashinfo paths only by trashing) captures that in run() and reads it
+    // here. Runs on the GUI thread (it only constructs a Task); the returned
+    // task then executes on a worker thread like any other. Default: not
+    // undoable.
+    virtual QString undoLabel() const { return {}; }
+    virtual std::unique_ptr<Task> makeUndoTask() const { return nullptr; }
+
+    // The undo-snackbar label when this task is undone as part of a BATCH of
+    // `count` sibling tasks (a multi-select move/trash enqueued via
+    // TranscriptionController::enqueueBatch() — batchId != 0). count==1 is the
+    // single-item case. Default: the singleton undoLabel(), ignoring count — a
+    // kind that supports multi-select batch undo overrides this to SUMMARIZE
+    // ("Moved 5 files") so N operations collapse into ONE snackbar. Only
+    // consulted for batch-enqueued tasks; irrelevant to kinds never batched.
+    virtual QString batchUndoLabel(int count) const
+    {
+        Q_UNUSED(count);
+        return undoLabel();
+    }
+
     // This kind's Tasks-row fields for QML, merged over the base row the queue
     // builds (id/kind/status/fileUrl/displayName/error/durationMs). Was the
     // giant per-flag switch in jobs(); now each kind authors its own row.
@@ -97,6 +189,13 @@ public:
 
     // --- Queue-owned lifecycle state (GUI thread writes; run() must not) ---
     int id = 0;
+    // 0 = a standalone task. Non-zero = this task is one member of a BATCH
+    // (several sibling tasks enqueued together via enqueueBatch(), e.g. a
+    // multi-select move) that share this id. The queue uses it to collapse the
+    // whole batch into ONE undo snackbar, fired when the LAST member finishes
+    // (see maybeEmitUndoAvailable()/undoTask()). Allocated from the same
+    // counter as `id`, so a batch id can never collide with any task id.
+    int batchId = 0;
     Status status = Status::Queued;
     QString error;
     qint64 durationMs = -1; // wall-clock Active time, set when the task ends
