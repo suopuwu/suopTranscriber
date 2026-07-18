@@ -334,9 +334,17 @@ target_link_libraries(suopTranscriber PRIVATE
     Qt6::Svg
     KF6::WindowSystem
     whisper
-    llama
     sherpa-onnx-cxx-api
 )
+
+# AI auto-labeling (llama.cpp) is opt-out: the llama target only exists when
+# SUOP_ENABLE_LABELING is ON (see the add_subdirectory guard above), and
+# LabelingEngine.cpp compiles a llama-free stub without this define. Linking
+# llama unconditionally made -DSUOP_ENABLE_LABELING=OFF fail at generation.
+if(SUOP_ENABLE_LABELING)
+    target_link_libraries(suopTranscriber PRIVATE llama)
+    target_compile_definitions(suopTranscriber PRIVATE SUOP_ENABLE_LABELING)
+endif()
 
 set_target_properties(suopTranscriber PROPERTIES
     BUILD_RPATH "$ORIGIN"

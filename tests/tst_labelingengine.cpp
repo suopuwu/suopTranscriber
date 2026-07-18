@@ -259,6 +259,9 @@ private slots:
     // needed (mirrors the deterministic backendKind-style checks).
     void chapterSystemPrompt_densityChangesInstruction()
     {
+#ifndef SUOP_ENABLE_LABELING
+        QSKIP("labeling (and its prompt builder) compiled out via SUOP_ENABLE_LABELING=OFF");
+#endif
         const QString low = LabelingEngine::chapterSystemPrompt(0.0);
         const QString mid = LabelingEngine::chapterSystemPrompt(0.5);
         const QString high = LabelingEngine::chapterSystemPrompt(1.0);

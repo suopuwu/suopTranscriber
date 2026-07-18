@@ -92,7 +92,10 @@ function(suop_add_test name)
     if(ARG_LINK_WHISPER)
         target_link_libraries(${name} PRIVATE whisper)
     endif()
-    if(ARG_LINK_LLAMA)
+    # Only link llama when labeling is actually built (mirrors the app target).
+    # With -DSUOP_ENABLE_LABELING=OFF the llama target doesn't exist and
+    # LabelingEngine.cpp compiles its stub, so no test needs (or can) link it.
+    if(ARG_LINK_LLAMA AND SUOP_ENABLE_LABELING)
         target_link_libraries(${name} PRIVATE llama)
     endif()
     if(ARG_LINK_SHERPA_ONNX)
@@ -107,6 +110,10 @@ function(suop_add_test name)
         SUOP_SAMPLES_DIR="${CMAKE_SOURCE_DIR}/third_party/whisper.cpp/samples"
         SUOP_QML_DIR="${CMAKE_SOURCE_DIR}/qml"
         SUOP_SRC_DIR="${CMAKE_SOURCE_DIR}/src"
+        # Keep every target that compiles LabelingEngine.cpp on the same branch
+        # as the app: ON links llama and builds the real engine, OFF builds the
+        # stub. Harmless on tests that don't compile it.
+        $<$<BOOL:${SUOP_ENABLE_LABELING}>:SUOP_ENABLE_LABELING>
     )
     add_test(NAME ${name} COMMAND ${name})
 endfunction()

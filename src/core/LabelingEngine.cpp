@@ -1,5 +1,14 @@
 #include "LabelingEngine.h"
 
+// AI auto-labeling links llama.cpp in-process. When the build is configured
+// with -DSUOP_ENABLE_LABELING=OFF the llama target isn't built and <llama.h>
+// isn't available, so the whole llama-backed implementation is compiled out
+// and replaced by the stubs at the bottom of this file. The header is
+// unchanged either way (it only forward-declares the llama types), and every
+// caller already gates on isValid()/ensureLabel(), so the OFF build degrades
+// to "labeling unavailable" with no caller changes.
+#ifdef SUOP_ENABLE_LABELING
+
 #include <QDebug>
 #include <QJsonArray>
 #include <QJsonDocument>
@@ -510,3 +519,44 @@ std::optional<QList<Chapter>> LabelingEngine::mergeSimilarChapters(const QList<C
     }
     return merged;
 }
+
+#else // !SUOP_ENABLE_LABELING — built without llama.cpp (no AI auto-labeling).
+
+// Every LabelingEngine is born invalid (m_model/m_ctx stay null, so the
+// header's inline isValid() returns false). EngineCache::ensureLabel() then
+// reports the engine unavailable and RelabelTask/ChaptersTask fail with that
+// error — the exact path a missing or failed-to-load label model already
+// takes, so no caller needs a build-time branch. loadModel()/
+// runGrammarConstrained() are never referenced here, so they need no stub.
+
+LabelingEngine::LabelingEngine(const QString &) {}
+
+LabelingEngine::~LabelingEngine() = default;
+
+std::optional<LabelResult> LabelingEngine::label(const QString &, const QStringList &, bool, double, double,
+                                                 QString *errorOut)
+{
+    if (errorOut)
+        *errorOut = QStringLiteral("auto-labeling was disabled at build time (SUOP_ENABLE_LABELING=OFF)");
+    return std::nullopt;
+}
+
+std::optional<QList<Chapter>> LabelingEngine::generateChapters(const QStringList &, double, QString *errorOut)
+{
+    if (errorOut)
+        *errorOut = QStringLiteral("auto-labeling was disabled at build time (SUOP_ENABLE_LABELING=OFF)");
+    return std::nullopt;
+}
+
+std::optional<QList<Chapter>> LabelingEngine::mergeSimilarChapters(const QList<Chapter> &chapters, const QStringList &,
+                                                                   double, QString *)
+{
+    return chapters; // nothing to merge without the model — return input unchanged
+}
+
+QString LabelingEngine::chapterSystemPrompt(double)
+{
+    return QString();
+}
+
+#endif // SUOP_ENABLE_LABELING
