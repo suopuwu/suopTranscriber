@@ -2138,7 +2138,7 @@ private slots:
         QVERIFY2(!phaseFn.isEmpty(), "phaseLabel() must exist");
         QVERIFY2(phaseFn.contains(QStringLiteral("case \"grabbing\":")),
                  "phaseLabel() must have a \"grabbing\" case so an active grab shows a phase label instead "
-                 "of a blank (TranscriptionWorker::usbGrabJob emits phase \"grabbing\")");
+                 "of a blank (UsbGrabTask::run() emits phase \"grabbing\")");
     }
 
     // Item 52 (diarize kind) + item 26/31 (chaptering phase): the two recently

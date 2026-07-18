@@ -7,6 +7,7 @@
 #include <QJsonObject>
 #include <QList>
 #include <QObject>
+#include <QSet>
 #include <QString>
 #include <QThread>
 #include <QUrl>
@@ -17,17 +18,25 @@
 #include <QVector>
 #include <qqml.h>
 
+#include <memory>
+#include <optional>
 #include <vector>
 
+#include "EngineRegistry.h" // EngineDescriptor — discoverEngines()/resolveEngine() return it
+                            // by value (std::vector<>/std::optional<>), which needs the
+                            // complete type, not just a forward declaration.
 #include "RollingAverage.h"
 #include "Segment.h"
 #include "UsbRuleStore.h"
+#include "tasks/ModelDownloadTarget.h"
+#include "tasks/Task.h"
 
 class QTimer;
-class TranscriptionWorker;
+class TaskRunner;
 struct DiarizedTurn; // DiarizationEngine.h — forward-declared so this header
                      // needn't pull in sherpa-onnx (spliceBodySpeakers only
                      // takes a const-ref to a vector of these).
+struct LabelResult; // LabelingEngine.h — forward-declared for writeLabelingFields()
 
 // Writes segment lines to an open sidecar .md file (see appendSegmentLine's
 // former doc comment / CLAUDE.md "vault layout"), merging a REPEATING CYCLE
@@ -173,6 +182,120 @@ QString spliceBodySpeakers(const QString &body, const QStringList &knownSpeakers
                             const std::vector<DiarizedTurn> &turns, double totalSeconds,
                             QStringList *appliedSpeakersOut = nullptr);
 
+// --- Transcript-format / vault-file helpers (Wave N task system) ---------
+// Declared here (definitions stay in the .cpp, same file-scope-not-anonymous
+// pattern already used above for isEngineModelId/discoverEngines/etc. and for
+// spliceBodySpeakers/spliceBodyChapters) so a Task subclass in src/core/tasks/
+// can call them directly without duplicating this parsing/writing logic — the
+// whole point of the task-system refactor (.task/plan.md) is that a kind's
+// doing-code has exactly ONE home. TranscriptionController.cpp remains the
+// only .cpp that DEFINES them until step 3 of that plan deletes the old
+// per-kind worker-slot bodies that used to be their only caller.
+
+// Item P7: see this function's definition-site doc comment for the full
+// audio-file-name-vs-stem collision rationale. Every sidecar-path call site
+// in this file and in VaultTreeModel.cpp must stay consistent with it.
+QString sidecarPath(const QString &audioFilePath);
+
+// The sentinel marking the end of an AI-generated prelude in a transcript
+// body (see stripPreludeIfPresent()/spliceBodyPrelude() at the definition
+// site) — a RelabelTask/ChaptersTask's skipIfAlreadyLabeled check looks for
+// this to tell "already labeled" from "never labeled".
+extern const QString kPreludeEndMarker;
+
+// Written immediately when a transcribe task starts, before any decoding
+// happens, so a killed/stopped run still leaves a file recording what it was
+// run with. See the definition site for the full field-by-field contract
+// (modelFallback/requestedModelId, speakers: allowlist, vad/vadError).
+void writeFrontmatter(QFile &mdFile, const QString &modelUsed, bool speakerDetection, bool modelFallback,
+                      const QString &requestedModelId, const QStringList &speakerLabels,
+                      const QString &speakerDetectionError, bool vad, const QString &vadError);
+
+// Splices a LabelingEngine result's label/tags/prelude fields into an
+// already-transcribed .md in place. Used by both the manual "regenerate
+// label" action and the auto-label follow-up after a transcribe.
+void writeLabelingFields(const QString &mdPath, const LabelResult &result);
+
+// Speaker-rename/merge, operating directly on a sidecar .md's frontmatter +
+// body (see segmentLinePattern()'s doc comment in the .cpp for how a "[tag]"
+// is recognized). renameSpeakerInFile REJECTS colliding with an existing
+// name (typo protection); mergeSpeakersInFile deliberately allows it (an
+// explicit "combine these two speakers" action). Both no-op successfully if
+// old==new / source==target.
+bool renameSpeakerInFile(const QString &path, const QString &oldName, const QString &newName, QString *errorOut);
+bool mergeSpeakersInFile(const QString &path, const QString &sourceName, const QString &targetName,
+                          QString *errorOut);
+
+// Splits an already-written .md into its raw frontmatter lines (minus the
+// "---" delimiters), body, the line index of "speakers:" within
+// frontmatterLines (-1 if absent), its parsed value (knownSpeakers), and
+// every speaker tag actually PRESENT in the body (distinctTags — the set
+// segmentLinePattern() matched, which may differ from the frontmatter
+// allowlist). false + *errorOut on a missing/malformed file. A DiarizeTask
+// uses this directly (not just via rename/merge) to read the file it's
+// about to splice speaker tags into.
+bool parseSpeakerTaggedFile(const QString &path, QStringList *frontmatterLines, QString *body,
+                             int *speakersLineIndex, QStringList *knownSpeakers, QStringList *distinctTags,
+                             QString *errorOut);
+
+// Rewrites path's frontmatter block + body from already-edited pieces (the
+// inverse of parseSpeakerTaggedFile) — the shared write-back every speaker-
+// tag-editing kind (rename/merge/diarize) funnels through.
+bool writeFrontmatterBlock(const QString &path, const QStringList &frontmatterLines, const QString &body,
+                           QString *errorOut);
+
+// Rewrites a .md's "speakers:" frontmatter line to exactly the tags that
+// actually appear in the body (first-appearance order), dropping the line
+// entirely if none do — see the definition site for why a raw diarization
+// cluster count can otherwise leave a phantom, never-used entry.
+void syncSpeakersFrontmatterToBody(const QString &path);
+
+// Splits a frontmatter "speakers: A, B, C" value into trimmed, non-empty
+// names. Empty/missing input (speaker detection was off, or predates this
+// key) yields an empty list.
+QStringList parseSpeakersList(const QString &raw);
+
+// Extracts the plain spoken text from a transcript body — strips prelude/
+// chapter-marker/timestamp/speaker-tag/repeat-marker decoration, leaving just
+// what was said (knownSpeakers scopes which "[tag]" runs are recognized as
+// speaker tags rather than ordinary bracketed text — see
+// segmentLinePattern()'s doc comment in the .cpp). Feeds a relabel/chapters
+// task's LLM call.
+QString plainTextFromTranscriptBody(const QString &body, const QStringList &knownSpeakers);
+
+// One segment's parsed identity from a transcript body — its position in the
+// returned QList IS its index, the same indexing LabelingEngine::
+// generateChapters() expects and returns "afterSegment" against. A
+// ChaptersTask needs both t0 (to resolve an LLM-returned index to a real
+// timestamp before anything touches disk) and text (what's shown to the
+// model) — plainTextFromTranscriptBody() above discards t0, so this is a
+// separate walk, not a wrapper around it.
+struct ParsedSegment {
+    double t0 = 0.0;
+    QString text;
+};
+QList<ParsedSegment> parsedSegmentsFromTranscriptBody(const QString &body, const QStringList &knownSpeakers);
+
+// Splices resolved chapter markers into mdPath's "## [ts] title" region and
+// rewrites the file — see spliceBodyChapters()'s doc comment for the
+// splicing rule itself; this is the file-write wrapper a ChaptersTask calls
+// once chapter indices are resolved to real timestamps.
+bool writeChaptersField(const QString &mdPath, const QList<ResolvedChapter> &chapters, QString *errorOut);
+
+// A model id with the "engine:" prefix routes to an out-of-process
+// SubprocessEngine (DESIGN.md "Pluggable engines"); anything else is a
+// whisper ggml tier (or the sherpa-onnx in-process Parakeet bundle) resolved
+// by ModelManager.
+bool isEngineModelId(const QString &modelId);
+QString engineIdFromModelId(const QString &modelId);
+
+// Discovers every out-of-process engine visible to vaultPath, capability-
+// checked against this machine. resolveEngine finds one by id; a found-but-
+// unavailable engine is still returned so the caller can surface
+// .unavailableReason rather than a bare "not found".
+std::vector<EngineDescriptor> discoverEngines(const QString &vaultPath);
+std::optional<EngineDescriptor> resolveEngine(const QString &engineId, const QString &vaultPath, QString *error);
+
 // Orchestrates: ffmpeg decode -> WhisperCppEngine -> vault sidecar files.
 // Owns a dedicated QThread; transcription (and its file IO) NEVER runs on
 // the GUI thread (see CLAUDE.md). Whole-file transcription only for now —
@@ -210,14 +333,16 @@ class TranscriptionController : public QObject {
     // proportioned width instead of just the two that happened to have a
     // progress callback.
     Q_PROPERTY(double overallProgress READ overallProgress NOTIFY overallProgressChanged)
-    // Benchmark runs (model + diarization sweeps) drive the bottom-bar progress
-    // glow too, but deliberately do NOT set `busy` / feed `overallProgress`:
-    // those are overloaded to mean "a real transcription job is running on the
-    // OPEN file" and gate things like MainPanel's blocking overlay, which must
-    // NOT appear during a benchmark. So the glow gets its own signal — active
-    // while a sweep runs, progress = fraction of models/combos started.
-    Q_PROPERTY(bool benchmarkActive READ benchmarkActive NOTIFY benchmarkActiveChanged)
-    Q_PROPERTY(double benchmarkProgress READ benchmarkProgress NOTIFY benchmarkProgressChanged)
+    // Wave N (task system): benchmarkActive/benchmarkProgress are GONE.
+    // They existed because a benchmark needed the bottom-bar glow but must
+    // NOT raise MainPanel's blocking overlay, and `busy` was overloaded to
+    // mean both — so a benchmark left the queue entirely and grew a parallel
+    // glow path, which is exactly how a task ends up invisible to the Tasks
+    // list. The axis is now explicit: EVERY task is queued and gets a row +
+    // the glow (`busy`), while Task::presentation() alone decides whether it
+    // also takes the overlay. `activeIsForeground` below is what the overlay
+    // binds to. See .task/plan.md invariant 2.
+    Q_PROPERTY(bool activeIsForeground READ activeIsForeground NOTIFY activeIsForegroundChanged)
     // "loading" (whisper model load — no native progress hook exists for
     // this; `progress` here is synthesized from elapsed-vs-historical-
     // average, see overallProgress's doc comment), "detecting-speakers-
@@ -239,12 +364,25 @@ class TranscriptionController : public QObject {
     // a hang.
     Q_PROPERTY(QString currentPhase READ currentPhase NOTIFY currentPhaseChanged)
     Q_PROPERTY(QUrl currentFile READ currentFile NOTIFY currentFileChanged)
-    // "transcribe"/"relabel"/"rename"/"merge"/"chapters" for whichever job is
-    // Active right now (see jobs()' "kind" key — same values), empty when
-    // idle. Changes at exactly the same time as currentFile (both set
-    // together in startJob()), so it reuses that signal rather than needing
-    // its own.
-    Q_PROPERTY(QString currentJobKind READ currentJobKind NOTIFY currentFileChanged)
+    // The kind slug of whichever task is Active right now (see jobs()' "kind"
+    // key — same values), empty when idle. Wave N bugfix: this now has its
+    // OWN NOTIFY, fired in startTask()/onTaskFinished(). It used to reuse
+    // currentFileChanged, which only fires when the FILE changes — so a
+    // pipeline of same-file steps (transcribe→diarize→relabel→chapters, all
+    // on one fileUrl) left currentJobKind reading "transcribe" the whole way
+    // through, and the overlay label had to key off currentPhase to work
+    // around it. A dedicated signal makes the property honest mid-pipeline.
+    Q_PROPERTY(QString currentJobKind READ currentJobKind NOTIFY currentJobKindChanged)
+    // Whether the Active task can be paused at all — read straight off its
+    // Task::capabilities().pausable. Wave N: this REPLACES BottomBar's own
+    // canPause(kind) string allowlist ("transcribe"/"download"/…), which was a
+    // re-implementation of the same fact that could drift from the C++ side.
+    // The task is the single source of truth now, which is the whole point of
+    // capabilities() (the 2026-07-09 pause bug was exactly such a drift). This
+    // is coarse "could this kind ever pause" — the finer "may I pause RIGHT
+    // NOW" (not mid-"loading", not while a soft-restart is in flight) still
+    // lives in BottomBar.canPauseNow(), gated additionally on phase.
+    Q_PROPERTY(bool activeCanPause READ activeCanPause NOTIFY currentJobKindChanged)
     Q_PROPERTY(int tasksTotal READ tasksTotal NOTIFY queueChanged)
     Q_PROPERTY(int tasksCompleted READ tasksCompleted NOTIFY queueChanged)
     Q_PROPERTY(QVariantList queuedFileUrls READ queuedFileUrls NOTIFY queueChanged)
@@ -300,21 +438,11 @@ class TranscriptionController : public QObject {
     Q_PROPERTY(QString activeBackendKind READ activeBackendKind NOTIFY activeBackendNameChanged)
 
 public:
-    // Paused: only reached from Active during "loading" — whisper.cpp's
-    // in-process, unhookable model-load call, the one phase left with no
-    // cooperative checkpoint at all (see pauseActive()'s doc comment;
-    // "decoding" used to be in this bucket too, but ffmpeg runs as a real
-    // subprocess — see AudioDecoder.h — so it gets a genuine pause instead).
-    // Presented to the user as paused, not failed; resuming
-    // restarts the job from scratch rather than continuing mid-flight.
-    //
-    // None (item P6): a pure sentinel, never actually assigned to a real
-    // Job::status — it's what jobStatusForPath() returns for a path with no
-    // job at all, so QML can compare against a named value instead of a
-    // magic -1. Explicit -1 underlying value so it can never collide with a
-    // real status if ever compared as a raw int.
-    enum class JobStatus { None = -1, Queued, Active, Paused, Done, Failed };
-    Q_ENUM(JobStatus)
+    // Wave N (task system): the job status enum lives on Task now
+    // (Task::Status). Its member VALUES are unchanged (Queued=0..Failed=4),
+    // so jobStatusForPath()'s int contract with QML/Sidebar is preserved;
+    // "no task for this path" is still the -1 sentinel that enum deliberately
+    // has no member for (jobStatusForPath returns a raw -1).
 
     // Fallback "average duration" (ms) a phase with zero recorded samples
     // yet uses — for BOTH recomputeOverallProgress()'s weight normalization
@@ -357,8 +485,13 @@ public:
     double progress() const { return m_progress; }
     // See the overallProgress Q_PROPERTY doc comment above.
     double overallProgress() const { return m_overallProgress; }
-    bool benchmarkActive() const { return m_benchmarkActive; }
-    double benchmarkProgress() const { return m_benchmarkProgress; }
+    // True iff a task is Active AND it declares Presentation::Foreground —
+    // i.e. it owns the main-panel overlay. False when idle, and false for a
+    // Background task (benchmark/sweep/download), which still shows a Tasks
+    // row + the glow via isBusy(). See the activeIsForeground Q_PROPERTY doc
+    // comment above.
+    bool activeIsForeground() const { return m_activeIsForeground; }
+    bool activeCanPause() const;
     QString currentPhase() const { return m_phase; }
     QUrl currentFile() const { return m_currentFile; }
     // See the liveUpdateTick Q_PROPERTY doc comment above.
@@ -1217,8 +1350,8 @@ signals:
     void busyChanged();
     void progressChanged();
     void overallProgressChanged();
-    void benchmarkActiveChanged();
-    void benchmarkProgressChanged();
+    void activeIsForegroundChanged();
+    void currentJobKindChanged();
     void currentPhaseChanged();
     void currentFileChanged();
     void queueChanged();
@@ -1291,106 +1424,16 @@ signals:
     void usbGrabFinished(int jobId, int filesCopied, int filesSkipped, const QStringList &errors, bool cancelled);
 
 private:
-    // Wave N (task system, item 5): which model file(s) a download job is
-    // responsible for fetching — orthogonal to the four existing job-kind
-    // flags below (a download job sets NONE of those; see jobKind()).
-    // SegmentationModel/EmbeddingModel each carry their chosen sub-model id in
-    // Job::modelId (like WhisperModel) — a diarize job queues one of each ahead
-    // of itself for the currently-selected pair. (Replaced the old single
-    // DiarizationModels target now that both halves are user-selectable.)
-    enum class DownloadTarget { None, WhisperModel, LabelModel, VadModel, SegmentationModel, EmbeddingModel };
+    // Wave N (task system): the Job struct, the DownloadTarget enum, and
+    // jobKind() that used to live here are GONE. A queued unit of work is now
+    // a polymorphic Task (src/core/tasks/Task.h) — one subclass per kind,
+    // owning its own doing-code, result signals, row fields, capabilities,
+    // presentation, persistence opt-in, and model prerequisites. See
+    // .task/plan.md: the 30-field union + 9 mutually-exclusive bool flags +
+    // the order-dependent jobKind() waterfall + the 10-branch startJob()
+    // dispatch were the reason a kind's knowledge lived in five disjoint
+    // places and one could silently be forgotten.
 
-    struct Job {
-        // Stable across the job's entire lifetime (Queued through Done/
-        // Failed) and never reused — the only safe key for cancelJob()/
-        // moveQueuedJob() (see their doc comments for why fileUrl alone
-        // isn't safe: re-queueing after Done/Failed can leave two entries
-        // for the same fileUrl at once).
-        int id = 0;
-        QUrl fileUrl;
-        QUrl vaultUrl;
-        QString modelId;
-        bool autoLabel = false;
-        bool relabelOnly = false;
-        // Item P21: true only for the automatic follow-up label pass
-        // transcribe(autoLabel=true) queues alongside its transcribe job —
-        // never set on the manual "Regenerate label and prelude" job
-        // (relabel()), which must always force-regenerate regardless of
-        // existing content. See relabelJob()'s doc comment for what this
-        // does at execution time.
-        bool skipIfAlreadyLabeled = false;
-        bool renameSpeakerOnly = false;
-        QString oldSpeakerName;
-        QString newSpeakerName;
-        bool mergeSpeakersOnly = false;
-        QString sourceSpeakerName;
-        QString targetSpeakerName;
-        // Feature 3a: see TranscriptionController::generateChapters()'s doc
-        // comment. Needs only fileUrl/vaultUrl (same as relabelOnly) plus
-        // item 27's chapter density below.
-        bool generateChaptersOnly = false;
-        // Item 27: 0.0-1.0 chapter-density slider for a generateChaptersOnly
-        // job (mirrors wordiness for a relabel job). Ignored by every other
-        // kind. Default 0.5 == the neutral tier this feature used before.
-        double chapterDensity = 0.5;
-        // Split-recording combine (see findCombineGroups()'s doc comment):
-        // fileUrl doubles as the combine job's OUTPUT path for this kind,
-        // same "reuse fileUrl for whatever this kind's one file is" pattern
-        // the other *Only kinds already use. combineSourcePaths is the
-        // ordered (combine order — see findCombineGroups()'s doc comment)
-        // list of parts to concatenate.
-        bool combineOnly = false;
-        QStringList combineSourcePaths;
-        bool deleteOriginalsAfterCombine = false;
-        // Item 37: drag-and-drop / external audio import job — like combineOnly,
-        // fileUrl doubles as this kind's OUTPUT (the in-vault destination), and
-        // importSourcePath is the external file being copied in. See
-        // importAudio() and TranscriptionWorker::importJob().
-        bool importOnly = false;
-        QString importSourcePath;
-        // USB grab job (see enqueueUsbGrab()): one mounted VOLUME walked under
-        // one resolved rule. Like combineOnly/importOnly, fileUrl doubles as
-        // this kind's OUTPUT — the destination folder the grab copies into.
-        // The whole rule rides along rather than six loose fields, so a new
-        // UsbGrabRule field never has to be re-threaded through the queue.
-        bool usbGrabOnly = false;
-        UsbGrabRule usbGrabRule;
-        QString usbGrabMountPath;
-        // True iff a hotplug started this grab by itself (rule.autoGrab),
-        // false for a "Grab now" click. Carried purely so UsbGrabberController
-        // can tell when the LAST auto-grab has drained and it's time to fire
-        // the auto-combine — see its autoGrabsSettled() signal. Nothing about
-        // how the grab actually runs depends on it.
-        bool usbGrabAuto = false;
-        // Item 52: standalone speaker-diarization job — re-runs speaker
-        // detection on an already-transcribed file (needs only fileUrl +
-        // vaultUrl, like relabelOnly). See diarizeFile() and
-        // TranscriptionWorker::diarizeJob().
-        bool diarizeOnly = false;
-        // Diarization tuning for a diarizeOnly job (and the runAllJobs diarize
-        // step): which segmentation/embedding models to use and the clustering
-        // SENSITIVITY (threshold — see DiarizationEngine). Ignored by every
-        // other kind. Empty ids ⇒ ModelManager's defaults; 0.5 == the neutral
-        // default this feature used before it was tunable.
-        QString segmentationModelId;
-        QString embeddingModelId;
-        double diarizationThreshold = 0.5;
-        bool restrictTagsToExisting = false;
-        double tagReuseBias = 0.5;
-        double wordiness = 0.5;
-        DownloadTarget downloadTarget = DownloadTarget::None;
-        JobStatus status = JobStatus::Queued;
-        QString error;
-        // -1 until the job reaches Done/Failed (see persistQueue()'s doc
-        // comment for why this is wall-clock-active time, not
-        // finishedAt-startedAt) — shown in the Tasks popup as "took Ns".
-        qint64 durationMs = -1;
-    };
-
-    // Shared by jobs()' "kind" key and currentJobKind() — the flags above
-    // (plus downloadTarget != None) are mutually exclusive by construction
-    // (each enqueuing function only ever sets one).
-    static QString jobKind(const Job &job);
 
     // One detected group of split-recording parts — see findCombineGroups()'s
     // doc comment for the matching/grouping/status semantics. Mirrors
@@ -1517,8 +1560,42 @@ private:
     // index — it names no single vault file.
     void rebuildJobStatusIndex();
 
-    void startJob(int index);
-    void onWorkerFinished(bool ok, const QString &error);
+    // Dispatches m_tasks[index] to the runner: wires its per-kind result
+    // signals (the one small localized switch that replaced the old worker's
+    // ~22 unioned signals), resets control, and invokes execute() across the
+    // thread boundary.
+    void startTask(int index);
+    // Wires one task's generic (progress/phase/paused) + kind-specific result
+    // signals to this controller. Called exactly once per task, right before
+    // its first dispatch.
+    void connectTask(Task *task);
+    // Removes m_tasks[index] and synthesizes its terminal report — the
+    // pre-run-cancel half of .task/plan.md invariant 1 ("every enqueued task
+    // reports exactly once, whether or not run() was called"). The old
+    // system's equivalent path just dropped the entry silently, which is why
+    // a job cancelled while still Queued never reported.
+    void cancelTaskAt(int index);
+    // Erases m_tasks[index], keeping m_activeIndex and m_connectedTasks
+    // consistent. The shared removal primitive under dismiss()/clearFinished()/
+    // cancelTaskAt() — does NOT emit queueChanged() or any report (callers do
+    // whatever's appropriate for their case).
+    void removeTaskAt(int index);
+    // The ONE way a task enters the queue. Assigns its id, queues any
+    // prerequisites() ahead of it, inserts it, emits queueChanged(), and
+    // auto-starts if idle. insertIndex: -1 (default) uses
+    // frontOfQueueInsertIndex() so a live "start this now" request jumps
+    // ahead of whatever's already Queued; a queue-REPLAY caller passes an
+    // explicit index to reproduce its exact saved order instead. Returns the
+    // new task's id.
+    int enqueueTask(std::unique_ptr<Task> task, int insertIndex = -1);
+    // The ONE terminal-report path. Reached either from the runner (run()
+    // returned or threw) or synthesized directly by the queue for a task
+    // cancelled before it ever ran — see .task/plan.md invariant 1: every
+    // enqueued task reports exactly once, whether or not run() was called.
+    void onTaskFinished(Task *task, bool ok, const QString &error);
+    // Index of `task` in m_tasks, or -1. The runner hands back a raw pointer;
+    // the task may have been removed (cancelled/dismissed) in the meantime.
+    int indexOfTask(const Task *task) const;
 
     // Item 17: the three public chapter editors (addChapter/setChapterTitle/
     // deleteChapter) all reopen the .md, carry frontmatter through untouched,
@@ -1548,8 +1625,14 @@ private:
     // order rather than jump anything. transcribe()/relabel() instead pass
     // frontOfQueueInsertIndex()'s cursor, so a live "start this now" request
     // jumps ahead of whatever's already Queued (see their own doc comments).
-    int maybeQueueDownloadJob(DownloadTarget target, const QUrl &vaultUrl, const QString &modelId,
-                               int insertIndex = -1);
+    int maybeQueueDownloadTask(ModelDownloadTarget target, const QUrl &vaultUrl, const QString &modelId,
+                                int insertIndex = -1);
+    // Queues a DownloadTask for each of `task`'s declared prerequisites()
+    // that isn't already on disk or queued, inserting each at *insertAt and
+    // advancing that cursor — so a kind declares its model needs ONCE (on
+    // itself) instead of every enqueue site (and the persisted-queue replay)
+    // separately remembering to queue the right downloads for it.
+    void queuePrerequisites(const Task &task, const QUrl &vaultUrl, int *insertAt);
     // Item O15: where a freshly requested job should land in m_jobs so it
     // runs NEXT once whatever's currently running finishes, ahead of
     // anything already Queued — right after the Active job if one exists
@@ -1562,30 +1645,21 @@ private:
     // True if ANY Queued/Active job already targets this exact download
     // (same vaultUrl + target + modelId) — maybeQueueDownloadJob()'s dedup
     // check.
-    bool isDownloadQueued(DownloadTarget target, const QUrl &vaultUrl, const QString &modelId) const;
+    bool isDownloadQueued(ModelDownloadTarget target, const QUrl &vaultUrl, const QString &modelId) const;
 
     // Wave N (task system, item 1): serializes every Queued job (an Active
     // job is written as Queued — see loadPersistedQueue()'s doc comment for
     // why) to m_vaultUrl's tasks.json. Connected to queueChanged() in the
     // constructor, so this fires automatically after every mutation; a
     // no-op if m_vaultUrl is empty (no vault open yet/ever this session).
+    // Persistence is OPT-IN: only a task whose isPersistable() returns true is
+    // written. A kind whose inputs name an external/removable path (import,
+    // usbGrab) simply never overrides it — replacing the old opt-OUT list
+    // (`if (job.importOnly) continue;`) that a new kind could silently forget
+    // and thereby persist a mount path that names a different device next
+    // session. See .task/plan.md invariant 3.
     void persistQueue() const;
     static QString tasksJsonPath(const QUrl &vaultUrl);
-    // Wave N (task system, item 1) bugfix: reconstructs and pushes ONE
-    // persisted entry as a fresh Queued job, mirroring the relevant public
-    // enqueue function's (transcribe()/relabel()/renameSpeaker()/
-    // mergeSpeakers()) job-building logic but DELIBERATELY skipping their
-    // isQueued(fileUrl) dedup guard. loadPersistedQueue() previously called
-    // those public functions directly, which broke exactly the common case
-    // this feature exists for: a persisted "transcribe" entry followed by a
-    // persisted "relabel" entry for the SAME fileUrl (from an autoLabel
-    // job) — by the time the relabel entry replayed, the transcribe entry
-    // was already Queued/Active for that fileUrl, so relabel()'s own dedup
-    // check silently rejected it, and the label job never came back after a
-    // restart. Replaying via direct Job construction has no such conflict:
-    // every persisted entry is BY DEFINITION a legitimate distinct job that
-    // already passed dedup once, when it was first queued live.
-    void enqueueReplayedJob(const QString &kind, const QJsonObject &obj);
 
     // 2026-07-10 (rolling-average phase weighting): records that `phase` (one
     // of kTimedPhases) just took `durationMs` on the job that just finished
@@ -1644,7 +1718,7 @@ private:
     void savePhaseTiming(const QString &key);
 
     QThread m_thread;
-    TranscriptionWorker *m_worker = nullptr;
+    TaskRunner *m_runner = nullptr;
     bool m_busy = false;
     double m_progress = 0.0;
     // Wave N (task system, item 6): the SAME 0..1 fraction run() used to
@@ -1655,11 +1729,9 @@ private:
     // comment), not emitted by the worker anymore, EXCEPT for a "downloading"
     // job (see the downloadProgress connection in the constructor).
     double m_overallProgress = 0.0;
-    // Benchmark-glow state (see the benchmarkActive/benchmarkProgress Q_PROPERTY
-    // doc comment). Set via setBenchmarkGlow(); independent of m_busy.
-    bool m_benchmarkActive = false;
-    double m_benchmarkProgress = 0.0;
-    void setBenchmarkGlow(bool active, double progress);
+    // See the activeIsForeground Q_PROPERTY doc comment — recomputed in
+    // startTask()/onTaskFinished() from the Active task's presentation().
+    bool m_activeIsForeground = false;
     // Rolling (last RollingAverage::kCapacity samples) average duration of
     // each named phase, keyed by a COMPOSITE string — phase bucket + modelId
     // + speakerDetection (see canonicalPhaseKey() in the .cpp), not just the
@@ -1692,12 +1764,22 @@ private:
     QString m_phase;
     QUrl m_currentFile;
     int m_liveUpdateTick = 0;
-    QVector<Job> m_jobs;
+    // Owning. A Task lives on the GUI thread for its whole lifetime
+    // (including as a Done/Failed history row) while its run() executes on the
+    // worker thread — see Task.h's THREADING doc comment. unique_ptr, not
+    // value semantics: Task is polymorphic and a QObject (non-copyable).
+    std::vector<std::unique_ptr<Task>> m_tasks;
+    // Tasks whose signals connectTask() has already wired. A task is
+    // dispatched more than once across its life (a Paused task re-enters
+    // startTask() when resumed), and re-connecting would double-count every
+    // progress tick. Raw pointers, only ever compared — the entries are owned
+    // by m_tasks and erased alongside them.
+    QSet<const Task *> m_connectedTasks;
     // Item P6: rebuilt from m_jobs by rebuildJobStatusIndex() (see its own
     // doc comment) — keyed by absolute local file path, mirrors jobs()'
     // per-path status but as an O(1) lookup for jobStatusForPath() instead of
     // a linear jobs() scan.
-    QHash<QString, JobStatus> m_jobStatusByPath;
+    QHash<QString, Task::Status> m_jobStatusByPath;
     int m_activeIndex = -1;
     int m_nextJobId = 1;
     // Set by loadPersistedQueue() (once per vault open) — where persistQueue()
@@ -1791,3 +1873,13 @@ private:
     // it needs no mutex (GUI thread only).
     mutable QHash<QString, CachedFileTags> m_vaultTagFileCache;
 };
+
+// Every distinct "tags:" value used anywhere in the vault — feeds a labeling
+// pass's tag vocabulary (existing-tag reuse bias / restrict-to-existing).
+// cache: nullptr when called from a Task's run() (worker thread; must not
+// touch the GUI thread's cache) — pass a real cache only from a GUI-thread
+// caller that re-enters this on every keystroke (see existingVaultTags()).
+// Declared after the class (not alongside the other transcript-format
+// helpers above) because CachedFileTags is a nested type of
+// TranscriptionController and isn't visible until the class body closes.
+QStringList collectVaultTags(const QString &vaultLocalPath, QHash<QString, TranscriptionController::CachedFileTags> *cache);

@@ -66,11 +66,11 @@ Item {
     // Whether a job is actively running right now — distinct from tasksTotal
     // (which also counts Done/Failed jobs still sitting in the persistent,
     // dismissible history list, see TranscriptionController's class doc).
+    // True while ANY task is Active — a benchmark/sweep included. Wave N: a
+    // benchmark is a real queued task now (Presentation::Background), so it
+    // sets `busy` and feeds `overallProgress` like everything else; the old
+    // separate benchmarkActive/benchmarkProgress glow path is gone.
     readonly property bool busy: transcriptionController ? transcriptionController.busy : false
-    // Benchmark sweeps drive the glow without setting `busy` (see the
-    // controller's benchmarkActive doc comment).
-    readonly property bool benchmarkActive: transcriptionController ? transcriptionController.benchmarkActive : false
-    readonly property real benchmarkProgress: transcriptionController ? transcriptionController.benchmarkProgress : 0
     // The Active job's kind/file — shown next to the progress bar so it's
     // clear at a glance WHAT is currently running, not just that something
     // is. currentFile here is the JOB's file (from TranscriptionController),
@@ -141,7 +141,14 @@ Item {
     // made the first click look like it did nothing (user report,
     // 2026-07-10).
     readonly property bool activeStopping: transcriptionController ? transcriptionController.activeStopping : false
-    function canPause(kind) { return kind === "transcribe" || kind === "download" || kind === "combine" || kind === "chapters" }
+    // Wave N (task system): whether the Active task can pause AT ALL, read
+    // straight off its Task::capabilities().pausable via the controller — the
+    // hardcoded kind allowlist ("transcribe"/"download"/"combine"/"chapters")
+    // is gone. The task is the single source of truth, so this can never drift
+    // from the C++ pause logic the way a duplicated QML list could (that drift
+    // was the 2026-07-09 pause bug). The finer "can pause RIGHT NOW" (phase
+    // gating) stays in canPauseNow() below.
+    readonly property bool activeCanPause: transcriptionController ? transcriptionController.activeCanPause : false
     // Item 9: whether the pause/play button should be ENABLED right now
     // (visibility is handled separately — the button is only SHOWN for a
     // pausable kind or a resumable queue). Starting a queued job (idle) and
@@ -328,7 +335,7 @@ Item {
     // line — cheap, stock-QtQuick, no extra modules.
     Item {
         id: progressGlow
-        visible: AppSettings.progressGlowEnabled && (bottomBar.busy || bottomBar.benchmarkActive)
+        visible: AppSettings.progressGlowEnabled && bottomBar.busy
         anchors.top: parent.top
         anchors.left: parent.left
         // Bug: taskOverallProgress is genuinely 0.0 at the exact instant a
@@ -342,8 +349,7 @@ Item {
         // job finishes, reading as "doesn't work" rather than "just started
         // at 0%". A small width floor keeps it visible as soon as busy
         // flips true.
-        width: Math.max(4, bottomBar.width
-                        * (bottomBar.busy ? bottomBar.taskOverallProgress : bottomBar.benchmarkProgress))
+        width: Math.max(4, bottomBar.width * bottomBar.taskOverallProgress)
         height: AppSettings.progressGlowWidth + AppSettings.progressGlowRadius
 
         // Halo layers — configurable count (AppSettings.progressGlowLayerCount),
@@ -531,7 +537,7 @@ Item {
         // can be started, only ACTIVE jobs are pause-gated by kind).
         Item {
             id: pauseButton
-            visible: (bottomBar.busy && bottomBar.canPause(bottomBar.currentJobKind))
+            visible: (bottomBar.busy && bottomBar.activeCanPause)
                 || (!bottomBar.busy && bottomBar.frontQueuedJob !== null)
             // Item 9: greyed (not just hidden) while the current phase can't
             // be paused — during "loading" the button is visible but disabled
@@ -730,7 +736,7 @@ Item {
                 // pauseButton doc comment for the full rationale.
                 Item {
                     id: popupPauseButton
-                    visible: (bottomBar.busy && bottomBar.canPause(bottomBar.currentJobKind))
+                    visible: (bottomBar.busy && bottomBar.activeCanPause)
                         || (!bottomBar.busy && bottomBar.frontQueuedJob !== null)
                     // Item 9: same enable gating as the bottom bar's own
                     // pauseButton (greyed during "loading"/stopping) — shared

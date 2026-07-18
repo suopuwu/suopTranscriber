@@ -279,6 +279,42 @@ qt_add_qml_module(suopTranscriber
         src/core/ModelManager.cpp
         src/core/TranscriptionController.h
         src/core/TranscriptionController.cpp
+        src/core/tasks/TaskControl.h
+        src/core/tasks/ModelDownloadTarget.h
+        src/core/tasks/TaskContext.h
+        src/core/tasks/TaskContext.cpp
+        src/core/tasks/TaskFactory.h
+        src/core/tasks/TaskFactory.cpp
+        src/core/tasks/EngineCache.h
+        src/core/tasks/EngineCache.cpp
+        src/core/tasks/Task.h
+        src/core/tasks/Task.cpp
+        src/core/tasks/TaskRunner.h
+        src/core/tasks/TaskRunner.cpp
+        src/core/tasks/DownloadTask.h
+        src/core/tasks/DownloadTask.cpp
+        src/core/tasks/RenameSpeakerTask.h
+        src/core/tasks/RenameSpeakerTask.cpp
+        src/core/tasks/MergeSpeakersTask.h
+        src/core/tasks/MergeSpeakersTask.cpp
+        src/core/tasks/CombineTask.h
+        src/core/tasks/CombineTask.cpp
+        src/core/tasks/ImportTask.h
+        src/core/tasks/ImportTask.cpp
+        src/core/tasks/UsbGrabTask.h
+        src/core/tasks/UsbGrabTask.cpp
+        src/core/tasks/RelabelTask.h
+        src/core/tasks/RelabelTask.cpp
+        src/core/tasks/ChaptersTask.h
+        src/core/tasks/ChaptersTask.cpp
+        src/core/tasks/DiarizeTask.h
+        src/core/tasks/DiarizeTask.cpp
+        src/core/tasks/TranscribeTask.h
+        src/core/tasks/TranscribeTask.cpp
+        src/core/tasks/BenchmarkTask.h
+        src/core/tasks/BenchmarkTask.cpp
+        src/core/tasks/DiarizationSweepTask.h
+        src/core/tasks/DiarizationSweepTask.cpp
 )
 
 target_include_directories(suopTranscriber PRIVATE

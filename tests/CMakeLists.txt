@@ -6,6 +6,17 @@ find_package(Qt6 6.7 REQUIRED COMPONENTS Test)
 
 set(SUOP_CORE_DIR ${CMAKE_SOURCE_DIR}/src/core)
 
+# Wave N (task system): TranscriptionController.cpp's connectTask() references
+# every concrete Task subclass (qobject_cast per kind), so ANY test that
+# compiles the controller must also compile the whole tasks/ set to link.
+# One list, appended wherever TranscriptionController.cpp appears, so a new
+# kind is added in exactly one place here rather than N test targets.
+set(SUOP_TASK_SOURCES
+    tasks/Task.cpp tasks/TaskContext.cpp tasks/EngineCache.cpp tasks/TaskRunner.cpp tasks/TaskFactory.cpp
+    tasks/DownloadTask.cpp tasks/TranscribeTask.cpp tasks/RelabelTask.cpp tasks/ChaptersTask.cpp
+    tasks/DiarizeTask.cpp tasks/RenameSpeakerTask.cpp tasks/MergeSpeakersTask.cpp tasks/CombineTask.cpp
+    tasks/ImportTask.cpp tasks/UsbGrabTask.cpp tasks/BenchmarkTask.cpp tasks/DiarizationSweepTask.cpp)
+
 # Each test compiles the core sources it needs directly — no core static lib,
 # so the app target stays untouched. QML_ELEMENT headers compile outside the
 # qml module as long as Qt6::Qml is linked.
@@ -131,7 +142,8 @@ suop_add_test(tst_mainpanel_chapterrefresh LINK_QUICK LINK_SVG ICON_ASSETS LINK_
     SOURCES IconTheme.cpp Clipboard.cpp TranscriptionController.cpp WhisperCppEngine.cpp VadChunker.cpp
             ModelManager.cpp AudioDecoder.cpp LabelingEngine.cpp DiarizationEngine.cpp
             EngineManifest.cpp GpuProbe.cpp SubprocessEngine.cpp EngineRegistry.cpp ParakeetEngine.cpp
-            UsbGrabJob.cpp UsbRuleStore.cpp)
+            UsbGrabJob.cpp UsbRuleStore.cpp
+            ${SUOP_TASK_SOURCES})
 # Loads the real MainPanel.qml + a REAL TranscriptionController and drives the
 # queue (fake zero-byte model → fast-fail jobs) to prove busyOrQueuedUrls clears
 # reactively when a job finishes — the per-file action buttons' re-enable. Same
@@ -141,7 +153,8 @@ suop_add_test(tst_mainpanel_buttonstate LINK_QUICK LINK_SVG ICON_ASSETS LINK_GUI
     SOURCES IconTheme.cpp Clipboard.cpp TranscriptionController.cpp WhisperCppEngine.cpp VadChunker.cpp
             ModelManager.cpp AudioDecoder.cpp LabelingEngine.cpp DiarizationEngine.cpp
             EngineManifest.cpp GpuProbe.cpp SubprocessEngine.cpp EngineRegistry.cpp ParakeetEngine.cpp
-            UsbGrabJob.cpp UsbRuleStore.cpp)
+            UsbGrabJob.cpp UsbRuleStore.cpp
+            ${SUOP_TASK_SOURCES})
 # Loads the real MainPanel.qml and proves the live transcript follows the tail
 # as content streams in — including a single large (>threshold) growth, the case
 # that regressed. Drives the follow deterministically (no model) plus one real
@@ -152,32 +165,102 @@ suop_add_test(tst_mainpanel_livescroll LINK_QUICK LINK_SVG ICON_ASSETS LINK_GUI
     SOURCES IconTheme.cpp Clipboard.cpp TranscriptionController.cpp WhisperCppEngine.cpp VadChunker.cpp
             ModelManager.cpp AudioDecoder.cpp LabelingEngine.cpp DiarizationEngine.cpp
             EngineManifest.cpp GpuProbe.cpp SubprocessEngine.cpp EngineRegistry.cpp ParakeetEngine.cpp
-            UsbGrabJob.cpp UsbRuleStore.cpp)
+            UsbGrabJob.cpp UsbRuleStore.cpp
+            ${SUOP_TASK_SOURCES})
 suop_add_test(tst_mainpanel_deleteundo LINK_QUICK LINK_SVG ICON_ASSETS LINK_GUI
     LINK_WHISPER LINK_LLAMA LINK_SHERPA_ONNX
     SOURCES IconTheme.cpp Clipboard.cpp VaultTreeModel.cpp TranscriptionController.cpp
             WhisperCppEngine.cpp VadChunker.cpp ModelManager.cpp AudioDecoder.cpp
             LabelingEngine.cpp DiarizationEngine.cpp
             EngineManifest.cpp GpuProbe.cpp SubprocessEngine.cpp EngineRegistry.cpp ParakeetEngine.cpp
-            UsbGrabJob.cpp UsbRuleStore.cpp)
+            UsbGrabJob.cpp UsbRuleStore.cpp
+            ${SUOP_TASK_SOURCES})
 suop_add_test(tst_vaultsearchproxymodel SOURCES VaultTreeModel.cpp VaultSearchProxyModel.cpp)
 suop_add_test(tst_modelmanager SOURCES ModelManager.cpp)
 suop_add_test(tst_transcript_format LINK_WHISPER LINK_LLAMA LINK_SHERPA_ONNX
     SOURCES TranscriptionController.cpp WhisperCppEngine.cpp VadChunker.cpp ModelManager.cpp AudioDecoder.cpp LabelingEngine.cpp DiarizationEngine.cpp
             EngineManifest.cpp GpuProbe.cpp SubprocessEngine.cpp EngineRegistry.cpp ParakeetEngine.cpp
-            UsbGrabJob.cpp UsbRuleStore.cpp)
+            UsbGrabJob.cpp UsbRuleStore.cpp
+            ${SUOP_TASK_SOURCES})
 suop_add_test(tst_transcription_queue LINK_WHISPER LINK_LLAMA LINK_SHERPA_ONNX
     SOURCES TranscriptionController.cpp WhisperCppEngine.cpp VadChunker.cpp ModelManager.cpp AudioDecoder.cpp LabelingEngine.cpp DiarizationEngine.cpp
             EngineManifest.cpp GpuProbe.cpp SubprocessEngine.cpp EngineRegistry.cpp ParakeetEngine.cpp
-            UsbGrabJob.cpp UsbRuleStore.cpp)
+            UsbGrabJob.cpp UsbRuleStore.cpp
+            ${SUOP_TASK_SOURCES})
 suop_add_test(tst_filecombine LINK_WHISPER LINK_LLAMA LINK_SHERPA_ONNX
     SOURCES TranscriptionController.cpp WhisperCppEngine.cpp VadChunker.cpp ModelManager.cpp AudioDecoder.cpp LabelingEngine.cpp DiarizationEngine.cpp
             EngineManifest.cpp GpuProbe.cpp SubprocessEngine.cpp EngineRegistry.cpp ParakeetEngine.cpp
-            UsbGrabJob.cpp UsbRuleStore.cpp)
+            UsbGrabJob.cpp UsbRuleStore.cpp
+            ${SUOP_TASK_SOURCES})
 suop_add_test(tst_engine_contract LINK_WHISPER
     SOURCES WhisperCppEngine.cpp AudioDecoder.cpp)
 suop_add_test(tst_parakeetengine LINK_SHERPA_ONNX SOURCES ParakeetEngine.cpp AudioDecoder.cpp)
 suop_add_test(tst_enginemanifest SOURCES EngineManifest.cpp)
+# Pilot for the task-system refactor (.task/plan.md) — validates Task/
+# TaskContext/TaskRunner/EngineCache generically (FakeTask) plus DownloadTask's
+# static interface, without touching TranscriptionController (that rewrite is
+# a later phase). LabelingEngine.cpp/DiarizationEngine.cpp are only here so
+# EngineCache's destructor links (see EngineCache.cpp's doc comment) — neither
+# is actually exercised since ensureAsr()/ensureLabel() aren't implemented yet.
+# EngineCache.cpp is ONE translation unit — now that it also implements
+# ensureAsr() (for TranscribeTask/BenchmarkTask), every test that compiles it
+# needs the FULL engine dependency set to link, even a download-only test
+# that never calls ensureAsr() at runtime.
+suop_add_test(tst_task_download LINK_WHISPER LINK_LLAMA LINK_SHERPA_ONNX
+    SOURCES TranscriptionController.cpp WhisperCppEngine.cpp VadChunker.cpp ModelManager.cpp AudioDecoder.cpp
+            LabelingEngine.cpp DiarizationEngine.cpp EngineManifest.cpp GpuProbe.cpp SubprocessEngine.cpp
+            EngineRegistry.cpp ParakeetEngine.cpp UsbGrabJob.cpp UsbRuleStore.cpp
+            ${SUOP_TASK_SOURCES})
+# RenameSpeakerTask/MergeSpeakersTask call the shared transcript-format
+# helpers TranscriptionController.h now exposes (renameSpeakerInFile() etc,
+# defined in TranscriptionController.cpp) — same full dependency set as
+# tst_transcription_queue since it's all one translation unit.
+suop_add_test(tst_task_speaker_edits LINK_WHISPER LINK_LLAMA LINK_SHERPA_ONNX
+    SOURCES TranscriptionController.cpp WhisperCppEngine.cpp VadChunker.cpp ModelManager.cpp AudioDecoder.cpp
+            LabelingEngine.cpp DiarizationEngine.cpp EngineManifest.cpp GpuProbe.cpp SubprocessEngine.cpp
+            EngineRegistry.cpp ParakeetEngine.cpp UsbGrabJob.cpp UsbRuleStore.cpp
+            ${SUOP_TASK_SOURCES})
+# CombineTask/ImportTask/UsbGrabTask are self-contained (no shared
+# transcript-format helper, no TranscriptionController.cpp dependency) —
+# just QProcess/QFile plumbing plus UsbGrabJob.cpp's runUsbGrabScan().
+# LabelingEngine.cpp/DiarizationEngine.cpp are only here so EngineCache's
+# destructor links (see EngineCache.cpp's doc comment), same as
+# tst_task_download.
+# Same full-dependency-set requirement as tst_task_download, above.
+suop_add_test(tst_task_files LINK_WHISPER LINK_LLAMA LINK_SHERPA_ONNX
+    SOURCES TranscriptionController.cpp WhisperCppEngine.cpp VadChunker.cpp ModelManager.cpp AudioDecoder.cpp
+            LabelingEngine.cpp DiarizationEngine.cpp EngineManifest.cpp GpuProbe.cpp SubprocessEngine.cpp
+            EngineRegistry.cpp ParakeetEngine.cpp UsbGrabJob.cpp UsbRuleStore.cpp
+            ${SUOP_TASK_SOURCES})
+# RelabelTask calls shared transcript-format helpers from
+# TranscriptionController.h (sidecarPath/parseSpeakersList/
+# plainTextFromTranscriptBody/collectVaultTags/writeLabelingFields/
+# kPreludeEndMarker) — same full dependency set as tst_task_speaker_edits.
+suop_add_test(tst_task_relabel LINK_WHISPER LINK_LLAMA LINK_SHERPA_ONNX
+    SOURCES TranscriptionController.cpp WhisperCppEngine.cpp VadChunker.cpp ModelManager.cpp AudioDecoder.cpp
+            LabelingEngine.cpp DiarizationEngine.cpp EngineManifest.cpp GpuProbe.cpp SubprocessEngine.cpp
+            EngineRegistry.cpp ParakeetEngine.cpp UsbGrabJob.cpp UsbRuleStore.cpp
+            ${SUOP_TASK_SOURCES})
+suop_add_test(tst_task_chapters LINK_WHISPER LINK_LLAMA LINK_SHERPA_ONNX
+    SOURCES TranscriptionController.cpp WhisperCppEngine.cpp VadChunker.cpp ModelManager.cpp AudioDecoder.cpp
+            LabelingEngine.cpp DiarizationEngine.cpp EngineManifest.cpp GpuProbe.cpp SubprocessEngine.cpp
+            EngineRegistry.cpp ParakeetEngine.cpp UsbGrabJob.cpp UsbRuleStore.cpp
+            ${SUOP_TASK_SOURCES})
+suop_add_test(tst_task_diarize LINK_WHISPER LINK_LLAMA LINK_SHERPA_ONNX
+    SOURCES TranscriptionController.cpp WhisperCppEngine.cpp VadChunker.cpp ModelManager.cpp AudioDecoder.cpp
+            LabelingEngine.cpp DiarizationEngine.cpp EngineManifest.cpp GpuProbe.cpp SubprocessEngine.cpp
+            EngineRegistry.cpp ParakeetEngine.cpp UsbGrabJob.cpp UsbRuleStore.cpp
+            ${SUOP_TASK_SOURCES})
+suop_add_test(tst_task_transcribe LINK_WHISPER LINK_LLAMA LINK_SHERPA_ONNX
+    SOURCES TranscriptionController.cpp WhisperCppEngine.cpp VadChunker.cpp ModelManager.cpp AudioDecoder.cpp
+            LabelingEngine.cpp DiarizationEngine.cpp EngineManifest.cpp GpuProbe.cpp SubprocessEngine.cpp
+            EngineRegistry.cpp ParakeetEngine.cpp UsbGrabJob.cpp UsbRuleStore.cpp
+            ${SUOP_TASK_SOURCES})
+suop_add_test(tst_task_benchmark LINK_WHISPER LINK_LLAMA LINK_SHERPA_ONNX
+    SOURCES TranscriptionController.cpp WhisperCppEngine.cpp VadChunker.cpp ModelManager.cpp AudioDecoder.cpp
+            LabelingEngine.cpp DiarizationEngine.cpp EngineManifest.cpp GpuProbe.cpp SubprocessEngine.cpp
+            EngineRegistry.cpp ParakeetEngine.cpp UsbGrabJob.cpp UsbRuleStore.cpp
+            ${SUOP_TASK_SOURCES})
 suop_add_test(tst_subprocessengine SOURCES SubprocessEngine.cpp EngineManifest.cpp)
 suop_add_test(tst_engineregistry SOURCES EngineRegistry.cpp EngineManifest.cpp GpuProbe.cpp)
 suop_add_test(tst_vadchunking LINK_WHISPER SOURCES VadChunker.cpp)
@@ -228,7 +311,8 @@ suop_add_test(tst_usbgrabbercontroller LINK_DBUS LINK_WHISPER LINK_LLAMA LINK_SH
     SOURCES UsbGrabberController.cpp UsbDeviceMonitor.cpp UsbRuleStore.cpp UsbGrabJob.cpp VaultTreeModel.cpp
             TranscriptionController.cpp WhisperCppEngine.cpp VadChunker.cpp ModelManager.cpp AudioDecoder.cpp
             LabelingEngine.cpp DiarizationEngine.cpp EngineManifest.cpp GpuProbe.cpp SubprocessEngine.cpp
-            EngineRegistry.cpp ParakeetEngine.cpp)
+            EngineRegistry.cpp ParakeetEngine.cpp
+            ${SUOP_TASK_SOURCES})
 # Loads the real UsbRegexField.qml in a QQuickView — tst_styleguide.cpp keeps
 # the cheap source-scan guard, this one proves the component actually LOADS
 # (a green cmake build doesn't) and that its validity indicator/token buttons
@@ -237,4 +321,5 @@ suop_add_test(tst_usbregexfield LINK_QUICK LINK_DBUS LINK_WHISPER LINK_LLAMA LIN
     SOURCES UsbGrabberController.cpp UsbDeviceMonitor.cpp UsbRuleStore.cpp UsbGrabJob.cpp VaultTreeModel.cpp
             TranscriptionController.cpp WhisperCppEngine.cpp VadChunker.cpp ModelManager.cpp AudioDecoder.cpp
             LabelingEngine.cpp DiarizationEngine.cpp EngineManifest.cpp GpuProbe.cpp SubprocessEngine.cpp
-            EngineRegistry.cpp ParakeetEngine.cpp)
+            EngineRegistry.cpp ParakeetEngine.cpp
+            ${SUOP_TASK_SOURCES})

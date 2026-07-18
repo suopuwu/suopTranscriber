@@ -46,8 +46,22 @@
 #include "UsbGrabJob.h"
 #include "VadChunker.h"
 #include "WhisperCppEngine.h"
+#include "tasks/BenchmarkTask.h"
+#include "tasks/ChaptersTask.h"
+#include "tasks/CombineTask.h"
+#include "tasks/DiarizationSweepTask.h"
+#include "tasks/DiarizeTask.h"
+#include "tasks/DownloadTask.h"
+#include "tasks/ImportTask.h"
+#include "tasks/MergeSpeakersTask.h"
+#include "tasks/RelabelTask.h"
+#include "tasks/RenameSpeakerTask.h"
+#include "tasks/Task.h"
+#include "tasks/TaskFactory.h"
+#include "tasks/TaskRunner.h"
+#include "tasks/TranscribeTask.h"
+#include "tasks/UsbGrabTask.h"
 
-namespace {
 
 // Compact H:MM:SS.fff — leading zero-valued units (hours, then minutes) are
 // dropped entirely rather than shown as "0:"/"00:", and the fractional
@@ -276,45 +290,41 @@ QRegularExpression segmentLinePattern(const QStringList &knownSpeakers)
         QRegularExpression::MultilineOption);
 }
 
-QString jobStatusToString(TranscriptionController::JobStatus status)
+QString taskStatusToString(Task::Status status)
 {
     switch (status) {
-    case TranscriptionController::JobStatus::None:
-        return QString();
-    case TranscriptionController::JobStatus::Queued:
+    case Task::Status::Queued:
         return QStringLiteral("queued");
-    case TranscriptionController::JobStatus::Active:
+    case Task::Status::Active:
         return QStringLiteral("active");
-    case TranscriptionController::JobStatus::Paused:
+    case Task::Status::Paused:
         return QStringLiteral("paused");
-    case TranscriptionController::JobStatus::Done:
+    case Task::Status::Done:
         return QStringLiteral("done");
-    case TranscriptionController::JobStatus::Failed:
+    case Task::Status::Failed:
         return QStringLiteral("failed");
     }
     return QString();
 }
 
 // Item P6: priority order rebuildJobStatusIndex() uses to pick ONE status
-// when multiple m_jobs entries share a path (e.g. a Done history entry plus
+// when multiple m_tasks entries share a path (e.g. a Done history entry plus
 // a freshly re-queued run) — "in progress" beats "finished", and among
 // finished entries Failed beats Done since a failure is the more actionable
 // one for the file tree to surface.
-int jobStatusPriority(TranscriptionController::JobStatus status)
+int taskStatusPriority(Task::Status status)
 {
     switch (status) {
-    case TranscriptionController::JobStatus::Active:
+    case Task::Status::Active:
         return 5;
-    case TranscriptionController::JobStatus::Paused:
+    case Task::Status::Paused:
         return 4;
-    case TranscriptionController::JobStatus::Queued:
+    case Task::Status::Queued:
         return 3;
-    case TranscriptionController::JobStatus::Failed:
+    case Task::Status::Failed:
         return 2;
-    case TranscriptionController::JobStatus::Done:
+    case Task::Status::Done:
         return 1;
-    case TranscriptionController::JobStatus::None:
-        return 0;
     }
     return 0;
 }
@@ -404,7 +414,7 @@ QString formatSegmentLine(double t0, const QString &speakerLabel, const QString 
 // ([\d:.]+) is loose enough that a hand-typed numbered list in the prelude
 // (e.g. "[1] First point") would otherwise collide and get misdetected as a
 // real segment.
-const QString kPreludeEndMarker = QStringLiteral("<!-- prelude end -->");
+extern const QString kPreludeEndMarker = QStringLiteral("<!-- prelude end -->");
 
 // Everything from `body`'s start through kPreludeEndMarker (and its
 // immediately-following blank line, if present) is the prelude region —
@@ -547,15 +557,8 @@ QString plainTextFromTranscriptBody(const QString &body, const QStringList &know
     return pieces.join(QLatin1Char(' '));
 }
 
-// Feature 3a ("generate chapters"): one segment's parsed identity from a
-// transcript body — this struct's position in the QList returned by
-// parsedSegmentsFromTranscriptBody() below IS its index (the same indexing
-// LabelingEngine::generateChapters() expects and returns "afterSegment"
-// against).
-struct ParsedSegment {
-    double t0 = 0.0;
-    QString text;
-};
+// ParsedSegment is now declared in TranscriptionController.h (Wave N task
+// system) so a ChaptersTask can build one without duplicating the struct.
 
 // A lightweight sibling to plainTextFromTranscriptBody() above — walks the
 // same segmentLinePattern().globalMatch() but keeps each segment's t0
@@ -1153,7 +1156,6 @@ QString combineOutputPathFor(const QString &ruleName, const QString &key, const 
     return dir + QStringLiteral("/") + name + QStringLiteral(".combined.") + ext;
 }
 
-}
 
 // See this function's declaration doc comment in TranscriptionController.h.
 QString spliceBodySpeakers(const QString &body, const QStringList &knownSpeakers,
@@ -1521,1676 +1523,85 @@ std::optional<EngineDescriptor> resolveEngine(const QString &engineId, const QSt
     return std::nullopt;
 }
 
-// Lives on TranscriptionController's dedicated QThread; never touches the
-// GUI thread. Owns the warm WhisperCppEngine so the model stays resident
-// across transcribe() calls.
-class TranscriptionWorker : public QObject {
-    Q_OBJECT
+// Wave N (task system): TranscriptionWorker is GONE (1601 lines). It was one
+// QObject with 12 kind-specific slots and ~22 unioned signals, owning the warm
+// engines and every kind's doing-code in one body. All of it now lives in
+// src/core/tasks/: one Task subclass per kind (its own run() + its own typed
+// result signals), EngineCache (the warm ASR/label/diarization engines +
+// GPU-hygiene eviction), TaskControl (the pause/cancel atomics),
+// TaskContext::checkpoint() (the one cooperative interruption point every
+// pausable kind funnels through), and TaskRunner (the thread host that turns
+// run()-returned-or-threw into exactly one taskFinished). See .task/plan.md.
 
-public:
-    using QObject::QObject;
-
-    // Wave N (task system): plain (non-slot) methods called DIRECTLY from
-    // the controller thread — safe despite the cross-thread call because
-    // they only touch std::atomic<bool>s, never anything else this object
-    // owns. Deliberately NOT routed through QMetaObject::invokeMethod: that
-    // would queue behind whatever job is currently running on this worker's
-    // event loop, which is exactly the moment a pause/cancel request needs
-    // to take effect — these have to land immediately, not wait in line.
-    void requestPause() { m_pauseRequested.store(true); }
-    void requestResume() { m_pauseRequested.store(false); }
-    void requestCancel() { m_cancelRequested.store(true); }
-    // Called by TranscriptionController::startJob() right before dispatching
-    // the next job, so a cancel/pause left over from whatever the PREVIOUS
-    // job did doesn't leak into this one.
-    void resetControl()
-    {
-        m_pauseRequested.store(false);
-        m_cancelRequested.store(false);
-    }
-    bool isCancelRequested() const { return m_cancelRequested.load(); }
-
-public slots:
-    void run(const QString &filePath, const QString &vaultPath, const QString &modelId)
-    {
-        // GPU memory hygiene: transcribe and label jobs never run
-        // concurrently (this worker runs at most one job at a time), so
-        // there's no reason to keep the label engine's GPU-resident weights
-        // + KV-cache buffer around while a transcription runs — evicting it
-        // here (unconditionally, not just under memory pressure) keeps this
-        // worker's steady-state GPU footprint to whichever ONE big model
-        // (whisper or label) its most recent job actually needed, instead of
-        // silently accumulating every model ever used this session. Costs a
-        // reload (a few seconds) the next time a labeling job runs, which is
-        // deliberately accepted in exchange for not exhausting VRAM — see
-        // LabelingEngine's CPU-fallback retry for when that reload itself
-        // hits GPU memory pressure.
-        m_labelingEngine.reset();
-
-        // 2026-07-10 (rolling-average phase weighting): wall-clock timer for
-        // whichever phase is currently running, restarted (recording the
-        // PREVIOUS phase's duration via phaseDurationMs) at each transition
-        // below — see TranscriptionController::recordPhaseDuration()'s doc
-        // comment. Deliberately only recorded right as a phase completes
-        // NORMALLY (never on a cancel/failure return in between), so an
-        // aborted phase's artificially-short elapsed time never pollutes the
-        // average.
-        QElapsedTimer phaseTimer;
-        phaseTimer.start();
-
-        // "loading": whisper.cpp has no progress hook for model load itself
-        // (whisper_init_from_file_with_params is one blocking call) — this
-        // phase covers ensureModel()'s (rare, first-run) download plus the
-        // model load, both otherwise invisible. Bigger models (medium.en,
-        // ~1.5GB) can take a real, previously-unexplained-looking delay here.
-        emit phase(QStringLiteral("loading"));
-
-        // A model id with the "engine:" prefix routes to an out-of-process
-        // SubprocessEngine (DESIGN.md "Pluggable engines"); anything else is a
-        // whisper ggml tier resolved by ModelManager. Everything downstream —
-        // diarization, VAD-windowing (whisper only, see below), the offset
-        // merge, frontmatter, labeling — is engine-agnostic because the
-        // abstraction is at the Segment level.
-        const bool useSubprocessEngine = isEngineModelId(modelId);
-        // Parakeet is in-process (sherpa-onnx, like whisper) but a different
-        // engine class + a multi-file ONNX bundle. It resolves through
-        // ensureModel() (which returns the bundle dir) and uses VAD windowing
-        // like whisper — only its engine construction differs.
-        const bool useParakeet = ModelManager::isParakeetModelId(modelId);
-        QString error;
-        bool modelFallback = false;
-        QString modelPath;     // ggml file path (whisper) OR the "engine:" id (subprocess) — also the reuse key
-        QString modelUsedName; // frontmatter "model" field: ggml file name, or the engine's display name
-        EngineDescriptor engineDesc;
-
-        if (useSubprocessEngine) {
-            const auto desc = resolveEngine(engineIdFromModelId(modelId), vaultPath, &error);
-            if (!desc || !desc->available) {
-                emit finished(false, error.isEmpty() ? QStringLiteral("engine unavailable") : error);
-                return;
-            }
-            engineDesc = *desc;
-            modelPath = modelId;
-            modelUsedName = desc->manifest.name;
-        } else {
-            modelPath = ModelManager::ensureModel(modelId, &error, &modelFallback);
-            if (modelPath.isEmpty()) {
-                emit finished(false, error.isEmpty() ? QStringLiteral("model unavailable") : error);
-                return;
-            }
-            modelUsedName = QFileInfo(modelPath).fileName();
-        }
-
-        // Item 50 (why "stop" can't be instant here): the whisper model load
-        // below is a single blocking whisper.cpp call
-        // (whisper_init_from_file_with_params) with NO abort hook — unlike
-        // whisper_full()'s abort_callback (see onAbort further down) or ffmpeg
-        // decode (a real killable subprocess). There is simply no interruption
-        // point to check a pause/cancel flag AT during a load, so pause is a
-        // no-op during "loading" (see pauseActive()) and a cancel requested
-        // here only takes effect at the next real checkpoint after the load
-        // returns. This is a genuine hard limitation of the native call, not
-        // something this app can fix cooperatively — documented so it's
-        // discoverable rather than looking like a missing feature. (A
-        // subprocess engine constructs instantly and validates lazily at spawn
-        // time, so none of this applies to it.)
-        if (!m_engine || m_engine->isValid() == false || m_modelPath != modelPath) {
-            if (useSubprocessEngine)
-                m_engine = std::make_unique<SubprocessEngine>(engineDesc.manifest, engineDesc.dir);
-            else if (useParakeet) {
-                const ModelManager::ParakeetModelPaths p =
-                    ModelManager::parakeetModelPaths();
-                m_engine = std::make_unique<ParakeetEngine>(p.encoder, p.decoder, p.joiner, p.tokens);
-            } else
-                m_engine = std::make_unique<WhisperCppEngine>(modelPath);
-            m_modelPath = modelPath;
-        }
-        if (!m_engine->isValid()) {
-            emit finished(false, QStringLiteral("failed to load model at %1").arg(modelPath));
-            return;
-        }
-        // Item O35: whichever backend whisper.cpp just picked for this load
-        // (see WhisperCppEngine::activeBackendName()'s doc comment) — fired
-        // here rather than after the later diarization-eviction reload below
-        // since QML only needs to know once per job, not on every reload.
-        emit backendNameChanged(m_engine->activeBackendName());
-
-        // A cancel (or pause, which resolves to cancel — see
-        // TranscriptionController::pauseActive()'s doc comment) requested
-        // DURING "loading" can't be caught mid-model-load (no callback hook
-        // exists there — see the "loading" phase comment above), but must
-        // not then ALSO be ignored through the entire audio decode below
-        // (which can be a real, multi-second delay of its own for a long
-        // file) — check the instant loading finishes, before starting
-        // anything else.
-        if (isCancelRequested()) {
-            emit finished(false, QStringLiteral("Cancelled"));
-            return;
-        }
-        emit phaseDurationMs(QStringLiteral("loading"), phaseTimer.restart());
-
-        // "decoding": unlike "loading" above, ffmpeg runs as a real
-        // subprocess (see AudioDecoder.h) — genuinely pausable (SIGSTOP the
-        // process) and instantly cancellable (kill it), same mechanism as
-        // ModelManager's downloads. Pause here behaves exactly like pausing
-        // during transcribing/diarization (activePaused, real cooperative
-        // resume), not the restart-based Paused status "loading" needs.
-        emit phase(QStringLiteral("decoding"));
-        bool decodePausedSignaled = false;
-        AudioDecoder::DecodeControl decodeControl;
-        decodeControl.paused = [this, &decodePausedSignaled] {
-            const bool p = m_pauseRequested.load();
-            if (p != decodePausedSignaled) {
-                decodePausedSignaled = p;
-                emit paused(p);
-            }
-            return p;
-        };
-        decodeControl.cancelled = [this] { return m_cancelRequested.load(); };
-        QString decodeError;
-        auto pcm = AudioDecoder::decodeTo16kMono(filePath, &decodeError, decodeControl);
-        if (!pcm) {
-            emit finished(false, decodeError.isEmpty() ? QStringLiteral("audio decode failed") : decodeError);
-            return;
-        }
-
-        // Transcribe is pure ASR — speaker diarization is a SEPARATE task now
-        // (the standalone diarizeFile() job / "Detect speakers" action, or the
-        // diarize step of the runAllJobs() pipeline), never run inline here.
-        // A fresh transcript is therefore always written speaker-less; the
-        // diarize job later splices "[Speaker N]" tags + "speakers:" into the
-        // .md in place (see spliceBodySpeakers()). See DESIGN.md "Speaker
-        // diarization".
-
-        // Wave N (task system): a cancel (or pause) requested during "loading"
-        // or "decoding" takes effect here, right after the decode finishes and
-        // before any file I/O happens — a normal pause/cancel checkpoint
-        // between phases.
-        if (waitWhilePausedOrCancelled()) {
-            emit finished(false, QStringLiteral("Cancelled"));
-            return;
-        }
-
-        // "detecting-speech": VAD windowing (DESIGN.md "Durable / resumable transcription",
-        // chunking half; see VadChunker.h): one small model does double duty —
-        // (a) whisper.cpp's own per-window silence gating (set on m_engine
-        // below) and (b) finding VAD-aligned window boundaries so a long file
-        // is transcribed as several bounded whisper_full() calls instead of
-        // one unbounded one (reduces long-context hallucination drift). A
-        // download/load failure degrades gracefully to today's single
-        // whole-file window with no gating — never blocks the job — recorded
-        // honestly in frontmatter below.
-        //
-        // Given its own visible phase (VAD is a real, sometimes-slow step:
-        // one small-model download on first run + one blocking computeWindows()
-        // call with no native progress hook — so its bar fraction is
-        // synthesized elapsed-vs-average, like "loading"/"decoding", see
-        // phaseRelativeSyntheticProgress()). The timer is restarted here so its
-        // duration is recorded separately from "transcribing" below.
-        emit phase(QStringLiteral("detecting-speech"));
-        phaseTimer.restart();
-        QString vadError;
-        std::vector<VadChunker::Window> windows;
-        bool vadActive = false;
-        if (useSubprocessEngine) {
-            // Out-of-process engines load a heavy model per process and do
-            // their own internal segmentation, so we feed the whole file as ONE
-            // chunk (one spawn) rather than VAD-windowing it into many spawns
-            // (v1 decision — a persistent multi-chunk worker process is a later
-            // optimization). whisper.cpp's own VAD gating is a WhisperCppEngine
-            // feature and simply doesn't apply here.
-            windows.push_back({0.0, static_cast<double>(pcm->size()) / 16000.0});
-        } else {
-            const QString vadModelPath = ModelManager::ensureVadModel(&vadError);
-            if (!vadModelPath.isEmpty()) {
-                QString chunkingError;
-                windows = VadChunker::computeWindows(*pcm, vadModelPath, &chunkingError);
-                if (chunkingError.isEmpty())
-                    vadActive = true;
-                else
-                    vadError = chunkingError;
-            }
-            if (windows.empty())
-                windows.push_back({0.0, static_cast<double>(pcm->size()) / 16000.0});
-            // Reset on every job (not just a failure this time) — m_engine is a
-            // persistent member reused across jobs/files, so a PREVIOUS job's
-            // successful VAD path must not silently leak into this one if this
-            // job's VAD failed. Guarded to the concrete whisper engine (VAD
-            // gating is its feature); a subprocess engine never reaches here.
-            if (auto *whisper = dynamic_cast<WhisperCppEngine *>(m_engine.get()))
-                whisper->setVadModelPath(vadActive ? vadModelPath : QString());
-        }
-
-        // Record the VAD phase's duration for the rolling-average bar
-        // weighting (recomputeOverallProgress()) and restart for "transcribing".
-        emit phaseDurationMs(QStringLiteral("detecting-speech"), phaseTimer.restart());
-
-        QFile mdFile(sidecarPath(filePath));
-        if (!mdFile.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
-            emit finished(false, QStringLiteral("could not open %1 for writing").arg(mdFile.fileName()));
-            return;
-        }
-
-        // Pure-ASR transcript: no speaker detection at transcribe time, so
-        // frontmatter records speakerDetection: false with an empty speaker
-        // list (the standalone diarize job splices real speakers in later).
-        writeFrontmatter(mdFile, modelUsedName, /*speakerDetection=*/false, modelFallback, modelId,
-                          /*speakerLabels=*/{}, /*speakerDetectionError=*/QString(), vadActive, vadError);
-        SegmentLineWriter lineWriter(mdFile);
-
-        // "transcribing": whisper's own per-segment progress, blended across
-        // ALL windows into one cumulative 0->1 (see secondsDoneInPriorWindows
-        // below) — each window's own done/total would otherwise snap the bar
-        // back to 0% at every window boundary. Item 6 (Wave N):
-        // progress() is this phase's OWN 0->1 regardless of whether
-        // diarization ran before it — TranscriptionController blends it into
-        // overallProgress using this phase's rolling-average share (see
-        // recomputeOverallProgress()'s doc comment), not a fixed half.
-        emit phase(QStringLiteral("transcribing"));
-        emit progress(0.0);
-        const double totalFileSeconds = static_cast<double>(pcm->size()) / 16000.0;
-        double secondsDoneInPriorWindows = 0.0;
-
-        // Drives TranscriptionController::liveUpdateTick (see its doc
-        // comment) — throttled independently of whisper's own progress
-        // ticks, which fire on every internal decode-loop iteration
-        // (including retries) rather than on real new content. liveTimer
-        // starts already kLiveUpdateThrottleMs in the past so the FIRST
-        // segment's tick fires immediately instead of waiting out the
-        // throttle window.
-        QElapsedTimer liveTimer;
-        liveTimer.start();
-        qint64 lastLiveTickMs = -kLiveUpdateThrottleMs;
-
-        // Wave N (task system): whisper.cpp checks this deep inside its own
-        // encode/decode loops (see WhisperCppEngine.cpp's onAbortCheck) —
-        // frequent enough that blocking here for a pause is near-instant,
-        // and returning true from waitWhilePausedOrCancelled() stops
-        // whisper_full() mid-file rather than only at its next natural
-        // boundary, unlike diarization above.
-        const AbortCallback onAbort = [this] { return waitWhilePausedOrCancelled(); };
-
-        for (const VadChunker::Window &window : windows) {
-            // Between-window pause/cancel checkpoint — a single-window file
-            // (today's pre-chunking behavior) never had this gap; mid-window
-            // pause/cancel is still handled by onAbort above, unchanged.
-            if (waitWhilePausedOrCancelled())
-                break;
-
-            const auto startSample = static_cast<std::size_t>(window.startSeconds * 16000.0);
-            const auto endSample =
-                std::min(pcm->size(), static_cast<std::size_t>(window.endSeconds * 16000.0));
-            if (endSample <= startSample)
-                continue;
-
-            AudioChunk chunk;
-            chunk.pcm16kMono.assign(pcm->begin() + static_cast<std::ptrdiff_t>(startSample),
-                                     pcm->begin() + static_cast<std::ptrdiff_t>(endSample));
-            chunk.offsetSeconds = window.startSeconds;
-            const double windowSeconds = static_cast<double>(chunk.pcm16kMono.size()) / 16000.0;
-
-            ProgressCallback onProgress = [this, &secondsDoneInPriorWindows, totalFileSeconds](double done, double) {
-                const double fraction =
-                    totalFileSeconds > 0 ? (secondsDoneInPriorWindows + done) / totalFileSeconds : 0.0;
-                emit progress(fraction);
-            };
-            SegmentCallback onSegment = [&lineWriter, &liveTimer,
-                                          &lastLiveTickMs, &chunk, this](const Segment &rawSegment) {
-                // Chunk offset merge is the app's job (see
-                // WhisperCppEngine.cpp/DESIGN.md "Engine architecture") — this
-                // is now a REAL merge for multi-window files, not the no-op
-                // it was when every job was a single offsetSeconds=0.0 chunk.
-                Segment segment = rawSegment;
-                segment.t0 += chunk.offsetSeconds;
-                segment.t1 += chunk.offsetSeconds;
-                // Pure ASR — no speaker label written at transcribe time (the
-                // standalone diarize job adds "[Speaker N]" tags later).
-                lineWriter.append(segment, QString());
-
-                const qint64 nowMs = liveTimer.elapsed();
-                if (nowMs - lastLiveTickMs >= kLiveUpdateThrottleMs) {
-                    lastLiveTickMs = nowMs;
-                    emit segmentWritten();
-                }
-            };
-
-            m_engine->transcribe(chunk, onProgress, onSegment, onAbort);
-            secondsDoneInPriorWindows += windowSeconds;
-
-            if (isCancelRequested())
-                break;
-        }
-        mdFile.close();
-
-        // No transcribe-time speaker detection, so no "speakers:" frontmatter
-        // to reconcile against body tags here (that reconciliation lives in the
-        // standalone diarize job — see syncSpeakersFrontmatterToBody()).
-
-        // AI auto-labeling (opt-in, see DESIGN.md "Model management") is no
-        // longer run as a bonus pass here — TranscriptionController::
-        // onWorkerFinished() queues it as its own separate, visible follow-up
-        // job (see transcribe()'s autoLabel doc comment) once this job
-        // reports success.
-
-        // A cancel mid-decode stops whisper_full() early (see onAbort above)
-        // but everything transcribed up to that point is still flushed and
-        // valid (SegmentLineWriter's per-append durability contract, same as
-        // a kill mid-run) — reported as Failed/"Cancelled" rather than
-        // Done, matching the Tasks list's honesty contract (this was
-        // deliberately stopped, not a silent success).
-        if (isCancelRequested()) {
-            emit finished(false, QStringLiteral("Cancelled"));
-            return;
-        }
-        emit phaseDurationMs(QStringLiteral("transcribing"), phaseTimer.elapsed());
-        emit finished(true, {});
-    }
-
-    // Model benchmark (Settings "Benchmark" page): runs each requested model /
-    // engine over ONE audio file, in memory, purely for comparison — writes NO
-    // .md, touches no queue or vault state, decodes the audio ONCE and reuses
-    // it across models. Deliberately a slot on this same worker (not a separate
-    // thread) so it serializes with real transcription jobs and never contends
-    // with them for the GPU. modelIds is exactly what to run (the Settings page
-    // filters to downloaded whisper tiers + available engines — the "only
-    // downloaded models" policy lives there, where availableModels()/
-    // availableEngines() give it the info). Reports each model's result as it
-    // finishes via benchmarkModelDone, and the whole run via benchmarkFinished
-    // (which the page persists through VaultTreeModel::writeBenchmarkLastRun).
-    void benchmarkJob(const QString &filePath, const QString &vaultPath, const QStringList &modelIds)
-    {
-        resetControl(); // a benchmark is cancellable via the same atomics jobs use
-
-        QString decodeError;
-        auto pcm = AudioDecoder::decodeTo16kMono(filePath, &decodeError);
-        if (!pcm) {
-            emit benchmarkFailed(decodeError.isEmpty() ? QStringLiteral("audio decode failed") : decodeError);
-            return;
-        }
-        const double audioSeconds = static_cast<double>(pcm->size()) / 16000.0;
-
-        AudioChunk chunk;
-        chunk.pcm16kMono = *pcm;
-        chunk.offsetSeconds = 0.0; // whole file, single chunk — no offset merge needed for display
-
-        const AbortCallback onAbort = [this] { return isCancelRequested(); };
-        QVariantList results;
-        QElapsedTimer totalTimer;
-        totalTimer.start();
-
-        for (int i = 0; i < modelIds.size(); ++i) {
-            if (isCancelRequested())
-                break;
-            const QString modelId = modelIds.at(i);
-            emit benchmarkModelStarted(modelId, i, modelIds.size());
-
-            QVariantMap result = runOneBenchmarkModel(modelId, vaultPath, chunk, audioSeconds, onAbort);
-            results.append(result);
-            emit benchmarkModelDone(result);
-        }
-
-        QVariantMap run;
-        run["file"] = filePath;
-        run["fileName"] = QFileInfo(filePath).fileName();
-        run["audioSeconds"] = audioSeconds;
-        run["totalRuntimeMs"] = static_cast<qint64>(totalTimer.elapsed());
-        run["cancelled"] = isCancelRequested();
-        run["results"] = results;
-        emit benchmarkFinished(run);
-    }
-
-    // Diarization sweep: runs each {segmentation, embedding, threshold} combo
-    // over ONE decode of the file and reports, per combo, how many speakers it
-    // found plus timing — the point being to compare which combination actually
-    // separates a hard recording. Writes nothing to the vault (same as
-    // benchmarkJob). Each combo builds a fresh DiarizationEngine (the threshold
-    // is baked in at construction, and a big embedding model shouldn't hold VRAM
-    // across combos); cancellation takes effect between combos (diarize() has no
-    // mid-pass abort hook — see runDiarizationPass()).
-    void diarizationBenchmarkJob(const QString &filePath, const QVariantList &combos)
-    {
-        resetControl();
-
-        QString decodeError;
-        auto pcm = AudioDecoder::decodeTo16kMono(filePath, &decodeError);
-        if (!pcm) {
-            emit benchmarkFailed(decodeError.isEmpty() ? QStringLiteral("audio decode failed") : decodeError);
-            return;
-        }
-        const double audioSeconds = static_cast<double>(pcm->size()) / 16000.0;
-
-        m_diarizationEngine.reset(); // don't reuse a warm engine across a sweep
-        QVariantList results;
-        QElapsedTimer totalTimer;
-        totalTimer.start();
-
-        for (int i = 0; i < combos.size(); ++i) {
-            if (isCancelRequested())
-                break;
-            const QVariantMap combo = combos.at(i).toMap();
-            const QString segId = combo.value("segmentationModelId").toString();
-            const QString embedId = combo.value("embeddingModelId").toString();
-            const double threshold = combo.value("threshold").toDouble();
-            const QString label = combo.value("label").toString();
-            emit diarizationBenchmarkComboStarted(label, i, combos.size());
-
-            QVariantMap result;
-            result["label"] = label;
-            result["segmentationModelId"] = segId;
-            result["embeddingModelId"] = embedId;
-            result["threshold"] = threshold;
-
-            QString segPath, embedPath, error;
-            if (!ModelManager::ensureDiarizationModels(segId, embedId, &segPath, &embedPath, &error)) {
-                result["ok"] = false;
-                result["error"] = error.isEmpty() ? QStringLiteral("models unavailable") : error;
-                results.append(result);
-                emit diarizationBenchmarkComboDone(result);
-                continue;
-            }
-
-            DiarizationEngine engine(segPath, embedPath, static_cast<float>(threshold));
-            if (!engine.isValid()) {
-                result["ok"] = false;
-                result["error"] = QStringLiteral("failed to load models");
-                results.append(result);
-                emit diarizationBenchmarkComboDone(result);
-                continue;
-            }
-
-            QElapsedTimer comboTimer;
-            comboTimer.start();
-            const std::vector<DiarizedTurn> turns = engine.diarize(*pcm);
-            const qint64 runtimeMs = comboTimer.elapsed();
-            int maxSpeaker = -1;
-            for (const DiarizedTurn &turn : turns)
-                maxSpeaker = std::max(maxSpeaker, turn.speaker);
-            result["ok"] = true;
-            result["speakerCount"] = maxSpeaker + 1;
-            result["turnCount"] = static_cast<int>(turns.size());
-            result["runtimeMs"] = runtimeMs;
-            result["realtimeFactor"] = runtimeMs > 0 ? audioSeconds / (runtimeMs / 1000.0) : 0.0;
-            results.append(result);
-            emit diarizationBenchmarkComboDone(result);
-        }
-        m_diarizationEngine.reset();
-
-        QVariantMap run;
-        run["file"] = filePath;
-        run["fileName"] = QFileInfo(filePath).fileName();
-        run["audioSeconds"] = audioSeconds;
-        run["totalRuntimeMs"] = static_cast<qint64>(totalTimer.elapsed());
-        run["cancelled"] = isCancelRequested();
-        run["kind"] = QStringLiteral("diarization");
-        run["results"] = results;
-        emit diarizationBenchmarkFinished(run);
-    }
-
-    // "Regenerate auto-title" (item 9): re-runs JUST the labeling pass on an
-    // already-transcribed file — no audio decode, no whisper, no frontmatter
-    // reset. Unlike the autoLabel branch above, a failure here IS the job's
-    // result (there's nothing else for this job to accomplish).
-    //
-    // skipIfAlreadyLabeled (item P21): only ever true for the automatic
-    // follow-up pass transcribe(autoLabel=true) queues right after its own
-    // transcribe job (see Job::skipIfAlreadyLabeled's doc comment) — false
-    // for the user's explicit "Regenerate label and prelude" button
-    // (relabel()), which must always force-regenerate. When true, an
-    // existing non-empty label/tags/prelude means this file was already
-    // labeled by a previous run (or a manual edit) and re-transcribing
-    // shouldn't clobber it — reports success with no LLM call rather than
-    // failure, since "nothing to do" isn't an error.
-    void relabelJob(const QString &filePath, const QString &vaultPath, bool restrictTagsToExisting,
-                     double tagReuseBias, double wordiness, bool skipIfAlreadyLabeled = false)
-    {
-        // Mirrors run()'s eviction of the label engine (see its doc
-        // comment): this job needs only the label engine, so free whisper's
-        // GPU-resident model now rather than let it sit warm through a
-        // labeling pass that never touches it. m_diarizationEngine is
-        // already evicted at the end of every run() job, so it's never
-        // actually resident here — reset defensively anyway in case that
-        // ever changes.
-        m_engine.reset();
-        m_diarizationEngine.reset();
-
-        const QString mdPath = sidecarPath(filePath);
-        if (!QFileInfo::exists(mdPath)) {
-            emit finished(false, QStringLiteral("%1 has not been transcribed yet").arg(filePath));
-            return;
-        }
-
-        QFile mdFile(mdPath);
-        if (!mdFile.open(QIODevice::ReadOnly | QIODevice::Text)) {
-            emit finished(false, QStringLiteral("could not open %1").arg(mdPath));
-            return;
-        }
-        QTextStream in(&mdFile);
-        if (in.readLine() != QStringLiteral("---")) {
-            emit finished(false, QStringLiteral("%1 has no frontmatter block").arg(mdPath));
-            return;
-        }
-        // Pull out "speakers:"/"label:"/"tags:" while skipping the rest of
-        // the frontmatter — speakers feeds plainTextFromTranscriptBody()'s
-        // known-speaker allowlist (see segmentLinePattern()'s doc comment);
-        // label/tags feed the skipIfAlreadyLabeled check below (item P21).
-        QStringList knownSpeakers;
-        QString existingLabel;
-        QString existingTags;
-        QString line;
-        while (!(line = in.readLine()).isNull() && line != QStringLiteral("---")) {
-            const int colon = line.indexOf(':');
-            if (colon < 0)
-                continue;
-            const QString key = line.left(colon).trimmed();
-            if (key == QStringLiteral("speakers"))
-                knownSpeakers = parseSpeakersList(line.mid(colon + 1));
-            else if (key == QStringLiteral("label"))
-                existingLabel = line.mid(colon + 1).trimmed();
-            else if (key == QStringLiteral("tags"))
-                existingTags = line.mid(colon + 1).trimmed();
-        }
-        const QString rawBody = in.readAll();
-        const QString transcriptText = plainTextFromTranscriptBody(rawBody, knownSpeakers);
-        mdFile.close();
-
-        // Item P21: this is the automatic post-transcribe follow-up, not an
-        // explicit user request — don't clobber label/tags/prelude a
-        // previous run (or a manual edit) already produced.
-        if (skipIfAlreadyLabeled
-            && (!existingLabel.isEmpty() || !existingTags.isEmpty() || rawBody.contains(kPreludeEndMarker))) {
-            emit finished(true, {});
-            return;
-        }
-
-        if (transcriptText.trimmed().isEmpty()) {
-            emit finished(false, QStringLiteral("%1 has no transcript text to label").arg(mdPath));
-            return;
-        }
-
-        QString error;
-        if (!runLabelingPass(vaultPath, transcriptText, mdPath, restrictTagsToExisting, tagReuseBias, wordiness,
-                              &error)) {
-            emit finished(false, error);
-            return;
-        }
-        emit finished(true, {});
-    }
-
-    // Feature 3a ("generate chapters"): a second, separate LLM pass sharing
-    // the SAME resident label engine as relabelJob()/runLabelingPass() above
-    // (see LabelingEngine::generateChapters()'s doc comment) — never a
-    // second LabelingEngine instance. Mirrors relabelJob()'s shape closely:
-    // same eviction, same "reopen the .md, read frontmatter+body, no audio
-    // decode" approach, same "a failure here IS the job's result" contract.
-    void generateChaptersJob(const QString &filePath, const QString &vaultPath, double density)
-    {
-        m_engine.reset();
-        m_diarizationEngine.reset();
-
-        const QString mdPath = sidecarPath(filePath);
-        if (!QFileInfo::exists(mdPath)) {
-            emit finished(false, QStringLiteral("%1 has not been transcribed yet").arg(filePath));
-            return;
-        }
-
-        QFile mdFile(mdPath);
-        if (!mdFile.open(QIODevice::ReadOnly | QIODevice::Text)) {
-            emit finished(false, QStringLiteral("could not open %1").arg(mdPath));
-            return;
-        }
-        QTextStream in(&mdFile);
-        if (in.readLine() != QStringLiteral("---")) {
-            emit finished(false, QStringLiteral("%1 has no frontmatter block").arg(mdPath));
-            return;
-        }
-        QStringList knownSpeakers;
-        QString line;
-        while (!(line = in.readLine()).isNull() && line != QStringLiteral("---")) {
-            const int colon = line.indexOf(':');
-            if (colon >= 0 && line.left(colon).trimmed() == QStringLiteral("speakers"))
-                knownSpeakers = parseSpeakersList(line.mid(colon + 1));
-        }
-        const QString body = in.readAll();
-        mdFile.close();
-
-        // Fresh parse of THIS job's own read of the file — the exact (index,
-        // t0, text) tuples chapter generation needs (see
-        // parsedSegmentsFromTranscriptBody()'s doc comment): index i's
-        // position in this list IS the index LabelingEngine::
-        // generateChapters() expects and returns "afterSegment" against.
-        const QList<ParsedSegment> segments = parsedSegmentsFromTranscriptBody(body, knownSpeakers);
-        if (segments.isEmpty()) {
-            emit finished(false, QStringLiteral("%1 has no transcript text to generate chapters from").arg(mdPath));
-            return;
-        }
-
-        QString labelError;
-        const QString labelModelPath = ModelManager::ensureLabelModel(&labelError);
-        if (labelModelPath.isEmpty()) {
-            emit finished(false, QStringLiteral("auto-label model unavailable: %1").arg(labelError));
-            return;
-        }
-        if (!m_labelingEngine || !m_labelingEngine->isValid() || m_labelModelPath != labelModelPath) {
-            m_labelingEngine = std::make_unique<LabelingEngine>(labelModelPath);
-            m_labelModelPath = labelModelPath;
-        }
-        if (!m_labelingEngine->isValid()) {
-            emit finished(false, QStringLiteral("failed to load labeling model at %1").arg(labelModelPath));
-            return;
-        }
-
-        QStringList segmentTexts;
-        segmentTexts.reserve(segments.size());
-        for (const ParsedSegment &segment : segments)
-            segmentTexts.append(segment.text);
-
-        // Item P34 / item 28: generateChapters() silently truncates (with a
-        // qWarning) any single call whose formatted "INDEX: text\n" input
-        // exceeds LabelingEngine::kMaxChapterInputChars — for a long file, one
-        // call over the whole transcript meant everything past ~20 minutes of
-        // speech never got proposed at all. Split into multiple windows, each
-        // kept under that budget (see computeChapterWindows()), and offset
-        // each window's returned afterSegmentIndex (0-relative to THAT
-        // window's own slice) by its starting index in the full segments list
-        // before merging.
-        const QList<int> windowStarts = computeChapterWindows(segmentTexts);
-
-        // Items 26/31: drive the progress bar. Chapter generation is a
-        // per-window sequence of LLM calls with a known window count up front,
-        // so a determinate fraction (one window == one unit, plus a final unit
-        // for the merge/resolve/write tail) advances the bar smoothly instead
-        // of it sitting frozen at 0 until the whole job finishes. Treated like
-        // "combining" on the controller side (a single fraction assigned
-        // straight to overallProgress — see the progress() connection).
-        emit phase(QStringLiteral("chaptering"));
-        emit progress(0.0);
-        const int progressUnits = windowStarts.size() + 1; // +1 for the merge/resolve/write tail
-
-        QList<Chapter> chapters;
-        for (int w = 0; w < windowStarts.size(); ++w) {
-            // Items 30/50: cooperative cancel/pause checkpoint between windows.
-            // An in-flight single generateChapters() LLM call can't be
-            // interrupted (no llama.cpp abort hook for a single-shot decode),
-            // but checking here means a cancel takes effect promptly between
-            // windows rather than only after the ENTIRE job — a big
-            // improvement for a long, multi-window transcript.
-            if (waitWhilePausedOrCancelled()) {
-                emit finished(false, QStringLiteral("Cancelled"));
-                return;
-            }
-
-            const int startIdx = windowStarts.at(w);
-            const int endIdx = (w + 1 < windowStarts.size()) ? windowStarts.at(w + 1) : segmentTexts.size();
-            const QStringList windowTexts = segmentTexts.mid(startIdx, endIdx - startIdx);
-
-            QString genError;
-            const auto windowChapters = m_labelingEngine->generateChapters(windowTexts, density, &genError);
-            if (!windowChapters) {
-                emit finished(false, QStringLiteral("chapter generation failed: %1").arg(genError));
-                return;
-            }
-            emit progress(static_cast<double>(w + 1) / progressUnits);
-            // afterSegmentIndex is 0-relative to THIS window's own
-            // windowTexts slice (see generateChapters()'s doc comment) —
-            // offset by startIdx so it's relative to the full file's
-            // segments list instead, exactly as if one single call had
-            // produced it (startIdx is 0 for the first window, a no-op
-            // offset there). The existing bounds/dedup/empty-title check
-            // below (against the full `segments` list) still applies
-            // uniformly across every window's contributions.
-            for (const Chapter &chapter : *windowChapters)
-                chapters.append({chapter.afterSegmentIndex + startIdx, chapter.title});
-        }
-
-        // See LabelingEngine::generateChapters()'s doc comment: the LLM only
-        // ever returns which SEGMENT INDEX a chapter starts after — never
-        // trusted as a timestamp directly. Sanitized here, against this
-        // job's own freshly-parsed `segments`, before anything touches disk
-        // (including the merge pass below, which needs valid indices to
-        // pull excerpt text). Out-of-range or duplicate target indices (and
-        // an empty title, which would otherwise render as a bare "## [t] "
-        // marker line) are silently dropped, not treated as a job failure —
-        // the grammar only constrains JSON shape, never the semantic
-        // validity of the integer (a small model can still propose e.g.
-        // afterSegment=99999 on a 50-segment transcript). Sorted by
-        // afterSegmentIndex ascending: window offsets keep this roughly
-        // sorted already, but mergeSimilarChapters() below treats list order
-        // AS adjacency, so this makes that assumption actually hold.
-        QList<Chapter> sanitized;
-        QSet<int> seenTargets;
-        for (const Chapter &chapter : chapters) {
-            const int targetIndex = chapter.afterSegmentIndex + 1;
-            const QString title = chapter.title.trimmed();
-            if (targetIndex < 0 || targetIndex >= segments.size() || title.isEmpty())
-                continue;
-            if (seenTargets.contains(targetIndex))
-                continue;
-            seenTargets.insert(targetIndex);
-            sanitized.append({chapter.afterSegmentIndex, title});
-        }
-        std::sort(sanitized.begin(), sanitized.end(),
-                  [](const Chapter &a, const Chapter &b) { return a.afterSegmentIndex < b.afterSegmentIndex; });
-
-        // Small instruct models over-propose boundaries in generateChapters()
-        // itself (see kChapterSystemPrompt's doc comment) — collapse
-        // over-eager adjacent chapters back down with a second, narrower
-        // pass rather than trying to prompt-tune that away. This is a
-        // refinement on an already-valid result, not a prerequisite for one:
-        // a failure here (e.g. a transient generation error) falls back to
-        // the unmerged-but-sanitized chapters instead of failing the whole
-        // job.
-        // Items 30/50: one more cancel/pause checkpoint before the merge pass
-        // (itself a run of LLM calls) — cancel takes effect here rather than
-        // after the whole merge finishes.
-        if (waitWhilePausedOrCancelled()) {
-            emit finished(false, QStringLiteral("Cancelled"));
-            return;
-        }
-
-        QList<Chapter> finalChapters = sanitized;
-        QString mergeError;
-        if (const auto merged = m_labelingEngine->mergeSimilarChapters(sanitized, segmentTexts, density, &mergeError))
-            finalChapters = *merged;
-        else
-            qWarning() << "generateChaptersJob: chapter-merge pass failed, keeping unmerged chapters:" << mergeError;
-
-        QList<ResolvedChapter> resolved;
-        resolved.reserve(finalChapters.size());
-        for (const Chapter &chapter : finalChapters)
-            resolved.append({segments.at(chapter.afterSegmentIndex + 1).t0, chapter.title});
-
-        QString writeError;
-        if (!writeChaptersField(mdPath, resolved, &writeError)) {
-            emit finished(false, writeError);
-            return;
-        }
-        emit progress(1.0);
-        emit finished(true, {});
-    }
-
-    // Item 52: standalone speaker diarization on an already-transcribed file —
-    // re-runs (or adds) speaker detection WITHOUT re-transcribing audio. Reads
-    // the existing .md's segment lines, decodes the sibling audio, runs the
-    // SAME diarization core run()'s inline speakerDetection path uses
-    // (runDiarizationPass()), assigns each existing segment its overlapping
-    // speaker (labelForSegment() via spliceBodySpeakers()), and writes the
-    // "[Speaker N]" tags + updated "speakerDetection: true"/"speakers:"
-    // frontmatter back into the .md in place (prelude/chapters/repeat markers
-    // preserved). A failure here IS the job's result (like relabelJob()).
-    // Cancel takes effect at the post-diarize checkpoint (diarization has no
-    // mid-pass abort hook — see runDiarizationPass()).
-    void diarizeJob(const QString &filePath, const QString &vaultPath, const QString &segmentationModelId,
-                    const QString &embeddingModelId, double threshold)
-    {
-        // Needs neither the whisper nor the label model — free them now
-        // (GPU hygiene, mirrors relabelJob()'s eviction).
-        m_engine.reset();
-        m_labelingEngine.reset();
-
-        const QString mdPath = sidecarPath(filePath);
-        if (!QFileInfo::exists(mdPath)) {
-            emit finished(false, QStringLiteral("%1 has not been transcribed yet").arg(filePath));
-            return;
-        }
-
-        // Read frontmatter + body + the file's existing "speakers:" allowlist
-        // up front (before the slow decode) so a malformed/absent file fails
-        // fast — same parse the rename/merge paths use.
-        QStringList frontmatterLines;
-        QString body;
-        int speakersLineIndex = -1;
-        QStringList knownSpeakers;
-        QStringList distinctTags;
-        QString parseError;
-        if (!parseSpeakerTaggedFile(mdPath, &frontmatterLines, &body, &speakersLineIndex, &knownSpeakers,
-                                     &distinctTags, &parseError)) {
-            emit finished(false, parseError);
-            return;
-        }
-
-        // Decode the sibling audio (same 16k mono pass whisper uses) —
-        // pause/cancel honored between chunks, same as run()'s decode.
-        emit phase(QStringLiteral("decoding"));
-        bool decodePausedSignaled = false;
-        AudioDecoder::DecodeControl decodeControl;
-        decodeControl.paused = [this, &decodePausedSignaled] {
-            const bool p = m_pauseRequested.load();
-            if (p != decodePausedSignaled) {
-                decodePausedSignaled = p;
-                emit paused(p);
-            }
-            return p;
-        };
-        decodeControl.cancelled = [this] { return m_cancelRequested.load(); };
-        QString decodeError;
-        auto pcm = AudioDecoder::decodeTo16kMono(filePath, &decodeError, decodeControl);
-        if (!pcm) {
-            emit finished(false, decodeError.isEmpty() ? QStringLiteral("audio decode failed") : decodeError);
-            return;
-        }
-
-        bool effective = false;
-        QString diarError;
-        const std::vector<DiarizedTurn> turns = runDiarizationPass(
-            *pcm, vaultPath, segmentationModelId, embeddingModelId, static_cast<float>(threshold), &effective,
-            &diarError);
-        // Unlike run() (where a diarization failure degrades to ASR-only),
-        // detecting speakers IS this job's only purpose — so a failure here
-        // is the job's result.
-        if (!effective) {
-            emit finished(false, diarError.isEmpty() ? QStringLiteral("speaker detection failed") : diarError);
-            return;
-        }
-
-        // A cancel requested DURING diarization (no mid-pass abort hook — see
-        // runDiarizationPass()) takes effect here, before any file I/O.
-        if (waitWhilePausedOrCancelled()) {
-            emit finished(false, QStringLiteral("Cancelled"));
-            return;
-        }
-
-        const double totalSeconds = static_cast<double>(pcm->size()) / 16000.0;
-        QStringList appliedSpeakers;
-        const QString newBody = spliceBodySpeakers(body, knownSpeakers, turns, totalSeconds, &appliedSpeakers);
-
-        // Update the frontmatter to reflect that detection now ran: set
-        // speakerDetection true, replace/insert the "speakers:" allowlist with
-        // exactly the labels that actually landed on a body line (mirrors
-        // syncSpeakersFrontmatterToBody()), and drop any stale
-        // speakerDetectionError from an earlier failed attempt. Every other
-        // frontmatter key (model/vad/transcribedAt/label/tags/...) is left
-        // untouched.
-        const auto setKey = [&frontmatterLines](const QString &key, const QString &value) {
-            for (int i = 0; i < frontmatterLines.size(); ++i) {
-                const int c = frontmatterLines[i].indexOf(QLatin1Char(':'));
-                if (c >= 0 && frontmatterLines[i].left(c).trimmed() == key) {
-                    frontmatterLines[i] = key + QStringLiteral(": ") + value;
-                    return;
-                }
-            }
-            frontmatterLines.append(key + QStringLiteral(": ") + value);
-        };
-        const auto removeKey = [&frontmatterLines](const QString &key) {
-            for (int i = 0; i < frontmatterLines.size(); ++i) {
-                const int c = frontmatterLines[i].indexOf(QLatin1Char(':'));
-                if (c >= 0 && frontmatterLines[i].left(c).trimmed() == key) {
-                    frontmatterLines.removeAt(i);
-                    return;
-                }
-            }
-        };
-        setKey(QStringLiteral("speakerDetection"), QStringLiteral("true"));
-        removeKey(QStringLiteral("speakerDetectionError"));
-        if (appliedSpeakers.isEmpty())
-            removeKey(QStringLiteral("speakers"));
-        else
-            setKey(QStringLiteral("speakers"), appliedSpeakers.join(QStringLiteral(", ")));
-
-        QString writeError;
-        if (!writeFrontmatterBlock(mdPath, frontmatterLines, newBody, &writeError)) {
-            emit finished(false, writeError);
-            return;
-        }
-        emit finished(true, {});
-    }
-
-    // Queued through the same job pipeline as run()/relabelJob() above (see
-    // TranscriptionController::renameSpeaker()'s doc comment) — emits BOTH
-    // the generic finished() (so this participates in busy/progress/the
-    // jobs() list exactly like any other task) AND the specific
-    // speakerRenamed() (so the caller learns which speaker's rename this
-    // result belongs to, which finished() alone can't carry).
-    void renameSpeaker(const QString &audioPath, const QString &oldName, const QString &newName)
-    {
-        QString error;
-        const bool ok = renameSpeakerInFile(sidecarPath(audioPath), oldName, newName, &error);
-        // Reported back against audioPath (not the .md sidecar) — matches
-        // finished()'s convention of identifying a file by its ORIGINAL
-        // (audio) fileUrl, which is what QML's Connections target compares
-        // against.
-        emit speakerRenamed(audioPath, oldName, ok, error);
-        emit finished(ok, error);
-    }
-
-    // Mirrors renameSpeaker() immediately above, just calling
-    // mergeSpeakersInFile() instead — see
-    // TranscriptionController::mergeSpeakers()'s doc comment.
-    void mergeSpeakers(const QString &audioPath, const QString &sourceName, const QString &targetName)
-    {
-        QString error;
-        const bool ok = mergeSpeakersInFile(sidecarPath(audioPath), sourceName, targetName, &error);
-        emit speakersMerged(audioPath, sourceName, targetName, ok, error);
-        emit finished(ok, error);
-    }
-
-    // Wave N (task system, item 5): a model download as its OWN job — no
-    // engine touched, nothing evicted, just bytes fetched via ModelManager.
-    // target is "model" (uses modelId)/"label"/"diarization", matching
-    // TranscriptionController::DownloadTarget one-to-one (passed as a plain
-    // QString rather than the enum itself to cross the thread boundary
-    // without needing a registered Qt metatype for a controller-private
-    // enum).
-    void download(const QString &target, const QString &modelId)
-    {
-        const ModelManager::DownloadProgressCallback onProgress = [this](qint64 done, qint64 total) {
-            emit downloadProgress(done, total);
-        };
-        ModelManager::DownloadControl control;
-        control.paused = [this] { return m_pauseRequested.load(); };
-        control.cancelled = [this] { return m_cancelRequested.load(); };
-
-        QString error;
-        bool ok = false;
-        if (target == QStringLiteral("model")) {
-            ok = !ModelManager::ensureModel(modelId, &error, nullptr, onProgress, control).isEmpty();
-        } else if (target == QStringLiteral("label")) {
-            ok = !ModelManager::ensureLabelModel(&error, onProgress, control).isEmpty();
-        } else if (target == QStringLiteral("vad")) {
-            ok = !ModelManager::ensureVadModel(&error, onProgress, control).isEmpty();
-        } else if (target == QStringLiteral("segmentation")) {
-            ok = !ModelManager::ensureSegmentationModel(modelId, &error, nullptr, onProgress, control).isEmpty();
-        } else if (target == QStringLiteral("embedding")) {
-            ok = !ModelManager::ensureEmbeddingModel(modelId, &error, nullptr, onProgress, control).isEmpty();
-        }
-        emit finished(ok, error);
-    }
-
-    // Split-recording combine (see
-    // TranscriptionController::findCombineGroups()'s doc comment):
-    // concatenates sourcePaths (already in combine order per the caller) into
-    // outputPath via ffmpeg's concat demuxer with stream copy (lossless,
-    // fast — these are same-format parts from the same recorder), then
-    // moves (or deletes, per deleteOriginals) each source into a sibling
-    // .combined/ dir so the next vault scan doesn't re-detect the same
-    // group. Never touches m_engine/m_diarizationEngine/m_labelingEngine —
-    // unlike run()/download(), this job doesn't use any of them, so there's
-    // nothing to evict/reload here.
-    void combineJob(const QStringList &sourcePaths, const QString &outputPath, bool deleteOriginals)
-    {
-        emit phase(QStringLiteral("combining"));
-
-        QTemporaryFile listFile;
-        if (!listFile.open()) {
-            emit finished(false, QStringLiteral("could not create ffmpeg concat list"));
-            return;
-        }
-        // The merged file stands in for the original recording, so it inherits
-        // the first part's mtime instead of taking "now" (see the mtime note in
-        // findCombineGroups()'s doc comment — mtime is the vault's stand-in for
-        // when a recording happened, since birth time doesn't survive a copy).
-        // Read before ffmpeg runs, because the sources move into .combined/
-        // afterwards. sourcePaths is in combine order, so .first() is the part
-        // the recording actually starts with — not necessarily the oldest, if
-        // the rule designated a sort differentiator.
-        const QDateTime firstPartMtime =
-            sourcePaths.isEmpty() ? QDateTime() : QFileInfo(sourcePaths.first()).lastModified();
-
-        qint64 totalInputBytes = 0;
-        for (const QString &path : sourcePaths) {
-            // ffmpeg concat demuxer syntax: single-quoted paths, any literal
-            // single quote escaped as '\''.
-            QString escaped = path;
-            escaped.replace(QStringLiteral("'"), QStringLiteral("'\\''"));
-            listFile.write(QStringLiteral("file '%1'\n").arg(escaped).toUtf8());
-            totalInputBytes += QFileInfo(path).size();
-        }
-        listFile.close();
-
-        QProcess ffmpeg;
-        ffmpeg.start(QStringLiteral("ffmpeg"),
-                      {QStringLiteral("-f"), QStringLiteral("concat"), QStringLiteral("-safe"), QStringLiteral("0"),
-                       QStringLiteral("-i"), listFile.fileName(), QStringLiteral("-c"), QStringLiteral("copy"),
-                       QStringLiteral("-y"), QStringLiteral("-hide_banner"), QStringLiteral("-loglevel"),
-                       QStringLiteral("error"), outputPath});
-        if (!ffmpeg.waitForStarted()) {
-            emit finished(false, QStringLiteral("failed to start ffmpeg"));
-            return;
-        }
-
-        // Same 100ms poll/pause/cancel shape as AudioDecoder::decodeTo16kMono
-        // — SIGSTOP/SIGCONT for pause, kill for cancel. Progress is
-        // approximate (output file size vs. summed input size — stream-copy
-        // throughput tracks output size closely for PCM/WAV), matching this
-        // app's existing "poll a size on disk" precedent (ModelManager's
-        // curl downloads) rather than adding a second, ffmpeg-`-progress`-
-        // based progress-parsing mechanism just for this one job kind.
-        bool wasPaused = false;
-        bool cancelled = false;
-        while (ffmpeg.state() != QProcess::NotRunning) {
-            if (isCancelRequested()) {
-                cancelled = true;
-                ffmpeg.kill();
-                ffmpeg.waitForFinished(2000);
-                break;
-            }
-            const bool shouldPause = m_pauseRequested.load();
-            if (shouldPause && !wasPaused) {
-                ::kill(static_cast<pid_t>(ffmpeg.processId()), SIGSTOP);
-                wasPaused = true;
-                emit paused(true);
-            } else if (!shouldPause && wasPaused) {
-                ::kill(static_cast<pid_t>(ffmpeg.processId()), SIGCONT);
-                wasPaused = false;
-                emit paused(false);
-            }
-            ffmpeg.waitForReadyRead(100);
-            if (totalInputBytes > 0) {
-                const qint64 outBytes = QFileInfo(outputPath).size();
-                emit progress(std::clamp(static_cast<double>(outBytes) / static_cast<double>(totalInputBytes), 0.0, 1.0));
-            }
-        }
-
-        if (cancelled) {
-            QFile::remove(outputPath);
-            emit finished(false, QStringLiteral("Cancelled"));
-            return;
-        }
-
-        if (ffmpeg.exitStatus() != QProcess::NormalExit || ffmpeg.exitCode() != 0) {
-            const QString err = QString::fromUtf8(ffmpeg.readAllStandardError());
-            QFile::remove(outputPath);
-            emit finished(false, err.isEmpty() ? QStringLiteral("ffmpeg concat failed") : err);
-            return;
-        }
-
-        emit progress(1.0);
-
-        // Restamp only now that ffmpeg has exited and closed the output —
-        // anything that writes the file stamps mtime as "now", so an earlier
-        // setFileTime() would just get clobbered.
-        if (firstPartMtime.isValid()) {
-            QFile out(outputPath);
-            if (out.open(QIODevice::ReadWrite))
-                out.setFileTime(firstPartMtime, QFileDevice::FileModificationTime);
-        }
-
-        // Move (or delete) every source now that the merge succeeded — a
-        // sibling .combined/ dir next to each one (hidden dotfolder, same
-        // convention as .transcriber/ — naturally invisible to
-        // VaultTreeModel::rebuild()'s scan, which never passes QDir::Hidden)
-        // so the next scan doesn't re-detect this exact group.
-        for (const QString &path : sourcePaths) {
-            if (deleteOriginals) {
-                QFile::remove(path);
-                continue;
-            }
-            const QFileInfo info(path);
-            QDir combinedDir(info.absolutePath() + QStringLiteral("/.combined"));
-            if (!combinedDir.exists())
-                combinedDir.mkpath(QStringLiteral("."));
-            QFile::rename(path, combinedDir.absoluteFilePath(info.fileName()));
-        }
-
-        emit finished(true, QString());
-    }
-
-    // Item 37: drag-and-drop / external audio import — copies sourcePath into
-    // destPath (the in-vault destination VaultTreeModel::importDestinationFor()
-    // already validated on the GUI thread) OFF the GUI thread, so a large file
-    // no longer freezes the UI. A chunked read/write loop (rather than a
-    // single blocking QFile::copy) is what lets this report byte progress and
-    // honor pause/cancel between chunks, same cooperative-checkpoint discipline
-    // combineJob()/download() use. Never touches m_engine/m_diarizationEngine/
-    // m_labelingEngine — nothing to evict/reload for a plain file copy.
-    // One USB grab: the whole recursive scan+copy of one mounted volume under
-    // one already-resolved rule. The walk itself is runUsbGrabScan() (shared
-    // verbatim with the dry-run preview — see UsbGrabJob.h); everything here is
-    // just wiring it to this worker's phase/progress/pause/cancel contract.
-    //
-    // Reports its counts through usbGrabScanCompleted() rather than stuffing
-    // them into finished(ok, error): a grab's result is "copied N, skipped M,
-    // and here are the K files that failed", which is not ok/error-shaped —
-    // per-file copy errors are non-fatal, so a grab that missed one file is a
-    // SUCCEEDED job that has something to report, not a failed one.
-    void usbGrabJob(const UsbGrabRule &rule, const QString &mountPath, const QString &destinationPath)
-    {
-        emit phase(QStringLiteral("grabbing"));
-
-        bool wasPaused = false;
-        UsbGrabScanHooks hooks;
-        hooks.onProgress = [this](int processed, int total) {
-            if (total > 0)
-                emit progress(std::clamp(static_cast<double>(processed) / static_cast<double>(total), 0.0, 1.0));
-        };
-        hooks.shouldAbort = [this, &wasPaused] {
-            // Between files, not between bytes: a grab's unit of work is one
-            // file, and QFile::copy() is uninterruptible anyway, so a pause or
-            // cancel lands at the next file boundary. Mirrors importJob()'s
-            // loop — no subprocess to SIGSTOP, so just block this worker here.
-            while (m_pauseRequested.load() && !isCancelRequested()) {
-                if (!wasPaused) {
-                    wasPaused = true;
-                    emit paused(true);
-                }
-                QThread::msleep(100);
-            }
-            if (wasPaused) {
-                wasPaused = false;
-                emit paused(false);
-            }
-            return isCancelRequested();
-        };
-
-        const UsbGrabScanResult result = runUsbGrabScan(rule, mountPath, destinationPath, /*dryRun=*/false, hooks);
-
-        if (!result.refusal.isEmpty()) {
-            // A refusal means the walk never ran (see usbGrabRefusalReason) —
-            // a genuinely failed job, unlike a per-file copy error.
-            emit usbGrabScanCompleted(0, 0, QStringList { result.refusal }, false);
-            emit finished(false, result.refusal);
-            return;
-        }
-
-        emit usbGrabScanCompleted(result.filesCopied, result.filesSkipped, result.errors, result.aborted);
-        if (result.aborted) {
-            emit finished(false, QStringLiteral("Cancelled"));
-            return;
-        }
-        emit progress(1.0);
-        emit finished(true, QString());
-    }
-
-    void importJob(const QString &sourcePath, const QString &destPath)
-    {
-        emit phase(QStringLiteral("importing"));
-
-        QFile src(sourcePath);
-        if (!src.open(QIODevice::ReadOnly)) {
-            emit finished(false, QStringLiteral("could not open source file"));
-            return;
-        }
-        // Collision could have appeared between validation and now — never
-        // silently overwrite (same refusal as importDestinationFor()).
-        if (QFileInfo::exists(destPath)) {
-            emit finished(false, QStringLiteral("a file with that name already exists in the vault"));
-            return;
-        }
-        QFile dst(destPath);
-        if (!dst.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
-            emit finished(false, QStringLiteral("could not create destination file"));
-            return;
-        }
-
-        const qint64 total = src.size();
-        qint64 copied = 0;
-        constexpr qint64 kChunk = 1 << 20; // 1 MiB
-        bool wasPaused = false;
-        while (true) {
-            if (isCancelRequested()) {
-                dst.close();
-                dst.remove(); // don't leave a half-written file in the vault
-                emit finished(false, QStringLiteral("Cancelled"));
-                return;
-            }
-            if (m_pauseRequested.load()) {
-                // No subprocess to SIGSTOP (unlike combineJob/decode) — just
-                // block this worker between chunks until resumed/cancelled.
-                if (!wasPaused) {
-                    wasPaused = true;
-                    emit paused(true);
-                }
-                QThread::msleep(100);
-                continue;
-            }
-            if (wasPaused) {
-                wasPaused = false;
-                emit paused(false);
-            }
-            const QByteArray buf = src.read(kChunk);
-            if (buf.isEmpty())
-                break; // done (or read error — treated as EOF; size check below is implicit)
-            if (dst.write(buf) != buf.size()) {
-                dst.close();
-                dst.remove();
-                emit finished(false, QStringLiteral("write failed while copying into the vault"));
-                return;
-            }
-            copied += buf.size();
-            if (total > 0)
-                emit progress(std::clamp(static_cast<double>(copied) / static_cast<double>(total), 0.0, 1.0));
-        }
-        dst.flush();
-        dst.close();
-        emit progress(1.0);
-        emit finished(true, QString());
-    }
-
-    // GPU memory hygiene, the idle case: run()/relabelJob() already evict
-    // whichever engine THIS job doesn't need (see their doc comments), but
-    // that leaves whichever engine the MOST RECENT job DID use warm
-    // indefinitely — fine while more jobs are queued (that's the whole
-    // point of staying warm), pointless once the queue is empty and nothing
-    // is going to reuse it. TranscriptionController::onWorkerFinished()
-    // calls this exactly when the job queue has just drained to empty, so
-    // idle GPU footprint goes back to ~0 instead of sitting at whatever the
-    // last job happened to need. Evicting all three unconditionally (rather
-    // than tracking which one is actually still resident) keeps this simple
-    // — resetting an already-null unique_ptr is a no-op.
-    void evictIdle()
-    {
-        m_engine.reset();
-        m_diarizationEngine.reset();
-        m_labelingEngine.reset();
-    }
-
-signals:
-    void progress(double fraction);
-    // Emitted by usbGrabJob() immediately before its finished(), carrying the
-    // grab's actual result (which finished(ok, error) has no room for — see
-    // usbGrabJob()'s doc comment). cancelled means the counts are a partial
-    // tally, so the controller must not report the grab as completed.
-    void usbGrabScanCompleted(int filesCopied, int filesSkipped, const QStringList &errors, bool cancelled);
-    // 2026-07-10 (rolling-average phase weighting): fired once a named phase
-    // (one of TranscriptionController::kTimedPhases) completes NORMALLY —
-    // never on a cancel/failure mid-phase, see run()'s emit sites — so
-    // TranscriptionController can feed it into that phase's RollingAverage
-    // (recordPhaseDuration()) and re-derive overallProgress's per-phase
-    // widths from real timing data instead of a fixed guess. Replaced the
-    // old overallProgress signal this worker used to emit directly (a
-    // hardcoded diarization=first-half/transcription=second-half blend) —
-    // the controller now computes that blend itself, since it's the one
-    // that owns the rolling-average data this needs.
-    void phaseDurationMs(const QString &phase, qint64 durationMs);
-    // See TranscriptionController::liveUpdateTick's doc comment — emitted
-    // (throttled, see run()'s liveTimer) each time a real new segment line
-    // is written to the .md sidecar during an in-progress transcription.
-    void segmentWritten();
-    // See TranscriptionController::currentPhase's doc comment — emitted at
-    // each phase transition within run() (loading/detecting-speakers/
-    // transcribing); never emitted by relabelJob()/renameSpeaker()/
-    // mergeSpeakers() (none of these have phases worth naming).
-    void phase(const QString &phase);
-    // Item O35: fired once right after a model successfully (re)loads in
-    // run() — see WhisperCppEngine::activeBackendName()'s doc comment for
-    // where the value itself comes from. Never emitted by relabelJob()/
-    // renameSpeaker()/mergeSpeakers()/download() (none of them touch
-    // WhisperCppEngine).
-    void backendNameChanged(const QString &name);
-    // Wave N (task system): fired on a real pause/resume transition (never
-    // on every poll — see waitWhilePausedOrCancelled()'s "only on change"
-    // discipline).
-    void paused(bool isPaused);
-    void finished(bool ok, const QString &error);
-    // Wave N (task system, item 5): download-job progress — deliberately a
-    // SEPARATE signal from progress()/phase() above (which are transcribe-
-    // job-specific concepts: whisper's segment progress, diarization/
-    // loading/transcribing phase names) rather than overloading them, since
-    // a download job has neither segments nor those phases, just bytes.
-    void downloadProgress(qint64 bytesDone, qint64 bytesTotal);
-    void speakerRenamed(const QString &path, const QString &oldName, bool ok, const QString &error);
-    void speakersMerged(const QString &path, const QString &sourceName, const QString &targetName, bool ok,
-                         const QString &error);
-    // Model-benchmark progress (see benchmarkJob()): started per model (with
-    // its index/total for a progress bar), done per model (the finished result
-    // row), finished once with the whole run, or failed before any model ran
-    // (e.g. audio decode failed).
-    void benchmarkModelStarted(const QString &modelId, int index, int total);
-    void benchmarkModelDone(const QVariantMap &result);
-    void benchmarkFinished(const QVariantMap &run);
-    void benchmarkFailed(const QString &error);
-    // Diarization sweep (diarizationBenchmarkJob) — mirrors the model-benchmark
-    // trio; a decode failure reuses benchmarkFailed.
-    void diarizationBenchmarkComboStarted(const QString &label, int index, int total);
-    void diarizationBenchmarkComboDone(const QVariantMap &result);
-    void diarizationBenchmarkFinished(const QVariantMap &run);
-
-private:
-    // Runs one model/engine for benchmarkJob() and returns its result row. Never
-    // writes anything; an unavailable/failed model becomes a row with ok=false
-    // and a reason rather than aborting the whole benchmark. runtimeMs measures
-    // ONLY transcribe() (model load happens before the timer starts, so tiers
-    // aren't penalized for cold-load differences the way the file's own
-    // transcription would be).
-    QVariantMap runOneBenchmarkModel(const QString &modelId, const QString &vaultPath, const AudioChunk &chunk,
-                                     double audioSeconds, const AbortCallback &onAbort)
-    {
-        QVariantMap row;
-        row["modelId"] = modelId;
-
-        std::unique_ptr<TranscriptionEngine> engine;
-        if (isEngineModelId(modelId)) {
-            QString error;
-            const auto desc = resolveEngine(engineIdFromModelId(modelId), vaultPath, &error);
-            row["kind"] = QStringLiteral("engine");
-            row["label"] = desc && desc->manifestValid ? desc->manifest.name : engineIdFromModelId(modelId);
-            if (!desc || !desc->available) {
-                row["ok"] = false;
-                row["error"] = error.isEmpty() ? QStringLiteral("engine unavailable") : error;
-                return row;
-            }
-            engine = std::make_unique<SubprocessEngine>(desc->manifest, desc->dir);
-        } else if (ModelManager::isParakeetModelId(modelId)) {
-            row["kind"] = QStringLiteral("parakeet");
-            row["label"] = modelId;
-            const ModelManager::ParakeetModelPaths p =
-                ModelManager::parakeetModelPaths();
-            if (!p.isComplete()) {
-                row["ok"] = false;
-                row["error"] = QStringLiteral("model not downloaded");
-                return row;
-            }
-            auto parakeet = std::make_unique<ParakeetEngine>(p.encoder, p.decoder, p.joiner, p.tokens);
-            if (!parakeet->isValid()) {
-                row["ok"] = false;
-                row["error"] = QStringLiteral("failed to load Parakeet model");
-                return row;
-            }
-            engine = std::move(parakeet);
-        } else {
-            row["kind"] = QStringLiteral("whisper");
-            row["label"] = modelId;
-            QString error;
-            // Only downloaded tiers are passed in, so ensureModel() resolves the
-            // existing file without a network fetch.
-            const QString modelPath = ModelManager::ensureModel(modelId, &error);
-            if (modelPath.isEmpty()) {
-                row["ok"] = false;
-                row["error"] = error.isEmpty() ? QStringLiteral("model unavailable") : error;
-                return row;
-            }
-            auto whisper = std::make_unique<WhisperCppEngine>(modelPath);
-            if (!whisper->isValid()) {
-                row["ok"] = false;
-                row["error"] = QStringLiteral("failed to load model");
-                return row;
-            }
-            engine = std::move(whisper);
-        }
-
-        QElapsedTimer timer;
-        timer.start();
-        const std::vector<Segment> segments = engine->transcribe(chunk, {}, {}, onAbort);
-        const qint64 runtimeMs = timer.elapsed();
-
-        QString text;
-        int wordCount = 0;
-        for (const Segment &seg : segments) {
-            const QString segText = QString::fromStdString(seg.text).trimmed();
-            if (segText.isEmpty())
-                continue;
-            if (!text.isEmpty())
-                text += QLatin1Char(' ');
-            text += segText;
-            wordCount += segText.split(QRegularExpression(QStringLiteral("\\s+")), Qt::SkipEmptyParts).size();
-        }
-
-        row["ok"] = true;
-        row["runtimeMs"] = runtimeMs;
-        row["segmentCount"] = static_cast<int>(segments.size());
-        row["wordCount"] = wordCount;
-        row["charCount"] = text.size();
-        // Realtime factor: seconds of audio processed per second of wall clock
-        // (>1 = faster than realtime). 0 if it somehow finished instantly.
-        row["realtimeFactor"] = runtimeMs > 0 ? audioSeconds / (runtimeMs / 1000.0) : 0.0;
-        row["text"] = text;
-        return row;
-    }
-
-    // Item 52: the diarization core shared by BOTH the inline transcribe path
-    // (run(), gated by its speakerDetection toggle) and the standalone
-    // diarizeJob(). Ensures + loads the diarization models, emits the
-    // "detecting-speakers" phase and its two sub-phases with REAL progress
-    // (sherpa-onnx's own chunk-processed callback, split at the 0.30
-    // segmentation/embedding boundary — see the vendored patch), runs the
-    // whole pass over pcm, then evicts the engine (a one-shot pass — nothing
-    // reuses it; cheap ~35MB reload next time). Sets *effectiveOut true iff
-    // diarization actually ran; otherwise *errorOut carries why (models
-    // unavailable / failed to load) — the never-misrepresent contract
-    // writeFrontmatter() records. Pause BLOCKS inside the progress callback
-    // (it fires often enough); a cancel is NOT actionable mid-pass — the
-    // DiarizationProgressCallback is `void(double)` (see DiarizationEngine.h),
-    // so there's no channel to abort sherpa-onnx's current batch, and its
-    // return value is deliberately ignored here. A cancel requested during
-    // diarization therefore takes effect at the CALLER's post-diarize
-    // checkpoint (run()'s waitWhilePausedOrCancelled() before file I/O,
-    // diarizeJob()'s equivalent), not instantly — a hard sherpa-onnx
-    // limitation, not faked.
-    std::vector<DiarizedTurn> runDiarizationPass(const std::vector<float> &pcm, const QString &vaultPath,
-                                                 const QString &segmentationModelId, const QString &embeddingModelId,
-                                                 float threshold, bool *effectiveOut, QString *errorOut)
-    {
-        Q_UNUSED(vaultPath);
-        *effectiveOut = false;
-        errorOut->clear();
-
-        emit phase(QStringLiteral("detecting-speakers"));
-        QString segPath, embedPath, diarizeError;
-        if (!ModelManager::ensureDiarizationModels(segmentationModelId, embeddingModelId, &segPath, &embedPath,
-                                                    &diarizeError)) {
-            *errorOut =
-                diarizeError.isEmpty() ? QStringLiteral("speaker diarization models unavailable") : diarizeError;
-            return {};
-        }
-        // Rebuild when the resolved paths OR the sensitivity change — the
-        // threshold is baked into the sherpa config at construction.
-        if (!m_diarizationEngine || !m_diarizationEngine->isValid() || m_diarizationSegPath != segPath
-            || m_diarizationEmbedPath != embedPath || m_diarizationThreshold != threshold) {
-            m_diarizationEngine = std::make_unique<DiarizationEngine>(segPath, embedPath, threshold);
-            m_diarizationSegPath = segPath;
-            m_diarizationEmbedPath = embedPath;
-            m_diarizationThreshold = threshold;
-        }
-        if (!m_diarizationEngine->isValid()) {
-            *errorOut = QStringLiteral("failed to load speaker diarization models");
-            m_diarizationEngine.reset();
-            return {};
-        }
-
-        QString detectingSubPhase;
-        // sherpa-onnx fires this callback once per internal ONNX chunk — the
-        // segmentation pass alone runs the model roughly once per ~1s audio
-        // hop (see cpuThreadCount()'s doc comment in DiarizationEngine.cpp),
-        // so a long recording means hundreds to thousands of calls, easily
-        // faster than the GUI thread can drain progress()'s queued
-        // connection (progressChanged() + recomputeOverallProgress() +
-        // overallProgressChanged() per tick — see the connect() in this
-        // controller's ctor). Unthrottled, that backlog starves repaints for
-        // the whole diarization pass, LOOKING like a GUI-thread freeze even
-        // though the actual inference is correctly running on this worker
-        // thread. Throttled to kLiveUpdateThrottleMs, same as run()'s live
-        // segment-write path — but the fraction==1.0 tail call always gets
-        // through so the bar actually reaches 100%.
-        QElapsedTimer progressThrottle;
-        progressThrottle.start();
-        qint64 lastProgressTickMs = -kLiveUpdateThrottleMs;
-        std::vector<DiarizedTurn> turns = m_diarizationEngine->diarize(
-            pcm, [this, &detectingSubPhase, &progressThrottle, &lastProgressTickMs](double fraction) {
-                waitWhilePausedOrCancelled(); // see this method's doc comment (cancel not actionable mid-pass)
-                const QString subPhase = fraction < 0.30 ? QStringLiteral("detecting-speakers-segmenting")
-                                                          : QStringLiteral("detecting-speakers-identifying");
-                if (subPhase != detectingSubPhase) {
-                    detectingSubPhase = subPhase;
-                    emit phase(subPhase);
-                }
-                const qint64 nowMs = progressThrottle.elapsed();
-                if (fraction >= 1.0 || nowMs - lastProgressTickMs >= kLiveUpdateThrottleMs) {
-                    lastProgressTickMs = nowMs;
-                    emit progress(fraction);
-                }
-            });
-        *effectiveOut = true;
-        m_diarizationEngine.reset();
-        return turns;
-    }
-
-    // Used by relabelJob() — both a manual "regenerate label" request and an
-    // automatic post-transcription follow-up (see
-    // TranscriptionController::onWorkerFinished()) go through the SAME
-    // relabelJob() call now, run() no longer has its own bonus-pass branch.
-    // Resolves/warms the label model, generates, and splices the result into
-    // mdPath's frontmatter. Returns false + *errorOut on failure.
-    bool runLabelingPass(const QString &vaultPath, const QString &transcriptText, const QString &mdPath,
-                         bool restrictTagsToExisting, double tagReuseBias, double wordiness,
-                         QString *errorOut = nullptr)
-    {
-        QString labelError;
-        const QString labelModelPath = ModelManager::ensureLabelModel(&labelError);
-        if (labelModelPath.isEmpty()) {
-            const QString msg = QStringLiteral("auto-label model unavailable: %1").arg(labelError);
-            if (errorOut)
-                *errorOut = msg;
-            else
-                qWarning() << msg;
-            return false;
-        }
-        if (!m_labelingEngine || !m_labelingEngine->isValid() || m_labelModelPath != labelModelPath) {
-            m_labelingEngine = std::make_unique<LabelingEngine>(labelModelPath);
-            m_labelModelPath = labelModelPath;
-        }
-        if (!m_labelingEngine->isValid()) {
-            const QString msg = QStringLiteral("failed to load labeling model at %1").arg(labelModelPath);
-            if (errorOut)
-                *errorOut = msg;
-            else
-                qWarning() << msg;
-            return false;
-        }
-        // Item 15 (Wave E): existingTags is now ALWAYS collected (cheap —
-        // vaults are small), not just when restrictTagsToExisting is set —
-        // tagReuseBias needs a vocabulary to bias toward even in
-        // unrestricted mode, whereas before this scan only ran for the hard-
-        // restrict case.
-        // nullptr = no cache: this runs on the worker thread (must not touch
-        // existingVaultTags()' GUI-thread cache) and only once per job.
-        const QStringList existingTags = collectVaultTags(vaultPath, nullptr);
-        // Item P29 / item 58: the prelude's length should scale WITH the
-        // transcript — capped DOWN for a short one (no "3-sentence transcript,
-        // 5-paragraph prelude") and scaled UP for a very long one (a 2-3 hour
-        // recording earns a fuller prelude tier). Both live in the static
-        // helper so the length->tier mapping is unit-testable without a model.
-        const int wordCount = transcriptText.split(QRegularExpression(QStringLiteral("\\s+")),
-                                                     Qt::SkipEmptyParts)
-                                   .size();
-        const double effectiveWordiness = TranscriptionController::effectiveWordinessForLength(wordiness, wordCount);
-        QString genError;
-        const auto result = m_labelingEngine->label(transcriptText, existingTags, restrictTagsToExisting,
-                                                     tagReuseBias, effectiveWordiness, &genError);
-        if (!result) {
-            const QString msg = QStringLiteral("auto-label generation failed: %1").arg(genError);
-            if (errorOut)
-                *errorOut = msg;
-            else
-                qWarning() << msg;
-            return false;
-        }
-        writeLabelingFields(mdPath, *result);
-        return true;
-    }
-
-    // Base-interface pointer so the in-process WhisperCppEngine and an
-    // out-of-process SubprocessEngine are swappable behind transcribe() (see
-    // DESIGN.md "Engine architecture"). m_modelPath doubles as the reuse key:
-    // the ggml file path for whisper, or the "engine:<id>" id for a subprocess
-    // engine — either way, an unchanged key skips a reload.
-    std::unique_ptr<TranscriptionEngine> m_engine;
-    QString m_modelPath;
-    std::unique_ptr<LabelingEngine> m_labelingEngine;
-    QString m_labelModelPath;
-    std::unique_ptr<DiarizationEngine> m_diarizationEngine;
-    QString m_diarizationSegPath;
-    QString m_diarizationEmbedPath;
-    // Part of the warm-engine cache key alongside the two paths — a changed
-    // sensitivity must rebuild the engine (threshold is baked into the sherpa
-    // config at construction; see DiarizationEngine::buildConfig).
-    float m_diarizationThreshold = 0.5f;
-
-    std::atomic<bool> m_pauseRequested{false};
-    std::atomic<bool> m_cancelRequested{false};
-    // Tracks whether the LAST waitWhilePausedOrCancelled() call actually
-    // blocked, so paused(true)/paused(false) fire only on a real transition
-    // — same "only on change" discipline as phase() (see run()'s doc
-    // comment), not once per poll.
-    bool m_pausedSignaled = false;
-
-    // Wave N (task system): the ONE interruption point every cooperative
-    // checkpoint in this file funnels through — whisper.cpp's
-    // abort_callback (via WhisperCppEngine's onAbort) and the diarization
-    // progress callback below both call this on every tick. Blocks (waking
-    // every 100ms to re-check) while paused and not cancelled; returns true
-    // the instant cancellation should take effect (whether requested before
-    // this call, or while blocked inside it).
-    bool waitWhilePausedOrCancelled()
-    {
-        while (m_pauseRequested.load() && !m_cancelRequested.load()) {
-            if (!m_pausedSignaled) {
-                m_pausedSignaled = true;
-                emit paused(true);
-            }
-            QThread::msleep(100);
-        }
-        if (m_pausedSignaled) {
-            m_pausedSignaled = false;
-            emit paused(false);
-        }
-        return m_cancelRequested.load();
-    }
-};
 
 TranscriptionController::TranscriptionController(QObject *parent)
     : QObject(parent)
 {
-    // A usbGrab job hands its whole UsbGrabRule to the worker across a QUEUED
-    // connection (see startJob()'s dispatch), which copies the argument through
-    // the metatype system — without this the invoke fails at RUNTIME, silently
-    // doing nothing, rather than at compile time.
-    qRegisterMetaType<UsbGrabRule>();
-
     loadPhaseTimings();
     // See recomputeOverallProgress()'s doc comment — the only way
     // "loading"/"decoding" (no real progress callback) ever advance
     // overallProgress mid-phase. Only ever running while m_phase is one of
-    // those two — started/stopped from the phase() handler below.
+    // those two — started/stopped from the phase() handler in connectTask().
     m_indeterminatePhaseTimer = new QTimer(this);
     m_indeterminatePhaseTimer->setInterval(200);
     connect(m_indeterminatePhaseTimer, &QTimer::timeout, this, &TranscriptionController::recomputeOverallProgress);
 
-    m_worker = new TranscriptionWorker;
-    m_worker->moveToThread(&m_thread);
-    connect(&m_thread, &QThread::finished, m_worker, &QObject::deleteLater);
-    connect(m_worker, &TranscriptionWorker::progress, this, [this](double fraction) {
+    m_runner = new TaskRunner;
+    m_runner->moveToThread(&m_thread);
+    connect(&m_thread, &QThread::finished, m_runner, &QObject::deleteLater);
+    // The ONE terminal-report path from the runner. A task cancelled before
+    // it ever ran never reaches the runner at all — the queue synthesizes its
+    // report directly (see cancelTaskAt()), so BOTH routes converge here and
+    // every enqueued task reports exactly once.
+    connect(m_runner, &TaskRunner::taskFinished, this, &TranscriptionController::onTaskFinished);
+
+    connect(this, &TranscriptionController::queueChanged, this, &TranscriptionController::persistQueue);
+    connect(this, &TranscriptionController::queueChanged, this, &TranscriptionController::rebuildJobStatusIndex);
+    m_thread.start();
+}
+
+// Wires ONE task's signals to this controller. The generic ones (progress/
+// phase/paused) are identical for every kind and are connected here; the
+// kind-specific ones are the small localized switch at the bottom — the
+// deliberate trade for typed per-subclass result signals instead of the old
+// worker's ~22 signals unioned onto one object (see .task/plan.md's
+// "Results" decision).
+//
+// Every connection is scoped to `task` as the sender AND `this` as context,
+// so they die with either object; a task is connected exactly once, right
+// before its first dispatch (see startTask()).
+void TranscriptionController::connectTask(Task *task)
+{
+    connect(task, &Task::progress, this, [this](double fraction) {
         m_progress = fraction;
         emit progressChanged();
-        // A combine job's "combining" phase, and (items 26/31) a chapter
-        // job's "chaptering" phase, aren't one of recomputeOverallProgress()'s
-        // fixed transcribe-job phase buckets (loading/decoding/[detecting-
-        // speakers]/transcribing) — each emits a single already-cumulative
-        // fraction, so mirror the downloadProgress connection below's direct
-        // assignment rather than trying to blend sub-phases.
+        // "combining"/"chaptering"/"importing" aren't one of
+        // recomputeOverallProgress()'s fixed transcribe phase buckets — each
+        // emits a single already-cumulative fraction, so assign it directly
+        // rather than trying to blend sub-phases.
         if (m_phase == QStringLiteral("combining") || m_phase == QStringLiteral("chaptering")
-            || m_phase == QStringLiteral("importing")) {
+            || m_phase == QStringLiteral("importing") || m_phase == QStringLiteral("downloading")
+            || m_phase == QStringLiteral("grabbing") || m_phase == QStringLiteral("benchmarking")) {
             m_overallProgress = fraction;
             emit overallProgressChanged();
         } else {
             recomputeOverallProgress();
         }
     });
-    // 2026-07-10 (rolling-average phase weighting): feeds this phase's
-    // just-finished duration into its RollingAverage — see
-    // recordPhaseDuration()'s doc comment. Replaces the old direct
-    // TranscriptionWorker::overallProgress connection (the controller now
-    // derives overallProgress itself, from m_phaseTimings + m_phase +
-    // m_progress, via recomputeOverallProgress()).
-    connect(m_worker, &TranscriptionWorker::phaseDurationMs, this, &TranscriptionController::recordPhaseDuration);
-    // Wave N (task system, item 5): a download job has no "phase" of its
-    // own in the transcribe-job sense, but reusing m_phase/m_progress here
-    // (rather than adding parallel QML-facing properties) means BottomBar's
-    // existing phase-label + percentage + progress-bar bindings work for a
-    // download job with no changes beyond a new phaseLabel() case for
-    // "downloading" (see BottomBar.qml). Guarded so currentPhaseChanged only
-    // fires on a real transition, not on every ~100ms poll tick.
-    connect(m_worker, &TranscriptionWorker::downloadProgress, this, [this](qint64 bytesDone, qint64 bytesTotal) {
-        if (m_phase != QStringLiteral("downloading")) {
-            m_phase = QStringLiteral("downloading");
-            emit currentPhaseChanged();
-        }
-        const double fraction =
-            bytesTotal > 0 ? static_cast<double>(bytesDone) / static_cast<double>(bytesTotal) : 0.0;
-        m_progress = fraction;
-        m_overallProgress = fraction;
-        emit progressChanged();
-        emit overallProgressChanged();
+    connect(task, &Task::phase, this, [this](const QString &phase) {
+        m_phase = phase;
+        m_phaseStartMs = activeElapsedMs();
+        emit currentPhaseChanged();
+        // See recomputeOverallProgress()'s doc comment — only "loading" and
+        // "decoding" need the timer (no real progress callback of their own);
+        // every other phase already advances overallProgress via progress().
+        if (phase == QStringLiteral("loading") || phase == QStringLiteral("decoding"))
+            m_indeterminatePhaseTimer->start();
+        else
+            m_indeterminatePhaseTimer->stop();
+        recomputeOverallProgress();
     });
-    connect(m_worker, &TranscriptionWorker::paused, this, [this](bool isPaused) {
+    connect(task, &Task::paused, this, [this](bool isPaused) {
         m_activePaused = isPaused;
         if (isPaused)
             m_activeAccumulatedMs += m_activeSegmentTimer.elapsed();
@@ -3198,89 +1609,58 @@ TranscriptionController::TranscriptionController(QObject *parent)
             m_activeSegmentTimer.restart();
         emit activePausedChanged();
     });
-    connect(this, &TranscriptionController::queueChanged, this, &TranscriptionController::persistQueue);
-    connect(this, &TranscriptionController::queueChanged, this, &TranscriptionController::rebuildJobStatusIndex);
-    connect(m_worker, &TranscriptionWorker::segmentWritten, this, [this] {
-        m_liveUpdateTick++;
-        emit liveUpdateTickChanged();
-    });
-    connect(m_worker, &TranscriptionWorker::phase, this, [this](const QString &phase) {
-        m_phase = phase;
-        m_phaseStartMs = activeElapsedMs();
-        emit currentPhaseChanged();
-        // See recomputeOverallProgress()'s doc comment — only "loading" and
-        // "decoding" need the timer (no real progress callback of their
-        // own); every other phase (including the detecting-speakers-*
-        // sub-phases) already advances overallProgress via the progress()
-        // connection above.
-        if (phase == QStringLiteral("loading") || phase == QStringLiteral("decoding"))
-            m_indeterminatePhaseTimer->start();
-        else
-            m_indeterminatePhaseTimer->stop();
-        recomputeOverallProgress();
-    });
-    connect(m_worker, &TranscriptionWorker::backendNameChanged, this, [this](const QString &name) {
-        if (m_activeBackendName != name) {
-            m_activeBackendName = name;
-            emit activeBackendNameChanged();
-        }
-    });
-    connect(m_worker, &TranscriptionWorker::finished, this, &TranscriptionController::onWorkerFinished);
-    connect(m_worker, &TranscriptionWorker::speakerRenamed, this,
-            [this](const QString &path, const QString &oldName, bool ok, const QString &error) {
-                emit speakerRenamed(QUrl::fromLocalFile(path), oldName, ok, error);
-            });
-    connect(m_worker, &TranscriptionWorker::speakersMerged, this,
-            [this](const QString &path, const QString &sourceName, const QString &targetName, bool ok,
-                   const QString &error) {
-                emit speakersMerged(QUrl::fromLocalFile(path), sourceName, targetName, ok, error);
-            });
-    connect(m_worker, &TranscriptionWorker::usbGrabScanCompleted, this,
-            [this](int filesCopied, int filesSkipped, const QStringList &errors, bool cancelled) {
-                // Safe to read m_activeIndex here: the worker emits this
-                // immediately BEFORE its finished(), and both arrive queued on
-                // this (the GUI) thread in that order — so the grab that just
-                // ran is still the active job, and onWorkerFinished() hasn't
-                // reset m_activeIndex to -1 yet. Attaching the job id here
-                // rather than making the worker carry it keeps the worker
-                // ignorant of the queue, like every other signal it emits.
-                if (m_activeIndex < 0 || m_activeIndex >= m_jobs.size())
-                    return;
-                emit usbGrabFinished(m_jobs[m_activeIndex].id, filesCopied, filesSkipped, errors, cancelled);
-            });
-    // Benchmark signals are plain value pass-throughs (worker emits on the
-    // worker thread; the queued connection marshals them to the GUI thread).
-    connect(m_worker, &TranscriptionWorker::benchmarkModelStarted, this,
-            &TranscriptionController::benchmarkModelStarted);
-    connect(m_worker, &TranscriptionWorker::benchmarkModelDone, this,
-            &TranscriptionController::benchmarkModelDone);
-    connect(m_worker, &TranscriptionWorker::benchmarkFinished, this, &TranscriptionController::benchmarkFinished);
-    connect(m_worker, &TranscriptionWorker::benchmarkFailed, this, &TranscriptionController::benchmarkFailed);
-    connect(m_worker, &TranscriptionWorker::diarizationBenchmarkComboStarted, this,
-            &TranscriptionController::diarizationBenchmarkComboStarted);
-    connect(m_worker, &TranscriptionWorker::diarizationBenchmarkComboDone, this,
-            &TranscriptionController::diarizationBenchmarkComboDone);
-    connect(m_worker, &TranscriptionWorker::diarizationBenchmarkFinished, this,
-            &TranscriptionController::diarizationBenchmarkFinished);
-    // Drive the progress glow off benchmark progress (item: benchmark tasks
-    // affect the glow, without touching m_busy). Each *Started advances the
-    // fraction; Finished/Failed clears it. These are separate connections from
-    // the pass-through ones above, so QML still gets the raw signals too.
-    connect(m_worker, &TranscriptionWorker::benchmarkModelStarted, this,
-            [this](const QString &, int index, int total) {
-                setBenchmarkGlow(true, total > 0 ? double(index) / total : 0.0);
-            });
-    connect(m_worker, &TranscriptionWorker::benchmarkFinished, this,
-            [this](const QVariantMap &) { setBenchmarkGlow(false, 0.0); });
-    connect(m_worker, &TranscriptionWorker::benchmarkFailed, this,
-            [this](const QString &) { setBenchmarkGlow(false, 0.0); });
-    connect(m_worker, &TranscriptionWorker::diarizationBenchmarkComboStarted, this,
-            [this](const QString &, int index, int total) {
-                setBenchmarkGlow(true, total > 0 ? double(index) / total : 0.0);
-            });
-    connect(m_worker, &TranscriptionWorker::diarizationBenchmarkFinished, this,
-            [this](const QVariantMap &) { setBenchmarkGlow(false, 0.0); });
-    m_thread.start();
+
+    // --- Kind-specific result signals ---
+    if (auto *transcribe = qobject_cast<TranscribeTask *>(task)) {
+        connect(transcribe, &TranscribeTask::phaseDurationMs, this, &TranscriptionController::recordPhaseDuration);
+        connect(transcribe, &TranscribeTask::segmentWritten, this, [this] {
+            m_liveUpdateTick++;
+            emit liveUpdateTickChanged();
+        });
+        connect(transcribe, &TranscribeTask::backendNameChanged, this, [this](const QString &name) {
+            if (m_activeBackendName != name) {
+                m_activeBackendName = name;
+                emit activeBackendNameChanged();
+            }
+        });
+    } else if (auto *rename = qobject_cast<RenameSpeakerTask *>(task)) {
+        connect(rename, &RenameSpeakerTask::speakerRenamed, this,
+                [this](const QString &path, const QString &oldName, bool ok, const QString &error) {
+                    emit speakerRenamed(QUrl::fromLocalFile(path), oldName, ok, error);
+                });
+    } else if (auto *merge = qobject_cast<MergeSpeakersTask *>(task)) {
+        connect(merge, &MergeSpeakersTask::speakersMerged, this,
+                [this](const QString &path, const QString &sourceName, const QString &targetName, bool ok,
+                       const QString &error) {
+                    emit speakersMerged(QUrl::fromLocalFile(path), sourceName, targetName, ok, error);
+                });
+    } else if (auto *grab = qobject_cast<UsbGrabTask *>(task)) {
+        // The task id rides along from HERE rather than being carried by the
+        // task itself, keeping the task ignorant of the queue — same split the
+        // old worker kept. Captured by value: `grab` outlives this lambda
+        // (the queue owns it), and the id is stable for its whole lifetime.
+        const int id = grab->id;
+        connect(grab, &UsbGrabTask::grabCompleted, this,
+                [this, id](int filesCopied, int filesSkipped, const QStringList &errors, bool cancelled) {
+                    emit usbGrabFinished(id, filesCopied, filesSkipped, errors, cancelled);
+                });
+    } else if (auto *bench = qobject_cast<BenchmarkTask *>(task)) {
+        connect(bench, &BenchmarkTask::benchmarkModelStarted, this,
+                &TranscriptionController::benchmarkModelStarted);
+        connect(bench, &BenchmarkTask::benchmarkModelDone, this, &TranscriptionController::benchmarkModelDone);
+        connect(bench, &BenchmarkTask::benchmarkRunFinished, this, &TranscriptionController::benchmarkFinished);
+        // No separate glow wiring: a BenchmarkTask is a real queued task now,
+        // so m_busy + overallProgress drive the existing glow for free. That
+        // parallel path (setBenchmarkGlow) is deleted — see the
+        // activeIsForeground Q_PROPERTY doc comment.
+    } else if (auto *sweep = qobject_cast<DiarizationSweepTask *>(task)) {
+        connect(sweep, &DiarizationSweepTask::comboStarted, this,
+                &TranscriptionController::diarizationBenchmarkComboStarted);
+        connect(sweep, &DiarizationSweepTask::comboDone, this,
+                &TranscriptionController::diarizationBenchmarkComboDone);
+        connect(sweep, &DiarizationSweepTask::sweepFinished, this,
+                &TranscriptionController::diarizationBenchmarkFinished);
+    }
 }
 
 TranscriptionController::~TranscriptionController()
@@ -3297,14 +1677,14 @@ TranscriptionController::~TranscriptionController()
     // had been closed at all. Requesting cancel first lets it unblock at
     // the very next checkpoint the active job's phase supports (the same
     // ones the pause/cancel UI feature already relies on — see
-    // waitWhilePausedOrCancelled()'s doc comment for which phases those
+    // TaskContext::checkpoint()'s doc comment for which phases those
     // are), so shutdown is prompt instead of an indefinite silent hang.
     // requestResume() wakes it first in case it was sitting paused, which
     // would otherwise block forever waiting for a pause that will never be
     // lifted by anyone once this destructor is running.
-    if (m_worker) {
-        m_worker->requestResume();
-        m_worker->requestCancel();
+    if (m_runner) {
+        m_runner->requestResume();
+        m_runner->requestCancel();
     }
     m_thread.quit();
     m_thread.wait();
@@ -3358,8 +1738,10 @@ static QString canonicalPhaseKey(const QString &phase, const QString &modelId, b
 // phase()/phaseDurationMs() signal for that job.
 QString TranscriptionController::activeModelIdForTiming() const
 {
-    if (m_activeIndex >= 0 && m_activeIndex < m_jobs.size())
-        return m_jobs[m_activeIndex].modelId;
+    if (m_activeIndex >= 0 && m_activeIndex < static_cast<int>(m_tasks.size())) {
+        if (auto *t = qobject_cast<const TranscribeTask *>(m_tasks[m_activeIndex].get()))
+            return t->modelId();
+    }
     return QString();
 }
 
@@ -3486,10 +1868,10 @@ void TranscriptionController::recomputeOverallProgress()
 
 bool TranscriptionController::isQueued(const QUrl &fileUrl) const
 {
-    for (const Job &job : m_jobs) {
-        if (job.fileUrl == fileUrl
-            && (job.status == JobStatus::Queued || job.status == JobStatus::Active
-                || job.status == JobStatus::Paused))
+    for (const auto &task : m_tasks) {
+        if (task->fileUrl == fileUrl
+            && (task->status == Task::Status::Queued || task->status == Task::Status::Active
+                || task->status == Task::Status::Paused))
             return true;
     }
     return false;
@@ -3497,14 +1879,14 @@ bool TranscriptionController::isQueued(const QUrl &fileUrl) const
 
 void TranscriptionController::rebuildJobStatusIndex()
 {
-    QHash<QString, JobStatus> rebuilt;
-    for (const Job &job : m_jobs) {
-        if (job.fileUrl.isEmpty())
-            continue; // download job — names no single vault file
-        const QString path = job.fileUrl.toLocalFile();
+    QHash<QString, Task::Status> rebuilt;
+    for (const auto &task : m_tasks) {
+        if (task->fileUrl.isEmpty())
+            continue; // download task — names no single vault file
+        const QString path = task->fileUrl.toLocalFile();
         const auto it = rebuilt.constFind(path);
-        if (it == rebuilt.constEnd() || jobStatusPriority(job.status) > jobStatusPriority(it.value()))
-            rebuilt[path] = job.status;
+        if (it == rebuilt.constEnd() || taskStatusPriority(task->status) > taskStatusPriority(it.value()))
+            rebuilt[path] = task->status;
     }
     if (rebuilt != m_jobStatusByPath) {
         m_jobStatusByPath = rebuilt;
@@ -3515,7 +1897,9 @@ void TranscriptionController::rebuildJobStatusIndex()
 int TranscriptionController::jobStatusForPath(const QString &path) const
 {
     const auto it = m_jobStatusByPath.constFind(path);
-    return it == m_jobStatusByPath.constEnd() ? static_cast<int>(JobStatus::None) : static_cast<int>(it.value());
+    // -1 == "no task for this path" (the sentinel Task::Status has no member
+    // for — see the class doc comment where JobStatus used to live).
+    return it == m_jobStatusByPath.constEnd() ? -1 : static_cast<int>(it.value());
 }
 
 bool TranscriptionController::matchesExistingTranscription(const QUrl &fileUrl, const QString &modelId) const
@@ -3547,6 +1931,40 @@ bool TranscriptionController::matchesExistingTranscription(const QUrl &fileUrl, 
     return meta.value(QStringLiteral("model")).toString() == expectedFileName;
 }
 
+// The ONE way a task enters the queue — see the header doc comment.
+int TranscriptionController::enqueueTask(std::unique_ptr<Task> task, int insertIndex)
+{
+    int insertAt = (insertIndex < 0) ? frontOfQueueInsertIndex() : insertIndex;
+    const int startIndex = insertAt;
+
+    // The models this kind declared it needs, each queued as its own
+    // DownloadTask ahead of it if absent. Every enqueue path gets this
+    // uniformly, from the kind's own prerequisites() — no site has to
+    // remember which downloads which kind wants.
+    queuePrerequisites(*task, task->vaultUrl, &insertAt);
+
+    task->id = m_nextJobId++;
+    task->status = Task::Status::Queued;
+    const int id = task->id;
+    m_tasks.insert(m_tasks.begin() + std::clamp(insertAt, 0, static_cast<int>(m_tasks.size())), std::move(task));
+    if (m_activeIndex >= insertAt)
+        ++m_activeIndex;
+
+    emit queueChanged();
+
+    if (m_activeIndex < 0)
+        startTask(startIndex);
+    return id;
+}
+
+void TranscriptionController::queuePrerequisites(const Task &task, const QUrl &vaultUrl, int *insertAt)
+{
+    for (const ModelPrerequisite &prereq : task.prerequisites()) {
+        if (maybeQueueDownloadTask(prereq.target, vaultUrl, prereq.modelId, *insertAt) >= 0)
+            ++(*insertAt);
+    }
+}
+
 void TranscriptionController::transcribe(const QUrl &fileUrl, const QUrl &vaultUrl, const QString &modelId,
                                           bool autoLabel, bool restrictTagsToExisting,
                                           double tagReuseBias, double wordiness)
@@ -3556,37 +1974,6 @@ void TranscriptionController::transcribe(const QUrl &fileUrl, const QUrl &vaultU
     if (isQueued(fileUrl))
         return;
 
-    // Item O15: a freshly requested job jumps ahead of whatever's already
-    // Queued — see frontOfQueueInsertIndex()'s doc comment. startIndex
-    // remembers where the FIRST newly-added entry (a download job, if one
-    // was queued, otherwise this transcribe job itself) landed, so
-    // autostart-if-idle below starts the right one; insertAt then walks
-    // forward as each subsequent entry (download(s), the transcribe job
-    // itself, autoLabel's follow-up relabel job) is inserted right after the
-    // previous one, keeping this whole cluster contiguous at the front of
-    // the queue rather than scattered.
-    int insertAt = frontOfQueueInsertIndex();
-    const int startIndex = insertAt;
-
-    // Item 5 (Wave N): the model(s) this job needs, queued as their OWN
-    // job(s) ahead of it if not already on disk — see
-    // maybeQueueDownloadJob()'s doc comment.
-    if (maybeQueueDownloadJob(DownloadTarget::WhisperModel, vaultUrl, modelId, insertAt) >= 0)
-        ++insertAt;
-
-    Job job;
-    job.id = m_nextJobId++;
-    job.fileUrl = fileUrl;
-    job.vaultUrl = vaultUrl;
-    job.modelId = modelId;
-    job.autoLabel = autoLabel;
-    job.restrictTagsToExisting = restrictTagsToExisting;
-    job.tagReuseBias = tagReuseBias;
-    job.wordiness = wordiness;
-    job.status = JobStatus::Queued;
-    m_jobs.insert(insertAt, job);
-    ++insertAt;
-
     // Item 23: a transcribe call ONLY transcribes now. It used to chain a
     // second relabel-only job whenever autoLabel was true, so clicking
     // "Transcribe" silently also labeled — the dedicated "Regenerate label"
@@ -3594,15 +1981,12 @@ void TranscriptionController::transcribe(const QUrl &fileUrl, const QUrl &vaultU
     // call sites in Sidebar.qml/MainPanel.qml still pass
     // AppSettings.autoLabelEnabled, and this invokable signature must stay
     // call-compatible with them) but is now a NO-OP.
-    // TODO (later wave): drop the autoLabel parameter here and the
-    // AppSettings.autoLabelEnabled property + its wiring in the QML call
-    // sites, once those files are in scope to edit.
     Q_UNUSED(autoLabel);
+    Q_UNUSED(restrictTagsToExisting);
+    Q_UNUSED(tagReuseBias);
+    Q_UNUSED(wordiness);
 
-    emit queueChanged();
-
-    if (m_activeIndex < 0)
-        startJob(startIndex);
+    enqueueTask(std::make_unique<TranscribeTask>(fileUrl, vaultUrl, modelId));
 }
 
 void TranscriptionController::transcribeAll(const QVariantList &fileUrls, const QUrl &vaultUrl,
@@ -3621,24 +2005,9 @@ void TranscriptionController::importAudio(const QUrl &sourceUrl, const QUrl &des
     if (isQueued(destUrl))
         return;
 
-    // Item O15: jump ahead of whatever's already Queued — see transcribe()'s
-    // frontOfQueueInsertIndex() use. No download job to queue first (a copy
-    // needs no model), so the import job itself is the front-most new entry.
-    const int insertAt = frontOfQueueInsertIndex();
-
-    Job job;
-    job.id = m_nextJobId++;
-    job.fileUrl = destUrl; // the in-vault destination (see Job::importOnly)
-    job.vaultUrl = vaultUrl;
-    job.importOnly = true;
-    job.importSourcePath = sourceUrl.toLocalFile();
-    job.status = JobStatus::Queued;
-    m_jobs.insert(insertAt, job);
-
-    emit queueChanged();
-
-    if (m_activeIndex < 0)
-        startJob(insertAt);
+    auto task = std::make_unique<ImportTask>(sourceUrl.toLocalFile(), destUrl);
+    task->vaultUrl = vaultUrl;
+    enqueueTask(std::move(task));
 }
 
 int TranscriptionController::enqueueUsbGrab(const UsbGrabRule &rule, const QString &mountPath, const QUrl &destUrl,
@@ -3647,25 +2016,9 @@ int TranscriptionController::enqueueUsbGrab(const UsbGrabRule &rule, const QStri
     // No isQueued(destUrl) dedup here, deliberately — see the header's doc
     // comment: a grab's fileUrl is a destination FOLDER that a device's two
     // volumes legitimately share.
-    const int insertAt = frontOfQueueInsertIndex();
-
-    Job job;
-    job.id = m_nextJobId++;
-    job.fileUrl = destUrl; // the destination folder (see Job::usbGrabOnly)
-    job.vaultUrl = vaultUrl;
-    job.usbGrabOnly = true;
-    job.usbGrabRule = rule;
-    job.usbGrabMountPath = mountPath;
-    job.usbGrabAuto = autoTriggered;
-    job.status = JobStatus::Queued;
-    m_jobs.insert(insertAt, job);
-
-    emit queueChanged();
-
-    if (m_activeIndex < 0)
-        startJob(insertAt);
-
-    return job.id;
+    auto task = std::make_unique<UsbGrabTask>(rule, mountPath, destUrl, autoTriggered);
+    task->vaultUrl = vaultUrl;
+    return enqueueTask(std::move(task));
 }
 
 void TranscriptionController::diarizeFile(const QUrl &fileUrl, const QUrl &vaultUrl,
@@ -3677,7 +2030,7 @@ void TranscriptionController::diarizeFile(const QUrl &fileUrl, const QUrl &vault
     if (isQueued(fileUrl))
         return;
 
-    // Empty id ⇒ the ModelManager default (keeps the Job's recorded ids
+    // Empty id ⇒ the ModelManager default (keeps the task's recorded ids
     // concrete for persistence + the download dedup key).
     const QString segId = segmentationModelId.isEmpty()
                               ? QString::fromLatin1(ModelManager::kDefaultSegmentationModelId)
@@ -3686,31 +2039,7 @@ void TranscriptionController::diarizeFile(const QUrl &fileUrl, const QUrl &vault
                                 ? QString::fromLatin1(ModelManager::kDefaultEmbeddingModelId)
                                 : embeddingModelId;
 
-    // Item O15: jump ahead of whatever's already Queued — see transcribe()'s
-    // frontOfQueueInsertIndex() use. The CHOSEN segmentation + embedding models
-    // are each queued as their own download job ahead of this one if not
-    // already on disk (same pattern the runAllJobs() diarize step uses).
-    int insertAt = frontOfQueueInsertIndex();
-    const int startIndex = insertAt;
-    if (maybeQueueDownloadJob(DownloadTarget::SegmentationModel, vaultUrl, segId, insertAt) >= 0)
-        ++insertAt;
-    if (maybeQueueDownloadJob(DownloadTarget::EmbeddingModel, vaultUrl, embedId, insertAt) >= 0)
-        ++insertAt;
-
-    Job job;
-    job.id = m_nextJobId++;
-    job.fileUrl = fileUrl;
-    job.vaultUrl = vaultUrl;
-    job.diarizeOnly = true;
-    job.segmentationModelId = segId;
-    job.embeddingModelId = embedId;
-    job.diarizationThreshold = sensitivity;
-    job.status = JobStatus::Queued;
-    m_jobs.insert(insertAt, job);
-    emit queueChanged();
-
-    if (m_activeIndex < 0)
-        startJob(startIndex);
+    enqueueTask(std::make_unique<DiarizeTask>(fileUrl, vaultUrl, segId, embedId, sensitivity));
 }
 
 void TranscriptionController::diarizeFilesForPaths(const QVariantList &fileUrls, const QUrl &vaultUrl,
@@ -3725,31 +2054,12 @@ void TranscriptionController::relabel(const QUrl &fileUrl, const QUrl &vaultUrl,
                                        double tagReuseBias, double wordiness)
 {
     // Same dedup rule as transcribe(): a Queued/Active entry (whether a full
-    // transcribe or a relabel-only job) blocks a duplicate request.
+    // transcribe or a relabel-only task) blocks a duplicate request.
     if (isQueued(fileUrl))
         return;
 
-    // Item O15: see transcribe()'s identical use of frontOfQueueInsertIndex()
-    // for why this jumps ahead of whatever's already Queued.
-    int insertAt = frontOfQueueInsertIndex();
-    const int startIndex = insertAt;
-    if (maybeQueueDownloadJob(DownloadTarget::LabelModel, vaultUrl, QString(), insertAt) >= 0)
-        ++insertAt;
-
-    Job job;
-    job.id = m_nextJobId++;
-    job.fileUrl = fileUrl;
-    job.vaultUrl = vaultUrl;
-    job.relabelOnly = true;
-    job.restrictTagsToExisting = restrictTagsToExisting;
-    job.tagReuseBias = tagReuseBias;
-    job.wordiness = wordiness;
-    job.status = JobStatus::Queued;
-    m_jobs.insert(insertAt, job);
-    emit queueChanged();
-
-    if (m_activeIndex < 0)
-        startJob(startIndex);
+    enqueueTask(std::make_unique<RelabelTask>(fileUrl, vaultUrl, restrictTagsToExisting, tagReuseBias, wordiness,
+                                               /*skipIfAlreadyLabeled=*/false));
 }
 
 void TranscriptionController::relabelAll(const QVariantList &fileUrls, const QUrl &vaultUrl,
@@ -3765,27 +2075,7 @@ void TranscriptionController::generateChapters(const QUrl &fileUrl, const QUrl &
     if (isQueued(fileUrl))
         return;
 
-    // Item O15: see transcribe()'s identical use of frontOfQueueInsertIndex()
-    // for why this jumps ahead of whatever's already Queued.
-    int insertAt = frontOfQueueInsertIndex();
-    const int startIndex = insertAt;
-    // Chapters use the same label model as relabel() — see
-    // LabelingEngine::generateChapters()'s doc comment.
-    if (maybeQueueDownloadJob(DownloadTarget::LabelModel, vaultUrl, QString(), insertAt) >= 0)
-        ++insertAt;
-
-    Job job;
-    job.id = m_nextJobId++;
-    job.fileUrl = fileUrl;
-    job.vaultUrl = vaultUrl;
-    job.generateChaptersOnly = true;
-    job.chapterDensity = density;
-    job.status = JobStatus::Queued;
-    m_jobs.insert(insertAt, job);
-    emit queueChanged();
-
-    if (m_activeIndex < 0)
-        startJob(startIndex);
+    enqueueTask(std::make_unique<ChaptersTask>(fileUrl, vaultUrl, density));
 }
 
 void TranscriptionController::generateChaptersAll(const QVariantList &fileUrls, const QUrl &vaultUrl, double density)
@@ -3816,100 +2106,46 @@ void TranscriptionController::runAllJobs(const QUrl &fileUrl, const QUrl &vaultU
 
     // Skip the transcribe step for a file that already has a sibling .md (the
     // friendly, least-surprising "run all" on an already-done file — just
-    // re-detect speakers and refresh its label+chapters; see header doc
-    // comment). An orphaned .md's sidecarPath() is itself, so this is true for
-    // those too.
+    // re-detect speakers and refresh its label+chapters). An orphaned .md's
+    // sidecarPath() is itself, so this is true for those too.
     const bool alreadyTranscribed = QFileInfo::exists(sidecarPath(fileUrl.toLocalFile()));
 
-    // Item O15 (same as every other enqueue path): jump ahead of whatever's
-    // already Queued, but keep this file's jobs CONTIGUOUS and IN ORDER by
-    // walking insertAt forward as each is inserted (rather than each new job
-    // re-jumping to the very front — which is exactly why this doesn't just
-    // call transcribe()/diarizeFile()/relabel()/generateChapters() in sequence).
+    // Item O15: jump ahead of whatever's already Queued, but keep this file's
+    // tasks CONTIGUOUS and IN ORDER by walking insertAt forward as each is
+    // inserted (rather than each new task re-jumping to the very front —
+    // which is exactly why this doesn't just call transcribe()/diarizeFile()/
+    // relabel()/generateChapters() in sequence). Each enqueueTask() also
+    // inserts that step's own prerequisites() ahead of it; maybeQueueDownloadTask()
+    // dedups, so the label model the relabel AND chapters steps both want is
+    // queued exactly once.
     int insertAt = frontOfQueueInsertIndex();
     const int startIndex = insertAt;
-
-    // Models this pipeline needs, queued ahead as their own jobs if absent
-    // (mirrors transcribe()/diarizeFile()/relabel()). maybeQueueDownloadJob()
-    // dedups, so the single LabelModel request here covers BOTH the later label
-    // and chapters jobs. The diarization models are needed regardless of
-    // alreadyTranscribed (the diarize step always runs); the whisper model only
-    // when transcription itself runs.
-    if (!alreadyTranscribed) {
-        if (maybeQueueDownloadJob(DownloadTarget::WhisperModel, vaultUrl, modelId, insertAt) >= 0)
-            ++insertAt;
-    }
-    if (maybeQueueDownloadJob(DownloadTarget::SegmentationModel, vaultUrl, segId, insertAt) >= 0)
-        ++insertAt;
-    if (maybeQueueDownloadJob(DownloadTarget::EmbeddingModel, vaultUrl, embedId, insertAt) >= 0)
-        ++insertAt;
-    if (maybeQueueDownloadJob(DownloadTarget::LabelModel, vaultUrl, QString(), insertAt) >= 0)
-        ++insertAt;
+    const auto step = [&](std::unique_ptr<Task> task) {
+        // Count what enqueueTask() actually inserted (the task + however many
+        // prerequisite downloads it queued ahead of it) so the next step lands
+        // after all of it.
+        const int before = static_cast<int>(m_tasks.size());
+        enqueueTask(std::move(task), insertAt);
+        insertAt += static_cast<int>(m_tasks.size()) - before;
+    };
 
     // (1) transcribe (pure ASR) — skipped if already transcribed.
-    if (!alreadyTranscribed) {
-        Job job;
-        job.id = m_nextJobId++;
-        job.fileUrl = fileUrl;
-        job.vaultUrl = vaultUrl;
-        job.modelId = modelId;
-        job.restrictTagsToExisting = restrictTagsToExisting;
-        job.tagReuseBias = tagReuseBias;
-        job.wordiness = wordiness;
-        job.status = JobStatus::Queued;
-        m_jobs.insert(insertAt, job);
-        ++insertAt;
-    }
-
-    // (2) detect speakers — reads the .md the transcribe job (if any) just
-    // wrote and splices "[Speaker N]" tags in (see diarizeFile()). This is the
-    // step that replaced transcribe()'s old inline speakerDetection toggle.
-    {
-        Job job;
-        job.id = m_nextJobId++;
-        job.fileUrl = fileUrl;
-        job.vaultUrl = vaultUrl;
-        job.diarizeOnly = true;
-        job.segmentationModelId = segId;
-        job.embeddingModelId = embedId;
-        job.diarizationThreshold = sensitivity;
-        job.status = JobStatus::Queued;
-        m_jobs.insert(insertAt, job);
-        ++insertAt;
-    }
-
-    // (3) label — reads the .md the diarize job just updated.
-    {
-        Job job;
-        job.id = m_nextJobId++;
-        job.fileUrl = fileUrl;
-        job.vaultUrl = vaultUrl;
-        job.relabelOnly = true;
-        job.restrictTagsToExisting = restrictTagsToExisting;
-        job.tagReuseBias = tagReuseBias;
-        job.wordiness = wordiness;
-        job.status = JobStatus::Queued;
-        m_jobs.insert(insertAt, job);
-        ++insertAt;
-    }
-
+    if (!alreadyTranscribed)
+        step(std::make_unique<TranscribeTask>(fileUrl, vaultUrl, modelId));
+    // (2) detect speakers — reads the .md the transcribe step (if any) just
+    // wrote and splices "[Speaker N]" tags in.
+    step(std::make_unique<DiarizeTask>(fileUrl, vaultUrl, segId, embedId, sensitivity));
+    // (3) label — reads the .md the diarize step just updated.
+    step(std::make_unique<RelabelTask>(fileUrl, vaultUrl, restrictTagsToExisting, tagReuseBias, wordiness,
+                                        /*skipIfAlreadyLabeled=*/false));
     // (4) chapters — reads the labeled .md.
-    {
-        Job job;
-        job.id = m_nextJobId++;
-        job.fileUrl = fileUrl;
-        job.vaultUrl = vaultUrl;
-        job.generateChaptersOnly = true;
-        job.chapterDensity = chapterDensity;
-        job.status = JobStatus::Queued;
-        m_jobs.insert(insertAt, job);
-        ++insertAt;
-    }
+    step(std::make_unique<ChaptersTask>(fileUrl, vaultUrl, chapterDensity));
 
-    emit queueChanged();
-
-    if (m_activeIndex < 0)
-        startJob(startIndex);
+    // No trailing startTask(): the FIRST step()'s enqueueTask() already
+    // auto-started the queue if it was idle (and startIndex just marks where
+    // that first item landed). Every later step inserts behind the now-Active
+    // task and correctly stays Queued.
+    Q_UNUSED(startIndex);
 }
 
 void TranscriptionController::runAllJobsForPaths(const QVariantList &fileUrls, const QUrl &vaultUrl,
@@ -3923,211 +2159,201 @@ void TranscriptionController::runAllJobsForPaths(const QVariantList &fileUrls, c
                    segmentationModelId, embeddingModelId, sensitivity);
 }
 
-void TranscriptionController::startJob(int index)
+void TranscriptionController::startTask(int index)
 {
-    // Safety-net re-check, before any state mutation below — see
-    // maybeRedirectForCombine()'s doc comment. A true return means it
-    // already recursed onto whatever should run instead (a newly-inserted
-    // combine job); this call contributes nothing further.
+    // Safety-net preflight, before any state mutation below — see
+    // maybeRedirectForCombine()'s doc comment. A true return means it already
+    // recursed onto whatever should run instead (a newly-inserted combine
+    // task); this call contributes nothing further.
     if (maybeRedirectForCombine(index))
         return;
 
     m_activeIndex = index;
-    Job &job = m_jobs[index];
-    job.status = JobStatus::Active;
-    job.error.clear();
+    Task *task = m_tasks[index].get();
+    task->status = Task::Status::Active;
+    task->error.clear();
 
-    // Wave N (task system): a pause/cancel left over from whatever the
-    // PREVIOUS job did must never leak into this one (see resetControl()'s
-    // doc comment). Elapsed-time tracking (activeElapsedMs()) restarts from
-    // zero for every new Active job.
-    m_worker->resetControl();
+    // A pause/cancel left over from whatever the PREVIOUS task did must never
+    // leak into this one. Elapsed-time tracking (activeElapsedMs()) restarts
+    // from zero for every new Active task.
+    m_runner->resetControl();
     m_activePaused = false;
     emit activePausedChanged();
     m_activeAccumulatedMs = 0;
     m_activeSegmentTimer.start();
     m_overallProgress = 0.0;
     emit overallProgressChanged();
-    // See recomputeOverallProgress()'s doc comment — true ONLY for the
-    // standalone "diarize" job, whose progress bar is weighted around the
-    // detecting-speakers phase. A "transcribe" job is pure ASR now (its bar is
-    // weighted around loading/decoding/detecting-speech/transcribing instead).
-    // Every other kind never emits phase() at all, so this is simply never
-    // read for them.
-    m_activeSpeakerDetection = job.diarizeOnly;
+    // See recomputeOverallProgress()'s doc comment — true ONLY for a
+    // "diarize" task, whose progress bar is weighted around the
+    // detecting-speakers phase. A "transcribe" task is pure ASR (its bar is
+    // weighted around loading/decoding/detecting-speech/transcribing). Every
+    // other kind never emits one of those phases at all, so this is simply
+    // never read for them.
+    m_activeSpeakerDetection = task->kind() == QStringLiteral("diarize");
     m_phaseStartMs = 0;
     m_indeterminatePhaseTimer->stop();
 
     m_busy = true;
     emit busyChanged();
+    // Presentation, not m_busy, is what decides the main-panel overlay now —
+    // so a Background task (benchmark/sweep/download) gets a Tasks row + the
+    // glow without hijacking the panel the user is reading, which is exactly
+    // what the old benchmark side-door existed to work around.
+    const bool foreground = task->presentation() == Task::Presentation::Foreground;
+    if (m_activeIsForeground != foreground) {
+        m_activeIsForeground = foreground;
+        emit activeIsForegroundChanged();
+    }
     m_progress = 0.0;
     emit progressChanged();
-    // Cleared here (not just at the end of the previous job) so a
-    // relabel/rename job — neither of which ever emits phase() — doesn't
-    // inherit a stale "transcribing" (or whatever) left over from an
-    // earlier transcribe job.
+    // Cleared here (not just at the end of the previous task) so a kind that
+    // never emits phase() at all doesn't inherit a stale phase left over from
+    // an earlier one.
     m_phase.clear();
     emit currentPhaseChanged();
-    m_currentFile = job.fileUrl;
+    m_currentFile = task->fileUrl;
     emit currentFileChanged();
+    emit currentJobKindChanged();
     emit queueChanged();
 
-    if (job.renameSpeakerOnly) {
-        QMetaObject::invokeMethod(m_worker, "renameSpeaker", Qt::QueuedConnection,
-                                   Q_ARG(QString, job.fileUrl.toLocalFile()), Q_ARG(QString, job.oldSpeakerName),
-                                   Q_ARG(QString, job.newSpeakerName));
-    } else if (job.mergeSpeakersOnly) {
-        QMetaObject::invokeMethod(m_worker, "mergeSpeakers", Qt::QueuedConnection,
-                                   Q_ARG(QString, job.fileUrl.toLocalFile()), Q_ARG(QString, job.sourceSpeakerName),
-                                   Q_ARG(QString, job.targetSpeakerName));
-    } else if (job.relabelOnly) {
-        QMetaObject::invokeMethod(m_worker, "relabelJob", Qt::QueuedConnection,
-                                   Q_ARG(QString, job.fileUrl.toLocalFile()),
-                                   Q_ARG(QString, job.vaultUrl.toLocalFile()),
-                                   Q_ARG(bool, job.restrictTagsToExisting), Q_ARG(double, job.tagReuseBias),
-                                   Q_ARG(double, job.wordiness), Q_ARG(bool, job.skipIfAlreadyLabeled));
-    } else if (job.generateChaptersOnly) {
-        QMetaObject::invokeMethod(m_worker, "generateChaptersJob", Qt::QueuedConnection,
-                                   Q_ARG(QString, job.fileUrl.toLocalFile()),
-                                   Q_ARG(QString, job.vaultUrl.toLocalFile()), Q_ARG(double, job.chapterDensity));
-    } else if (job.diarizeOnly) {
-        QMetaObject::invokeMethod(m_worker, "diarizeJob", Qt::QueuedConnection,
-                                   Q_ARG(QString, job.fileUrl.toLocalFile()),
-                                   Q_ARG(QString, job.vaultUrl.toLocalFile()),
-                                   Q_ARG(QString, job.segmentationModelId), Q_ARG(QString, job.embeddingModelId),
-                                   Q_ARG(double, job.diarizationThreshold));
-    } else if (job.combineOnly) {
-        QMetaObject::invokeMethod(m_worker, "combineJob", Qt::QueuedConnection,
-                                   Q_ARG(QStringList, job.combineSourcePaths),
-                                   Q_ARG(QString, job.fileUrl.toLocalFile()),
-                                   Q_ARG(bool, job.deleteOriginalsAfterCombine));
-    } else if (job.usbGrabOnly) {
-        QMetaObject::invokeMethod(m_worker, "usbGrabJob", Qt::QueuedConnection, Q_ARG(UsbGrabRule, job.usbGrabRule),
-                                   Q_ARG(QString, job.usbGrabMountPath),
-                                   Q_ARG(QString, job.fileUrl.toLocalFile()));
-    } else if (job.importOnly) {
-        QMetaObject::invokeMethod(m_worker, "importJob", Qt::QueuedConnection,
-                                   Q_ARG(QString, job.importSourcePath),
-                                   Q_ARG(QString, job.fileUrl.toLocalFile()));
-    } else if (job.downloadTarget != DownloadTarget::None) {
-        QString target;
-        switch (job.downloadTarget) {
-        case DownloadTarget::WhisperModel: target = QStringLiteral("model"); break;
-        case DownloadTarget::LabelModel: target = QStringLiteral("label"); break;
-        case DownloadTarget::VadModel: target = QStringLiteral("vad"); break;
-        case DownloadTarget::SegmentationModel: target = QStringLiteral("segmentation"); break;
-        case DownloadTarget::EmbeddingModel: target = QStringLiteral("embedding"); break;
-        case DownloadTarget::None: break;
-        }
-        QMetaObject::invokeMethod(m_worker, "download", Qt::QueuedConnection, Q_ARG(QString, target),
-                                   Q_ARG(QString, job.modelId));
-    } else {
-        QMetaObject::invokeMethod(m_worker, "run", Qt::QueuedConnection,
-                                   Q_ARG(QString, job.fileUrl.toLocalFile()),
-                                   Q_ARG(QString, job.vaultUrl.toLocalFile()), Q_ARG(QString, job.modelId));
+    // Connected exactly once, on first dispatch. A Paused task that resumes
+    // re-enters startTask(), so guard against double-wiring (which would
+    // double-count every progress tick).
+    if (!m_connectedTasks.contains(task)) {
+        m_connectedTasks.insert(task);
+        connectTask(task);
     }
+
+    // The ENTIRE dispatch, for every kind. This replaced a 10-branch if/else
+    // that marshalled each kind's own argument list into a string-named worker
+    // slot — the single biggest reason adding a kind meant editing five
+    // disjoint sites. Now the kind IS the object.
+    QMetaObject::invokeMethod(m_runner, "execute", Qt::QueuedConnection, Q_ARG(Task *, task));
 }
 
-void TranscriptionController::onWorkerFinished(bool ok, const QString &error)
+int TranscriptionController::indexOfTask(const Task *task) const
+{
+    for (int i = 0; i < static_cast<int>(m_tasks.size()); ++i) {
+        if (m_tasks[i].get() == task)
+            return i;
+    }
+    return -1;
+}
+
+void TranscriptionController::onTaskFinished(Task *task, bool ok, const QString &error)
 {
     m_busy = false;
     emit busyChanged();
-    // A job that fails/gets cancelled mid-"loading"/"decoding" never gets
-    // another phase() signal to naturally stop this — see recomputeOverallProgress()'s
-    // doc comment.
+    if (m_activeIsForeground) {
+        m_activeIsForeground = false;
+        emit activeIsForegroundChanged();
+    }
+    // A task that fails/gets cancelled mid-"loading"/"decoding" never gets
+    // another phase() signal to naturally stop this.
     m_indeterminatePhaseTimer->stop();
     const QUrl finishedFile = m_currentFile;
 
-    // See JobStatus::Paused's doc comment and togglePauseActive()'s
-    // "loading" branch — same requestCancel()->finished(false, "Cancelled")
-    // mechanism as a real cancel, distinguished only by this flag, which
-    // togglePauseActive() sets right before triggering it.
+    // Same requestCancel()->TaskError("Cancelled") mechanism as a real cancel,
+    // distinguished only by this flag, which togglePauseActive() sets right
+    // before triggering it (a pause during the unhookable "loading" phase).
     const bool wasStopping = m_pausingActiveAsRestart;
     const bool pausedAsRestart = m_pausingActiveAsRestart && !ok && error == QStringLiteral("Cancelled");
     m_pausingActiveAsRestart = false;
     if (wasStopping)
         emit activeStoppingChanged();
 
-    if (m_activeIndex >= 0 && m_activeIndex < m_jobs.size()) {
-        Job &job = m_jobs[m_activeIndex];
+    const int taskIndex = indexOfTask(task);
+    if (taskIndex >= 0) {
         if (pausedAsRestart) {
-            job.status = JobStatus::Paused;
-            job.error.clear();
+            task->status = Task::Status::Paused;
+            task->error.clear();
         } else {
-            job.status = ok ? JobStatus::Done : JobStatus::Failed;
-            job.error = error;
-            // Item 7 (Wave N): snapshot active-work elapsed time (excludes
-            // any paused stretches — see activeElapsedMs()'s doc comment) as
-            // this job's final duration, shown in the Tasks popup's history
-            // rows. Left unset (-1) for a Paused job — it isn't finished.
-            job.durationMs = activeElapsedMs();
+            task->status = ok ? Task::Status::Done : Task::Status::Failed;
+            task->error = error;
+            // Snapshot active-work elapsed time (excludes any paused stretches
+            // — see activeElapsedMs()) as this task's final duration, shown in
+            // the Tasks popup's history rows. Left unset (-1) for a Paused
+            // task — it isn't finished.
+            task->durationMs = activeElapsedMs();
             // A predownload (or lazy download) that just landed changes the
             // set of downloaded models — let the Models page refresh.
-            if (ok && job.downloadTarget != DownloadTarget::None)
+            if (ok && task->kind() == QStringLiteral("download"))
                 emit modelsChanged();
         }
     }
     m_activeIndex = -1;
-    // A paused job that gets cancelled resumes (see cancelJob()'s doc
-    // comment) right before finishing — reset here too so a stray "Paused"
-    // state never lingers once nothing is Active.
     m_activePaused = false;
     emit activePausedChanged();
 
     if (pausedAsRestart) {
-        // Deliberately do NOT advance to the next Queued job — the Paused
-        // job sits at the front until the user explicitly resumes it
-        // (startNext() prioritizes any Paused job over Queued ones), same
-        // as a persisted-but-not-yet-started job on vault open. A sibling
-        // relabel job queued alongside this one (autoLabel) correctly stays
-        // Queued behind it rather than running against a transcript that
-        // was never written.
+        // Deliberately do NOT advance to the next Queued task — the Paused
+        // task sits at the front until the user explicitly resumes it
+        // (startNext() prioritizes any Paused task over Queued ones).
         m_currentFile = QUrl();
         emit currentFileChanged();
+        emit currentJobKindChanged();
         emit queueChanged();
-        QMetaObject::invokeMethod(m_worker, "evictIdle", Qt::QueuedConnection);
+        QMetaObject::invokeMethod(m_runner, "evictIdle", Qt::QueuedConnection);
         emit finished(finishedFile, ok, error);
         return;
     }
 
-    // A transcribe(autoLabel=true) call already queued its follow-up
-    // "relabel" job UP FRONT, right alongside this one (see transcribe()'s
-    // doc comment) — so it's just the next Queued entry here, exactly like
-    // any other job a user queued ahead of time. No special-casing needed.
     int nextIndex = -1;
-    for (int i = 0; i < m_jobs.size(); ++i) {
-        if (m_jobs[i].status == JobStatus::Queued) {
+    for (int i = 0; i < static_cast<int>(m_tasks.size()); ++i) {
+        if (m_tasks[i]->status == Task::Status::Queued) {
             nextIndex = i;
             break;
         }
     }
 
     if (nextIndex >= 0) {
-        startJob(nextIndex);
+        startTask(nextIndex);
     } else {
         m_currentFile = QUrl();
         emit currentFileChanged();
+        emit currentJobKindChanged();
         emit queueChanged();
-        // See TranscriptionWorker::evictIdle()'s doc comment — nothing left
-        // queued to reuse a warm engine, so release whichever one the job
-        // that just finished was using.
-        QMetaObject::invokeMethod(m_worker, "evictIdle", Qt::QueuedConnection);
+        // Nothing left queued to reuse a warm engine, so release whichever one
+        // the task that just finished was using.
+        QMetaObject::invokeMethod(m_runner, "evictIdle", Qt::QueuedConnection);
     }
 
     emit finished(finishedFile, ok, error);
 }
 
+void TranscriptionController::removeTaskAt(int index)
+{
+    m_connectedTasks.remove(m_tasks[index].get());
+    m_tasks.erase(m_tasks.begin() + index);
+    if (m_activeIndex > index)
+        --m_activeIndex;
+}
+
+void TranscriptionController::cancelTaskAt(int index)
+{
+    // Snapshot before erasing — this is the pre-run-cancel half of the
+    // one-terminal-report invariant (.task/plan.md invariant 1): a task
+    // cancelled while still Queued/Paused never reached the runner, so the
+    // queue must synthesize its terminal report itself. The old system just
+    // dropped the entry, which is why a consumer waiting on finished() (e.g.
+    // UsbGrabberController's in-flight tracking) never heard back for a
+    // cancelled-while-queued task.
+    const QUrl url = m_tasks[index]->fileUrl;
+    removeTaskAt(index);
+    emit queueChanged();
+    emit finished(url, false, QStringLiteral("Cancelled"));
+}
+
 void TranscriptionController::dismiss(const QUrl &fileUrl)
 {
-    // A fileUrl may have multiple entries (re-queueing a Done/Failed job is
+    // A fileUrl may have multiple entries (re-queueing a Done/Failed task is
     // allowed) — remove only the first Done/Failed match, skipping over any
     // Queued/Active entry for the same url rather than no-op'ing on it.
-    for (int i = 0; i < m_jobs.size(); ++i) {
-        const Job &job = m_jobs[i];
-        if (job.fileUrl == fileUrl && (job.status == JobStatus::Done || job.status == JobStatus::Failed)) {
-            m_jobs.removeAt(i);
-            if (m_activeIndex > i)
-                --m_activeIndex;
+    for (int i = 0; i < static_cast<int>(m_tasks.size()); ++i) {
+        const Task *task = m_tasks[i].get();
+        if (task->fileUrl == fileUrl
+            && (task->status == Task::Status::Done || task->status == Task::Status::Failed)) {
+            removeTaskAt(i);
             emit queueChanged();
             return;
         }
@@ -4137,11 +2363,9 @@ void TranscriptionController::dismiss(const QUrl &fileUrl)
 void TranscriptionController::clearFinished()
 {
     bool changed = false;
-    for (int i = m_jobs.size() - 1; i >= 0; --i) {
-        if (m_jobs[i].status == JobStatus::Done || m_jobs[i].status == JobStatus::Failed) {
-            m_jobs.removeAt(i);
-            if (m_activeIndex > i)
-                --m_activeIndex;
+    for (int i = static_cast<int>(m_tasks.size()) - 1; i >= 0; --i) {
+        if (m_tasks[i]->status == Task::Status::Done || m_tasks[i]->status == Task::Status::Failed) {
+            removeTaskAt(i);
             changed = true;
         }
     }
@@ -4166,20 +2390,15 @@ qint64 TranscriptionController::estimatedRemainingMs() const
 
 void TranscriptionController::pauseActive()
 {
-    if (m_activeIndex < 0 || m_activeIndex >= m_jobs.size())
+    if (m_activeIndex < 0 || m_activeIndex >= static_cast<int>(m_tasks.size()))
         return;
-    // See this method's header doc comment — only these kinds have a real
-    // interruption point. "combine" is the same real, killable/SIGSTOP-able
-    // ffmpeg subprocess as "transcribe"'s "decoding" phase (see
-    // TranscriptionWorker::combineJob()), just as its ENTIRE job rather than
-    // one phase of it.
-    const QString kind = jobKind(m_jobs[m_activeIndex]);
-    // Items 30/50: "chapters" is pausable too — generateChaptersJob() checks
-    // waitWhilePausedOrCancelled() between windows and around the merge pass
-    // (an in-flight single LLM call still can't be interrupted, but between
-    // windows it's honored promptly).
-    if (kind != QStringLiteral("transcribe") && kind != QStringLiteral("download")
-        && kind != QStringLiteral("combine") && kind != QStringLiteral("chapters"))
+    // The task itself declares whether it can pause — the string allowlist
+    // (transcribe/download/combine/chapters) is gone; a kind with a real
+    // interruption point returns capabilities().pausable, and everything else
+    // is a safe no-op here. This is the same capability the UI reads to enable
+    // the pause button, so the two can never disagree (the 2026-07-09 bug was
+    // exactly such a disagreement).
+    if (!m_tasks[m_activeIndex]->capabilities().pausable)
         return;
     // See this method's header doc comment — "loading" is whisper.cpp's
     // in-process, unhookable model-load call (no interruption point at all),
@@ -4199,12 +2418,12 @@ void TranscriptionController::pauseActive()
     // job. Wait for it to resolve instead of stacking a second request.
     if (m_pausingActiveAsRestart)
         return;
-    m_worker->requestPause();
+    m_runner->requestPause();
 }
 
 void TranscriptionController::resumeActive()
 {
-    m_worker->requestResume();
+    m_runner->requestResume();
 }
 
 void TranscriptionController::togglePauseActive()
@@ -4245,35 +2464,33 @@ void TranscriptionController::togglePauseActive()
 
 void TranscriptionController::cancelActive()
 {
-    if (m_activeIndex < 0 || m_activeIndex >= m_jobs.size())
+    if (m_activeIndex < 0 || m_activeIndex >= static_cast<int>(m_tasks.size()))
         return;
-    cancelJob(m_jobs[m_activeIndex].id);
+    cancelJob(m_tasks[m_activeIndex]->id);
 }
 
 void TranscriptionController::cancelJob(int id)
 {
-    for (int i = 0; i < m_jobs.size(); ++i) {
-        Job &job = m_jobs[i];
-        if (job.id != id)
+    for (int i = 0; i < static_cast<int>(m_tasks.size()); ++i) {
+        Task *task = m_tasks[i].get();
+        if (task->id != id)
             continue;
-        // Paused (see JobStatus::Paused's doc comment) has nothing running
-        // to interrupt — same removal as Queued.
-        if (job.status == JobStatus::Queued || job.status == JobStatus::Paused) {
-            m_jobs.removeAt(i);
-            if (m_activeIndex > i)
-                --m_activeIndex;
-            emit queueChanged();
+        // A Queued or Paused task has nothing running to interrupt — remove it
+        // and synthesize its terminal report (cancelTaskAt), so a consumer
+        // waiting on finished() hears back even though run() never ran.
+        if (task->status == Task::Status::Queued || task->status == Task::Status::Paused) {
+            cancelTaskAt(i);
             return;
         }
-        if (job.status == JobStatus::Active) {
-            // requestResume() wakes it if currently blocked in a pause wait
-            // — otherwise a paused-then-cancelled job would sit paused
-            // forever instead of ever reaching the cancel check (see
-            // waitWhilePausedOrCancelled()'s doc comment). See cancelJob()'s
-            // header doc comment for which kinds this actually interrupts
-            // immediately vs. at the next checkpoint.
-            m_worker->requestCancel();
-            m_worker->requestResume();
+        if (task->status == Task::Status::Active) {
+            // requestResume() wakes it if currently blocked in a pause wait —
+            // otherwise a paused-then-cancelled task would sit paused forever
+            // instead of ever reaching the cancel check. The runner emits the
+            // terminal report for THIS case (run() returns via TaskError or
+            // early-return), so no synthesis here. See cancelJob()'s header
+            // doc comment for immediate-vs-next-checkpoint per kind.
+            m_runner->requestCancel();
+            m_runner->requestResume();
         }
         return;
     }
@@ -4281,28 +2498,36 @@ void TranscriptionController::cancelJob(int id)
 
 void TranscriptionController::cancelAll()
 {
-    bool changed = false;
-    for (int i = m_jobs.size() - 1; i >= 0; --i) {
-        if (m_jobs[i].status == JobStatus::Queued || m_jobs[i].status == JobStatus::Paused) {
-            m_jobs.removeAt(i);
-            if (m_activeIndex > i)
-                --m_activeIndex;
-            changed = true;
-        }
+    // Snapshot the ids to cancel first — cancelTaskAt() mutates m_tasks (and
+    // emits finished() per task), so iterating it live while removing would
+    // be unsafe. Active job handled separately below (it's not removed here;
+    // the runner reports it).
+    QList<int> queuedIds;
+    for (const auto &task : m_tasks) {
+        if (task->status == Task::Status::Queued || task->status == Task::Status::Paused)
+            queuedIds.append(task->id);
     }
-    if (changed)
-        emit queueChanged();
+    for (const int id : std::as_const(queuedIds)) {
+        const int idx = [this, id] {
+            for (int i = 0; i < static_cast<int>(m_tasks.size()); ++i)
+                if (m_tasks[i]->id == id)
+                    return i;
+            return -1;
+        }();
+        if (idx >= 0)
+            cancelTaskAt(idx);
+    }
     if (m_activeIndex >= 0) {
-        m_worker->requestCancel();
-        m_worker->requestResume();
+        m_runner->requestCancel();
+        m_runner->requestResume();
     }
 }
 
 void TranscriptionController::moveQueuedJob(int id, int newIndex)
 {
     int fromRealIndex = -1;
-    for (int i = 0; i < m_jobs.size(); ++i) {
-        if (m_jobs[i].id == id && m_jobs[i].status == JobStatus::Queued) {
+    for (int i = 0; i < static_cast<int>(m_tasks.size()); ++i) {
+        if (m_tasks[i]->id == id && m_tasks[i]->status == Task::Status::Queued) {
             fromRealIndex = i;
             break;
         }
@@ -4310,12 +2535,12 @@ void TranscriptionController::moveQueuedJob(int id, int newIndex)
     if (fromRealIndex < 0)
         return;
 
-    // Real (m_jobs) indices of every Queued entry, in current order — the
-    // ordering moveQueuedJob()'s newIndex counts within (see its header doc
-    // comment: Active/Done/Failed rows are never part of this ordering).
+    // Real (m_tasks) indices of every Queued entry, in current order — the
+    // ordering moveQueuedJob()'s newIndex counts within (Active/Done/Failed
+    // rows are never part of it).
     QVector<int> queuedIndices;
-    for (int i = 0; i < m_jobs.size(); ++i) {
-        if (m_jobs[i].status == JobStatus::Queued)
+    for (int i = 0; i < static_cast<int>(m_tasks.size()); ++i) {
+        if (m_tasks[i]->status == Task::Status::Queued)
             queuedIndices.append(i);
     }
     const int fromQueuedPos = queuedIndices.indexOf(fromRealIndex);
@@ -4323,85 +2548,87 @@ void TranscriptionController::moveQueuedJob(int id, int newIndex)
     if (clampedNewIndex == fromQueuedPos)
         return;
 
-    const Job movedJob = m_jobs[fromRealIndex];
-    m_jobs.removeAt(fromRealIndex);
+    std::unique_ptr<Task> moved = std::move(m_tasks[fromRealIndex]);
+    m_tasks.erase(m_tasks.begin() + fromRealIndex);
     if (m_activeIndex > fromRealIndex)
         --m_activeIndex;
 
     // Recompute the remaining Queued real-indices after the removal shifted
-    // everything past fromRealIndex down by one, then reinsert movedJob
-    // right at the target Queued slot's (now-current) real index — or at
-    // the very end of m_jobs if newIndex names the last Queued slot.
+    // everything past fromRealIndex down by one, then reinsert `moved` right
+    // at the target Queued slot's (now-current) real index — or at the very
+    // end of m_tasks if newIndex names the last Queued slot.
     queuedIndices.removeAt(fromQueuedPos);
     for (int &idx : queuedIndices) {
         if (idx > fromRealIndex)
             --idx;
     }
-    const int insertRealIndex = clampedNewIndex >= queuedIndices.size() ? m_jobs.size() : queuedIndices[clampedNewIndex];
-    m_jobs.insert(insertRealIndex, movedJob);
+    const int insertRealIndex =
+        clampedNewIndex >= queuedIndices.size() ? static_cast<int>(m_tasks.size()) : queuedIndices[clampedNewIndex];
+    m_tasks.insert(m_tasks.begin() + insertRealIndex, std::move(moved));
     if (m_activeIndex >= insertRealIndex)
         ++m_activeIndex;
     emit queueChanged();
 }
 
-bool TranscriptionController::isDownloadQueued(DownloadTarget target, const QUrl &vaultUrl,
+bool TranscriptionController::isDownloadQueued(ModelDownloadTarget target, const QUrl &vaultUrl,
                                                 const QString &modelId) const
 {
-    for (const Job &job : m_jobs) {
-        if (job.downloadTarget == target && job.vaultUrl == vaultUrl
-            && ((target != DownloadTarget::WhisperModel && target != DownloadTarget::SegmentationModel
-                 && target != DownloadTarget::EmbeddingModel)
-                || job.modelId == modelId)
-            && (job.status == JobStatus::Queued || job.status == JobStatus::Active))
+    const QString targetStr = DownloadTask::targetToString(target);
+    for (const auto &task : m_tasks) {
+        auto *dl = qobject_cast<DownloadTask *>(task.get());
+        if (!dl || dl->target() != target || dl->vaultUrl != vaultUrl)
+            continue;
+        const bool idMatters = target == ModelDownloadTarget::WhisperModel
+            || target == ModelDownloadTarget::SegmentationModel || target == ModelDownloadTarget::EmbeddingModel;
+        if ((!idMatters || dl->modelId() == modelId)
+            && (task->status == Task::Status::Queued || task->status == Task::Status::Active))
             return true;
     }
     return false;
 }
 
-int TranscriptionController::maybeQueueDownloadJob(DownloadTarget target, const QUrl &vaultUrl,
-                                                    const QString &modelId, int insertIndex)
+int TranscriptionController::maybeQueueDownloadTask(ModelDownloadTarget target, const QUrl &vaultUrl,
+                                                     const QString &modelId, int insertIndex)
 {
     bool alreadyOnDisk = false;
     switch (target) {
-    case DownloadTarget::WhisperModel:
+    case ModelDownloadTarget::WhisperModel:
         // An unrecognized modelId has no real file to pre-download — there
         // is nothing sensible to queue (ensureModel()'s own fallback-to-
-        // default logic, run inline when the transcribe job actually
+        // default logic, run inline when the transcribe task actually
         // starts, is what actually resolves this case; see ModelManager's
-        // class doc comment). Queuing a phantom download job here would
-        // silently redirect to the default model under a job label that
-        // still says the unrecognized id.
+        // class doc comment). Queuing a phantom download here would silently
+        // redirect to the default model under a label that still says the
+        // unrecognized id.
         if (ModelManager::modelFileName(modelId).isEmpty())
             return -1;
         alreadyOnDisk = ModelManager::isModelDownloaded(modelId);
         break;
-    case DownloadTarget::LabelModel:
+    case ModelDownloadTarget::LabelModel:
         alreadyOnDisk = ModelManager::isLabelModelDownloaded();
         break;
-    case DownloadTarget::VadModel:
+    case ModelDownloadTarget::VadModel:
         alreadyOnDisk = ModelManager::isVadModelDownloaded();
         break;
-    case DownloadTarget::SegmentationModel:
+    case ModelDownloadTarget::SegmentationModel:
         alreadyOnDisk = ModelManager::isSegmentationModelDownloaded(modelId);
         break;
-    case DownloadTarget::EmbeddingModel:
+    case ModelDownloadTarget::EmbeddingModel:
         alreadyOnDisk = ModelManager::isEmbeddingModelDownloaded(modelId);
         break;
-    case DownloadTarget::None:
-        return -1;
     }
     if (alreadyOnDisk || isDownloadQueued(target, vaultUrl, modelId))
         return -1;
 
-    Job job;
-    job.id = m_nextJobId++;
-    job.vaultUrl = vaultUrl;
-    job.modelId = modelId; // only meaningful for WhisperModel
-    job.downloadTarget = target;
-    job.status = JobStatus::Queued;
-    const int at = (insertIndex < 0) ? m_jobs.size() : std::clamp(insertIndex, 0, static_cast<int>(m_jobs.size()));
-    m_jobs.insert(at, job);
-    return job.id;
+    auto task = std::make_unique<DownloadTask>(target, modelId);
+    task->id = m_nextJobId++;
+    task->vaultUrl = vaultUrl;
+    task->status = Task::Status::Queued;
+    const int id = task->id;
+    const int at =
+        (insertIndex < 0) ? static_cast<int>(m_tasks.size()) : std::clamp(insertIndex, 0, static_cast<int>(m_tasks.size()));
+    m_tasks.insert(m_tasks.begin() + at, std::move(task));
+    return id;
 }
 
 // See this method's header doc comment.
@@ -4409,11 +2636,11 @@ int TranscriptionController::frontOfQueueInsertIndex() const
 {
     if (m_activeIndex >= 0)
         return m_activeIndex + 1;
-    for (int i = 0; i < m_jobs.size(); ++i) {
-        if (m_jobs[i].status == JobStatus::Queued)
+    for (int i = 0; i < static_cast<int>(m_tasks.size()); ++i) {
+        if (m_tasks[i]->status == Task::Status::Queued)
             return i;
     }
-    return m_jobs.size();
+    return static_cast<int>(m_tasks.size());
 }
 
 // See this method's header doc comment for the full matching/grouping/status
@@ -4608,9 +2835,9 @@ QStringList TranscriptionController::differentiatorNonParticipatingFiles(const Q
 bool TranscriptionController::isCombineQueued(const QString &outputPath) const
 {
     const QUrl outputUrl = QUrl::fromLocalFile(outputPath);
-    for (const Job &job : m_jobs) {
-        if (job.combineOnly && job.fileUrl == outputUrl
-            && (job.status == JobStatus::Queued || job.status == JobStatus::Active))
+    for (const auto &task : m_tasks) {
+        if (task->kind() == QStringLiteral("combine") && task->fileUrl == outputUrl
+            && (task->status == Task::Status::Queued || task->status == Task::Status::Active))
             return true;
     }
     return false;
@@ -4619,34 +2846,36 @@ bool TranscriptionController::isCombineQueued(const QString &outputPath) const
 void TranscriptionController::enqueueCombineJob(const CombineGroup &group, const QUrl &vaultUrl,
                                                  bool deleteOriginals, int insertIndex)
 {
-    Job job;
-    job.id = m_nextJobId++;
-    job.fileUrl = QUrl::fromLocalFile(group.outputPath);
-    job.vaultUrl = vaultUrl;
-    job.combineOnly = true;
-    job.combineSourcePaths = group.files;
-    job.deleteOriginalsAfterCombine = deleteOriginals;
-    job.status = JobStatus::Queued;
+    auto task = std::make_unique<CombineTask>(group.files, QUrl::fromLocalFile(group.outputPath), deleteOriginals);
+    task->id = m_nextJobId++;
+    task->vaultUrl = vaultUrl;
+    task->status = Task::Status::Queued;
     const int at = (insertIndex < 0) ? frontOfQueueInsertIndex() : insertIndex;
-    m_jobs.insert(std::clamp(at, 0, static_cast<int>(m_jobs.size())), job);
+    m_tasks.insert(m_tasks.begin() + std::clamp(at, 0, static_cast<int>(m_tasks.size())), std::move(task));
 }
 
-// See this method's header doc comment.
+// See this method's header doc comment. This is the scheduler-level preflight
+// .task/plan.md flagged as the hardest port: it can rewrite the task's target
+// file, insert a combine task ahead of it, and recurse — all strictly BEFORE
+// dispatch, on the GUI thread, which is what makes mutating Task::fileUrl safe
+// (run() hasn't started; see that field's doc comment).
 bool TranscriptionController::maybeRedirectForCombine(int index)
 {
-    Job &job = m_jobs[index];
-    if (job.combineOnly || job.relabelOnly || job.generateChaptersOnly || job.renameSpeakerOnly
-        || job.mergeSpeakersOnly || job.importOnly || job.diarizeOnly
-        || job.downloadTarget != DownloadTarget::None || job.fileUrl.isEmpty())
+    Task *task = m_tasks[index].get();
+    // Only a plain transcribe is ever redirected — it's the sole kind whose
+    // input file might turn out to be a combine fragment. Every *Only kind in
+    // the old flag-soup guard was just "not transcribe"; a single qobject_cast
+    // expresses that now.
+    auto *transcribe = qobject_cast<TranscribeTask *>(task);
+    if (!transcribe || transcribe->fileUrl.isEmpty())
         return false;
 
-    const QFileInfo info(job.fileUrl.toLocalFile());
+    const QFileInfo info(transcribe->fileUrl.toLocalFile());
 
     // Outcome 1: an earlier manual runCombineScan() run may already have
     // merged this exact file's group (and moved the original fragment into
-    // .combined/) since this job was queued. The merged output's path is
-    // recomputable from this filename alone (see findCombineGroups()'s
-    // outputPath doc comment), so check for it directly.
+    // .combined/) since this task was queued. The merged output's path is
+    // recomputable from this filename alone, so check for it directly.
     for (const QVariant &ruleVar : m_combineRules) {
         const QVariantMap rule = ruleVar.toMap();
         const auto key = matchRuleCapturedKey(rule, info.fileName());
@@ -4655,33 +2884,28 @@ bool TranscriptionController::maybeRedirectForCombine(int index)
         const QString outputPath = combineOutputPathFor(rule.value(QStringLiteral("name")).toString(), *key,
                                                           info.absolutePath(), info.suffix());
         if (QFileInfo::exists(outputPath))
-            job.fileUrl = QUrl::fromLocalFile(outputPath);
+            transcribe->fileUrl = QUrl::fromLocalFile(outputPath);
         break; // only the first matching rule is used, mirroring findCombineGroups()
     }
 
     // Outcome 2: this file is a member of a currently-"ready" group per the
     // last runCombineScan() scan that hasn't been merged yet — insert the
-    // combine job ahead of this one and redirect, same insert-ahead shape
-    // maybeQueueDownloadJob() already uses for model downloads.
-    const QString filePath = job.fileUrl.toLocalFile();
+    // combine task ahead of this one and redirect.
+    const QString filePath = transcribe->fileUrl.toLocalFile();
     for (const CombineGroup &group : findCombineGroups(m_combineRules, m_combineAudioPaths)) {
         if (group.status != QStringLiteral("ready") || !group.files.contains(filePath))
             continue;
-        job.fileUrl = QUrl::fromLocalFile(group.outputPath);
+        transcribe->fileUrl = QUrl::fromLocalFile(group.outputPath);
         if (!isCombineQueued(group.outputPath))
-            enqueueCombineJob(group, job.vaultUrl, m_combineDeleteOriginals, index);
+            enqueueCombineJob(group, transcribe->vaultUrl, m_combineDeleteOriginals, index);
         emit queueChanged();
-        // Recurses onto the freshly-inserted combine job at this same index
-        // (safe — see this method's header doc comment). If a combine job
-        // for this group was somehow already queued elsewhere (defensive
-        // only: this app dispatches one job at a time via front-to-back
-        // scans, and a front-inserted combine job is always reached before
-        // a transcribe job queued behind it — see enqueueCombineJob()'s
-        // insertIndex), nothing was inserted at `index` here, so this
-        // recurses onto the SAME transcribe job; its redirected fileUrl
-        // still won't exist yet and it fails cleanly via the normal
-        // "file not found"-shaped decode error rather than looping.
-        startJob(index);
+        // Recurses onto the freshly-inserted combine task at this same index
+        // (safe — see this method's header doc comment). If a combine task
+        // for this group was somehow already queued elsewhere, nothing was
+        // inserted at `index` here, so this recurses onto the SAME transcribe
+        // task; its redirected fileUrl still won't exist yet and it fails
+        // cleanly via the normal decode error rather than looping.
+        startTask(index);
         return true;
     }
     return false;
@@ -4754,60 +2978,26 @@ void TranscriptionController::persistQueue() const
         return;
 
     QJsonArray array;
-    for (const Job &job : m_jobs) {
-        // Only Queued survives a restart — an Active OR Paused job is
-        // persisted AS Queued (no true mid-file resume exists yet, see
-        // loadPersistedQueue()'s doc comment); Done/Failed history is
-        // already session-only by design (see class doc comment) and isn't
-        // persisted here either.
-        if (job.status != JobStatus::Queued && job.status != JobStatus::Active && job.status != JobStatus::Paused)
+    for (const auto &task : m_tasks) {
+        // Only Queued survives a restart — an Active OR Paused task is
+        // persisted AS Queued (no true mid-file resume yet); Done/Failed
+        // history is session-only by design.
+        if (task->status != Task::Status::Queued && task->status != Task::Status::Active
+            && task->status != Task::Status::Paused)
             continue;
 
-        // Item 37: import jobs are deliberately NOT persisted across a restart
-        // — importSourcePath names an EXTERNAL file (often on removable media)
-        // that may well be gone next session, and a half-done copy left a
-        // partial file the collision check would then refuse. A drag-and-drop
-        // import is inherently a live, in-session action; if it didn't finish
-        // before close, the user simply drags the file in again.
-        if (job.importOnly)
+        // Persistence is OPT-IN: import/usbGrab (external/removable paths)
+        // return isPersistable() == false and are simply never written — see
+        // the header doc comment on why this replaced the old opt-OUT list.
+        if (!task->isPersistable())
             continue;
 
-        // USB grabs are not persisted, for a STRONGER version of the same
-        // reason: usbGrabMountPath is a mount point for removable media that is
-        // very likely unplugged by next session, and a mount point that gets
-        // reused by a DIFFERENT volume would make a restored job walk the wrong
-        // device entirely. A grab is inherently tied to the device being
-        // present — replugging it re-fires the auto-grab (or the user clicks
-        // Grab now), which is the correct way to resume one.
-        if (job.usbGrabOnly)
-            continue;
-
-        QJsonObject obj;
-        obj["kind"] = jobKind(job);
-        obj["fileUrl"] = job.fileUrl.toString();
-        obj["vaultUrl"] = job.vaultUrl.toString();
-        obj["modelId"] = job.modelId;
-        obj["restrictTagsToExisting"] = job.restrictTagsToExisting;
-        obj["tagReuseBias"] = job.tagReuseBias;
-        obj["wordiness"] = job.wordiness;
-        obj["chapterDensity"] = job.chapterDensity;
-        obj["segmentationModelId"] = job.segmentationModelId;
-        obj["embeddingModelId"] = job.embeddingModelId;
-        obj["diarizationThreshold"] = job.diarizationThreshold;
-        obj["oldSpeakerName"] = job.oldSpeakerName;
-        obj["newSpeakerName"] = job.newSpeakerName;
-        obj["sourceSpeakerName"] = job.sourceSpeakerName;
-        obj["targetSpeakerName"] = job.targetSpeakerName;
-        obj["combineSourcePaths"] = QJsonArray::fromStringList(job.combineSourcePaths);
-        obj["deleteOriginalsAfterCombine"] = job.deleteOriginalsAfterCombine;
-        switch (job.downloadTarget) {
-        case DownloadTarget::WhisperModel: obj["downloadTarget"] = QStringLiteral("model"); break;
-        case DownloadTarget::LabelModel: obj["downloadTarget"] = QStringLiteral("label"); break;
-        case DownloadTarget::VadModel: obj["downloadTarget"] = QStringLiteral("vad"); break;
-        case DownloadTarget::SegmentationModel: obj["downloadTarget"] = QStringLiteral("segmentation"); break;
-        case DownloadTarget::EmbeddingModel: obj["downloadTarget"] = QStringLiteral("embedding"); break;
-        case DownloadTarget::None: break;
-        }
+        // The queue owns kind/fileUrl/vaultUrl; toJson() adds whatever this
+        // kind needs to rebuild itself (createTaskFromJson()).
+        QJsonObject obj = task->toJson();
+        obj["kind"] = task->kind();
+        obj["fileUrl"] = task->fileUrl.toString();
+        obj["vaultUrl"] = task->vaultUrl.toString();
         array.append(obj);
     }
 
@@ -4828,134 +3018,56 @@ void TranscriptionController::loadPersistedQueue(const QUrl &vaultUrl)
     if (!doc.isArray())
         return;
 
-    // Replayed in file order, which is the order persistQueue() wrote
-    // m_jobs in — a download job a transcribe/relabel entry depends on was
-    // always written just BEFORE it (see transcribe()/relabel()'s
-    // maybeQueueDownloadJob() calls), so replaying in order queues each
-    // download ahead of its dependent job here too, and that dependent
-    // job's OWN maybeQueueDownloadJob() call sees it already queued
-    // (isDownloadQueued()) and doesn't duplicate it.
+    // Replayed in file order — the order persistQueue() wrote. A download a
+    // dependent task needs was written just before it, so replaying in order
+    // queues each download ahead of its dependent (and the dependent's own
+    // prerequisites() sees it already queued via isDownloadQueued(), no dup).
     //
-    // Every non-download entry goes through enqueueReplayedJob() — NOT the
-    // public transcribe()/relabel()/renameSpeaker()/mergeSpeakers()
-    // functions — precisely so a "transcribe" entry immediately followed by
-    // a "relabel" entry for the SAME fileUrl (an autoLabel job) replays
-    // both: calling relabel() directly here would see the transcribe entry
-    // already Queued/Active for that fileUrl and silently reject it via its
-    // own isQueued() dedup guard (see enqueueReplayedJob()'s doc comment).
-    //
-    // Deliberately does NOT auto-start anything (see loadPersistedQueue()'s
-    // doc comment) — every restored entry, download jobs included, just
-    // sits Queued until the user resumes via startNext().
+    // Deliberately does NOT auto-start anything: every restored entry just
+    // sits Queued until the user resumes via startNext(). So this appends at
+    // the tail (explicit insertIndex == size) rather than going through the
+    // front-jumping enqueueTask(), and reproduces the exact saved order —
+    // which is ALSO why a "transcribe" entry followed by its "relabel"
+    // sibling for the same fileUrl both replay: neither goes through the
+    // public transcribe()/relabel() dedup guard (that guard would reject the
+    // second), only through createTaskFromJson() + a raw insert.
     for (const QJsonValue &v : doc.array()) {
         const QJsonObject obj = v.toObject();
         const QString kind = obj.value("kind").toString();
 
-        if (kind == QStringLiteral("download")) {
-            const QString target = obj.value("downloadTarget").toString();
-            DownloadTarget dt = DownloadTarget::None;
-            if (target == QStringLiteral("model"))
-                dt = DownloadTarget::WhisperModel;
-            else if (target == QStringLiteral("label"))
-                dt = DownloadTarget::LabelModel;
-            else if (target == QStringLiteral("vad"))
-                dt = DownloadTarget::VadModel;
-            else if (target == QStringLiteral("segmentation"))
-                dt = DownloadTarget::SegmentationModel;
-            else if (target == QStringLiteral("embedding"))
-                dt = DownloadTarget::EmbeddingModel;
-            const QUrl jobVaultUrl(obj.value("vaultUrl").toString());
-            if (maybeQueueDownloadJob(dt, jobVaultUrl, obj.value("modelId").toString()) >= 0)
-                emit queueChanged();
-        } else {
-            enqueueReplayedJob(kind, obj);
-        }
-    }
-}
+        std::unique_ptr<Task> task = createTaskFromJson(kind, obj);
+        if (!task)
+            continue; // unrecognized kind, or one whose isPersistable() is false
 
-void TranscriptionController::enqueueReplayedJob(const QString &kind, const QJsonObject &obj)
-{
-    const QUrl fileUrl(obj.value("fileUrl").toString());
-    const QUrl jobVaultUrl(obj.value("vaultUrl").toString());
+        // A download entry is self-contained (no prerequisites of its own); a
+        // dependent kind gets its downloads queued ahead of it, deduped
+        // against whatever the persisted download entries already queued.
+        int insertAt = static_cast<int>(m_tasks.size());
+        queuePrerequisites(*task, task->vaultUrl, &insertAt);
 
-    if (kind == QStringLiteral("relabel") || kind == QStringLiteral("chapters")) {
-        // Chapters use the same label model as relabel — see
-        // LabelingEngine::generateChapters()'s doc comment.
-        maybeQueueDownloadJob(DownloadTarget::LabelModel, jobVaultUrl, QString());
-    } else if (kind == QStringLiteral("diarize")) {
-        // Item 52: a standalone diarize job needs only its chosen diarization
-        // models (segmentation + embedding), no whisper model. Empty ids ⇒
-        // defaults (an entry persisted before this became selectable).
-        const QString segId = obj.value("segmentationModelId").toString().isEmpty()
-                                  ? QString::fromLatin1(ModelManager::kDefaultSegmentationModelId)
-                                  : obj.value("segmentationModelId").toString();
-        const QString embedId = obj.value("embeddingModelId").toString().isEmpty()
-                                    ? QString::fromLatin1(ModelManager::kDefaultEmbeddingModelId)
-                                    : obj.value("embeddingModelId").toString();
-        maybeQueueDownloadJob(DownloadTarget::SegmentationModel, jobVaultUrl, segId);
-        maybeQueueDownloadJob(DownloadTarget::EmbeddingModel, jobVaultUrl, embedId);
-    } else if (kind != QStringLiteral("rename") && kind != QStringLiteral("merge")
-               && kind != QStringLiteral("combine")) {
-        // "transcribe" — pure ASR now (a fresh transcribe is speaker-less; see
-        // DESIGN.md "Speaker diarization"), so no diarization models here.
-        const QString modelId = obj.value("modelId").toString();
-        maybeQueueDownloadJob(DownloadTarget::WhisperModel, jobVaultUrl, modelId);
+        task->id = m_nextJobId++;
+        task->status = Task::Status::Queued;
+        m_tasks.insert(m_tasks.begin() + std::clamp(insertAt, 0, static_cast<int>(m_tasks.size())), std::move(task));
+        emit queueChanged();
     }
-
-    Job job;
-    job.id = m_nextJobId++;
-    job.fileUrl = fileUrl;
-    job.vaultUrl = jobVaultUrl;
-    if (kind == QStringLiteral("relabel")) {
-        job.relabelOnly = true;
-        job.restrictTagsToExisting = obj.value("restrictTagsToExisting").toBool();
-        job.tagReuseBias = obj.value("tagReuseBias").toDouble(0.5);
-        job.wordiness = obj.value("wordiness").toDouble(0.5);
-    } else if (kind == QStringLiteral("rename")) {
-        job.renameSpeakerOnly = true;
-        job.oldSpeakerName = obj.value("oldSpeakerName").toString();
-        job.newSpeakerName = obj.value("newSpeakerName").toString();
-    } else if (kind == QStringLiteral("merge")) {
-        job.mergeSpeakersOnly = true;
-        job.sourceSpeakerName = obj.value("sourceSpeakerName").toString();
-        job.targetSpeakerName = obj.value("targetSpeakerName").toString();
-    } else if (kind == QStringLiteral("chapters")) {
-        job.generateChaptersOnly = true;
-        job.chapterDensity = obj.value("chapterDensity").toDouble(0.5);
-    } else if (kind == QStringLiteral("diarize")) {
-        job.diarizeOnly = true;
-        job.segmentationModelId = obj.value("segmentationModelId").toString();
-        job.embeddingModelId = obj.value("embeddingModelId").toString();
-        job.diarizationThreshold = obj.value("diarizationThreshold").toDouble(0.5);
-    } else if (kind == QStringLiteral("combine")) {
-        job.combineOnly = true;
-        for (const QJsonValue &v : obj.value("combineSourcePaths").toArray())
-            job.combineSourcePaths << v.toString();
-        job.deleteOriginalsAfterCombine = obj.value("deleteOriginalsAfterCombine").toBool();
-    } else {
-        job.modelId = obj.value("modelId").toString();
-    }
-    job.status = JobStatus::Queued;
-    m_jobs.push_back(job);
-    emit queueChanged();
 }
 
 void TranscriptionController::startNext()
 {
     if (m_activeIndex >= 0)
         return;
-    // A Paused job (see JobStatus::Paused's doc comment) is what the user
-    // just clicked "resume" on — it takes priority over unrelated Queued
-    // jobs regardless of list position; there's at most one at a time.
-    for (int i = 0; i < m_jobs.size(); ++i) {
-        if (m_jobs[i].status == JobStatus::Paused) {
-            startJob(i);
+    // A Paused task is what the user just clicked "resume" on — it takes
+    // priority over unrelated Queued tasks regardless of list position;
+    // there's at most one at a time.
+    for (int i = 0; i < static_cast<int>(m_tasks.size()); ++i) {
+        if (m_tasks[i]->status == Task::Status::Paused) {
+            startTask(i);
             return;
         }
     }
-    for (int i = 0; i < m_jobs.size(); ++i) {
-        if (m_jobs[i].status == JobStatus::Queued) {
-            startJob(i);
+    for (int i = 0; i < static_cast<int>(m_tasks.size()); ++i) {
+        if (m_tasks[i]->status == Task::Status::Queued) {
+            startTask(i);
             return;
         }
     }
@@ -5601,18 +3713,11 @@ void TranscriptionController::renameSpeaker(const QUrl &fileUrl, const QString &
         return;
     }
 
-    Job job;
-    job.id = m_nextJobId++;
-    job.fileUrl = fileUrl;
-    job.renameSpeakerOnly = true;
-    job.oldSpeakerName = oldName;
-    job.newSpeakerName = newName;
-    job.status = JobStatus::Queued;
-    m_jobs.push_back(job);
-    emit queueChanged();
-
-    if (m_activeIndex < 0)
-        startJob(m_jobs.size() - 1);
+    // Appended at the tail (explicit insertIndex == size), not jumped ahead
+    // like transcribe() — matches the old renameSpeaker()'s push_back. A
+    // rename is cheap and non-urgent; it can wait behind queued transcription.
+    enqueueTask(std::make_unique<RenameSpeakerTask>(fileUrl, oldName, newName),
+                static_cast<int>(m_tasks.size()));
 }
 
 void TranscriptionController::mergeSpeakers(const QUrl &fileUrl, const QString &sourceName, const QString &targetName)
@@ -5625,18 +3730,9 @@ void TranscriptionController::mergeSpeakers(const QUrl &fileUrl, const QString &
         return;
     }
 
-    Job job;
-    job.id = m_nextJobId++;
-    job.fileUrl = fileUrl;
-    job.mergeSpeakersOnly = true;
-    job.sourceSpeakerName = sourceName;
-    job.targetSpeakerName = targetName;
-    job.status = JobStatus::Queued;
-    m_jobs.push_back(job);
-    emit queueChanged();
-
-    if (m_activeIndex < 0)
-        startJob(m_jobs.size() - 1);
+    // Appended at the tail, same as renameSpeaker() — see its doc comment.
+    enqueueTask(std::make_unique<MergeSpeakersTask>(fileUrl, sourceName, targetName),
+                static_cast<int>(m_tasks.size()));
 }
 
 QString TranscriptionController::readTranscriptBody(const QUrl &fileUrl) const
@@ -5828,14 +3924,14 @@ QStringList TranscriptionController::existingVaultTags(const QUrl &vaultUrl) con
 
 int TranscriptionController::tasksTotal() const
 {
-    return m_jobs.size();
+    return static_cast<int>(m_tasks.size());
 }
 
 int TranscriptionController::tasksCompleted() const
 {
     int count = 0;
-    for (const Job &job : m_jobs) {
-        if (job.status == JobStatus::Done || job.status == JobStatus::Failed)
+    for (const auto &task : m_tasks) {
+        if (task->status == Task::Status::Done || task->status == Task::Status::Failed)
             ++count;
     }
     return count;
@@ -5844,80 +3940,46 @@ int TranscriptionController::tasksCompleted() const
 QVariantList TranscriptionController::queuedFileUrls() const
 {
     QVariantList list;
-    for (const Job &job : m_jobs) {
-        if (job.status == JobStatus::Queued)
-            list.append(job.fileUrl);
+    for (const auto &task : m_tasks) {
+        if (task->status == Task::Status::Queued)
+            list.append(task->fileUrl);
     }
     return list;
 }
 
-QString TranscriptionController::jobKind(const Job &job)
-{
-    if (job.downloadTarget != DownloadTarget::None)
-        return QStringLiteral("download");
-    if (job.renameSpeakerOnly)
-        return QStringLiteral("rename");
-    if (job.mergeSpeakersOnly)
-        return QStringLiteral("merge");
-    if (job.relabelOnly)
-        return QStringLiteral("relabel");
-    if (job.generateChaptersOnly)
-        return QStringLiteral("chapters");
-    if (job.diarizeOnly)
-        return QStringLiteral("diarize");
-    if (job.combineOnly)
-        return QStringLiteral("combine");
-    if (job.usbGrabOnly)
-        return QStringLiteral("usbGrab");
-    if (job.importOnly)
-        return QStringLiteral("import");
-    return QStringLiteral("transcribe");
-}
-
 QString TranscriptionController::currentJobKind() const
 {
-    if (m_activeIndex < 0 || m_activeIndex >= m_jobs.size())
+    if (m_activeIndex < 0 || m_activeIndex >= static_cast<int>(m_tasks.size()))
         return QString();
-    return jobKind(m_jobs[m_activeIndex]);
+    return m_tasks[m_activeIndex]->kind();
+}
+
+bool TranscriptionController::activeCanPause() const
+{
+    if (m_activeIndex < 0 || m_activeIndex >= static_cast<int>(m_tasks.size()))
+        return false;
+    return m_tasks[m_activeIndex]->capabilities().pausable;
 }
 
 QVariantList TranscriptionController::jobs() const
 {
     QVariantList list;
-    for (const Job &job : m_jobs) {
+    for (const auto &task : m_tasks) {
+        // The base row every kind shares; each kind's own extra fields come
+        // from its toVariantMap() (the giant per-flag switch this used to be
+        // is now distributed authorship — each Task authors its own row).
         QVariantMap entry;
-        entry["id"] = job.id;
-        entry["fileUrl"] = job.fileUrl;
-        entry["status"] = jobStatusToString(job.status);
-        entry["error"] = job.error;
-        entry["kind"] = jobKind(job);
-        // Ordered source parts of a "combine" job (empty for every other kind)
-        // — the exact concatenation order, so a caller/test can see WHICH files
-        // this merge covers and in what order. See enqueueCombineJob().
-        entry["combineSourcePaths"] = job.combineSourcePaths;
-        // -1 (QML sees it as a negative number) until Done/Failed — see
-        // Job::durationMs's doc comment.
-        entry["durationMs"] = job.durationMs;
-        // modelId is only meaningful for a "download" kind entry targeting
-        // WhisperModel (empty otherwise) — fileUrl is empty for every
-        // download job (nothing to open), so the Tasks popup needs SOME
-        // name to show; modelId (or a fixed label for the other two
-        // download targets, which have no modelId concept) is that name.
-        entry["modelId"] = job.modelId;
-        // Diarization tuning carried by a "diarize" kind entry (empty/0.5 for
-        // every other kind) — lets the Tasks UI / tests see which models + which
-        // sensitivity a queued speaker-detection job will use.
-        entry["segmentationModelId"] = job.segmentationModelId;
-        entry["embeddingModelId"] = job.embeddingModelId;
-        entry["diarizationThreshold"] = job.diarizationThreshold;
-        switch (job.downloadTarget) {
-        case DownloadTarget::WhisperModel: entry["downloadTarget"] = QStringLiteral("model"); break;
-        case DownloadTarget::LabelModel: entry["downloadTarget"] = QStringLiteral("label"); break;
-        case DownloadTarget::VadModel: entry["downloadTarget"] = QStringLiteral("vad"); break;
-        case DownloadTarget::SegmentationModel: entry["downloadTarget"] = QStringLiteral("segmentation"); break;
-        case DownloadTarget::EmbeddingModel: entry["downloadTarget"] = QStringLiteral("embedding"); break;
-        case DownloadTarget::None: entry["downloadTarget"] = QString(); break;
-        }
+        entry["id"] = task->id;
+        entry["fileUrl"] = task->fileUrl;
+        entry["status"] = taskStatusToString(task->status);
+        entry["error"] = task->error;
+        entry["kind"] = task->kind();
+        entry["displayName"] = task->displayName();
+        // -1 (QML sees it as a negative number) until Done/Failed.
+        entry["durationMs"] = task->durationMs;
+        const QVariantMap extra = task->toVariantMap();
+        for (auto it = extra.constBegin(); it != extra.constEnd(); ++it)
+            entry[it.key()] = it.value();
         list.append(entry);
     }
     return list;
@@ -6102,21 +4164,21 @@ QVariantList TranscriptionController::manageableModels() const
 
 void TranscriptionController::downloadModel(const QString &modelId)
 {
-    DownloadTarget target = DownloadTarget::WhisperModel; // whisper tiers + parakeet
+    ModelDownloadTarget target = ModelDownloadTarget::WhisperModel; // whisper tiers + parakeet
     if (modelId == QLatin1String(ModelManager::kLabelModelId)) {
-        target = DownloadTarget::LabelModel;
+        target = ModelDownloadTarget::LabelModel;
     } else if (modelId == QLatin1String(ModelManager::kVadModelId)) {
-        target = DownloadTarget::VadModel;
+        target = ModelDownloadTarget::VadModel;
     } else {
         for (const ModelManager::DiarizationModelInfo &info : ModelManager::availableSegmentationModels()) {
             if (info.id == modelId) {
-                target = DownloadTarget::SegmentationModel;
+                target = ModelDownloadTarget::SegmentationModel;
                 break;
             }
         }
         for (const ModelManager::DiarizationModelInfo &info : ModelManager::availableEmbeddingModels()) {
             if (info.id == modelId) {
-                target = DownloadTarget::EmbeddingModel;
+                target = ModelDownloadTarget::EmbeddingModel;
                 break;
             }
         }
@@ -6124,8 +4186,8 @@ void TranscriptionController::downloadModel(const QString &modelId)
 
     // Same queue path used lazily before a transcribe — inserted at the tail so
     // it doesn't jump ahead of in-flight work. No-op if already downloaded or
-    // already queued (maybeQueueDownloadJob returns -1).
-    if (maybeQueueDownloadJob(target, m_vaultUrl, modelId) >= 0) {
+    // already queued (maybeQueueDownloadTask returns -1).
+    if (maybeQueueDownloadTask(target, m_vaultUrl, modelId) >= 0) {
         emit queueChanged();
         startNext();
     }
@@ -6178,43 +4240,38 @@ void TranscriptionController::exportModel(const QString &modelId, const QUrl &de
 
 void TranscriptionController::runBenchmark(const QUrl &fileUrl, const QStringList &modelIds)
 {
-    // Dispatched onto the worker thread's event loop — serializes behind any
-    // in-flight job (no GPU contention), then runs benchmarkJob(). No queue
-    // entry, no file writes; results arrive via the benchmark* signals. Uses
-    // the currently-open vault, same as availableModels()/availableEngines().
-    // Light the progress glow immediately (before the first model-started
-    // signal) so it doesn't lag the run kicking off.
-    setBenchmarkGlow(true, 0.0);
-    QMetaObject::invokeMethod(m_worker, "benchmarkJob", Qt::QueuedConnection,
-                              Q_ARG(QString, fileUrl.toLocalFile()), Q_ARG(QString, m_vaultUrl.toLocalFile()),
-                              Q_ARG(QStringList, modelIds));
+    // Wave N (task system): a REAL queued task now. This used to bypass the
+    // queue entirely — invoking a worker slot directly, with "no queue entry,
+    // no file writes" and its own parallel setBenchmarkGlow() path — purely
+    // because a queue entry would have raised MainPanel's blocking overlay
+    // (m_busy was overloaded to mean both "glow" and "overlay"). That escape
+    // hatch IS the bug class this refactor exists to remove: a task that runs
+    // for minutes with no Tasks row and no cancel/progress plumbing of its
+    // own. Presentation::Background now expresses "glow + row, no overlay"
+    // directly, so it can just be enqueued like everything else — and it
+    // inherits the queue's serialization (no GPU contention with a real
+    // transcription) for free, which is what the manual worker dispatch was
+    // hand-rolling.
+    enqueueTask(std::make_unique<BenchmarkTask>(fileUrl, m_vaultUrl, modelIds));
 }
 
 void TranscriptionController::runDiarizationBenchmark(const QUrl &fileUrl, const QVariantList &combos)
 {
-    // Same worker/serialization/cancel story as runBenchmark(); no queue entry,
-    // no file writes. Results arrive via the diarizationBenchmark* signals.
-    setBenchmarkGlow(true, 0.0);
-    QMetaObject::invokeMethod(m_worker, "diarizationBenchmarkJob", Qt::QueuedConnection,
-                              Q_ARG(QString, fileUrl.toLocalFile()), Q_ARG(QVariantList, combos));
-}
-
-void TranscriptionController::setBenchmarkGlow(bool active, double progress)
-{
-    if (m_benchmarkProgress != progress) {
-        m_benchmarkProgress = progress;
-        emit benchmarkProgressChanged();
-    }
-    if (m_benchmarkActive != active) {
-        m_benchmarkActive = active;
-        emit benchmarkActiveChanged();
-    }
+    // Same story as runBenchmark() above.
+    enqueueTask(std::make_unique<DiarizationSweepTask>(fileUrl, combos));
 }
 
 void TranscriptionController::cancelBenchmark()
 {
-    if (m_worker)
-        m_worker->requestCancel();
+    // Cancels whichever benchmark/sweep task is Active or Queued. Now that
+    // both are real queued tasks, this is just cancelJob() over the two kinds
+    // rather than a bare requestCancel() at the worker (which would also have
+    // cancelled an unrelated real job that happened to be running).
+    for (int i = static_cast<int>(m_tasks.size()) - 1; i >= 0; --i) {
+        const QString kind = m_tasks[i]->kind();
+        if (kind == QStringLiteral("benchmark") || kind == QStringLiteral("diarizationSweep"))
+            cancelJob(m_tasks[i]->id);
+    }
 }
 
 QVariantList TranscriptionController::availableEngines() const
@@ -6236,5 +4293,3 @@ QVariantList TranscriptionController::availableEngines() const
     }
     return list;
 }
-
-#include "TranscriptionController.moc"

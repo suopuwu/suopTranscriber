@@ -135,14 +135,74 @@ This makes the out-of-process NeMo `engines/parakeet/` above the *fallback*
 route for Parakeet; the subprocess subsystem's real value is genuinely
 Python-only engines (faster-whisper, etc.).
 
+## Task system (the one queue)
+
+Every unit of background work — transcribe, detect-speakers (diarize),
+relabel, chapters, rename/merge speaker, combine split recordings, import,
+USB grab, model download, model benchmark, diarization sweep — is a
+**polymorphic `Task`** (`src/core/tasks/Task.h`), one subclass per kind. They
+all run through **one FIFO queue** owned by `TranscriptionController`, on one
+worker thread (`TaskRunner`), at most one at a time — so nothing contends for
+the GPU, and a warm model (`EngineCache`) is reused across consecutive tasks.
+
+This replaced an earlier design where "a job" was a single 30-field `Job`
+struct with nine mutually-exclusive bool flags, a `jobKind()` flag-waterfall,
+a ten-branch `startJob()` that marshalled each kind's args into a string-named
+slot on a monolithic `TranscriptionWorker`, and opt-*out* persistence. A
+kind's knowledge lived in five disjoint places and one could always be
+forgotten — which is exactly how work went missing (see below). Now the kind
+*is* the object: its `run()` (the doing-code), its typed result signals, its
+`toVariantMap()` Tasks-row fields, `capabilities()`, `presentation()`,
+`isPersistable()`, and `prerequisites()` all live in one file.
+
+**Load-bearing invariants** (the actual bug-killers, see `.task/plan.md`):
+
+- **Exactly one terminal report per enqueued task.** Whether `run()` finishes,
+  throws `TaskError`, or the task is cancelled *before it ever ran*, the queue
+  emits `finished` exactly once. The old system silently dropped a
+  cancelled-while-Queued job, so a consumer waiting on the result never heard
+  back (`UsbGrabberController` had to reconcile against the queue to notice).
+- **Everything queued gets a Tasks row. No exceptions.** A task is never
+  invisible. `Task::Presentation` (`Foreground`/`Background`) controls only
+  whether it *also* raises MainPanel's blocking overlay — NOT whether it
+  appears in the list or drives the bottom-bar glow. A benchmark is
+  `Background`: real queued task, real row + glow, no overlay over the
+  transcript you're reading. This axis is why the benchmark no longer needs a
+  side door (it used to bypass the queue entirely, precisely because "being a
+  job" indivisibly granted the overlay it had to avoid).
+- **Persistence is opt-*in*** (`isPersistable()`): a kind whose inputs name an
+  external/removable path (import, usbGrab) simply never overrides it, instead
+  of every new kind having to remember to add itself to an opt-out list.
+- **Capabilities are declared, not guessed.** The UI asks `capabilities()`
+  (`pausable`, `cancellableMidRun`) instead of re-deriving a kind allowlist in
+  QML — the source of the 2026-07-09 pause-vs-cancel latch bug.
+- **Model prerequisites** ride on the kind (`prerequisites()`): the queue
+  turns each into a `DownloadTask` inserted ahead of the requester (deduped),
+  so a kind declares its model needs once instead of at every enqueue site and
+  the persisted-queue replay separately.
+
+The scheduler keeps two hooks worth naming: a **combine preflight**
+(`maybeRedirectForCombine`) that can retarget a queued transcribe at a merged
+output *before* dispatch (the only place `Task::fileUrl` is mutated, and only
+on the GUI thread, pre-run), and **`TaskFactory`**, the one place a persisted
+kind slug maps back to a concrete class.
+
+Threading: a `Task` lives on the GUI thread its whole life (including as a
+Done/Failed history row); its `run()` executes on the worker thread and
+communicates back only through queued signals — it never touches GUI-thread
+state. `TaskContext::checkpoint()` is the single cooperative interruption point
+every pausable kind funnels through.
+
 ## Benchmark (top-level page)
 
 A display-only comparison harness, its own **top-level page** (a TitleBar icon
 button next to the USB grabber, mounted by `MainPanel` in a `ScrollView` — no
 longer a Settings sub-page). It defaults to the file open in the left panel
-(`currentFilePath`), falling back to a vault-wide picker. Two sweeps, both on the
-transcription worker thread (so they serialize with real jobs and never contend
-for the GPU), writing **no** `.md`:
+(`currentFilePath`), falling back to a vault-wide picker. Two sweeps, each a
+real **`Background` task** on the one queue (`BenchmarkTask` /
+`DiarizationSweepTask` — see "Task system" above), so they serialize with real
+work and never contend for the GPU, show a Tasks row + progress glow without
+raising the transcript overlay, and write **no** `.md`:
 
 - **Model benchmark** — `TranscriptionController::runBenchmark()` runs every
   *already-downloaded* model plus every *available* engine over the file,
@@ -220,7 +280,7 @@ Both models are **user-selectable** (`AppSettings.diarizationSegmentationModel` 
 default pair is pyannote-segmentation-3.0 + WeSpeaker ResNet293-LM, with
 Rev.ai reverb-diarization-v1 (segmentation), 3D-Speaker CAM++ and NeMo
 TitaNet-large (embedding) as alternatives, each its own downloadable/manageable
-model. The selection + sensitivity are carried on the `diarizeOnly` job and can
+model. The selection + sensitivity are carried on the `DiarizeTask` and can
 be swept in the benchmark (see below) to compare combinations on a hard file.
 See `ModelManager::availableSegmentationModels()`/`availableEmbeddingModels()`.
 
@@ -229,10 +289,10 @@ producing `DiarizedTurn`s (`{start, end, speaker}`), and each segment is tagged
 with the diarized turn it overlaps most (`labelForSegment`). Diarization is a
 **standalone task, never bundled into transcription** — **Transcribe is pure
 ASR** (plus its intrinsic VAD windowing; see below). It's invoked two ways, both
-through `TranscriptionController`'s single worker thread and sharing one
-diarization-core routine (`TranscriptionWorker::runDiarizationPass`):
+through the one task queue and sharing one diarization core
+(`EngineCache::ensureDiar` + `DiarizeTask`'s progress-driving pass):
 
-- **Standalone** — the `diarizeOnly` job (`diarizeFile()`, the MainPanel /
+- **Standalone** — the `DiarizeTask` (`diarizeFile()`, the MainPanel /
   Sidebar-ribbon "Detect speakers" action). Runs (or re-runs) speaker detection
   on an already-transcribed file *without* re-transcribing: reads the existing
   `.md`'s segments, decodes the audio, diarizes, and splices the speaker tags +
@@ -561,12 +621,12 @@ the overview, not a duplicate of it.
   a pinned path.
 - **A grab is a queued task, not its own thread.** `UsbGrabberController::
   startGrabJob()` hands the resolved rule to `TranscriptionController::
-  enqueueUsbGrab()`, so a grab is an ordinary `"usbGrab"` job in the ONE task
+  enqueueUsbGrab()`, so a grab is an ordinary `UsbGrabTask` in the ONE task
   queue alongside transcribe/import/combine, and inherits that queue's Tasks
-  row, progress glow, and pause/cancel with no bespoke plumbing (`
-  TranscriptionWorker::usbGrabJob()` just wires `runUsbGrabScan`'s hooks to the
-  worker's phase/progress/pause/cancel contract; pause/cancel land at a file
-  boundary, since `QFile::copy()` is uninterruptible). This replaced a
+  row, progress glow, and pause/cancel with no bespoke plumbing (`UsbGrabTask::
+  run()` just wires `runUsbGrabScan`'s hooks to the phase/progress/pause/cancel
+  contract; pause/cancel land at a file boundary, since `QFile::copy()` is
+  uninterruptible). This replaced a
   dedicated QThread per grab. The cost, accepted: a hotplug grab that lands
   mid-transcription waits its turn instead of starting immediately — which also
   means it can't fight the transcription for the same disk. Grab jobs are

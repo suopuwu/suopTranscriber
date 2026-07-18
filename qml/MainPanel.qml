@@ -35,8 +35,15 @@ Rectangle {
     // down this file. Editing while this file's transcription job is
     // actively appending live segments would fight the same text the user
     // is typing into.
+    // activeIsForeground (Wave N, task system): the blocking overlay must NOT
+    // appear for a Background task (a benchmark/sweep on this same file — see
+    // Task::Presentation). `busy` alone is true for those too now that they're
+    // real queued tasks, so gating on presentation is what keeps a benchmark
+    // from freezing the panel the user is reading. This is the concrete reason
+    // Presentation exists as an axis separate from "is a task running".
     readonly property bool transcribingThisFile: mainPanel.transcriptionController && mainPanel.player
         && mainPanel.transcriptionController.busy
+        && mainPanel.transcriptionController.activeIsForeground
         && mainPanel.transcriptionController.currentFile.toString() === mainPanel.player.source.toString()
     // Item 55: true only in the window between THIS file's (re)transcription
     // job starting and the first NEW segment actually landing on disk — i.e.

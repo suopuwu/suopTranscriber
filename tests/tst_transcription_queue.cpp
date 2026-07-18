@@ -131,35 +131,23 @@ class TstTranscriptionQueue : public QObject
     QScopedPointer<QTemporaryDir> m_emptyBundled;
 
 private slots:
-    // The model benchmark (benchmarkJob) is display-only: it must NEVER write a
-    // transcript .md or otherwise mutate the vault (that's the whole point —
-    // "doing so changes no files"). No QQuickView/model-run harness here to
-    // drive a real benchmark end-to-end, so this is a source-scan guard on the
-    // benchmarkJob body (same technique as tst_styleguide's guards): a future
-    // edit that reaches for sidecarPath()/writeFrontmatter()/a SegmentLineWriter
-    // inside benchmarkJob trips it.
+    // The model benchmark (BenchmarkTask) is display-only: it must NEVER write
+    // a transcript .md or otherwise mutate the vault. Wave N: the old
+    // benchmarkJob worker slot is now BenchmarkTask::run() in its own file, so
+    // this source-scan guard (same technique as tst_styleguide's) points there
+    // — a future edit that reaches for sidecarPath()/writeFrontmatter()/a
+    // SegmentLineWriter inside it trips.
     void benchmarkJob_writesNoTranscriptFiles()
     {
-        QFile src(QStringLiteral(SUOP_SRC_DIR "/core/TranscriptionController.cpp"));
-        QVERIFY2(src.open(QIODevice::ReadOnly), "TranscriptionController.cpp must be readable");
+        QFile src(QStringLiteral(SUOP_SRC_DIR "/core/tasks/BenchmarkTask.cpp"));
+        QVERIFY2(src.open(QIODevice::ReadOnly), "BenchmarkTask.cpp must be readable");
         const QString all = QString::fromUtf8(src.readAll());
-
-        const int start = all.indexOf(QStringLiteral("void benchmarkJob("));
-        QVERIFY2(start >= 0, "benchmarkJob must exist");
-        // Body ends where the next helper (runOneBenchmarkModel, declared right
-        // after in the private section, or the following slot) begins.
-        int end = all.indexOf(QStringLiteral("runOneBenchmarkModel"), start);
-        if (end < 0)
-            end = all.indexOf(QStringLiteral("void relabelJob("), start);
-        QVERIFY(end > start);
-        const QString body = all.mid(start, end - start);
-
-        QVERIFY2(!body.contains(QStringLiteral("sidecarPath(")),
-                 "benchmarkJob must not resolve a transcript sidecar path (it writes no files)");
-        QVERIFY2(!body.contains(QStringLiteral("writeFrontmatter(")),
-                 "benchmarkJob must not write frontmatter (it writes no files)");
-        QVERIFY2(!body.contains(QStringLiteral("SegmentLineWriter")),
-                 "benchmarkJob must not open a SegmentLineWriter (it writes no files)");
+        QVERIFY2(!all.contains(QStringLiteral("sidecarPath(")),
+                 "BenchmarkTask must not resolve a transcript sidecar path (it writes no files)");
+        QVERIFY2(!all.contains(QStringLiteral("writeFrontmatter(")),
+                 "BenchmarkTask must not write frontmatter (it writes no files)");
+        QVERIFY2(!all.contains(QStringLiteral("SegmentLineWriter")),
+                 "BenchmarkTask must not open a SegmentLineWriter (it writes no files)");
     }
 
     // TranscriptionController persists rolling-average phase timing via a
@@ -794,6 +782,42 @@ private slots:
         QCOMPARE(controller.jobs().at(0).toMap().value("status").toString(), QStringLiteral("active"));
 
         QTRY_COMPARE(controller.tasksCompleted(), 1); // let the fake (fails-fast) model job settle before teardown
+    }
+
+    // Wave N (task system) invariant 1 — "exactly one terminal report per
+    // enqueued task, whether or not run() was ever called." The OLD system
+    // silently dropped a cancelled-while-Queued job (removeAt, no signal), so
+    // a consumer waiting on finished() (e.g. UsbGrabberController's in-flight
+    // tracking) never heard back and had to reconcile against the queue to
+    // notice. Now the queue synthesizes the terminal report on a pre-run
+    // cancel. See TranscriptionController::cancelTaskAt().
+    void cancelQueuedTask_stillEmitsFinished_soNothingWaitsForever()
+    {
+        VaultFixture vault;
+        TranscriptionController controller;
+        const QUrl activeFile = vault.audioUrl("a.wav");
+        const QUrl queuedFile = vault.audioUrl("b.wav");
+
+        controller.transcribe(activeFile, vault.vaultUrl, kModelId);
+        controller.transcribe(queuedFile, vault.vaultUrl, kModelId);
+
+        QSignalSpy finishedSpy(&controller, &TranscriptionController::finished);
+        const int queuedId = controller.jobs().at(1).toMap().value("id").toInt();
+        controller.cancelJob(queuedId);
+
+        // The cancelled-while-Queued task reports finished(queuedFile, false,
+        // "Cancelled") synchronously — NOT dropped silently.
+        bool sawQueuedReport = false;
+        for (const QList<QVariant> &args : finishedSpy) {
+            if (args.at(0).toUrl() == queuedFile) {
+                QCOMPARE(args.at(1).toBool(), false);
+                QCOMPARE(args.at(2).toString(), QStringLiteral("Cancelled"));
+                sawQueuedReport = true;
+            }
+        }
+        QVERIFY2(sawQueuedReport, "a cancelled-while-Queued task must still emit finished() exactly once");
+
+        QTRY_COMPARE(controller.tasksCompleted(), 1); // let the active fake job settle before teardown
     }
 
     // Item 3: cancelling the ACTIVE job takes effect (Failed/"Cancelled")
