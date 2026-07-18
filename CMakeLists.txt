@@ -257,6 +257,7 @@ qt_add_qml_module(suopTranscriber
         src/core/Clipboard.cpp
         src/core/AudioDecoder.h
         src/core/AudioDecoder.cpp
+        src/core/ProcessRunner.h
         src/core/WhisperCppEngine.h
         src/core/WhisperCppEngine.cpp
         src/core/ParakeetEngine.h

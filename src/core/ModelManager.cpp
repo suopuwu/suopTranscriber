@@ -1,4 +1,5 @@
 #include "ModelManager.h"
+#include "ProcessRunner.h"
 
 #include <QCoreApplication>
 #include <QDebug>
@@ -10,7 +11,6 @@
 #include <QStandardPaths>
 #include <QThread>
 
-#include <csignal>
 #include <unistd.h>
 
 namespace ModelManager {
@@ -325,28 +325,17 @@ QString downloadToModelsDir(const QDir &modelsDir, const QString &fileName, cons
         return {};
     }
 
-    bool wasPaused = false;
-    bool cancelled = false;
-    while (!curl.waitForFinished(100)) {
-        if (control.cancelled && control.cancelled()) {
-            cancelled = true;
-            curl.kill();
-            curl.waitForFinished(2000);
-            break;
-        }
-        const bool shouldPause = control.paused && control.paused();
-        if (shouldPause && !wasPaused) {
-            ::kill(static_cast<pid_t>(curl.processId()), SIGSTOP);
-            wasPaused = true;
-        } else if (!shouldPause && wasPaused) {
-            ::kill(static_cast<pid_t>(curl.processId()), SIGCONT);
-            wasPaused = false;
-        }
-        if (onProgress && !wasPaused)
-            onProgress(QFileInfo(tmpPath).size(), totalBytes);
-    }
+    // Pausable poll (see ProcessRunner::runPausable). curl writes the body
+    // straight to tmpPath (-o), so there's no stdout to drain — progress is the
+    // growing file size against the Content-Length probe.
+    const auto outcome = ProcessRunner::runPausable(
+        curl, {control.cancelled, control.paused, {}},
+        [&] {
+            if (onProgress)
+                onProgress(QFileInfo(tmpPath).size(), totalBytes);
+        });
 
-    if (cancelled) {
+    if (outcome == ProcessRunner::RunOutcome::Cancelled) {
         if (errorOut)
             *errorOut = QStringLiteral("Cancelled");
         QFile::remove(tmpPath);

@@ -1,5 +1,7 @@
 #include "CombineTask.h"
 
+#include "../ProcessRunner.h"
+
 #include <QDateTime>
 #include <QDir>
 #include <QFile>
@@ -9,8 +11,6 @@
 #include <QTemporaryFile>
 
 #include <algorithm>
-#include <csignal>
-#include <sys/types.h>
 
 CombineTask::CombineTask(QStringList sourcePaths, QUrl outputUrl, bool deleteOriginals, QObject *parent)
     : Task(parent)
@@ -77,36 +77,22 @@ void CombineTask::run(TaskContext &ctx)
     if (!ffmpeg.waitForStarted())
         throw TaskError(QStringLiteral("failed to start ffmpeg"));
 
-    // Same 100ms poll/pause/cancel shape as AudioDecoder::decodeTo16kMono —
-    // SIGSTOP/SIGCONT for pause, kill for cancel. Progress is approximate
-    // (output file size vs. summed input size).
-    bool wasPaused = false;
-    bool cancelled = false;
-    while (ffmpeg.state() != QProcess::NotRunning) {
-        if (ctx.cancelRequested()) {
-            cancelled = true;
-            ffmpeg.kill();
-            ffmpeg.waitForFinished(2000);
-            break;
-        }
-        const bool shouldPause = ctx.pauseRequested();
-        if (shouldPause && !wasPaused) {
-            ::kill(static_cast<pid_t>(ffmpeg.processId()), SIGSTOP);
-            wasPaused = true;
-            ctx.reportPaused(true);
-        } else if (!shouldPause && wasPaused) {
-            ::kill(static_cast<pid_t>(ffmpeg.processId()), SIGCONT);
-            wasPaused = false;
-            ctx.reportPaused(false);
-        }
-        ffmpeg.waitForReadyRead(100);
-        if (totalInputBytes > 0) {
-            const qint64 outBytes = QFileInfo(outputPath).size();
-            emit progress(std::clamp(static_cast<double>(outBytes) / static_cast<double>(totalInputBytes), 0.0, 1.0));
-        }
-    }
+    // Pausable poll (see ProcessRunner::runPausable). Progress is approximate
+    // (output file size vs. summed input size); reportPaused mirrors the
+    // SIGSTOP/SIGCONT state up to the task UI.
+    const auto outcome = ProcessRunner::runPausable(
+        ffmpeg,
+        {[&ctx] { return ctx.cancelRequested(); }, [&ctx] { return ctx.pauseRequested(); },
+         [&ctx](bool paused) { ctx.reportPaused(paused); }},
+        [&] {
+            if (totalInputBytes > 0) {
+                const qint64 outBytes = QFileInfo(outputPath).size();
+                emit progress(
+                    std::clamp(static_cast<double>(outBytes) / static_cast<double>(totalInputBytes), 0.0, 1.0));
+            }
+        });
 
-    if (cancelled) {
+    if (outcome == ProcessRunner::RunOutcome::Cancelled) {
         QFile::remove(outputPath);
         throw TaskError(QStringLiteral("Cancelled"));
     }

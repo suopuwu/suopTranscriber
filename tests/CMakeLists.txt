@@ -120,6 +120,9 @@ endfunction()
 
 suop_add_test(tst_smoke)
 suop_add_test(tst_rollingaverage)
+# Header-only helper (ProcessRunner.h) — no SOURCES, just needs SUOP_CORE_DIR
+# on the include path (added for every test above) and a real child process.
+suop_add_test(tst_processrunner)
 suop_add_test(tst_vaulttreemodel SOURCES VaultTreeModel.cpp)
 suop_add_test(tst_desktopintegration LINK_DBUS LINK_KWINDOWSYSTEM SOURCES DesktopIntegration.cpp)
 suop_add_test(tst_clipboard LINK_GUI SOURCES Clipboard.cpp)
