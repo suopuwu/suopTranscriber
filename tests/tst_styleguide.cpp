@@ -1366,6 +1366,28 @@ private slots:
         }
     }
 
+    // Item 7 (drift fix): ModelsPage's delete-confirm popup must match its
+    // sibling confirm dialogs (Sidebar's fileDeleteConfirmPopup, MainPanel's) —
+    // modal + dim + focus + closePolicy so Escape / click-outside cancel and
+    // the backdrop dims. It previously set only `modal`, so the same "delete?"
+    // UX behaved differently depending on which page you were on.
+    void modelsPage_deleteConfirmMatchesSiblingDialogs()
+    {
+        const QString src = stripComments(readAll(QStringLiteral(SUOP_QML_DIR "/ModelsPage.qml")));
+        const int anchor = src.indexOf(QStringLiteral("id: deleteConfirmPopup"));
+        QVERIFY2(anchor >= 0, "could not find deleteConfirmPopup");
+        // Scope to the popup's property block (up to its content ColumnLayout).
+        const int blockEnd = src.indexOf(QStringLiteral("ColumnLayout"), anchor);
+        QVERIFY2(blockEnd > anchor, "could not bound the deleteConfirmPopup block");
+        const QString block = src.mid(anchor, blockEnd - anchor);
+        QVERIFY2(block.contains(QStringLiteral("closePolicy")),
+                 "deleteConfirmPopup must set closePolicy (Escape/click-outside cancels), like its siblings");
+        QVERIFY2(block.contains(QStringLiteral("dim: true")),
+                 "deleteConfirmPopup must dim the backdrop, like its siblings");
+        QVERIFY2(block.contains(QStringLiteral("focus: true")),
+                 "deleteConfirmPopup must take focus (so Escape works), like its siblings");
+    }
+
     // Milestone 2 decision: the desktop's QQC2 theme (KDE Breeze) breaks this
     // app; the bundled Basic style is forced instead.
     void mainCpp_forcesBasicControlsStyle()

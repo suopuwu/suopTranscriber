@@ -250,6 +250,14 @@ ColumnLayout {
         id: deleteConfirmPopup
         anchors.centerIn: Overlay.overlay
         modal: true
+        // Match every other confirm dialog (Sidebar's fileDeleteConfirmPopup,
+        // MainPanel's) — dim the backdrop, take focus, and let Escape /
+        // click-outside cancel. This popup previously set only `modal`, so it
+        // behaved differently (no dim, Escape/outside-click didn't dismiss it)
+        // depending on which page you were on.
+        dim: true
+        focus: true
+        closePolicy: Popup.CloseOnPressOutside | Popup.CloseOnEscape
         padding: 16
         background: Rectangle {
             color: "#242424"
