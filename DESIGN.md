@@ -398,11 +398,17 @@ vault/
     `speakerDetection` (bool), `transcribedAt` (ISO 8601). Frontmatter is
     written the moment a job starts, before transcription runs, so a
     killed/stopped job still leaves a file recording what it was run with.
-  - One `[HH:MM:SS.mmm - HH:MM:SS.mmm] text` line per segment, appended and
-    flushed as each segment is produced — not buffered to the end. An
-    optional trailing `[SPEAKER_TURN]` marker marks a tinydiarize speaker change.
-    This is also where sentence-highlight sync will later re-derive timing
-    from, once that milestone lands (see "Sentence highlighting" above).
+  - One `[start] text` line per segment, appended and flushed as each segment
+    is produced — not buffered to the end. The timestamp is a compact start
+    only (leading/trailing zeros trimmed, e.g. `[1:07]`); there is no end
+    timestamp — it is always the next segment's start. When speaker detection
+    ran, a `[Speaker N]` tag follows the timestamp (written by
+    DiarizationEngine); consecutive identical lines collapse to a trailing
+    `(×N)` repeat marker. This is also where sentence-highlight sync re-derives
+    timing from (see "Sentence highlighting" above). The old trailing
+    `[SPEAKER_TURN]` marker (tinydiarize, since replaced by DiarizationEngine)
+    is now only PARSED for backward-compatible reads of older files — never
+    written.
   - If the requested model id isn't recognized, `ModelManager` falls back to
     the default model rather than failing outright (see "Model management"
     below) — the frontmatter also carries `modelRequested` and
