@@ -2,6 +2,7 @@
 
 #include <QDir>
 #include <QFile>
+#include <QSaveFile>
 #include <QFileInfo>
 #include <QJsonArray>
 #include <QJsonDocument>
@@ -1454,7 +1455,9 @@ bool VaultTreeModel::writeVaultSettings(const QVariantMap &settings, QString *er
         return false;
     }
 
-    QFile file(configDir.filePath(QStringLiteral("settings.json")));
+    // Atomic (QSaveFile): a crash/full-disk mid-write leaves the previous
+    // settings.json intact rather than truncating it to nothing.
+    QSaveFile file(configDir.filePath(QStringLiteral("settings.json")));
     if (!file.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
         if (errorOut)
             *errorOut = QStringLiteral("could not open %1 for writing").arg(file.fileName());
@@ -1463,6 +1466,11 @@ bool VaultTreeModel::writeVaultSettings(const QVariantMap &settings, QString *er
 
     const QJsonDocument doc(QJsonObject::fromVariantMap(settings));
     file.write(doc.toJson(QJsonDocument::Indented));
+    if (!file.commit()) {
+        if (errorOut)
+            *errorOut = QStringLiteral("could not write %1 (%2)").arg(file.fileName(), file.errorString());
+        return false;
+    }
     return true;
 }
 
@@ -1512,7 +1520,7 @@ bool VaultTreeModel::appendUsbGrabHistoryEntry(const QVariantMap &entry, QString
 
     history.append(QJsonObject::fromVariantMap(entry));
 
-    QFile writeFile(historyPath);
+    QSaveFile writeFile(historyPath);
     if (!writeFile.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
         if (errorOut)
             *errorOut = QStringLiteral("could not open %1 for writing").arg(writeFile.fileName());
@@ -1521,6 +1529,11 @@ bool VaultTreeModel::appendUsbGrabHistoryEntry(const QVariantMap &entry, QString
 
     const QJsonDocument doc(history);
     writeFile.write(doc.toJson(QJsonDocument::Indented));
+    if (!writeFile.commit()) {
+        if (errorOut)
+            *errorOut = QStringLiteral("could not write %1 (%2)").arg(writeFile.fileName(), writeFile.errorString());
+        return false;
+    }
     return true;
 }
 
@@ -1559,7 +1572,7 @@ bool VaultTreeModel::writeBenchmarkLastRun(const QVariantMap &run, QString *erro
 
     // Overwrite each run (not appended, unlike usbGrabHistory) — only the last
     // benchmark is kept.
-    QFile file(configDir.filePath(QStringLiteral("benchmarkLastRun.json")));
+    QSaveFile file(configDir.filePath(QStringLiteral("benchmarkLastRun.json")));
     if (!file.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
         if (errorOut)
             *errorOut = QStringLiteral("could not open %1 for writing").arg(file.fileName());
@@ -1568,6 +1581,11 @@ bool VaultTreeModel::writeBenchmarkLastRun(const QVariantMap &run, QString *erro
 
     const QJsonDocument doc(QJsonObject::fromVariantMap(run));
     file.write(doc.toJson(QJsonDocument::Indented));
+    if (!file.commit()) {
+        if (errorOut)
+            *errorOut = QStringLiteral("could not write %1 (%2)").arg(file.fileName(), file.errorString());
+        return false;
+    }
     return true;
 }
 

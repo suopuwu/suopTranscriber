@@ -7,6 +7,7 @@
 #include <QDirIterator>
 #include <QElapsedTimer>
 #include <QFile>
+#include <QSaveFile>
 #include <QFileInfo>
 #include <QJsonArray>
 #include <QJsonDocument>
@@ -476,6 +477,11 @@ QString spliceBodyPrelude(const QString &body, const QString &newPrelude)
 // are a flat line-based format — a raw '\n' inside a JSON string (from a
 // "\n" escape) would otherwise corrupt the frontmatter block; the prelude's
 // real newlines are exactly the point of moving it to the body.
+// Defined below; declared here so the frontmatter writers above it (this one
+// and its neighbours) route through the single atomic writer.
+bool writeFrontmatterBlock(const QString &path, const QStringList &frontmatterLines, const QString &body,
+                           QString *errorOut);
+
 void writeLabelingFields(const QString &mdPath, const LabelResult &result)
 {
     QFile mdFile(mdPath);
@@ -520,18 +526,9 @@ void writeLabelingFields(const QString &mdPath, const LabelResult &result)
     spliceOrAppend(QStringLiteral("tags"), sanitize(result.tags));
     const QString newBody = spliceBodyPrelude(body, result.prelude);
 
-    if (!mdFile.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
-        qWarning() << "auto-label: could not reopen" << mdPath << "for writing";
-        return;
-    }
-    QTextStream out(&mdFile);
-    out << "---\n";
-    for (const QString &fmLine : frontmatterLines)
-        out << fmLine << '\n';
-    out << "---\n";
-    out << newBody;
-    out.flush();
-    mdFile.flush();
+    QString writeError;
+    if (!writeFrontmatterBlock(mdPath, frontmatterLines, newBody, &writeError))
+        qWarning() << "auto-label: could not write" << mdPath << ":" << writeError;
 }
 
 // Plain prose for the labeling prompt (see relabel()'s slot below): strips
@@ -827,15 +824,20 @@ bool parseSpeakerTaggedFile(const QString &path, QStringList *frontmatterLines, 
     return true;
 }
 
-// Truncates mdFile and writes frontmatterLines + body back out in the
-// standard "---\n<lines>\n---\n<body>" shape shared by every frontmatter
-// rewrite (rename/merge/sync). mdFile must already be open for reading
-// having been closed by parseSpeakerTaggedFile() above (or otherwise not
-// open) — this reopens it WriteOnly|Truncate itself.
+// Writes frontmatterLines + body out in the standard "---\n<lines>\n---\n<body>"
+// shape shared by every frontmatter rewrite (rename/merge/sync/label/tags/
+// prelude/chapters). Opens `path` itself; the caller must already have closed
+// any read handle it held on the same file.
 bool writeFrontmatterBlock(const QString &path, const QStringList &frontmatterLines, const QString &body,
                            QString *errorOut)
 {
-    QFile mdFile(path);
+    // Atomic: QSaveFile stages into a temp file in the same directory and
+    // only renames into place on commit(). A crash, full disk, or write
+    // failure leaves the ORIGINAL .md byte-for-byte intact (the old
+    // WriteOnly|Truncate path destroyed the transcript body before the new
+    // bytes landed, then still returned true — permanent data loss reported
+    // as "saved"). Every frontmatter rewrite routes through here.
+    QSaveFile mdFile(path);
     if (!mdFile.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
         if (errorOut)
             *errorOut = QStringLiteral("could not open %1 for writing").arg(mdFile.fileName());
@@ -848,8 +850,11 @@ bool writeFrontmatterBlock(const QString &path, const QStringList &frontmatterLi
     out << "---\n";
     out << body;
     out.flush();
-    mdFile.flush();
-    mdFile.close();
+    if (!mdFile.commit()) {
+        if (errorOut)
+            *errorOut = QStringLiteral("could not write %1 (%2)").arg(path, mdFile.errorString());
+        return false;
+    }
     return true;
 }
 
@@ -3001,10 +3006,11 @@ void TranscriptionController::persistQueue() const
         array.append(obj);
     }
 
-    QFile file(tasksJsonPath(m_vaultUrl));
+    QSaveFile file(tasksJsonPath(m_vaultUrl));
     if (!file.open(QIODevice::WriteOnly | QIODevice::Truncate))
         return;
     file.write(QJsonDocument(array).toJson(QJsonDocument::Indented));
+    file.commit();
 }
 
 void TranscriptionController::loadPersistedQueue(const QUrl &vaultUrl)
@@ -3203,20 +3209,8 @@ bool TranscriptionController::setLabel(const QUrl &fileUrl, const QString &label
     if (!replaced)
         frontmatterLines.append(QStringLiteral("label: ") + label);
 
-    if (!mdFile.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
-        if (errorOut)
-            *errorOut = QStringLiteral("could not open %1 for writing").arg(mdFile.fileName());
+    if (!writeFrontmatterBlock(mdFile.fileName(), frontmatterLines, body, errorOut))
         return false;
-    }
-    QTextStream out(&mdFile);
-    out << "---\n";
-    for (const QString &fmLine : frontmatterLines)
-        out << fmLine << '\n';
-    out << "---\n";
-    out << body;
-    out.flush();
-    mdFile.flush();
-    mdFile.close();
     // Item P19: this manual (non-queued) rewrite otherwise leaves the
     // sidebar's cached per-row metadata stale until an unrelated job
     // finishes or a full VaultTreeModel rebuild happens — see finished()'s
@@ -3289,20 +3283,8 @@ bool TranscriptionController::setTags(const QUrl &fileUrl, const QStringList &ta
     if (!replaced)
         frontmatterLines.append(QStringLiteral("tags: ") + joined);
 
-    if (!mdFile.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
-        if (errorOut)
-            *errorOut = QStringLiteral("could not open %1 for writing").arg(mdFile.fileName());
+    if (!writeFrontmatterBlock(mdFile.fileName(), frontmatterLines, body, errorOut))
         return false;
-    }
-    QTextStream out(&mdFile);
-    out << "---\n";
-    for (const QString &fmLine : frontmatterLines)
-        out << fmLine << '\n';
-    out << "---\n";
-    out << body;
-    out.flush();
-    mdFile.flush();
-    mdFile.close();
     // Item P19-style notification: sidebar's tag-derived display (if any)
     // should refresh the same way a label edit does — see setLabel()'s
     // matching emit for why (VaultTreeModel::refreshFile(fileUrl)).
@@ -3375,20 +3357,8 @@ bool TranscriptionController::setCollapsedChapters(const QUrl &fileUrl, const QS
     if (!replaced && !joined.isEmpty())
         frontmatterLines.append(QStringLiteral("collapsedChapters: ") + joined);
 
-    if (!mdFile.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
-        if (errorOut)
-            *errorOut = QStringLiteral("could not open %1 for writing").arg(mdFile.fileName());
+    if (!writeFrontmatterBlock(mdFile.fileName(), frontmatterLines, body, errorOut))
         return false;
-    }
-    QTextStream out(&mdFile);
-    out << "---\n";
-    for (const QString &fmLine : frontmatterLines)
-        out << fmLine << '\n';
-    out << "---\n";
-    out << body;
-    out.flush();
-    mdFile.flush();
-    mdFile.close();
     // No finished() emit — see the header doc comment (collapse is pure view
     // state, must not trigger a metadata/transcript reload on every toggle).
     return true;
@@ -3531,20 +3501,8 @@ bool TranscriptionController::setPrelude(const QUrl &fileUrl, const QString &pre
 
     const QString newBody = spliceBodyPrelude(body, prelude);
 
-    if (!mdFile.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
-        if (errorOut)
-            *errorOut = QStringLiteral("could not open %1 for writing").arg(mdFile.fileName());
+    if (!writeFrontmatterBlock(mdFile.fileName(), frontmatterLines, newBody, errorOut))
         return false;
-    }
-    QTextStream out(&mdFile);
-    out << "---\n";
-    for (const QString &fmLine : frontmatterLines)
-        out << fmLine << '\n';
-    out << "---\n";
-    out << newBody;
-    out.flush();
-    mdFile.flush();
-    mdFile.close();
     // Item P19: see setLabel()'s matching emit for why
     // (VaultTreeModel::refreshFile(fileUrl)).
     emit finished(fileUrl, true, QString());
@@ -3661,20 +3619,8 @@ bool TranscriptionController::editChapterMarker(const QUrl &fileUrl, ChapterEdit
     }
     }
 
-    if (!mdFile.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
-        if (errorOut)
-            *errorOut = QStringLiteral("could not open %1 for writing").arg(mdFile.fileName());
+    if (!writeFrontmatterBlock(mdFile.fileName(), frontmatterLines, body, errorOut))
         return false;
-    }
-    QTextStream out(&mdFile);
-    out << "---\n";
-    for (const QString &fmLine : frontmatterLines)
-        out << fmLine << '\n';
-    out << "---\n";
-    out << body;
-    out.flush();
-    mdFile.flush();
-    mdFile.close();
     return true;
 }
 

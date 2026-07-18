@@ -19,10 +19,13 @@
 #include <QtTest>
 
 #include <QDir>
+#include <QFile>
 #include <QFileInfo>
 #include <QStandardPaths>
 #include <QTemporaryDir>
 #include <QUrl>
+
+#include <unistd.h> // geteuid() — the failed-write test needs to skip under root
 
 #include "ModelManager.h"
 #include "TranscriptionController.h"
@@ -753,6 +756,45 @@ private slots:
         QVERIFY(!controller.setLabel(QUrl::fromLocalFile(dir.path() + "/bare.wav"), QStringLiteral("x"), &error));
         QVERIFY2(error.contains(QStringLiteral("no frontmatter")), qPrintable(error));
         QCOMPARE(readAllBytes(barePath), original);
+    }
+
+    // DATA-LOSS regression (item 1a): a frontmatter rewrite whose write FAILS
+    // must leave the original .md byte-for-byte intact and report the failure
+    // — never truncate-then-fail. The old WriteOnly|Truncate path destroyed
+    // the transcript body before the new bytes landed, yet still returned true
+    // ("saved"). writeFrontmatterBlock now stages through QSaveFile, which
+    // renames into place only on commit(), so a failed write cannot touch the
+    // original. We force the failure by making the containing directory
+    // read-only so QSaveFile's temp file can't be created (the read of the
+    // existing .md still succeeds under r-x). Every setter routes through the
+    // same primitive, so setLabel exercises the whole class.
+    void frontmatterWrite_failedWrite_leavesOriginalIntact()
+    {
+        if (geteuid() == 0)
+            QSKIP("running as root bypasses directory permissions");
+
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        const QString mdPath = writeFixture(dir.path(), "meeting.wav.md", kFixtureMd);
+        const QUrl audioUrl = QUrl::fromLocalFile(dir.path() + "/meeting.wav");
+
+        TranscriptionController controller;
+
+        // Directory r-x only: the existing .md still opens for reading, but
+        // QSaveFile can't create its sibling temp file.
+        QVERIFY(QFile::setPermissions(dir.path(), QFileDevice::ReadOwner | QFileDevice::ExeOwner));
+
+        QString error;
+        const bool ok = controller.setLabel(audioUrl, QStringLiteral("Should not persist"), &error);
+
+        // Restore before asserting so the checks (and QTemporaryDir cleanup)
+        // can touch the directory again even if an assertion below fails.
+        QVERIFY(QFile::setPermissions(
+            dir.path(), QFileDevice::ReadOwner | QFileDevice::WriteOwner | QFileDevice::ExeOwner));
+
+        QVERIFY2(!ok, "setLabel must report failure when the write cannot be committed");
+        QVERIFY2(!error.isEmpty(), "a failed write must surface a non-empty error");
+        QCOMPARE(readAllBytes(mdPath), kFixtureMd);
     }
 
     // Feature 2: setPrelude() on a body with no existing "<!-- prelude

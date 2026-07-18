@@ -360,11 +360,34 @@ QString downloadToModelsDir(const QDir &modelsDir, const QString &fileName, cons
         return {};
     }
 
-    if (onProgress) {
-        const qint64 finalSize = QFileInfo(tmpPath).size();
-        onProgress(finalSize, totalBytes > 0 ? totalBytes : finalSize);
+    // A curl that exits 0 can still have written a truncated body (a mid-stream
+    // network cut curl didn't classify as an error). When the upfront
+    // Content-Length probe gave us an expected size, reject a short file rather
+    // than installing a corrupt model that crashes the engine on load or
+    // produces garbage transcription — neither of which surfaces an error.
+    const qint64 finalSize = QFileInfo(tmpPath).size();
+    if (totalBytes > 0 && finalSize != totalBytes) {
+        if (errorOut)
+            *errorOut = QStringLiteral("model download incomplete: got %1 of %2 bytes")
+                            .arg(finalSize)
+                            .arg(totalBytes);
+        QFile::remove(tmpPath);
+        return {};
     }
-    QFile::rename(tmpPath, modelPath);
+
+    if (onProgress)
+        onProgress(finalSize, totalBytes > 0 ? totalBytes : finalSize);
+
+    // Qt's rename does NOT overwrite an existing target and returns false — a
+    // stale modelPath already existing here would otherwise leave the fresh
+    // .part orphaned while we return modelPath as if the download succeeded.
+    if (!QFile::rename(tmpPath, modelPath)) {
+        if (errorOut)
+            *errorOut = QStringLiteral("could not move downloaded model into place: %1 (does it already exist?)")
+                            .arg(modelPath);
+        QFile::remove(tmpPath);
+        return {};
+    }
     return modelPath;
 }
 

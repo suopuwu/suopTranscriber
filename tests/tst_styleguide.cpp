@@ -1306,6 +1306,28 @@ private slots:
         QVERIFY2(appCtor > setEnv, "backend must be forced before QGuiApplication is constructed");
     }
 
+    // Item 1d (download integrity): downloadToModelsDir() must (a) reject a
+    // curl-exited-0-but-truncated body by comparing the final file size against
+    // the upfront Content-Length probe, and (b) check QFile::rename's return
+    // value so a failed move (Qt's rename won't overwrite an existing target)
+    // never reports success while orphaning the fresh .part. No unit test drives
+    // this — the download path shells out to real curl over the network, which
+    // tst_modelmanager.cpp deliberately never exercises ("tests must pass with
+    // no network") — so it's guarded at the source. Both tokens are unique to
+    // this function (verified). functionBody() can't anchor here because the
+    // signature's `= {}` default args trip its brace matcher, so this scans the
+    // comment-stripped file for the two specific tokens.
+    void modelManager_downloadVerifiesSizeAndCheckedRename()
+    {
+        const QString src = stripComments(readAll(QStringLiteral(SUOP_SRC_DIR "/core/ModelManager.cpp")));
+        QVERIFY2(src.contains(QStringLiteral("finalSize != totalBytes")),
+                 "downloadToModelsDir must reject a truncated download by comparing the final "
+                 "size against the Content-Length probe (item 1d)");
+        QVERIFY2(src.contains(QStringLiteral("!QFile::rename(tmpPath, modelPath)")),
+                 "downloadToModelsDir must check QFile::rename's return value — a failed move "
+                 "must surface as failure, not a silently orphaned .part (item 1d)");
+    }
+
     // Milestone 2 decision: the desktop's QQC2 theme (KDE Breeze) breaks this
     // app; the bundled Basic style is forced instead.
     void mainCpp_forcesBasicControlsStyle()
