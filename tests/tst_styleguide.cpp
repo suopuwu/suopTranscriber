@@ -146,44 +146,44 @@ private slots:
         QVERIFY2(!second.isEmpty(), "onJobStatusesChanged must exist");
         QVERIFY2(second.contains(QStringLiteral("jobStatusRevision")),
                  "functionBody() must return onJobStatusesChanged's OWN body");
-        QVERIFY2(!second.contains(QStringLiteral("metadataRevision")),
+        QVERIFY2(!second.contains(QStringLiteral("refreshTreeOrdering")),
                  "functionBody() must not bleed into the preceding onFinished's body");
 
         const QString first = functionBody(src, QStringLiteral("function onFinished(fileUrl, ok, error)"));
         QVERIFY2(!first.isEmpty(), "onFinished must exist");
-        QVERIFY2(first.contains(QStringLiteral("metadataRevision")),
+        QVERIFY2(first.contains(QStringLiteral("refreshTreeOrdering")),
                  "functionBody() must return onFinished's own body");
         QVERIFY2(!first.contains(QStringLiteral("jobStatusRevision")),
                  "functionBody() must stop at onFinished's close, not run on into its sibling");
     }
 
     // Regression: Sidebar.qml's treeDelegate (a TreeView row) recycles a
-    // fixed pool of delegate Items as rows scroll in/out of view — required
-    // properties like path/isAudio get reassigned to the recycled Item for
-    // its new row, but metadata/jobStatus are plain imperative properties
-    // only ever pushed at Component.onCompleted. Without an onPathChanged
-    // refresh, a recycled Item kept showing whichever label/job-status it
-    // FIRST loaded, forever, regardless of which file it was recycled to
-    // represent — this made one label appear to "repeat" throughout the
-    // whole tree at a fixed interval (the delegate pool size). No QQuickView
-    // in this test suite to actually drive TreeView recycling, so this is a
-    // source-scan guard against the fix regressing rather than a behavioral
-    // test.
-    void treeDelegate_refreshesMetadataAndJobStatusOnRecycle()
+    // fixed pool of delegate Items as rows scroll in/out of view. Required
+    // properties bound to model roles (path/isAudio/label/...) get reassigned
+    // for the recycled Item's new row automatically, but jobStatus is a plain
+    // imperative property (jobStatusForPath() is a Q_INVOKABLE, not a role),
+    // pushed at Component.onCompleted. Without an onPathChanged refresh, a
+    // recycled Item kept showing whichever job-status it FIRST loaded, forever.
+    // (The label used to have the same hazard via an imperative `metadata`
+    // property — that's now the LabelRole required property, so recycling
+    // handles it and only jobStatus still needs the manual refresh.) No
+    // QQuickView here to drive TreeView recycling, so this is a source-scan
+    // guard against the fix regressing rather than a behavioral test.
+    void treeDelegate_refreshesJobStatusOnRecycle()
     {
         const QString src = readAll(QStringLiteral(SUOP_QML_DIR "/Sidebar.qml"));
         QVERIFY2(!src.isEmpty(), "qml/Sidebar.qml must exist");
-        // Match the handler's declaration, not the bare name: the recycling
-        // hazard this guards is referenced by name in doc comments elsewhere in
-        // the file (and one of those now sits ABOVE the handler), which a
-        // name-only search would land on instead.
+        // The label side of the recycling fix: it must be a bound role, not an
+        // imperative push, so it can't go stale on reuse.
+        QVERIFY2(src.contains(QStringLiteral("required property string label")),
+                 "treeDelegate must bind the label model role (not an imperative metadata push), "
+                 "so a recycled row shows the right label automatically");
+        // The jobStatus side still needs the manual onPathChanged refresh.
         const int idx = src.indexOf(QStringLiteral("onPathChanged: {"));
         QVERIFY2(idx >= 0,
-                 "treeDelegate must refresh metadata/jobStatus onPathChanged — TreeView recycles "
-                 "delegate Items across rows, so a Component.onCompleted-only push goes stale on reuse");
+                 "treeDelegate must refresh jobStatus onPathChanged — TreeView recycles delegate "
+                 "Items across rows, so a Component.onCompleted-only push goes stale on reuse");
         const QString after = src.mid(idx, 300);
-        QVERIFY2(after.contains(QStringLiteral("refreshMetadata()")),
-                 "onPathChanged must call refreshMetadata() so recycled rows show the right label");
         QVERIFY2(after.contains(QStringLiteral("refreshJobStatus()")),
                  "onPathChanged must call refreshJobStatus() so recycled rows show the right job status");
     }
