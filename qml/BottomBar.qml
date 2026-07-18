@@ -304,6 +304,8 @@ Item {
         case "chaptering": return qsTr("chaptering…")
         case "importing": return qsTr("importing…")
         case "grabbing": return qsTr("grabbing…")
+        case "labeling": return qsTr("labeling…")
+        case "benchmarking": return qsTr("benchmarking…")
         default: return ""
         }
     }

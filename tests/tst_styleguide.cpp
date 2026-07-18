@@ -1,8 +1,10 @@
 #include <QtTest>
 
 #include <QDir>
+#include <QDirIterator>
 #include <QFile>
 #include <QRegularExpression>
+#include <QSet>
 
 // Source-scan checks for the conventions in StyleGuide.md and the environment
 // constraints in CLAUDE.md ("force QT_MEDIA_BACKEND=ffmpeg"). These read the
@@ -1326,6 +1328,42 @@ private slots:
         QVERIFY2(src.contains(QStringLiteral("!QFile::rename(tmpPath, modelPath)")),
                  "downloadToModelsDir must check QFile::rename's return value — a failed move "
                  "must surface as failure, not a silently orphaned .part (item 1d)");
+    }
+
+    // Item 5 (living doc): every job phase the C++ side announces via
+    // `emit phase(QStringLiteral("X"))` must have a human label in
+    // BottomBar.phaseLabel(), or that phase renders blank in the bottom bar
+    // (the label is hidden when phaseLabel returns ""). This caught two real
+    // gaps — "labeling" (relabel jobs) and "benchmarking" (benchmark/sweep) —
+    // that fell through to the empty default. It scans src/core for the
+    // emitted phase vocabulary so a newly-added phase can't silently ship
+    // unlabeled.
+    void bottomBar_phaseLabelCoversEveryEmittedPhase()
+    {
+        QSet<QString> emitted;
+        const QRegularExpression phaseEmit(
+            QStringLiteral("emit phase\\(QStringLiteral\\(\"([^\"]+)\"\\)\\)"));
+        QDirIterator it(QStringLiteral(SUOP_SRC_DIR "/core"), {QStringLiteral("*.cpp")}, QDir::Files,
+                        QDirIterator::Subdirectories);
+        while (it.hasNext()) {
+            const QString src = readAll(it.next());
+            auto m = phaseEmit.globalMatch(src);
+            while (m.hasNext())
+                emitted.insert(m.next().captured(1));
+        }
+        QVERIFY2(!emitted.isEmpty(), "found no `emit phase(...)` sites — scan regex/path drifted");
+
+        const QString label =
+            stripComments(readAll(QStringLiteral(SUOP_QML_DIR "/BottomBar.qml")));
+        const QString body = functionBody(label, QStringLiteral("function phaseLabel(phase)"));
+        QVERIFY2(!body.isEmpty(), "could not locate BottomBar.phaseLabel()");
+        for (const QString &phase : emitted) {
+            const QString needle = QStringLiteral("case \"%1\"").arg(phase);
+            QVERIFY2(body.contains(needle),
+                     qPrintable(QStringLiteral("BottomBar.phaseLabel() has no case for the C++-emitted "
+                                               "phase \"%1\" — it would render blank (item 5)")
+                                    .arg(phase)));
+        }
     }
 
     // Milestone 2 decision: the desktop's QQC2 theme (KDE Breeze) breaks this
