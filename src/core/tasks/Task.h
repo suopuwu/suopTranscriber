@@ -161,6 +161,14 @@ public:
     virtual QString undoLabel() const { return {}; }
     virtual std::unique_ptr<Task> makeUndoTask() const { return nullptr; }
 
+    // Did this task actually land something undoable — a non-empty
+    // undoLabel() AND a buildable inverse? Same gate maybeEmitUndoAvailable()'s
+    // standalone branch uses to decide whether to offer undo; also read by
+    // jobs() so a finished Tasks row can show a per-row Undo button (the
+    // persistent equivalent of the auto snackbar). Only meaningful once Done —
+    // makeUndoTask() captures run()'s result, so callers gate on status first.
+    bool isUndoable() const { return !undoLabel().isEmpty() && makeUndoTask() != nullptr; }
+
     // The undo-snackbar label when this task is undone as part of a BATCH of
     // `count` sibling tasks (a multi-select move/trash enqueued via
     // TranscriptionController::enqueueBatch() — batchId != 0). count==1 is the

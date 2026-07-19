@@ -317,6 +317,12 @@ suop_add_test(tst_future_spec)
 suop_add_test(tst_styleguide)
 suop_add_test(tst_benchmark_combos)
 suop_add_test(tst_icontheme LINK_QUICK LINK_SVG ICON_ASSETS SOURCES IconTheme.cpp)
+# OPT-IN pixel-snapshot harness — built so it never bit-rots, but DORMANT unless
+# SUOP_SNAPSHOT=update|compare is set (it QSKIPs otherwise), so a normal `ctest`
+# run does nothing here. Goldens are environment-specific and NOT committed (see
+# .gitignore's tests/snapshots/). Renders real QML (AppIcon) offscreen, hence
+# LINK_QUICK + icon resources like the other QQuickView harnesses.
+suop_add_test(tst_visual_snapshot LINK_QUICK LINK_SVG ICON_ASSETS SOURCES IconTheme.cpp)
 # Renders the real Snackbar/SnackbarHost/Notifications in an ApplicationWindow
 # (not a QQuickView — SnackbarHost needs Overlay.overlay; see the test's
 # top-of-file comment). Needs IconTheme + icon resources for the close AppIcon.

@@ -208,8 +208,11 @@ private:
         return glyph->mapToScene(QPointF(glyph->width() / 2, glyph->height() / 2)).toPoint();
     }
 
-    // A point on the row but past the end of its painted name — the row's dead
-    // space, which used to toggle the folder and now must do nothing at all.
+    // A point on the row but past the end of its painted name — the row's empty
+    // right-hand space. The row's hitbox is far wider than a short name, so this
+    // now begins the rename just as a click on the letters does (see
+    // Sidebar.qml's tapIsOnRowName). It first toggled the folder, then was made
+    // inert; it renames now.
     static QPoint pastNameTextPoint(QQuickItem *row)
     {
         QQuickItem *nameText = row->findChild<QQuickItem *>(QStringLiteral("rowNameText"));
@@ -737,9 +740,11 @@ private slots:
         QVERIFY(!QFileInfo::exists(folderPath));
     }
 
-    // The rest of a folder row is inert — the empty space right of the name is
-    // where a stray click lands, and it must neither rename nor toggle.
-    void clickFolderPastName_doesNothing()
+    // The empty space right of a folder's name renames it, same as clicking the
+    // name itself — the row's hitbox is far wider than the painted name, and a
+    // click there must reach the name gesture (see tapIsOnRowName). It must
+    // still NOT toggle the folder — only the glyph does that.
+    void clickFolderPastName_startsRename()
     {
         QTemporaryDir vault;
         QVERIFY(vault.isValid());
@@ -758,11 +763,40 @@ private slots:
         QVERIFY(item);
 
         clickAt(&view, pastNameTextPoint(item));
-        QVERIFY2(!renameFieldVisibleOn(item),
-                 "a click past the folder's name must not start a rename");
-        QCOMPARE(sidebarItem->property("renamingPath").toString(), QString());
+        QTRY_VERIFY2(renameFieldVisibleOn(item),
+                     "a click in the empty space right of the folder's name must start a rename");
         QVERIFY2(rowForPath(treeItem, childPath) >= 0,
-                 "a click past the folder's name must not toggle it — only the glyph does");
+                 "the rename click must not ALSO toggle the folder — only the glyph does");
+    }
+
+    // The file counterpart of clickFolderPastName_startsRename: for a note the
+    // rename needs the sole-selection first click (file-manager convention), but
+    // the SECOND click may land in the empty space right of the name, not only
+    // on the letters — the row's hitbox is far wider than a short name.
+    void clickPastNameOfSoleSelectedFile_startsRename()
+    {
+        QTemporaryDir vault;
+        QVERIFY(vault.isValid());
+        QVERIFY(touch(vault.filePath(QStringLiteral("talk.mp3"))));
+
+        QQuickView view;
+        QQuickItem *sidebarItem = nullptr;
+        QQuickItem *treeItem = openVault(&view, vault.path(), &sidebarItem);
+        QVERIFY2(treeItem, "could not load Sidebar.qml / locate its TreeView");
+        QTRY_VERIFY(treeItem->property("rows").toInt() > 0);
+        expandEverything(treeItem);
+
+        const int row = rowForPath(treeItem, vault.filePath(QStringLiteral("talk.mp3")));
+        QVERIFY(row >= 0);
+        QQuickItem *item = rowItem(treeItem, row);
+        QVERIFY(item);
+
+        clickAt(&view, nameTextPoint(item));     // select
+        clickAt(&view, pastNameTextPoint(item)); // click the dead space -> rename
+        QTRY_VERIFY2(renameFieldVisibleOn(item),
+                     "clicking the empty space right of a sole-selected file's name must rename it");
+        QCOMPARE(sidebarItem->property("renamingPath").toString(),
+                 vault.filePath(QStringLiteral("talk.mp3")));
     }
 
     // A rename the model refuses (name already taken) must leave the file
@@ -1067,6 +1101,55 @@ private slots:
         QVERIFY2(delTranscript, "the Delete transcript row must exist");
         QVERIFY2(delTranscript->isVisible(),
                  "Delete transcript must be offered for a transcribed audio row");
+    }
+
+    // REGRESSION (user report): the context menu spawned at the raw cursor
+    // point, so a right-click low/far-right pushed it past the sidebar edge and
+    // clipped it under the window frame. It's an in-scene popup, so Qt won't
+    // flip/clamp it — Sidebar.qml's clampedMenuX/Y must keep the whole popup
+    // inside the sidebar.
+    void contextMenu_clampedInsideSidebarWhenAnchoredNearEdge()
+    {
+        QTemporaryDir vault;
+        QVERIFY(vault.isValid());
+        QVERIFY(touch(vault.filePath(QStringLiteral("a.mp3"))));
+
+        QQuickView view;
+        QQuickItem *sidebarItem = nullptr;
+        QQuickItem *treeItem = openVault(&view, vault.path(), &sidebarItem);
+        QVERIFY2(treeItem, "could not load Sidebar.qml / locate its TreeView");
+        QTRY_VERIFY(treeItem->property("rows").toInt() > 0);
+        expandEverything(treeItem);
+
+        QObject *menu = sidebarItem->findChild<QObject *>(QStringLiteral("contextMenu"));
+        QVERIFY(menu);
+
+        const qreal sw = sidebarItem->width();
+        const qreal sh = sidebarItem->height();
+        QVERIFY(sw > 0 && sh > 0);
+
+        // Anchor the menu at the very bottom-right corner of the sidebar — well
+        // past where a 200px-wide, multi-row menu could fit if left unclamped.
+        const QString path = vault.filePath(QStringLiteral("a.mp3"));
+        const QString dir = QFileInfo(path).absolutePath();
+        QMetaObject::invokeMethod(
+            sidebarItem, "openContextMenu",
+            Q_ARG(QVariant, path), Q_ARG(QVariant, false), Q_ARG(QVariant, true),
+            Q_ARG(QVariant, true), Q_ARG(QVariant, 1), Q_ARG(QVariant, dir),
+            Q_ARG(QVariant, QString()), Q_ARG(QVariant, sw - 2), Q_ARG(QVariant, sh - 2));
+        QTRY_VERIFY(menu->property("opened").toBool());
+
+        const qreal x = menu->property("x").toReal();
+        const qreal y = menu->property("y").toReal();
+        const qreal w = menu->property("width").toReal();
+        const qreal h = menu->property("height").toReal();
+        QVERIFY2(w > 0 && h > 0, "the menu must have laid out to a real size");
+        QVERIFY2(x >= 0 && x + w <= sw + 0.5,
+                 qPrintable(QStringLiteral("menu overflows sidebar horizontally: x=%1 w=%2 sidebar=%3")
+                                .arg(x).arg(w).arg(sw)));
+        QVERIFY2(y >= 0 && y + h <= sh + 0.5,
+                 qPrintable(QStringLiteral("menu overflows sidebar vertically: y=%1 h=%2 sidebar=%3")
+                                .arg(y).arg(h).arg(sh)));
     }
 
     // The other half of the same fix: right-clicking genuinely empty space

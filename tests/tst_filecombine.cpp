@@ -139,6 +139,33 @@ private slots:
         QVERIFY(group.value("outputPath").toString().endsWith(QStringLiteral(".combined.wav")));
     }
 
+    // Readable merged filename: multiple capture groups are SPACE-joined into
+    // the key (not run together), a capture that repeats the one just before it
+    // is collapsed, spaces are allowed in the name, and rule/key join with
+    // " - ". The old form ran everything together as
+    // "acme-mic-3-20260710editedit.combined.wav"; this is the fix (see DESIGN.md
+    // "Split-recording combine" outputPath, and CombineNaming.h).
+    void outputName_readable_spaceJoinedKey_collapsedDuplicates()
+    {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        // Two capture groups after the date BOTH grab "edit" — the classic
+        // double-capturing rule that produced "editedit".
+        const QString p1 = touchFile(dir.path(), "cam_20260710_edit_edit_a.wav", 60);
+        const QString p2 = touchFile(dir.path(), "cam_20260710_edit_edit_b.wav", 40);
+
+        TranscriptionController controller;
+        const QVariantList rules = {rule("Acme Mic 3", "^cam_(\\d{8})_(edit)_(edit)_[ab]\\.wav$")};
+        const QVariantList groups = controller.detectCombineGroups(rules, {p1, p2});
+
+        const QVariantMap group = findGroup(groups, "Acme Mic 3");
+        QCOMPARE(group.value("status").toString(), QStringLiteral("ready"));
+        // Space-joined, with the consecutive duplicate "edit" collapsed to one.
+        QCOMPARE(group.value("key").toString(), QStringLiteral("20260710 edit"));
+        QCOMPARE(QFileInfo(group.value("outputPath").toString()).fileName(),
+                 QStringLiteral("Acme Mic 3 - 20260710 edit.combined.wav"));
+    }
+
     // sortGroupIndex names a SECOND capture group as the sort differentiator
     // instead of a grouping one — group.key must then contain ONLY the
     // device id (group 1), not the part number (group 2), proving the sort

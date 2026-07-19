@@ -146,7 +146,8 @@ private slots:
     {
         UsbGrabRule rule;
         rule.deviceLabel = QStringLiteral("Test Recorder");
-        UsbGrabTask task(rule, QStringLiteral("/mnt/fake"), QUrl::fromLocalFile(QStringLiteral("/vault/dest")), /*autoTriggered=*/true);
+        UsbGrabTask task(rule, QStringLiteral("/mnt/fake"), QUrl::fromLocalFile(QStringLiteral("/vault/dest")),
+                         /*autoTriggered=*/true, /*combineRules=*/{});
         QCOMPARE(task.kind(), QStringLiteral("usbGrab"));
         QVERIFY(!task.isPersistable()); // removable-media source, never persisted
         QVERIFY(task.capabilities().pausable);

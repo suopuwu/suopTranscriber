@@ -220,6 +220,96 @@ private slots:
         QCOMPARE(idAt(5), 1);
     }
 
+    // collapseBatches(): rows sharing a non-zero batchId fold into ONE
+    // aggregate row (isBatch), standalone rows pass through, and a LONE-member
+    // batch is emitted flat (no pointless "1 file" collapse). Aggregate status
+    // = any-active-wins; batchCount = distinct files; members carried for the
+    // expandable UI. Pure/static, so it's asserted here without real jobs.
+    void collapseBatches_foldsMembers_passesStandalonesThrough_flattensLoneBatch()
+    {
+        auto row = [](int id, int batchId, const char *status, const char *file,
+                      const char *kindLabel, const char *batchLabel) {
+            QVariantMap m;
+            m[QStringLiteral("id")] = id;
+            m[QStringLiteral("batchId")] = batchId;
+            m[QStringLiteral("status")] = QString::fromLatin1(status);
+            m[QStringLiteral("fileUrl")] = QUrl::fromLocalFile(QString::fromLatin1(file));
+            m[QStringLiteral("kindLabel")] = QString::fromLatin1(kindLabel);
+            m[QStringLiteral("batchLabel")] = QString::fromLatin1(batchLabel);
+            m[QStringLiteral("durationMs")] = qint64(-1);
+            m[QStringLiteral("error")] = QString();
+            return QVariant(m);
+        };
+        QVariantList raw;
+        raw << row(1, 0, "active", "/v/solo.wav", "Transcribe", "")   // standalone
+            << row(2, 50, "done", "/v/a.wav", "Transcribe", "")       // batch 50
+            << row(3, 50, "active", "/v/b.wav", "Transcribe", "")     // batch 50
+            << row(4, 50, "queued", "/v/c.wav", "Transcribe", "")     // batch 50
+            << row(5, 0, "done", "/v/solo2.wav", "Label", "")         // standalone
+            << row(6, 77, "done", "/v/only.wav", "Move", "");         // lone-member batch
+
+        const QVariantList out = TranscriptionController::collapseBatches(raw);
+        // solo(1), batch-50 aggregate, solo2(5), flattened lone member(6).
+        QCOMPARE(out.size(), 4);
+
+        QCOMPARE(out.at(0).toMap().value(QStringLiteral("id")).toInt(), 1);
+        QVERIFY(!out.at(0).toMap().value(QStringLiteral("isBatch")).toBool());
+
+        const QVariantMap agg = out.at(1).toMap();
+        QVERIFY(agg.value(QStringLiteral("isBatch")).toBool());
+        QCOMPARE(agg.value(QStringLiteral("batchId")).toInt(), 50);
+        QCOMPARE(agg.value(QStringLiteral("batchCount")).toInt(), 3);       // 3 distinct files
+        QCOMPARE(agg.value(QStringLiteral("batchDoneCount")).toInt(), 1);   // only a.wav all-done
+        QCOMPARE(agg.value(QStringLiteral("status")).toString(), QStringLiteral("active")); // active wins
+        QCOMPARE(agg.value(QStringLiteral("members")).toList().size(), 3);
+        QCOMPARE(agg.value(QStringLiteral("kindLabel")).toString(), QStringLiteral("Transcribe")); // derived
+
+        QCOMPARE(out.at(2).toMap().value(QStringLiteral("id")).toInt(), 5);
+
+        // The lone-member batch is the member itself, rendered flat.
+        QVERIFY(!out.at(3).toMap().value(QStringLiteral("isBatch")).toBool());
+        QCOMPARE(out.at(3).toMap().value(QStringLiteral("id")).toInt(), 6);
+    }
+
+    // Aggregate specifics: an explicit batchLabel (a mixed-kind "Run all" batch,
+    // where no single kindLabel could be derived) is used verbatim; an
+    // all-terminal batch sums its members' durations; one genuine failure makes
+    // the whole row failed with a summarizing error; and distinct-file counting
+    // treats a run-all's several-tasks-per-file correctly.
+    void collapseBatches_usesExplicitLabel_sumsDuration_surfacesFailure()
+    {
+        auto row = [](int id, int batchId, const char *status, const char *file,
+                      const char *kindLabel, const char *batchLabel, qint64 dur, const char *error) {
+            QVariantMap m;
+            m[QStringLiteral("id")] = id;
+            m[QStringLiteral("batchId")] = batchId;
+            m[QStringLiteral("status")] = QString::fromLatin1(status);
+            m[QStringLiteral("fileUrl")] = QUrl::fromLocalFile(QString::fromLatin1(file));
+            m[QStringLiteral("kindLabel")] = QString::fromLatin1(kindLabel);
+            m[QStringLiteral("batchLabel")] = QString::fromLatin1(batchLabel);
+            m[QStringLiteral("durationMs")] = dur;
+            m[QStringLiteral("error")] = QString::fromLatin1(error);
+            return QVariant(m);
+        };
+        QVariantList raw;
+        // Two files, run-all pipeline: a.wav has two Done steps; b.wav's one
+        // step genuinely failed. Same fileUrl for a.wav's two steps.
+        raw << row(1, 9, "done", "/v/a.wav", "Transcribe", "Run all", 100, "")
+            << row(2, 9, "done", "/v/a.wav", "Detect speakers", "Run all", 50, "")
+            << row(3, 9, "failed", "/v/b.wav", "Transcribe", "Run all", 30, "boom");
+
+        const QVariantList out = TranscriptionController::collapseBatches(raw);
+        QCOMPARE(out.size(), 1);
+        const QVariantMap agg = out.first().toMap();
+        QCOMPARE(agg.value(QStringLiteral("kindLabel")).toString(), QStringLiteral("Run all")); // explicit
+        QCOMPARE(agg.value(QStringLiteral("batchCount")).toInt(), 2);            // 2 distinct files
+        QCOMPARE(agg.value(QStringLiteral("batchDoneCount")).toInt(), 1);        // only a.wav fully done
+        QCOMPARE(agg.value(QStringLiteral("batchFailedCount")).toInt(), 1);      // b.wav failed
+        QCOMPARE(agg.value(QStringLiteral("status")).toString(), QStringLiteral("failed"));
+        QVERIFY(!agg.value(QStringLiteral("error")).toString().isEmpty());       // summarized
+        QCOMPARE(agg.value(QStringLiteral("durationMs")).toLongLong(), qint64(180)); // 100+50+30, all terminal
+    }
+
     // Item 25: backendKind maps CUDA/Vulkan/any-non-CPU -> "gpu", CPU -> "cpu"
     // (case-insensitive), empty -> empty (so QML keeps its indicator hidden
     // until a model loads).
@@ -407,6 +497,55 @@ private slots:
         QTRY_COMPARE(controller.tasksCompleted(), 2);
         QCOMPARE(statusOf(controller, fileA), QStringLiteral("failed"));
         QCOMPARE(statusOf(controller, fileB), QStringLiteral("failed"));
+    }
+
+    // A multi-select bulk op stamps every task it enqueues with ONE shared
+    // batchId (so the underlying per-file tasks still run/report individually),
+    // and sortedJobs() collapses them into a single Tasks row. This is the
+    // controller-side wiring behind collapseBatches()'s pure-transform tests.
+    void bulkTranscribe_sharesOneBatchId_andCollapsesToOneSortedRow()
+    {
+        VaultFixture vault;
+        TranscriptionController controller;
+        const QUrl a = vault.audioUrl("a.wav");
+        const QUrl b = vault.audioUrl("b.wav");
+        const QUrl c = vault.audioUrl("c.wav");
+
+        controller.transcribeAll({a, b, c}, vault.vaultUrl, kModelId);
+        QCOMPARE(controller.tasksTotal(), 3);
+        // All fail (missing files) but stay in the queue as history, keeping
+        // their batchId — the collapse is independent of run outcome.
+        QTRY_COMPARE(controller.tasksCompleted(), 3);
+
+        const QVariantList raw = controller.jobs();
+        QCOMPARE(raw.size(), 3);
+        const int batchId = raw.first().toMap().value(QStringLiteral("batchId")).toInt();
+        QVERIFY2(batchId != 0, "a bulk op's tasks must carry a non-zero shared batchId");
+        for (const QVariant &v : raw)
+            QCOMPARE(v.toMap().value(QStringLiteral("batchId")).toInt(), batchId);
+
+        const QVariantList sorted = controller.sortedJobs();
+        QCOMPARE(sorted.size(), 1); // three tasks, ONE collapsed row
+        const QVariantMap agg = sorted.first().toMap();
+        QVERIFY(agg.value(QStringLiteral("isBatch")).toBool());
+        QCOMPARE(agg.value(QStringLiteral("batchCount")).toInt(), 3);
+        QCOMPARE(agg.value(QStringLiteral("members")).toList().size(), 3);
+        QCOMPARE(agg.value(QStringLiteral("kindLabel")).toString(), QStringLiteral("Transcribe"));
+    }
+
+    // dismissBatch() clears every terminal member of a batch in one action —
+    // the collapsed row's single close button on a finished batch.
+    void dismissBatch_removesEveryTerminalMember()
+    {
+        VaultFixture vault;
+        TranscriptionController controller;
+        controller.transcribeAll({vault.audioUrl("a.wav"), vault.audioUrl("b.wav")}, vault.vaultUrl, kModelId);
+        QTRY_COMPARE(controller.tasksCompleted(), 2); // both failed → terminal
+
+        const int batchId = controller.jobs().first().toMap().value(QStringLiteral("batchId")).toInt();
+        QVERIFY(batchId != 0);
+        controller.dismissBatch(batchId);
+        QCOMPARE(controller.jobs().size(), 0); // whole batch cleared at once
     }
 
     // Item 37: drag-and-drop import runs its byte-copy on the SAME worker
@@ -600,6 +739,11 @@ private slots:
         const int undoableId = undoSpy.constFirst().at(0).toInt();
         QVERIFY(!undoSpy.constFirst().at(1).toString().isEmpty()); // has a label
 
+        // ...and that same "this row is undoable" fact is exposed on the Tasks
+        // row itself (jobs()' "undoable"), so the popup can show a per-row Undo
+        // button — the persistent twin of the auto snackbar.
+        QVERIFY(controller.jobs().first().toMap().value("undoable").toBool());
+
         // Undo it — the inverse rename runs and a.wav comes back.
         renamedSpy.clear();
         controller.undoTask(undoableId);
@@ -634,6 +778,17 @@ private slots:
         QTRY_COMPARE(movedSpy.count(), 2);
         QVERIFY(QFileInfo::exists(vault.dir.path() + "/sub/a.wav"));
         QVERIFY(QFileInfo::exists(vault.dir.path() + "/sub/b.wav"));
+
+        // ...and the two moves show as ONE collapsed Tasks row, not two (the
+        // whole point of collapseBatches — a multi-select op is one row).
+        const QVariantList sortedAfterMove = controller.sortedJobs();
+        QCOMPARE(sortedAfterMove.size(), 1);
+        QVERIFY(sortedAfterMove.first().toMap().value("isBatch").toBool());
+        QCOMPARE(sortedAfterMove.first().toMap().value("batchCount").toInt(), 2);
+        QCOMPARE(sortedAfterMove.first().toMap().value("kindLabel").toString(), QStringLiteral("Move"));
+        // The collapsed header advertises undoable too (any Done member is
+        // undoable) — so its single Undo button undoes the whole batch.
+        QVERIFY(sortedAfterMove.first().toMap().value("undoable").toBool());
 
         // ...but the whole batch offers exactly ONE undo, summarizing the count.
         QTRY_COMPARE(undoSpy.count(), 1);
@@ -701,6 +856,13 @@ private slots:
         QTRY_COMPARE(controller.tasksCompleted(), 3);
         // Idle again once every job has finished.
         QCOMPARE(controller.currentJobKind(), QString());
+
+        // None of these kinds is undoable (transcribe/relabel/rename-speaker
+        // advertise no undo) and they finish Failed regardless — jobs() must
+        // report undoable == false so no per-row Undo button ever appears.
+        const QVariantList finished = controller.jobs();
+        for (const QVariant &v : finished)
+            QVERIFY(!v.toMap().value("undoable").toBool());
     }
 
     // Item 23 (behavior change): a transcribe call now ONLY transcribes. It

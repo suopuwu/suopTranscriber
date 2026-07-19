@@ -1,5 +1,6 @@
 #include "UsbGrabJob.h"
 
+#include "CombineNaming.h"
 #include "VaultTreeModel.h"
 
 #include <QCoreApplication>
@@ -11,7 +12,10 @@
 #include <QHash>
 #include <QList>
 #include <QRegularExpression>
+#include <QVariantList>
 #include <QVariantMap>
+
+#include <optional>
 
 namespace {
 
@@ -48,6 +52,33 @@ bool alreadyPresentAtDestination(const QFileInfo &sourceInfo, const QList<DestFi
     for (const DestFile &candidate : candidates) {
         if (candidate.size == sourceInfo.size() && candidate.lastModified == sourceInfo.lastModified())
             return true;
+    }
+    return false;
+}
+
+// True iff the split-recording group this file belongs to has already been
+// combined — i.e. the merged output the combiner would produce for it already
+// exists beside where this file would land (destDir). Unlike the quick-check
+// above, this catches a part whose raw file is GONE from the vault: after a
+// combine the originals move into .combined/ (which the dedup index doesn't
+// walk) or are deleted outright, so without this a re-plugged device re-grabs
+// them and the group re-combines. Mirrors
+// TranscriptionController::maybeRedirectForCombine()'s "Outcome 1": recompute
+// the deterministic output name from THIS filename alone (first matching rule
+// wins, as in findCombineGroups()) via the shared CombineNaming.h helpers, and
+// check for it on disk. combineRules is AppSettings.combineRules; empty means
+// the check is disabled.
+bool alreadyCombinedAtDestination(const QFileInfo &sourceInfo, const QString &destDir,
+                                  const QVariantList &combineRules)
+{
+    for (const QVariant &ruleVar : combineRules) {
+        const QVariantMap rule = ruleVar.toMap();
+        const std::optional<QString> key = matchRuleCapturedKey(rule, sourceInfo.fileName());
+        if (!key)
+            continue;
+        const QString outputPath = combineOutputPathFor(rule.value(QStringLiteral("name")).toString(), *key,
+                                                        destDir, sourceInfo.suffix());
+        return QFileInfo::exists(outputPath); // first matching rule wins
     }
     return false;
 }
@@ -210,7 +241,7 @@ QString usbGrabRefusalReason(const QString &scanRoot, const QString &destination
 
 UsbGrabScanResult runUsbGrabScan(const UsbGrabRule &rule, const QString &mountPath,
                                   const QString &destinationVaultPath, bool dryRun,
-                                  const UsbGrabScanHooks &hooks)
+                                  const UsbGrabScanHooks &hooks, const QVariantList &combineRules)
 {
     UsbGrabScanResult result;
 
@@ -278,10 +309,28 @@ UsbGrabScanResult runUsbGrabScan(const UsbGrabRule &rule, const QString &mountPa
                 result.previewEntries.append(makePreviewEntry(QDir(scanRoot).relativeFilePath(sourcePath),
                                                                QStringLiteral("filtered")));
         } else {
+            // Where this file would land in the vault. Computed up front
+            // because BOTH the already-combined check and the copy need it —
+            // but mkpath() stays down in the copy branch, so a dry-run or a
+            // skipped file never creates the folder.
+            QString relativeDir;
+            if (rule.preserveStructure) {
+                const QString rel = QDir(scanRoot).relativeFilePath(sourceInfo.absolutePath());
+                if (rel != QStringLiteral("."))
+                    relativeDir = rel;
+            }
+            const QString destDir = relativeDir.isEmpty()
+                ? destinationVaultPath
+                : destinationVaultPath + QLatin1Char('/') + relativeDir;
+
             const bool alreadyPresent = alreadyPresentAtDestination(
                 sourceInfo, destFilesByBasename.value(sourceInfo.fileName()));
+            // Only worth recomputing the merged-output name when the raw part
+            // isn't already sitting there under its own name.
+            const bool alreadyCombined = !alreadyPresent
+                && alreadyCombinedAtDestination(sourceInfo, destDir, combineRules);
 
-            if (alreadyPresent) {
+            if (alreadyPresent || alreadyCombined) {
                 ++result.filesSkipped;
                 // Skipped instantly, but its bytes ARE "done" — advance the
                 // byte-weighted progress so a folder of mostly-already-grabbed
@@ -296,15 +345,6 @@ UsbGrabScanResult runUsbGrabScan(const UsbGrabRule &rule, const QString &mountPa
                 result.previewEntries.append(
                     makePreviewEntry(QDir(scanRoot).relativeFilePath(sourcePath), QStringLiteral("grab")));
             } else {
-                QString relativeDir;
-                if (rule.preserveStructure) {
-                    const QString rel = QDir(scanRoot).relativeFilePath(sourceInfo.absolutePath());
-                    if (rel != QStringLiteral("."))
-                        relativeDir = rel;
-                }
-                const QString destDir = relativeDir.isEmpty()
-                    ? destinationVaultPath
-                    : destinationVaultPath + QLatin1Char('/') + relativeDir;
                 QDir().mkpath(destDir);
 
                 // Same basename already sitting at this exact spot, but
@@ -387,7 +427,8 @@ public:
     using QObject::QObject;
 
 public slots:
-    void start(const UsbGrabRule &rule, const QString &mountPath, const QString &destinationVaultPath)
+    void start(const UsbGrabRule &rule, const QString &mountPath, const QString &destinationVaultPath,
+               const QVariantList &combineRules)
     {
         m_cancelRequested = false;
 
@@ -404,7 +445,7 @@ public slots:
         };
 
         const UsbGrabScanResult result = runUsbGrabScan(rule, mountPath, destinationVaultPath,
-                                                         /*dryRun=*/true, hooks);
+                                                         /*dryRun=*/true, hooks, combineRules);
         emit previewCompleted(result.previewEntries, result.refusal);
     }
 
@@ -449,10 +490,12 @@ UsbGrabPreviewJob::~UsbGrabPreviewJob()
     m_thread.wait();
 }
 
-void UsbGrabPreviewJob::start(const UsbGrabRule &rule, const QString &mountPath, const QString &destinationVaultPath)
+void UsbGrabPreviewJob::start(const UsbGrabRule &rule, const QString &mountPath, const QString &destinationVaultPath,
+                              const QVariantList &combineRules)
 {
     QMetaObject::invokeMethod(m_worker, "start", Qt::QueuedConnection, Q_ARG(UsbGrabRule, rule),
-                               Q_ARG(QString, mountPath), Q_ARG(QString, destinationVaultPath));
+                               Q_ARG(QString, mountPath), Q_ARG(QString, destinationVaultPath),
+                               Q_ARG(QVariantList, combineRules));
 }
 
 #include "UsbGrabJob.moc"

@@ -360,6 +360,49 @@ private slots:
         openMd(m_panel, QString());
         QTRY_COMPARE(m_panel->property("prelude").toString(), QString());
     }
+
+    // The core of the orphaned/audio unification: an orphaned .md (no audio,
+    // player null in this harness) must render and behave as an editable
+    // transcript, not a second-class read-only one. Its frontmatter loads into
+    // the single `metadata` store (hasMetadata true), the transcript editor is
+    // editable (transcriptArea.readOnly follows hasMetadata, not an audio-only
+    // flag), and edits actually persist to the file — the write paths route
+    // through currentMdUrl, so they no longer silently no-op the way the old
+    // player.source-only paths did for an orphaned .md.
+    void orphanedMd_isTranscribedEditableAndPersistsEdits()
+    {
+        QQuickView view;
+        QVERIFY2(openPanel(&view), "could not load MainPanel.qml / locate it");
+
+        openMd(m_panel, m_chapteredMd);
+        QVERIFY(waitForBodyLoaded(m_panel));
+
+        // Frontmatter present ⇒ reads as transcribed, exactly like an
+        // audio-backed sibling .md would.
+        QVERIFY2(m_panel->property("hasMetadata").toBool(),
+                 "an orphaned .md with frontmatter must report hasMetadata=true");
+
+        // The editor must not be read-only for an orphaned .md — this is the
+        // regression the refactor fixes (hasStoredMetadata used to be audio-only,
+        // forcing every orphaned transcript read-only).
+        QQuickItem *area = m_panel->findChild<QQuickItem *>(QStringLiteral("transcriptArea"));
+        QVERIFY2(area, "transcriptArea must exist");
+        QVERIFY2(!area->property("readOnly").toBool(),
+                 "the transcript editor must be editable for an orphaned .md (parity with audio)");
+
+        // An edit must persist to the orphaned file itself. commitPrelude()
+        // writes through currentMdUrl; before the unification it keyed off the
+        // (empty) player.source and wrote nothing.
+        QVERIFY(QMetaObject::invokeMethod(m_panel, "commitPrelude",
+                                          Q_ARG(QVariant, QStringLiteral("Orphaned prelude note"))));
+        QCOMPARE(m_panel->property("prelude").toString(), QStringLiteral("Orphaned prelude note"));
+
+        QFile f(m_chapteredMd);
+        QVERIFY(f.open(QIODevice::ReadOnly | QIODevice::Text));
+        const QString onDisk = QString::fromUtf8(f.readAll());
+        QVERIFY2(onDisk.contains(QStringLiteral("Orphaned prelude note")),
+                 "committing a prelude on an orphaned .md must write it to that file on disk");
+    }
 };
 
 int main(int argc, char *argv[])

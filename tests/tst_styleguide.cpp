@@ -301,6 +301,33 @@ private slots:
                  "collapse must persist via the controller's setCollapsedChapters invokable");
     }
 
+    // The playback controls must be inert when there's no audio loaded — the
+    // seek slider was draggable with nothing open (its track spans the panel
+    // whenever the orphaned-md view isn't showing, including the nothing-open
+    // state). Both the play button and the seek slider gate their `enabled` on
+    // the SAME hasPlayableSource binding so they can never disagree — and being
+    // a plain binding on player.source, it also greys out the instant a
+    // deletion closes the current file (onFileDeleted sets player.source = "").
+    void mainPanel_playbackControlsInertWithNoAudio()
+    {
+        const QString src = stripComments(readAll(QStringLiteral(SUOP_QML_DIR "/MainPanel.qml")));
+        QVERIFY2(!src.isEmpty(), "qml/MainPanel.qml must exist");
+
+        QVERIFY2(src.contains(QStringLiteral("readonly property bool hasPlayableSource")),
+                 "MainPanel must expose a single hasPlayableSource binding both playback controls share");
+
+        const QString slider = enclosingBlock(src, QStringLiteral("id: seekSlider"));
+        QVERIFY2(!slider.isEmpty(), "id: seekSlider must exist in MainPanel.qml");
+        QVERIFY2(slider.contains(QStringLiteral("enabled: mainPanel.hasPlayableSource")),
+                 "the seek slider must be disabled when no audio is loaded, or it can be dragged with "
+                 "nothing open");
+
+        const QString playButton = enclosingBlock(src, QStringLiteral("id: playPauseButton"));
+        QVERIFY2(!playButton.isEmpty(), "id: playPauseButton must exist in MainPanel.qml");
+        QVERIFY2(playButton.contains(QStringLiteral("enabled: mainPanel.hasPlayableSource")),
+                 "the play/pause button must gate on the same hasPlayableSource binding as the slider");
+    }
+
     // Item: a dedicated drag-handle grip carries the speaker merge gesture (so a
     // plain click can still edit the name) — its own AppIcon, not overloading
     // the pill body (StyleGuide "Always-editable text").
@@ -1445,6 +1472,30 @@ private slots:
                  "phaseOverlayLabel() (the overlay column of the one phase registry) instead");
     }
 
+    // Bug (live test #3): a restored file must become a TRUE selection, not just
+    // the currentPath outline, or it can't anchor a Shift-click. The restore's
+    // rebuild() fires modelReset (which clears the selection), so the Sidebar
+    // has to re-establish it from the model's restore signals. This guards that
+    // all three restore signals are handled and route through selectRestoredNote
+    // (the behavior itself is proven in tst_sidebar_selectall's
+    // restoredNote_becomesShiftClickAnchor). Without the wiring, the tree
+    // "selection" after an undo is a dead outline again.
+    void sidebar_restoreReestablishesSelectionAnchor()
+    {
+        const QString src = stripComments(readAll(QStringLiteral(SUOP_QML_DIR "/Sidebar.qml")));
+        for (const QString &sig : {QStringLiteral("onFileRestored"), QStringLiteral("onTranscriptRestored"),
+                                   QStringLiteral("onAudioRestoredForTranscript")}) {
+            QVERIFY2(src.contains(sig),
+                     qPrintable(QStringLiteral("Sidebar must handle the model's %1 restore signal to "
+                                               "re-select the restored file").arg(sig)));
+        }
+        QVERIFY2(src.contains(QStringLiteral("function selectRestoredNote")),
+                 "Sidebar must define selectRestoredNote() (the restore re-selection helper)");
+        QVERIFY2(src.contains(QStringLiteral("selectRestoredNote(")),
+                 "the restore signal handlers must call selectRestoredNote() so a restored file becomes a "
+                 "real Shift-anchorable selection, not just the currentPath outline");
+    }
+
     // Item 7 (drift fix): ModelsPage's delete-confirm popup must match its
     // sibling confirm dialogs (Sidebar's fileDeleteConfirmPopup, MainPanel's) —
     // modal + dim + focus + closePolicy so Escape / click-outside cancel and
@@ -2554,6 +2605,9 @@ private slots:
                  "extendNoteSelection() must back Shift+Up/Down range extension");
         QVERIFY2(src.contains(QStringLiteral("function jumpToGroupBoundary(direction)")),
                  "jumpToGroupBoundary() must back Ctrl+Up/Down group-boundary jumps");
+        QVERIFY2(src.contains(QStringLiteral("function extendNoteSelectionToGroupBoundary(direction)")),
+                 "extendNoteSelectionToGroupBoundary() must back Ctrl+Shift+Up/Down "
+                 "(group jump + Shift-range in one gesture)");
         QVERIFY2(src.contains(QStringLiteral("function parentDir(path)")),
                  "parentDir() must define a note's group (parent folder) for the boundary jump");
 
@@ -2573,11 +2627,25 @@ private slots:
         QVERIFY2(jumpBody.contains(QStringLiteral("sidebar.parentDir(")),
                  "jumpToGroupBoundary must stop at folder boundaries (same parent-folder run)");
 
+        // Ctrl+Shift group-boundary extend must combine both: the fixed anchor +
+        // moving cursor of a Shift-range, walked to a parent-folder boundary, and
+        // must select the contiguous swept range (like extendNoteSelection).
+        const int gExtIdx = src.indexOf(QStringLiteral("function extendNoteSelectionToGroupBoundary("));
+        const QString gExtBody = src.mid(gExtIdx, 2000);
+        QVERIFY2(gExtBody.contains(QStringLiteral("sidebar.lastClickedPath"))
+                     && gExtBody.contains(QStringLiteral("sidebar.selectionCursorPath")),
+                 "extendNoteSelectionToGroupBoundary must keep the fixed anchor and move the cursor");
+        QVERIFY2(gExtBody.contains(QStringLiteral("sidebar.parentDir(")),
+                 "extendNoteSelectionToGroupBoundary must stop at folder boundaries");
+        QVERIFY2(gExtBody.contains(QStringLiteral("order.slice(lo, hi + 1)")),
+                 "extendNoteSelectionToGroupBoundary must select the contiguous anchor..boundary range");
+
         // Both key pairs wired as Shortcuts, gated like plain Up/Down — via the
         // shared noteShortcutsEnabled now (see sidebar_arrowKeyNavigatesNotes
         // for why the focus test moved into that gate).
         for (const QString &seq : {QStringLiteral("Shift+Up"), QStringLiteral("Shift+Down"),
-                                   QStringLiteral("Ctrl+Up"), QStringLiteral("Ctrl+Down")}) {
+                                   QStringLiteral("Ctrl+Up"), QStringLiteral("Ctrl+Down"),
+                                   QStringLiteral("Ctrl+Shift+Up"), QStringLiteral("Ctrl+Shift+Down")}) {
             const int sIdx = src.indexOf(QStringLiteral("sequence: \"%1\"").arg(seq));
             QVERIFY2(sIdx >= 0, qPrintable(seq + QStringLiteral(" must be wired as a Shortcut")));
             const QString sBlock = src.mid(sIdx, 220);
@@ -3036,7 +3104,7 @@ private slots:
     }
 
     // Item 32: on a file's FIRST transcription the regenerate
-    // label/prelude/chapters buttons gate on hasStoredMetadata, which flips
+    // label/prelude/chapters buttons gate on hasMetadata, which flips
     // true when refreshMetadata() reads the frontmatter written at job start.
     // onProgressChanged can fire during model-load BEFORE that flush, so the
     // definitely-post-frontmatter live-content edge (onLiveUpdateTickChanged)
@@ -3052,7 +3120,7 @@ private slots:
         QVERIFY2(idx >= 0, "onLiveUpdateTickChanged handler must exist");
         const QString block = src.mid(idx, 1400);
         QVERIFY2(block.contains(QStringLiteral("refreshMetadata()")),
-                 "the live-content tick must refresh metadata for the open file so hasStoredMetadata "
+                 "the live-content tick must refresh metadata for the open file so hasMetadata "
                  "flips true (regenerate buttons appear) on a file's first transcription (item 32)");
     }
 
@@ -3101,7 +3169,7 @@ private slots:
         const int mpIdx = mainPanel.indexOf(QStringLiteral("id: runAllIconButton"));
         QVERIFY2(mpIdx >= 0, "MainPanel must have a runAllIconButton (items 24/53)");
         const QString mpBlock = mainPanel.mid(mpIdx, 1500);
-        QVERIFY2(mpBlock.contains(QStringLiteral("!mainPanel.hasStoredMetadata")),
+        QVERIFY2(mpBlock.contains(QStringLiteral("!mainPanel.hasMetadata")),
                  "the MainPanel run-all button must appear only when there is no transcription yet "
                  "(untranscribed open file) per the user's spec (items 24/53)");
         QVERIFY2(mpBlock.contains(QStringLiteral("transcriptionController.runAllJobs(")),
@@ -3370,28 +3438,30 @@ private slots:
                  "transcribedPaths (audio-only)");
 
         // (2) MainPanel's generateChaptersButton must support orphaned .md the
-        // same way regenerateLabelButton already does: visible whenever
-        // orphanedMdPath is set (not excluded), and dispatching against a
-        // targetUrl that resolves to the orphaned path rather than
-        // player.source.
+        // same way regenerateLabelButton already does: gated on hasTranscript
+        // (true for an orphaned .md, not just transcribed audio) and dispatching
+        // against a targetUrl that resolves to currentMdUrl — the single .md
+        // identity that points at the orphaned path OR the audio sibling.
         const int mpIdx = mainPanel.indexOf(QStringLiteral("id: generateChaptersButton"));
         QVERIFY2(mpIdx >= 0, "MainPanel must have a generateChaptersButton");
         const QString mpBlock = mainPanel.mid(mpIdx, 1000);
-        QVERIFY2(mpBlock.contains(QStringLiteral("mainPanel.orphanedMdPath !== \"\"")),
-                 "generateChaptersButton must NOT be hidden whenever an orphaned .md is open");
-        QVERIFY2(mpBlock.contains(QStringLiteral("generateChaptersButton.targetUrl")),
-                 "generateChaptersButton must dispatch via a targetUrl that resolves to orphanedMdPath "
-                 "when open, mirroring regenerateLabelButton's targetUrl");
+        QVERIFY2(mpBlock.contains(QStringLiteral("mainPanel.hasTranscript")),
+                 "generateChaptersButton must be gated on hasTranscript (which includes an orphaned "
+                 ".md), not force-hidden when audio is absent");
+        QVERIFY2(mpBlock.contains(QStringLiteral("mainPanel.currentMdUrl")),
+                 "generateChaptersButton's targetUrl must resolve to currentMdUrl (the orphaned path "
+                 "or the audio sibling), mirroring regenerateLabelButton");
 
-        // refreshPreludeAndChapters() must be able to populate mainPanel.chapters
-        // for an orphaned .md too, so a freshly-generated chapter list actually
-        // becomes visible right after the job's onFinished fires.
+        // refreshPreludeAndChapters() must populate mainPanel.chapters for an
+        // orphaned .md too, so a freshly-generated chapter list becomes visible
+        // right after the job's onFinished fires — it reads through currentMdUrl,
+        // which is the orphaned path when one is open.
         const int refreshIdx = mainPanel.indexOf(QStringLiteral("function refreshPreludeAndChapters()"));
         QVERIFY2(refreshIdx >= 0, "refreshPreludeAndChapters() must exist");
         const QString refreshBlock = mainPanel.mid(refreshIdx, 700);
-        QVERIFY2(refreshBlock.contains(QStringLiteral("mainPanel.orphanedMdPath !== \"\"")),
-                 "refreshPreludeAndChapters() must read chapters via orphanedMdPath when open, not "
-                 "only via player.source");
+        QVERIFY2(refreshBlock.contains(QStringLiteral("mainPanel.currentMdUrl")),
+                 "refreshPreludeAndChapters() must read prelude/chapters via currentMdUrl (so an "
+                 "orphaned .md is covered), not only via player.source");
 
         // The chapter list itself must not be force-hidden for orphaned .md
         // (it only ever needs mainPanel.chapters, which the above now
@@ -3471,6 +3541,82 @@ private slots:
         QVERIFY2(fn.contains(QStringLiteral("importDestinationFor(")),
                  "importDroppedUrls() must validate synchronously via importDestinationFor() before enqueuing: "
                  "wrong-type/collision/no-vault deserve instant feedback, not a Failed task later");
+    }
+
+    // Settings saves are debounced by AppSettings' saveTimer, but the window
+    // closes via TranscriptionController::terminateApplicationImmediately()'s
+    // hard ::_exit(0) — which never lets that timer fire. So onClosing MUST
+    // flush the pending save first, or any setting changed within the timer's
+    // interval of closing is silently lost (the "titanet embedding model won't
+    // persist" bug: it was just whatever the user touched last before closing).
+    void mainWindow_closeFlushesPendingSettingsSave()
+    {
+        // stripComments + functionBody: both files' comments name these very
+        // calls while explaining the bug, so a raw `contains` would pass on the
+        // prose even if the code stopped doing it (see stripComments()' doc).
+        const QString main = stripComments(readAll(QStringLiteral(SUOP_QML_DIR "/Main.qml")));
+        QVERIFY2(!main.isEmpty(), "qml/Main.qml must exist");
+
+        const QString onClosing = functionBody(main, QStringLiteral("onClosing:"));
+        QVERIFY2(!onClosing.isEmpty(), "Main.qml must still handle onClosing");
+        const int flushIdx = onClosing.indexOf(QStringLiteral("AppSettings.flushPendingSave()"));
+        const int termIdx = onClosing.indexOf(QStringLiteral("terminateApplicationImmediately()"));
+        QVERIFY2(flushIdx >= 0,
+                 "onClosing must flush pending settings via AppSettings.flushPendingSave() — the hard "
+                 "::_exit(0) that follows never lets the debounced saveTimer fire");
+        QVERIFY2(termIdx < 0 || flushIdx < termIdx,
+                 "flushPendingSave() must run BEFORE terminateApplicationImmediately() — after the "
+                 "::_exit(0) it would never run at all");
+
+        // And flushPendingSave() must actually WRITE, not just stop the timer.
+        const QString settings = stripComments(readAll(QStringLiteral(SUOP_QML_DIR "/AppSettings.qml")));
+        const QString flush = functionBody(settings, QStringLiteral("function flushPendingSave()"));
+        QVERIFY2(!flush.isEmpty(), "AppSettings.qml must define flushPendingSave()");
+        QVERIFY2(flush.contains(QStringLiteral("saveToVault()")),
+                 "flushPendingSave() must call saveToVault() — stopping the timer alone drops the change");
+    }
+
+    // A model picker's currentIndex must survive its list being assigned AFTER
+    // the combo is built, and must never render an empty box. indexOfValue()
+    // reads the model but that read is NOT a tracked QML binding dependency, so
+    // `currentIndex: indexOfValue(selectedId)` alone computes -1 once against the
+    // still-empty list and never re-runs when the list fills in — the "the
+    // transcription-model box is empty on load even though the model IS saved"
+    // bug. The binding must (a) touch `count` so it re-evaluates on list change,
+    // and (b) fall back to the first entry (0) rather than -1.
+    void modelComboBox_currentIndexReevaluatesAndDefaultsToFirst()
+    {
+        for (const QString &file : {QStringLiteral("ModelComboBox.qml"),
+                                    QStringLiteral("SettingsPopup.qml")}) {
+            // stripComments: these files' comments explain the `count`/fallback
+            // trick BY NAME, so a raw scan would pass on the prose alone.
+            const QString src = stripComments(readAll(QStringLiteral(SUOP_QML_DIR "/") + file));
+            QVERIFY2(!src.isEmpty(), qPrintable(file + " must exist"));
+
+            // Every currentIndex binding driven by indexOfValue must be guarded.
+            int from = 0;
+            int found = 0;
+            while (true) {
+                const int idx = src.indexOf(QStringLiteral("indexOfValue("), from);
+                if (idx < 0)
+                    break;
+                ++found;
+                // Walk back to the enclosing `currentIndex:` and brace-match its block.
+                const int ci = src.lastIndexOf(QStringLiteral("currentIndex:"), idx);
+                QVERIFY2(ci >= 0, qPrintable(file + ": indexOfValue() must sit inside a currentIndex binding"));
+                const QString binding = functionBody(src, src.mid(ci, idx - ci));
+                QVERIFY2(!binding.isEmpty(),
+                         qPrintable(file + ": currentIndex must be a {…} block, not a bare indexOfValue()"));
+                QVERIFY2(binding.contains(QStringLiteral("count")),
+                         qPrintable(file + ": currentIndex must read `count` so the binding re-evaluates when "
+                                           "the model list populates — otherwise the box stays empty at -1"));
+                QVERIFY2(binding.contains(QStringLiteral("0 :")),
+                         qPrintable(file + ": currentIndex must fall back to the first entry (0), never leave "
+                                           "an empty box, when selectedId isn't in the list"));
+                from = idx + 1;
+            }
+            QVERIFY2(found > 0, qPrintable(file + " was expected to drive a model picker via indexOfValue()"));
+        }
     }
 
     // The mount gate above is `enabled`; the AUTO-grab gate is `enabled &&

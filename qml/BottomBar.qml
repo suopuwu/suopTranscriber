@@ -837,14 +837,88 @@ Item {
                     model: bottomBar.transcriptionController ? bottomBar.transcriptionController.sortedJobs : []
                     spacing: 2
 
-                    delegate: Item {
-                        id: jobRow
+                    // Which batches are expanded, keyed by batchId. Held HERE,
+                    // not on the delegate: sortedJobs returns a fresh array on
+                    // every queueChanged (a member finishing, say), so the
+                    // ListView recreates its delegates and any per-delegate
+                    // state would reset — re-collapsing a batch the user just
+                    // opened, repeatedly, mid-processing. Keyed by the stable
+                    // batchId, expansion survives those rebuilds. (Reassigned,
+                    // not mutated, so the delegates' bindings re-evaluate.)
+                    property var expandedBatches: ({})
+                    function toggleBatchExpanded(batchId) {
+                        const next = {}
+                        for (const k in jobListView.expandedBatches)
+                            next[k] = jobListView.expandedBatches[k]
+                        next[batchId] = !next[batchId]
+                        jobListView.expandedBatches = next
+                    }
+
+                    // A multi-select bulk op (transcribe/relabel/chapters/
+                    // detect-speakers/run-all/move over N files) collapses into
+                    // ONE row via TranscriptionController::collapseBatches() —
+                    // modelData.isBatch, with modelData.members holding the
+                    // per-file task rows. This delegate is a Column: the batch
+                    // header (or a standalone task) on top, and — for an
+                    // EXPANDED batch — its member rows beneath. taskRowComponent
+                    // renders all three cases (standalone / header / member) so
+                    // the row layout lives in one place; index 0 is the header,
+                    // index > 0 a member (see its isHeader/isMember).
+                    delegate: Column {
+                        id: entryColumn
                         required property var modelData
                         width: jobListView.width
+                        spacing: 2
+
+                        readonly property bool entryIsBatch: modelData.isBatch === true
+                        // Read from jobListView.expandedBatches so it survives
+                        // the model rebuilds sortedJobs triggers — see that
+                        // property's comment.
+                        readonly property bool expanded: entryColumn.entryIsBatch
+                            && jobListView.expandedBatches[modelData.batchId] === true
+
+                        readonly property var visibleRows: {
+                            if (!entryColumn.entryIsBatch)
+                                return [modelData]
+                            const rows = [modelData] // header first
+                            if (entryColumn.expanded) {
+                                const ms = modelData.members
+                                for (let i = 0; i < ms.length; ++i)
+                                    rows.push(ms[i])
+                            }
+                            return rows
+                        }
+
+                        Repeater {
+                            model: entryColumn.visibleRows
+                            delegate: taskRowComponent
+                        }
+
+                        Component {
+                            id: taskRowComponent
+                            Item {
+                        id: jobRow
+                        required property var modelData
+                        required property int index
+                        width: entryColumn.width
                         height: 24
+
+                        // Role within entryColumn: a batch's header is index 0
+                        // (aggregate row), its members index > 0; a standalone
+                        // task is a lone non-batch row.
+                        readonly property bool isHeader: entryColumn.entryIsBatch && index === 0
+                        readonly property bool isMember: entryColumn.entryIsBatch && index > 0
 
                         readonly property bool isDownload: modelData.kind === "download"
                         readonly property string fileName: {
+                            if (jobRow.isHeader) {
+                                // The batch header names the whole set by its
+                                // distinct-file count (a run-all batch has
+                                // several tasks per file, so this is files, not
+                                // tasks — see collapseBatches()).
+                                const n = modelData.batchCount
+                                return n === 1 ? qsTr("1 file") : qsTr("%1 files").arg(n)
+                            }
                             if (jobRow.isDownload) {
                                 // Downloads have no fileUrl (nothing to
                                 // open) — name the row after WHAT is being
@@ -911,6 +985,15 @@ Item {
                         // whenever status is "active"); final duration once
                         // Done/Failed; nothing yet while Queued.
                         readonly property string detailText: {
+                            // Batch header: show file-completion progress
+                            // ("2/5 done") while anything's pending; the summed
+                            // wall-clock once the whole batch is terminal.
+                            if (jobRow.isHeader) {
+                                if (modelData.status === "done" || modelData.status === "failed")
+                                    return modelData.durationMs >= 0
+                                        ? bottomBar.formatDuration(modelData.durationMs) : ""
+                                return qsTr("%1/%2 done").arg(modelData.batchDoneCount).arg(modelData.batchCount)
+                            }
                             if (modelData.status === "active") {
                                 // Avoid "paused (paused at 45s)" — statusText
                                 // above already says "paused"; just the bare
@@ -924,36 +1007,67 @@ Item {
                             return ""
                         }
                         // Item 3: up/down only make sense among Queued rows
-                        // — see queuedPositionOf()'s doc comment.
+                        // — see queuedPositionOf()'s doc comment. Never for a
+                        // batch header or a member (a batch keeps its enqueue
+                        // order; reorder stays a standalone-row affordance).
+                        readonly property bool reorderable: !entryColumn.entryIsBatch
                         readonly property int queuedPosition: bottomBar.queuedPositionOf(modelData.id)
+
+                        // A batch header's own row-tap toggles expand rather
+                        // than opening a file (it has none); a member/standalone
+                        // opens its note. Downloads open nothing.
+                        readonly property bool rowClickable: jobRow.isHeader || !jobRow.isDownload
 
                         HoverHandler {
                             id: jobRowHover
                             cursorShape: Qt.PointingHandCursor
-                            enabled: !jobRow.isDownload
+                            enabled: jobRow.rowClickable
                         }
                         // Clicking a task jumps straight to its note — same
                         // "row itself is clickable, inner buttons still work
                         // independently" pattern as Sidebar.qml's file rows;
                         // the buttons' own TapHandlers below (child Items)
                         // take priority over this one within their bounds.
-                        // Disabled for download rows (no file to open).
+                        // A batch header toggles its expansion instead.
                         TapHandler {
-                            enabled: !jobRow.isDownload
+                            enabled: jobRow.rowClickable
                             onTapped: {
+                                if (jobRow.isHeader) {
+                                    jobListView.toggleBatchExpanded(modelData.batchId)
+                                    return
+                                }
                                 bottomBar.taskActivated(jobRow.modelData.fileUrl.toString().replace("file://", ""))
                                 jobListPopup.close()
                             }
                         }
                         HoverBorder {
                             anchors.fill: parent
-                            active: jobRowHover.hovered && !jobRow.isDownload
+                            active: jobRowHover.hovered && jobRow.rowClickable
                         }
 
                             RowLayout {
                                 anchors.fill: parent
+                                // Indent member rows so they read as children of
+                                // the batch header above them.
+                                anchors.leftMargin: jobRow.isMember ? 14 : 0
                                 spacing: 6
 
+                                // Batch header disclosure chevron (expanded vs
+                                // collapsed) — a header reads as a disclosure
+                                // row. Only headers show it (an invisible
+                                // Layout child collapses, so standalone/member
+                                // rows keep their status dot at the left edge).
+                                Item {
+                                    Layout.preferredWidth: 9
+                                    Layout.preferredHeight: 9
+                                    visible: jobRow.isHeader
+                                    AppIcon {
+                                        anchors.centerIn: parent
+                                        name: entryColumn.expanded ? "collapse" : "expand"
+                                        iconSize: 9
+                                        color: "#8fa8bf"
+                                    }
+                                }
                                 Rectangle {
                                     width: 8
                                     height: 8
@@ -997,10 +1111,12 @@ Item {
                                 }
 
 
-                                // Item 3: reorder — Queued rows only.
+                                // Item 3: reorder — Queued standalone rows only
+                                // (a batch reorders as a unit it doesn't expose).
                                 Item {
                                     id: moveUpButton
-                                    visible: modelData.status === "queued" && jobRow.queuedPosition > 0
+                                    visible: jobRow.reorderable && modelData.status === "queued"
+                                        && jobRow.queuedPosition > 0
                                     Layout.preferredWidth: 14
                                     Layout.preferredHeight: 14
 
@@ -1029,7 +1145,7 @@ Item {
                                 }
                                 Item {
                                     id: moveDownButton
-                                    visible: modelData.status === "queued"
+                                    visible: jobRow.reorderable && modelData.status === "queued"
                                         && jobRow.queuedPosition >= 0 && jobRow.queuedPosition < bottomBar.queuedCount() - 1
                                     Layout.preferredWidth: 14
                                     Layout.preferredHeight: 14
@@ -1055,6 +1171,51 @@ Item {
                                     }
                                 }
 
+                                // Per-row Undo — the persistent twin of the
+                                // auto undo snackbar (Main.qml's onUndoAvailable):
+                                // a finished task that advertises an undo
+                                // (modelData.undoable, set by jobs()) offers to
+                                // enqueue its inverse right from the Tasks list,
+                                // so undo stays reachable after the snackbar has
+                                // expired. A batch header undoes every Done
+                                // member at once via its batchId; a standalone/
+                                // member undoes just itself via its own id —
+                                // exactly the token undoTask() expects (it reads
+                                // a non-zero token as either, unambiguously). The
+                                // terminal gate keeps it hidden on a header still
+                                // running (some members Done, batch not finished).
+                                Item {
+                                    id: undoButton
+                                    visible: modelData.undoable === true
+                                        && (modelData.status === "done" || modelData.status === "failed")
+                                    Layout.preferredWidth: 16
+                                    Layout.preferredHeight: 16
+
+                                    HoverHandler {
+                                        id: undoHover
+                                        cursorShape: Qt.PointingHandCursor
+                                    }
+                                    TapHandler {
+                                        // See the main pauseButton TapHandler for
+                                        // why ReleaseWithinBounds on a small icon.
+                                        gesturePolicy: TapHandler.ReleaseWithinBounds
+                                        onTapped: bottomBar.transcriptionController.undoTask(
+                                            jobRow.isHeader ? modelData.batchId : modelData.id)
+                                    }
+                                    HoverBorder {
+                                        anchors.fill: parent
+                                        active: undoHover.hovered
+                                    }
+                                    AppIcon {
+                                        anchors.centerIn: parent
+                                        name: "undo"
+                                        iconSize: 13
+                                        color: "#dddddd"
+                                    }
+                                    ToolTip.visible: undoHover.hovered
+                                    ToolTip.text: qsTr("Undo")
+                                }
+
                                 // Item 3: one button for both "cancel"
                                 // (Queued/Active — stops it, see
                                 // TranscriptionController::cancelJob()'s doc
@@ -1075,10 +1236,22 @@ Item {
                                     TapHandler {
                                         gesturePolicy: TapHandler.ReleaseWithinBounds
                                         onTapped: {
-                                            if (modelData.status === "done" || modelData.status === "failed")
+                                            const terminal = modelData.status === "done"
+                                                || modelData.status === "failed"
+                                            // A batch header's one button acts on
+                                            // the WHOLE batch (dismiss/cancel all
+                                            // members); a member/standalone acts
+                                            // on just itself.
+                                            if (jobRow.isHeader) {
+                                                if (terminal)
+                                                    bottomBar.transcriptionController.dismissBatch(modelData.batchId)
+                                                else
+                                                    bottomBar.transcriptionController.cancelBatch(modelData.batchId)
+                                            } else if (terminal) {
                                                 bottomBar.transcriptionController.dismiss(modelData.fileUrl)
-                                            else
+                                            } else {
                                                 bottomBar.transcriptionController.cancelJob(modelData.id)
+                                            }
                                         }
                                     }
                                     HoverBorder {
@@ -1093,6 +1266,8 @@ Item {
                                     }
                                 }
                             }
+                            }
+                        }
                     }
                 }
             }

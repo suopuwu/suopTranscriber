@@ -37,7 +37,19 @@ ComboBox {
     textRole: "label"
     valueRole: "id"
     hoverEnabled: true
-    currentIndex: indexOfValue(selectedId)
+    // Reading `count` is load-bearing, not cosmetic: indexOfValue() reads the
+    // model internally, but that read is NOT a tracked binding dependency, so
+    // when the model list is still empty as this combo is built (e.g. the
+    // controller/model assigned a tick later) the binding would compute -1 once
+    // and never re-run when the list fills in — leaving the box stuck empty.
+    // Touching `count` ties this binding to the list changing so it recomputes.
+    // And when selectedId isn't in the list (nothing chosen yet, or a stale/
+    // removed id) fall back to the FIRST entry rather than showing nothing.
+    currentIndex: {
+        const n = count
+        const i = indexOfValue(selectedId)
+        return i >= 0 ? i : (n > 0 ? 0 : -1)
+    }
 
     onActivated: control.picked(currentValue)
 

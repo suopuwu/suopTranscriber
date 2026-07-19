@@ -65,6 +65,12 @@ public:
     QVariant data(const QModelIndex &proxyIndex, int role) const override;
     QHash<int, QByteArray> roleNames() const override;
 
+    // Overridden purely to hook the source model's reset boundary (see
+    // m_sourceResetting) — behaviour is otherwise the base's. sourceModel is
+    // set once (Sidebar's `model` alias), but this still disconnects the old
+    // source's trackers so a re-set can't double-connect.
+    void setSourceModel(QAbstractItemModel *sourceModel) override;
+
 signals:
     void searchQueryChanged();
     void includeTranscriptionsChanged();
@@ -84,9 +90,27 @@ private:
     bool rowHasAllFilterSpeakers(const QModelIndex &sourceIndex) const;
     bool matchesSpeakerFilter(const QModelIndex &sourceIndex) const;
 
+    // Every property setter routes its invalidate() through here. While the
+    // SOURCE model is between beginResetModel() and endResetModel(), the
+    // proxy's persistent indexes into it still carry raw Node* internalPointers
+    // that VaultTreeModel::rebuild() has already freed — calling invalidate()
+    // then walks those dangling indexes (QPersistentModelIndex::parent() ->
+    // VaultTreeModel::parent()) and segfaults. This crashed live: a QML
+    // Connections onModelReset handler re-derives fileSortKeys and writes it
+    // back into this proxy synchronously, from inside the source's
+    // endResetModel() emission (see Sidebar.qml's `target: sidebar.model`
+    // block). Deferring the invalidate to onSourceReset() (which runs AFTER the
+    // base class has rebuilt its mapping off the fresh tree) makes the write
+    // safe regardless of which caller made it.
+    void invalidateUnlessResetting();
+    void onSourceAboutToBeReset();
+    void onSourceReset();
+
     QString m_searchQuery;
     bool m_includeTranscriptions = true;
     QStringList m_tagFilter;
     QStringList m_speakerFilter;
     QVariantMap m_fileSortKeys;
+    bool m_sourceResetting = false;
+    bool m_invalidateDeferred = false;
 };

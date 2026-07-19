@@ -87,9 +87,19 @@ struct UsbGrabScanHooks {
 // all — no mkpath, no QFile::copy — filling previewEntries instead of copying.
 // Everything else (filters, the dedup index, the abort check) is identical
 // between the two modes, which is exactly why they share one function.
+//
+// combineRules is AppSettings.combineRules — the same split-recording combine
+// rules the combiner uses. A file whose group was already combined is skipped
+// as a "duplicate" even though its raw part no longer sits in the vault (it was
+// moved into .combined/ or deleted): the merged output the combiner would
+// produce is recomputed from the filename and checked for on disk, so a
+// re-plugged device doesn't re-grab parts that only "vanished" because they
+// were merged. Empty (the default) disables the check — the scan then falls
+// back to the plain quick-check dedup alone.
 UsbGrabScanResult runUsbGrabScan(const UsbGrabRule &rule, const QString &mountPath,
                                   const QString &destinationVaultPath, bool dryRun,
-                                  const UsbGrabScanHooks &hooks = {});
+                                  const UsbGrabScanHooks &hooks = {},
+                                  const QVariantList &combineRules = {});
 
 // Runs one DRY-RUN grab preview (runUsbGrabScan(dryRun=true) for one
 // UsbGrabRule against one already-mounted volume) off the GUI thread. Mirrors
@@ -123,7 +133,8 @@ public:
     // no history entry, and touches the filesystem only to read directory
     // entries — see runUsbGrabScan()'s dryRun parameter for the classification
     // it produces, and previewReady() below for how it comes back.
-    void start(const UsbGrabRule &rule, const QString &mountPath, const QString &destinationVaultPath);
+    void start(const UsbGrabRule &rule, const QString &mountPath, const QString &destinationVaultPath,
+               const QVariantList &combineRules = {});
 
 signals:
     // Emitted once the dry run finishes. entries is a list of

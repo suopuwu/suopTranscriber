@@ -3493,7 +3493,14 @@ Popup {
                     model: transcriptionController.availableSegmentationModels()
                     textRole: "label"
                     valueRole: "id"
-                    currentIndex: indexOfValue(AppSettings.diarizationSegmentationModel)
+                    // See ModelComboBox.qml: touch `count` so this re-runs when
+                    // the list populates (indexOfValue isn't a tracked dep), and
+                    // default to the first entry instead of an empty box.
+                    currentIndex: {
+                        const n = count
+                        const i = indexOfValue(AppSettings.diarizationSegmentationModel)
+                        return i >= 0 ? i : (n > 0 ? 0 : -1)
+                    }
                     hoverEnabled: true
                     onActivated: AppSettings.diarizationSegmentationModel = currentValue
 
@@ -3548,7 +3555,14 @@ Popup {
                     model: transcriptionController.availableEmbeddingModels()
                     textRole: "label"
                     valueRole: "id"
-                    currentIndex: indexOfValue(AppSettings.diarizationEmbeddingModel)
+                    // See ModelComboBox.qml: touch `count` so this re-runs when
+                    // the list populates (indexOfValue isn't a tracked dep), and
+                    // default to the first entry instead of an empty box.
+                    currentIndex: {
+                        const n = count
+                        const i = indexOfValue(AppSettings.diarizationEmbeddingModel)
+                        return i >= 0 ? i : (n > 0 ? 0 : -1)
+                    }
                     hoverEnabled: true
                     onActivated: AppSettings.diarizationEmbeddingModel = currentValue
 

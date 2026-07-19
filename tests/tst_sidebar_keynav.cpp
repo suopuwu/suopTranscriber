@@ -314,6 +314,84 @@ private slots:
         QCOMPARE(root->property("openPath").toString(), firstPath);
     }
 
+    // Bug (live test): after a Ctrl+Shift+arrow group-boundary EXTEND, a
+    // following Shift-click / Ctrl-click with the MOUSE must still build a
+    // multi-selection. The user reported it silently stopped after using
+    // Ctrl+Shift+arrow (keyboard Shift+arrow kept working). Drives real key +
+    // real modifier-bearing mouse events end-to-end so the whole
+    // Shortcut->selection-state->TapHandler->handleNoteClick chain is exercised.
+    void ctrlShiftArrow_thenMouseModifierClicksStillSelect()
+    {
+        QTemporaryDir vault;
+        QVERIFY(vault.isValid());
+        QStringList notePaths;
+        for (int i = 0; i < 6; ++i) {
+            const QString path = vault.filePath(QStringLiteral("note%1.mp3").arg(i));
+            QVERIFY(touch(path));
+            notePaths << path;
+        }
+
+        QQuickView view;
+        view.engine()->addImportPath(m_moduleDir.path());
+        view.engine()->addImageProvider(QString::fromLatin1(IconImageProvider::kProviderId),
+                                        new IconImageProvider);
+        view.rootContext()->setContextProperty(QStringLiteral("vaultUrl"),
+                                                QUrl::fromLocalFile(vault.path()));
+        view.setSource(QUrl::fromLocalFile(m_driverQmlPath));
+        QVERIFY2(view.status() == QQuickView::Ready, "driver.qml failed to load");
+        view.show();
+        QVERIFY(QTest::qWaitForWindowExposed(&view));
+
+        QQuickItem *root = view.rootObject();
+        QVERIFY(root);
+        QQuickItem *sidebarItem = root->findChild<QQuickItem *>(QStringLiteral("sidebar"));
+        QVERIFY(sidebarItem);
+        QQuickItem *treeItem = findByClassNamePrefix(sidebarItem, "QQuickTreeView");
+        QVERIFY(treeItem);
+        QTRY_VERIFY(treeItem->property("rows").toInt() >= 6);
+
+        auto rowScenePos = [&](int row) -> QPoint {
+            QQuickItem *item = nullptr;
+            QMetaObject::invokeMethod(treeItem, "itemAtCell", Qt::DirectConnection,
+                                      Q_RETURN_ARG(QQuickItem *, item), Q_ARG(QPoint, QPoint(0, row)));
+            if (!item)
+                return QPoint(-1, -1);
+            return item->mapToScene(QPointF(item->width() / 2, item->height() / 2)).toPoint();
+        };
+        auto selectedPaths = [&]() -> QStringList {
+            QStringList out;
+            for (const QVariant &v : sidebarItem->property("selectedPaths").toList())
+                out << v.toString();
+            return out;
+        };
+
+        // Focus the tree + select row 0 with a real click.
+        QTest::mouseClick(&view, Qt::LeftButton, Qt::NoModifier, rowScenePos(0));
+        QTest::qWait(20);
+        QVERIFY(treeItem->property("activeFocus").toBool());
+        QCOMPARE(selectedPaths().size(), 1);
+
+        // Ctrl+Shift+Down: one flat group (all notes share the vault-root
+        // parent), so this extends the selection to the last note — all 6.
+        QTest::keyClick(&view, Qt::Key_Down, Qt::ControlModifier | Qt::ShiftModifier);
+        QTest::qWait(20);
+        QCOMPARE(selectedPaths().size(), 6);
+
+        // THE BUG: a Shift-click on row 2 with the mouse must now shrink the
+        // range to note0..note2 (anchor still note0). If the extend left the
+        // anchor unusable, this silently collapses to a single selection.
+        QTest::mouseClick(&view, Qt::LeftButton, Qt::ShiftModifier, rowScenePos(2));
+        QTest::qWait(20);
+        QCOMPARE(selectedPaths().size(), 3);
+
+        // And a Ctrl-click on row 4 must toggle it into the selection.
+        QTest::mouseClick(&view, Qt::LeftButton, Qt::ControlModifier, rowScenePos(4));
+        QTest::qWait(20);
+        QVERIFY2(selectedPaths().contains(notePaths[4]),
+                 "Ctrl-click after a Ctrl+Shift+arrow extend must still toggle a row in");
+        QCOMPARE(selectedPaths().size(), 4);
+    }
+
 };
 
 int main(int argc, char *argv[])

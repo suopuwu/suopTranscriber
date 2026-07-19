@@ -6,11 +6,13 @@
 
 #include "../UsbGrabJob.h"
 
-UsbGrabTask::UsbGrabTask(UsbGrabRule rule, QString mountPath, QUrl destUrl, bool autoTriggered, QObject *parent)
+UsbGrabTask::UsbGrabTask(UsbGrabRule rule, QString mountPath, QUrl destUrl, bool autoTriggered,
+                         QVariantList combineRules, QObject *parent)
     : Task(parent)
     , m_rule(std::move(rule))
     , m_mountPath(std::move(mountPath))
     , m_autoTriggered(autoTriggered)
+    , m_combineRules(std::move(combineRules))
 {
     fileUrl = std::move(destUrl);
 }
@@ -57,7 +59,7 @@ void UsbGrabTask::run(TaskContext &ctx)
     };
 
     const UsbGrabScanResult result =
-        runUsbGrabScan(m_rule, m_mountPath, fileUrl.toLocalFile(), /*dryRun=*/false, hooks);
+        runUsbGrabScan(m_rule, m_mountPath, fileUrl.toLocalFile(), /*dryRun=*/false, hooks, m_combineRules);
 
     if (!result.refusal.isEmpty()) {
         // A refusal means the walk never ran — a genuinely failed task,

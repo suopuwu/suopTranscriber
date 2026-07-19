@@ -2,6 +2,7 @@
 
 #include <QString>
 #include <QUrl>
+#include <QVariantList>
 
 #include "../UsbRuleStore.h"
 #include "Task.h"
@@ -26,7 +27,11 @@ public:
     // UsbGrabberController can tell when the LAST auto-grab of a batch has
     // drained (its autoGrabsSettled() signal) — nothing about how the grab
     // itself runs depends on it.
-    UsbGrabTask(UsbGrabRule rule, QString mountPath, QUrl destUrl, bool autoTriggered, QObject *parent = nullptr);
+    // combineRules: AppSettings.combineRules, forwarded to runUsbGrabScan() so
+    // the walk skips parts whose split-recording group was already combined
+    // (see UsbGrabJob.h). Empty disables that check.
+    UsbGrabTask(UsbGrabRule rule, QString mountPath, QUrl destUrl, bool autoTriggered,
+                QVariantList combineRules, QObject *parent = nullptr);
 
     QString kind() const override { return QStringLiteral("usbGrab"); }
     QString kindLabel() const override { return QStringLiteral("USB grab"); }
@@ -55,4 +60,5 @@ private:
     UsbGrabRule m_rule;
     QString m_mountPath;
     bool m_autoTriggered;
+    QVariantList m_combineRules;
 };

@@ -1367,6 +1367,14 @@ private slots:
         const QString original = readAllBytes(dir.path() + "/interview.wav.md");
 
         TranscriptionController controller;
+        // The two merges must run strictly sequentially. speakersMerged fires
+        // from the instant-lane task's run() BEFORE onTaskFinished reaps it, so
+        // after the first spy.wait() the task is often still Active — a second
+        // merge issued now would hit mergeSpeakers()'s isQueued() dedup and be
+        // rejected with "another task is already running" instead of "not found".
+        // Wait on finished() (emitted from onTaskFinished, after the task is
+        // fully reaped) to drain each merge before starting the next.
+        QSignalSpy finishedSpy(&controller, &TranscriptionController::finished);
         {
             QSignalSpy spy(&controller, &TranscriptionController::speakersMerged);
             controller.mergeSpeakers(audioUrl, QStringLiteral("Speaker 9"), QStringLiteral("Speaker 1"));
@@ -1374,6 +1382,7 @@ private slots:
             const QList<QVariant> args = spy.takeFirst();
             QVERIFY(!args.at(3).toBool());
             QVERIFY2(args.at(4).toString().contains(QStringLiteral("not found")), qPrintable(args.at(4).toString()));
+            QVERIFY(finishedSpy.count() >= 1 || finishedSpy.wait(5000));
         }
         {
             QSignalSpy spy(&controller, &TranscriptionController::speakersMerged);
@@ -1382,6 +1391,7 @@ private slots:
             const QList<QVariant> args = spy.takeFirst();
             QVERIFY(!args.at(3).toBool());
             QVERIFY2(args.at(4).toString().contains(QStringLiteral("not found")), qPrintable(args.at(4).toString()));
+            QVERIFY(finishedSpy.count() >= 2 || finishedSpy.wait(5000));
         }
         QCOMPARE(readAllBytes(dir.path() + "/interview.wav.md"), original);
     }

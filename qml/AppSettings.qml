@@ -401,6 +401,18 @@ Item {
             saveTimer.restart()
     }
 
+    // Write any debounced-but-not-yet-flushed change RIGHT NOW. The app closes
+    // via a hard ::_exit(0) (TranscriptionController::terminateApplicationImmediately)
+    // which never lets saveTimer fire, so a setting changed within saveTimer's
+    // interval of closing the window would otherwise be silently lost. Main.qml's
+    // onClosing calls this before terminating.
+    function flushPendingSave() {
+        if (saveTimer.running) {
+            saveTimer.stop()
+            appSettings.saveToVault()
+        }
+    }
+
     // One handler per persisted key (mechanical, mirrors the defaults map
     // above) — QML has no generic "any property on this object changed"
     // signal, so each needs its own connection.

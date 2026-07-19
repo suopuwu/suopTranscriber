@@ -53,3 +53,6 @@ engines/**/.venv/
 .idea/
 *.swp
 .DS_Store
+
+# Environment-specific visual-snapshot goldens (opt-in tst_visual_snapshot)
+tests/snapshots/

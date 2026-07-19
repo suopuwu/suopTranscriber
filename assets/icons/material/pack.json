@@ -52,6 +52,7 @@
     "more": "more.svg",
     "freeze": "freeze.svg",
     "reset": "reset.svg",
+    "undo": "undo.svg",
 
     "warning": "warning.svg",
     "invalid": "invalid.svg",

@@ -33,6 +33,7 @@
 
 #include <QtTest>
 
+#include <QColor>
 #include <QQmlContext>
 #include <QQmlEngine>
 #include <QQuickItem>
@@ -193,6 +194,17 @@ private slots:
         QVERIFY(m_moduleDir.isValid());
         QVERIFY(m_vaultDir.isValid());
 
+        // A zero-byte fake model so a transcribe() enqueues and then fails fast
+        // on load (no GPU, no network) — used by
+        // deleteFileButton_visibilityAndColorReflectState to drive the busy
+        // state that greys the button. Same trick as tst_mainpanel_buttonstate.
+        const QString modelsDir = m_vaultDir.filePath(QStringLiteral(".transcriber/models"));
+        QVERIFY(QDir().mkpath(modelsDir));
+        QFile fakeModel(modelsDir + QStringLiteral("/ggml-base.en.bin"));
+        QVERIFY(fakeModel.open(QIODevice::WriteOnly));
+        fakeModel.close();
+        qputenv("SUOP_MODELS_DIR", modelsDir.toLocal8Bit());
+
         const QString suopDir = m_moduleDir.filePath(QStringLiteral("SuopTranscriber"));
         QVERIFY(QDir().mkpath(suopDir));
         // Symlink (not copy) to the real checked-out qml/ — must reflect what's
@@ -298,16 +310,16 @@ private slots:
         QVERIFY2(openPanel(&view), "could not load MainPanel.qml / locate it");
 
         m_player->setSource(QUrl::fromLocalFile(m_audioPath));
-        QTRY_VERIFY(m_panel->property("hasStoredMetadata").toBool());
+        QTRY_VERIFY(m_panel->property("hasMetadata").toBool());
 
         const QVariantMap result = m_model->trashTranscript({ QUrl::fromLocalFile(m_audioPath) });
         QCOMPARE(result.value(QStringLiteral("trashed")).toInt(), 1);
-        QTRY_VERIFY2(!m_panel->property("hasStoredMetadata").toBool(),
+        QTRY_VERIFY2(!m_panel->property("hasMetadata").toBool(),
                      "precondition: deleting the transcript must revert the panel to untranscribed");
 
         QCOMPARE(m_model->restoreFromTrash(result.value(QStringLiteral("restorable")).toList()), 1);
 
-        QTRY_VERIFY2_WITH_TIMEOUT(m_panel->property("hasStoredMetadata").toBool(),
+        QTRY_VERIFY2_WITH_TIMEOUT(m_panel->property("hasMetadata").toBool(),
                                   "the panel still reads as untranscribed after its transcript was restored",
                                   2000);
         // The file itself never moved — undo must not have switched views.
@@ -381,6 +393,97 @@ private slots:
         QTRY_COMPARE(undoSpy.count(), 1);
         m_controller->undoTask(undoSpy.constFirst().at(0).toInt());
         QTRY_COMPARE_WITH_TIMEOUT(playerSource(), QUrl::fromLocalFile(m_audioPath), 5000);
+
+        // Live test #1 (restore half): the reopened file's delete button must be
+        // active again. The button's `enabled` is `visible && busyOrQueuedUrls
+        // doesn't contain the url` — with the file reopened (visible) the only way
+        // it could stay greyed is the restored file's url lingering in
+        // busyOrQueuedUrls (a Done RestoreTask never leaving the queue set). Assert
+        // it's gone, which is exactly "the delete button is active".
+        const QString restoredUrl = QUrl::fromLocalFile(m_audioPath).toString();
+        QTRY_VERIFY2_WITH_TIMEOUT(
+            !m_panel->property("busyOrQueuedUrls").toStringList().contains(restoredUrl),
+            "after undo, the restored file is still in busyOrQueuedUrls — its delete button stays greyed",
+            5000);
+    }
+
+    // [VIS]->property: the delete button's affordance rendering. Instead of a
+    // pixel snapshot, assert the actual observable properties a screenshot would
+    // be a proxy for: it is HIDDEN with nothing open, SHOWN + enabled + painted
+    // the enabled color once a file is open, and greyed to the disabled color
+    // while a job for that file runs (then back, reactively). Covers the
+    // §6/§7 "delete button reflects state" visual checks from LIVE_TESTING.md
+    // deterministically, no screenshot diff.
+    void deleteFileButton_visibilityAndColorReflectState()
+    {
+        QQuickView view;
+        QVERIFY2(openPanel(&view), "could not load MainPanel.qml / locate it");
+
+        QQuickItem *button = m_panel->findChild<QQuickItem *>(QStringLiteral("deleteFileButton"));
+        QVERIFY2(button, "deleteFileButton must expose objectName for this test");
+        QQuickItem *icon = m_panel->findChild<QQuickItem *>(QStringLiteral("deleteFileIcon"));
+        QVERIFY2(icon, "deleteFileIcon must expose objectName for this test");
+
+        const QColor enabledColor(QStringLiteral("#e07a7a"));
+        const QColor disabledColor(QStringLiteral("#666666"));
+
+        // Nothing open → the button is not shown at all.
+        QVERIFY2(!button->isVisible(), "delete button must be hidden when no file is open");
+
+        // Open an audio file → shown, enabled, painted the enabled color.
+        m_player->setSource(QUrl::fromLocalFile(m_audioPath));
+        QTRY_VERIFY2(button->isVisible(), "delete button must appear once a file is open");
+        QVERIFY(button->property("enabled").toBool());
+        QCOMPARE(icon->property("color").value<QColor>(), enabledColor);
+
+        // Queue a job FOR THAT FILE → greyed + disabled-colored. transcribe()
+        // makes the file Active synchronously (see tst_transcription_queue),
+        // before the worker's fast fake-model-load failure arrives.
+        m_controller->transcribe(QUrl::fromLocalFile(m_audioPath), QUrl::fromLocalFile(m_vaultDir.path()),
+                                 QStringLiteral("base.en"));
+        QVERIFY2(!button->property("enabled").toBool(),
+                 "delete button must disable while a job for its open file runs");
+        QCOMPARE(icon->property("color").value<QColor>(), disabledColor);
+
+        // Job finishes (fails fast on the empty model) → re-enabled + enabled
+        // color again, reactively, with no reopen.
+        QTRY_VERIFY2(button->property("enabled").toBool(),
+                     "delete button must re-enable when its file's job leaves the queue");
+        QCOMPARE(icon->property("color").value<QColor>(), enabledColor);
+    }
+
+    // [VIS]->geometry: the §12 "no horizontal body scroll / clipped text" check
+    // as a layout invariant rather than a screenshot. A single very long line
+    // must WRAP within the transcript area's width — if the view ever stopped
+    // wrapping (NoWrap, or a fixed too-wide content width) its contentWidth
+    // would exceed its width and force a horizontal scrollbar. The text has
+    // spaces so word-wrap has boundaries to break on.
+    void transcriptText_wrapsWithinWidth_noHorizontalOverflow()
+    {
+        QQuickView view;
+        QVERIFY2(openPanel(&view), "could not load MainPanel.qml / locate it");
+
+        // Overwrite the fixture's short transcript with one long, space-separated
+        // line — long enough to exceed the 900px panel width many times over.
+        const QString longLine = QStringLiteral("lorem ipsum dolor sit amet ").repeated(60);
+        QVERIFY(writeFile(m_mdPath,
+                          QStringLiteral("---\nmodel: base\nspeakerDetection: false\n---\n[0] ") + longLine
+                              + QStringLiteral("\n")));
+        m_player->setSource(QUrl::fromLocalFile(m_audioPath));
+
+        QQuickItem *area = m_panel->findChild<QQuickItem *>(QStringLiteral("transcriptArea"));
+        QVERIFY2(area, "transcriptArea must expose objectName");
+        // visible flips true only once the (long) body has loaded.
+        QTRY_VERIFY2(area->isVisible(), "the transcript area must show once a body loads");
+
+        const qreal width = area->property("width").toReal();
+        const qreal contentWidth = area->property("contentWidth").toReal();
+        QVERIFY2(width > 0.0, "transcript area has no width — layout not realized");
+        QVERIFY2(contentWidth <= width + 1.0,
+                 qPrintable(QStringLiteral("transcript text overflows horizontally (contentWidth %1 > width %2) "
+                                           "— it must wrap, not force a horizontal scrollbar")
+                                .arg(contentWidth)
+                                .arg(width)));
     }
 
     // An orphaned .md is a file too, and reopening it needs the text-only view —

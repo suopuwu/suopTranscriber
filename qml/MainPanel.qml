@@ -28,8 +28,48 @@ Rectangle {
     // onBenchmarkRequested) — gates the benchmark page below, mirroring
     // usbGrabberOpen. recording/usbGrabber win if several are true.
     property bool benchmarkOpen: false
-    property var storedMetadata: ({})
-    readonly property bool hasStoredMetadata: Object.keys(mainPanel.storedMetadata).length > 0
+    // The frontmatter/metadata of the transcript currently open, whether it's
+    // an audio file's sibling .md or a standalone orphaned .md — one store for
+    // both modes (see currentMdUrl / refreshMetadata). hasMetadata is true the
+    // moment that map has any keys, so an orphaned .md with frontmatter reads
+    // as transcribed exactly like an audio-backed one (this is what makes the
+    // transcript editor editable for orphaned files — see transcriptArea.readOnly).
+    property var metadata: ({})
+    readonly property bool hasMetadata: Object.keys(mainPanel.metadata).length > 0
+    // The .md URL to READ/WRITE the open transcript's data (metadata, prelude,
+    // chapters, sentence/label/rename edits), regardless of mode: the orphaned
+    // .md directly, or the audio file's URL (the controller resolves its sibling
+    // .md), or "" when nothing is open. This is the single identity every
+    // non-audio-specific read/write funnels through, so orphaned and audio files
+    // travel identical code paths. (readMetadata/readChapters/setLabel/renameFile/
+    // setPrelude/setSentenceTexts all accept either an audio URL or an .md URL.)
+    //
+    // Computed by resolvedMdUrl() from the raw source properties, NOT inlined
+    // here, because refreshMetadata()/displayTitle()/currentFileStem() must call
+    // that function DIRECTLY: they run from onOrphanedMdPathChanged, and reading
+    // this cached property inside its own dependency's change handler can still
+    // return the STALE value (QML re-evaluates the binding lazily, only after the
+    // handler returns). The raw properties the function reads are always current.
+    function resolvedMdUrl() {
+        return mainPanel.orphanedMdPath !== ""
+            ? "file://" + mainPanel.orphanedMdPath
+            : (mainPanel.player ? mainPanel.player.source.toString() : "")
+    }
+    readonly property string currentMdUrl: mainPanel.resolvedMdUrl()
+    // True only for an audio-backed file — gates the genuinely audio-specific
+    // chrome (playback/seek row, model + sensitivity pickers, add-chapter-at-
+    // playhead). NOT the same question as "is this transcribed": an orphaned .md
+    // is transcribed but has no audio. Everything that is really about the
+    // transcript (body, chapters, tags, prelude, editing) keys off hasMetadata
+    // instead, so it behaves the same in both modes.
+    readonly property bool hasAudio: mainPanel.player && mainPanel.player.source.toString() !== ""
+    // "There is a transcript body to act on" — the gate for the mode-agnostic
+    // transcript actions (relabel, generate chapters, copy, open). An orphaned
+    // .md IS a transcript, so it always qualifies; an audio file qualifies once
+    // it's transcribed (hasMetadata). This is the one place the orphaned-vs-
+    // audio distinction is spelled out for "is there a transcript"; every such
+    // gate reads this instead of re-deriving it.
+    readonly property bool hasTranscript: mainPanel.orphanedMdPath !== "" || mainPanel.hasMetadata
     // Gates transcriptArea's editability below — mirrors
     // transcribeIconButton.isActive's own busy+currentFile check further
     // down this file. Editing while this file's transcription job is
@@ -41,6 +81,15 @@ Rectangle {
     // real queued tasks, so gating on presentation is what keeps a benchmark
     // from freezing the panel the user is reading. This is the concrete reason
     // Presentation exists as an axis separate from "is a task running".
+    // True only when an actual audio file is loaded in the player (not the
+    // orphaned-md text view, and not the nothing-open state). Drives the
+    // playback controls' enabled state so they can't be operated when there's
+    // nothing to play. A plain binding on player.source, so it re-evaluates on
+    // ANY source change — not just user open/close, but also a deletion closing
+    // the current file (onFileDeleted sets player.source = "") — with no
+    // imperative sync needed.
+    readonly property bool hasPlayableSource: mainPanel.player
+        && mainPanel.player.source.toString() !== ""
     readonly property bool transcribingThisFile: mainPanel.transcriptionController && mainPanel.player
         && mainPanel.transcriptionController.busy
         && mainPanel.transcriptionController.activeIsForeground
@@ -132,9 +181,10 @@ Rectangle {
 
     // Text-only view for an orphaned .md (no matching audio) — mutually
     // exclusive with player.source; showAudioFile()/showOrphanedMd() below
-    // are the only places that should touch either.
+    // are the only places that should touch either. Its metadata is NOT a
+    // separate store: like an audio file's, it loads into the one `metadata`
+    // property via currentMdUrl, so every downstream read is mode-agnostic.
     property string orphanedMdPath: ""
-    property var orphanedMdMetadata: ({})
 
     // The file this panel closed because it was deleted out from under it (see
     // the vaultTreeModel Connections' onFileDeleted) — the only memory that
@@ -152,15 +202,15 @@ Rectangle {
 
     // Feature 2: multi-paragraph, editable prelude (upgrades O26's old
     // read-only single-line summary) — lives in the .md BODY, not
-    // storedMetadata/frontmatter (see TranscriptionController::readPrelude()),
-    // so it needs its own property, populated alongside storedMetadata in
+    // metadata/frontmatter (see TranscriptionController::readPrelude()),
+    // so it needs its own property, populated alongside metadata in
     // refreshMetadata() below.
     property string prelude: ""
 
     // Feature 3b/3c: chapter markers (see
     // TranscriptionController::readChapters()) — shared by the seek-bar tick
     // marks (3b) and the chapter list (3c), populated once alongside
-    // prelude/storedMetadata in refreshMetadata() below rather than each
+    // prelude/metadata in refreshMetadata() below rather than each
     // calling readChapters() separately.
     property var chapters: []
     property bool chaptersExpanded: true
@@ -231,8 +281,11 @@ Rectangle {
     }
 
     function refreshMetadata() {
-        storedMetadata = (player && player.source.toString() !== "" && transcriptionController)
-            ? transcriptionController.readMetadata(player.source) : ({})
+        // resolvedMdUrl() not currentMdUrl — see resolvedMdUrl()'s doc comment
+        // (this runs from onOrphanedMdPathChanged, where the property is stale).
+        const url = mainPanel.resolvedMdUrl()
+        metadata = (url !== "" && transcriptionController)
+            ? transcriptionController.readMetadata(url) : ({})
         // titleField is always-editable (no display/edit swap — see its doc
         // comment), so its `text: displayTitle()` binding is a one-shot: it's
         // severed the first time the user types. Resync explicitly on every
@@ -266,20 +319,18 @@ Rectangle {
     //    same background pass already populated TranscriptionController's
     //    body cache for this exact file.
     // It is deliberately NEVER called from onSourceChanged directly (unlike
-    // storedMetadata above, which is a cheap frontmatter-only read either
+    // metadata above, which is a cheap frontmatter-only read either
     // way) — see beginTranscriptLoad()'s doc comment for why that path
     // defers to the async completion instead.
     function refreshPreludeAndChapters() {
-        mainPanel.prelude = (player && player.source.toString() !== "" && transcriptionController)
-            ? transcriptionController.readPrelude(player.source) : ""
-        // Chapters, unlike prelude, are also readable for an orphaned .md —
-        // TranscriptionController::readChapters() only ever reads the .md's
-        // existing body, never audio, same reasoning as generateChaptersButton
-        // above.
-        const chaptersUrl = mainPanel.orphanedMdPath !== "" ? ("file://" + mainPanel.orphanedMdPath)
-            : (player ? player.source.toString() : "")
-        mainPanel.chapters = (chaptersUrl !== "" && transcriptionController)
-            ? transcriptionController.readChapters(chaptersUrl) : []
+        // Prelude and chapters both live in the .md BODY (not frontmatter) and
+        // read the same for an orphaned .md or an audio file's sibling .md —
+        // readPrelude()/readChapters() only ever touch the .md, never audio —
+        // so both go through the one currentMdUrl.
+        mainPanel.prelude = (mainPanel.currentMdUrl !== "" && transcriptionController)
+            ? transcriptionController.readPrelude(mainPanel.currentMdUrl) : ""
+        mainPanel.chapters = (mainPanel.currentMdUrl !== "" && transcriptionController)
+            ? transcriptionController.readChapters(mainPanel.currentMdUrl) : []
         // preludeArea is always-editable (see its doc comment) — same
         // one-shot-binding caveat as titleField, resynced here.
         if (!preludeArea.activeFocus)
@@ -365,16 +416,6 @@ Rectangle {
         mainPanel.persistCollapsedChapters()
     }
 
-    // The .md url backing the currently-shown chapters (player file or the
-    // orphaned .md), or "" if none — chapters/collapse are readable/persistable
-    // for both.
-    function chaptersFileUrl() {
-        if (mainPanel.orphanedMdPath !== "")
-            return "file://" + mainPanel.orphanedMdPath
-        return (mainPanel.player && mainPanel.player.source.toString() !== "")
-            ? mainPanel.player.source.toString() : ""
-    }
-
     // Item: persist which chapters are collapsed into the .md frontmatter, so
     // it survives reopening the file. Writes the collapse map's live keys via
     // setCollapsedChapters (which does NOT emit finished(), so this can't
@@ -382,7 +423,7 @@ Rectangle {
     function persistCollapsedChapters() {
         if (!mainPanel.transcriptionController)
             return
-        const url = mainPanel.chaptersFileUrl()
+        const url = mainPanel.currentMdUrl
         if (url === "")
             return
         const keys = []
@@ -399,7 +440,7 @@ Rectangle {
     // (comma-joined String(t0) keys) from whichever metadata map backs the
     // current view.
     function initCollapsedFromFrontmatter() {
-        const meta = mainPanel.orphanedMdPath !== "" ? mainPanel.orphanedMdMetadata : mainPanel.storedMetadata
+        const meta = mainPanel.metadata
         const raw = (meta && meta.collapsedChapters) ? meta.collapsedChapters : ""
         const map = ({})
         if (raw && typeof raw === "string") {
@@ -453,13 +494,6 @@ Rectangle {
         return true
     }
 
-    function refreshOrphanedMetadata() {
-        orphanedMdMetadata = (mainPanel.orphanedMdPath !== "" && mainPanel.transcriptionController)
-            ? mainPanel.transcriptionController.readMetadata("file://" + mainPanel.orphanedMdPath) : ({})
-        if (!titleField.activeFocus)
-            titleField.text = mainPanel.displayTitle()
-    }
-
     function showAudioFile(path) {
         mainPanel.orphanedMdPath = ""
         mainPanel.player.source = "file://" + path
@@ -468,14 +502,18 @@ Rectangle {
     function showOrphanedMd(path) {
         mainPanel.player.source = ""
         mainPanel.orphanedMdPath = path
-        mainPanel.refreshOrphanedMetadata()
+        // Setting orphanedMdPath fires onOrphanedMdPathChanged (which runs the
+        // shared reset), but that does NOT read frontmatter — refresh the
+        // unified metadata here so the title/tags/editability populate at once,
+        // exactly as the player's onSourceChanged does for an audio file.
+        mainPanel.refreshMetadata()
     }
 
     // Item 13: tags are comma-separated (see TranscriptionController's
     // frontmatter format — not a YAML list), so split+trim+drop-empties here.
     function currentTags() {
-        const metadata = mainPanel.orphanedMdPath !== "" ? mainPanel.orphanedMdMetadata : mainPanel.storedMetadata
-        const raw = metadata && metadata.tags ? String(metadata.tags) : ""
+        const meta = mainPanel.metadata
+        const raw = meta && meta.tags ? String(meta.tags) : ""
         if (raw === "")
             return []
         return raw.split(",").map(t => t.trim()).filter(t => t.length > 0)
@@ -523,9 +561,9 @@ Rectangle {
 
     // Bumped whenever background state changes in a way that the `sentences`
     // binding wouldn't otherwise notice (see its own doc comment for why
-    // storedMetadata/orphanedMdMetadata reference churn alone doesn't
-    // reliably re-trigger it) — a successful speaker rename is exactly that
-    // case, since it rewrites the transcript body sentences reads from.
+    // metadata reference churn alone doesn't reliably re-trigger it) — a
+    // successful speaker rename is exactly that case, since it rewrites the
+    // transcript body sentences reads from.
     property int sentencesRevision: 0
 
     // A rejected speaker rename OR a failed merge (see commitSpeakerRename()/
@@ -535,15 +573,12 @@ Rectangle {
     // transient reports about an action that just failed, not descriptions of
     // a control's current state, so they belong in the one floating queue.
 
-    // The file a speaker rename/merge should be applied to — the orphaned-md
-    // view and the normal audio-player view are mutually exclusive (see
-    // showAudioFile()/showOrphanedMd()), so exactly one of these is ever
-    // live at a time. Player-less/no-file case included so callers can
-    // safely .toString()-compare against a signal's fileUrl without a null
-    // check of their own.
+    // The file a speaker rename/merge (and tag edit) should be applied to.
+    // Just currentMdUrl — kept as a function so the many .toString()-compare
+    // call sites (against a signal's fileUrl) read unchanged; "" when no file
+    // is open so those compares are null-safe.
     function currentFileUrl() {
-        return mainPanel.orphanedMdPath !== "" ? ("file://" + mainPanel.orphanedMdPath)
-                                                : (mainPanel.player ? mainPanel.player.source : "")
+        return mainPanel.currentMdUrl
     }
 
     // Item 2 (delete): the open file's two destructive actions. Both TRY THE
@@ -721,7 +756,7 @@ Rectangle {
                 mainPanel.player.source = newUrl // fires onSourceChanged -> refreshMetadata
             if (isOrphaned) {
                 mainPanel.orphanedMdPath = newUrl.toString().replace("file://", "")
-                mainPanel.refreshOrphanedMetadata()
+                mainPanel.refreshMetadata()
             }
         }
         // File move is an instant-lane task like rename (see Sidebar's
@@ -738,7 +773,7 @@ Rectangle {
                 mainPanel.player.source = newUrl // fires onSourceChanged -> refreshMetadata
             if (mainPanel.orphanedMdPath !== "" && ("file://" + mainPanel.orphanedMdPath) === oldStr) {
                 mainPanel.orphanedMdPath = newUrl.toString().replace("file://", "")
-                mainPanel.refreshOrphanedMetadata()
+                mainPanel.refreshMetadata()
             }
         }
         function onSpeakerRenamed(fileUrl, oldName, ok, error) {
@@ -935,12 +970,8 @@ Rectangle {
     // by orphaned-vs-player the same way they are. Undo/redo is per-file, so
     // "current file" is always the one the entry's fileUrl refers to.
     function refreshCurrentFileMetadata() {
-        if (mainPanel.orphanedMdPath !== "") {
-            mainPanel.refreshOrphanedMetadata()
-        } else {
-            mainPanel.refreshMetadata()
-            mainPanel.refreshPreludeAndChapters()
-        }
+        mainPanel.refreshMetadata()
+        mainPanel.refreshPreludeAndChapters()
     }
 
     function applyHistoryEntry(entry, direction) {
@@ -1042,18 +1073,14 @@ Rectangle {
     }
 
     function displayTitle() {
-        if (mainPanel.orphanedMdPath !== "") {
-            const label = mainPanel.orphanedMdMetadata.label
-            if (AppSettings.useLabelsMainPanel && label)
-                return label
-            const base = mainPanel.orphanedMdPath.substring(mainPanel.orphanedMdPath.lastIndexOf("/") + 1)
-            return AppSettings.hideExtensionsMainPanel ? mainPanel.stripExtension(base) : base
-        }
-        if (!mainPanel.player || mainPanel.player.source.toString() === "")
+        // resolvedMdUrl() not currentMdUrl — refreshMetadata() calls this from
+        // the file-open change handler, where the property is stale.
+        const url = mainPanel.resolvedMdUrl()
+        if (url === "")
             return qsTr("No file selected")
-        if (AppSettings.useLabelsMainPanel && mainPanel.storedMetadata.label)
-            return mainPanel.storedMetadata.label
-        const rel = mainPanel.relativeToVault(mainPanel.player.source)
+        if (AppSettings.useLabelsMainPanel && mainPanel.metadata.label)
+            return mainPanel.metadata.label
+        const rel = mainPanel.relativeToVault(url)
         return AppSettings.hideExtensionsMainPanel ? mainPanel.stripExtension(rel) : rel
     }
 
@@ -1069,34 +1096,21 @@ Rectangle {
             return
         }
 
-        if (mainPanel.orphanedMdPath !== "") {
-            if (AppSettings.useLabelsMainPanel) {
-                const oldLabel = mainPanel.orphanedMdMetadata.label || ""
-                if (trimmed !== oldLabel)
-                    mainPanel.pushUndo({type: "label", fileUrl: "file://" + mainPanel.orphanedMdPath, oldValue: oldLabel, newValue: trimmed})
-                mainPanel.transcriptionController.setLabel("file://" + mainPanel.orphanedMdPath, trimmed)
-                mainPanel.refreshOrphanedMetadata()
-            } else if (mainPanel.transcriptionController) {
-                // Instant-lane rename task — onFileRenamed updates
-                // orphanedMdPath + refreshes on success.
-                mainPanel.transcriptionController.renameFile("file://" + mainPanel.orphanedMdPath, trimmed)
-            }
+        const url = mainPanel.currentMdUrl
+        if (url === "")
             return
-        }
 
-        if (mainPanel.player && mainPanel.player.source.toString() !== "") {
-            if (AppSettings.useLabelsMainPanel) {
-                const oldLabel = mainPanel.storedMetadata.label || ""
-                if (trimmed !== oldLabel)
-                    mainPanel.pushUndo({type: "label", fileUrl: mainPanel.player.source, oldValue: oldLabel, newValue: trimmed})
-                mainPanel.transcriptionController.setLabel(mainPanel.player.source, trimmed)
-                mainPanel.refreshMetadata()
-                mainPanel.refreshPreludeAndChapters()
-            } else if (mainPanel.transcriptionController) {
-                // Instant-lane rename task — onFileRenamed repoints the player
-                // on success.
-                mainPanel.transcriptionController.renameFile(mainPanel.player.source, trimmed)
-            }
+        if (AppSettings.useLabelsMainPanel) {
+            const oldLabel = mainPanel.metadata.label || ""
+            if (trimmed !== oldLabel)
+                mainPanel.pushUndo({type: "label", fileUrl: url, oldValue: oldLabel, newValue: trimmed})
+            mainPanel.transcriptionController.setLabel(url, trimmed)
+            mainPanel.refreshCurrentFileMetadata()
+        } else {
+            // Instant-lane rename task — onFileRenamed repoints the player (for
+            // an audio file) or orphanedMdPath (for an orphaned .md) and
+            // refreshes on success.
+            mainPanel.transcriptionController.renameFile(url, trimmed)
         }
     }
 
@@ -1104,54 +1118,58 @@ Rectangle {
     // what renameFile() takes as its new-name argument and what the editable
     // filename subtitle shows/edits.
     function currentFileStem() {
-        if (!mainPanel.player || mainPanel.player.source.toString() === "")
+        // resolvedMdUrl() not currentMdUrl — refreshMetadata() resyncs the
+        // filename subtitle from this at file-open time, where the property is
+        // stale (see resolvedMdUrl()'s doc comment).
+        const url = mainPanel.resolvedMdUrl()
+        if (url === "")
             return ""
-        const rel = mainPanel.relativeToVault(mainPanel.player.source)
+        const rel = mainPanel.relativeToVault(url)
         const base = rel.substring(rel.lastIndexOf("/") + 1)
         return mainPanel.stripExtension(base)
     }
 
     // Item: the filename subtitle (shown when the title is an AI label) is an
     // editable rename control for the REAL file. renameFile() renames the
-    // audio file AND its sibling .md together (so this "also edits the md
-    // file"), then we repoint player.source, which fires onSourceChanged →
-    // refreshMetadata → resyncs both the title and this subtitle. The subtitle
-    // is disabled while busy (see its `enabled`), so a rename can't race a
-    // running job; on any no-op/failure we revert the field to the real stem.
-    // No undo entry — file renames aren't on the undo stack (matches
-    // commitRename's file-rename branch).
+    // audio file AND its sibling .md together (or a standalone orphaned .md),
+    // then onFileRenamed repoints player.source / orphanedMdPath, which
+    // refreshes both the title and this subtitle. The subtitle is disabled
+    // while busy (see its `enabled`), so a rename can't race a running job; on
+    // any no-op/failure we revert the field to the real stem. No undo entry —
+    // file renames aren't on the undo stack (matches commitRename's file-rename
+    // branch).
     function commitFilenameRename(newValue) {
         const trimmed = newValue.trim()
         const oldStem = mainPanel.currentFileStem()
         if (!mainPanel.transcriptionController || !mainPanel.vaultTreeModel
-                || !mainPanel.player || mainPanel.player.source.toString() === ""
+                || mainPanel.currentMdUrl === ""
                 || trimmed === "" || trimmed === oldStem) {
             filenameSubtitle.text = oldStem
             return
         }
         // Instant-lane rename task (see onFileRenamed above): the field is
-        // already optimistic (shows `trimmed`); the player repoints on success
-        // and the field reverts on failure, both in onFileRenamed.
-        mainPanel.transcriptionController.renameFile(mainPanel.player.source, trimmed)
+        // already optimistic (shows `trimmed`); the player/orphanedMdPath
+        // repoints on success and the field reverts on failure, both in
+        // onFileRenamed.
+        mainPanel.transcriptionController.renameFile(mainPanel.currentMdUrl, trimmed)
     }
 
     // Autosaves the prelude editor below on blur (see preludeArea's
     // onActiveFocusChanged) — no explicit Save/Cancel; plain Enter just
     // inserts a newline since the prelude is multi-line, same as
-    // transcriptArea's own blur-commit below. Orphaned-md files never show
-    // the prelude editor (see its visible: condition below), so unlike
-    // commitRename() this only needs the player.source path. setLabel()'s
-    // failures are already silently ignored by commitRename() above;
-    // matched here for consistency.
+    // transcriptArea's own blur-commit below. Writes through currentMdUrl, so
+    // it works for an orphaned .md exactly as for an audio file. setLabel()'s
+    // failures are already silently ignored by commitRename() above; matched
+    // here for consistency.
     function commitPrelude(newValue) {
-        if (!mainPanel.transcriptionController || !mainPanel.player || mainPanel.player.source.toString() === "") {
+        if (!mainPanel.transcriptionController || mainPanel.currentMdUrl === "") {
             preludeArea.text = mainPanel.prelude
             return
         }
         if (newValue === mainPanel.prelude)
             return
-        mainPanel.pushUndo({type: "prelude", fileUrl: mainPanel.player.source, oldValue: mainPanel.prelude, newValue: newValue})
-        mainPanel.transcriptionController.setPrelude(mainPanel.player.source, newValue)
+        mainPanel.pushUndo({type: "prelude", fileUrl: mainPanel.currentMdUrl, oldValue: mainPanel.prelude, newValue: newValue})
+        mainPanel.transcriptionController.setPrelude(mainPanel.currentMdUrl, newValue)
         mainPanel.refreshMetadata()
         mainPanel.refreshPreludeAndChapters()
     }
@@ -1164,7 +1182,7 @@ Rectangle {
     // invariant displaySentences' char offsets depend on — the line-count
     // check below is a defensive fallback, not the primary guard.
     function commitTranscriptEdits(newText) {
-        if (!mainPanel.transcriptionController || !mainPanel.player || mainPanel.player.source.toString() === "")
+        if (!mainPanel.transcriptionController || mainPanel.currentMdUrl === "")
             return
         const lines = newText.split("\n")
         const entries = mainPanel.displaySentences
@@ -1198,8 +1216,8 @@ Rectangle {
         if (edits.length === 0)
             return // no-op: nothing actually changed
 
-        mainPanel.pushUndo({type: "transcriptText", fileUrl: mainPanel.player.source, oldValue: oldValues, newValue: edits})
-        const ok = mainPanel.transcriptionController.setSentenceTexts(mainPanel.player.source, edits)
+        mainPanel.pushUndo({type: "transcriptText", fileUrl: mainPanel.currentMdUrl, oldValue: oldValues, newValue: edits})
+        const ok = mainPanel.transcriptionController.setSentenceTexts(mainPanel.currentMdUrl, edits)
         if (ok) {
             mainPanel.sentencesRevision += 1
         } else {
@@ -1283,9 +1301,9 @@ Rectangle {
     //      switched files again before the background pass finished.
     //   3. refreshTranscriptSync() — called on liveUpdateTick (gated on
     //      currentFile matching, same condition the original binding used),
-    //      on sentencesRevision bumps, and on hasStoredMetadata flipping
+    //      on sentencesRevision bumps, and on hasMetadata flipping
     //      true (frontmatter now exists — matches the moment the original
-    //      binding's dependency on hasStoredMetadata would have started
+    //      binding's dependency on hasMetadata would have started
     //      returning real content instead of ""/[]). All three are either
     //      small edits to an already-open file or an early/small live
     //      transcript — cheap synchronous calls, exactly as before.
@@ -1295,6 +1313,19 @@ Rectangle {
     // waiting on — "" when nothing is in flight (untranscribed file, no
     // transcriptionController, etc.).
     property string transcriptLoadingFor: ""
+
+    // The .md URL to load the transcript body/sentences from, or "" when
+    // there's nothing to load yet. An orphaned .md IS the open file, so it
+    // always loads; an audio file loads only once its sibling .md exists
+    // (hasMetadata) — before it's transcribed there is no transcript to read
+    // and loadTranscriptAsync(audioUrl) would find no .md.
+    function transcriptLoadKey() {
+        if (mainPanel.orphanedMdPath !== "")
+            return "file://" + mainPanel.orphanedMdPath
+        if (mainPanel.hasAudio && mainPanel.hasMetadata)
+            return mainPanel.player.source.toString()
+        return ""
+    }
 
     function beginTranscriptLoad() {
         mainPanel.transcriptBody = ""
@@ -1314,18 +1345,14 @@ Rectangle {
             preludeArea.text = ""
         if (!mainPanel.transcriptionController)
             return
-        if (mainPanel.orphanedMdPath !== "") {
-            const key = "file://" + mainPanel.orphanedMdPath
-            mainPanel.transcriptLoadingFor = key
-            mainPanel.transcriptionController.loadTranscriptAsync(key)
-        } else if (mainPanel.player && mainPanel.player.source.toString() !== "" && mainPanel.hasStoredMetadata) {
-            const key = mainPanel.player.source.toString()
+        const key = mainPanel.transcriptLoadKey()
+        if (key !== "") {
             mainPanel.transcriptLoadingFor = key
             mainPanel.transcriptionController.loadTranscriptAsync(key)
         }
-        // else: no file, or an untranscribed file with nothing to load yet
-        // — stays cleared until hasStoredMetadata flips true (see
-        // onHasStoredMetadataChanged below).
+        // else: no file, or an untranscribed audio file with nothing to load
+        // yet — stays cleared until hasMetadata flips true (see
+        // onHasMetadataChanged below).
     }
 
     function refreshTranscriptSync() {
@@ -1334,11 +1361,7 @@ Rectangle {
             mainPanel.sentences = []
             return
         }
-        let key = ""
-        if (mainPanel.orphanedMdPath !== "")
-            key = "file://" + mainPanel.orphanedMdPath
-        else if (mainPanel.player && mainPanel.player.source.toString() !== "" && mainPanel.hasStoredMetadata)
-            key = mainPanel.player.source.toString()
+        const key = mainPanel.transcriptLoadKey()
         if (key === "") {
             mainPanel.transcriptBody = ""
             mainPanel.sentences = []
@@ -1349,7 +1372,7 @@ Rectangle {
     }
 
     onSentencesRevisionChanged: mainPanel.refreshTranscriptSync()
-    onHasStoredMetadataChanged: mainPanel.refreshTranscriptSync()
+    onHasMetadataChanged: mainPanel.refreshTranscriptSync()
 
     Connections {
         target: mainPanel.transcriptionController
@@ -1379,15 +1402,15 @@ Rectangle {
                     && mainPanel.transcriptionController.currentFile.toString() === mainPanel.player.source.toString()) {
                 // Item 32: a live tick means the first segment has been
                 // written, which strictly postdates the frontmatter written
-                // at job START — so hasStoredMetadata is guaranteed readable
+                // at job START — so hasMetadata is guaranteed readable
                 // by now. onProgressChanged (the other metadata-refresh site)
                 // can fire during model-load, BEFORE the frontmatter flush,
                 // so on a file's very FIRST transcription its regenerate
-                // label/prelude/chapters buttons (gated on hasStoredMetadata)
+                // label/prelude/chapters buttons (gated on hasMetadata)
                 // could stay hidden until the next progress tick or a full
                 // reopen. Refreshing metadata here — on the definitely-
                 // post-frontmatter content edge — closes that hole and also
-                // guarantees refreshTranscriptSync() below sees hasStoredMetadata
+                // guarantees refreshTranscriptSync() below sees hasMetadata
                 // true (it gates the body read on it), so live output shows.
                 mainPanel.refreshMetadata()
                 // Item 55: the new transcript has started being written — drop
@@ -1976,60 +1999,60 @@ Rectangle {
         mainPanel.applyTranscriptReplacement(result)
     }
 
-    Connections {
-        target: mainPanel.player
-        // Item P8: restart the repaint nudge on EVERY file open, not just
-        // the empty->populated transition (see transcriptRepaintNudgeTimer's
-        // own doc comment below) — switching directly between two
-        // already-transcribed files never passes through an empty state, so
-        // onTranscriptBodyChanged's own trigger alone would miss it.
-        // Item P16: also reset per-file undo history so Ctrl+Z can never
-        // reach across a file switch into a different note's edits.
-        function onSourceChanged() {
-            mainPanel.refreshMetadata()
-            // Item P23: NOT refreshPreludeAndChapters() here — this is the
-            // cold-open case, see beginTranscriptLoad()'s doc comment.
-            mainPanel.beginTranscriptLoad()
-            transcriptRepaintNudgeTimer.restart()
-            mainPanel.undoStack = []
-            mainPanel.redoStack = []
-            mainPanel.gutterSpeakerFilter = ""
-            // A pending "undo could reopen this" only holds while the panel
-            // stays where the delete left it — see closedByDeleteUrl.
-            mainPanel.closedByDeleteUrl = ""
-            // Item 33/34: collapse + which-chapter-is-editing are per-file
-            // view state keyed by this file's chapter timestamps — reset on a
-            // file switch so they never leak into a different note's chapters.
-            mainPanel.collapsedChapters = ({})
-            mainPanel.editingChapterTs = -1
-            // A fresh file opens at the top, not following — re-armed only when
-            // THIS file's own transcription starts (see onTranscribingThisFileChanged).
-            mainPanel.followingTail = false
-        }
-    }
-    // Item P8/P16: showOrphanedMd() switches files by setting orphanedMdPath
-    // directly (player.source is cleared to "" first, which fires
-    // onSourceChanged above for the "no file" state, not the orphaned file
-    // itself) — this is the other half of "a different file was just
-    // opened", covering the orphaned-md view.
-    onOrphanedMdPathChanged: {
+    // The shared "a different file was just opened" reset, run by BOTH file
+    // identities' change handlers (player.source for audio, orphanedMdPath for
+    // an orphaned .md) so the two modes reset identically.
+    //
+    // Item P8: restart the repaint nudge on EVERY file open, not just the
+    // empty->populated transition (see transcriptRepaintNudgeTimer's own doc
+    // comment below) — switching directly between two already-transcribed files
+    // never passes through an empty state, so onTranscriptBodyChanged's own
+    // trigger alone would miss it. Item P16: reset per-file undo history so
+    // Ctrl+Z can never reach across a file switch into a different note's edits.
+    // Item P23: refreshMetadata() is done by each caller BEFORE this (cheap
+    // frontmatter read) but refreshPreludeAndChapters() is NOT — this is the
+    // cold-open case, see beginTranscriptLoad()'s doc comment.
+    function resetForFileOpen() {
         mainPanel.beginTranscriptLoad()
         transcriptRepaintNudgeTimer.restart()
         mainPanel.undoStack = []
         mainPanel.redoStack = []
         mainPanel.gutterSpeakerFilter = ""
+        // A pending "undo could reopen this" only holds while the panel
+        // stays where the delete left it — see closedByDeleteUrl.
+        mainPanel.closedByDeleteUrl = ""
+        // Item 33/34: collapse + which-chapter-is-editing are per-file
+        // view state keyed by this file's chapter timestamps — reset on a
+        // file switch so they never leak into a different note's chapters.
         mainPanel.collapsedChapters = ({})
         mainPanel.editingChapterTs = -1
-        mainPanel.closedByDeleteUrl = "" // see onSourceChanged's identical line
-        mainPanel.followingTail = false // see onSourceChanged's identical line
+        // A fresh file opens at the top, not following — re-armed only when
+        // THIS file's own transcription starts (see onTranscribingThisFileChanged).
+        mainPanel.followingTail = false
+    }
+
+    Connections {
+        target: mainPanel.player
+        function onSourceChanged() {
+            mainPanel.refreshMetadata()
+            mainPanel.resetForFileOpen()
+        }
+    }
+    // showOrphanedMd() switches files by setting orphanedMdPath directly
+    // (player.source is cleared to "" first, which fires onSourceChanged above
+    // for the "no file" state, not the orphaned file itself) — this is the
+    // other half of "a different file was just opened", covering the orphaned
+    // .md view, and is symmetric with onSourceChanged.
+    onOrphanedMdPathChanged: {
+        mainPanel.refreshMetadata()
+        mainPanel.resetForFileOpen()
     }
     Connections {
         target: mainPanel.transcriptionController
         function onFinished(fileUrl, ok, error) {
             mainPanel.refreshMetadata()
             mainPanel.refreshPreludeAndChapters()
-            mainPanel.refreshOrphanedMetadata()
-            // None of the three refreshes above touch the transcript BODY
+            // Neither of the two refreshes above touches the transcript BODY
             // (transcriptBody/sentences) — during a live job that's driven only
             // by the throttled liveUpdateTick (onLiveUpdateTickChanged below).
             // An engine that streams segments one at a time (whisper.cpp) keeps
@@ -2049,7 +2072,7 @@ Rectangle {
         }
         // Item 10: frontmatter is written at job START (durability, see
         // TranscriptionController), before any segment lines exist — so
-        // hasStoredMetadata can flip true well before onFinished fires.
+        // hasMetadata can flip true well before onFinished fires.
         // Re-checking on every progress tick (for the file currently open)
         // is what lets transcriptBody's binding start reading a live,
         // in-progress file instead of waiting for completion.
@@ -2230,8 +2253,7 @@ Rectangle {
 
     Shortcut {
         sequence: "Ctrl+F"
-        enabled: mainPanel.activeFocus && (mainPanel.orphanedMdPath !== ""
-                     || (mainPanel.player && mainPanel.player.source.toString() !== ""))
+        enabled: mainPanel.activeFocus && mainPanel.currentMdUrl !== ""
         onActivated: {
             mainPanel.searchExpanded = true
             searchField.forceActiveFocus()
@@ -2263,8 +2285,7 @@ Rectangle {
     // shouldn't shut the bar you just opened.
     Shortcut {
         sequence: "Ctrl+H"
-        enabled: mainPanel.activeFocus && (mainPanel.orphanedMdPath !== ""
-                     || (mainPanel.player && mainPanel.player.source.toString() !== ""))
+        enabled: mainPanel.activeFocus && mainPanel.currentMdUrl !== ""
         onActivated: {
             mainPanel.searchExpanded = true
             mainPanel.replaceEnabled = true
@@ -2341,13 +2362,13 @@ Rectangle {
         RowLayout {
             Layout.fillWidth: true
             spacing: 12
-            visible: mainPanel.orphanedMdPath === ""
+            visible: mainPanel.hasAudio
 
             Item {
                 id: playPauseButton
                 Layout.preferredWidth: 28
                 Layout.preferredHeight: 28
-                enabled: mainPanel.player && mainPanel.player.source.toString() !== ""
+                enabled: mainPanel.hasPlayableSource
 
                 HoverHandler {
                     id: playPauseHover
@@ -2402,6 +2423,16 @@ Rectangle {
                 id: seekSlider
                 Layout.fillWidth: true
                 hoverEnabled: true
+                // No file open (or the text-only orphaned-md view) means
+                // nothing to scrub — mirror the play/pause button so the track
+                // can't be dragged with no audio loaded. Shares the same
+                // hasPlayableSource binding, so a deletion that closes the file
+                // greys this out the same instant it greys the play button.
+                enabled: mainPanel.hasPlayableSource
+                // The custom handle: below doesn't dim itself on disable, so
+                // fade the whole track to read as inert (same affordance as the
+                // play button greying its icon).
+                opacity: enabled ? 1 : 0.4
                 from: 0
                 to: mainPanel.player ? Math.max(mainPanel.player.duration, 1) : 1
                 value: mainPanel.player ? mainPanel.player.position : 0
@@ -2485,7 +2516,7 @@ Rectangle {
         RowLayout {
             Layout.fillWidth: true
             spacing: 8
-            visible: mainPanel.orphanedMdPath !== "" || (mainPanel.player && mainPanel.player.source.toString() !== "")
+            visible: mainPanel.currentMdUrl !== ""
 
             Item {
                 id: titleContainer
@@ -2550,8 +2581,8 @@ Rectangle {
                     // actual on-disk file is no longer visible anywhere —
                     // this small secondary line restores that, reusing
                     // displayTitle()'s own relativeToVault() helper rather
-                    // than re-deriving the path. Only for the player-backed
-                    // view (orphaned .md has no player.source to relativize)
+                    // than re-deriving the path (currentFileStem() works for an
+                    // orphaned .md and an audio file alike, via currentMdUrl),
                     // and only once this file actually HAS a label (an
                     // untranscribed file with labels-mode on still just
                     // shows its filename as the title itself, so a
@@ -2569,8 +2600,7 @@ Rectangle {
                     TextField {
                         id: filenameSubtitle
                         Layout.fillWidth: true
-                        visible: AppSettings.useLabelsMainPanel
-                                 && mainPanel.orphanedMdPath === "" && !!mainPanel.storedMetadata.label
+                        visible: AppSettings.useLabelsMainPanel && !!mainPanel.metadata.label
                         enabled: !(mainPanel.transcriptionController && mainPanel.transcriptionController.busy)
                         color: "#777777"
                         font.pixelSize: 10
@@ -2604,8 +2634,7 @@ Rectangle {
                 id: transcribeIconButton
                 Layout.preferredWidth: 22
                 Layout.preferredHeight: 22
-                visible: mainPanel.orphanedMdPath === "" && mainPanel.player
-                         && mainPanel.player.source.toString() !== ""
+                visible: mainPanel.hasAudio
 
                 readonly property bool isActive: mainPanel.transcriptionController && mainPanel.player
                     && mainPanel.transcriptionController.busy
@@ -2622,7 +2651,7 @@ Rectangle {
                               : transcribeIconButton.isQueued ? qsTr("Queued…")
                               : (mainPanel.transcriptionController && mainPanel.transcriptionController.busy
                                  ? qsTr("Add to queue")
-                                 : (mainPanel.hasStoredMetadata ? qsTr("Re-transcribe") : qsTr("Transcribe")))
+                                 : (mainPanel.hasMetadata ? qsTr("Re-transcribe") : qsTr("Transcribe")))
                 ToolTip.delay: 500
 
                 HoverHandler {
@@ -2662,9 +2691,7 @@ Rectangle {
                 id: runAllIconButton
                 Layout.preferredWidth: 22
                 Layout.preferredHeight: 22
-                visible: mainPanel.transcriptionController && mainPanel.player
-                         && mainPanel.player.source.toString() !== ""
-                         && mainPanel.orphanedMdPath === "" && !mainPanel.hasStoredMetadata
+                visible: mainPanel.transcriptionController && mainPanel.hasAudio && !mainPanel.hasMetadata
                 readonly property bool isQueued: mainPanel.transcriptionController && mainPanel.player
                     && mainPanel.transcriptionController.queuedFileUrls.some(
                            u => u.toString() === mainPanel.player.source.toString())
@@ -2716,10 +2743,8 @@ Rectangle {
                 id: regenerateLabelButton
                 Layout.preferredWidth: 22
                 Layout.preferredHeight: 22
-                visible: mainPanel.transcriptionController
-                         && (mainPanel.orphanedMdPath !== "" || mainPanel.hasStoredMetadata)
-                readonly property url targetUrl: mainPanel.orphanedMdPath !== ""
-                    ? ("file://" + mainPanel.orphanedMdPath) : mainPanel.player.source
+                visible: mainPanel.transcriptionController && mainPanel.hasTranscript
+                readonly property url targetUrl: mainPanel.currentMdUrl
                 enabled: visible && mainPanel.busyOrQueuedUrls.indexOf(regenerateLabelButton.targetUrl.toString()) === -1
 
                 ToolTip.visible: regenerateLabelHover.hovered
@@ -2765,10 +2790,8 @@ Rectangle {
                 id: generateChaptersButton
                 Layout.preferredWidth: 22
                 Layout.preferredHeight: 22
-                visible: mainPanel.transcriptionController
-                         && (mainPanel.orphanedMdPath !== "" || mainPanel.hasStoredMetadata)
-                readonly property url targetUrl: mainPanel.orphanedMdPath !== ""
-                    ? ("file://" + mainPanel.orphanedMdPath) : mainPanel.player.source
+                visible: mainPanel.transcriptionController && mainPanel.hasTranscript
+                readonly property url targetUrl: mainPanel.currentMdUrl
                 enabled: visible && mainPanel.busyOrQueuedUrls.indexOf(generateChaptersButton.targetUrl.toString()) === -1
 
                 ToolTip.visible: generateChaptersHover.hovered
@@ -2814,8 +2837,7 @@ Rectangle {
                 id: detectSpeakersButton
                 Layout.preferredWidth: 22
                 Layout.preferredHeight: 22
-                visible: mainPanel.transcriptionController
-                         && mainPanel.orphanedMdPath === "" && mainPanel.hasStoredMetadata
+                visible: mainPanel.transcriptionController && mainPanel.hasAudio && mainPanel.hasMetadata
                 readonly property url targetUrl: mainPanel.player.source
                 enabled: visible && mainPanel.busyOrQueuedUrls.indexOf(detectSpeakersButton.targetUrl.toString()) === -1
 
@@ -2859,8 +2881,8 @@ Rectangle {
                 id: deleteTranscriptButton
                 Layout.preferredWidth: 22
                 Layout.preferredHeight: 22
-                visible: mainPanel.transcriptionController && mainPanel.vaultTreeModel && mainPanel.player
-                         && mainPanel.orphanedMdPath === "" && mainPanel.hasStoredMetadata
+                visible: mainPanel.transcriptionController && mainPanel.vaultTreeModel
+                         && mainPanel.hasAudio && mainPanel.hasMetadata
                 readonly property url targetUrl: mainPanel.player.source
                 enabled: visible && mainPanel.busyOrQueuedUrls.indexOf(deleteTranscriptButton.targetUrl.toString()) === -1
 
@@ -2891,7 +2913,7 @@ Rectangle {
 
             // "Delete audio only" — the complement of "Delete transcript", and
             // gated identically: a transcribed AUDIO file (orphanedMdPath == ""
-            // + hasStoredMetadata), never an orphaned .md (no audio to drop)
+            // + hasMetadata), never an orphaned .md (no audio to drop)
             // and never an untranscribed one (nothing to keep, so it would just
             // duplicate "Delete file"). Same isQueued gate — dropping the audio
             // out from under a running job would fight the worker.
@@ -2900,8 +2922,8 @@ Rectangle {
                 objectName: "deleteAudioOnlyButton"
                 Layout.preferredWidth: 22
                 Layout.preferredHeight: 22
-                visible: mainPanel.transcriptionController && mainPanel.vaultTreeModel && mainPanel.player
-                         && mainPanel.orphanedMdPath === "" && mainPanel.hasStoredMetadata
+                visible: mainPanel.transcriptionController && mainPanel.vaultTreeModel
+                         && mainPanel.hasAudio && mainPanel.hasMetadata
                 readonly property url targetUrl: mainPanel.player.source
                 enabled: visible && mainPanel.busyOrQueuedUrls.indexOf(deleteAudioOnlyButton.targetUrl.toString()) === -1
 
@@ -2936,11 +2958,10 @@ Rectangle {
             // orphaned .md). Same isQueued gate as above.
             Item {
                 id: deleteFileButton
+                objectName: "deleteFileButton"
                 Layout.preferredWidth: 22
                 Layout.preferredHeight: 22
-                visible: mainPanel.vaultTreeModel
-                         && (mainPanel.orphanedMdPath !== ""
-                             || (mainPanel.player && mainPanel.player.source.toString() !== ""))
+                visible: mainPanel.vaultTreeModel && mainPanel.currentMdUrl !== ""
                 readonly property url targetUrl: mainPanel.currentFileUrl()
                 enabled: visible && mainPanel.busyOrQueuedUrls.indexOf(deleteFileButton.targetUrl.toString()) === -1
 
@@ -2962,6 +2983,7 @@ Rectangle {
                     active: deleteFileButton.enabled && deleteFileHover.hovered
                 }
                 AppIcon {
+                    objectName: "deleteFileIcon"
                     anchors.centerIn: parent
                     name: "delete-file"
                     iconSize: 14
@@ -2971,7 +2993,7 @@ Rectangle {
 
             // Item 18: search icon → expands to a text field, Ctrl+F while
             // the main panel has focus. Searches title/tags (via
-            // storedMetadata, already loaded) + the transcript body
+            // metadata, already loaded) + the transcript body
             // (jumpToNextMatch() selects/scrolls the next match below).
             // Item 7: this field is ALSO the find pattern for replace — the
             // .*/Aa toggles and the Replace checkbox sit right after it, and
@@ -3357,11 +3379,10 @@ Rectangle {
                     spacing: 6
                     // Item P15/P20: the add-tag affordance needs to be
                     // reachable even before this file has any tags at all —
-                    // visible whenever there's an actual note to attach tags
-                    // to (mirrors preludeContainer/chapterListColumn's own
+                    // visible whenever there's an actual transcript to attach
+                    // tags to (mirrors preludeContainer/chapterListColumn's own
                     // gating), not just once currentTags() is non-empty.
-                    visible: mainPanel.currentTags().length > 0 || mainPanel.orphanedMdPath !== ""
-                             || mainPanel.hasStoredMetadata
+                    visible: mainPanel.hasTranscript
 
                     Repeater {
                         model: mainPanel.currentTags()
@@ -3762,14 +3783,14 @@ Rectangle {
 
                 Label {
                     Layout.fillWidth: true
-                    visible: mainPanel.orphanedMdPath === "" && (!mainPanel.player || mainPanel.player.source.toString() === "")
+                    visible: mainPanel.currentMdUrl === ""
                     text: qsTr("No file selected")
                     color: "white"
                 }
 
                 RowLayout {
                     spacing: 12
-                    visible: mainPanel.orphanedMdPath === "" && mainPanel.hasStoredMetadata
+                    visible: mainPanel.hasAudio && mainPanel.hasMetadata
 
                     TextEdit {
                         Layout.fillWidth: true
@@ -3779,8 +3800,8 @@ Rectangle {
                         selectByKeyboard: true
                         activeFocusOnPress: false
                         text: qsTr("Previously transcribed — model: %1, speaker detection: %2")
-                              .arg(mainPanel.storedMetadata.model || "?")
-                              .arg(mainPanel.storedMetadata.speakerDetection ? qsTr("on") : qsTr("off"))
+                              .arg(mainPanel.metadata.model || "?")
+                              .arg(mainPanel.metadata.speakerDetection ? qsTr("on") : qsTr("off"))
                         color: "#aaaaaa"
                         font.pixelSize: 11
 
@@ -3797,13 +3818,13 @@ Rectangle {
                 // click-to-edit idiom as titleLabel/titleField above, but a
                 // TextArea (multi-line) that autosaves on blur instead of
                 // commit-on-Enter — plain Enter must insert a newline here.
-                // Visibility mirrors O26's own gating exactly (never shown
-                // for an orphaned .md, only once the file has been
-                // transcribed at all).
+                // Shown whenever the open file has a transcript to describe,
+                // orphaned .md and audio-backed alike (the prelude lives in the
+                // .md body and reads/writes through currentMdUrl either way).
                 Item {
                     id: preludeContainer
                     Layout.fillWidth: true
-                    visible: mainPanel.orphanedMdPath === "" && mainPanel.hasStoredMetadata
+                    visible: mainPanel.hasMetadata
                     implicitHeight: preludeArea.implicitHeight
 
                     // Always-editable: a single TextArea is present at all
@@ -3899,7 +3920,10 @@ Rectangle {
                             id: addChapterButton
                             Layout.preferredWidth: 18
                             Layout.preferredHeight: 18
-                            visible: !!mainPanel.player && mainPanel.player.source.toString() !== ""
+                            // Audio-only: "at playhead" is meaningless without a
+                            // player. Orphaned .md chapters are managed via the
+                            // TOC's own add/edit affordances, not the playhead.
+                            visible: mainPanel.hasAudio
 
                             ToolTip.visible: addChapterHover.hovered
                             ToolTip.text: qsTr("Add chapter at playhead")
@@ -4101,10 +4125,10 @@ Rectangle {
                 // auto-expires, which would lose it.
                 Label {
                     Layout.fillWidth: true
-                    visible: mainPanel.orphanedMdPath === "" && mainPanel.hasStoredMetadata
-                             && !!mainPanel.storedMetadata.speakerDetectionError
+                    visible: mainPanel.hasAudio && mainPanel.hasMetadata
+                             && !!mainPanel.metadata.speakerDetectionError
                     text: qsTr("Speaker detection was requested but did not run: %1")
-                          .arg(mainPanel.storedMetadata.speakerDetectionError || "")
+                          .arg(mainPanel.metadata.speakerDetectionError || "")
                     color: "#e0a25a"
                     font.pixelSize: 11
                     wrapMode: Text.WordWrap
@@ -4114,7 +4138,7 @@ Rectangle {
                     id: modelRow
                     spacing: 12
                     Layout.fillWidth: true
-                    visible: mainPanel.orphanedMdPath === ""
+                    visible: mainPanel.hasAudio
 
                     // Speaker detection is no longer a transcribe-time toggle —
                     // it's the standalone "Detect speakers" action (the
@@ -4192,7 +4216,7 @@ Rectangle {
                     id: sensitivityRow
                     spacing: 12
                     Layout.fillWidth: true
-                    visible: mainPanel.orphanedMdPath === ""
+                    visible: mainPanel.hasAudio
 
                     Label {
                         text: qsTr("Sensitivity")
@@ -4243,7 +4267,7 @@ Rectangle {
                 // Commit happens on blur (onActiveFocusChanged), diffed
                 // against displaySentences by
                 // mainPanel.commitTranscriptEdits().
-                readOnly: !mainPanel.hasStoredMetadata || mainPanel.transcribingThisFile
+                readOnly: !mainPanel.hasMetadata || mainPanel.transcribingThisFile
                 wrapMode: TextArea.Wrap
                 text: mainPanel.displayText
                 color: "#dddddd"
@@ -5261,9 +5285,7 @@ Rectangle {
             // B2: default the benchmark to whatever file is open/highlighted in
             // the left panel (the same "current file" expression Main.qml feeds
             // the sidebar); empty ⇒ BenchmarkPage falls back to its picker.
-            currentFilePath: (mainPanel.player && mainPanel.player.source.toString() !== "")
-                             ? mainPanel.player.source.toString().replace("file://", "")
-                             : (mainPanel.orphanedMdPath !== "" ? mainPanel.orphanedMdPath : "")
+            currentFilePath: mainPanel.currentMdUrl.replace("file://", "")
         }
     }
 

@@ -298,6 +298,35 @@ Rectangle {
         sidebar.selectionCursorPath = order[order.length - 1]
     }
 
+    // Collapse any multi-selection down to just the currently-open file.
+    // Reached three ways: the Escape key (see the Shortcut below), a click on
+    // any non-file surface in the sidebar (empty tree/search space — see
+    // treeEmptyLeftTap/searchEmptyLeftTap), and the explicit deselect button
+    // beside the "N selected" indicator. "Deselect everything but the current
+    // file" — so the open file stays: it keeps its currentPath outline either
+    // way (that's driven by currentPath, not selectedPaths), and here we also
+    // make it the sole real selection so a following Shift-click still has a
+    // sane anchor. If the open file isn't a visible note (nothing open, or it's
+    // hidden by a filter/collapse), fall back to a fully empty selection.
+    //
+    // Deliberately NOT wired to file-action buttons (transcribe/delete/…) or
+    // file rows: those must keep the selection they act on, and overlapping
+    // TapHandlers aren't mutually exclusive in Qt Quick (see the treeRowTap /
+    // StyleGuide "Always-editable text" notes), so this is added only on the
+    // genuinely-empty surfaces, never as a blanket catcher over the ribbon.
+    function deselectExceptCurrent() {
+        if (sidebar.currentPath !== ""
+                && sidebar.visibleNotePaths().indexOf(sidebar.currentPath) >= 0) {
+            sidebar.selectedPaths = [sidebar.currentPath]
+            sidebar.lastClickedPath = sidebar.currentPath
+            sidebar.selectionCursorPath = sidebar.currentPath
+        } else {
+            sidebar.selectedPaths = []
+            sidebar.lastClickedPath = ""
+            sidebar.selectionCursorPath = ""
+        }
+    }
+
     // Single entry point for both treeDelegate's and searchResultsView's
     // TapHandlers (see each's onTapped below) — modifiers come from
     // TapHandler.point.modifiers (QQuickHandlerPoint's own property, not
@@ -513,6 +542,29 @@ Rectangle {
         sidebar.scrollNoteIntoView(path)
     }
 
+    // Re-establish a note as a TRUE selection after an undo-of-delete restored
+    // it. The restore rebuild() fires modelReset, whose handler wipes
+    // selectedPaths/lastClickedPath/selectionCursorPath (see the target:
+    // sidebar.model Connections) — and MainPanel reopening the file only gives
+    // it the currentPath "open file" OUTLINE, which LOOKS selected but is not a
+    // selectedPaths member and, crucially, is not a Shift-click anchor. Without
+    // this, a restored file couldn't start a Shift-range (the reported bug):
+    // handleNoteClick's shift branch needs a non-empty lastClickedPath.
+    //
+    // APPENDS (rather than replacing) so a batch undo that restores N files
+    // leaves all N selected — each restore signal fires after the single
+    // modelReset that cleared the set, so the first append starts from empty.
+    // The anchor/cursor collapse onto the most-recently-restored path, matching
+    // how a fresh single-select leaves them.
+    function selectRestoredNote(path) {
+        if (path === "")
+            return
+        if (sidebar.selectedPaths.indexOf(path) < 0)
+            sidebar.selectedPaths = sidebar.selectedPaths.concat([path])
+        sidebar.lastClickedPath = path
+        sidebar.selectionCursorPath = path
+    }
+
     // Shift+Up/Down: grow/shrink the selection between the fixed anchor
     // (lastClickedPath) and a moving cursor (selectionCursorPath), mirroring
     // Shift-click's contiguous range. Does NOT open a file (matches
@@ -569,6 +621,52 @@ Rectangle {
                 j = k
         }
         sidebar.selectAndOpenNote(order[j])
+    }
+
+    // Ctrl+Shift+Up/Down: the Shift analog of jumpToGroupBoundary — extend the
+    // selection to the current group's boundary instead of collapsing onto it.
+    // The anchor (lastClickedPath) stays fixed while the moving cursor
+    // (selectionCursorPath) jumps to the first/last note sharing the CURSOR's
+    // parent folder (then hops into the adjacent group on a repeat, exactly like
+    // the plain group jump), selecting everything swept in between. Walks from
+    // the moving cursor, not currentPath, so it composes with a Shift+arrow
+    // range already in progress. Does NOT open a file (matches
+    // extendNoteSelection / Shift-click).
+    function extendNoteSelectionToGroupBoundary(direction) {
+        const order = sidebar.visibleNotePaths()
+        if (order.length === 0)
+            return
+        let anchorIdx = order.indexOf(sidebar.lastClickedPath !== "" ? sidebar.lastClickedPath
+                                                                      : sidebar.currentPath)
+        let cursorIdx = order.indexOf(sidebar.selectionCursorPath !== "" ? sidebar.selectionCursorPath
+                                                                         : sidebar.currentPath)
+        if (anchorIdx < 0)
+            anchorIdx = cursorIdx >= 0 ? cursorIdx : 0
+        if (cursorIdx < 0)
+            cursorIdx = anchorIdx
+        // Same boundary walk as jumpToGroupBoundary, but from the moving cursor.
+        const parent = sidebar.parentDir(order[cursorIdx])
+        let j = cursorIdx
+        while (true) {
+            const k = j + direction
+            if (k < 0 || k > order.length - 1)
+                break
+            if (sidebar.parentDir(order[k]) !== parent)
+                break
+            j = k
+        }
+        if (j === cursorIdx) {
+            // Already at this group's edge — hop into the neighbouring group.
+            const k = cursorIdx + direction
+            if (k >= 0 && k <= order.length - 1)
+                j = k
+        }
+        sidebar.lastClickedPath = order[anchorIdx]
+        sidebar.selectionCursorPath = order[j]
+        const lo = Math.min(anchorIdx, j)
+        const hi = Math.max(anchorIdx, j)
+        sidebar.selectedPaths = order.slice(lo, hi + 1)
+        sidebar.scrollNoteIntoView(order[j])
     }
 
     // Backs the Up/Down Shortcut items near Ctrl+F's: moves to the
@@ -684,6 +782,22 @@ Rectangle {
             // renameFolder() rebuild, and commitActiveRename() has already
             // cleared the state by then, so this is a no-op in that case.
             sidebar.cancelRename()
+        }
+        // Undo-of-delete restore signals (emitted AFTER the rebuild's modelReset
+        // — see VaultTreeModel::applyRestoreOutcome, which rebuilds THEN emits).
+        // onModelReset above just cleared the selection; these put it back onto
+        // the restored file so it's a real, Shift-anchorable selection and not
+        // just the currentPath outline. `fileUrl` follows each signal's
+        // convention that the user-visible note is the AUDIO (or the orphaned
+        // .md), which is exactly what visibleNotePaths()/selectedPaths key on.
+        function onFileRestored(fileUrl, isOrphanedMd) {
+            sidebar.selectRestoredNote(fileUrl.toString().replace("file://", ""))
+        }
+        function onTranscriptRestored(fileUrl) {
+            sidebar.selectRestoredNote(fileUrl.toString().replace("file://", ""))
+        }
+        function onAudioRestoredForTranscript(fileUrl, transcriptUrl) {
+            sidebar.selectRestoredNote(fileUrl.toString().replace("file://", ""))
         }
     }
 
@@ -1258,6 +1372,21 @@ Rectangle {
     property string ctxLabel: ""
     property real ctxMenuX: 0
     property real ctxMenuY: 0
+    // The click-anchored popups (contextMenu / newFolderPopup / moveToPopup /
+    // fileDeleteConfirmPopup) all spawn at the cursor via ctxMenuX/ctxMenuY.
+    // These are IN-SCENE popups, so Qt won't flip/clamp them to stay on screen
+    // — a right-click low or far-right would push the popup past the sidebar
+    // edge and clip it under the window frame. Clamp the anchor by the popup's
+    // own size so its full extent stays inside the sidebar. Passing the size in
+    // (rather than reading popup.width/height globally) keeps each popup's
+    // clamp reactive to ITS size, and makes width/height/ctxMenu* all binding
+    // dependencies so it re-clamps as the content lays out.
+    function clampedMenuX(w) {
+        return Math.max(0, Math.min(sidebar.ctxMenuX, sidebar.width - w))
+    }
+    function clampedMenuY(h) {
+        return Math.max(0, Math.min(sidebar.ctxMenuY, sidebar.height - h))
+    }
     // Destinations for the "Move to…" picker (from VaultTreeModel.vaultFolders(),
     // minus the file's own current directory).
     property var moveFolderList: []
@@ -1961,6 +2090,19 @@ Rectangle {
         onActivated: sidebar.jumpToGroupBoundary(1)
     }
 
+    // Item 41: Ctrl+Shift+Up/Down extend the selection to the current group's
+    // boundary (group jump + Shift-range in one gesture), same focus gating.
+    Shortcut {
+        sequence: "Ctrl+Shift+Up"
+        enabled: sidebar.noteShortcutsEnabled
+        onActivated: sidebar.extendNoteSelectionToGroupBoundary(-1)
+    }
+    Shortcut {
+        sequence: "Ctrl+Shift+Down"
+        enabled: sidebar.noteShortcutsEnabled
+        onActivated: sidebar.extendNoteSelectionToGroupBoundary(1)
+    }
+
     // Mirrors the ribbon's prepended selectAllButton. Same focus gating as
     // the other note-selection shortcuts above — inert while a TextField
     // elsewhere has focus, so it never fights a text field's own native
@@ -1985,6 +2127,18 @@ Rectangle {
         sequence: StandardKey.Delete
         enabled: sidebar.noteShortcutsEnabled && sidebar.selectedPaths.length > 0
         onActivated: sidebar.beginDeleteFile(sidebar.selectedPaths.slice())
+    }
+
+    // Escape collapses a multi-selection back to just the open file (see
+    // deselectExceptCurrent). Gated on an actual multi-selection existing so it
+    // never swallows Escape from anything else when there's nothing to clear;
+    // the `renamingPath === ""` half of noteShortcutsEnabled also keeps it off
+    // while an inline rename editor is open (Escape there reverts the edit —
+    // see rowRenameField's Keys.onEscapePressed).
+    Shortcut {
+        sequence: "Escape"
+        enabled: sidebar.noteShortcutsEnabled && sidebar.selectedPaths.length > 1
+        onActivated: sidebar.deselectExceptCurrent()
     }
 
     Item {
@@ -2024,6 +2178,28 @@ Rectangle {
             anchors.rightMargin: 6
             spacing: 4
             visible: !sidebar.searchExpanded
+
+            // A left-click on empty ribbon space — the gap to the right of the
+            // "N selected" indicator, or between wrapped buttons — clears the
+            // multi-selection, matching the empty-tree-space behavior
+            // (treeEmptyLeftTap). childAt() is the ribbon's analogue of the
+            // tree's cellAtPosition bail: it returns the direct Flow child under
+            // the tap (a button/label/divider) or null for genuinely empty
+            // space, so this only fires on empty space. That bail is
+            // load-bearing, not defensive — overlapping TapHandlers aren't
+            // mutually exclusive in Qt Quick, so this ALSO fires when a bulk
+            // action button is tapped, and a file-action button must keep the
+            // selection it's about to act on.
+            TapHandler {
+                id: ribbonEmptyLeftTap
+                acceptedButtons: Qt.LeftButton
+                onTapped: {
+                    const p = ribbonEmptyLeftTap.point.position
+                    if (ribbonFlow.childAt(p.x, p.y))
+                        return // a real control owns this tap
+                    sidebar.deselectExceptCurrent()
+                }
+            }
 
             // Prepended select-all: mirrors the Ctrl+A shortcut above, and
             // is what makes the bulk buttons to its right ("apply to the
@@ -2640,6 +2816,42 @@ Rectangle {
                 font.pixelSize: 11
                 height: 22
                 verticalAlignment: Text.AlignVCenter
+            }
+
+            // Explicit deselect: clears the multi-selection back to just the
+            // open file (deselectExceptCurrent), the same thing Escape and a
+            // click on empty sidebar space do. Shown only alongside the "N
+            // selected" indicator (2+ rows) — with nothing multi-selected
+            // there's nothing to clear. Standard icon-button convention
+            // (Item + HoverHandler + TapHandler + HoverBorder + AppIcon).
+            Item {
+                id: deselectButton
+                objectName: "deselectButton"
+                visible: sidebar.selectedPaths.length > 1
+                width: 22
+                height: 22
+
+                HoverHandler {
+                    id: deselectHover
+                    cursorShape: Qt.PointingHandCursor
+                }
+                TapHandler {
+                    onTapped: sidebar.deselectExceptCurrent()
+                }
+                HoverBorder {
+                    anchors.fill: parent
+                    active: deselectHover.hovered
+                }
+                AppIcon {
+                    anchors.centerIn: parent
+                    name: "close"
+                    color: "#dddddd"
+                    iconSize: 15
+                }
+
+                ToolTip.visible: deselectHover.hovered
+                ToolTip.text: qsTr("Clear selection (Esc)")
+                ToolTip.delay: 500
             }
 
         }
@@ -3435,21 +3647,42 @@ Rectangle {
         // rightClickRow_menuOffersRenameAndNamesTheSelectionCount.
         //
         // So: bail when the tap landed on a real cell, rather than assume it
-        // can't have. cellAtPosition() wants contentItem coordinates (the view
-        // scrolls under them), while a TapHandler's point.position is relative
-        // to its parent item — hence the map.
+        // can't have. cellAtPosition() takes the tap in the TableView's OWN
+        // coordinate system (it accounts for the scroll offset internally) —
+        // which is exactly what a TapHandler's point.position already is. An
+        // earlier version mapped the point into contentItem coordinates first,
+        // which double-applied contentY: harmless at the top (contentY 0) but
+        // once the view was scrolled down every real row read as -1 (empty
+        // space), so a row click wrongly fell through to the empty-space branch.
         TapHandler {
             id: treeEmptyContextTap
             acceptedButtons: Qt.RightButton
             onTapped: {
                 const local = treeEmptyContextTap.point.position
-                const inContent = tree.mapToItem(tree.contentItem, local.x, local.y)
-                const cell = tree.cellAtPosition(inContent.x, inContent.y, true)
+                const cell = tree.cellAtPosition(local.x, local.y, true)
                 if (cell.y >= 0)
                     return // a row — its own treeRowContextTap owns this click
                 const p = tree.mapToItem(sidebar, local.x, local.y)
                 sidebar.openContextMenu("", false, false, false, 0,
                                          sidebar.model ? sidebar.model.vaultLocalPath : "", "", p.x, p.y)
+            }
+        }
+
+        // Left-click on empty tree space (below/around the rows) clears the
+        // multi-selection back to the open file — the "click a non-file surface
+        // to deselect" behavior. Same cellAtPosition() hit-test as the
+        // right-click handler above: bail when the tap actually landed on a
+        // row, since nested TapHandlers aren't mutually exclusive (a row's own
+        // treeRowTap must own its click and keep the selection it just made).
+        TapHandler {
+            id: treeEmptyLeftTap
+            acceptedButtons: Qt.LeftButton
+            onTapped: {
+                const local = treeEmptyLeftTap.point.position
+                const cell = tree.cellAtPosition(local.x, local.y, true)
+                if (cell.y >= 0)
+                    return // a row — treeRowTap owns this click
+                sidebar.deselectExceptCurrent()
             }
         }
 
@@ -3921,9 +4154,11 @@ Rectangle {
                 }
             }
 
-            // A plain click on the NAME starts an inline rename — on a note
-            // that's already the sole selection (file-manager convention), or
-            // on a FOLDER outright. Second way in, alongside the context menu's
+            // A plain click on the name — or anywhere in the empty space to its
+            // right, the row's hitbox being far wider than a short name (see
+            // tapIsOnRowName) — starts an inline rename: on a note that's
+            // already the sole selection (file-manager convention), or on a
+            // FOLDER outright. Second way in, alongside the context menu's
             // "Rename".
             //
             // A folder needs no already-selected first click because it has no
@@ -3940,24 +4175,27 @@ Rectangle {
             // rename against handleNoteClick (StyleGuide.md "Always-editable
             // text" documents that exact bug). One handler, one decision.
             //
-            // Bounded by the name's PAINTED width (implicitWidth), not the
-            // Text's laid-out width — it Layout.fillWidths the whole row, so
-            // the plain width would make empty space far right of a short name
-            // count as "on the name".
+            // Bounded by the name's LAID-OUT width (it Layout.fillWidths to the
+            // row's right edge), NOT its painted implicitWidth — the row's
+            // hitbox is much wider than a short name's glyphs, and a click in
+            // the empty space right of the name must begin the rename too, not
+            // just a click on the letters themselves (user report). Still left-
+            // bounded at the name's start (local.x >= 0) so the row's left-side
+            // status glyphs keep their own space.
             function tapIsOnRowName(pos) {
                 if (!rowNameText.visible)
                     return false
                 const local = rowNameText.mapFromItem(treeDelegate, pos.x, pos.y)
-                const textWidth = Math.min(rowNameText.width, rowNameText.implicitWidth)
-                return local.x >= 0 && local.x <= textWidth
+                return local.x >= 0 && local.x <= rowNameText.width
                         && local.y >= 0 && local.y <= rowNameText.height
             }
 
             // Expand/collapse is the GLYPH's gesture, not the row's — that's
-            // what frees the folder's name to mean "rename" instead (see
-            // tapIsOnRowName). The rest of a folder row is deliberately inert:
-            // its empty right-hand space toggling the folder is what made the
-            // name unclickable in the first place.
+            // what frees the rest of the folder row to mean "rename" instead
+            // (see tapIsOnRowName, which now claims the name AND the empty space
+            // to its right). Putting expand back on the row's dead space is what
+            // made the name unclickable in the first place; keeping it on the
+            // glyph alone is what lets that dead space rename now.
             //
             // The painted glyph is only 10x11px — too small to ask a real
             // cursor to land inside. So the hit box isn't the glyph's bounds:
@@ -4872,6 +5110,25 @@ Rectangle {
 
         ScrollBar.vertical: ScrollBar { policy: ScrollBar.AlwaysOn }
 
+        // Mirror of the tree's treeEmptyLeftTap: a left-click on empty results
+        // space (below the last result) clears the multi-selection back to the
+        // open file. indexAt() wants content coordinates (the list scrolls
+        // under the handler's parent-relative point), and returns -1 off any
+        // real row — so a genuine result row's own resultRowTap keeps its
+        // click and the selection it makes.
+        TapHandler {
+            id: searchEmptyLeftTap
+            acceptedButtons: Qt.LeftButton
+            onTapped: {
+                const local = searchEmptyLeftTap.point.position
+                const idx = searchResultsView.indexAt(searchResultsView.contentX + local.x,
+                                                        searchResultsView.contentY + local.y)
+                if (idx >= 0)
+                    return // a result row — resultRowTap owns this click
+                sidebar.deselectExceptCurrent()
+            }
+        }
+
         delegate: Item {
             id: resultDelegate
             required property var modelData
@@ -5066,8 +5323,8 @@ Rectangle {
     Popup {
         id: contextMenu
         objectName: "contextMenu"
-        x: sidebar.ctxMenuX
-        y: sidebar.ctxMenuY
+        x: sidebar.clampedMenuX(width)
+        y: sidebar.clampedMenuY(height)
         width: 200
         padding: 4
         modal: true
@@ -5384,8 +5641,8 @@ Rectangle {
     // Item 40: "New folder" name entry.
     Popup {
         id: newFolderPopup
-        x: sidebar.ctxMenuX
-        y: sidebar.ctxMenuY
+        x: sidebar.clampedMenuX(width)
+        y: sidebar.clampedMenuY(height)
         width: 240
         padding: 8
         modal: true
@@ -5493,8 +5750,8 @@ Rectangle {
     // (VaultTreeModel.vaultFolders(), minus the file's own current dir).
     Popup {
         id: moveToPopup
-        x: sidebar.ctxMenuX
-        y: sidebar.ctxMenuY
+        x: sidebar.clampedMenuX(width)
+        y: sidebar.clampedMenuY(height)
         width: 260
         padding: 4
         modal: true
@@ -5571,8 +5828,8 @@ Rectangle {
     // kinds; the message + confirm action switch on sidebar.pendingDeleteMode.
     Popup {
         id: fileDeleteConfirmPopup
-        x: sidebar.ctxMenuX
-        y: sidebar.ctxMenuY
+        x: sidebar.clampedMenuX(width)
+        y: sidebar.clampedMenuY(height)
         width: 280
         padding: 8
         modal: true

@@ -111,6 +111,14 @@ class UsbGrabberController : public QObject {
     // else needs.
     Q_PROPERTY(TranscriptionController *transcriptionController READ transcriptionController WRITE
                    setTranscriptionController NOTIFY transcriptionControllerChanged)
+    // AppSettings.combineRules, bound live from QML (Main.qml). Forwarded into
+    // every grab (queued and preview) so the walk skips parts whose split-
+    // recording group was already combined — see UsbGrabJob.h. Taken from the
+    // persisted QML property, NOT TranscriptionController::m_combineRules
+    // (which is a cache, empty until the first combine scan and reset each
+    // launch), so a device replugged in a fresh session still recognises what
+    // it already grabbed-and-combined.
+    Q_PROPERTY(QVariantList combineRules READ combineRules WRITE setCombineRules NOTIFY combineRulesChanged)
     // Non-empty if the most recent triggerManualGrab() call couldn't
     // proceed (no vault open, device not currently mounted, or no enabled
     // rule for it) — mirrors AudioRecorder::lastError's surfaced-not-
@@ -129,6 +137,9 @@ public:
 
     TranscriptionController *transcriptionController() const { return m_transcriptionController; }
     void setTranscriptionController(TranscriptionController *controller);
+
+    QVariantList combineRules() const { return m_combineRules; }
+    void setCombineRules(const QVariantList &rules);
 
     QString lastError() const { return m_lastError; }
 
@@ -196,6 +207,7 @@ public:
 signals:
     void vaultTreeModelChanged();
     void transcriptionControllerChanged();
+    void combineRulesChanged();
     void lastErrorChanged();
     // Emitted once a grab (manual or auto) finishes, after its history entry
     // has already been appended (see handleUsbGrabFinished()'s ordering).
@@ -324,6 +336,7 @@ private:
     UsbRuleStore m_ruleStore;
     VaultTreeModel *m_vaultTreeModel = nullptr;
     TranscriptionController *m_transcriptionController = nullptr;
+    QVariantList m_combineRules;
     QString m_lastError;
 
     // What one in-flight grab job needs at completion time that its id alone

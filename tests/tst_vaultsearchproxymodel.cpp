@@ -58,6 +58,25 @@ QStringList siblingNamesInOrder(const QAbstractItemModel &m, const QModelIndex &
     return names;
 }
 
+// Collect a QPersistentModelIndex for every node in a nested tree. A live
+// TreeView holds exactly these while expanded; a headless test doesn't, and
+// they are what the reset-reentrancy regression below hinges on. It's not
+// enough to merely realize the proxy's lazy source mapping (recursive index()
+// calls): the crash is in QSortFilterProxyModel::invalidate() ->
+// store_persistent_indexes(), which only walks (and dereferences the source
+// side of) proxy persistent indexes that something is actually HOLDING. With
+// none held, invalidate() has nothing to walk and the freed-Node* access never
+// happens — so the test must keep these alive across the reset.
+void collectPersistent(const QAbstractItemModel &m, QList<QPersistentModelIndex> &out,
+                       const QModelIndex &parent = QModelIndex())
+{
+    for (int row = 0; row < m.rowCount(parent); ++row) {
+        const QModelIndex idx = m.index(row, 0, parent);
+        out << QPersistentModelIndex(idx);
+        collectPersistent(m, out, idx);
+    }
+}
+
 } // namespace
 
 class TstVaultSearchProxyModel : public QObject
@@ -447,6 +466,77 @@ private slots:
         proxy.setFileSortKeys(keys);
 
         QCOMPARE(siblingNamesInOrder(proxy), QStringList({"aaa.mp3", "orphaned.md"}));
+    }
+
+    // Regression (segfault): a handler that reacts to the SOURCE model's reset
+    // by writing one of this proxy's properties must not crash. Live repro was
+    // moving a file into/out of a nested folder: VaultTreeModel::rebuild()
+    // frees the whole Node tree and re-scans (a full begin/endResetModel),
+    // while Sidebar.qml's `Connections { target: sidebar.model } onModelReset`
+    // synchronously re-derived fileSortKeys and wrote them back here. The
+    // setter's invalidate() then walked the proxy's persistent indexes — still
+    // carrying raw Node* internalPointers rebuild() had just freed — and
+    // dereferenced freed memory in VaultTreeModel::parent(). A flat vault never
+    // crashed only because its keys didn't change, so the setter's equality
+    // short-circuit skipped the invalidate(); a file crossing a nested folder
+    // boundary (sibling folder populated) changed the keys and fired it. The
+    // fix defers the invalidate until the source reset finishes and the proxy
+    // has remapped onto the fresh tree (VaultSearchProxyModel::onSourceReset).
+    //
+    // This is a heap use-after-free, so a bare Release build may pass by luck
+    // (the freed Node allocation is usually still mapped and the dangling read
+    // just returns garbage) — a green plain run is NOT proof. It faults
+    // deterministically under AddressSanitizer, which is where the guard's
+    // absence shows up as a hard failure; that's the signal that matters.
+    void sourceResetReentrantSetter_doesNotCrash()
+    {
+        QTemporaryDir vault;
+        QVERIFY(vault.isValid());
+        // The live-repro shape exactly: a folder ("inner") nested inside
+        // another folder ("outer"), whose sibling folder holds an item; the
+        // moved file lands in the nested folder.
+        QVERIFY(QDir().mkpath(vault.filePath("outer/inner")));
+        QVERIFY(touch(vault.filePath("outer/sibling/clip.mp3")));
+        QVERIFY(touch(vault.filePath("outer/roamer.mp3")));
+
+        VaultTreeModel source;
+        source.setVaultPath(QUrl::fromLocalFile(vault.path()));
+
+        VaultSearchProxyModel proxy;
+
+        // Connect the reentrant handler to the source reset BEFORE the proxy
+        // wires its own reset handling, so it fires while the proxy's mapping
+        // still holds the now-freed source indexes — the exact ordering that
+        // crashed. Each reset it pushes a DIFFERENT fileSortKeys map so the
+        // setter's equality short-circuit can't mask the invalidate().
+        int resetCount = 0;
+        QObject::connect(&source, &QAbstractItemModel::modelReset, &proxy, [&] {
+            QVariantMap keys;
+            keys.insert(QStringLiteral("k"),
+                        QVariantList() << QString::number(++resetCount) << QStringLiteral("c")
+                                       << QStringLiteral("1"));
+            proxy.setFileSortKeys(keys);
+        });
+
+        proxy.setSourceModel(&source);
+
+        // Hold persistent proxy indexes across the whole nested tree, standing
+        // in for the expanded TreeView the crash needed (see collectPersistent).
+        QList<QPersistentModelIndex> held;
+        collectPersistent(proxy, held);
+        QVERIFY(!held.isEmpty());
+
+        // Move triggers rebuild() -> begin/endResetModel; the handler re-enters
+        // the proxy mid-reset, and invalidate() walks `held` back to the freed
+        // source Nodes. Pre-fix this segfaulted here.
+        QVERIFY(source.moveFile(QUrl::fromLocalFile(vault.filePath("outer/roamer.mp3")),
+                                QUrl::fromLocalFile(vault.filePath("outer/inner"))));
+
+        // Survived, the tree is consistent, and the deferred invalidate applied
+        // the handler's keys.
+        QVERIFY(resetCount >= 1);
+        QVERIFY(findByName(proxy, "roamer.mp3").isValid());
+        QCOMPARE(proxy.fileSortKeys().value(QStringLiteral("k")).toList().size(), 3);
     }
 };
 

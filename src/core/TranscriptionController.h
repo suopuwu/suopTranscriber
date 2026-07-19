@@ -18,6 +18,7 @@
 #include <QVector>
 #include <qqml.h>
 
+#include <functional>
 #include <memory>
 #include <optional>
 #include <vector>
@@ -608,6 +609,19 @@ public:
     // ordering deterministically without spinning up real jobs.
     static QVariantList sortJobsForDisplay(const QVariantList &jobEntries);
 
+    // Collapse the rows of a multi-select batch (each carrying the same
+    // non-zero "batchId", stamped by enqueueBatch()) into ONE aggregate row so
+    // a bulk op appears as a single Tasks entry — "at least visually" one task,
+    // while the underlying per-file tasks keep running/reporting individually
+    // (that per-file granularity is what the queue, the tree's status dots, and
+    // per-file cancel all depend on; see DESIGN.md "Task system"). The
+    // aggregate carries a "members" list (the original per-task rows) for the
+    // expandable UI, plus aggregate status/counts. A batch of ONE member is
+    // emitted flat (no pointless "1 file" row). Standalone rows (batchId 0)
+    // pass through untouched. Pure + static so it's unit-testable like
+    // sortJobsForDisplay(); sortedJobs() applies it before partitioning.
+    static QVariantList collapseBatches(const QVariantList &jobEntries);
+
     // Item P6: lets the sidebar's file tree query a single path's job status
     // directly, without walking the whole jobs() list itself. path must be an
     // absolute local file path (QUrl::toLocalFile()), matching what m_jobs'
@@ -694,8 +708,12 @@ public:
     // is its DESTINATION FOLDER, which two volumes of one device legitimately
     // share — deduping on it would silently drop the second volume's grab, the
     // exact bug the per-volume job map already exists to prevent.
+    // combineRules is AppSettings.combineRules (passed through from
+    // UsbGrabberController, NOT the m_combineRules cache — which is empty until
+    // the first combine scan and reset every launch): the walk skips parts
+    // whose split-recording group was already combined. See UsbGrabJob.h.
     int enqueueUsbGrab(const UsbGrabRule &rule, const QString &mountPath, const QUrl &destUrl, const QUrl &vaultUrl,
-                       bool autoTriggered);
+                       bool autoTriggered, const QVariantList &combineRules = {});
 
     // Item 52: standalone speaker diarization on an ALREADY-transcribed file
     // — adds (or re-runs) speaker detection WITHOUT re-transcribing the audio.
@@ -1034,6 +1052,14 @@ public:
     // sub-phase finishes rather than instantly). A no-op if id doesn't match
     // any current Queued/Active entry.
     Q_INVOKABLE void cancelJob(int id);
+    // Batch analogues of cancelJob()/dismiss(), for the collapsed batch row's
+    // single close button (see collapseBatches()). cancelBatch() cancels every
+    // still-pending (Queued/Paused/Active) member of the batch, exactly like
+    // cancelJob() per member (same immediate-vs-next-checkpoint caveat);
+    // dismissBatch() removes every Done/Failed member of the batch (the
+    // batch-wide "clear this finished row"). Both no-op on an unknown batchId.
+    Q_INVOKABLE void cancelBatch(int batchId);
+    Q_INVOKABLE void dismissBatch(int batchId);
     // Cancels every Queued job, then cancels the Active job exactly like
     // cancelJob() (same immediate-vs-next-checkpoint caveat). Done/Failed
     // history entries are untouched (use clearFinished() for those).
@@ -1727,13 +1753,31 @@ private:
     //     batchUndoLabel(k)) covering all k undoable-Done members — so N
     //     multi-selected ops collapse into a single snackbar (see undoTask()).
     void maybeEmitUndoAvailable(const Task *task, bool ok);
-    // Enqueues several tasks as ONE undo batch: allocates a shared batchId
-    // (from the same counter as task ids, so it can't collide with one),
-    // stamps it on each, and appends them in order. Returns the batchId — the
-    // token undoAvailable()/undoTask() use to undo the whole set at once. Used
-    // for multi-select file ops (move/…); a single-item op is just a batch of
-    // one (still one snackbar, labelled via batchUndoLabel(1)).
-    int enqueueBatch(std::vector<std::unique_ptr<Task>> tasks);
+    // Enqueues several tasks as ONE batch: allocates a shared batchId (from the
+    // same counter as task ids, so it can't collide with one) via the scoped
+    // m_currentBatchId (which enqueueTask() stamps onto the task it inserts —
+    // NOT onto the prerequisite downloads it queues ahead, which stay
+    // standalone), and appends them in order. Returns the batchId — the token
+    // undoAvailable()/undoTask() use to undo the whole set, and the key
+    // collapseBatches() groups the display row by. `displayLabel` is the
+    // collapsed row's category label (e.g. "Run all"); empty means "derive from
+    // the members' own kindLabel" (right for a homogeneous batch like a bulk
+    // move/transcribe). Used for every multi-select op; a single-item op is
+    // just a batch of one (still one undo snackbar via batchUndoLabel(1), and
+    // rendered flat by collapseBatches()).
+    int enqueueBatch(std::vector<std::unique_ptr<Task>> tasks, const QString &displayLabel = {});
+    // Runs `fn` (which enqueues per-file tasks via the normal single-file
+    // helpers) inside a batch scope: allocates the shared batchId, sets
+    // m_currentBatchId so each enqueueTask() stamps it, records displayLabel,
+    // then clears the scope. Drops the (empty) batch label if `fn` enqueued
+    // nothing (e.g. every file was deduped away). This is how the loop-based
+    // bulk ops (transcribeAll/…/runAllJobsForPaths) become one batch without
+    // duplicating their per-file dedup/prerequisite/ordering logic.
+    void withBatch(const QString &displayLabel, const std::function<void()> &fn);
+    // True iff some task in m_tasks still carries this (non-zero) batchId — the
+    // "does this batch still exist" check behind withBatch()'s empty-batch
+    // label prune and dismissBatch()/cancelBatch()'s label cleanup.
+    bool batchHasMembers(int batchId) const;
     // The ONE way a task enters the queue. Assigns its id, queues any
     // prerequisites() ahead of it, inserts it, emits queueChanged(), and
     // auto-starts if idle. insertIndex: -1 (default) uses
@@ -1949,6 +1993,20 @@ private:
     QHash<QString, Task::Status> m_jobStatusByPath;
     int m_activeIndex = -1;
     int m_nextJobId = 1;
+    // The batchId enqueueTask() stamps onto the task it's inserting, or 0 for a
+    // standalone enqueue. Set only for the duration of a withBatch()/
+    // enqueueBatch() scope (never re-entrant — batches are built synchronously
+    // on the GUI thread). Prerequisite downloads enqueueTask queues ahead of
+    // the task are inserted directly (maybeQueueDownloadTask), NOT via
+    // enqueueTask, so they never pick this up — a shared prereq isn't part of
+    // any one batch.
+    int m_currentBatchId = 0;
+    // batchId -> the collapsed row's category label (collapseBatches()). Only
+    // holds the batches whose enqueue site passed an explicit label (e.g. "Run
+    // all", whose mixed member kinds can't derive one); a homogeneous batch
+    // leaves no entry and collapseBatches() derives the label from a member's
+    // kindLabel. Pruned when a batch's last member leaves m_tasks.
+    QHash<int, QString> m_batchLabels;
     // Set by loadPersistedQueue() (once per vault open) — where persistQueue()
     // writes back to. Empty (no persistence) until then.
     QUrl m_vaultUrl;

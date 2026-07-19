@@ -196,6 +196,80 @@ private slots:
         QVERIFY(QFileInfo::exists(vault.filePath("clip2.wav")));
     }
 
+    // A device part whose split-recording group was ALREADY combined must be
+    // skipped, not re-grabbed — even though the raw part no longer sits in the
+    // vault (a real combine moves it into .combined/ or deletes it), so the
+    // plain basename/size/mtime quick-check can't see it. Without this,
+    // replugging the device re-grabs the parts and the group re-combines,
+    // doubling the disk use. runUsbGrabScan() recognises the group by
+    // recomputing the merged-output name from the filename (the same
+    // CombineNaming.h helpers the combiner uses) and finding it on disk. See
+    // DESIGN.md's "USB import" (already-combined) and tst_filecombine for the
+    // naming.
+    void alreadyCombinedGroup_isSkipped_notReGrabbed()
+    {
+        QTemporaryDir device;
+        QTemporaryDir vault;
+        QVERIFY(device.isValid() && vault.isValid());
+        // The two raw parts still sit on the USB device...
+        QVERIFY(writeFile(device.filePath("cam_20260710_edit_a.wav"), "part-a"));
+        QVERIFY(writeFile(device.filePath("cam_20260710_edit_b.wav"), "part-b"));
+        // ...but the vault holds ONLY their merged output — the parts were
+        // moved into .combined/ or deleted by a prior combine.
+        QVERIFY(writeFile(vault.filePath("Acme Mic 3 - 20260710 edit.combined.wav"), "merged"));
+
+        UsbGrabRule rule;
+        rule.deviceSerial = QStringLiteral("TEST-SERIAL");
+        rule.extensionFilter = {QStringLiteral("wav")};
+        rule.preserveStructure = false; // combined output lands at the vault root
+
+        QVariantMap combineRule;
+        combineRule["name"] = QStringLiteral("Acme Mic 3");
+        combineRule["pattern"] = QStringLiteral("^cam_(\\d{8})_(edit)_[ab]\\.wav$");
+        combineRule["enabled"] = true;
+        combineRule["sortGroupIndex"] = -1;
+
+        const UsbGrabScanResult result = runUsbGrabScan(
+            rule, device.path(), vault.path(), /*dryRun=*/false, /*hooks=*/{}, QVariantList{combineRule});
+
+        QCOMPARE(result.filesCopied, 0);
+        QCOMPARE(result.filesSkipped, 2);
+        // The re-grab did NOT recreate the raw parts in the vault.
+        QVERIFY(!QFileInfo::exists(vault.filePath("cam_20260710_edit_a.wav")));
+        QVERIFY(!QFileInfo::exists(vault.filePath("cam_20260710_edit_b.wav")));
+    }
+
+    // Negative control for the skip above: a rule that MATCHES the parts but
+    // whose merged output isn't on disk yet must NOT skip them — the gate is
+    // "the combined file exists", not "a combine rule matched". (The
+    // no-combine-rules-at-all case is every other test in this file.)
+    void combineRuleMatchesButNotYetCombined_partsAreGrabbed()
+    {
+        QTemporaryDir device;
+        QTemporaryDir vault;
+        QVERIFY(device.isValid() && vault.isValid());
+        QVERIFY(writeFile(device.filePath("cam_20260710_edit_a.wav"), "part-a"));
+        QVERIFY(writeFile(device.filePath("cam_20260710_edit_b.wav"), "part-b"));
+        // No merged output written to the vault.
+
+        UsbGrabRule rule;
+        rule.deviceSerial = QStringLiteral("TEST-SERIAL");
+        rule.extensionFilter = {QStringLiteral("wav")};
+        rule.preserveStructure = false;
+
+        QVariantMap combineRule;
+        combineRule["name"] = QStringLiteral("Acme Mic 3");
+        combineRule["pattern"] = QStringLiteral("^cam_(\\d{8})_(edit)_[ab]\\.wav$");
+        combineRule["enabled"] = true;
+        combineRule["sortGroupIndex"] = -1;
+
+        const UsbGrabScanResult result = runUsbGrabScan(
+            rule, device.path(), vault.path(), /*dryRun=*/false, /*hooks=*/{}, QVariantList{combineRule});
+
+        QCOMPARE(result.filesCopied, 2);
+        QCOMPARE(result.filesSkipped, 0);
+    }
+
     // Same basename and same mtime, but a different size -> a genuinely
     // different file, so it's copied rather than skipped. Pinning both mtimes
     // to the same instant is what makes this prove size is part of the

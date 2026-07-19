@@ -38,6 +38,7 @@
 #include <tuple>
 
 #include "AudioDecoder.h"
+#include "CombineNaming.h"
 #include "DiarizationEngine.h"
 #include "LabelingEngine.h"
 #include "ModelManager.h"
@@ -1062,92 +1063,15 @@ void syncSpeakersFrontmatterToBody(const QString &path)
         qWarning() << "syncSpeakersFrontmatterToBody: failed to write" << path << ":" << error;
 }
 
-// findCombineGroups()'s outputPath is built from (ruleName, capturedKey), not
-// a filename component that's guaranteed filesystem-safe (a regex capture
-// group can pull out literally anything) — collapse everything except
-// alphanumerics/-/_ to '-' so the derived name is always a valid single path
-// segment on every filesystem this app targets.
-QString sanitizeForFilename(const QString &raw)
-{
-    QString out = raw;
-    static const QRegularExpression unsafe(QStringLiteral("[^A-Za-z0-9_-]+"));
-    out.replace(unsafe, QStringLiteral("-"));
-    while (out.startsWith(QChar('-')))
-        out.remove(0, 1);
-    while (out.endsWith(QChar('-')))
-        out.chop(1);
-    return out.isEmpty() ? QStringLiteral("combined") : out;
-}
+// sanitizeForFilename(), matchRuleCapturedKey() and combineOutputPathFor() now
+// live in CombineNaming.h — the ONE source of truth shared with the USB
+// grabber's already-combined skip (see that header's top comment).
 
 // findCombineGroups()'s "pending" status: a group is otherwise "ready" but
 // its newest member was modified more recently than this many seconds ago —
 // the recorder may still be actively writing that file, and concatenating a
 // growing/not-yet-closed file risks truncation or a corrupt merge.
 constexpr qint64 kCombineStabilityWindowSecs = 5;
-
-// One rule ({name, pattern, enabled, sortGroupIndex} map) matched against a
-// single filename (not a full path — QFileInfo::fileName()), search
-// semantics (QRegularExpression, unanchored unless the pattern itself has
-// ^/$). On a match, returns the "real string" key: capture groups 1..N
-// concatenated in order, EXCLUDING the rule's sort differentiator group if
-// it has one (empty key if the pattern has no OTHER capture groups) — see
-// TranscriptionController::findCombineGroups()'s doc comment for the full
-// semantics. Shared by findCombineGroups() (which tries every rule against
-// every candidate path) and maybeRedirectForCombine() (which only needs to
-// try every rule against ONE already-known filename). `capturedValuesOut`,
-// if given, is filled with the SAME (non-sort) capture groups
-// un-concatenated — only findCombineGroups() needs the individual values
-// (for the Settings preview header showing exactly which differentiator
-// values grouped these files); maybeRedirectForCombine() only ever needs the
-// flattened key. `sortValueOut`, if given, receives the sort differentiator
-// group's own captured text (untouched/nullopt if the rule has none
-// configured, or the configured index is out of range for this match) —
-// only findCombineGroups() uses this, to order a group's members by that
-// value instead of the mtime default.
-std::optional<QString> matchRuleCapturedKey(const QVariantMap &rule, const QString &fileName,
-                                             QStringList *capturedValuesOut = nullptr,
-                                             std::optional<QString> *sortValueOut = nullptr)
-{
-    if (!rule.value(QStringLiteral("enabled"), true).toBool())
-        return std::nullopt;
-    const QString pattern = rule.value(QStringLiteral("pattern")).toString();
-    if (pattern.isEmpty())
-        return std::nullopt;
-    const QRegularExpression re(pattern);
-    if (!re.isValid())
-        return std::nullopt;
-    const QRegularExpressionMatch m = re.match(fileName);
-    if (!m.hasMatch())
-        return std::nullopt;
-    const int sortGroupIndex = rule.value(QStringLiteral("sortGroupIndex"), -1).toInt();
-    QString key;
-    for (int i = 1; i <= m.lastCapturedIndex(); ++i) {
-        const QString captured = m.captured(i);
-        if (i == sortGroupIndex) {
-            if (sortValueOut)
-                *sortValueOut = captured;
-            continue; // the sort differentiator is explicitly NOT a grouping one
-        }
-        key += captured;
-        if (capturedValuesOut)
-            capturedValuesOut->append(captured);
-    }
-    return key;
-}
-
-// Deterministic merged-output filename for a (ruleName, capturedKey) pair,
-// resolved against a directory + extension — see
-// TranscriptionController::findCombineGroups()'s outputPath doc comment for
-// why it's derived from the rule+key rather than any single member's
-// filename.
-QString combineOutputPathFor(const QString &ruleName, const QString &key, const QString &dir, const QString &ext)
-{
-    QString name = sanitizeForFilename(ruleName);
-    if (!key.isEmpty())
-        name += QStringLiteral("-") + sanitizeForFilename(key);
-    return dir + QStringLiteral("/") + name + QStringLiteral(".combined.") + ext;
-}
-
 
 // See this function's declaration doc comment in TranscriptionController.h.
 QString spliceBodySpeakers(const QString &body, const QStringList &knownSpeakers,
@@ -2040,6 +1964,11 @@ int TranscriptionController::enqueueTask(std::unique_ptr<Task> task, int insertI
     queuePrerequisites(*task, task->vaultUrl, &insertAt);
 
     task->id = m_nextJobId++;
+    // Stamp the active batch scope (0 = standalone). Set only inside a
+    // withBatch()/enqueueBatch() scope; the prerequisite downloads queued just
+    // above went through maybeQueueDownloadTask(), not this path, so they
+    // correctly stay standalone. See m_currentBatchId's doc comment.
+    task->batchId = m_currentBatchId;
     task->status = Task::Status::Queued;
     const int id = task->id;
     m_tasks.insert(m_tasks.begin() + std::clamp(insertAt, 0, static_cast<int>(m_tasks.size())), std::move(task));
@@ -2092,9 +2021,15 @@ void TranscriptionController::transcribeAll(const QVariantList &fileUrls, const 
                                              const QString &modelId, bool autoLabel,
                                              bool restrictTagsToExisting, double tagReuseBias, double wordiness)
 {
-    for (const QVariant &v : fileUrls)
-        transcribe(v.toUrl(), vaultUrl, modelId, autoLabel, restrictTagsToExisting, tagReuseBias,
-                   wordiness);
+    // One batch so a multi-select transcribe shows as a single collapsed Tasks
+    // row (empty label ⇒ derived from the members' "Transcribe" kindLabel).
+    // Each transcribe() still applies its own Queued/Active dedup, so a
+    // deduped-away file simply isn't a batch member.
+    withBatch(QString(), [&] {
+        for (const QVariant &v : fileUrls)
+            transcribe(v.toUrl(), vaultUrl, modelId, autoLabel, restrictTagsToExisting, tagReuseBias,
+                       wordiness);
+    });
 }
 
 void TranscriptionController::importAudio(const QUrl &sourceUrl, const QUrl &destUrl, const QUrl &vaultUrl)
@@ -2110,12 +2045,13 @@ void TranscriptionController::importAudio(const QUrl &sourceUrl, const QUrl &des
 }
 
 int TranscriptionController::enqueueUsbGrab(const UsbGrabRule &rule, const QString &mountPath, const QUrl &destUrl,
-                                             const QUrl &vaultUrl, bool autoTriggered)
+                                             const QUrl &vaultUrl, bool autoTriggered,
+                                             const QVariantList &combineRules)
 {
     // No isQueued(destUrl) dedup here, deliberately — see the header's doc
     // comment: a grab's fileUrl is a destination FOLDER that a device's two
     // volumes legitimately share.
-    auto task = std::make_unique<UsbGrabTask>(rule, mountPath, destUrl, autoTriggered);
+    auto task = std::make_unique<UsbGrabTask>(rule, mountPath, destUrl, autoTriggered, combineRules);
     task->vaultUrl = vaultUrl;
     return enqueueTask(std::move(task));
 }
@@ -2145,8 +2081,11 @@ void TranscriptionController::diarizeFilesForPaths(const QVariantList &fileUrls,
                                                    const QString &segmentationModelId,
                                                    const QString &embeddingModelId, double sensitivity)
 {
-    for (const QVariant &v : fileUrls)
-        diarizeFile(v.toUrl(), vaultUrl, segmentationModelId, embeddingModelId, sensitivity);
+    // One batch (derived "Detect speakers" label) — see transcribeAll().
+    withBatch(QString(), [&] {
+        for (const QVariant &v : fileUrls)
+            diarizeFile(v.toUrl(), vaultUrl, segmentationModelId, embeddingModelId, sensitivity);
+    });
 }
 
 void TranscriptionController::relabel(const QUrl &fileUrl, const QUrl &vaultUrl, bool restrictTagsToExisting,
@@ -2164,8 +2103,11 @@ void TranscriptionController::relabel(const QUrl &fileUrl, const QUrl &vaultUrl,
 void TranscriptionController::relabelAll(const QVariantList &fileUrls, const QUrl &vaultUrl,
                                           bool restrictTagsToExisting, double tagReuseBias, double wordiness)
 {
-    for (const QVariant &v : fileUrls)
-        relabel(v.toUrl(), vaultUrl, restrictTagsToExisting, tagReuseBias, wordiness);
+    // One batch (derived "Label" label) — see transcribeAll().
+    withBatch(QString(), [&] {
+        for (const QVariant &v : fileUrls)
+            relabel(v.toUrl(), vaultUrl, restrictTagsToExisting, tagReuseBias, wordiness);
+    });
 }
 
 void TranscriptionController::generateChapters(const QUrl &fileUrl, const QUrl &vaultUrl, double density)
@@ -2179,8 +2121,11 @@ void TranscriptionController::generateChapters(const QUrl &fileUrl, const QUrl &
 
 void TranscriptionController::generateChaptersAll(const QVariantList &fileUrls, const QUrl &vaultUrl, double density)
 {
-    for (const QVariant &v : fileUrls)
-        generateChapters(v.toUrl(), vaultUrl, density);
+    // One batch (derived "Generate chapters" label) — see transcribeAll().
+    withBatch(QString(), [&] {
+        for (const QVariant &v : fileUrls)
+            generateChapters(v.toUrl(), vaultUrl, density);
+    });
 }
 
 void TranscriptionController::runAllJobs(const QUrl &fileUrl, const QUrl &vaultUrl, const QString &modelId,
@@ -2253,9 +2198,17 @@ void TranscriptionController::runAllJobsForPaths(const QVariantList &fileUrls, c
                                                   double chapterDensity, const QString &segmentationModelId,
                                                   const QString &embeddingModelId, double sensitivity)
 {
-    for (const QVariant &v : fileUrls)
-        runAllJobs(v.toUrl(), vaultUrl, modelId, restrictTagsToExisting, tagReuseBias, wordiness, chapterDensity,
-                   segmentationModelId, embeddingModelId, sensitivity);
+    // One batch across ALL files' pipeline steps — so "run all" over N files is
+    // a single collapsed row ("Run all · N files") instead of up to 4N rows.
+    // Explicit label because the members are mixed kinds (transcribe/diarize/
+    // label/chapters), so there's no single kindLabel to derive from; the
+    // collapsed row's file count comes from the distinct fileUrls, not the task
+    // count (see collapseBatches()).
+    withBatch(QStringLiteral("Run all"), [&] {
+        for (const QVariant &v : fileUrls)
+            runAllJobs(v.toUrl(), vaultUrl, modelId, restrictTagsToExisting, tagReuseBias, wordiness, chapterDensity,
+                       segmentationModelId, embeddingModelId, sensitivity);
+    });
 }
 
 void TranscriptionController::startTask(int index)
@@ -2577,27 +2530,62 @@ void TranscriptionController::undoTask(int token)
     }
 }
 
-int TranscriptionController::enqueueBatch(std::vector<std::unique_ptr<Task>> tasks)
+int TranscriptionController::enqueueBatch(std::vector<std::unique_ptr<Task>> tasks, const QString &displayLabel)
 {
     if (tasks.empty())
         return 0;
     // One shared id for the whole batch, drawn from the SAME counter as task
-    // ids (assigned inside enqueueTask below) so it can never collide with one
-    // — that's what lets undoTask()/maybeEmitUndoAvailable() treat a single int
-    // token as either a task id or a batch id unambiguously.
-    const int batchId = m_nextJobId++;
-    for (auto &task : tasks) {
-        task->batchId = batchId;
-        // Append in order (like the speaker edits / renameFile) so a batch's
-        // members run in the order the user selected them.
-        enqueueTask(std::move(task), static_cast<int>(m_tasks.size()));
-    }
+    // ids (assigned inside enqueueTask) so it can never collide with one —
+    // that's what lets undoTask()/maybeEmitUndoAvailable()/collapseBatches()
+    // treat a single int token as either a task id or a batch id unambiguously.
+    // The stamping goes through m_currentBatchId (enqueueTask reads it), the
+    // same scope withBatch() uses, so both batch paths are identical.
+    int batchId = 0;
+    withBatch(displayLabel, [&] {
+        batchId = m_currentBatchId;
+        for (auto &task : tasks) {
+            // Append in order (like the speaker edits / renameFile) so a
+            // batch's members run in the order the user selected them.
+            enqueueTask(std::move(task), static_cast<int>(m_tasks.size()));
+        }
+    });
     return batchId;
+}
+
+void TranscriptionController::withBatch(const QString &displayLabel, const std::function<void()> &fn)
+{
+    // Not re-entrant: batches are built synchronously on the GUI thread, one at
+    // a time. A nested withBatch() would clobber the outer scope's batchId, so
+    // guard against it rather than silently mis-stamp.
+    Q_ASSERT(m_currentBatchId == 0);
+    const int batchId = m_nextJobId++;
+    m_currentBatchId = batchId;
+    if (!displayLabel.isEmpty())
+        m_batchLabels.insert(batchId, displayLabel);
+    fn();
+    m_currentBatchId = 0;
+    // Nothing landed under this batchId (e.g. every file was deduped away) — no
+    // batch exists, so drop the label we speculatively recorded rather than
+    // leak it. (A deduped-away op enqueues nothing at all, prereqs included,
+    // since the single-file helpers return before enqueueTask.)
+    if (!batchHasMembers(batchId))
+        m_batchLabels.remove(batchId);
+}
+
+bool TranscriptionController::batchHasMembers(int batchId) const
+{
+    if (batchId == 0)
+        return false;
+    for (const auto &task : m_tasks)
+        if (task->batchId == batchId)
+            return true;
+    return false;
 }
 
 void TranscriptionController::removeTaskAt(int index)
 {
     Task *task = m_tasks[index].get();
+    const int batchId = task->batchId;
     m_connectedTasks.remove(task);
     // m_instantActive is a pointer, not an index — clear it if THIS is the
     // instant-lane task being removed (a cancel-while-queued never sets it,
@@ -2607,6 +2595,10 @@ void TranscriptionController::removeTaskAt(int index)
     m_tasks.erase(m_tasks.begin() + index);
     if (m_activeIndex > index)
         --m_activeIndex;
+    // Drop a batch's display label once its last member is gone, so
+    // m_batchLabels doesn't accumulate stale entries across a long session.
+    if (batchId != 0 && !batchHasMembers(batchId))
+        m_batchLabels.remove(batchId);
 }
 
 void TranscriptionController::cancelTaskAt(int index)
@@ -2775,6 +2767,46 @@ void TranscriptionController::cancelJob(int id)
         }
         return;
     }
+}
+
+void TranscriptionController::cancelBatch(int batchId)
+{
+    if (batchId == 0)
+        return;
+    // Snapshot the member ids first — cancelJob() mutates m_tasks (a
+    // Queued/Paused member is removed outright), so walking it live while
+    // cancelling would invalidate indices. Route each through cancelJob() so a
+    // member gets the exact same Queued-vs-Active handling a single cancel
+    // would (removal + synthesized terminal report, or a runner cancel request).
+    QList<int> ids;
+    for (const auto &task : m_tasks) {
+        if (task->batchId == batchId
+            && (task->status == Task::Status::Queued || task->status == Task::Status::Paused
+                || task->status == Task::Status::Active))
+            ids.append(task->id);
+    }
+    for (const int id : std::as_const(ids))
+        cancelJob(id);
+}
+
+void TranscriptionController::dismissBatch(int batchId)
+{
+    if (batchId == 0)
+        return;
+    // Remove every terminal (Done/Failed) member of the batch — the batch-wide
+    // "clear this finished row". Walk back-to-front so each erase leaves the
+    // earlier indices valid (same shape as clearFinished()).
+    bool changed = false;
+    for (int i = static_cast<int>(m_tasks.size()) - 1; i >= 0; --i) {
+        const Task *task = m_tasks[i].get();
+        if (task->batchId == batchId
+            && (task->status == Task::Status::Done || task->status == Task::Status::Failed)) {
+            removeTaskAt(i);
+            changed = true;
+        }
+    }
+    if (changed)
+        emit queueChanged();
 }
 
 void TranscriptionController::cancelAll()
@@ -4136,6 +4168,17 @@ QVariantList TranscriptionController::jobs() const
         entry["displayName"] = task->displayName();
         // -1 (QML sees it as a negative number) until Done/Failed.
         entry["durationMs"] = task->durationMs;
+        // Whether the finished row should offer a per-row Undo button (the
+        // persistent twin of the auto undo snackbar) — a Done task that
+        // advertises an undo and can build its inverse. Only Done tasks
+        // qualify: makeUndoTask() captures run()'s result.
+        entry["undoable"] = task->status == Task::Status::Done && task->isUndoable();
+        // Batch grouping (0 = standalone). batchLabel is the collapsed row's
+        // category label; empty ⇒ collapseBatches() derives it from a member's
+        // kindLabel. Both are read only by collapseBatches() (a pure transform
+        // that can't reach m_batchLabels), never by the per-row delegate.
+        entry["batchId"] = task->batchId;
+        entry["batchLabel"] = task->batchId != 0 ? m_batchLabels.value(task->batchId) : QString();
         const QVariantMap extra = task->toVariantMap();
         for (auto it = extra.constBegin(); it != extra.constEnd(); ++it)
             entry[it.key()] = it.value();
@@ -4175,6 +4218,133 @@ double TranscriptionController::effectiveWordinessForLength(double baseWordiness
     return baseWordiness;
 }
 
+QVariantList TranscriptionController::collapseBatches(const QVariantList &jobEntries)
+{
+    // First pass: walk in append order, recording the display order as a
+    // sequence of tokens (a standalone row, or the FIRST appearance of a
+    // batchId) and bucketing each batch's member rows. Preserving first-seen
+    // order keeps a batch sitting where its earliest member would have.
+    QVariantList out;
+    QList<int> batchOrder;                 // batchIds in first-seen order
+    QHash<int, QVariantList> members;      // batchId -> its member rows
+    QHash<int, int> placeholderAt;         // batchId -> index in `out` reserved for it
+
+    for (const QVariant &v : jobEntries) {
+        const QVariantMap row = v.toMap();
+        const int batchId = row.value(QStringLiteral("batchId")).toInt();
+        if (batchId == 0) {
+            out.append(row);
+            continue;
+        }
+        if (!members.contains(batchId)) {
+            placeholderAt.insert(batchId, out.size());
+            out.append(QVariant()); // reserve the slot; filled in the second pass
+            batchOrder.append(batchId);
+        }
+        members[batchId].append(row);
+    }
+
+    // Second pass: turn each batch's members into ONE aggregate row (or, for a
+    // lone member, the member itself — no pointless "1 file" collapse).
+    for (const int batchId : std::as_const(batchOrder)) {
+        const QVariantList &group = members[batchId];
+        const int slot = placeholderAt.value(batchId);
+        if (group.size() == 1) {
+            out[slot] = group.first();
+            continue;
+        }
+
+        // Distinct files (a run-all batch has up to 4 tasks per file, so the
+        // member count overstates the file count — the row should say "5
+        // files", not "20"). A file counts as done only when ALL its tasks are
+        // Done; genuinely failed (not a user cancel) if any of its tasks are.
+        QStringList distinctFiles;
+        QHash<QString, bool> fileAllDone;      // seeded true, cleared by any non-Done task
+        QHash<QString, bool> fileHasFailure;   // any genuine (non-cancel) failure
+        bool anyActive = false, anyQueued = false, anyPaused = false;
+        bool anyDone = false, anyGenuineFailure = false, anyCancelled = false;
+        bool anyUndoable = false; // any Done member advertises an undo (see jobs())
+        qint64 durationSum = 0;
+        bool allTerminal = true;
+        QString label = group.first().toMap().value(QStringLiteral("batchLabel")).toString();
+        if (label.isEmpty())
+            label = group.first().toMap().value(QStringLiteral("kindLabel")).toString();
+
+        for (const QVariant &mv : group) {
+            const QVariantMap m = mv.toMap();
+            const QString status = m.value(QStringLiteral("status")).toString();
+            const QString fileKey = m.value(QStringLiteral("fileUrl")).toUrl().toString();
+            const bool cancelled = status == QStringLiteral("failed")
+                && m.value(QStringLiteral("error")).toString() == QStringLiteral("Cancelled");
+            if (!distinctFiles.contains(fileKey)) {
+                distinctFiles.append(fileKey);
+                fileAllDone.insert(fileKey, true);
+                fileHasFailure.insert(fileKey, false);
+            }
+            if (status != QStringLiteral("done"))
+                fileAllDone[fileKey] = false;
+            if (status == QStringLiteral("failed") && !cancelled)
+                fileHasFailure[fileKey] = true;
+
+            if (status == QStringLiteral("active")) { anyActive = true; allTerminal = false; }
+            else if (status == QStringLiteral("queued")) { anyQueued = true; allTerminal = false; }
+            else if (status == QStringLiteral("paused")) { anyPaused = true; allTerminal = false; }
+            else if (status == QStringLiteral("done")) anyDone = true;
+            else if (cancelled) anyCancelled = true;
+            else anyGenuineFailure = true;
+
+            if (m.value(QStringLiteral("undoable")).toBool())
+                anyUndoable = true;
+
+            const qint64 d = m.value(QStringLiteral("durationMs")).toLongLong();
+            if (d > 0)
+                durationSum += d;
+        }
+
+        int filesDone = 0, filesFailed = 0;
+        for (const QString &f : std::as_const(distinctFiles)) {
+            if (fileHasFailure.value(f))
+                ++filesFailed;
+            else if (fileAllDone.value(f))
+                ++filesDone;
+        }
+
+        // Aggregate status priority: any still-running phase wins so the row
+        // reads as live; among terminal-only batches a genuine failure surfaces
+        // as failed, an all-cancelled batch reads as a cancel, otherwise done.
+        QString aggStatus;
+        QString aggError;
+        if (anyActive) aggStatus = QStringLiteral("active");
+        else if (anyQueued) aggStatus = QStringLiteral("queued");
+        else if (anyPaused) aggStatus = QStringLiteral("paused");
+        else if (anyGenuineFailure) { aggStatus = QStringLiteral("failed");
+            aggError = QStringLiteral("%1 of %2 failed").arg(filesFailed).arg(distinctFiles.size()); }
+        else if (anyCancelled && !anyDone) { aggStatus = QStringLiteral("failed");
+            aggError = QStringLiteral("Cancelled"); }
+        else aggStatus = QStringLiteral("done");
+
+        QVariantMap agg;
+        agg[QStringLiteral("isBatch")] = true;
+        agg[QStringLiteral("batchId")] = batchId;
+        agg[QStringLiteral("id")] = batchId; // unique (shares the task-id counter) — safe row key
+        agg[QStringLiteral("kind")] = QStringLiteral("batch");
+        agg[QStringLiteral("kindLabel")] = label;
+        agg[QStringLiteral("status")] = aggStatus;
+        agg[QStringLiteral("error")] = aggError;
+        agg[QStringLiteral("fileUrl")] = QUrl(); // aggregate has no single file
+        agg[QStringLiteral("batchCount")] = distinctFiles.size();
+        agg[QStringLiteral("batchDoneCount")] = filesDone;
+        agg[QStringLiteral("batchFailedCount")] = filesFailed;
+        agg[QStringLiteral("durationMs")] = allTerminal ? durationSum : qint64(-1);
+        // The header's Undo button undoes every Done member at once
+        // (undoTask(batchId)); offer it iff at least one member is undoable.
+        agg[QStringLiteral("undoable")] = anyUndoable;
+        agg[QStringLiteral("members")] = group; // the per-task rows, for the expandable UI
+        out[slot] = agg;
+    }
+    return out;
+}
+
 QVariantList TranscriptionController::sortJobsForDisplay(const QVariantList &jobEntries)
 {
     QVariantList active;
@@ -4207,7 +4377,11 @@ QVariantList TranscriptionController::sortJobsForDisplay(const QVariantList &job
 
 QVariantList TranscriptionController::sortedJobs() const
 {
-    return sortJobsForDisplay(jobs());
+    // Collapse multi-select batches into one row each FIRST, then partition —
+    // so a batch lands in a single bucket by its aggregate status (see
+    // collapseBatches()), instead of scattering its members across
+    // active/queued/finished.
+    return sortJobsForDisplay(collapseBatches(jobs()));
 }
 
 QVariantList TranscriptionController::availableModels() const

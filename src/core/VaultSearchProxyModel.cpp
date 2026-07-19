@@ -19,6 +19,58 @@ VaultSearchProxyModel::VaultSearchProxyModel(QObject *parent)
     sort(0);
 }
 
+void VaultSearchProxyModel::setSourceModel(QAbstractItemModel *sourceModel)
+{
+    // Drop our own reset trackers from any previous source (NOT the base
+    // class's connections — those bind the source's private slots to `this`
+    // and the base manages them itself; disconnecting by our named slots leaves
+    // them untouched).
+    if (QAbstractItemModel *old = this->sourceModel()) {
+        disconnect(old, &QAbstractItemModel::modelAboutToBeReset, this,
+                   &VaultSearchProxyModel::onSourceAboutToBeReset);
+        disconnect(old, &QAbstractItemModel::modelReset, this, &VaultSearchProxyModel::onSourceReset);
+    }
+
+    QSortFilterProxyModel::setSourceModel(sourceModel);
+
+    if (sourceModel) {
+        // Connected AFTER the base's setSourceModel wired its own reset slots,
+        // so onSourceReset() fires AFTER the base has remapped onto the fresh
+        // tree — the deferred invalidate() below therefore never sees a stale
+        // mapping.
+        connect(sourceModel, &QAbstractItemModel::modelAboutToBeReset, this,
+                &VaultSearchProxyModel::onSourceAboutToBeReset);
+        connect(sourceModel, &QAbstractItemModel::modelReset, this, &VaultSearchProxyModel::onSourceReset);
+    }
+}
+
+void VaultSearchProxyModel::onSourceAboutToBeReset()
+{
+    m_sourceResetting = true;
+}
+
+void VaultSearchProxyModel::onSourceReset()
+{
+    m_sourceResetting = false;
+    if (m_invalidateDeferred) {
+        m_invalidateDeferred = false;
+        invalidate();
+    }
+}
+
+void VaultSearchProxyModel::invalidateUnlessResetting()
+{
+    // See the header for why an invalidate() mid-source-reset segfaults. A
+    // reset already re-filters/re-sorts the whole proxy off the new tree, so
+    // during one we only need to guarantee a final invalidate() lands once the
+    // reset settles and the new property value (already stored by the caller)
+    // is in effect — hence deferring rather than dropping it.
+    if (m_sourceResetting)
+        m_invalidateDeferred = true;
+    else
+        invalidate();
+}
+
 QString VaultSearchProxyModel::searchQuery() const
 {
     return m_searchQuery;
@@ -30,7 +82,7 @@ void VaultSearchProxyModel::setSearchQuery(const QString &query)
         return;
     m_searchQuery = query;
     emit searchQueryChanged();
-    invalidate();
+    invalidateUnlessResetting();
 }
 
 bool VaultSearchProxyModel::includeTranscriptions() const
@@ -44,7 +96,7 @@ void VaultSearchProxyModel::setIncludeTranscriptions(bool include)
         return;
     m_includeTranscriptions = include;
     emit includeTranscriptionsChanged();
-    invalidate();
+    invalidateUnlessResetting();
 }
 
 QStringList VaultSearchProxyModel::tagFilter() const
@@ -58,7 +110,7 @@ void VaultSearchProxyModel::setTagFilter(const QStringList &tags)
         return;
     m_tagFilter = tags;
     emit tagFilterChanged();
-    invalidate();
+    invalidateUnlessResetting();
 }
 
 QStringList VaultSearchProxyModel::speakerFilter() const
@@ -72,7 +124,7 @@ void VaultSearchProxyModel::setSpeakerFilter(const QStringList &speakers)
         return;
     m_speakerFilter = speakers;
     emit speakerFilterChanged();
-    invalidate();
+    invalidateUnlessResetting();
 }
 
 QVariantMap VaultSearchProxyModel::fileSortKeys() const
@@ -86,7 +138,7 @@ void VaultSearchProxyModel::setFileSortKeys(const QVariantMap &keys)
         return;
     m_fileSortKeys = keys;
     emit fileSortKeysChanged();
-    invalidate();
+    invalidateUnlessResetting();
 }
 
 bool VaultSearchProxyModel::filterAcceptsRow(int sourceRow, const QModelIndex &sourceParent) const

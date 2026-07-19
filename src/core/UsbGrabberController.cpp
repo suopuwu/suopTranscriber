@@ -113,6 +113,14 @@ void UsbGrabberController::setTranscriptionController(TranscriptionController *c
     emit transcriptionControllerChanged();
 }
 
+void UsbGrabberController::setCombineRules(const QVariantList &rules)
+{
+    if (rules == m_combineRules)
+        return;
+    m_combineRules = rules;
+    emit combineRulesChanged();
+}
+
 void UsbGrabberController::setLastError(const QString &error)
 {
     if (error == m_lastError)
@@ -312,7 +320,7 @@ void UsbGrabberController::startGrabJob(const UsbGrabRule &rule, const QString &
     const QString destinationPath = resolveDestinationPath(rule);
     const int jobId = m_transcriptionController->enqueueUsbGrab(
         rule, mountPath, QUrl::fromLocalFile(destinationPath),
-        QUrl::fromLocalFile(m_vaultTreeModel->vaultLocalPath()), autoTriggered);
+        QUrl::fromLocalFile(m_vaultTreeModel->vaultLocalPath()), autoTriggered, m_combineRules);
 
     m_inFlightJobs.insert(jobId, InFlightGrab { rule.deviceSerial, rule.deviceLabel, autoTriggered });
     if (autoTriggered)
@@ -476,6 +484,6 @@ void UsbGrabberController::requestGrabPreview(const QString &deviceSerial)
                         setLastError(*firstError);
                     emit grabPreviewReady(deviceSerial, *combined, *firstError);
                 });
-        job->start(rule, mountPath, resolveDestinationPath(rule));
+        job->start(rule, mountPath, resolveDestinationPath(rule), m_combineRules);
     }
 }

@@ -406,11 +406,26 @@ ColumnLayout {
         title: qsTr("Run a large sweep?")
         standardButtons: Dialog.Ok | Dialog.Cancel
         onAccepted: benchmarkPage.runDiarizationSweep(diarizationConfirmDialog.pendingCombos)
-        contentItem: Label {
-            wrapMode: Text.WordWrap
-            text: qsTr("This runs %1 diarization tests over the file — each loads models and runs a full "
-                       + "pass, so it can take a while. Continue?").arg(diarizationConfirmDialog.pendingCombos.length)
-            color: "white"
+        // Break the Dialog implicitWidth binding loop by giving the content a
+        // CONSTANT implicitWidth (320) that has no dependency to feed back: a
+        // bare WordWrap Label as contentItem reports its full unwrapped
+        // implicitWidth, which the Dialog sizes to, which changes the wrap,
+        // which changes the implicitWidth — the loop. The wrapper Item pins
+        // implicitWidth to 320 (a literal, not derived from the Label), and the
+        // Label just fills that fixed width and wraps within it. (contentWidth
+        // and Layout.maximumWidth both only downgraded the loop to a warning,
+        // since the Dialog still read the Label's own implicitWidth.)
+        contentItem: Item {
+            implicitWidth: 320
+            implicitHeight: sweepConfirmLabel.implicitHeight
+            Label {
+                id: sweepConfirmLabel
+                width: parent.width
+                wrapMode: Text.WordWrap
+                text: qsTr("This runs %1 diarization tests over the file — each loads models and runs a full "
+                           + "pass, so it can take a while. Continue?").arg(diarizationConfirmDialog.pendingCombos.length)
+                color: "white"
+            }
         }
     }
 

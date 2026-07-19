@@ -179,6 +179,29 @@ then emits ONE snackbar (`batchUndoLabel(k)` → "Moved 5 files") whose undo
 enqueues every member's inverse as a fresh one-snackbar-undoable batch — so N
 moves are one reversible action, not N.
 
+**A batch is also ONE row, not N** (`sortedJobs()` runs `collapseBatches()`
+before partitioning). Every multi-select op is now enqueued as a batch — not
+just move but the bulk ASR ops too (`transcribeAll`/`relabelAll`/
+`generateChaptersAll`/`diarizeFilesForPaths`/`runAllJobsForPaths`), each via
+`withBatch()`, which allocates the shared batchId and sets `m_currentBatchId`
+so `enqueueTask()` stamps it onto the task it inserts (NOT onto the prerequisite
+downloads it queues ahead — a shared prereq belongs to no one batch). The tasks
+still run/report/persist **individually** — one-at-a-time warm-model reuse, the
+per-file tree status dots (`m_jobStatusIndex`), per-file cancel — none of which
+a monolithic "N files in one task" could express; the collapse is purely at the
+DISPLAY layer. `collapseBatches()` (a pure transform, like `sortJobsForDisplay`)
+folds a batch's rows into one aggregate row: `isBatch`, a `members` list (the
+per-task rows, for the expandable BottomBar delegate), `batchCount` = distinct
+files (so a run-all's several-tasks-per-file still reads "5 files"),
+`batchDoneCount`, an any-active-wins aggregate `status`, and a summed duration
+once terminal. A batch of ONE member renders flat (no "1 file" row). The
+collapsed row's label is the members' shared `kindLabel` ("Transcribe"/"Move"/…)
+or an explicit one for a mixed-kind batch ("Run all", passed to `withBatch()`
+and carried in `m_batchLabels`). Its single close button drives `cancelBatch()`/
+`dismissBatch()` (whole-batch); expanding it exposes the per-file rows with
+their own cancel. Trash/delete are already ONE multi-file task (atomic, no
+per-file lifecycle), so they render as one row for free — same visual language.
+
 **Trash / delete / restore** are instant-lane tasks too — `TrashTask`,
 `DeleteTask`, `RestoreTask` over the four `VaultFileScope`s (files / transcript /
 audio-only / folder). The pure filesystem work lives in `VaultFileOps.h`
@@ -256,7 +279,10 @@ tripwire that fails if a new persistable kind is added without a factory branch
   cancelled-while-Queued job, so a consumer waiting on the result never heard
   back (`UsbGrabberController` had to reconcile against the queue to notice).
 - **Everything queued gets a Tasks row. No exceptions.** A task is never
-  invisible. `Task::Presentation` (`Foreground`/`Background`) controls only
+  invisible — though the members of one multi-select batch share a single
+  *collapsed* row (expandable to the per-task rows; see `collapseBatches()`
+  above), so "a row" can mean "one expandable batch row" without any task going
+  unrepresented. `Task::Presentation` (`Foreground`/`Background`) controls only
   whether it *also* raises MainPanel's blocking overlay — NOT whether it
   appears in the list or drives the bottom-bar glow. A benchmark is
   `Background`: real queued task, real row + glow, no overlay over the
@@ -572,7 +598,13 @@ the overview, not a duplicate of it.
   vault's audio was recorded in place or copied off an SD card.
 - **`outputPath`** is derived from (sanitized rule name, sanitized key) — not
   from any one member's filename — so it stays re-derivable from a single
-  surviving filename after the other parts have moved into `.combined/`.
+  surviving filename after the other parts have moved into `.combined/`. The
+  readable form is `<rule> - <key>.combined.<ext>`, e.g. `Acme Mic 3 - 20260710
+  edit.combined.wav`: spaces are allowed in the name, the rule and key are
+  joined with ` - `, and the key's capture groups are space-joined with a
+  consecutive-duplicate collapsed (a rule that captures the same token twice
+  yields `… edit`, not `… edit edit`). The naming is the single source of
+  truth in `CombineNaming.h` (shared with the USB grabber — see below).
 - **Group status** is one of `ready`, `singleton` (only one match),
   `alreadyTranscribed` (a member already has a sibling `.md` — never silently
   discard existing work), `alreadyCombined` (output already on disk), or
@@ -714,6 +746,24 @@ the overview, not a duplicate of it.
   same-named-but-different file — appends a numeric suffix instead). A plain
   synchronous function over its inputs that knows nothing about threads, the
   queue, or history entries — it walks, it copies, it returns what happened.
+- **Already-combined parts are skipped too**, not just already-present ones.
+  After a combine the original parts leave the vault — they move into the hidden
+  `.combined/` (which the quick-check index doesn't walk) or are deleted
+  outright with `deleteOriginalsAfterCombine` — so the quick-check alone would
+  see them as absent and re-grab them, re-triggering the merge and doubling the
+  disk use. So for each candidate the walk also recomputes the merged-output
+  name the combiner *would* produce from that filename (via `CombineNaming.h`,
+  the same `matchRuleCapturedKey`/`combineOutputPathFor` the combiner and
+  `maybeRedirectForCombine()` use — first matching rule wins) and skips the file
+  as a duplicate if that output already exists beside where it would land. This
+  covers both the move and the delete disposition with **no persisted grab
+  ledger** (a ledger would grow without bound). The combine rules come from
+  `AppSettings.combineRules`, threaded from QML through
+  `UsbGrabberController.combineRules` into every grab and preview — deliberately
+  NOT `TranscriptionController::m_combineRules`, which is a cache that's empty
+  until the first combine scan and reset each launch, so it would miss a device
+  replugged in a fresh session. When no combine rules are configured the check
+  is inert and the plain quick-check dedup stands alone.
   Triggered either manually (`UsbGrabberController::triggerManualGrab()`) or
   automatically on hotplug when the two gates above both pass and a vault is
   open — auto-grabs always target whichever vault is open at that moment, never

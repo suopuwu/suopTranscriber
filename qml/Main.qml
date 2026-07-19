@@ -68,6 +68,10 @@ ApplicationWindow {
         // so they share one queue (and one disk) with transcribes/imports
         // rather than racing them — see UsbGrabberController's class doc.
         transcriptionController: transcriptionController
+        // So a grab skips parts whose split-recording group was already
+        // combined (persisted per-vault, unlike the C++-side cache) — see
+        // UsbGrabJob.h's runUsbGrabScan() doc comment.
+        combineRules: AppSettings.combineRules
     }
 
     // A grab is invisible unless the USB Grabber page happens to be open — and
@@ -146,7 +150,13 @@ ApplicationWindow {
     // when useSystemTitlebar is on, a window-manager close request — since
     // they all funnel through this ONE signal, not just TitleBar.qml's
     // button.
-    onClosing: transcriptionController.terminateApplicationImmediately()
+    onClosing: {
+        // Flush any debounced settings save before the hard ::_exit(0) below —
+        // that exit never lets AppSettings' saveTimer fire, so a setting changed
+        // in the last ~250ms before closing would otherwise be lost.
+        AppSettings.flushPendingSave()
+        transcriptionController.terminateApplicationImmediately()
+    }
 
     function openVaultDialog() {
         if (vaultModel.vaultPath.toString() !== "")
