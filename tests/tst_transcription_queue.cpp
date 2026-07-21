@@ -2492,9 +2492,11 @@ private slots:
         // Seed the cached scan inputs maybeRedirectForCombine() re-checks (the
         // friend seam lets the test set these directly, WITHOUT enqueuing the
         // combine job itself — runCombineScan() would have pre-queued it).
-        controller.m_combineRules = rules;
-        controller.m_combineAudioPaths = audioPaths;
-        controller.m_combineDeleteOriginals = false;
+        // The combine scan-input cache moved to the scheduler (PHASE Q). The
+        // test is a friend of both, so it seeds them directly there.
+        controller.m_scheduler->m_combineRules = rules;
+        controller.m_scheduler->m_combineAudioPaths = audioPaths;
+        controller.m_scheduler->m_combineDeleteOriginals = false;
 
         controller.transcribe(frag1Url, vault.vaultUrl, kModelId);
 

@@ -417,28 +417,19 @@ TranscriptionController::TranscriptionController(QObject *parent)
         recomputeOverallProgress();
     });
 
-    m_runner = new TaskRunner;
-    m_runner->moveToThread(&m_thread);
-    connect(&m_thread, &QThread::finished, m_runner, &QObject::deleteLater);
-    // The ONE terminal-report path from the runner. A task cancelled before
-    // it ever ran never reaches the runner at all — the queue synthesizes its
-    // report directly (see cancelTaskAt()), so BOTH routes converge here and
-    // every enqueued task reports exactly once. onTaskFinished() routes by the
-    // task's lane, so the instant runner shares this same handler.
-    connect(m_runner, &TaskRunner::taskFinished, this, &TranscriptionController::onTaskFinished);
-
-    // The instant lane (see Task::Lane / pumpQueues()): a second worker thread
-    // for fast Lane::Instant tasks so a rename never waits behind a serial
-    // transcription.
-    m_instantRunner = new TaskRunner;
-    m_instantRunner->moveToThread(&m_instantThread);
-    connect(&m_instantThread, &QThread::finished, m_instantRunner, &QObject::deleteLater);
-    connect(m_instantRunner, &TaskRunner::taskFinished, this, &TranscriptionController::onTaskFinished);
-
+    // PHASE Q: the display-blind queue engine. It owns the task list, the two
+    // worker threads/runners, and the pause/cancel intent; this class is its
+    // observer (all display + typed emits). Not parented to `this` so it's
+    // deleted (and its threads shut down) explicitly at the very top of the
+    // destructor, while this observer is still fully valid.
+    m_scheduler = new TaskScheduler(this);
+    // Re-emit the scheduler's every queue mutation as this class's own
+    // queueChanged — a DIRECT connection, so the ordering (and the synchronous
+    // persistQueue + rebuildJobStatusIndex below, which drive off THIS signal)
+    // is preserved exactly as when the queue lived here.
+    connect(m_scheduler, &TaskScheduler::queueChanged, this, &TranscriptionController::queueChanged);
     connect(this, &TranscriptionController::queueChanged, this, &TranscriptionController::persistQueue);
     connect(this, &TranscriptionController::queueChanged, this, &TranscriptionController::rebuildJobStatusIndex);
-    m_thread.start();
-    m_instantThread.start();
 }
 
 // Wires ONE task's signals to this controller. The generic ones (progress/
@@ -683,37 +674,13 @@ void TranscriptionController::connectTask(Task *task)
 
 TranscriptionController::~TranscriptionController()
 {
-    // Bug report (2026-07-09): "transcription was still running after
-    // closing the GUI... it should never run in the background". Root
-    // cause: m_thread.wait() below blocks the calling (GUI) thread until
-    // the worker thread's current call returns — but nothing was ever
-    // telling that call to stop, so closing the app while a job was
-    // Active made the WHOLE APPLICATION SHUTDOWN silently hang/block until
-    // whatever whisper.cpp/sherpa-onnx call was in flight happened to
-    // finish naturally (which, for a long recording, could be minutes),
-    // during which the transcription kept running exactly as if nothing
-    // had been closed at all. Requesting cancel first lets it unblock at
-    // the very next checkpoint the active job's phase supports (the same
-    // ones the pause/cancel UI feature already relies on — see
-    // TaskContext::checkpoint()'s doc comment for which phases those
-    // are), so shutdown is prompt instead of an indefinite silent hang.
-    // requestResume() wakes it first in case it was sitting paused, which
-    // would otherwise block forever waiting for a pause that will never be
-    // lifted by anyone once this destructor is running.
-    if (m_runner) {
-        m_runner->requestResume();
-        m_runner->requestCancel();
-    }
-    // The instant lane too — an instant task is fast, but cancel+resume it for
-    // symmetry so shutdown never blocks on one mid-rewrite.
-    if (m_instantRunner) {
-        m_instantRunner->requestResume();
-        m_instantRunner->requestCancel();
-    }
-    m_thread.quit();
-    m_instantThread.quit();
-    m_thread.wait();
-    m_instantThread.wait();
+    // The prompt-shutdown thread teardown (bug report 2026-07-09: never leave a
+    // transcription running after the GUI closes) moved into ~TaskScheduler with
+    // the threads. Delete it FIRST — explicitly, while this observer is still
+    // fully valid — so the requestCancel()+wait() runs before any of this
+    // class's own members are torn down.
+    delete m_scheduler;
+    m_scheduler = nullptr;
 }
 
 // The phase-timing subsystem lives in PhaseTimer now (2026-07-20) — the
@@ -737,10 +704,8 @@ double TranscriptionController::defaultPhaseDurationMs(const QString &phase)
 // phase()/phaseDurationMs() signal for that job.
 QString TranscriptionController::activeModelIdForTiming() const
 {
-    if (m_activeIndex >= 0 && m_activeIndex < static_cast<int>(m_tasks.size())) {
-        if (auto *t = qobject_cast<const TranscribeTask *>(m_tasks[m_activeIndex].get()))
-            return t->modelId();
-    }
+    if (auto *t = qobject_cast<const TranscribeTask *>(m_scheduler->activeTask()))
+        return t->modelId();
     return QString();
 }
 
@@ -762,9 +727,7 @@ void TranscriptionController::recomputeOverallProgress()
     // needs about the job shape — its ProgressModel and its ordered phase set
     // — so this never hardcodes a phase list that could drift against the
     // progress lambda's copy.
-    Task *task = (m_activeIndex >= 0 && m_activeIndex < static_cast<int>(m_tasks.size()))
-                     ? m_tasks[m_activeIndex].get()
-                     : nullptr;
+    Task *task = m_scheduler->activeTask();
     const bool weightedPhases =
         task && task->progressModel() == Task::ProgressModel::WeightedPhases;
     m_phaseTimer->recomputeOverallProgress(
@@ -775,13 +738,13 @@ void TranscriptionController::recomputeOverallProgress()
 
 bool TranscriptionController::isQueued(const QUrl &fileUrl) const
 {
-    return TaskQuery::isQueued(m_tasks, fileUrl);
+    return TaskQuery::isQueued(m_scheduler->tasks(), fileUrl);
 }
 
 void TranscriptionController::rebuildJobStatusIndex()
 {
     QHash<QString, Task::Status> rebuilt;
-    for (const auto &task : m_tasks) {
+    for (const auto &task : m_scheduler->tasks()) {
         if (task->fileUrl.isEmpty())
             continue; // download task — names no single vault file
         if (!task->occupiesFile())
@@ -834,45 +797,12 @@ bool TranscriptionController::matchesExistingTranscription(const QUrl &fileUrl, 
     return meta.value(QStringLiteral("model")).toString() == expectedFileName;
 }
 
-// The ONE way a task enters the queue — see the header doc comment.
+// The ONE way a task enters the queue — a thin forwarder to the scheduler (the
+// mechanics moved there; queuePrerequisites, run inside, calls back into
+// resolveDownloadPrerequisite() for the model knowledge).
 int TranscriptionController::enqueueTask(std::unique_ptr<Task> task, int insertIndex)
 {
-    int insertAt = (insertIndex < 0) ? frontOfQueueInsertIndex() : insertIndex;
-
-    // The models this kind declared it needs, each queued as its own
-    // DownloadTask ahead of it if absent. Every enqueue path gets this
-    // uniformly, from the kind's own prerequisites() — no site has to
-    // remember which downloads which kind wants.
-    queuePrerequisites(*task, task->vaultUrl, &insertAt);
-
-    task->id = m_nextJobId++;
-    // Stamp the active batch scope (0 = standalone). Set only inside a
-    // withBatch()/enqueueBatch() scope; the prerequisite downloads queued just
-    // above went through maybeQueueDownloadTask(), not this path, so they
-    // correctly stay standalone. See m_currentBatchId's doc comment.
-    task->batchId = m_currentBatchId;
-    task->status = Task::Status::Queued;
-    const int id = task->id;
-    m_tasks.insert(m_tasks.begin() + std::clamp(insertAt, 0, static_cast<int>(m_tasks.size())), std::move(task));
-    if (m_activeIndex >= insertAt)
-        ++m_activeIndex;
-
-    emit queueChanged();
-
-    // pumpQueues() dispatches the front-most runnable task in EACH lane, so a
-    // serial enqueue-while-idle starts here just as before, and an instant
-    // enqueue starts on the instant runner immediately (unless it conflicts
-    // with the active serial task on the same file).
-    pumpQueues();
-    return id;
-}
-
-void TranscriptionController::queuePrerequisites(const Task &task, const QUrl &vaultUrl, int *insertAt)
-{
-    for (const ModelPrerequisite &prereq : task.prerequisites()) {
-        if (maybeQueueDownloadTask(prereq.target, vaultUrl, prereq.modelId, *insertAt) >= 0)
-            ++(*insertAt);
-    }
+    return m_scheduler->enqueueTask(std::move(task), insertIndex);
 }
 
 void TranscriptionController::transcribe(const QUrl &fileUrl, const QUrl &vaultUrl, const QString &modelId,
@@ -907,7 +837,7 @@ void TranscriptionController::transcribeAll(const QVariantList &fileUrls, const 
     // row (empty label ⇒ derived from the members' "Transcribe" kindLabel).
     // Each transcribe() still applies its own Queued/Active dedup, so a
     // deduped-away file simply isn't a batch member.
-    withBatch(QString(), [&] {
+    m_scheduler->withBatch(QString(), [&] {
         for (const QVariant &v : fileUrls)
             transcribe(v.toUrl(), vaultUrl, modelId, autoLabel, restrictTagsToExisting, tagReuseBias,
                        wordiness);
@@ -965,7 +895,7 @@ void TranscriptionController::diarizeFilesForPaths(const QVariantList &fileUrls,
                                                    const QString &embeddingModelId, double sensitivity)
 {
     // One batch (derived "Detect speakers" label) — see transcribeAll().
-    withBatch(QString(), [&] {
+    m_scheduler->withBatch(QString(), [&] {
         for (const QVariant &v : fileUrls)
             diarizeFile(v.toUrl(), vaultUrl, segmentationModelId, embeddingModelId, sensitivity);
     });
@@ -997,7 +927,7 @@ void TranscriptionController::relabelAll(const QVariantList &fileUrls, const QUr
                                           bool restrictTagsToExisting, double tagReuseBias, double wordiness)
 {
     // One batch (derived "Label" label) — see transcribeAll().
-    withBatch(QString(), [&] {
+    m_scheduler->withBatch(QString(), [&] {
         for (const QVariant &v : fileUrls)
             relabel(v.toUrl(), vaultUrl, restrictTagsToExisting, tagReuseBias, wordiness);
     });
@@ -1015,7 +945,7 @@ void TranscriptionController::generateChapters(const QUrl &fileUrl, const QUrl &
 void TranscriptionController::generateChaptersAll(const QVariantList &fileUrls, const QUrl &vaultUrl, double density)
 {
     // One batch (derived "Generate chapters" label) — see transcribeAll().
-    withBatch(QString(), [&] {
+    m_scheduler->withBatch(QString(), [&] {
         for (const QVariant &v : fileUrls)
             generateChapters(v.toUrl(), vaultUrl, density);
     });
@@ -1061,9 +991,9 @@ void TranscriptionController::runAllJobs(const QUrl &fileUrl, const QUrl &vaultU
         // Count what enqueueTask() actually inserted (the task + however many
         // prerequisite downloads it queued ahead of it) so the next step lands
         // after all of it.
-        const int before = static_cast<int>(m_tasks.size());
+        const int before = static_cast<int>(m_scheduler->tasks().size());
         enqueueTask(std::move(task), insertAt);
-        insertAt += static_cast<int>(m_tasks.size()) - before;
+        insertAt += static_cast<int>(m_scheduler->tasks().size()) - before;
     };
 
     // (1) transcribe (pure ASR) — skipped if already transcribed.
@@ -1097,56 +1027,38 @@ void TranscriptionController::runAllJobsForPaths(const QVariantList &fileUrls, c
     // label/chapters), so there's no single kindLabel to derive from; the
     // collapsed row's file count comes from the distinct fileUrls, not the task
     // count (see collapseBatches()).
-    withBatch(QStringLiteral("Run all"), [&] {
+    m_scheduler->withBatch(QStringLiteral("Run all"), [&] {
         for (const QVariant &v : fileUrls)
             runAllJobs(v.toUrl(), vaultUrl, modelId, restrictTagsToExisting, tagReuseBias, wordiness, chapterDensity,
                        segmentationModelId, embeddingModelId, sensitivity);
     });
 }
 
-void TranscriptionController::startTask(int index)
+// --- TaskSchedulerObserver: serial start (verbatim the old startTask display
+// block, minus the scheduler mechanics). Golden emission order; connectTask
+// (which emits nothing) runs at the end, before the scheduler's queueChanged.
+void TranscriptionController::onSerialTaskStarting(Task *task, bool wasCancelling)
 {
-    // Safety-net preflight, before any state mutation below — see
-    // maybeRedirectForCombine()'s doc comment. A true return means it already
-    // recursed onto whatever should run instead (a newly-inserted combine
-    // task); this call contributes nothing further.
-    if (maybeRedirectForCombine(index))
-        return;
-
-    m_activeIndex = index;
-    Task *task = m_tasks[index].get();
-    task->status = Task::Status::Active;
-    task->error.clear();
-
-    // A pause/cancel left over from whatever the PREVIOUS task did must never
-    // leak into this one. Elapsed-time tracking (activeElapsedMs()) restarts
-    // from zero for every new Active task.
-    m_runner->resetControl();
     m_activePaused = false;
     emit activePausedChanged();
-    if (m_activeCancelling) {
-        m_activeCancelling = false;
+    if (wasCancelling)
         emit activeStoppingChanged();
-    }
+    // Elapsed-time tracking (activeElapsedMs()) restarts from zero for every new
+    // Active task.
     m_activeAccumulatedMs = 0;
     m_activeSegmentTimer.start();
     m_phaseTimer->setOverallProgress(0.0);
-    // See recomputeOverallProgress()'s doc comment — true ONLY for a
-    // "diarize" task, whose progress bar is weighted around the
-    // detecting-speakers phase. A "transcribe" task is pure ASR (its bar is
-    // weighted around loading/decoding/detecting-speech/transcribing). Every
-    // other kind never emits one of those phases at all, so this is simply
-    // never read for them.
+    // See recomputeOverallProgress()'s doc comment — true ONLY for a "diarize"
+    // task, whose progress bar is weighted around the detecting-speakers phase.
     m_activeSpeakerDetection = task->kind() == QStringLiteral("diarize");
     m_phaseStartMs = 0;
     m_indeterminatePhaseTimer->stop();
 
     m_busy = true;
     emit busyChanged();
-    // Presentation, not m_busy, is what decides the main-panel overlay now —
-    // so a Background task (benchmark/sweep/download) gets a Tasks row + the
-    // glow without hijacking the panel the user is reading, which is exactly
-    // what the old benchmark side-door existed to work around.
+    // Presentation, not m_busy, decides the main-panel overlay: a Background
+    // task (benchmark/sweep/download) gets a Tasks row + glow without hijacking
+    // the panel the user is reading.
     const bool foreground = task->presentation() == Task::Presentation::Foreground;
     if (m_activeIsForeground != foreground) {
         m_activeIsForeground = foreground;
@@ -1154,124 +1066,34 @@ void TranscriptionController::startTask(int index)
     }
     m_progress = 0.0;
     emit progressChanged();
-    // Cleared here (not just at the end of the previous task) so a kind that
-    // never emits phase() at all doesn't inherit a stale phase left over from
-    // an earlier one.
+    // Cleared so a kind that never emits phase() doesn't inherit a stale phase.
     m_phase.clear();
     emit currentPhaseChanged();
     m_currentFile = task->fileUrl;
     emit currentFileChanged();
     emit currentJobKindChanged();
-    emit queueChanged();
 
-    // Connected exactly once, on first dispatch. A Paused task that resumes
-    // re-enters startTask(), so guard against double-wiring (which would
-    // double-count every progress tick).
+    // Connected exactly once, on first dispatch (a resumed Paused task re-enters
+    // this, so guard against double-wiring). Emits nothing.
     if (!m_connectedTasks.contains(task)) {
         m_connectedTasks.insert(task);
         connectTask(task);
     }
-
-    // The ENTIRE dispatch, for every kind. This replaced a 10-branch if/else
-    // that marshalled each kind's own argument list into a string-named worker
-    // slot — the single biggest reason adding a kind meant editing five
-    // disjoint sites. Now the kind IS the object.
-    QMetaObject::invokeMethod(m_runner, "execute", Qt::QueuedConnection, Q_ARG(Task *, task));
 }
 
-bool TranscriptionController::serialActiveConflictsWith(const QUrl &fileUrl) const
+// --- TaskSchedulerObserver: instant start. Just the connectTask guard — an
+// instant task never touches the serial-lane display state.
+void TranscriptionController::onInstantTaskStarting(Task *task)
 {
-    return m_activeIndex >= 0 && m_activeIndex < static_cast<int>(m_tasks.size()) && !fileUrl.isEmpty()
-        && isSameRecording(m_tasks[m_activeIndex]->fileUrl, fileUrl);
-}
-
-void TranscriptionController::pumpQueues()
-{
-    const int n = static_cast<int>(m_tasks.size());
-
-    // --- Serial lane: one at a time, Paused (resume) before Queued. ---
-    if (m_activeIndex < 0) {
-        int next = -1;
-        for (int i = 0; i < n; ++i) {
-            if (m_tasks[i]->lane() == Task::Lane::Serial && m_tasks[i]->status == Task::Status::Paused) {
-                next = i;
-                break;
-            }
-        }
-        if (next < 0) {
-            for (int i = 0; i < n; ++i) {
-                if (m_tasks[i]->lane() == Task::Lane::Serial && m_tasks[i]->status == Task::Status::Queued) {
-                    next = i;
-                    break;
-                }
-            }
-        }
-        if (next >= 0)
-            startTask(next); // may recurse (combine preflight) and set m_activeIndex
-    }
-
-    // --- Instant lane: one at a time, front-most Queued Instant task with no
-    // file conflict against the ACTIVE serial task. ---
-    if (!m_instantActive) {
-        for (int i = 0; i < static_cast<int>(m_tasks.size()); ++i) {
-            Task *t = m_tasks[i].get();
-            if (t->lane() == Task::Lane::Instant && t->status == Task::Status::Queued
-                && !serialActiveConflictsWith(t->fileUrl)) {
-                startInstantTask(i);
-                break;
-            }
-        }
-    }
-}
-
-void TranscriptionController::startInstantTask(int index)
-{
-    Task *task = m_tasks[index].get();
-    task->status = Task::Status::Active;
-    task->error.clear();
-    m_instantActive = task;
-
-    // Connected once, like a serial task — for its typed result signals
-    // (speakerRenamed etc.). connectTask() no-ops the serial-only progress/
-    // phase/paused wiring for an Instant task (see there).
     if (!m_connectedTasks.contains(task)) {
         m_connectedTasks.insert(task);
         connectTask(task);
     }
-    emit queueChanged(); // status -> active shows in the Tasks list
-
-    m_instantRunner->resetControl();
-    QMetaObject::invokeMethod(m_instantRunner, "execute", Qt::QueuedConnection, Q_ARG(Task *, task));
 }
 
-int TranscriptionController::indexOfTask(const Task *task) const
+// --- TaskSchedulerObserver: serial finish phase 1 ("active work ended").
+void TranscriptionController::onSerialActiveEnded(bool wasStopping)
 {
-    return TaskQuery::indexOfTask(m_tasks, task);
-}
-
-void TranscriptionController::onTaskFinished(Task *task, bool ok, const QString &error)
-{
-    // Instant lane (see Task::Lane / startInstantTask()): a separate, parallel
-    // path that never touched the serial-lane UI state (m_busy/currentFile/
-    // phase/overlay), so its completion doesn't either — it just records the
-    // terminal status, emits the one report, and re-pumps (a serial task that
-    // finishes may now unblock a same-file instant task, and vice versa).
-    if (task == m_instantActive) {
-        m_instantActive = nullptr;
-        const QUrl finishedFile = task->fileUrl;
-        if (indexOfTask(task) >= 0) {
-            task->status = ok ? Task::Status::Done : Task::Status::Failed;
-            task->error = error;
-            task->durationMs = 0; // instant by construction — no elapsed tracking
-        }
-        emit queueChanged();
-        emit finished(finishedFile, ok, error, task->isStructuralFileOp());
-        if (indexOfTask(task) >= 0)
-            maybeEmitUndoAvailable(task, ok); // fires per terminal; batch-aware
-        pumpQueues();
-        return;
-    }
-
     m_busy = false;
     emit busyChanged();
     if (m_activeIsForeground) {
@@ -1281,279 +1103,103 @@ void TranscriptionController::onTaskFinished(Task *task, bool ok, const QString 
     // A task that fails/gets cancelled mid-"loading"/"decoding" never gets
     // another phase() signal to naturally stop this.
     m_indeterminatePhaseTimer->stop();
-    const QUrl finishedFile = m_currentFile;
-
-    // Same requestCancel()->TaskError("Cancelled") mechanism as a real cancel,
-    // distinguished only by this flag, which togglePauseActive() sets right
-    // before triggering it (a pause during the unhookable "loading" phase).
-    const bool wasStopping = m_pausingActiveAsRestart;
-    const bool pausedAsRestart = m_pausingActiveAsRestart && !ok && error == QStringLiteral("Cancelled");
-    m_pausingActiveAsRestart = false;
+    // Snapshot the finishing file so the terminal finished() report names it
+    // even after pumpQueues() has moved m_currentFile on to the next task.
+    m_finishingFileUrl = m_currentFile;
     if (wasStopping)
         emit activeStoppingChanged();
-
-    const int taskIndex = indexOfTask(task);
-    if (taskIndex >= 0) {
-        if (pausedAsRestart) {
-            task->status = Task::Status::Paused;
-            task->error.clear();
-        } else {
-            task->status = ok ? Task::Status::Done : Task::Status::Failed;
-            task->error = error;
-            // Snapshot active-work elapsed time (excludes any paused stretches
-            // — see activeElapsedMs()) as this task's final duration, shown in
-            // the Tasks popup's history rows. Left unset (-1) for a Paused
-            // task — it isn't finished.
-            task->durationMs = activeElapsedMs();
-            // Any task whose completion changes the on-disk model set (a landed
-            // download, a successful model import) refreshes the Models page —
-            // ONE central emit keyed off Task::completionChangesModelSet(),
-            // rather than a per-kind check here plus another in the ModelIoTask
-            // wiring.
-            if (ok && task->completionChangesModelSet())
-                emit modelsChanged();
-            // A benchmark / diarization-sweep that throws BEFORE emitting its
-            // run-finished summary (a decode failure, or an engine that throws
-            // mid-sweep) otherwise pins the Benchmark page on "Running…"
-            // forever: the page clears that state off benchmarkFinished /
-            // diarizationBenchmarkFinished, which never arrives on the throw
-            // path, and benchmarkFailed had no emit site at all. Surface it so
-            // the page resets and shows why. A user cancel already reported
-            // itself via the run-finished summary (cancelled=true) before
-            // throwing "Cancelled", so skip that to avoid a double report
-            // clobbering the "Cancelled." status.
-            const QString failedKind = task->kind();
-            if (!ok && error != QStringLiteral("Cancelled")
-                && (failedKind == QStringLiteral("benchmark")
-                    || failedKind == QStringLiteral("diarizationSweep")))
-                emit benchmarkFailed(error);
-        }
-    }
-    m_activeIndex = -1;
-    m_activePaused = false;
-    emit activePausedChanged();
-    if (m_activeCancelling) {
-        m_activeCancelling = false;
-        emit activeStoppingChanged();
-    }
-
-    if (pausedAsRestart) {
-        // Deliberately do NOT advance to the next Queued task — the Paused
-        // task sits at the front until the user explicitly resumes it
-        // (startNext() prioritizes any Paused task over Queued ones).
-        m_currentFile = QUrl();
-        emit currentFileChanged();
-        emit currentJobKindChanged();
-        emit queueChanged();
-        QMetaObject::invokeMethod(m_runner, "evictIdle", Qt::QueuedConnection);
-        emit finished(finishedFile, ok, error);
-        return;
-    }
-
-    // Advance both lanes (a just-finished serial task may unblock a same-file
-    // instant task). pumpQueues() starts the next serial task if any.
-    pumpQueues();
-    if (m_activeIndex < 0) {
-        // Serial queue drained — clear the "what's running" UI and release the
-        // warm engine the finished task was using.
-        m_currentFile = QUrl();
-        emit currentFileChanged();
-        emit currentJobKindChanged();
-        emit queueChanged();
-        QMetaObject::invokeMethod(m_runner, "evictIdle", Qt::QueuedConnection);
-    }
-
-    emit finished(finishedFile, ok, error, task->isStructuralFileOp());
-    // Fires on EVERY terminal (Done or Failed) so a batch can detect its last
-    // member; the standalone path inside still gates on ok. A Paused task
-    // isn't terminal, so skip it.
-    if (taskIndex >= 0 && !pausedAsRestart)
-        maybeEmitUndoAvailable(task, ok);
 }
 
-void TranscriptionController::maybeEmitUndoAvailable(const Task *task, bool ok)
+// --- TaskSchedulerObserver: serial finish phase 2 ("terminal status reached").
+// Fires the central modelsChanged / benchmarkFailed emits, returns the task's
+// final active-work duration for the scheduler to stamp.
+qint64 TranscriptionController::onSerialTaskTerminal(Task *task, bool ok, const QString &error)
 {
-    // --- Batch member: one snackbar for the whole set, fired by the LAST
-    // member to finish. ---
-    if (task->batchId != 0) {
-        const int batchId = task->batchId;
-        int undoableDone = 0;
-        int labelMemberIndex = -1;
-        for (int i = 0; i < static_cast<int>(m_tasks.size()); ++i) {
-            const Task *t = m_tasks[i].get();
-            if (t->batchId != batchId)
-                continue;
-            if (t->status != Task::Status::Done && t->status != Task::Status::Failed)
-                return; // a sibling is still pending — this isn't the last one
-            if (t->status == Task::Status::Done && t->makeUndoTask()) {
-                ++undoableDone;
-                labelMemberIndex = i; // any member of the kind can author the label
-            }
-        }
-        // All members are terminal (cancelled-while-queued ones were removed
-        // from m_tasks entirely, so they simply don't appear here). Emit once,
-        // iff at least one member actually landed something undoable.
-        if (undoableDone > 0 && labelMemberIndex >= 0)
-            emit undoAvailable(batchId, m_tasks[labelMemberIndex]->batchUndoLabel(undoableDone));
-        return;
-    }
+    // Any task whose completion changes the on-disk model set (a landed
+    // download, a successful model import) refreshes the Models page — ONE
+    // central emit keyed off Task::completionChangesModelSet().
+    if (ok && task->completionChangesModelSet())
+        emit modelsChanged();
+    // A benchmark / diarization-sweep that throws BEFORE emitting its
+    // run-finished summary otherwise pins the Benchmark page on "Running…"
+    // forever. A user cancel already reported via the summary, so skip it.
+    const QString failedKind = task->kind();
+    if (!ok && error != QStringLiteral("Cancelled")
+        && (failedKind == QStringLiteral("benchmark") || failedKind == QStringLiteral("diarizationSweep")))
+        emit benchmarkFailed(error);
+    // Active-work elapsed (excludes paused stretches — see activeElapsedMs()).
+    // Read while the scheduler's active slot is still this task (m_activeIndex
+    // not yet cleared), matching the old timing.
+    return activeElapsedMs();
+}
 
-    // --- Standalone task: undoable iff it succeeded AND advertises a label
-    // AND can build its inverse (see Task::undoLabel/makeUndoTask). We build
-    // the inverse here only to confirm it exists, then discard it — undoTask()
-    // rebuilds it on click, so the snackbar never holds a live Task. ---
-    if (!ok)
-        return;
-    const QString label = task->undoLabel();
-    if (label.isEmpty() || !task->makeUndoTask())
-        return;
-    emit undoAvailable(task->id, label);
+// --- TaskSchedulerObserver: serial finish phase 3 ("active slot cleared").
+void TranscriptionController::onSerialActiveCleared(bool wasCancelling)
+{
+    m_activePaused = false;
+    emit activePausedChanged();
+    if (wasCancelling)
+        emit activeStoppingChanged();
+}
+
+// --- TaskSchedulerObserver: queue idle drain. Clears the "what's running" UI.
+void TranscriptionController::onQueueDrained()
+{
+    m_currentFile = QUrl();
+    emit currentFileChanged();
+    emit currentJobKindChanged();
+}
+
+// --- TaskSchedulerObserver: the terminal finished() report. threeArg
+// reproduces the pausedAsRestart branch's 3-arg emit (omits structural).
+void TranscriptionController::reportSerialFinished(bool ok, const QString &error, bool structural, bool threeArg)
+{
+    if (threeArg)
+        emit finished(m_finishingFileUrl, ok, error);
+    else
+        emit finished(m_finishingFileUrl, ok, error, structural);
+}
+
+// --- TaskSchedulerObserver: the instant lane's terminal finished() report.
+void TranscriptionController::reportInstantFinished(Task *task, const QUrl &finishedFile, bool ok,
+                                                    const QString &error)
+{
+    emit finished(finishedFile, ok, error, task->isStructuralFileOp());
+}
+
+// --- TaskSchedulerObserver: the undo-snackbar emit. The scheduler computes the
+// token+label from queue state (maybeEmitUndoAvailable); this only emits.
+void TranscriptionController::emitUndoAvailable(int token, const QString &label)
+{
+    emit undoAvailable(token, label);
 }
 
 void TranscriptionController::undoTask(int token)
 {
-    // A batch token: undo every Done member of the batch as ONE fresh batch
-    // (so the undo is itself a single-snackbar-undoable action). batchId and
-    // task id share the m_nextJobId counter, so a non-zero token is
-    // unambiguously one or the other — try the batch interpretation first.
-    if (token != 0) {
-        std::vector<std::unique_ptr<Task>> inverses;
-        for (const auto &task : m_tasks) {
-            if (task->batchId == token && task->status == Task::Status::Done) {
-                if (auto inverse = task->makeUndoTask())
-                    inverses.push_back(std::move(inverse));
-            }
-        }
-        if (!inverses.empty()) {
-            enqueueBatch(std::move(inverses));
-            return;
-        }
-    }
-
-    // Otherwise a standalone task id.
-    for (const auto &task : m_tasks) {
-        if (task->id != token || task->status != Task::Status::Done)
-            continue;
-        std::unique_ptr<Task> inverse = task->makeUndoTask();
-        if (inverse)
-            enqueueTask(std::move(inverse), static_cast<int>(m_tasks.size()));
-        return;
-    }
+    m_scheduler->undoTask(token);
 }
 
-int TranscriptionController::enqueueBatch(std::vector<std::unique_ptr<Task>> tasks, const QString &displayLabel)
+// --- TaskSchedulerObserver: forget a task the scheduler is erasing, from the
+// connectTask wired-once guard (heap reuse would otherwise falsely read as
+// already-connected).
+void TranscriptionController::onTaskRemoved(Task *task)
 {
-    if (tasks.empty())
-        return 0;
-    // One shared id for the whole batch, drawn from the SAME counter as task
-    // ids (assigned inside enqueueTask) so it can never collide with one —
-    // that's what lets undoTask()/maybeEmitUndoAvailable()/collapseBatches()
-    // treat a single int token as either a task id or a batch id unambiguously.
-    // The stamping goes through m_currentBatchId (enqueueTask reads it), the
-    // same scope withBatch() uses, so both batch paths are identical.
-    int batchId = 0;
-    withBatch(displayLabel, [&] {
-        batchId = m_currentBatchId;
-        for (auto &task : tasks) {
-            // Append in order (like the speaker edits / renameFile) so a
-            // batch's members run in the order the user selected them.
-            enqueueTask(std::move(task), static_cast<int>(m_tasks.size()));
-        }
-    });
-    return batchId;
-}
-
-void TranscriptionController::withBatch(const QString &displayLabel, const std::function<void()> &fn)
-{
-    // Not re-entrant: batches are built synchronously on the GUI thread, one at
-    // a time. A nested withBatch() would clobber the outer scope's batchId, so
-    // guard against it rather than silently mis-stamp.
-    Q_ASSERT(m_currentBatchId == 0);
-    const int batchId = m_nextJobId++;
-    m_currentBatchId = batchId;
-    if (!displayLabel.isEmpty())
-        m_batchLabels.insert(batchId, displayLabel);
-    fn();
-    m_currentBatchId = 0;
-    // Nothing landed under this batchId (e.g. every file was deduped away) — no
-    // batch exists, so drop the label we speculatively recorded rather than
-    // leak it. (A deduped-away op enqueues nothing at all, prereqs included,
-    // since the single-file helpers return before enqueueTask.)
-    if (!batchHasMembers(batchId))
-        m_batchLabels.remove(batchId);
-}
-
-bool TranscriptionController::batchHasMembers(int batchId) const
-{
-    return TaskQuery::batchHasMembers(m_tasks, batchId);
-}
-
-void TranscriptionController::removeTaskAt(int index)
-{
-    Task *task = m_tasks[index].get();
-    const int batchId = task->batchId;
     m_connectedTasks.remove(task);
-    // m_instantActive is a pointer, not an index — clear it if THIS is the
-    // instant-lane task being removed (a cancel-while-queued never sets it,
-    // but a defensive clear keeps the invariant simple).
-    if (m_instantActive == task)
-        m_instantActive = nullptr;
-    m_tasks.erase(m_tasks.begin() + index);
-    if (m_activeIndex > index)
-        --m_activeIndex;
-    // Drop a batch's display label once its last member is gone, so
-    // m_batchLabels doesn't accumulate stale entries across a long session.
-    if (batchId != 0 && !batchHasMembers(batchId))
-        m_batchLabels.remove(batchId);
-}
-
-void TranscriptionController::cancelTaskAt(int index)
-{
-    // Snapshot before erasing — this is the pre-run-cancel half of the
-    // one-terminal-report invariant (.task/plan.md invariant 1): a task
-    // cancelled while still Queued/Paused never reached the runner, so the
-    // queue must synthesize its terminal report itself. The old system just
-    // dropped the entry, which is why a consumer waiting on finished() (e.g.
-    // UsbGrabberController's in-flight tracking) never heard back for a
-    // cancelled-while-queued task.
-    const QUrl url = m_tasks[index]->fileUrl;
-    removeTaskAt(index);
-    emit queueChanged();
-    emit finished(url, false, QStringLiteral("Cancelled"));
 }
 
 void TranscriptionController::dismiss(const QUrl &fileUrl)
 {
-    // A fileUrl may have multiple entries (re-queueing a Done/Failed task is
-    // allowed) — remove only the first Done/Failed match, skipping over any
-    // Queued/Active entry for the same url rather than no-op'ing on it.
-    for (int i = 0; i < static_cast<int>(m_tasks.size()); ++i) {
-        const Task *task = m_tasks[i].get();
-        if (task->fileUrl == fileUrl
-            && (task->status == Task::Status::Done || task->status == Task::Status::Failed)) {
-            removeTaskAt(i);
-            emit queueChanged();
-            return;
-        }
-    }
+    m_scheduler->dismiss(fileUrl);
 }
 
 void TranscriptionController::clearFinished()
 {
-    bool changed = false;
-    for (int i = static_cast<int>(m_tasks.size()) - 1; i >= 0; --i) {
-        if (m_tasks[i]->status == Task::Status::Done || m_tasks[i]->status == Task::Status::Failed) {
-            removeTaskAt(i);
-            changed = true;
-        }
-    }
-    if (changed)
-        emit queueChanged();
+    m_scheduler->clearFinished();
 }
 
 qint64 TranscriptionController::activeElapsedMs() const
 {
-    if (m_activeIndex < 0)
+    if (m_scheduler->activeIndex() < 0)
         return 0;
     return m_activeAccumulatedMs + (m_activePaused ? 0 : m_activeSegmentTimer.elapsed());
 }
@@ -1561,7 +1207,7 @@ qint64 TranscriptionController::activeElapsedMs() const
 qint64 TranscriptionController::estimatedRemainingMs() const
 {
     const double overall = m_phaseTimer->overallProgress();
-    if (m_activeIndex < 0 || overall <= 0.0)
+    if (m_scheduler->activeIndex() < 0 || overall <= 0.0)
         return -1;
     const double remainingFraction = (1.0 - overall) / overall;
     return static_cast<qint64>(activeElapsedMs() * remainingFraction);
@@ -1569,7 +1215,8 @@ qint64 TranscriptionController::estimatedRemainingMs() const
 
 void TranscriptionController::pauseActive()
 {
-    if (m_activeIndex < 0 || m_activeIndex >= static_cast<int>(m_tasks.size()))
+    Task *task = m_scheduler->activeTask();
+    if (!task)
         return;
     // The task itself declares whether it can pause — the string allowlist
     // (transcribe/download/combine/chapters) is gone; a kind with a real
@@ -1577,7 +1224,7 @@ void TranscriptionController::pauseActive()
     // is a safe no-op here. This is the same capability the UI reads to enable
     // the pause button, so the two can never disagree (the 2026-07-09 bug was
     // exactly such a disagreement).
-    if (!m_tasks[m_activeIndex]->capabilities().pausable)
+    if (!task->capabilities().pausable)
         return;
     // See this method's header doc comment — "loading" is whisper.cpp's
     // in-process, unhookable model-load call (no interruption point at all),
@@ -1595,14 +1242,14 @@ void TranscriptionController::pauseActive()
     // suppressed by that pending cancel (waitWhilePausedOrCancelled()'s wait
     // loop never runs while cancelled), permanently breaking pause for this
     // job. Wait for it to resolve instead of stacking a second request.
-    if (m_pausingActiveAsRestart)
+    if (m_scheduler->isPausingActiveAsRestart())
         return;
-    m_runner->requestPause();
+    m_scheduler->requestPause();
 }
 
 void TranscriptionController::resumeActive()
 {
-    m_runner->requestResume();
+    m_scheduler->requestResume();
 }
 
 void TranscriptionController::togglePauseActive()
@@ -1612,7 +1259,7 @@ void TranscriptionController::togglePauseActive()
     // m_busy/m_activePaused/m_phase (this object's own state) instead of
     // QML's copies of them.
     if (!m_busy) {
-        startNext();
+        m_scheduler->startNext();
         return;
     }
     if (m_activePaused) {
@@ -1622,7 +1269,7 @@ void TranscriptionController::togglePauseActive()
     // A soft-pause-as-restart is already in flight and hasn't resolved yet
     // (see activeStopping's doc comment) — ignore further clicks rather than
     // stacking a second request on top of the still-pending cancel.
-    if (m_pausingActiveAsRestart)
+    if (m_scheduler->isPausingActiveAsRestart())
         return;
     // Item 9 (2026-07-14): "loading" (whisper.cpp's blocking, unhookable
     // model-load call) has no cooperative checkpoint to pause AT. It used to
@@ -1641,149 +1288,27 @@ void TranscriptionController::togglePauseActive()
     pauseActive();
 }
 
-void TranscriptionController::cancelActive()
-{
-    if (m_activeIndex < 0 || m_activeIndex >= static_cast<int>(m_tasks.size()))
-        return;
-    cancelJob(m_tasks[m_activeIndex]->id);
-}
-
-void TranscriptionController::cancelJob(int id)
-{
-    for (int i = 0; i < static_cast<int>(m_tasks.size()); ++i) {
-        Task *task = m_tasks[i].get();
-        if (task->id != id)
-            continue;
-        // A Queued or Paused task has nothing running to interrupt — remove it
-        // and synthesize its terminal report (cancelTaskAt), so a consumer
-        // waiting on finished() hears back even though run() never ran.
-        if (task->status == Task::Status::Queued || task->status == Task::Status::Paused) {
-            cancelTaskAt(i);
-            return;
-        }
-        if (task->status == Task::Status::Active) {
-            // The runner emits the terminal report for THIS case (run() returns
-            // via TaskError or early-return), so no synthesis here. Route to
-            // whichever lane's runner is actually running this task.
-            TaskRunner *runner = (task == m_instantActive) ? m_instantRunner : m_runner;
-            // Enter the honest "Cancelling" state for a task that can't abort
-            // mid-pass — its pass runs to its boundary, and without this the UI
-            // would misread the between-tick paused(false) as a resume and let
-            // pause silently no-op. Derived from the task's own capability, so
-            // future non-mid-cancellable kinds inherit it. Only the serial lane
-            // has the pause UI, so only flag it there.
-            if (task != m_instantActive && task->capabilities().pausable
-                && !task->capabilities().cancellableMidRun) {
-                m_activeCancelling = true;
-                emit activeStoppingChanged();
-            }
-            // No requestResume(): every pause-wait re-checks cancel on its own
-            // poll (checkpoint()'s while-condition; ProcessRunner's top-of-loop
-            // cancelled() check), so the cancel lands within one ~100ms tick
-            // regardless of pause state. Resuming here only fired a misleading
-            // paused(false)/SIGCONT edge that looked like the task had resumed.
-            runner->requestCancel();
-        }
-        return;
-    }
-}
-
-void TranscriptionController::cancelBatch(int batchId)
-{
-    if (batchId == 0)
-        return;
-    // Snapshot the member ids first — cancelJob() mutates m_tasks (a
-    // Queued/Paused member is removed outright), so walking it live while
-    // cancelling would invalidate indices. Route each through cancelJob() so a
-    // member gets the exact same Queued-vs-Active handling a single cancel
-    // would (removal + synthesized terminal report, or a runner cancel request).
-    QList<int> ids;
-    for (const auto &task : m_tasks) {
-        if (task->batchId == batchId
-            && (task->status == Task::Status::Queued || task->status == Task::Status::Paused
-                || task->status == Task::Status::Active))
-            ids.append(task->id);
-    }
-    for (const int id : std::as_const(ids))
-        cancelJob(id);
-}
-
-void TranscriptionController::dismissBatch(int batchId)
-{
-    if (batchId == 0)
-        return;
-    // Remove every terminal (Done/Failed) member of the batch — the batch-wide
-    // "clear this finished row". Walk back-to-front so each erase leaves the
-    // earlier indices valid (same shape as clearFinished()).
-    bool changed = false;
-    for (int i = static_cast<int>(m_tasks.size()) - 1; i >= 0; --i) {
-        const Task *task = m_tasks[i].get();
-        if (task->batchId == batchId
-            && (task->status == Task::Status::Done || task->status == Task::Status::Failed)) {
-            removeTaskAt(i);
-            changed = true;
-        }
-    }
-    if (changed)
-        emit queueChanged();
-}
-
-void TranscriptionController::cancelAll()
-{
-    // Snapshot the ids to cancel first — cancelTaskAt() mutates m_tasks (and
-    // emits finished() per task), so iterating it live while removing would
-    // be unsafe. Active job handled separately below (it's not removed here;
-    // the runner reports it).
-    QList<int> queuedIds;
-    for (const auto &task : m_tasks) {
-        if (task->status == Task::Status::Queued || task->status == Task::Status::Paused)
-            queuedIds.append(task->id);
-    }
-    for (const int id : std::as_const(queuedIds)) {
-        const int idx = [this, id] {
-            for (int i = 0; i < static_cast<int>(m_tasks.size()); ++i)
-                if (m_tasks[i]->id == id)
-                    return i;
-            return -1;
-        }();
-        if (idx >= 0)
-            cancelTaskAt(idx);
-    }
-    if (m_activeIndex >= 0) {
-        Task *active = m_tasks[m_activeIndex].get();
-        if (active->capabilities().pausable && !active->capabilities().cancellableMidRun) {
-            m_activeCancelling = true;
-            emit activeStoppingChanged();
-        }
-        m_runner->requestCancel(); // no requestResume() — see cancelJob()
-    }
-}
-
-void TranscriptionController::moveQueuedJob(int id, int newIndex)
-{
-    // Index math is pure over the task list — TaskQuery::planQueuedMove().
-    // What stays here is the part that can't be: the actual reorder of the
-    // owning vector, the m_activeIndex fixups the shift implies, and the
-    // queueChanged() emission.
-    const TaskQuery::QueuedMove move = TaskQuery::planQueuedMove(m_tasks, id, newIndex);
-    if (!move.valid)
-        return;
-
-    std::unique_ptr<Task> moved = std::move(m_tasks[move.fromIndex]);
-    m_tasks.erase(m_tasks.begin() + move.fromIndex);
-    if (m_activeIndex > move.fromIndex)
-        --m_activeIndex;
-
-    m_tasks.insert(m_tasks.begin() + move.insertIndex, std::move(moved));
-    if (m_activeIndex >= move.insertIndex)
-        ++m_activeIndex;
-    emit queueChanged();
-}
+// The cancel/dismiss/move family is pure queue mechanics — thin forwarders.
+void TranscriptionController::cancelActive() { m_scheduler->cancelActive(); }
+void TranscriptionController::cancelJob(int id) { m_scheduler->cancelJob(id); }
+void TranscriptionController::cancelBatch(int batchId) { m_scheduler->cancelBatch(batchId); }
+void TranscriptionController::dismissBatch(int batchId) { m_scheduler->dismissBatch(batchId); }
+void TranscriptionController::cancelAll() { m_scheduler->cancelAll(); }
+void TranscriptionController::moveQueuedJob(int id, int newIndex) { m_scheduler->moveQueuedJob(id, newIndex); }
 
 bool TranscriptionController::isDownloadQueued(ModelDownloadTarget target, const QUrl &vaultUrl,
                                                 const QString &modelId) const
 {
-    return TaskQuery::isDownloadQueued(m_tasks, target, vaultUrl, modelId);
+    return TaskQuery::isDownloadQueued(m_scheduler->tasks(), target, vaultUrl, modelId);
+}
+
+// Wrinkle 1: the scheduler's queuePrerequisites() calls this back through the
+// observer so ModelManager (and DownloadTask construction) stays out of the
+// scheduler. Returns the id, or -1 if no download was needed.
+int TranscriptionController::resolveDownloadPrerequisite(ModelDownloadTarget target, const QUrl &vaultUrl,
+                                                         const QString &modelId, int insertIndex)
+{
+    return maybeQueueDownloadTask(target, vaultUrl, modelId, insertIndex);
 }
 
 int TranscriptionController::maybeQueueDownloadTask(ModelDownloadTarget target, const QUrl &vaultUrl,
@@ -1819,21 +1344,18 @@ int TranscriptionController::maybeQueueDownloadTask(ModelDownloadTarget target, 
     if (alreadyOnDisk || isDownloadQueued(target, vaultUrl, modelId))
         return -1;
 
+    // The queue MECHANICS (id allocation + insertion) live on the scheduler; the
+    // controller only owns the model-knowledge decision above + building the
+    // DownloadTask here.
     auto task = std::make_unique<DownloadTask>(target, modelId);
-    task->id = m_nextJobId++;
     task->vaultUrl = vaultUrl;
-    task->status = Task::Status::Queued;
-    const int id = task->id;
-    const int at =
-        (insertIndex < 0) ? static_cast<int>(m_tasks.size()) : std::clamp(insertIndex, 0, static_cast<int>(m_tasks.size()));
-    m_tasks.insert(m_tasks.begin() + at, std::move(task));
-    return id;
+    return m_scheduler->insertResolvedDownload(std::move(task), insertIndex);
 }
 
 // See this method's header doc comment.
 int TranscriptionController::frontOfQueueInsertIndex() const
 {
-    return TaskQuery::frontOfQueueInsertIndex(m_tasks, m_activeIndex);
+    return m_scheduler->frontOfQueueInsertIndex();
 }
 
 QVariantList TranscriptionController::detectCombineGroups(const QVariantList &rules,
@@ -1853,139 +1375,20 @@ QStringList TranscriptionController::differentiatorNonParticipatingFiles(const Q
     return CombineScanner::differentiatorNonParticipatingFiles(pattern, groupIndex, audioPaths);
 }
 
-bool TranscriptionController::isCombineQueued(const QString &outputPath) const
-{
-    return TaskQuery::isCombineQueued(m_tasks, outputPath);
-}
-
-void TranscriptionController::enqueueCombineJob(const CombineGroup &group, const QUrl &vaultUrl,
-                                                 bool deleteOriginals, int insertIndex)
-{
-    auto task = std::make_unique<CombineTask>(group.files, QUrl::fromLocalFile(group.outputPath), deleteOriginals);
-    task->id = m_nextJobId++;
-    task->vaultUrl = vaultUrl;
-    task->status = Task::Status::Queued;
-    const int at = (insertIndex < 0) ? frontOfQueueInsertIndex() : insertIndex;
-    m_tasks.insert(m_tasks.begin() + std::clamp(at, 0, static_cast<int>(m_tasks.size())), std::move(task));
-}
-
-// See this method's header doc comment. This is the scheduler-level preflight
-// .task/plan.md flagged as the hardest port: it can rewrite the task's target
-// file, insert a combine task ahead of it, and recurse — all strictly BEFORE
-// dispatch, on the GUI thread, which is what makes mutating Task::fileUrl safe
-// (run() hasn't started; see that field's doc comment).
-bool TranscriptionController::maybeRedirectForCombine(int index)
-{
-    Task *task = m_tasks[index].get();
-    // Only a plain transcribe is ever redirected — it's the sole kind whose
-    // input file might turn out to be a combine fragment. Every *Only kind in
-    // the old flag-soup guard was just "not transcribe"; a single qobject_cast
-    // expresses that now.
-    auto *transcribe = qobject_cast<TranscribeTask *>(task);
-    if (!transcribe || transcribe->fileUrl.isEmpty())
-        return false;
-
-    const QFileInfo info(transcribe->fileUrl.toLocalFile());
-
-    // Outcome 1: an earlier manual runCombineScan() run may already have
-    // merged this exact file's group (and moved the original fragment into
-    // .combined/) since this task was queued. The merged output's path is
-    // recomputable from this filename alone, so check for it directly.
-    for (const QVariant &ruleVar : m_combineRules) {
-        const QVariantMap rule = ruleVar.toMap();
-        const auto key = matchRuleCapturedKey(rule, info.fileName());
-        if (!key)
-            continue;
-        const QString outputPath = combineOutputPathFor(rule.value(QStringLiteral("name")).toString(), *key,
-                                                          info.absolutePath(), info.suffix());
-        if (QFileInfo::exists(outputPath))
-            transcribe->fileUrl = QUrl::fromLocalFile(outputPath);
-        break; // only the first matching rule is used, mirroring findCombineGroups()
-    }
-
-    // Outcome 2: this file is a member of a currently-"ready" group per the
-    // last runCombineScan() scan that hasn't been merged yet — insert the
-    // combine task ahead of this one and redirect.
-    const QString filePath = transcribe->fileUrl.toLocalFile();
-    for (const CombineGroup &group : CombineScanner::findCombineGroups(m_combineRules, m_combineAudioPaths)) {
-        if (group.status != QStringLiteral("ready") || !group.files.contains(filePath))
-            continue;
-        transcribe->fileUrl = QUrl::fromLocalFile(group.outputPath);
-        if (!isCombineQueued(group.outputPath))
-            enqueueCombineJob(group, transcribe->vaultUrl, m_combineDeleteOriginals, index);
-        emit queueChanged();
-        // Recurses onto the freshly-inserted combine task at this same index
-        // (safe — see this method's header doc comment). If a combine task
-        // for this group was somehow already queued elsewhere, nothing was
-        // inserted at `index` here, so this recurses onto the SAME transcribe
-        // task; its redirected fileUrl still won't exist yet and it fails
-        // cleanly via the normal decode error rather than looping.
-        startTask(index);
-        return true;
-    }
-    return false;
-}
-
-// The shared spine of both bulk (runCombineScan) and single-group
-// (combineGroup) enqueue: cache the scan inputs for maybeRedirectForCombine()'s
-// later per-job check, then enqueue a combine job for every "ready", not-
-// already-queued group that passes the outputPath filter, and kick the queue
-// once if anything went in. outputPathFilter empty = every ready group;
-// non-empty = only the group whose outputPath matches (a single-group action).
-// Returns how many were enqueued.
-int TranscriptionController::enqueueReadyCombineGroups(const QVariantList &rules, const QStringList &audioPaths,
-                                                        const QUrl &vaultUrl, bool deleteOriginals,
-                                                        const QString &outputPathFilter)
-{
-    // Cached for maybeRedirectForCombine()'s per-job safety check — see its
-    // doc comment and the m_combineRules/m_combineAudioPaths field comments.
-    // Set even when nothing ends up enqueued, matching the old behavior.
-    m_combineRules = rules;
-    m_combineAudioPaths = audioPaths;
-    m_combineDeleteOriginals = deleteOriginals;
-
-    int enqueued = 0;
-    for (const CombineGroup &group : CombineScanner::findCombineGroups(rules, audioPaths)) {
-        if (group.status != QStringLiteral("ready"))
-            continue;
-        if (!outputPathFilter.isEmpty() && group.outputPath != outputPathFilter)
-            continue;
-        if (isCombineQueued(group.outputPath))
-            continue;
-        enqueueCombineJob(group, vaultUrl, deleteOriginals);
-        ++enqueued;
-    }
-    if (enqueued == 0)
-        return 0;
-    emit queueChanged();
-    // Live trigger (like transcribe()), not a persisted-queue replay — auto-
-    // starting when idle matches transcribe()'s own behavior, unlike
-    // loadPersistedQueue()'s deliberately-not-auto-started restored jobs
-    // (see startNext()'s doc comment).
-    if (m_activeIndex < 0)
-        startNext();
-    return enqueued;
-}
-
+// The combine QUEUE glue (isCombineQueued/enqueueCombineJob/
+// maybeRedirectForCombine/enqueueReadyCombineGroups) moved to TaskScheduler —
+// it mutates the task list + m_combineRules/m_combineAudioPaths cache the
+// scheduler owns. These two Q_INVOKABLEs stay thin forwarders so QML is unchanged.
 void TranscriptionController::runCombineScan(const QVariantList &rules, const QStringList &audioPaths,
                                                const QUrl &vaultUrl, bool deleteOriginals)
 {
-    enqueueReadyCombineGroups(rules, audioPaths, vaultUrl, deleteOriginals, /*outputPathFilter=*/QString());
+    m_scheduler->runCombineScan(rules, audioPaths, vaultUrl, deleteOriginals);
 }
 
-// Sidebar's per-row "combine this group" hover button (item 51): same shape
-// as runCombineScan() above but filtered to the ONE group whose outputPath
-// matches — a deliberate single-group action, not "scan and enqueue
-// everything ready" the ribbon button performs. Silently no-ops if that
-// group is no longer "ready" (e.g. a concurrent edit/scan already changed
-// its status) or already queued — the sidebar only shows this button for a
-// row it just computed as "ready" via detectCombineGroups(), but that
-// snapshot can go stale between hover and click just as easily as
-// runCombineScan()'s own dedup check already accounts for.
 void TranscriptionController::combineGroup(const QVariantList &rules, const QStringList &audioPaths,
                                             const QString &outputPath, const QUrl &vaultUrl, bool deleteOriginals)
 {
-    enqueueReadyCombineGroups(rules, audioPaths, vaultUrl, deleteOriginals, outputPath);
+    m_scheduler->combineGroup(rules, audioPaths, outputPath, vaultUrl, deleteOriginals);
 }
 
 QString TranscriptionController::tasksJsonPath(const QUrl &vaultUrl)
@@ -2002,7 +1405,7 @@ void TranscriptionController::persistQueue() const
     // over the task list — TaskQuery::serializeQueue() (see its doc comment
     // for the Queued-only / opt-in-persistable rules). What stays here is the
     // vault-path resolution and the atomic write.
-    const QJsonArray array = TaskQuery::serializeQueue(m_tasks);
+    const QJsonArray array = TaskQuery::serializeQueue(m_scheduler->tasks());
 
     QSaveFile file(tasksJsonPath(m_vaultUrl));
     if (!file.open(QIODevice::WriteOnly | QIODevice::Truncate))
@@ -2013,55 +1416,16 @@ void TranscriptionController::persistQueue() const
 
 void TranscriptionController::loadPersistedQueue(const QUrl &vaultUrl)
 {
+    // Remember the vault for subsequent persistQueue() writes (controller-side
+    // persistence state), then let the scheduler replay the saved queue (the
+    // file read + createTaskFromJson + raw insert are queue mechanics).
     m_vaultUrl = vaultUrl;
-
-    QFile file(tasksJsonPath(vaultUrl));
-    if (!file.open(QIODevice::ReadOnly))
-        return;
-    const QJsonDocument doc = QJsonDocument::fromJson(file.readAll());
-    if (!doc.isArray())
-        return;
-
-    // Replayed in file order — the order persistQueue() wrote. A download a
-    // dependent task needs was written just before it, so replaying in order
-    // queues each download ahead of its dependent (and the dependent's own
-    // prerequisites() sees it already queued via isDownloadQueued(), no dup).
-    //
-    // Deliberately does NOT auto-start anything: every restored entry just
-    // sits Queued until the user resumes via startNext(). So this appends at
-    // the tail (explicit insertIndex == size) rather than going through the
-    // front-jumping enqueueTask(), and reproduces the exact saved order —
-    // which is ALSO why a "transcribe" entry followed by its "relabel"
-    // sibling for the same fileUrl both replay: neither goes through the
-    // public transcribe()/relabel() dedup guard (that guard would reject the
-    // second), only through createTaskFromJson() + a raw insert.
-    for (const QJsonValue &v : doc.array()) {
-        const QJsonObject obj = v.toObject();
-        const QString kind = obj.value("kind").toString();
-
-        std::unique_ptr<Task> task = createTaskFromJson(kind, obj);
-        if (!task)
-            continue; // unrecognized kind, or one whose isPersistable() is false
-
-        // A download entry is self-contained (no prerequisites of its own); a
-        // dependent kind gets its downloads queued ahead of it, deduped
-        // against whatever the persisted download entries already queued.
-        int insertAt = static_cast<int>(m_tasks.size());
-        queuePrerequisites(*task, task->vaultUrl, &insertAt);
-
-        task->id = m_nextJobId++;
-        task->status = Task::Status::Queued;
-        m_tasks.insert(m_tasks.begin() + std::clamp(insertAt, 0, static_cast<int>(m_tasks.size())), std::move(task));
-        emit queueChanged();
-    }
+    m_scheduler->loadPersistedQueue(vaultUrl);
 }
 
 void TranscriptionController::startNext()
 {
-    // The QML play button's resume entry point — just the scheduler. Serial
-    // Paused-before-Queued priority and the instant lane both live in
-    // pumpQueues() now.
-    pumpQueues();
+    m_scheduler->startNext();
 }
 
 void TranscriptionController::terminateApplicationImmediately() const
@@ -2458,7 +1822,7 @@ void TranscriptionController::renameSpeaker(const QUrl &fileUrl, const QString &
     // like transcribe() — matches the old renameSpeaker()'s push_back. A
     // rename is cheap and non-urgent; it can wait behind queued transcription.
     enqueueTask(std::make_unique<RenameSpeakerTask>(fileUrl, oldName, newName),
-                static_cast<int>(m_tasks.size()));
+                static_cast<int>(m_scheduler->tasks().size()));
 }
 
 void TranscriptionController::mergeSpeakers(const QUrl &fileUrl, const QString &sourceName, const QString &targetName)
@@ -2473,7 +1837,7 @@ void TranscriptionController::mergeSpeakers(const QUrl &fileUrl, const QString &
 
     // Appended at the tail, same as renameSpeaker() — see its doc comment.
     enqueueTask(std::make_unique<MergeSpeakersTask>(fileUrl, sourceName, targetName),
-                static_cast<int>(m_tasks.size()));
+                static_cast<int>(m_scheduler->tasks().size()));
 }
 
 void TranscriptionController::renameFile(const QUrl &fileUrl, const QString &newBaseName)
@@ -2490,7 +1854,7 @@ void TranscriptionController::renameFile(const QUrl &fileUrl, const QString &new
     m_pendingRenames.insert(fileUrl.toLocalFile(), newBaseName);
     ++m_pendingRenamesRevision;
     emit pendingRenamesRevisionChanged();
-    enqueueTask(std::make_unique<RenameFileTask>(fileUrl, newBaseName), static_cast<int>(m_tasks.size()));
+    enqueueTask(std::make_unique<RenameFileTask>(fileUrl, newBaseName), static_cast<int>(m_scheduler->tasks().size()));
 }
 
 QString TranscriptionController::pendingRenameStem(const QUrl &fileUrl) const
@@ -2509,7 +1873,7 @@ void TranscriptionController::moveFiles(const QVariantList &fileUrls, const QUrl
         if (!url.isEmpty())
             tasks.push_back(std::make_unique<MoveTask>(url, destDirUrl, vaultUrl));
     }
-    enqueueBatch(std::move(tasks));
+    m_scheduler->enqueueBatch(std::move(tasks));
 }
 
 void TranscriptionController::setVaultTreeModel(VaultTreeModel *model)
@@ -2528,7 +1892,7 @@ void TranscriptionController::trash(const QString &scope, const QVariantList &ur
     // ONE instant-lane TrashTask for the whole batch ⇒ ONE undo snackbar (see
     // TrashTask). Appended at the tail like the other instant edits.
     enqueueTask(std::make_unique<TrashTask>(scopeFromString(scope), list, vaultUrl),
-                static_cast<int>(m_tasks.size()));
+                static_cast<int>(m_scheduler->tasks().size()));
 }
 
 void TranscriptionController::deletePermanently(const QString &scope, const QVariantList &urls, const QUrl &vaultUrl)
@@ -2537,19 +1901,19 @@ void TranscriptionController::deletePermanently(const QString &scope, const QVar
     if (list.isEmpty())
         return;
     enqueueTask(std::make_unique<DeleteTask>(scopeFromString(scope), list, vaultUrl),
-                static_cast<int>(m_tasks.size()));
+                static_cast<int>(m_scheduler->tasks().size()));
 }
 
 void TranscriptionController::renameFolder(const QUrl &folderUrl, const QString &newName, const QUrl &vaultUrl)
 {
     enqueueTask(std::make_unique<FolderRenameTask>(folderUrl, newName, vaultUrl),
-                static_cast<int>(m_tasks.size()));
+                static_cast<int>(m_scheduler->tasks().size()));
 }
 
 void TranscriptionController::moveFolder(const QUrl &folderUrl, const QUrl &destParentUrl, const QUrl &vaultUrl)
 {
     enqueueTask(std::make_unique<FolderMoveTask>(folderUrl, destParentUrl, vaultUrl),
-                static_cast<int>(m_tasks.size()));
+                static_cast<int>(m_scheduler->tasks().size()));
 }
 
 QString TranscriptionController::readTranscriptBody(const QUrl &fileUrl) const
@@ -2834,31 +2198,29 @@ QStringList TranscriptionController::existingVaultSpeakers(const QUrl &vaultUrl)
 
 int TranscriptionController::tasksTotal() const
 {
-    return TaskQuery::tasksTotal(m_tasks);
+    return TaskQuery::tasksTotal(m_scheduler->tasks());
 }
 
 int TranscriptionController::tasksCompleted() const
 {
-    return TaskQuery::tasksCompleted(m_tasks);
+    return TaskQuery::tasksCompleted(m_scheduler->tasks());
 }
 
 QVariantList TranscriptionController::queuedFileUrls() const
 {
-    return TaskQuery::queuedFileUrls(m_tasks);
+    return TaskQuery::queuedFileUrls(m_scheduler->tasks());
 }
 
 QString TranscriptionController::currentJobKind() const
 {
-    if (m_activeIndex < 0 || m_activeIndex >= static_cast<int>(m_tasks.size()))
-        return QString();
-    return m_tasks[m_activeIndex]->kind();
+    Task *task = m_scheduler->activeTask();
+    return task ? task->kind() : QString();
 }
 
 QString TranscriptionController::currentJobKindLabel() const
 {
-    if (m_activeIndex < 0 || m_activeIndex >= static_cast<int>(m_tasks.size()))
-        return QString();
-    return m_tasks[m_activeIndex]->kindLabel();
+    Task *task = m_scheduler->activeTask();
+    return task ? task->kindLabel() : QString();
 }
 
 QString TranscriptionController::phaseLabel(const QString &phase) const
@@ -2873,15 +2235,14 @@ QString TranscriptionController::phaseOverlayLabel(const QString &phase) const
 
 bool TranscriptionController::activeCanPause() const
 {
-    if (m_activeIndex < 0 || m_activeIndex >= static_cast<int>(m_tasks.size()))
-        return false;
-    return m_tasks[m_activeIndex]->capabilities().pausable;
+    Task *task = m_scheduler->activeTask();
+    return task && task->capabilities().pausable;
 }
 
 QVariantList TranscriptionController::jobs() const
 {
     QVariantList list;
-    for (const auto &task : m_tasks) {
+    for (const auto &task : m_scheduler->tasks()) {
         // The base row every kind shares; each kind's own extra fields come
         // from its toVariantMap() (the giant per-flag switch this used to be
         // is now distributed authorship — each Task authors its own row).
@@ -2910,7 +2271,7 @@ QVariantList TranscriptionController::jobs() const
         // kindLabel. Both are read only by collapseBatches() (a pure transform
         // that can't reach m_batchLabels), never by the per-row delegate.
         entry["batchId"] = task->batchId;
-        entry["batchLabel"] = task->batchId != 0 ? m_batchLabels.value(task->batchId) : QString();
+        entry["batchLabel"] = task->batchId != 0 ? m_scheduler->batchLabels().value(task->batchId) : QString();
         const QVariantMap extra = task->toVariantMap();
         for (auto it = extra.constBegin(); it != extra.constEnd(); ++it)
             entry[it.key()] = it.value();
@@ -3164,12 +2525,15 @@ void TranscriptionController::cancelBenchmark()
     // Cancels whichever benchmark/sweep task is Active or Queued. Now that
     // both are real queued tasks, this is just cancelJob() over the two kinds
     // rather than a bare requestCancel() at the worker (which would also have
-    // cancelled an unrelated real job that happened to be running).
-    for (int i = static_cast<int>(m_tasks.size()) - 1; i >= 0; --i) {
-        const QString kind = m_tasks[i]->kind();
-        if (kind == QStringLiteral("benchmark") || kind == QStringLiteral("diarizationSweep"))
-            cancelJob(m_tasks[i]->id);
+    // cancelled an unrelated real job that happened to be running). Snapshot
+    // the ids first — cancelJob() mutates the scheduler's task list.
+    QList<int> ids;
+    for (const auto &task : m_scheduler->tasks()) {
+        if (task->kind() == QStringLiteral("benchmark") || task->kind() == QStringLiteral("diarizationSweep"))
+            ids.append(task->id);
     }
+    for (const int id : std::as_const(ids))
+        cancelJob(id);
 }
 
 QVariantList TranscriptionController::availableEngines() const

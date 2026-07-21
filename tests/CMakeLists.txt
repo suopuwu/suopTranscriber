@@ -45,7 +45,12 @@ set(SUOP_TASK_SOURCES
     # persistQueue's JSON) split out of TranscriptionController.cpp — the
     # controller forwards to it directly, so it's needed by exactly the same
     # set of targets, hence the same one list.
-    TaskQuery.cpp)
+    TaskQuery.cpp
+    # PHASE Q: the display-blind queue engine split out of
+    # TranscriptionController.cpp — the controller holds one as a member and
+    # implements its observer interface, so it's needed by exactly the same set
+    # of targets, hence the same one list.
+    TaskScheduler.cpp)
 
 # Each test compiles the core sources it needs directly — no core static lib,
 # so the app target stays untouched. QML_ELEMENT headers compile outside the

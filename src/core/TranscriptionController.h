@@ -43,6 +43,11 @@
 #include "tasks/ModelDownloadTarget.h"
 #include "tasks/Task.h"
 
+#include "TaskScheduler.h" // the display-blind queue engine (PHASE Q) + the
+                          // TaskSchedulerObserver interface this class implements.
+                          // Full type: the observer overrides + the inline getters
+                          // below call m_scheduler-> directly.
+
 class QTimer;
 class TaskRunner;
 // (VaultTreeModel is included above, not forward-declared — see the include note.)
@@ -98,7 +103,7 @@ std::optional<EngineDescriptor> resolveEngine(const QString &engineId, const QSt
 // m_jobs (visible to QML via the jobs property) until the user dismisses
 // them individually (dismiss()) or clears them in bulk (clearFinished()) —
 // like a download manager, not a transient progress bar.
-class TranscriptionController : public QObject {
+class TranscriptionController : public QObject, public TaskSchedulerObserver {
     Q_OBJECT
     QML_ELEMENT
     // Test-only seam: the queue's cancel/pause state machine can only be
@@ -303,8 +308,8 @@ public:
     bool activeIsForeground() const { return m_activeIsForeground; }
     bool activeOccupiesFile() const
     {
-        return m_activeIndex >= 0 && m_activeIndex < static_cast<int>(m_tasks.size())
-            && m_tasks[m_activeIndex]->occupiesFile();
+        Task *task = m_scheduler->activeTask();
+        return task && task->occupiesFile();
     }
     bool activeCanPause() const;
     QString currentPhase() const { return m_phase; }
@@ -324,8 +329,10 @@ public:
     QString currentJobKindLabel() const;
     // See the activePaused Q_PROPERTY doc comment above.
     bool isActivePaused() const { return m_activePaused; }
-    // See the activeStopping Q_PROPERTY doc comment above.
-    bool isActiveStopping() const { return m_pausingActiveAsRestart || m_activeCancelling; }
+    // See the activeStopping Q_PROPERTY doc comment above. The pause/cancel
+    // INTENT lives on the scheduler now (Q1); the NOTIFY is re-emitted through
+    // the observer methods + onActiveStoppingChanged().
+    bool isActiveStopping() const { return m_scheduler->isActiveStopping(); }
     // See the activeBackendName Q_PROPERTY doc comment above.
     QString activeBackendName() const { return m_activeBackendName; }
     // See the activeBackendKind Q_PROPERTY doc comment above.
@@ -351,7 +358,7 @@ public:
     // expected to re-poll it on its own Timer tick (see BottomBar.qml)
     // rather than have this object tick a timer of its own just to fire
     // NOTIFY signals nobody but a display needs.
-    Q_INVOKABLE qint64 activeElapsedMs() const;
+    Q_INVOKABLE qint64 activeElapsedMs() const override;
     // Linear-extrapolation estimate of when the Active job will finish, in
     // milliseconds from now (-1 if unknown — nothing Active, or too early in
     // the job for m_overallProgress to be above 0 yet). Deliberately uses the
@@ -1426,49 +1433,45 @@ private:
     // places and one could silently be forgotten.
 
 
-    // The CombineGroup struct and findCombineGroups() (pure detection over
-    // (rules, audioPaths)) moved to CombineScanner (2026-07-20) — see that
-    // header. What stays below is the QUEUE glue that consumes them, which
-    // needs m_tasks.
+    // PHASE Q: the queue MECHANICS (enqueue/pump/start/finish, the cancel/
+    // dismiss/undo/combine machinery, the two worker threads, and the pause/
+    // cancel INTENT) moved WHOLESALE to TaskScheduler (see its header). This
+    // class now implements TaskSchedulerObserver: the scheduler calls back
+    // through the observer overrides below at the exact points display state
+    // should update, so the golden emission ORDER is preserved, and the
+    // controller re-emits the scheduler's queueChanged as its own (which keeps
+    // driving persistQueue/rebuildJobStatusIndex + the QML NOTIFY). Every queue
+    // Q_INVOKABLE stays a thin forwarder to m_scheduler.
 
-    // True if a Queued/Active "combine" job already targets this exact
-    // outputPath — runCombineScan()'s dedup check, mirrors isDownloadQueued().
-    // Forwards to TaskQuery::isCombineQueued().
-    bool isCombineQueued(const QString &outputPath) const;
-    // Builds and inserts a Queued Job for `group` at frontOfQueueInsertIndex()
-    // (or the given insertIndex, for callers that already computed a
-    // specific slot — see startJob()'s safety-net re-check). Shared by
-    // runCombineScan() and startJob() so both enqueue combine jobs identically.
-    void enqueueCombineJob(const CombineGroup &group, const QUrl &vaultUrl, bool deleteOriginals,
-                            int insertIndex = -1);
-    // Shared spine of runCombineScan() (bulk) and combineGroup() (single):
-    // caches the scan inputs, then enqueues a combine job for every "ready",
-    // not-already-queued group passing outputPathFilter (empty = all), kicking
-    // the queue once if anything was inserted. Returns the number enqueued.
-    int enqueueReadyCombineGroups(const QVariantList &rules, const QStringList &audioPaths, const QUrl &vaultUrl,
-                                   bool deleteOriginals, const QString &outputPathFilter = QString());
-    // Safety-net re-check, called from the very top of startJob() before any
-    // state mutation — "double check the file being transcribed for parts
-    // before or after, whenever it is being transcribed" (the user's last
-    // manual runCombineScan() run can miss a sibling part that appeared, or
-    // never have run at all this session, before this job sat Queued).
-    // Only acts on a plain transcribe-kind job (no other *Only
-    // flag/downloadTarget set) with a non-empty fileUrl; returns false
-    // immediately for anything else. Two outcomes when it does act:
-    // (1) the merged output for this exact fileUrl's filename already
-    // exists (recomputed from the filename alone, not group membership —
-    // see CombineScanner::findCombineGroups()'s outputPath doc comment) -> redirects
-    // job.fileUrl in place and returns false, so startJob() falls through to
-    // its normal dispatch against the now-merged file; (2) fileUrl is a
-    // member of a currently-"ready" group per the last runCombineScan() run
-    // (m_combineRules/m_combineAudioPaths) -> inserts a combine Job ahead of
-    // this one (same insert-ahead-of-transcribe shape as
-    // maybeQueueDownloadJob), redirects job.fileUrl to the pending output,
-    // and recurses via startJob(index) onto the freshly-inserted combine job
-    // (safe: combine jobs are never "transcribe kind", so this check is a
-    // no-op on that recursive call) — returns true, telling startJob() NOT
-    // to also run its normal dispatch for this call.
-    bool maybeRedirectForCombine(int index);
+    // --- TaskSchedulerObserver overrides (see TaskScheduler.h for the exact
+    // contract each fulfills). All display work + all typed emits live here; the
+    // scheduler owns none of it. ---
+    void onSerialTaskStarting(Task *task, bool wasCancelling) override;
+    void onInstantTaskStarting(Task *task) override;
+    void onSerialActiveEnded(bool wasStopping) override;
+    qint64 onSerialTaskTerminal(Task *task, bool ok, const QString &error) override;
+    void onSerialActiveCleared(bool wasCancelling) override;
+    void onQueueDrained() override;
+    void reportSerialFinished(bool ok, const QString &error, bool structural, bool threeArg) override;
+    void reportInstantFinished(Task *task, const QUrl &finishedFile, bool ok, const QString &error) override;
+    void emitUndoAvailable(int token, const QString &label) override;
+    // Wrinkle 1: keep ModelManager + DownloadTask construction here (out of the
+    // scheduler). Forwards to maybeQueueDownloadTask(); the download is inserted
+    // via the scheduler's insertResolvedDownload().
+    int resolveDownloadPrerequisite(ModelDownloadTarget target, const QUrl &vaultUrl, const QString &modelId,
+                                    int insertIndex) override;
+    // Forget a task the scheduler is erasing, from the connectTask wired-once
+    // guard (m_connectedTasks) — heap reuse would otherwise falsely read as
+    // already-connected.
+    void onTaskRemoved(Task *task) override;
+    // The cancel-request set-transition (cancelJob/cancelAll) crosses the seam
+    // here — re-emit activeStoppingChanged.
+    void onActiveStoppingChanged() override { emit activeStoppingChanged(); }
+    // cancelTaskAt()'s synthesized terminal for a task cancelled before it ran.
+    void reportCancelledBeforeRun(const QUrl &fileUrl) override
+    {
+        emit finished(fileUrl, false, QStringLiteral("Cancelled"));
+    }
 
     // Item P6: rebuilds m_jobStatusByPath from scratch off the current
     // m_jobs, emitting jobStatusesChanged() iff the resolved per-path status
@@ -1488,95 +1491,16 @@ private:
     // index — it names no single vault file.
     void rebuildJobStatusIndex();
 
-    // Dispatches m_tasks[index] to the runner: wires its per-kind result
-    // signals (the one small localized switch that replaced the old worker's
-    // ~22 unioned signals), resets control, and invokes execute() across the
-    // thread boundary.
-    void startTask(int index);
-    // The scheduler's single entry point: dispatches the next runnable task in
-    // EACH lane. Serial: if the serial lane is idle, start the front-most
-    // Paused-then-Queued Serial task. Instant: if the instant lane is idle,
-    // start the front-most Queued Instant task that has no file conflict with
-    // the ACTIVE serial task (an Instant task on file X waits while a Serial
-    // task on X runs — they'd both rewrite X's .md). Called after every
-    // enqueue and every task completion.
-    void pumpQueues();
-    // Dispatch one Instant task to the instant runner. Unlike startTask()
-    // (serial), this deliberately does NOT touch m_busy/currentFile/m_phase/
-    // the overlay — an instant rewrite is background-ish and must not hijack
-    // the main-panel UI a serial task owns. The task still shows in the Tasks
-    // list via jobs().
-    void startInstantTask(int index);
-    // True iff the ACTIVE serial task targets fileUrl (non-empty) — the
-    // instant-lane conflict gate.
-    bool serialActiveConflictsWith(const QUrl &fileUrl) const;
     // Wires one task's generic (progress/phase/paused) + kind-specific result
-    // signals to this controller. Called exactly once per task, right before
-    // its first dispatch.
+    // signals to this controller. Called exactly once per task (guarded by
+    // m_connectedTasks), right before its first dispatch — from
+    // onSerialTaskStarting()/onInstantTaskStarting(). Stays fully controller-side
+    // (it reads m_vaultModel/m_pendingRenames and emits typed signals).
     void connectTask(Task *task);
-    // Removes m_tasks[index] and synthesizes its terminal report — the
-    // pre-run-cancel half of .task/plan.md invariant 1 ("every enqueued task
-    // reports exactly once, whether or not run() was called"). The old
-    // system's equivalent path just dropped the entry silently, which is why
-    // a job cancelled while still Queued never reported.
-    void cancelTaskAt(int index);
-    // Erases m_tasks[index], keeping m_activeIndex and m_connectedTasks
-    // consistent. The shared removal primitive under dismiss()/clearFinished()/
-    // cancelTaskAt() — does NOT emit queueChanged() or any report (callers do
-    // whatever's appropriate for their case).
-    void removeTaskAt(int index);
-    // Drives the undo snackbar. Called after EVERY task reaches a terminal
-    // state (Done or Failed, both lanes) — `ok` says which.
-    //   Standalone task (batchId==0): emits undoAvailable(id, undoLabel()) iff
-    //     ok AND the task is undoable (label non-empty + makeUndoTask non-null).
-    //   Batch member (batchId!=0): stays silent until the LAST member of the
-    //     batch finishes, then emits ONE undoAvailable(batchId,
-    //     batchUndoLabel(k)) covering all k undoable-Done members — so N
-    //     multi-selected ops collapse into a single snackbar (see undoTask()).
-    void maybeEmitUndoAvailable(const Task *task, bool ok);
-    // Enqueues several tasks as ONE batch: allocates a shared batchId (from the
-    // same counter as task ids, so it can't collide with one) via the scoped
-    // m_currentBatchId (which enqueueTask() stamps onto the task it inserts —
-    // NOT onto the prerequisite downloads it queues ahead, which stay
-    // standalone), and appends them in order. Returns the batchId — the token
-    // undoAvailable()/undoTask() use to undo the whole set, and the key
-    // collapseBatches() groups the display row by. `displayLabel` is the
-    // collapsed row's category label (e.g. "Run all"); empty means "derive from
-    // the members' own kindLabel" (right for a homogeneous batch like a bulk
-    // move/transcribe). Used for every multi-select op; a single-item op is
-    // just a batch of one (still one undo snackbar via batchUndoLabel(1), and
-    // rendered flat by collapseBatches()).
-    int enqueueBatch(std::vector<std::unique_ptr<Task>> tasks, const QString &displayLabel = {});
-    // Runs `fn` (which enqueues per-file tasks via the normal single-file
-    // helpers) inside a batch scope: allocates the shared batchId, sets
-    // m_currentBatchId so each enqueueTask() stamps it, records displayLabel,
-    // then clears the scope. Drops the (empty) batch label if `fn` enqueued
-    // nothing (e.g. every file was deduped away). This is how the loop-based
-    // bulk ops (transcribeAll/…/runAllJobsForPaths) become one batch without
-    // duplicating their per-file dedup/prerequisite/ordering logic.
-    void withBatch(const QString &displayLabel, const std::function<void()> &fn);
-    // True iff some task in m_tasks still carries this (non-zero) batchId — the
-    // "does this batch still exist" check behind withBatch()'s empty-batch
-    // label prune and dismissBatch()/cancelBatch()'s label cleanup. Forwards
-    // to TaskQuery::batchHasMembers().
-    bool batchHasMembers(int batchId) const;
-    // The ONE way a task enters the queue. Assigns its id, queues any
-    // prerequisites() ahead of it, inserts it, emits queueChanged(), and
-    // auto-starts if idle. insertIndex: -1 (default) uses
-    // frontOfQueueInsertIndex() so a live "start this now" request jumps
-    // ahead of whatever's already Queued; a queue-REPLAY caller passes an
-    // explicit index to reproduce its exact saved order instead. Returns the
-    // new task's id.
+    // The ONE way a task enters the queue — a thin forwarder to
+    // m_scheduler->enqueueTask() so the friend test seam and every single-file
+    // helper keep the same call site. Returns the new task's id.
     int enqueueTask(std::unique_ptr<Task> task, int insertIndex = -1);
-    // The ONE terminal-report path. Reached either from the runner (run()
-    // returned or threw) or synthesized directly by the queue for a task
-    // cancelled before it ever ran — see .task/plan.md invariant 1: every
-    // enqueued task reports exactly once, whether or not run() was called.
-    void onTaskFinished(Task *task, bool ok, const QString &error);
-    // Index of `task` in m_tasks, or -1. The runner hands back a raw pointer;
-    // the task may have been removed (cancelled/dismissed) in the meantime.
-    // Forwards to TaskQuery::indexOfTask().
-    int indexOfTask(const Task *task) const;
 
     // Item 17: the three public chapter editors (addChapter/setChapterTitle/
     // deleteChapter) all reopen the .md, carry frontmatter through untouched,
@@ -1608,12 +1532,6 @@ private:
     // jumps ahead of whatever's already Queued (see their own doc comments).
     int maybeQueueDownloadTask(ModelDownloadTarget target, const QUrl &vaultUrl, const QString &modelId,
                                 int insertIndex = -1);
-    // Queues a DownloadTask for each of `task`'s declared prerequisites()
-    // that isn't already on disk or queued, inserting each at *insertAt and
-    // advancing that cursor — so a kind declares its model needs ONCE (on
-    // itself) instead of every enqueue site (and the persisted-queue replay)
-    // separately remembering to queue the right downloads for it.
-    void queuePrerequisites(const Task &task, const QUrl &vaultUrl, int *insertAt);
     // Item O15: where a freshly requested job should land in m_jobs so it
     // runs NEXT once whatever's currently running finishes, ahead of
     // anything already Queued — right after the Active job if one exists
@@ -1672,17 +1590,17 @@ private:
     // no-op.
     void recomputeOverallProgress();
 
-    QThread m_thread;
-    TaskRunner *m_runner = nullptr;
-    // The instant lane (see Task::Lane): a SECOND worker thread + runner that
-    // executes Lane::Instant tasks (rename/merge — fast file rewrites) in
-    // parallel with the serial GPU queue, so a rename never waits behind a
-    // transcription. One instant task at a time (they're fast); the task
-    // currently running here is m_instantActive (a borrowed pointer into
-    // m_tasks, or null). Its own (unused) EngineCache costs nothing.
-    QThread m_instantThread;
-    TaskRunner *m_instantRunner = nullptr;
-    Task *m_instantActive = nullptr;
+    // PHASE Q: the display-blind queue engine. Owns the task list, the two
+    // worker threads/runners, and the pause/cancel INTENT — everything this
+    // class no longer touches directly. Not a QObject child (deleted explicitly
+    // in ~TranscriptionController, so the thread shutdown runs while this
+    // observer is still fully valid). Constructed AFTER m_phaseTimer since the
+    // inline getters need neither yet, but before anything can enqueue.
+    TaskScheduler *m_scheduler = nullptr;
+    // onSerialActiveEnded() snapshots m_currentFile here so the terminal
+    // finished() report names the file that finished, even after pumpQueues()
+    // has already moved m_currentFile on to the next task.
+    QUrl m_finishingFileUrl;
     // Bound from QML (setVaultTreeModel); null in headless tests. Used only to
     // call applyRemovalOutcome()/applyRestoreOutcome() after a trash/delete/
     // restore task completes — see setVaultTreeModel()'s doc comment.
@@ -1721,67 +1639,23 @@ private:
     QString m_phase;
     QUrl m_currentFile;
     int m_liveUpdateTick = 0;
-    // Owning. A Task lives on the GUI thread for its whole lifetime
-    // (including as a Done/Failed history row) while its run() executes on the
-    // worker thread — see Task.h's THREADING doc comment. unique_ptr, not
-    // value semantics: Task is polymorphic and a QObject (non-copyable).
-    std::vector<std::unique_ptr<Task>> m_tasks;
     // Tasks whose signals connectTask() has already wired. A task is
     // dispatched more than once across its life (a Paused task re-enters
     // startTask() when resumed), and re-connecting would double-count every
     // progress tick. Raw pointers, only ever compared — the entries are owned
-    // by m_tasks and erased alongside them.
+    // by the scheduler's task list and forgotten via onTaskRemoved() as they're
+    // erased.
     QSet<const Task *> m_connectedTasks;
     // Item P6: rebuilt from m_jobs by rebuildJobStatusIndex() (see its own
     // doc comment) — keyed by absolute local file path, mirrors jobs()'
     // per-path status but as an O(1) lookup for jobStatusForPath() instead of
     // a linear jobs() scan.
     QHash<QString, Task::Status> m_jobStatusByPath;
-    int m_activeIndex = -1;
-    int m_nextJobId = 1;
-    // The batchId enqueueTask() stamps onto the task it's inserting, or 0 for a
-    // standalone enqueue. Set only for the duration of a withBatch()/
-    // enqueueBatch() scope (never re-entrant — batches are built synchronously
-    // on the GUI thread). Prerequisite downloads enqueueTask queues ahead of
-    // the task are inserted directly (maybeQueueDownloadTask), NOT via
-    // enqueueTask, so they never pick this up — a shared prereq isn't part of
-    // any one batch.
-    int m_currentBatchId = 0;
-    // batchId -> the collapsed row's category label (collapseBatches()). Only
-    // holds the batches whose enqueue site passed an explicit label (e.g. "Run
-    // all", whose mixed member kinds can't derive one); a homogeneous batch
-    // leaves no entry and collapseBatches() derives the label from a member's
-    // kindLabel. Pruned when a batch's last member leaves m_tasks.
-    QHash<int, QString> m_batchLabels;
     // Set by loadPersistedQueue() (once per vault open) — where persistQueue()
     // writes back to. Empty (no persistence) until then.
     QUrl m_vaultUrl;
-    // Cached from the most recent runCombineScan() call (Sidebar.qml's
-    // ribbon "combine" button — a user-initiated action now, not automatic)
-    // so maybeRedirectForCombine()'s per-job safety check has something to
-    // consult without TranscriptionController needing its own
-    // VaultTreeModel/AppSettings reference. Only as fresh as the user's last
-    // manual combine run — possibly empty if they've never run one this
-    // session — acceptable, see maybeRedirectForCombine()'s doc comment.
-    QVariantList m_combineRules;
-    QStringList m_combineAudioPaths;
-    bool m_combineDeleteOriginals = false;
     // See isActivePaused()'s doc comment.
     bool m_activePaused = false;
-    // Set right before killing the Active job specifically to soft-pause it
-    // (togglePauseActive() during "loading" — see JobStatus::Paused's
-    // doc comment), so onWorkerFinished() can tell that outcome apart from a
-    // real cancel/failure of the SAME underlying "requestCancel() then
-    // finished(false, "Cancelled")" mechanism. Cleared the instant it's read.
-    bool m_pausingActiveAsRestart = false;
-    // True from the moment a cancel is requested on an Active task that can't
-    // stop instantly (pausable && !capabilities().cancellableMidRun — e.g.
-    // diarization, whose pass runs to its boundary before the cancel lands)
-    // until that task reaches terminal. Folds into isActiveStopping() so the
-    // UI shows "Cancelling", disables pause, and never flips back to a
-    // running-looking state. Derived from the task's OWN declared capability,
-    // so any future non-mid-cancellable kind gets this for free.
-    bool m_activeCancelling = false;
     // Wave N (task system, item 4/7): wall-clock ms the Active job has
     // actually been RUNNING, excluding paused stretches — see
     // activeElapsedMs()'s doc comment. m_activeSegmentTimer covers the

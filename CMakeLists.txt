@@ -322,6 +322,8 @@ qt_add_qml_module(suopTranscriber
         src/core/JobListFormatter.cpp
         src/core/TaskQuery.h
         src/core/TaskQuery.cpp
+        src/core/TaskScheduler.h
+        src/core/TaskScheduler.cpp
         src/core/TranscriptionController.h
         src/core/TranscriptionController.cpp
         src/core/tasks/TaskControl.h
