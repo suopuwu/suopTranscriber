@@ -9,6 +9,7 @@
 
 #include "core/FocusBlurFilter.h"
 #include "core/IconTheme.h"
+#include "core/SortKey.h"
 
 int main(int argc, char *argv[])
 {
@@ -83,6 +84,12 @@ int main(int argc, char *argv[])
     // restart.
     QCoreApplication::setOrganizationName("suopTranscriber");
     QCoreApplication::setApplicationName("suopTranscriber");
+
+    // VaultSearchProxyModel.fileSortKeys is a typed SortKeyMap (see
+    // src/core/SortKey.h) that TreeOrdering.compute() produces and Sidebar.qml
+    // passes straight through to the proxy as an opaque value. Register it so
+    // the QML property system can carry and assign it by its metatype.
+    qRegisterMetaType<SortKeyMap>("SortKeyMap");
 
     // App-wide "click outside a focused text field blurs (commits) it". Installed
     // on the application so it observes every press BEFORE any QML grab — the

@@ -8,15 +8,16 @@
 // deliberate product decision about how the vault tree orders itself — not a
 // refactor.
 //
-// THE CONTRACT THIS GUARDS. sortKeys is a 3-element list of STRINGS —
-// [groupRank, clusterKey, memberRank] — consumed by
-// VaultSearchProxyModel::lessThan(), which compares element 0, then 1, then 2,
-// each as a plain QString. That mirroring used to span two languages in two
-// files; it is now producer-and-consumer side by side in src/core/, and these
-// tests are what keep the two halves honest. tst_vaultsearchproxymodel.cpp
-// covers the CONSUMER half (keys in -> row order out); this file covers the
-// PRODUCER half (vault data in -> keys out). Between them the whole path is
-// pinned.
+// THE CONTRACT THIS GUARDS. sortKeys is a path -> typed SortKey
+// (src/core/SortKey.h; groupRank, then clusterKey, then memberRank) map,
+// consumed by VaultSearchProxyModel::lessThan() via SortKey::operator<. The
+// field count and the compare are now the STRUCT's, shared by both sides — a
+// wrong element count is a compile error, not something these tests must catch.
+// What these tests still pin is the VALUES the producer puts in each field (the
+// padded-integer encoding, the dateDesc flip, the group min-rank sharing) and
+// the resulting order. tst_vaultsearchproxymodel.cpp covers the CONSUMER half
+// (keys in -> row order out); this file covers the PRODUCER half (vault data in
+// -> keys out). Between them the whole path is pinned.
 //
 // The encoding details that are load-bearing and asserted LITERALLY here
 // rather than structurally:
@@ -42,6 +43,7 @@
 #include <QVariantList>
 #include <QVariantMap>
 
+#include "SortKey.h"
 #include "TreeOrdering.h"
 
 namespace {
@@ -62,9 +64,21 @@ QVariantMap pending(const QString &outputPath)
     return p;
 }
 
+SortKeyMap sortKeysOf(const QVariantMap &out)
+{
+    return out.value(QStringLiteral("sortKeys")).value<SortKeyMap>();
+}
+
+// Decodes the typed SortKey back into the {groupRank, clusterKey, memberRank}
+// triple the value assertions below read positionally. A path with no entry
+// comes back empty (size 0), exactly as the old toStringList() did.
 QStringList keyOf(const QVariantMap &out, const QString &path)
 {
-    return out.value(QStringLiteral("sortKeys")).toMap().value(path).toStringList();
+    const SortKeyMap keys = sortKeysOf(out);
+    const auto it = keys.constFind(path);
+    if (it == keys.constEnd())
+        return {};
+    return { it->groupRank, it->clusterKey, it->memberRank };
 }
 
 // The order the tree actually displays: sort the keyed paths exactly the way
@@ -107,11 +121,12 @@ private slots:
     {
         const QVariantMap out = TreeOrdering::compute({}, {}, {}, {}, kName);
         for (const QString &key : { QStringLiteral("readyPaths"), QStringLiteral("orderPaths"),
-                                    QStringLiteral("topMerged"), QStringLiteral("bottomMerged"),
-                                    QStringLiteral("sortKeys") }) {
+                                    QStringLiteral("topMerged"), QStringLiteral("bottomMerged") }) {
             QVERIFY2(out.contains(key), qPrintable(key));
             QVERIFY2(out.value(key).toMap().isEmpty(), qPrintable(key));
         }
+        QVERIFY(out.contains(QStringLiteral("sortKeys")));
+        QVERIFY(sortKeysOf(out).isEmpty());
     }
 
     // --- sortMode "name" ---
@@ -503,11 +518,12 @@ private slots:
 
     // --- Every path gets a key ---
 
-    // The proxy splits on "has a well-formed 3-element key" as its FIRST
-    // ordering tier, so a missing or wrong-length entry silently demotes that
-    // file below every sibling. Every audio path and every placeholder must
-    // come back with exactly 3 elements.
-    void everyPathGetsAThreeElementKey()
+    // The proxy splits on "has a key entry" as its FIRST ordering tier, so a
+    // MISSING entry silently demotes that file below every sibling. Every audio
+    // path and every placeholder must therefore come back with an entry. (That
+    // each entry has exactly three string ranks is now guaranteed by the SortKey
+    // type itself — a compile-time property, no longer a runtime check here.)
+    void everyPathGetsAKey()
     {
         const QStringList paths = { QStringLiteral("/v/a.wav"), QStringLiteral("/v/b.wav"),
                                     QStringLiteral("/v/c.wav") };
@@ -516,14 +532,11 @@ private slots:
         const QVariantMap out =
             TreeOrdering::compute(paths, {}, groups, { pending(QStringLiteral("/v/p.wav")) }, kName);
 
-        const QVariantMap sortKeys = out.value(QStringLiteral("sortKeys")).toMap();
+        const SortKeyMap sortKeys = sortKeysOf(out);
         QCOMPARE(sortKeys.size(), 4);
-        for (auto it = sortKeys.constBegin(); it != sortKeys.constEnd(); ++it) {
-            const QVariantList key = it.value().toList();
-            QCOMPARE(key.size(), 3);
-            for (const QVariant &element : key)
-                QCOMPARE(element.metaType().id(), QMetaType::QString);
-        }
+        for (const QString &p : { QStringLiteral("/v/a.wav"), QStringLiteral("/v/b.wav"),
+                                  QStringLiteral("/v/c.wav"), QStringLiteral("/v/p.wav") })
+            QVERIFY2(sortKeys.contains(p), qPrintable(p));
     }
 };
 

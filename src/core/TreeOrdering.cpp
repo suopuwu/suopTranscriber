@@ -1,9 +1,10 @@
 #include "TreeOrdering.h"
 
+#include "SortKey.h"
+
 #include <QHash>
 
 #include <algorithm>
-#include <array>
 
 namespace {
 
@@ -175,26 +176,27 @@ QVariantMap TreeOrdering::compute(const QStringList &audioPaths,
     // a lone file whose ownRank happens to tie a group's groupRank lands
     // cleanly before or after that whole group instead of inside it.
     //
-    // This 3-element encoding IS VaultSearchProxyModel::lessThan()'s
-    // comparison contract (kFileSortKeyElements there). Changing the count,
-    // the order, or an element's type means changing lessThan() in the same
-    // commit — they are two halves of one thing, which is why this producer
-    // was moved next to that consumer.
-    QVariantMap sortKeys;
-    // Same triple, kept in a typed side table so the displayOrder sort below
-    // compares QStrings directly instead of round-tripping through QVariant.
-    QHash<QString, std::array<QString, 3>> keyOf;
-    const auto addKey = [&](const QString &path, const std::array<QString, 3> &key) {
-        keyOf.insert(path, key);
-        sortKeys.insert(path, QVariantList{key[0], key[1], key[2]});
+    // This encoding IS VaultSearchProxyModel::lessThan()'s comparison contract.
+    // It is no longer a 3-element stringly-typed list held together by this
+    // comment: both sides now go through the typed SortKey (src/core/SortKey.h),
+    // whose field count and operator< ARE the contract — a mismatched count is
+    // a compile error, not a silent mis-sort. This producer sits next to that
+    // consumer for the same reason.
+    //
+    // The one typed table doubles as both the transport value (an opaque
+    // SortKeyMap QML hands straight to the proxy) and the side table the
+    // displayOrder sort below compares directly via SortKey::operator<.
+    SortKeyMap sortKeys;
+    const auto addKey = [&](const QString &path, const SortKey &key) {
+        sortKeys.insert(path, key);
     };
     for (const QString &path : audioPaths) {
         const auto key = clusterKeyOf.constFind(path);
         if (key == clusterKeyOf.constEnd()) {
             const QString own = ownRank(path, sortMode, mtimes);
-            addKey(path, {own, path, own});
+            addKey(path, SortKey{own, path, own});
         } else {
-            addKey(path, {groupRankOf.value(*key), *key, memberOrderRank(path, groupFileOrder)});
+            addKey(path, SortKey{groupRankOf.value(*key), *key, memberOrderRank(path, groupFileOrder)});
         }
     }
 
@@ -232,17 +234,13 @@ QVariantMap TreeOrdering::compute(const QStringList &audioPaths,
     // allAudioPaths() order. std::sort would be free to swap it.
     // Read through a CONST alias: QHash::operator[] on a mutable hash would
     // insert-on-miss, and an insert mid-sort can rehash and dangle the
-    // references the comparator is holding.
-    const QHash<QString, std::array<QString, 3>> &keys = keyOf;
+    // references the comparator is holding. The compare IS SortKey::operator<,
+    // the exact same one lessThan() uses — one definition, no re-implemented
+    // element loop to drift.
+    const SortKeyMap &keys = sortKeys;
     std::stable_sort(displayOrder.begin(), displayOrder.end(),
                      [&keys](const QString &a, const QString &b) {
-                         const std::array<QString, 3> &ka = *keys.constFind(a);
-                         const std::array<QString, 3> &kb = *keys.constFind(b);
-                         for (int i = 0; i < 3; ++i) {
-                             if (ka[i] != kb[i])
-                                 return ka[i] < kb[i];
-                         }
-                         return false;
+                         return *keys.constFind(a) < *keys.constFind(b);
                      });
 
     QVariantMap topMerged;
@@ -272,6 +270,6 @@ QVariantMap TreeOrdering::compute(const QStringList &audioPaths,
     out.insert(QStringLiteral("orderPaths"), orderPaths);
     out.insert(QStringLiteral("topMerged"), topMerged);
     out.insert(QStringLiteral("bottomMerged"), bottomMerged);
-    out.insert(QStringLiteral("sortKeys"), sortKeys);
+    out.insert(QStringLiteral("sortKeys"), QVariant::fromValue(sortKeys));
     return out;
 }

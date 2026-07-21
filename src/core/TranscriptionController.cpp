@@ -1478,9 +1478,12 @@ QVariantMap TranscriptionController::readMetadata(const QUrl &fileUrl) const
             continue;
         const QString key = line.left(colon).trimmed();
         const QString value = line.mid(colon + 1).trimmed();
-        if (value == QStringLiteral("true"))
+        // The boolean-token rule is single-sourced in MdFrontmatter so this
+        // typed reader can't diverge from VaultTreeModel::frontmatterField's
+        // string reader on what "true"/"false" mean.
+        if (MdFrontmatter::isTrue(value))
             result[key] = true;
-        else if (value == QStringLiteral("false"))
+        else if (MdFrontmatter::isFalse(value))
             result[key] = false;
         else
             result[key] = value;

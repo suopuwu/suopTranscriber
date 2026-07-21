@@ -22,17 +22,17 @@
 //   topMerged     path -> true when the row ABOVE it in display order is in
 //                 the same ready group (Sidebar.combineTopMergedPaths).
 //   bottomMerged  ditto for the row below (Sidebar.combineBottomMergedPaths).
-//   sortKeys      path -> the 3-element [groupRank, clusterKey, memberRank]
-//                 string list VaultSearchProxyModel::lessThan() compares
-//                 (searchProxy.fileSortKeys).
+//   sortKeys      path -> a typed SortKey (src/core/SortKey.h), the value
+//                 VaultSearchProxyModel::lessThan() compares. Carried in the
+//                 bundle as an opaque QHash<QString, SortKey> (SortKeyMap) that
+//                 QML passes straight to searchProxy.fileSortKeys untouched.
 //
-// WHY THIS IS IN C++: sortKeys' encoding must EXACTLY mirror
-// VaultSearchProxyModel::lessThan()'s comparison — same element count, same
-// element order, same string-compare semantics. That contract used to span
-// two languages in two files, which made it the single most drift-prone thing
-// in a 4.5k-line QML file. Producer and consumer now sit side by side in
-// src/core/, so a change to one is in the same directory (and the same
-// language) as the guard on the other.
+// WHY THIS IS IN C++: sortKeys' encoding and lessThan()'s comparison are two
+// halves of one contract. That contract used to span two languages in two
+// files — the single most drift-prone thing in a 4.5k-line QML file. It is now
+// the single typed SortKey struct both sides go through: the field count and
+// operator< ARE the contract, so a mismatch is a compile error rather than a
+// silent mis-sort. Producer and consumer sit side by side in src/core/.
 //
 // Stateless by construction — a QML_SINGLETON purely so QML has something to
 // call; compute() is a plain static and holds no state between calls.

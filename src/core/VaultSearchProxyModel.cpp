@@ -2,15 +2,6 @@
 
 #include "VaultTreeModel.h"
 
-namespace {
-// Length of a well-formed fileSortKeys entry (groupRank, cluster identity,
-// position within the cluster) — TreeOrdering::compute() builds them (see
-// TreeOrdering.h; it sits next to this file precisely so the producer and
-// this consumer can't drift apart); anything else is treated as "no key" by
-// lessThan() below.
-constexpr int kFileSortKeyElements = 3;
-}
-
 VaultSearchProxyModel::VaultSearchProxyModel(QObject *parent)
     : QSortFilterProxyModel(parent)
 {
@@ -129,12 +120,12 @@ void VaultSearchProxyModel::setSpeakerFilter(const QStringList &speakers)
     invalidateUnlessResetting();
 }
 
-QVariantMap VaultSearchProxyModel::fileSortKeys() const
+SortKeyMap VaultSearchProxyModel::fileSortKeys() const
 {
     return m_fileSortKeys;
 }
 
-void VaultSearchProxyModel::setFileSortKeys(const QVariantMap &keys)
+void VaultSearchProxyModel::setFileSortKeys(const SortKeyMap &keys)
 {
     if (keys == m_fileSortKeys)
         return;
@@ -316,9 +307,10 @@ bool VaultSearchProxyModel::lessThan(const QModelIndex &left, const QModelIndex 
     }
 
     if (!leftIsDir && !m_fileSortKeys.isEmpty()) {
-        const QVariantList leftKey = m_fileSortKeys.value(src->data(left, VaultTreeModel::PathRole).toString()).toList();
-        const QVariantList rightKey =
-            m_fileSortKeys.value(src->data(right, VaultTreeModel::PathRole).toString()).toList();
+        const auto leftKey = m_fileSortKeys.constFind(src->data(left, VaultTreeModel::PathRole).toString());
+        const auto rightKey = m_fileSortKeys.constFind(src->data(right, VaultTreeModel::PathRole).toString());
+        const bool leftHasKey = leftKey != m_fileSortKeys.constEnd();
+        const bool rightHasKey = rightKey != m_fileSortKeys.constEnd();
         // Sidebar.qml's file-tree sort (sort mode + combine-candidate
         // clustering) — see VaultSearchProxyModel.h's fileSortKeys doc
         // comment. Orphaned .md files have no entry (out of scope — combine
@@ -335,22 +327,14 @@ bool VaultSearchProxyModel::lessThan(const QModelIndex &left, const QModelIndex 
         // comparison consistent with every other, at the cost of keyless
         // files (orphaned .md) always landing after every audio file in the
         // same folder instead of interleaving at their old alphabetical spot.
-        const bool leftHasKey = leftKey.size() == kFileSortKeyElements;
-        const bool rightHasKey = rightKey.size() == kFileSortKeyElements;
         if (leftHasKey != rightHasKey)
             return leftHasKey;
-        if (leftHasKey) {
-            // Element order is TreeOrdering::compute()'s, not this file's:
-            // groupRank, then cluster identity, then position within the
-            // cluster — see its sortKeys comment for why identity is
-            // its own tier (without it, two groups with an equal groupRank
-            // interleave their members instead of staying clustered).
-            for (int i = 0; i < kFileSortKeyElements; ++i) {
-                const QString leftElement = leftKey.at(i).toString();
-                const QString rightElement = rightKey.at(i).toString();
-                if (leftElement != rightElement)
-                    return leftElement < rightElement;
-            }
+        if (leftHasKey && *leftKey != *rightKey) {
+            // The comparison IS SortKey::operator< — the same one
+            // TreeOrdering::compute()'s own displayOrder sort uses. groupRank,
+            // then cluster identity, then position within the cluster; there
+            // is no element loop here to drift from the producer's.
+            return *leftKey < *rightKey;
         }
     }
 

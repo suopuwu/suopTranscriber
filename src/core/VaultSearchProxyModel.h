@@ -5,6 +5,8 @@
 #include <QVariantMap>
 #include <qqml.h>
 
+#include "SortKey.h"
+
 // Item 9: sidebar search sort + match highlighting/snippet support. Wraps a
 // VaultTreeModel (a tree, not a flat list) so matches sort to the top of
 // their sibling list without ever hiding non-matches — the sidebar already
@@ -24,7 +26,7 @@ class VaultSearchProxyModel : public QSortFilterProxyModel {
     Q_PROPERTY(QStringList tagFilter READ tagFilter WRITE setTagFilter NOTIFY tagFilterChanged)
     Q_PROPERTY(QStringList speakerFilter READ speakerFilter WRITE setSpeakerFilter NOTIFY speakerFilterChanged)
     Q_PROPERTY(
-        QVariantMap fileSortKeys READ fileSortKeys WRITE setFileSortKeys NOTIFY fileSortKeysChanged)
+        SortKeyMap fileSortKeys READ fileSortKeys WRITE setFileSortKeys NOTIFY fileSortKeysChanged)
 
 public:
     // Extra role beyond what VaultTreeModel::roleNames() forwards: whether
@@ -50,18 +52,18 @@ public:
     void setSpeakerFilter(const QStringList &speakers);
 
     // Sidebar.qml's file-tree sort feature (Name / Date Modified asc-desc,
-    // plus keeping combine-candidate groups tree-adjacent): path -> a
-    // 3-element [groupRank, clusterKey, memberRank] string list, compared in
-    // that order (clusterKey is what keeps two groups sharing a groupRank
-    // from interleaving — see TreeOrdering::compute()'s own comment),
-    // precomputed by TreeOrdering (src/core/TreeOrdering.h) from
-    // allAudioPaths()/audioLastModified()/detectCombineGroups() and pushed
-    // here as one map by Sidebar.qml's refreshTreeOrdering(), so lessThan()
-    // only ever does a plain QString compare —
-    // same "QML computes, proxy just compares" shape as MatchesSearchRole
-    // above, avoiding a second copy of the grouping logic in C++.
-    QVariantMap fileSortKeys() const;
-    void setFileSortKeys(const QVariantMap &keys);
+    // plus keeping combine-candidate groups tree-adjacent): path -> a typed
+    // SortKey (src/core/SortKey.h; groupRank, then clusterKey, then memberRank
+    // — clusterKey is what keeps two groups sharing a groupRank from
+    // interleaving, see TreeOrdering::compute()'s own comment), precomputed by
+    // TreeOrdering (src/core/TreeOrdering.h) from allAudioPaths()/
+    // audioLastModified()/detectCombineGroups() and pushed here as one opaque
+    // SortKeyMap by Sidebar.qml's refreshTreeOrdering(). lessThan() compares via
+    // SortKey::operator< — the SAME comparison the producer uses, not a
+    // re-implemented element loop that could drift. Same "QML computes, proxy
+    // just compares" shape as MatchesSearchRole above.
+    SortKeyMap fileSortKeys() const;
+    void setFileSortKeys(const SortKeyMap &keys);
 
     QVariant data(const QModelIndex &proxyIndex, int role) const override;
     QHash<int, QByteArray> roleNames() const override;
@@ -111,7 +113,7 @@ private:
     bool m_includeTranscriptions = true;
     QStringList m_tagFilter;
     QStringList m_speakerFilter;
-    QVariantMap m_fileSortKeys;
+    SortKeyMap m_fileSortKeys;
     bool m_sourceResetting = false;
     bool m_invalidateDeferred = false;
 };

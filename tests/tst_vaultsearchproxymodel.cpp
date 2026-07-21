@@ -10,6 +10,7 @@
 #include <QTemporaryDir>
 #include <QUrl>
 
+#include "SortKey.h"
 #include "VaultSearchProxyModel.h"
 #include "VaultTreeModel.h"
 
@@ -363,10 +364,10 @@ private slots:
         VaultSearchProxyModel proxy;
         proxy.setSourceModel(&source);
 
-        QVariantMap keys;
-        keys.insert(vault.filePath("a.mp3"), QVariantList() << "group1" << "g1" << "a");
-        keys.insert(vault.filePath("b.mp3"), QVariantList() << "group1" << "g1" << "b");
-        keys.insert(vault.filePath("z.mp3"), QVariantList() << "group0" << "g0" << "z");
+        SortKeyMap keys;
+        keys.insert(vault.filePath("a.mp3"), SortKey{"group1", "g1", "a"});
+        keys.insert(vault.filePath("b.mp3"), SortKey{"group1", "g1", "b"});
+        keys.insert(vault.filePath("z.mp3"), SortKey{"group0", "g0", "z"});
         proxy.setFileSortKeys(keys);
 
         QCOMPARE(siblingNamesInOrder(proxy), QStringList({"z.mp3", "a.mp3", "b.mp3"}));
@@ -403,11 +404,11 @@ private slots:
 
         // Both clusters share groupRank "r" (identical mtimes); each file is
         // member #1/#2 of its own cluster.
-        QVariantMap keys;
-        keys.insert(vault.filePath("mic1_edit.wav"), QVariantList() << "r" << "edit" << "1");
-        keys.insert(vault.filePath("mic2_edit.wav"), QVariantList() << "r" << "edit" << "2");
-        keys.insert(vault.filePath("mic1_orig.wav"), QVariantList() << "r" << "orig" << "1");
-        keys.insert(vault.filePath("mic2_orig.wav"), QVariantList() << "r" << "orig" << "2");
+        SortKeyMap keys;
+        keys.insert(vault.filePath("mic1_edit.wav"), SortKey{"r", "edit", "1"});
+        keys.insert(vault.filePath("mic2_edit.wav"), SortKey{"r", "edit", "2"});
+        keys.insert(vault.filePath("mic1_orig.wav"), SortKey{"r", "orig", "1"});
+        keys.insert(vault.filePath("mic2_orig.wav"), SortKey{"r", "orig", "2"});
         proxy.setFileSortKeys(keys);
 
         // Each cluster contiguous, in member order — NOT the alphabetical
@@ -432,8 +433,8 @@ private slots:
         VaultSearchProxyModel proxy;
         proxy.setSourceModel(&source);
 
-        QVariantMap keys;
-        keys.insert(vault.filePath("aaa.mp3"), QVariantList() << "aaa.mp3" << "aaa.mp3" << "aaa.mp3");
+        SortKeyMap keys;
+        keys.insert(vault.filePath("aaa.mp3"), SortKey{"aaa.mp3", "aaa.mp3", "aaa.mp3"});
         proxy.setFileSortKeys(keys);
 
         QCOMPARE(siblingNamesInOrder(proxy), QStringList({"zzz_dir", "aaa.mp3"}));
@@ -462,8 +463,8 @@ private slots:
         VaultSearchProxyModel proxy;
         proxy.setSourceModel(&source);
 
-        QVariantMap keys;
-        keys.insert(vault.filePath("aaa.mp3"), QVariantList() << "zzz" << "zzz" << "zzz");
+        SortKeyMap keys;
+        keys.insert(vault.filePath("aaa.mp3"), SortKey{"zzz", "zzz", "zzz"});
         proxy.setFileSortKeys(keys);
 
         QCOMPARE(siblingNamesInOrder(proxy), QStringList({"aaa.mp3", "orphaned.md"}));
@@ -512,10 +513,9 @@ private slots:
         // setter's equality short-circuit can't mask the invalidate().
         int resetCount = 0;
         QObject::connect(&source, &QAbstractItemModel::modelReset, &proxy, [&] {
-            QVariantMap keys;
+            SortKeyMap keys;
             keys.insert(QStringLiteral("k"),
-                        QVariantList() << QString::number(++resetCount) << QStringLiteral("c")
-                                       << QStringLiteral("1"));
+                        SortKey{QString::number(++resetCount), QStringLiteral("c"), QStringLiteral("1")});
             proxy.setFileSortKeys(keys);
         });
 
@@ -537,7 +537,11 @@ private slots:
         // the handler's keys.
         QVERIFY(resetCount >= 1);
         QVERIFY(findByName(proxy, "roamer.mp3").isValid());
-        QCOMPARE(proxy.fileSortKeys().value(QStringLiteral("k")).toList().size(), 3);
+        // The deferred invalidate applied the LATEST handler write (its groupRank
+        // is the final resetCount), proving the typed key round-tripped through
+        // the setter rather than being dropped.
+        QVERIFY(proxy.fileSortKeys().contains(QStringLiteral("k")));
+        QCOMPARE(proxy.fileSortKeys().value(QStringLiteral("k")).groupRank, QString::number(resetCount));
     }
 
     // A rename applied via VaultTreeModel::applyRenameOutcome must flow through

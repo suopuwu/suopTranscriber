@@ -2,6 +2,7 @@
 
 #include "AudioExtensions.h"
 #include "FileRename.h"
+#include "MdFrontmatter.h"
 
 #include <QDateTime>
 #include <QDir>
@@ -397,7 +398,7 @@ VaultTreeModel::Status VaultTreeModel::effectiveStatus(const Node *node) const
     if (node->status != TranscribedStatus)
         return node->status;
     const QString mdPath = sidecarMdPath(node);
-    if (!mdPath.isEmpty() && frontmatterField(mdPath, QStringLiteral("partial")) == QLatin1String("true"))
+    if (!mdPath.isEmpty() && MdFrontmatter::isTrue(frontmatterField(mdPath, QStringLiteral("partial"))))
         return PartialStatus;
     return TranscribedStatus;
 }

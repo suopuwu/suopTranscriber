@@ -13,11 +13,21 @@
 // they don't touch is rewritten byte-for-byte). Header-only so no per-test
 // dependency wiring. Writes still go through writeFrontmatterBlock() (atomic).
 //
-// NOTE: the value READERS (TranscriptionController::readMetadata,
-// VaultTreeModel::frontmatterField) still parse independently and disagree on
-// bool coercion — deliberately not unified here to keep this change to the
-// write path.
+// The two value READERS (TranscriptionController::readMetadata,
+// VaultTreeModel::frontmatterField) still keep SEPARATE parse loops and caches
+// (different return shapes, different hot paths) — but they no longer DISAGREE
+// on bool coercion: both decide "is this the boolean-true token?" through the
+// single isTrue()/isFalse() predicate below, so what counts as true is defined
+// in exactly one place.
 namespace MdFrontmatter {
+
+// The ONE frontmatter boolean coercion, shared by every reader so they can't
+// drift apart on what "true" means. The app writes bools as the exact lowercase
+// tokens "true"/"false" (see upsertKey below and TranscriptFormat's writers),
+// so recognition is an exact match on those tokens — a stray "True"/"yes"/"1"
+// is deliberately NOT boolean-true, identically in every reader.
+inline bool isTrue(const QString &value) { return value == QLatin1String("true"); }
+inline bool isFalse(const QString &value) { return value == QLatin1String("false"); }
 
 // Reads `path`'s frontmatter block into `lines` (the raw "key: value" lines
 // between the two "---" delimiters) and everything after the closing delimiter

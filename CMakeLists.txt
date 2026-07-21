@@ -260,6 +260,7 @@ qt_add_qml_module(suopTranscriber
         src/core/FileRename.cpp
         src/core/VaultFileOps.h
         src/core/VaultFileOps.cpp
+        src/core/SortKey.h
         src/core/VaultSearchProxyModel.h
         src/core/VaultSearchProxyModel.cpp
         src/core/AudioPlayer.h
