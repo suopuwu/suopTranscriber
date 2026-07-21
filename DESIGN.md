@@ -141,9 +141,29 @@ Every unit of background work — transcribe, detect-speakers (diarize),
 relabel, chapters, rename/merge speaker, combine split recordings, import,
 USB grab, model download, model benchmark, diarization sweep — is a
 **polymorphic `Task`** (`src/core/tasks/Task.h`), one subclass per kind. They
-all run through **one FIFO queue** owned by `TranscriptionController`, on one
-worker thread (`TaskRunner`), at most one at a time — so nothing contends for
-the GPU, and a warm model (`EngineCache`) is reused across consecutive tasks.
+all run through **one FIFO queue**, on one worker thread (`TaskRunner`), at most
+one at a time — so nothing contends for the GPU, and a warm model
+(`EngineCache`) is reused across consecutive tasks.
+
+**The queue engine is a display-blind `TaskScheduler`** (`src/core/TaskScheduler.h`),
+split out of `TranscriptionController`. It owns ONLY the mechanics — the task
+list, the two worker threads/runners, enqueue/pump/start/finish, and the
+cancel/dismiss/undo/combine machinery — and never reads or writes a display
+field, emits a QML-facing signal, or wires a task's result signals. The
+dependency is **inverted**: the scheduler knows only an abstract
+`TaskSchedulerObserver`, which `TranscriptionController` implements. The
+controller stays a thin adapter that owns all display/progress state (`m_busy`/
+`m_phase`/`m_currentFile`/…), does every typed-signal emit, and forwards each
+queue `Q_INVOKABLE` to the scheduler — so the QML-facing surface is unchanged.
+The scheduler calls back through the observer at the exact synchronous points
+where display should update (a task starting, an active task ending, the queue
+draining), which is what makes the emission *order* the QML bindings depend on
+survive the split byte-for-byte. This is a genuine one-directional seam
+(scheduler → observer; the sole read-back is `activeElapsedMs()`, a pure value
+query) — not the earlier "extract the whole queue" idea, which was rejected
+because the scheduler and the serial-lane display state were a co-owned mesh.
+The behavior is pinned by the `characterize_*` slots in
+`tst_transcription_queue.cpp`, which lock the golden signal-emission sequence.
 
 **Two lanes** (`Task::lane()`). Most kinds are `Serial`: they run one-at-a-time
 because they're INTENSIVE on a scarce system resource. That's not only "needs
