@@ -35,15 +35,20 @@
 #include <QRegularExpression>
 #include <QSettings>
 #include <QStandardPaths>
+#include <QThread>
 #include <QtTest>
+
+#include <atomic>
 
 #include "DiarizationEngine.h" // DiarizedTurn for the spliceBodySpeakers test (item 52)
 #include "LabelingEngine.h" // kMaxChapterInputChars for the item-28 window test
 #include "TranscriptionController.h"
 // Persistence round-trip guard (everyPersistableKind_roundTripsThroughFactory):
 // build a representative of each persistable kind and rebuild it via the factory.
+#include "tasks/BenchmarkTask.h"
 #include "tasks/ChaptersTask.h"
 #include "tasks/CombineTask.h"
+#include "tasks/DiarizationSweepTask.h"
 #include "tasks/DiarizeTask.h"
 #include "tasks/DownloadTask.h"
 #include "tasks/MergeSpeakersTask.h"
@@ -92,6 +97,34 @@ struct VaultFixture {
     }
 
     QUrl audioUrl(const QString &name) const { return QUrl::fromLocalFile(dir.path() + "/" + name); }
+};
+
+// A fake Task mimicking diarization's shape for the cancel-while-paused state
+// machine (item 065): pausable == true, cancellableMidRun == false. Its run()
+// blocks on ctx.checkpoint() to honor pause, but DISCARDS checkpoint()'s cancel
+// return during the "pass" — exactly like DiarizeTask, whose sherpa-onnx
+// progress-callback return is ignored, so a cancel cannot abort the pass
+// mid-flight. The cancel is honored only at the post-pass boundary. The test
+// releases that boundary by flipping m_passDone. No diarization model needed.
+class FakePausablePassTask : public Task {
+public:
+    QString kind() const override { return QStringLiteral("fakePausablePass"); }
+    QString displayName() const override { return QStringLiteral("Fake pausable pass"); }
+    Capabilities capabilities() const override { return {/*pausable*/ true, /*cancellableMidRun*/ false}; }
+    void run(TaskContext &ctx) override
+    {
+        // The unabortable pass: keep honoring pause via checkpoint(), but ignore
+        // its cancel return (mimics diarization) so a cancel can't stop us here.
+        while (!m_passDone.load()) {
+            ctx.checkpoint(); // return DELIBERATELY discarded
+            QThread::msleep(5);
+        }
+        // Pass boundary: now honor a latched cancel honestly.
+        if (ctx.checkpoint())
+            throw TaskError(QStringLiteral("Cancelled"));
+    }
+
+    std::atomic<bool> m_passDone{false};
 };
 
 // Same detection strategy as tst_transcript_format's locateRealModel(): env
@@ -420,6 +453,40 @@ private slots:
         QCOMPARE(statusOf(controller, fileB), QStringLiteral("failed"));
     }
 
+    // occupiesFile() contract: comparison-only kinds (benchmark/sweep) do NOT
+    // occupy their file for per-file gating; real ops do. Pure predicate check,
+    // no worker run.
+    void comparisonKinds_doNotOccupyFile()
+    {
+        const QUrl file = QUrl::fromLocalFile(QStringLiteral("/v/x.wav"));
+        const QUrl vault = QUrl::fromLocalFile(QStringLiteral("/v"));
+        BenchmarkTask bench(file, vault, {QStringLiteral("base.en")});
+        DiarizationSweepTask sweep(file, {});
+        TranscribeTask xcribe(file, vault, QStringLiteral("base.en"));
+        QVERIFY(!bench.occupiesFile());
+        QVERIFY(!sweep.occupiesFile());
+        QVERIFY(xcribe.occupiesFile()); // default-true holds for a real op
+    }
+
+    // The reported bug: a benchmark on file X must NOT block queueing a
+    // transcription on X. isQueued(X) is false for a benchmark (it doesn't
+    // occupy X), so transcribe(X) actually enqueues instead of being swallowed.
+    void benchmark_doesNotBlockTranscribeOnSameFile()
+    {
+        VaultFixture vault;
+        TranscriptionController controller;
+        const QUrl file = vault.audioUrl("a.wav");
+
+        controller.runBenchmark(file, {QStringLiteral("base.en")});
+        QVERIFY(!controller.isQueued(file));               // benchmark doesn't occupy
+        QVERIFY(!controller.queuedFileUrls().contains(file));
+
+        controller.transcribe(file, vault.vaultUrl, kModelId);
+        QCOMPARE(controller.tasksTotal(), 2);              // benchmark + transcribe both enqueued
+
+        QTRY_COMPARE(controller.tasksCompleted(), 2);      // both drain (fail fast, no hang)
+    }
+
     // dismiss() removes exactly one Done/Failed entry for the fileUrl;
     // Queued/Active entries are never dismissible (no-op), and dismissing an
     // unknown url is a no-op. (The Queued case is deterministically testable
@@ -573,6 +640,11 @@ private slots:
 
         TranscriptionController controller;
         QSignalSpy finishedSpy(&controller, &TranscriptionController::finished);
+        // Item 040: an import is Presentation::Background, so it must never flip
+        // the main-panel overlay gate. m_activeIsForeground starts false and
+        // only changes on a Foreground task start, so a Background import
+        // produces ZERO notifications regardless of copy timing.
+        QSignalSpy foregroundSpy(&controller, &TranscriptionController::activeIsForegroundChanged);
         controller.importAudio(sourceUrl, destUrl, vaultUrl);
 
         // The job is an "import" kind, keyed on the destination.
@@ -582,6 +654,10 @@ private slots:
         const QList<QVariant> args = finishedSpy.takeFirst();
         QCOMPARE(args.at(0).toUrl(), destUrl);
         QVERIFY2(args.at(1).toBool(), qPrintable(args.at(2).toString()));
+
+        // The blocking overlay never engaged for the import.
+        QCOMPARE(foregroundSpy.count(), 0);
+        QVERIFY(!controller.activeIsForeground());
 
         QCOMPARE(statusOf(controller, destUrl), QStringLiteral("done"));
         QVERIFY(QFileInfo::exists(destPath));
@@ -613,6 +689,48 @@ private slots:
         QVERIFY(!finishedSpy.first().at(2).toString().isEmpty());
         QCOMPARE(statusOf(controller, destUrl), QStringLiteral("failed"));
         QVERIFY(!QFileInfo::exists(destUrl.toLocalFile())); // no partial file left behind
+    }
+
+    // Item 074: the controller-owned pending-rename store. pendingRenameStem()
+    // returns the new stem between renameFile() and fileRenamed, and "" after;
+    // pendingRenamesRevision bumps on BOTH edges (enqueue and completion). This
+    // is the single source both panels read so a rename deferred behind a
+    // same-file transcription shows AT ONCE everywhere.
+    void pendingRenameStore_populatesOnEnqueue_clearsOnCompletion()
+    {
+        QTemporaryDir vault;
+        QVERIFY(vault.isValid());
+        const QString audioPath = vault.path() + QStringLiteral("/talk.m4a");
+        {
+            QFile a(audioPath);
+            QVERIFY(a.open(QIODevice::WriteOnly));
+            a.write("not-really-audio");
+            a.close();
+            QFile m(audioPath + QStringLiteral(".md"));
+            QVERIFY(m.open(QIODevice::WriteOnly));
+            m.write("---\nmodel: base\n---\n[0] hi\n");
+            m.close();
+        }
+        const QUrl audioUrl = QUrl::fromLocalFile(audioPath);
+
+        TranscriptionController controller;
+        QSignalSpy revSpy(&controller, &TranscriptionController::pendingRenamesRevisionChanged);
+        QSignalSpy renamedSpy(&controller, &TranscriptionController::fileRenamed);
+
+        // Before: nothing pending.
+        QCOMPARE(controller.pendingRenameStem(audioUrl), QString());
+
+        controller.renameFile(audioUrl, QStringLiteral("chat"));
+        // Synchronously recorded + one revision bump, all BEFORE the task runs.
+        QCOMPARE(renamedSpy.count(), 0);
+        QCOMPARE(controller.pendingRenameStem(audioUrl), QStringLiteral("chat"));
+        QCOMPARE(revSpy.count(), 1);
+
+        QTRY_COMPARE_WITH_TIMEOUT(renamedSpy.count(), 1, 5000);
+        QVERIFY2(renamedSpy.constFirst().at(2).toBool(), "the rename itself failed");
+        // Cleared on completion, with a second revision bump.
+        QCOMPARE(controller.pendingRenameStem(audioUrl), QString());
+        QCOMPARE(revSpy.count(), 2);
     }
 
     // CLAUDE.md: "Never run transcription on the GUI thread." The worker
@@ -1100,6 +1218,51 @@ private slots:
         QCOMPARE(controller.jobs().at(0).toMap().value("error").toString(), QStringLiteral("Cancelled"));
     }
 
+    // Item 065: cancelling a PAUSED task that can't abort mid-pass (diarization's
+    // shape — pausable && !cancellableMidRun) must show an honest "Cancelling"
+    // (activeStopping) state, NOT look like a resume with a dead pause button.
+    // Before the fix, the cancel paths fired requestResume() and checkpoint()
+    // emitted a phantom paused(false), so the UI flipped back to running and
+    // pause silently no-op'd for the rest of the pass. The queue now derives the
+    // Cancelling state from the task's OWN cancellableMidRun=false capability, so
+    // any future non-mid-cancellable kind is immune for free.
+    void cancelWhilePaused_showsCancelling_notResumed()
+    {
+        TranscriptionController controller;
+
+        auto task = std::make_unique<FakePausablePassTask>();
+        FakePausablePassTask *raw = task.get();
+        controller.enqueueTask(std::move(task)); // friend seam — no public arbitrary-Task enqueue
+
+        // Reaches Active and starts spinning in run()/checkpoint().
+        QTRY_COMPARE(controller.jobs().at(0).toMap().value("status").toString(), QStringLiteral("active"));
+
+        // Pause works the FIRST time: activePaused true, not stopping yet.
+        controller.pauseActive();
+        QTRY_VERIFY(controller.isActivePaused());
+        QVERIFY(!controller.isActiveStopping());
+
+        // Cancel all while paused -> honest Cancelling state. Crucially it must
+        // NOT report a fresh running/resumed edge: activePaused stays true (a
+        // requestResume()/phantom paused(false) — the old bug — would clear it).
+        controller.cancelAll();
+        QTRY_VERIFY(controller.isActiveStopping());
+        QVERIFY(controller.isActivePaused()); // never flips to a running-looking state
+        // Give any stray resume/SIGCONT edge time to land, then re-confirm the
+        // state held (the pass is still running to its boundary).
+        QTest::qWait(300);
+        QVERIFY(controller.isActiveStopping());
+        QVERIFY(controller.isActivePaused());
+        QCOMPARE(controller.jobs().at(0).toMap().value("status").toString(), QStringLiteral("active"));
+
+        // Release the pass boundary: the post-pass checkpoint() sees the latched
+        // cancel and throws "Cancelled" -> row ends Failed and Cancelling clears.
+        raw->m_passDone.store(true);
+        QTRY_COMPARE(controller.jobs().at(0).toMap().value("status").toString(), QStringLiteral("failed"));
+        QCOMPARE(controller.jobs().at(0).toMap().value("error").toString(), QStringLiteral("Cancelled"));
+        QVERIFY(!controller.isActiveStopping());
+    }
+
     // User correction (2026-07-09): "loading" (model load) has no
     // interruption point at all (whisper_init_from_file_with_params is one
     // blocking call, no callback hook) — pauseActive() must no-op there
@@ -1308,6 +1471,50 @@ private slots:
         QVERIFY(finishedSpy.wait(20000));
         QCOMPARE(finishedSpy.at(0).at(1).toBool(), true);
         QCOMPARE(controller.jobs().at(0).toMap().value("status").toString(), QStringLiteral("done"));
+    }
+
+    // The no-callback phases (loading/decoding/detecting-speech) have no native
+    // per-item progress signal; their per-phase number must be SYNTHESIZED
+    // (elapsed-vs-average) and climb off 0 while the phase runs, not sit at 0%
+    // until it flips. Before the fix, progress() returned raw m_progress == 0
+    // for this whole phase. "decoding" is the class representative (the fix is a
+    // shared predicate + getter + timer that detecting-speech takes too);
+    // tst_styleguide::syntheticProgressPhaseSet_hasOneSourceOfTruth locks the set.
+    void syntheticPhase_reportsAdvancingProgress_notFrozenAtZero()
+    {
+        const QString modelPath = locateRealModel();
+        if (modelPath.isEmpty())
+            QSKIP("no real ggml model available; set SUOP_TEST_MODEL or transcribe once in the app");
+        if (QStandardPaths::findExecutable(QStringLiteral("ffmpeg")).isEmpty())
+            QSKIP("ffmpeg not on PATH — needed to decode the sample");
+
+        QTemporaryDir vault;
+        QVERIFY(vault.isValid());
+        const QString modelsDir = vault.path() + "/.transcriber/models";
+        QVERIFY(QDir().mkpath(modelsDir));
+        qputenv("SUOP_MODELS_DIR", modelsDir.toLocal8Bit());
+        QVERIFY(QFile::copy(modelPath, modelsDir + "/ggml-base.en.bin"));
+
+        const QString samplePath = vault.path() + "/a.wav";
+        QProcess gen;
+        gen.start("ffmpeg", {"-y", "-f", "lavfi", "-i",
+                              QStringLiteral("sine=frequency=440:duration=300"), samplePath});
+        if (!gen.waitForFinished(30000) || gen.exitCode() != 0 || !QFileInfo::exists(samplePath))
+            QSKIP("could not generate synthetic test audio via ffmpeg");
+
+        TranscriptionController controller;
+        controller.transcribe(QUrl::fromLocalFile(samplePath), QUrl::fromLocalFile(vault.path()), kModelId);
+
+        // progress() is a live getter, so it reads > 0 within a millisecond of
+        // the phase starting (no timer tick needed); the QTRY only guards the
+        // same-millisecond elapsed == 0 corner and machine speed.
+        QTRY_VERIFY_WITH_TIMEOUT(controller.currentPhase() == QStringLiteral("decoding")
+                                     && controller.progress() > 0.0,
+                                 10000);
+        QVERIFY2(controller.progress() <= 0.95,
+                 "synthetic progress is clamped so it never LOOKS finished before the real transition");
+
+        controller.cancelActive();
     }
 
     // User correction (2026-07-09): cancelActive() is a real, intentional

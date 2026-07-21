@@ -26,7 +26,8 @@ QString UsbGrabTask::displayName() const
 QVariantMap UsbGrabTask::toVariantMap() const
 {
     return {{QStringLiteral("outputPath"), fileUrl.toLocalFile()},
-            {QStringLiteral("ruleName"), m_rule.deviceLabel.isEmpty() ? m_rule.deviceSerial : m_rule.deviceLabel}};
+            {QStringLiteral("ruleName"), m_rule.deviceLabel.isEmpty() ? m_rule.deviceSerial : m_rule.deviceLabel},
+            {QStringLiteral("fileCount"), m_fileCount.load()}};
 }
 
 void UsbGrabTask::run(TaskContext &ctx)
@@ -38,6 +39,10 @@ void UsbGrabTask::run(TaskContext &ctx)
     hooks.onProgress = [this](qint64 bytesDone, qint64 bytesTotal) {
         if (bytesTotal > 0)
             emit progress(std::clamp(static_cast<double>(bytesDone) / static_cast<double>(bytesTotal), 0.0, 1.0));
+    };
+    hooks.onTotalsKnown = [this](int totalFiles) {
+        m_fileCount.store(totalFiles);
+        emit fileCountKnown();
     };
     hooks.shouldAbort = [&ctx, &wasPaused] {
         // Between files, not between bytes: a grab's unit of work is one

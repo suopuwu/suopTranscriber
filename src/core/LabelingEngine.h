@@ -4,6 +4,7 @@
 #include <QString>
 #include <QStringList>
 
+#include <functional>
 #include <optional>
 
 struct llama_model;
@@ -124,8 +125,12 @@ public:
     // prompt always used before density existed.
     //
     // Returns std::nullopt on failure (errorOut set if given).
+    // onTokens (optional) reports output tokens decoded so far, so a caller
+    // driving a progress bar can move DURING this single long call instead
+    // of only between calls. Never a total — see runGrammarConstrained().
     std::optional<QList<Chapter>> generateChapters(const QStringList &segmentTexts, double density = 0.5,
-                                                    QString *errorOut = nullptr);
+                                                    QString *errorOut = nullptr,
+                                                    const std::function<void(int)> &onTokens = {});
 
     // Item 27: the density-parameterized chapter system prompt generateChapters()
     // uses internally — exposed static so it's unit-testable directly (a low
@@ -174,9 +179,36 @@ public:
     // KEEPING adjacent chapters separate, a LOW density errs strongly toward
     // merging. Default 0.5 == the neutral "err toward merging unless clearly
     // different" wording this pass used before density existed.
+    // onPair (optional) is invoked after each pairwise comparison with
+    // (comparisonsDone, comparisonsTotal) — this pass is chapters.size()-1
+    // separate LLM calls, often more than generateChapters() makes, so a
+    // caller with a progress bar must be able to see inside it.
     std::optional<QList<Chapter>> mergeSimilarChapters(const QList<Chapter> &chapters,
                                                          const QStringList &segmentTexts, double density = 0.5,
-                                                         QString *errorOut = nullptr);
+                                                         QString *errorOut = nullptr,
+                                                         const std::function<void(int, int)> &onPair = {});
+
+    // Companion to generateChapters(): that pass is told to SKIP the
+    // transcript's very first chapter (it "always starts at segment 0
+    // implicitly" — see kChapterSystemPromptSuffix), so nothing it returns
+    // ever names the opening stretch and a transcript's first minutes end up
+    // under no heading at all. This names that one chapter in a SEPARATE,
+    // narrow pass — same shared resident model/context as label()/
+    // generateChapters()/mergeSimilarChapters(), same reason as their doc
+    // comments.
+    //
+    // segmentTexts is the opening chapter's OWN segments only (segment 0 up
+    // to, but not including, the first real boundary — the caller slices it;
+    // the whole file when the model proposed no boundaries at all), so the
+    // model titles what that chapter actually covers rather than the
+    // transcript as a whole. Longer than kMaxChapterInputChars is truncated,
+    // same as generateChapters().
+    //
+    // Returns std::nullopt on failure (errorOut set if given). Callers should
+    // treat a failure as NON-fatal and ship the boundaries they already have
+    // — same fall-back-rather-than-fail policy mergeSimilarChapters() gets in
+    // ChaptersTask::run().
+    std::optional<QString> openingChapterTitle(const QStringList &segmentTexts, QString *errorOut = nullptr);
 
     // Item P34: the same limit generateChapters() truncates to internally
     // (see its doc comment above and the .cpp definition site), exposed so
@@ -202,8 +234,13 @@ private:
     // actually differs between them — everything else (chat template,
     // grammar sampler wiring, context-overflow/decode-failure handling) is
     // identical and was previously duplicated between the two.
+    // onTokens, when set, is invoked as generation proceeds with the number
+    // of output tokens decoded so far — the only signal available for
+    // sub-call progress, since a grammar-constrained generation stops when
+    // the grammar completes, not at maxOutputTokens.
     std::optional<QString> runGrammarConstrained(const QString &systemPrompt, const QString &userText,
-                                                  const char *grammar, int maxOutputTokens, QString *errorOut);
+                                                  const char *grammar, int maxOutputTokens, QString *errorOut,
+                                                  const std::function<void(int)> &onTokens = {});
 
     llama_model *m_model = nullptr;
     llama_context *m_ctx = nullptr;

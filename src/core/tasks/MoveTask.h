@@ -29,6 +29,9 @@ public:
     QString kindLabel() const override { return QStringLiteral("Move"); }
     QString displayName() const override;
     Lane lane() const override { return Lane::Instant; }
+    // Moves files on disk -> the watcher rebuild resets the model, which is the
+    // authoritative reflow (see Task::isStructuralFileOp).
+    bool isStructuralFileOp() const override { return true; }
     // Not persisted: an instant, in-session action; the file is either moved or
     // it isn't, nothing to resume across a restart.
     QVariantMap toVariantMap() const override;
@@ -39,6 +42,7 @@ public:
     QString undoLabel() const override;
     QString batchUndoLabel(int count) const override;
     std::unique_ptr<Task> makeUndoTask() const override;
+    bool undoStillApplicable() const override;
 
     void run(TaskContext &ctx) override;
 

@@ -55,16 +55,23 @@ struct UsbGrabScanResult {
 // queue's worker polls atomics and blocks on pause — neither shape belongs
 // inside the walk itself.
 struct UsbGrabScanHooks {
-    // Byte-weighted progress: bytesDone is how many bytes of the whole grab
-    // have been accounted for (fully copied, or skipped-because-already-
-    // present), plus the partial bytes of the file currently copying;
-    // bytesTotal is the summed size of every candidate the pre-count pass
-    // found. Fires DURING a copy (sub-file granularity), not just once per
-    // file — so a grab of 15 small already-present files + 1 large new file
-    // shows the real ~progress of that large copy instead of jumping to 94%
-    // and stalling (the old per-candidate count did the latter). bytesTotal is
-    // 0 only when there are no candidates at all.
+    // Byte-weighted progress over the files the grab will ACTUALLY copy:
+    // bytesDone is how many of those bytes are fully copied plus the partial
+    // bytes of the file currently copying; bytesTotal is their summed size from
+    // the pre-count pass. Files skipped as already-present/already-combined are
+    // in NEITHER — they're instant and represent no work, so they don't count
+    // toward the total or advance the bar (counting them made a re-plugged,
+    // mostly-already-grabbed device start the bar at ~80%). Fires DURING a copy
+    // (sub-file granularity), not just once per file. bytesTotal is 0 only when
+    // there is nothing new to copy at all.
     std::function<void(qint64 bytesDone, qint64 bytesTotal)> onProgress;
+    // Fired once, right after the pre-count pass, with the number of files this
+    // grab will actually copy — matching the rule's filters AND not already
+    // present/combined in the vault. Lets a caller name the running task by its
+    // real file count ("N files") so the label and the progress bar tell the
+    // same story. Only fires when onProgress is also set (the pre-count pass is
+    // gated on it).
+    std::function<void(int totalFiles)> onTotalsKnown;
     // Polled between files. Returning true stops the walk where it stands and
     // sets UsbGrabScanResult::aborted. Also the hook where a caller that needs
     // to pump an event loop or block on a pause does so.

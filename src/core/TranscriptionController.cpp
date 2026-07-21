@@ -40,6 +40,7 @@
 #include "AudioDecoder.h"
 #include "CombineNaming.h"
 #include "DiarizationEngine.h"
+#include "FileRename.h"
 #include "LabelingEngine.h"
 #include "ModelManager.h"
 #include "RegexValidation.h"
@@ -56,6 +57,7 @@
 #include "tasks/ChaptersTask.h"
 #include "tasks/CombineTask.h"
 #include "tasks/DeleteTask.h"
+#include "tasks/DetectSilenceTask.h"
 #include "tasks/DiarizationSweepTask.h"
 #include "tasks/DiarizeTask.h"
 #include "tasks/DownloadTask.h"
@@ -229,7 +231,7 @@ double parseCompactTimestamp(const QString &raw)
 }
 
 // Splits a frontmatter "speakers: A, B, C" value into trimmed, non-empty
-// names — same comma-splitting shape as collectVaultTags()' "tags:"
+// names — same comma-splitting shape as collectVaultFrontmatterList()' "tags:"
 // handling. An empty/missing "speakers:" key (speaker detection was off, or
 // this predates that key) yields an empty list.
 QStringList parseSpeakersList(const QString &raw)
@@ -380,13 +382,29 @@ int taskStatusPriority(Task::Status status)
 // gets no frontmatter field at all), VAD depends on a small model download
 // that can fail (network/disk), and ASR must still proceed without it. Same
 // never-misrepresent contract as speakerDetection/speakerDetectionError.
+// See this function's doc comment in TranscriptionController.h.
+QString formatSilencesValue(const std::vector<std::pair<double, double>> &silences)
+{
+    QStringList parts;
+    parts.reserve(static_cast<int>(silences.size()));
+    for (const auto &span : silences)
+        parts << formatTimestamp(span.first) + QLatin1Char('-') + formatTimestamp(span.second);
+    return parts.join(QStringLiteral(", "));
+}
+
 void writeFrontmatter(QFile &mdFile, const QString &modelUsed, bool speakerDetection, bool modelFallback,
                       const QString &requestedModelId, const QStringList &speakerLabels,
-                      const QString &speakerDetectionError, bool vad, const QString &vadError)
+                      const QString &speakerDetectionError, bool vad, const QString &vadError, bool partial,
+                      const std::optional<std::vector<std::pair<double, double>>> &silences)
 {
     QTextStream out(&mdFile);
     out << "---\n";
     out << "model: " << modelUsed << '\n';
+    // Written up front for EVERY run; TranscribeTask removes it only on a
+    // fully-completed run, so a cancelled/killed job's truncated .md keeps it
+    // and reads back as PartialStatus in the vault (VaultTreeModel).
+    if (partial)
+        out << "partial: true\n";
     out << "speakerDetection: " << (speakerDetection ? "true" : "false") << '\n';
     if (speakerDetection && !speakerLabels.isEmpty())
         out << "speakers: " << speakerLabels.join(QStringLiteral(", ")) << '\n';
@@ -395,6 +413,10 @@ void writeFrontmatter(QFile &mdFile, const QString &modelUsed, bool speakerDetec
     out << "vad: " << (vad ? "true" : "false") << '\n';
     if (!vadError.isEmpty())
         out << "vadError: " << vadError << '\n';
+    // silences: nullopt (VAD didn't run yet) omits the key entirely — see
+    // this function's doc comment in the header.
+    if (silences)
+        out << "silences: " << formatSilencesValue(*silences) << '\n';
     out << "transcribedAt: " << QDateTime::currentDateTime().toString(Qt::ISODate) << '\n';
     if (modelFallback) {
         out << "modelRequested: " << requestedModelId << '\n';
@@ -707,10 +729,10 @@ void removeChapterMarkerLine(QString *body, const QRegularExpressionMatch &m)
 // thread, and must not touch the GUI thread's cache. existingVaultTags()
 // passes its cache, because it is called from a QML binding on every
 // keystroke — see its doc comment in the header.
-QStringList collectVaultTags(const QString &vaultLocalPath,
-                             QHash<QString, TranscriptionController::CachedFileTags> *cache)
+QStringList collectVaultFrontmatterList(const QString &vaultLocalPath, const QString &key,
+                                        QHash<QString, TranscriptionController::CachedFileValues> *cache)
 {
-    QSet<QString> tags;
+    QSet<QString> values;
     QDirIterator it(vaultLocalPath, {QStringLiteral("*.md")}, QDir::Files,
                      QDirIterator::Subdirectories);
     while (it.hasNext()) {
@@ -722,8 +744,8 @@ QStringList collectVaultTags(const QString &vaultLocalPath,
             const qint64 size = info.size();
             const auto cached = cache->constFind(mdPath);
             if (cached != cache->constEnd() && cached->mtimeMs == mtimeMs && cached->size == size) {
-                for (const QString &tag : cached->tags)
-                    tags.insert(tag);
+                for (const QString &value : cached->values)
+                    values.insert(value);
                 continue;
             }
         }
@@ -734,34 +756,34 @@ QStringList collectVaultTags(const QString &vaultLocalPath,
         QTextStream in(&mdFile);
         if (in.readLine() != QStringLiteral("---"))
             continue;
-        // This file's own tags, collected separately from the vault-wide set
-        // so they can be cached per file.
-        QStringList fileTags;
+        // This file's own values for `key`, collected separately from the
+        // vault-wide set so they can be cached per file.
+        QStringList fileValues;
         QString line;
         while (!(line = in.readLine()).isNull() && line != QStringLiteral("---")) {
             const int colon = line.indexOf(':');
-            if (colon < 0 || line.left(colon).trimmed() != QStringLiteral("tags"))
+            if (colon < 0 || line.left(colon).trimmed() != key)
                 continue;
-            const QString value = line.mid(colon + 1).trimmed();
-            for (const QString &tag : value.split(QLatin1Char(','), Qt::SkipEmptyParts)) {
-                const QString trimmed = tag.trimmed();
+            const QString rhs = line.mid(colon + 1).trimmed();
+            for (const QString &part : rhs.split(QLatin1Char(','), Qt::SkipEmptyParts)) {
+                const QString trimmed = part.trimmed();
                 if (!trimmed.isEmpty())
-                    fileTags.append(trimmed);
+                    fileValues.append(trimmed);
             }
         }
-        for (const QString &tag : fileTags)
-            tags.insert(tag);
+        for (const QString &value : fileValues)
+            values.insert(value);
         if (cache) {
             // Re-stat rather than reuse the values read above: the file could
             // have been rewritten between that stat and the read just done,
             // which would otherwise cache the OLD mtime against NEW content
             // and never re-read it.
             const QFileInfo info(mdPath);
-            cache->insert(mdPath, TranscriptionController::CachedFileTags{
-                                      info.lastModified().toMSecsSinceEpoch(), info.size(), fileTags});
+            cache->insert(mdPath, TranscriptionController::CachedFileValues{
+                                      info.lastModified().toMSecsSinceEpoch(), info.size(), fileValues});
         }
     }
-    QStringList sorted = tags.values();
+    QStringList sorted = values.values();
     sorted.sort(Qt::CaseInsensitive);
     return sorted;
 }
@@ -1460,7 +1482,14 @@ TranscriptionController::TranscriptionController(QObject *parent)
     // those two — started/stopped from the phase() handler in connectTask().
     m_indeterminatePhaseTimer = new QTimer(this);
     m_indeterminatePhaseTimer->setInterval(200);
-    connect(m_indeterminatePhaseTimer, &QTimer::timeout, this, &TranscriptionController::recomputeOverallProgress);
+    // A no-callback phase's fraction is synthesized purely from elapsed time, so
+    // both the displayed per-phase number (progress, via
+    // phaseRelativeSyntheticProgress()) and its blended slice of the overall bar
+    // advance on this tick alone — re-notify both so QML repaints.
+    connect(m_indeterminatePhaseTimer, &QTimer::timeout, this, [this] {
+        emit progressChanged();
+        recomputeOverallProgress();
+    });
 
     m_runner = new TaskRunner;
     m_runner->moveToThread(&m_thread);
@@ -1568,10 +1597,16 @@ void TranscriptionController::connectTask(Task *task)
         m_phase = phase;
         m_phaseStartMs = activeElapsedMs();
         emit currentPhaseChanged();
-        // See recomputeOverallProgress()'s doc comment — only "loading" and
-        // "decoding" need the timer (no real progress callback of their own);
-        // every other phase already advances overallProgress via progress().
-        if (phase == QStringLiteral("loading") || phase == QStringLiteral("decoding"))
+        // Reset the displayed per-phase number the instant the phase changes —
+        // progress() is now phase-relative (phaseRelativeSyntheticProgress()),
+        // so entering a fresh phase must re-notify or the label lingers on the
+        // previous phase's last value until the next tick.
+        emit progressChanged();
+        // The no-callback phases (isSyntheticProgressPhase) have no progress
+        // signal of their own, so this timer is the only thing that advances
+        // BOTH progress() and overallProgress() mid-phase; every other phase
+        // gets its ticks from the real Task::progress signal instead.
+        if (isSyntheticProgressPhase(phase))
             m_indeterminatePhaseTimer->start();
         else
             m_indeterminatePhaseTimer->stop();
@@ -1612,7 +1647,25 @@ void TranscriptionController::connectTask(Task *task)
                     emit speakersMerged(QUrl::fromLocalFile(path), sourceName, targetName, ok, error);
                 });
     } else if (auto *renameFileTask = qobject_cast<RenameFileTask *>(task)) {
-        connect(renameFileTask, &RenameFileTask::fileRenamed, this, &TranscriptionController::fileRenamed);
+        connect(renameFileTask, &RenameFileTask::fileRenamed, this,
+                [this](const QUrl &oldUrl, const QUrl &newUrl, bool ok, const QString &error) {
+                    // Update the tree IN PLACE before the watcher fires, so the
+                    // rescan finds sameStructure() true and never resets the
+                    // model (which would flash the whole tree — see
+                    // VaultTreeModel::applyRenameOutcome). GUI thread: this
+                    // queued slot runs after run() returned.
+                    if (ok && m_vaultModel)
+                        m_vaultModel->applyRenameOutcome(oldUrl, newUrl);
+                    // Release the optimistic override: on success the tree/panels
+                    // now show the real new name (applyRenameOutcome above +
+                    // fileRenamed below repoint them); on failure they revert to
+                    // the unchanged on-disk name. Erase by the OLD path (the key).
+                    if (m_pendingRenames.remove(oldUrl.toLocalFile()) > 0) {
+                        ++m_pendingRenamesRevision;
+                        emit pendingRenamesRevisionChanged();
+                    }
+                    emit fileRenamed(oldUrl, newUrl, ok, error);
+                });
     } else if (auto *moveFileTask = qobject_cast<MoveTask *>(task)) {
         connect(moveFileTask, &MoveTask::fileMoved, this, &TranscriptionController::fileMoved);
     } else if (auto *folderRename = qobject_cast<FolderRenameTask *>(task)) {
@@ -1659,10 +1712,35 @@ void TranscriptionController::connectTask(Task *task)
                 [this, id](int filesCopied, int filesSkipped, const QStringList &errors, bool cancelled) {
                     emit usbGrabFinished(id, filesCopied, filesSkipped, errors, cancelled);
                 });
+        // The pre-count pass reports its file count mid-run; phase()/progress()
+        // don't emit queueChanged, so the Tasks row would never re-read
+        // toVariantMap's fileCount without this.
+        connect(grab, &UsbGrabTask::fileCountKnown, this, [this] { emit queueChanged(); });
+    } else if (auto *combine = qobject_cast<CombineTask *>(task)) {
+        // Durable combine log: a successful merge writes one entry to the vault's
+        // combineHistory.json, so an auto-combine that moved the user's originals
+        // into .combined/ (or deleted them) leaves an account of itself that
+        // outlives the in-session Tasks row and undo. Appended from HERE (GUI
+        // thread) rather than in run(), which is on a worker and must not touch
+        // the GUI-owned VaultTreeModel — same split as the USB grab history.
+        connect(combine, &CombineTask::combineCompleted, this,
+                [this](const QString &outputPath, const QStringList &sourcePaths, bool deleteOriginals) {
+                    if (!m_vaultModel)
+                        return;
+                    QVariantMap entry;
+                    entry[QStringLiteral("timestamp")] = QDateTime::currentDateTimeUtc().toString(Qt::ISODate);
+                    entry[QStringLiteral("outputPath")] = outputPath;
+                    entry[QStringLiteral("sourcePaths")] = sourcePaths;
+                    entry[QStringLiteral("partCount")] = sourcePaths.size();
+                    entry[QStringLiteral("deleteOriginals")] = deleteOriginals;
+                    m_vaultModel->appendCombineHistoryEntry(entry, nullptr);
+                });
     } else if (auto *bench = qobject_cast<BenchmarkTask *>(task)) {
         connect(bench, &BenchmarkTask::benchmarkModelStarted, this,
                 &TranscriptionController::benchmarkModelStarted);
         connect(bench, &BenchmarkTask::benchmarkModelDone, this, &TranscriptionController::benchmarkModelDone);
+        connect(bench, &BenchmarkTask::benchmarkModelProgressText, this,
+                &TranscriptionController::benchmarkModelProgressText);
         connect(bench, &BenchmarkTask::benchmarkRunFinished, this, &TranscriptionController::benchmarkFinished);
         // No separate glow wiring: a BenchmarkTask is a real queued task now,
         // so m_busy + overallProgress drive the existing glow for free. That
@@ -1824,14 +1902,19 @@ double TranscriptionController::defaultPhaseDurationMs(const QString &phase)
     return 10000.0; // "detecting-speakers" / "transcribing"
 }
 
+bool TranscriptionController::isSyntheticProgressPhase(const QString &phase)
+{
+    return phase == QStringLiteral("loading") || phase == QStringLiteral("decoding")
+        || phase == QStringLiteral("detecting-speech");
+}
+
 double TranscriptionController::phaseRelativeSyntheticProgress() const
 {
     // "loading"/"decoding"/"detecting-speech" have no native per-item progress
     // callback (each is one blocking call), so their within-phase fraction is
     // synthesized from elapsed-vs-historical-average; every other phase reports
     // real progress via m_progress.
-    if (m_phase != QStringLiteral("loading") && m_phase != QStringLiteral("decoding")
-        && m_phase != QStringLiteral("detecting-speech"))
+    if (!isSyntheticProgressPhase(m_phase))
         return m_progress;
     const QString key = canonicalPhaseKey(m_phase, activeModelIdForTiming(), m_activeSpeakerDetection);
     const double avg = m_phaseTimings.value(key).average(defaultPhaseDurationMs(m_phase));
@@ -1890,6 +1973,8 @@ void TranscriptionController::recomputeOverallProgress()
 bool TranscriptionController::isQueued(const QUrl &fileUrl) const
 {
     for (const auto &task : m_tasks) {
+        if (!task->occupiesFile())
+            continue; // a benchmark/sweep on this file doesn't block a real op
         if (task->fileUrl == fileUrl
             && (task->status == Task::Status::Queued || task->status == Task::Status::Active
                 || task->status == Task::Status::Paused))
@@ -1904,6 +1989,8 @@ void TranscriptionController::rebuildJobStatusIndex()
     for (const auto &task : m_tasks) {
         if (task->fileUrl.isEmpty())
             continue; // download task — names no single vault file
+        if (!task->occupiesFile())
+            continue; // benchmark/sweep — no status dot on the file it reads
         const QString path = task->fileUrl.toLocalFile();
         const auto it = rebuilt.constFind(path);
         if (it == rebuilt.constEnd() || taskStatusPriority(task->status) > taskStatusPriority(it.value()))
@@ -2032,14 +2119,15 @@ void TranscriptionController::transcribeAll(const QVariantList &fileUrls, const 
     });
 }
 
-void TranscriptionController::importAudio(const QUrl &sourceUrl, const QUrl &destUrl, const QUrl &vaultUrl)
+void TranscriptionController::importAudio(const QUrl &sourceUrl, const QUrl &destUrl, const QUrl &vaultUrl,
+                                           bool overwrite)
 {
     // Same Queued/Active dedup rule as transcribe(), keyed on the destination
     // (two drops resolving to the same in-vault file don't double-enqueue).
     if (isQueued(destUrl))
         return;
 
-    auto task = std::make_unique<ImportTask>(sourceUrl.toLocalFile(), destUrl);
+    auto task = std::make_unique<ImportTask>(sourceUrl.toLocalFile(), destUrl, overwrite);
     task->vaultUrl = vaultUrl;
     enqueueTask(std::move(task));
 }
@@ -2086,6 +2174,16 @@ void TranscriptionController::diarizeFilesForPaths(const QVariantList &fileUrls,
         for (const QVariant &v : fileUrls)
             diarizeFile(v.toUrl(), vaultUrl, segmentationModelId, embeddingModelId, sensitivity);
     });
+}
+
+void TranscriptionController::detectSilences(const QUrl &fileUrl, const QUrl &vaultUrl)
+{
+    // Same dedup rule as diarizeFile()/relabel(): a Queued/Active entry blocks
+    // a duplicate request.
+    if (isQueued(fileUrl))
+        return;
+
+    enqueueTask(std::make_unique<DetectSilenceTask>(fileUrl, vaultUrl));
 }
 
 void TranscriptionController::relabel(const QUrl &fileUrl, const QUrl &vaultUrl, bool restrictTagsToExisting,
@@ -2231,6 +2329,10 @@ void TranscriptionController::startTask(int index)
     m_runner->resetControl();
     m_activePaused = false;
     emit activePausedChanged();
+    if (m_activeCancelling) {
+        m_activeCancelling = false;
+        emit activeStoppingChanged();
+    }
     m_activeAccumulatedMs = 0;
     m_activeSegmentTimer.start();
     m_overallProgress = 0.0;
@@ -2286,7 +2388,7 @@ void TranscriptionController::startTask(int index)
 bool TranscriptionController::serialActiveConflictsWith(const QUrl &fileUrl) const
 {
     return m_activeIndex >= 0 && m_activeIndex < static_cast<int>(m_tasks.size()) && !fileUrl.isEmpty()
-        && m_tasks[m_activeIndex]->fileUrl == fileUrl;
+        && isSameRecording(m_tasks[m_activeIndex]->fileUrl, fileUrl);
 }
 
 void TranscriptionController::pumpQueues()
@@ -2373,7 +2475,7 @@ void TranscriptionController::onTaskFinished(Task *task, bool ok, const QString 
             task->durationMs = 0; // instant by construction — no elapsed tracking
         }
         emit queueChanged();
-        emit finished(finishedFile, ok, error);
+        emit finished(finishedFile, ok, error, task->isStructuralFileOp());
         if (indexOfTask(task) >= 0)
             maybeEmitUndoAvailable(task, ok); // fires per terminal; batch-aware
         pumpQueues();
@@ -2420,11 +2522,30 @@ void TranscriptionController::onTaskFinished(Task *task, bool ok, const QString 
             // wiring.
             if (ok && task->completionChangesModelSet())
                 emit modelsChanged();
+            // A benchmark / diarization-sweep that throws BEFORE emitting its
+            // run-finished summary (a decode failure, or an engine that throws
+            // mid-sweep) otherwise pins the Benchmark page on "Running…"
+            // forever: the page clears that state off benchmarkFinished /
+            // diarizationBenchmarkFinished, which never arrives on the throw
+            // path, and benchmarkFailed had no emit site at all. Surface it so
+            // the page resets and shows why. A user cancel already reported
+            // itself via the run-finished summary (cancelled=true) before
+            // throwing "Cancelled", so skip that to avoid a double report
+            // clobbering the "Cancelled." status.
+            const QString failedKind = task->kind();
+            if (!ok && error != QStringLiteral("Cancelled")
+                && (failedKind == QStringLiteral("benchmark")
+                    || failedKind == QStringLiteral("diarizationSweep")))
+                emit benchmarkFailed(error);
         }
     }
     m_activeIndex = -1;
     m_activePaused = false;
     emit activePausedChanged();
+    if (m_activeCancelling) {
+        m_activeCancelling = false;
+        emit activeStoppingChanged();
+    }
 
     if (pausedAsRestart) {
         // Deliberately do NOT advance to the next Queued task — the Paused
@@ -2452,7 +2573,7 @@ void TranscriptionController::onTaskFinished(Task *task, bool ok, const QString 
         QMetaObject::invokeMethod(m_runner, "evictIdle", Qt::QueuedConnection);
     }
 
-    emit finished(finishedFile, ok, error);
+    emit finished(finishedFile, ok, error, task->isStructuralFileOp());
     // Fires on EVERY terminal (Done or Failed) so a batch can detect its last
     // member; the standalone path inside still gates on ok. A Paused task
     // isn't terminal, so skip it.
@@ -2755,15 +2876,27 @@ void TranscriptionController::cancelJob(int id)
             return;
         }
         if (task->status == Task::Status::Active) {
-            // requestResume() wakes it if currently blocked in a pause wait —
-            // otherwise a paused-then-cancelled task would sit paused forever
-            // instead of ever reaching the cancel check. The runner emits the
-            // terminal report for THIS case (run() returns via TaskError or
-            // early-return), so no synthesis here. Route to whichever lane's
-            // runner is actually running this task.
+            // The runner emits the terminal report for THIS case (run() returns
+            // via TaskError or early-return), so no synthesis here. Route to
+            // whichever lane's runner is actually running this task.
             TaskRunner *runner = (task == m_instantActive) ? m_instantRunner : m_runner;
+            // Enter the honest "Cancelling" state for a task that can't abort
+            // mid-pass — its pass runs to its boundary, and without this the UI
+            // would misread the between-tick paused(false) as a resume and let
+            // pause silently no-op. Derived from the task's own capability, so
+            // future non-mid-cancellable kinds inherit it. Only the serial lane
+            // has the pause UI, so only flag it there.
+            if (task != m_instantActive && task->capabilities().pausable
+                && !task->capabilities().cancellableMidRun) {
+                m_activeCancelling = true;
+                emit activeStoppingChanged();
+            }
+            // No requestResume(): every pause-wait re-checks cancel on its own
+            // poll (checkpoint()'s while-condition; ProcessRunner's top-of-loop
+            // cancelled() check), so the cancel lands within one ~100ms tick
+            // regardless of pause state. Resuming here only fired a misleading
+            // paused(false)/SIGCONT edge that looked like the task had resumed.
             runner->requestCancel();
-            runner->requestResume();
         }
         return;
     }
@@ -2831,8 +2964,12 @@ void TranscriptionController::cancelAll()
             cancelTaskAt(idx);
     }
     if (m_activeIndex >= 0) {
-        m_runner->requestCancel();
-        m_runner->requestResume();
+        Task *active = m_tasks[m_activeIndex].get();
+        if (active->capabilities().pausable && !active->capabilities().cancellableMidRun) {
+            m_activeCancelling = true;
+            emit activeStoppingChanged();
+        }
+        m_runner->requestCancel(); // no requestResume() — see cancelJob()
     }
 }
 
@@ -3082,6 +3219,19 @@ TranscriptionController::findCombineGroups(const QVariantList &rules, const QStr
             // it always needs the TRUE newest mtime, not just members.last().
             const auto newest = std::max_element(members.begin(), members.end(),
                                                   [](const Candidate &a, const Candidate &b) { return a.mtime < b.mtime; });
+            // Deliberately NO completeness/contiguity check on the sort
+            // differentiator (e.g. "the numbers 1,2,4 have a gap, so part 3 is
+            // missing"). The differentiator is an ORDERING key, not a part
+            // counter: a group of PART1/PART2/PART10 is legitimate and complete
+            // (see tst_filecombine's sortDifferentiator_numericOverridesMtimeOrder),
+            // and nothing on disk can tell "take 10 after take 2, no 3–9" apart
+            // from "parts 3–9 were lost". The one incompleteness that DOES have a
+            // reliable signal — a grab that aborted mid-copy, which can truncate
+            // the TAIL of a set a gap check couldn't catch anyway — is handled
+            // upstream: UsbGrabberController only auto-combines after a CLEAN grab
+            // batch (see m_autoBatchClean). So this stays a pure grouping/mtime
+            // decision; don't re-add a gap heuristic here (it only produces false
+            // "incomplete"s).
             if (anyTranscribed)
                 group.status = QStringLiteral("alreadyTranscribed");
             else if (newest->mtime.secsTo(now) < kCombineStabilityWindowSecs)
@@ -3224,24 +3374,37 @@ bool TranscriptionController::maybeRedirectForCombine(int index)
     return false;
 }
 
-void TranscriptionController::runCombineScan(const QVariantList &rules, const QStringList &audioPaths,
-                                               const QUrl &vaultUrl, bool deleteOriginals)
+// The shared spine of both bulk (runCombineScan) and single-group
+// (combineGroup) enqueue: cache the scan inputs for maybeRedirectForCombine()'s
+// later per-job check, then enqueue a combine job for every "ready", not-
+// already-queued group that passes the outputPath filter, and kick the queue
+// once if anything went in. outputPathFilter empty = every ready group;
+// non-empty = only the group whose outputPath matches (a single-group action).
+// Returns how many were enqueued.
+int TranscriptionController::enqueueReadyCombineGroups(const QVariantList &rules, const QStringList &audioPaths,
+                                                        const QUrl &vaultUrl, bool deleteOriginals,
+                                                        const QString &outputPathFilter)
 {
     // Cached for maybeRedirectForCombine()'s per-job safety check — see its
     // doc comment and the m_combineRules/m_combineAudioPaths field comments.
+    // Set even when nothing ends up enqueued, matching the old behavior.
     m_combineRules = rules;
     m_combineAudioPaths = audioPaths;
     m_combineDeleteOriginals = deleteOriginals;
 
-    bool inserted = false;
+    int enqueued = 0;
     for (const CombineGroup &group : findCombineGroups(rules, audioPaths)) {
-        if (group.status != QStringLiteral("ready") || isCombineQueued(group.outputPath))
+        if (group.status != QStringLiteral("ready"))
+            continue;
+        if (!outputPathFilter.isEmpty() && group.outputPath != outputPathFilter)
+            continue;
+        if (isCombineQueued(group.outputPath))
             continue;
         enqueueCombineJob(group, vaultUrl, deleteOriginals);
-        inserted = true;
+        ++enqueued;
     }
-    if (!inserted)
-        return;
+    if (enqueued == 0)
+        return 0;
     emit queueChanged();
     // Live trigger (like transcribe()), not a persisted-queue replay — auto-
     // starting when idle matches transcribe()'s own behavior, unlike
@@ -3249,6 +3412,13 @@ void TranscriptionController::runCombineScan(const QVariantList &rules, const QS
     // (see startNext()'s doc comment).
     if (m_activeIndex < 0)
         startNext();
+    return enqueued;
+}
+
+void TranscriptionController::runCombineScan(const QVariantList &rules, const QStringList &audioPaths,
+                                               const QUrl &vaultUrl, bool deleteOriginals)
+{
+    enqueueReadyCombineGroups(rules, audioPaths, vaultUrl, deleteOriginals, /*outputPathFilter=*/QString());
 }
 
 // Sidebar's per-row "combine this group" hover button (item 51): same shape
@@ -3263,21 +3433,7 @@ void TranscriptionController::runCombineScan(const QVariantList &rules, const QS
 void TranscriptionController::combineGroup(const QVariantList &rules, const QStringList &audioPaths,
                                             const QString &outputPath, const QUrl &vaultUrl, bool deleteOriginals)
 {
-    m_combineRules = rules;
-    m_combineAudioPaths = audioPaths;
-    m_combineDeleteOriginals = deleteOriginals;
-
-    for (const CombineGroup &group : findCombineGroups(rules, audioPaths)) {
-        if (group.outputPath != outputPath)
-            continue;
-        if (group.status != QStringLiteral("ready") || isCombineQueued(group.outputPath))
-            return;
-        enqueueCombineJob(group, vaultUrl, deleteOriginals);
-        emit queueChanged();
-        if (m_activeIndex < 0)
-            startNext();
-        return;
-    }
+    enqueueReadyCombineGroups(rules, audioPaths, vaultUrl, deleteOriginals, outputPath);
 }
 
 QString TranscriptionController::tasksJsonPath(const QUrl &vaultUrl)
@@ -3792,7 +3948,20 @@ void TranscriptionController::renameFile(const QUrl &fileUrl, const QString &new
     // it still runs right away (in parallel with any serial transcription of a
     // DIFFERENT file); the scheduler defers it only if THIS file is actively
     // transcribing. Reports via fileRenamed().
+    //
+    // Record the pending stem BEFORE enqueueing so every view (see
+    // pendingRenameStem()) shows the new name now — fileRenamed is deferred
+    // behind a same-file transcription and would leave panels stale for the whole
+    // job. Erased when the task completes (below).
+    m_pendingRenames.insert(fileUrl.toLocalFile(), newBaseName);
+    ++m_pendingRenamesRevision;
+    emit pendingRenamesRevisionChanged();
     enqueueTask(std::make_unique<RenameFileTask>(fileUrl, newBaseName), static_cast<int>(m_tasks.size()));
+}
+
+QString TranscriptionController::pendingRenameStem(const QUrl &fileUrl) const
+{
+    return m_pendingRenames.value(fileUrl.toLocalFile());
 }
 
 void TranscriptionController::moveFiles(const QVariantList &fileUrls, const QUrl &destDirUrl, const QUrl &vaultUrl)
@@ -4025,15 +4194,108 @@ int TranscriptionController::activeSentenceIndex(const QVariantList &sentences, 
     const auto it = std::upper_bound(
         sentences.begin(), sentences.end(), positionSeconds,
         [](double pos, const QVariant &sentence) { return pos < sentence.toMap().value("t0").toDouble(); });
-    const int index = int(std::distance(sentences.begin(), it)) - 1;
+    int index = int(std::distance(sentences.begin(), it)) - 1;
+    // Chapter headings are zero-length pseudo-entries interleaved into this list
+    // (isChapterHeading), not spoken content. When the search lands DIRECTLY on
+    // one there are two cases:
+    //   - The chapter is COLLAPSED: its body sentences are dropped from this
+    //     list, so the heading is the ONLY line representing that chapter and
+    //     playback is somewhere inside its time range — the highlight belongs
+    //     ON the heading. Return it as-is (the caller paints the whole row).
+    //   - The chapter is EXPANDED: playback is in the lead-in silence after the
+    //     marker but before the chapter's first sentence; walk back to the
+    //     previous REAL sentence so the highlight holds there, exactly as it
+    //     does across an ordinary silence gap.
+    // Headings merely PASSED OVER by the walk-back (an expanded chapter's
+    // lead-in heading, or a collapsed heading we did not land in) are always
+    // skipped — the walk only ever stops on real content or on a directly-hit
+    // collapsed heading. If only headings precede pos (a chapter opens the
+    // transcript and is not collapsed), this falls through to -1 and the
+    // caller's front-edge clamp lights the first real sentence instead.
+    if (index >= 0) {
+        const QVariantMap landed = sentences.at(index).toMap();
+        if (landed.value(QStringLiteral("isChapterHeading")).toBool()
+            && landed.value(QStringLiteral("collapsed")).toBool())
+            return index;
+    }
+    // Silence phase 3: the between-segment divider is ANOTHER zero-length
+    // pseudo-entry interleaved into this same list (isSilenceMarker, see
+    // MainPanel.qml's displayData/pushSilenceMarker) — pure decoration, never
+    // a landing spot, so it walks back exactly like an EXPANDED chapter
+    // heading (no "collapsed" exception exists for it).
+    while (index >= 0
+           && (sentences.at(index).toMap().value(QStringLiteral("isChapterHeading")).toBool()
+               || sentences.at(index).toMap().value(QStringLiteral("isSilenceMarker")).toBool()))
+        --index;
+    // Front edge (index < 0): playback hasn't reached the first entry's t0 yet
+    // (or every preceding entry was an expanded lead-in heading we walked over).
+    // If the transcript OPENS with a COLLAPSED chapter, its heading is the only
+    // visible line representing that opening content, so hold the highlight ON
+    // it from 0:00 — identical to when playback is already inside its range. A
+    // first chapter's real t0 is often a hair above 0 (lead-in silence) even
+    // though its gutter timestamp floors to "0:00", so pos==0 lands here, not on
+    // the directly-hit branch above. An EXPANDED leading heading (no `collapsed`
+    // key) still yields -1, leaving the caller's front-edge clamp to light the
+    // first real sentence, exactly as item 010 established.
+    if (index < 0) {
+        const QVariantMap first = sentences.at(0).toMap();
+        if (first.value(QStringLiteral("isChapterHeading")).toBool()
+            && first.value(QStringLiteral("collapsed")).toBool())
+            return 0;
+    }
     return index;
+}
+
+QVariantList TranscriptionController::parseSilences(const QString &raw) const
+{
+    // formatSilencesValue()'s inverse: "12.4-18.9, 45-52.3" (compact
+    // timestamps either side of a literal '-', comma-separated spans) ->
+    // {t0, t1} maps. Compact timestamps never themselves contain '-' (see
+    // formatTimestamp), so splitting each span on the FIRST '-' is safe and
+    // unambiguous.
+    QVariantList result;
+    if (raw.trimmed().isEmpty())
+        return result;
+    for (const QString &part : raw.split(QLatin1Char(','), Qt::SkipEmptyParts)) {
+        const QString trimmed = part.trimmed();
+        const int dash = trimmed.indexOf(QLatin1Char('-'));
+        if (dash <= 0 || dash + 1 >= trimmed.size())
+            continue;
+        QVariantMap span;
+        span[QStringLiteral("t0")] = parseCompactTimestamp(trimmed.left(dash));
+        span[QStringLiteral("t1")] = parseCompactTimestamp(trimmed.mid(dash + 1));
+        result.append(span);
+    }
+    return result;
+}
+
+double TranscriptionController::nextSilenceSkipTarget(const QVariantList &silences, double positionSeconds,
+                                                       double thresholdSeconds) const
+{
+    for (const QVariant &entry : silences) {
+        const QVariantMap span = entry.toMap();
+        const double t0 = span.value(QStringLiteral("t0")).toDouble();
+        const double t1 = span.value(QStringLiteral("t1")).toDouble();
+        if (positionSeconds >= t0 && positionSeconds < t1 && (t1 - t0) >= thresholdSeconds)
+            return t1;
+    }
+    return -1.0;
 }
 
 QStringList TranscriptionController::existingVaultTags(const QUrl &vaultUrl) const
 {
     // See the header doc comment: GUI thread only, cached per file because
     // QML calls this from a binding on every keystroke.
-    return collectVaultTags(vaultUrl.toLocalFile(), &m_vaultTagFileCache);
+    return collectVaultFrontmatterList(vaultUrl.toLocalFile(), QStringLiteral("tags"),
+                                       &m_vaultTagFileCache);
+}
+
+QStringList TranscriptionController::existingVaultSpeakers(const QUrl &vaultUrl) const
+{
+    // Same contract and same reasoning as existingVaultTags() above, over the
+    // `speakers:` key and its own cache.
+    return collectVaultFrontmatterList(vaultUrl.toLocalFile(), QStringLiteral("speakers"),
+                                       &m_vaultSpeakerFileCache);
 }
 
 int TranscriptionController::tasksTotal() const
@@ -4055,7 +4317,7 @@ QVariantList TranscriptionController::queuedFileUrls() const
 {
     QVariantList list;
     for (const auto &task : m_tasks) {
-        if (task->status == Task::Status::Queued)
+        if (task->status == Task::Status::Queued && task->occupiesFile())
             list.append(task->fileUrl);
     }
     return list;
@@ -4101,6 +4363,12 @@ const PhaseInfo *phaseInfoFor(const QString &phase)
          TranscriptionController::tr("Decoding audio…")},
         {QStringLiteral("detecting-speech"), TranscriptionController::tr("detecting speech…"),
          TranscriptionController::tr("Detecting speech…")},
+        // DetectSilenceTask (silence-capture feature, phase 1's backfill job)
+        // — Presentation::Foreground by default (like DiarizeTask), so it
+        // needs a real overlay title, not the empty-string "no overlay" rows
+        // below.
+        {QStringLiteral("detecting-silence"), TranscriptionController::tr("detecting silence…"),
+         TranscriptionController::tr("Detecting silence…")},
         {QStringLiteral("detecting-speakers"), TranscriptionController::tr("detecting speakers…"),
          TranscriptionController::tr("Detecting speakers…")},
         {QStringLiteral("detecting-speakers-segmenting"), TranscriptionController::tr("finding speech…"),
@@ -4115,8 +4383,13 @@ const PhaseInfo *phaseInfoFor(const QString &phase)
          TranscriptionController::tr("Combining…")},
         {QStringLiteral("chaptering"), TranscriptionController::tr("chaptering…"),
          TranscriptionController::tr("Generating chapters…")},
-        {QStringLiteral("importing"), TranscriptionController::tr("importing…"),
-         TranscriptionController::tr("Importing…")},
+        {QStringLiteral("merging-chapters"), TranscriptionController::tr("merging chapters…"),
+         TranscriptionController::tr("Generating chapters…")},
+        // No overlay wording: import is Presentation::Background now (see
+        // ImportTask::presentation()), so it must never claim the main-panel
+        // overlay. The bottom-bar label column stays — the row itself is
+        // required by tst_styleguide's emitted-phase-has-a-registry-row guard.
+        {QStringLiteral("importing"), TranscriptionController::tr("importing…"), QString()},
         {QStringLiteral("grabbing"), TranscriptionController::tr("grabbing…"), QString()},
         {QStringLiteral("labeling"), TranscriptionController::tr("labeling…"), QString()},
         {QStringLiteral("benchmarking"), TranscriptionController::tr("benchmarking…"), QString()},
@@ -4173,6 +4446,11 @@ QVariantList TranscriptionController::jobs() const
         // advertises an undo and can build its inverse. Only Done tasks
         // qualify: makeUndoTask() captures run()'s result.
         entry["undoable"] = task->status == Task::Status::Done && task->isUndoable();
+        // Undo is offered (undoable) but no longer applicable — the Tasks-list
+        // Undo button greys out rather than vanishing. Re-evaluated on every
+        // queueChanged (a later move of the same file fires one), so it flips the
+        // moment the file leaves m_resultUrl. See Task::undoStillApplicable().
+        entry["undoStale"] = entry["undoable"].toBool() && !task->undoStillApplicable();
         // Batch grouping (0 = standalone). batchLabel is the collapsed row's
         // category label; empty ⇒ collapseBatches() derives it from a member's
         // kindLabel. Both are read only by collapseBatches() (a pure transform
@@ -4264,6 +4542,7 @@ QVariantList TranscriptionController::collapseBatches(const QVariantList &jobEnt
         bool anyActive = false, anyQueued = false, anyPaused = false;
         bool anyDone = false, anyGenuineFailure = false, anyCancelled = false;
         bool anyUndoable = false; // any Done member advertises an undo (see jobs())
+        bool anyUndoApplicable = false; // any undoable member still applicable
         qint64 durationSum = 0;
         bool allTerminal = true;
         QString label = group.first().toMap().value(QStringLiteral("batchLabel")).toString();
@@ -4293,8 +4572,11 @@ QVariantList TranscriptionController::collapseBatches(const QVariantList &jobEnt
             else if (cancelled) anyCancelled = true;
             else anyGenuineFailure = true;
 
-            if (m.value(QStringLiteral("undoable")).toBool())
+            if (m.value(QStringLiteral("undoable")).toBool()) {
                 anyUndoable = true;
+                if (!m.value(QStringLiteral("undoStale")).toBool())
+                    anyUndoApplicable = true;
+            }
 
             const qint64 d = m.value(QStringLiteral("durationMs")).toLongLong();
             if (d > 0)
@@ -4339,6 +4621,9 @@ QVariantList TranscriptionController::collapseBatches(const QVariantList &jobEnt
         // The header's Undo button undoes every Done member at once
         // (undoTask(batchId)); offer it iff at least one member is undoable.
         agg[QStringLiteral("undoable")] = anyUndoable;
+        // Grey the header undo only when EVERY undoable member is stale — a mixed
+        // batch (some members still applicable) keeps the header undo live.
+        agg[QStringLiteral("undoStale")] = anyUndoable && !anyUndoApplicable;
         agg[QStringLiteral("members")] = group; // the per-task rows, for the expandable UI
         out[slot] = agg;
     }

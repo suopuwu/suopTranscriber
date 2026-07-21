@@ -164,6 +164,7 @@ private slots:
         // production's actual signal path, not a simplified stand-in.
         const QString driverQml = QStringLiteral(
             "import QtQuick\n"
+            "import QtQuick.Controls\n"
             "import SuopTranscriber\n"
             "Item {\n"
             "    id: root\n"
@@ -171,6 +172,7 @@ private slots:
             "    height: 260\n"
             "    property string openPath: \"\"\n"
             "    VaultTreeModel { id: vaultModel; vaultPath: Qt.resolvedUrl(vaultUrl) }\n"
+            "    TextField { objectName: \"decoy\"; width: 1; height: 1 }\n"
             "    Sidebar {\n"
             "        id: sidebar\n"
             "        objectName: \"sidebar\"\n"
@@ -390,6 +392,137 @@ private slots:
         QVERIFY2(selectedPaths().contains(notePaths[4]),
                  "Ctrl-click after a Ctrl+Shift+arrow extend must still toggle a row in");
         QCOMPARE(selectedPaths().size(), 4);
+    }
+
+    // Queue item 055: the Delete key deletes the sidebar selection whenever one
+    // exists and no text field is being edited — NOT gated on tree focus, since
+    // the selection stays highlighted after focus drifts to the main panel.
+    // Asserted at the property level (deleteShortcutEnabled) rather than driving
+    // a real Delete, which would trash into the user's real XDG trash.
+    void deleteGateFollowsSelectionNotTreeFocus()
+    {
+        QTemporaryDir vault;
+        QVERIFY(vault.isValid());
+        for (int i = 0; i < 5; ++i)
+            QVERIFY(touch(vault.filePath(QStringLiteral("note%1.mp3").arg(i))));
+
+        QQuickView view;
+        view.engine()->addImportPath(m_moduleDir.path());
+        view.engine()->addImageProvider(QString::fromLatin1(IconImageProvider::kProviderId),
+                                        new IconImageProvider);
+        view.rootContext()->setContextProperty(QStringLiteral("vaultUrl"),
+                                                QUrl::fromLocalFile(vault.path()));
+        view.setSource(QUrl::fromLocalFile(m_driverQmlPath));
+        QCOMPARE(view.status(), QQuickView::Ready);
+        view.show();
+        QVERIFY(QTest::qWaitForWindowExposed(&view));
+
+        QQuickItem *root = view.rootObject();
+        QVERIFY(root);
+        QQuickItem *sidebarItem = root->findChild<QQuickItem *>(QStringLiteral("sidebar"));
+        QVERIFY(sidebarItem);
+        QQuickItem *treeItem = findByClassNamePrefix(sidebarItem, "QQuickTreeView");
+        QVERIFY(treeItem);
+        QTRY_VERIFY(treeItem->property("rows").toInt() > 0);
+
+        // Click row 0: selection of 1, tree focused — Delete enabled (baseline).
+        QQuickItem *row0 = nullptr;
+        QMetaObject::invokeMethod(treeItem, "itemAtCell", Qt::DirectConnection,
+                                   Q_RETURN_ARG(QQuickItem *, row0), Q_ARG(QPoint, QPoint(0, 0)));
+        QVERIFY(row0);
+        QTest::mouseClick(&view, Qt::LeftButton, Qt::NoModifier,
+                          row0->mapToScene(QPointF(row0->width() / 2, row0->height() / 2)).toPoint());
+        QTest::qWait(20);
+        QCOMPARE(sidebarItem->property("selectedPaths").toList().size(), 1);
+        QVERIFY(treeItem->property("activeFocus").toBool());
+        QVERIFY2(sidebarItem->property("deleteShortcutEnabled").toBool(),
+                 "Delete must be enabled with a selection and the tree focused");
+
+        // Focus leaves the tree (like clicking into MainPanel): selection stays,
+        // no text field is focused — Delete MUST stay enabled (the fix).
+        root->setFocus(true);
+        QVERIFY(!treeItem->property("activeFocus").toBool());
+        QVERIFY(!sidebarItem->property("textFieldHasFocus").toBool());
+        QVERIFY2(sidebarItem->property("deleteShortcutEnabled").toBool(),
+                 "Delete must stay enabled after focus leaves the tree — the selection is still shown");
+
+        // Focus a text field: Delete must be suppressed (must edit text, not
+        // trash the selection).
+        QQuickItem *decoy = root->findChild<QQuickItem *>(QStringLiteral("decoy"));
+        QVERIFY(decoy);
+        decoy->forceActiveFocus();
+        QTest::qWait(20);
+        QVERIFY2(sidebarItem->property("textFieldHasFocus").toBool(),
+                 "focusing a TextField must register as text-field focus");
+        QVERIFY2(!sidebarItem->property("deleteShortcutEnabled").toBool(),
+                 "Delete must be suppressed while a text field is being edited");
+    }
+
+    // Queue item 052: Escape clears a multi-selection (mirroring the cancel
+    // button and empty-space taps) even after keyboard focus has left the
+    // tree — NOT gated on tree/search focus, since the selection stays
+    // highlighted after focus drifts to the main panel. Under the old
+    // `noteShortcutsEnabled` gate this shortcut went dead the instant the
+    // tree blurred; this pins that regression.
+    void escapeClearsSelectionWithoutTreeFocus()
+    {
+        QTemporaryDir vault;
+        QVERIFY(vault.isValid());
+        for (int i = 0; i < 5; ++i)
+            QVERIFY(touch(vault.filePath(QStringLiteral("note%1.mp3").arg(i))));
+
+        QQuickView view;
+        view.engine()->addImportPath(m_moduleDir.path());
+        view.engine()->addImageProvider(QString::fromLatin1(IconImageProvider::kProviderId),
+                                        new IconImageProvider);
+        view.rootContext()->setContextProperty(QStringLiteral("vaultUrl"),
+                                                QUrl::fromLocalFile(vault.path()));
+        view.setSource(QUrl::fromLocalFile(m_driverQmlPath));
+        QCOMPARE(view.status(), QQuickView::Ready);
+        view.show();
+        QVERIFY(QTest::qWaitForWindowExposed(&view));
+
+        QQuickItem *root = view.rootObject();
+        QVERIFY(root);
+        QQuickItem *sidebarItem = root->findChild<QQuickItem *>(QStringLiteral("sidebar"));
+        QVERIFY(sidebarItem);
+        QQuickItem *treeItem = findByClassNamePrefix(sidebarItem, "QQuickTreeView");
+        QVERIFY(treeItem);
+        QTRY_VERIFY(treeItem->property("rows").toInt() > 0);
+
+        auto selectedPaths = [&]() -> QStringList {
+            QStringList out;
+            for (const QVariant &v : sidebarItem->property("selectedPaths").toList())
+                out << v.toString();
+            return out;
+        };
+
+        // Click row 0 to focus the tree and open the first note, then
+        // Ctrl+Shift+Down to build a multi-selection (same pattern as
+        // ctrlShiftArrow_thenMouseModifierClicksStillSelect above).
+        QQuickItem *row0 = nullptr;
+        QMetaObject::invokeMethod(treeItem, "itemAtCell", Qt::DirectConnection,
+                                   Q_RETURN_ARG(QQuickItem *, row0), Q_ARG(QPoint, QPoint(0, 0)));
+        QVERIFY(row0);
+        QTest::mouseClick(&view, Qt::LeftButton, Qt::NoModifier,
+                          row0->mapToScene(QPointF(row0->width() / 2, row0->height() / 2)).toPoint());
+        QTest::qWait(20);
+        QVERIFY(treeItem->property("activeFocus").toBool());
+
+        QTest::keyClick(&view, Qt::Key_Down, Qt::ControlModifier | Qt::ShiftModifier);
+        QTest::qWait(20);
+        QVERIFY2(selectedPaths().size() > 1, "Ctrl+Shift+Down must build a multi-selection");
+
+        // Blur the tree (like clicking into MainPanel) — the selection stays
+        // highlighted, but keyboard focus is gone.
+        root->setFocus(true);
+        QVERIFY(!treeItem->property("activeFocus").toBool());
+
+        // Escape must still collapse the selection down to at most the open
+        // file, exactly as the cancel button / empty-space click would.
+        QTest::keyClick(&view, Qt::Key_Escape);
+        QTRY_VERIFY2(selectedPaths().size() <= 1,
+                     "Escape must clear a multi-selection even without tree focus");
     }
 
 };

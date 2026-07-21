@@ -53,6 +53,9 @@ ApplicationWindow {
             Notifications.post({
                 text: label,
                 kind: "info",
+                // Dropped while the Tasks popup is open — that popup already
+                // lists this task and carries its own per-row Undo.
+                taskRelated: true,
                 actions: [{
                     label: qsTr("Undo"),
                     onTriggered: function() { transcriptionController.undoTask(taskId) }
@@ -72,6 +75,12 @@ ApplicationWindow {
         // combined (persisted per-vault, unlike the C++-side cache) — see
         // UsbGrabJob.h's runUsbGrabScan() doc comment.
         combineRules: AppSettings.combineRules
+        // The auto-combine after a CLEAN auto-grab batch runs in C++ now
+        // (UsbGrabberController::maybeAutoCombineAfterGrab), gated on these two —
+        // bound live like combineRules so the decision reads the same persisted
+        // settings the manual combine path does.
+        autoCombineAfterGrab: AppSettings.autoCombineAfterGrab
+        deleteOriginalsAfterCombine: AppSettings.deleteOriginalsAfterCombine
     }
 
     // A grab is invisible unless the USB Grabber page happens to be open — and
@@ -105,37 +114,16 @@ ApplicationWindow {
                                : qsTr("Grabbed %n new file(s).", "", filesCopied))
         }
 
-        // The auto-combiner. Fires once per auto-grab batch, after the LAST
-        // auto-grab has left the queue (see autoGrabsSettled()) — never
-        // mid-batch, so a recording split across parts that arrive in different
-        // grab jobs is combined as one group rather than half-combined twice.
-        //
-        // Rule-driven like every other combine path (DESIGN.md "Split-recording
-        // combine"): runCombineScan enqueues only groups a user-authored rule
-        // matched AND detectCombineGroups() calls "ready", so a part the
-        // recorder is still writing, an already-transcribed group, or a group
-        // with nothing to merge is left alone by the same logic the manual scan
-        // button uses. With no rules, or the setting off, this does nothing.
-        function onAutoGrabsSettled() {
-            if (!AppSettings.autoCombineAfterGrab || AppSettings.combineRules.length === 0)
-                return
-            // Load-bearing: allAudioPaths() reads the in-memory tree, which is
-            // refreshed by a filesystem WATCHER — asynchronously, and not at
-            // all for subfolders the grab itself just created. Scanning without
-            // this would routinely decide against a tree that predates the
-            // grabbed files and silently find nothing to combine.
-            vaultModel.refresh()
-            const audioPaths = vaultModel.allAudioPaths()
-            const ready = transcriptionController.detectCombineGroups(AppSettings.combineRules, audioPaths)
-                            .filter(g => g.status === "ready")
-            if (ready.length === 0)
-                return
-            transcriptionController.runCombineScan(AppSettings.combineRules, audioPaths, vaultModel.vaultPath,
-                                                    AppSettings.deleteOriginalsAfterCombine)
-            // Announced because it's the one combine the user didn't click: a
-            // merge that moves their original parts into .combined/ must never
-            // just happen with no account of itself.
-            Notifications.info(qsTr("Auto-combining %n recording group(s) after grab.", "", ready.length))
+        // The auto-combine itself runs in C++ now (UsbGrabberController::
+        // maybeAutoCombineAfterGrab, fired once per CLEAN auto-grab batch after
+        // the LAST auto-grab leaves the queue, and gated on a batch that wasn't
+        // cancelled/aborted/errored — an aborted grab can leave a truncated part
+        // set, and combining that would drop a recording's tail). All that
+        // remains here is announcing it: the one combine the user didn't click,
+        // which moves their original parts into .combined/, must never happen
+        // with no account of itself.
+        function onAutoCombineStarted(groupCount) {
+            Notifications.info(qsTr("Auto-combining %n recording group(s) after grab.", "", groupCount))
         }
     }
 
@@ -168,7 +156,7 @@ ApplicationWindow {
     // copies them into the vault ROOT (never a subfolder, regardless of
     // where over the window the drop lands — see fileDropArea below). Item
     // 37: the copy is now ASYNC — each file is validated synchronously
-    // (VaultTreeModel::importDestinationFor(), instant feedback for wrong
+    // (VaultTreeModel::inspectImportCandidate(), instant feedback for wrong
     // type / collision / no vault) then its byte-copy is enqueued as an
     // "import" task on TranscriptionController's worker thread
     // (importAudio()), so dropping a large file no longer freezes the UI and
@@ -176,27 +164,47 @@ ApplicationWindow {
     // fatal to the whole drop — every dropped file is attempted
     // independently, and any that failed validation are named in a snackbar
     // (StyleGuide.md "Snackbars"); a copy that fails on the worker surfaces
-    // as a Failed row in the Tasks popup instead.
+    // as a Failed row in the Tasks popup instead. A NAME COLLISION is not
+    // treated as a hard failure — it routes to a separate sticky
+    // Overwrite/Skip snackbar (item 078) instead of the plain error one.
     function importDroppedUrls(urls) {
         if (vaultModel.vaultPath.toString() === "") {
             Notifications.error(qsTr("Open a vault before dropping in audio files."))
             return
         }
         const failed = []
+        const collisions = []   // [{ url, dest, name }]
         for (const url of urls) {
-            // Item 37: validate synchronously (instant feedback for wrong
-            // type / collision / no vault), then enqueue the slow byte-copy as
-            // an async "import" task on TranscriptionController's worker thread
-            // so a large file never freezes the UI. A copy that fails on the
-            // worker shows up as a Failed row in the Tasks popup instead.
-            const dest = vaultModel.importDestinationFor(url)
-            if (dest === "")
-                failed.push(url.toString().split("/").pop())
+            const v = vaultModel.inspectImportCandidate(url)
+            if (v.reason === "ok")
+                transcriptionController.importAudio(url, "file://" + v.dest, vaultModel.vaultPath)
+            else if (v.reason === "collision")
+                collisions.push({ url: url, dest: v.dest, name: v.name })
             else
-                transcriptionController.importAudio(url, "file://" + dest, vaultModel.vaultPath)
+                failed.push(v.name)
         }
         if (failed.length > 0)
             Notifications.error(qsTr("Couldn't import: %1").arg(failed.join(", ")))
+        if (collisions.length > 0) {
+            // Sticky (timeout: 0) — the user must choose. NOT taskRelated: this
+            // is a pre-enqueue prompt, not a duplicate of a Tasks-popup row, so
+            // it must survive with the popup open.
+            Notifications.post({
+                text: qsTr("%n file(s) already in the vault.", "", collisions.length),
+                kind: "warning",
+                timeout: 0,
+                actions: [{
+                    label: qsTr("Overwrite"),
+                    onTriggered: () => {
+                        for (const c of collisions)
+                            transcriptionController.importAudio(c.url, "file://" + c.dest, vaultModel.vaultPath, true)
+                    }
+                }, {
+                    label: qsTr("Skip"),
+                    onTriggered: () => {}   // Notifications.trigger() dismisses after the action
+                }]
+            })
+        }
     }
 
     // Wave D item 3: reverted to the native/portal dialog (was replaced by
@@ -281,6 +289,12 @@ ApplicationWindow {
         }
     }
 
+    // Ctrl+Y => redo inside whichever text box has focus. Window-wide (one
+    // ApplicationWindow, so the default Qt.WindowShortcut context covers
+    // every field in every page and popup) — see TextRedoShortcut.qml for why
+    // Qt doesn't already give us this chord on Linux.
+    TextRedoShortcut {}
+
     onWidthChanged: Qt.callLater(updateBlurRegions)
     onHeightChanged: Qt.callLater(updateBlurRegions)
 
@@ -324,6 +338,26 @@ ApplicationWindow {
     Item {
         id: rootContent
         anchors.fill: parent
+
+        // A left-click on genuinely empty space anywhere in the window drops
+        // keyboard focus from whatever text field currently holds it —
+        // forceActiveFocus() on this container pulls active focus off the
+        // field, whose own onActiveFocusChanged then commits it (matching the
+        // platform expectation that clicking off a field deselects it). A
+        // deeper handler (a field, button, tree row, timestamp seek, middle-
+        // drag pan) grabs the press first, so this only fires on empty space.
+        // Deliberately an Item-attached TapHandler, NOT a MouseArea: it carries
+        // no implicit cursor, so it can span the whole window without poisoning
+        // the I-beam/pointer cursor resolution of everything above it (see
+        // MainPanel's own deselect TapHandler and the MouseArea cursor-bleed
+        // notes). DragThreshold policy means a click-drag (a text selection, a
+        // slider, a window move) is not treated as a tap, so it never blurs
+        // mid-gesture. The DropArea below only handles drag-drop, never a
+        // press, so it does not intercept this.
+        TapHandler {
+            acceptedButtons: Qt.LeftButton
+            onTapped: rootContent.forceActiveFocus()
+        }
 
         // Item: drag-and-drop import — dropping OS file(s) anywhere over the
         // window imports them into the vault root (see importDroppedUrls()
@@ -403,22 +437,22 @@ ApplicationWindow {
                 window: window
                 title: window.title
                 recording: mainPanel.recording
+                recordingActive: audioRecorder.recording
                 usbGrabberOpen: mainPanel.usbGrabberOpen
                 benchmarkOpen: mainPanel.benchmarkOpen
                 visible: !AppSettings.useSystemTitlebar
                 onSettingsRequested: settingsPopup.open()
                 onForceRetranscribeAllRequested: sidebar.forceRetranscribeAll()
-                onRecordRequested: mainPanel.recording = !mainPanel.recording
-                onUsbGrabberRequested: {
-                    mainPanel.usbGrabberOpen = !mainPanel.usbGrabberOpen
-                    if (mainPanel.usbGrabberOpen)
-                        mainPanel.benchmarkOpen = false
-                }
-                onBenchmarkRequested: {
-                    mainPanel.benchmarkOpen = !mainPanel.benchmarkOpen
-                    if (mainPanel.benchmarkOpen)
-                        mainPanel.usbGrabberOpen = false
-                }
+                // Each button toggles ITS screen: on if it wasn't showing,
+                // otherwise back to the transcript. setTopLevelScreen closes
+                // whatever else was open, so leaving one screen can never
+                // reveal a stale one underneath.
+                onRecordRequested: mainPanel.setTopLevelScreen(
+                    mainPanel.recording ? "" : "recorder")
+                onUsbGrabberRequested: mainPanel.setTopLevelScreen(
+                    mainPanel.usbGrabberOpen ? "" : "usbGrabber")
+                onBenchmarkRequested: mainPanel.setTopLevelScreen(
+                    mainPanel.benchmarkOpen ? "" : "benchmark")
             }
 
             SplitView {
@@ -499,9 +533,15 @@ ApplicationWindow {
             anchors.fill: parent
             color: "transparent"
             radius: AppSettings.borderRadius
-            border.width: AppSettings.rimWidth
-            border.color: AppSettings.rimColor
-            visible: AppSettings.rimEnabled && !AppSettings.useSystemTitlebar
+            // While capture is running the rim becomes the app-wide "you are
+            // recording" signal: it takes recordingActiveColor, forces itself
+            // visible even when the rim is switched off, and widens to at
+            // least 2px so a 1px default rim is actually noticeable.
+            border.width: audioRecorder.recording ? Math.max(AppSettings.rimWidth, 2) : AppSettings.rimWidth
+            border.color: audioRecorder.recording ? AppSettings.recordingActiveColor : AppSettings.rimColor
+            visible: (AppSettings.rimEnabled || audioRecorder.recording) && !AppSettings.useSystemTitlebar
+
+            Behavior on color { ColorAnimation { duration: AppSettings.animationsEnabled ? 150 : 0 } }
         }
 
         // Frameless mode has no OS-drawn resize border, so nothing lets the

@@ -10,17 +10,36 @@
 // thread — see Task::fileUrl's OUTPUT-path convention) off the GUI thread via
 // a chunked read/write loop, which is what lets it report byte progress and
 // honor pause/cancel between chunks.
+//
+// `overwrite` (opt-in, from the drop handler's Overwrite/Skip snackbar) lifts
+// the collision guard in run() and lets the copy truncate the existing
+// destination. It replaces the audio bytes ONLY — a pre-existing sibling
+// `.md` transcript is left untouched (import never owned it; see the 078
+// work order's Open questions for the destructive alternative that was NOT
+// chosen).
 class ImportTask : public Task {
     Q_OBJECT
 public:
-    ImportTask(QString sourcePath, QUrl destUrl, QObject *parent = nullptr);
+    ImportTask(QString sourcePath, QUrl destUrl, bool overwrite = false, QObject *parent = nullptr);
 
     QString kind() const override { return QStringLiteral("import"); }
+    // Creates/moves files in the vault -> the watcher rebuild resets the model,
+    // which is the authoritative reflow (see Task::isStructuralFileOp).
+    bool isStructuralFileOp() const override { return true; }
     QString kindLabel() const override { return QStringLiteral("Import"); }
     QString displayName() const override;
     // Pausable between chunks (no subprocess to SIGSTOP, so the task just
     // blocks itself — see run()).
     Capabilities capabilities() const override { return {/*pausable=*/true, /*cancellableMidRun=*/true}; }
+    // Background, NOT the Foreground default: an import is a byte copy into a
+    // file that has no transcript yet, so the main-panel overlay would block
+    // the panel for the whole copy (minutes on a long file) while showing the
+    // user nothing — and it would never lift, since the overlay is cleared by
+    // the first live segment and an import emits none. Same reasoning as
+    // BenchmarkTask/DownloadTask/ModelIoTask: the Tasks row + bottom-bar glow
+    // + progress are the right surface. See MainPanel.qml's
+    // transcribingThisFile / activeIsForeground.
+    Presentation presentation() const override { return Presentation::Background; }
     // NOT persisted (old persistQueue()'s explicit opt-out): m_sourcePath
     // names an EXTERNAL file (often removable media) that may be gone next
     // session, and a half-done copy left a partial file the collision check
@@ -35,4 +54,5 @@ public:
 
 private:
     QString m_sourcePath;
+    bool m_overwrite = false;
 };

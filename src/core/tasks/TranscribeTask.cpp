@@ -5,10 +5,14 @@
 #include <QFileInfo>
 
 #include <algorithm>
+#include <optional>
+#include <utility>
 
 #include "../AudioDecoder.h"
+#include "../MdFrontmatter.h"
 #include "../ModelManager.h"
 #include "../Segment.h"
+#include "../TranscribePipeline.h"
 #include "../TranscriptionController.h"
 #include "../TranscriptionEngine.h"
 #include "../VadChunker.h"
@@ -133,36 +137,24 @@ void TranscribeTask::run(TaskContext &ctx)
     // recorded honestly in frontmatter below.
     emit phase(QStringLiteral("detecting-speech"));
     phaseTimer.restart();
-    QString vadError;
-    std::vector<VadChunker::Window> windows;
-    bool vadActive = false;
-    const bool useSubprocessEngine = isEngineModelId(m_modelId);
-    if (useSubprocessEngine) {
-        // Out-of-process engines load a heavy model per process and do
-        // their own internal segmentation, so feed the whole file as ONE
-        // chunk (one spawn) rather than VAD-windowing it into many.
-        windows.push_back({0.0, static_cast<double>(pcm->size()) / 16000.0});
-    } else {
-        const QString vadModelPath = ModelManager::ensureVadModel(&vadError);
-        if (!vadModelPath.isEmpty()) {
-            QString chunkingError;
-            windows = VadChunker::computeWindows(*pcm, vadModelPath, &chunkingError);
-            if (chunkingError.isEmpty())
-                vadActive = true;
-            else
-                vadError = chunkingError;
-        }
-        if (windows.empty())
-            windows.push_back({0.0, static_cast<double>(pcm->size()) / 16000.0});
-        // m_asr is a persistent cache entry reused across tasks — a
-        // PREVIOUS task's successful VAD path must not silently leak into
-        // this one if this task's VAD failed. Guarded to the concrete
-        // whisper engine (VAD gating is its feature); a subprocess engine
-        // never reaches here.
-        if (auto *whisper = dynamic_cast<WhisperCppEngine *>(asr.engine))
-            whisper->setVadModelPath(vadActive ? vadModelPath : QString());
-    }
+    const TranscribePipeline::Windowing win =
+        TranscribePipeline::planWindows(isEngineModelId(m_modelId), *pcm, *asr.engine);
+    const std::vector<VadChunker::Window> &windows = win.windows;
+    const bool vadActive = win.vadActive;
+    const QString vadError = win.vadError;
     emit phaseDurationMs(QStringLiteral("detecting-speech"), phaseTimer.restart());
+
+    const double totalFileSeconds = static_cast<double>(pcm->size()) / 16000.0;
+
+    // Silence-capture feature, phase 1 (Decision: VAD primary). When VAD
+    // actually ran, the real complement is already known up front — no need
+    // to wait for the transcript to exist. When it didn't (self-segmenting
+    // engine, or VAD failed), this stays nullopt (key omitted for now) and
+    // gets filled in with the transcript-gap fallback once the transcript
+    // exists, below (see the "so the key is always present" contract).
+    std::optional<std::vector<std::pair<double, double>>> initialSilences;
+    if (vadActive)
+        initialSilences = VadChunker::complementSpans(win.speechSpans, totalFileSeconds);
 
     QFile mdFile(sidecarPath(filePath));
     if (!mdFile.open(QIODevice::WriteOnly | QIODevice::Truncate))
@@ -172,7 +164,8 @@ void TranscribeTask::run(TaskContext &ctx)
     // frontmatter records speakerDetection: false with an empty speaker
     // list (a standalone diarize task splices real speakers in later).
     writeFrontmatter(mdFile, asr.modelUsedName, /*speakerDetection=*/false, asr.fellBack, m_modelId,
-                      /*speakerLabels=*/{}, /*speakerDetectionError=*/QString(), vadActive, vadError);
+                      /*speakerLabels=*/{}, /*speakerDetectionError=*/QString(), vadActive, vadError,
+                      /*partial=*/true, initialSilences);
     SegmentLineWriter lineWriter(mdFile);
 
     // "transcribing": the engine's own per-segment progress, blended across
@@ -180,8 +173,6 @@ void TranscribeTask::run(TaskContext &ctx)
     // would otherwise snap the bar back to 0% at every window boundary.
     emit phase(QStringLiteral("transcribing"));
     emit progress(0.0);
-    const double totalFileSeconds = static_cast<double>(pcm->size()) / 16000.0;
-    double secondsDoneInPriorWindows = 0.0;
 
     // Drives the old liveUpdateTick — throttled independently of the
     // engine's own progress ticks, which fire on every internal decode-loop
@@ -198,58 +189,60 @@ void TranscribeTask::run(TaskContext &ctx)
     // mid-file rather than only at its next natural boundary.
     const AbortCallback onAbort = [&ctx] { return ctx.checkpoint(); };
 
-    for (const VadChunker::Window &window : windows) {
-        // Between-window pause/cancel checkpoint — mid-window pause/cancel
-        // is still handled by onAbort above, unchanged.
-        if (ctx.checkpoint())
-            break;
+    ProgressCallback onProgress = [this, totalFileSeconds](double done, double) {
+        emit progress(totalFileSeconds > 0 ? done / totalFileSeconds : 0.0);
+    };
+    // Only accumulated when VAD didn't run — feeds the transcript-gap
+    // silence fallback below. Real transcribed-segment (t0, t1) pairs stand
+    // in for "speech spans" when there's no VAD data to complement instead
+    // (see the fallback's doc comment below).
+    std::vector<std::pair<double, double>> fallbackSpeechSpans;
+    SegmentCallback onSegment = [&lineWriter, &liveTimer, &lastLiveTickMs, &fallbackSpeechSpans, vadActive,
+                                  this](const Segment &segment) {
+        // Segment is already absolute (offset merge is the pipeline's job
+        // now). Pure ASR — no speaker label written at transcribe time.
+        lineWriter.append(segment, QString());
+        if (!vadActive)
+            fallbackSpeechSpans.emplace_back(segment.t0, segment.t1);
 
-        const auto startSample = static_cast<std::size_t>(window.startSeconds * 16000.0);
-        const auto endSample = std::min(pcm->size(), static_cast<std::size_t>(window.endSeconds * 16000.0));
-        if (endSample <= startSample)
-            continue;
-
-        AudioChunk chunk;
-        chunk.pcm16kMono.assign(pcm->begin() + static_cast<std::ptrdiff_t>(startSample),
-                                 pcm->begin() + static_cast<std::ptrdiff_t>(endSample));
-        chunk.offsetSeconds = window.startSeconds;
-        const double windowSeconds = static_cast<double>(chunk.pcm16kMono.size()) / 16000.0;
-
-        ProgressCallback onProgress = [this, &secondsDoneInPriorWindows, totalFileSeconds](double done, double) {
-            const double fraction =
-                totalFileSeconds > 0 ? (secondsDoneInPriorWindows + done) / totalFileSeconds : 0.0;
-            emit progress(fraction);
-        };
-        SegmentCallback onSegment = [&lineWriter, &liveTimer, &lastLiveTickMs, &chunk, this](const Segment &rawSegment) {
-            // Chunk offset merge is the app's job — a REAL merge for
-            // multi-window files, not a no-op.
-            Segment segment = rawSegment;
-            segment.t0 += chunk.offsetSeconds;
-            segment.t1 += chunk.offsetSeconds;
-            // Pure ASR — no speaker label written at transcribe time.
-            lineWriter.append(segment, QString());
-
-            const qint64 nowMs = liveTimer.elapsed();
-            if (nowMs - lastLiveTickMs >= kLiveUpdateThrottleMs) {
-                lastLiveTickMs = nowMs;
-                emit segmentWritten();
-            }
-        };
-
-        asr.engine->transcribe(chunk, onProgress, onSegment, onAbort);
-        secondsDoneInPriorWindows += windowSeconds;
-
-        if (ctx.cancelRequested())
-            break;
-    }
+        const qint64 nowMs = liveTimer.elapsed();
+        if (nowMs - lastLiveTickMs >= kLiveUpdateThrottleMs) {
+            lastLiveTickMs = nowMs;
+            emit segmentWritten();
+        }
+    };
+    TranscribePipeline::runWindows(*asr.engine, *pcm, windows, onProgress, onSegment, onAbort);
     mdFile.close();
 
     // A cancel mid-decode stops the engine early (see onAbort above) but
     // everything transcribed up to that point is still flushed and valid
     // (SegmentLineWriter's per-append durability contract) — reported as
     // Failed/"Cancelled" rather than Done, matching the Tasks list's
-    // honesty contract.
+    // honesty contract. Its .md keeps the `partial: true` marker written above.
     if (ctx.cancelRequested())
         throw TaskError(QStringLiteral("Cancelled"));
+
+    // Fully completed: drop the `partial: true` marker so the finished .md is
+    // no longer flagged incomplete. Only a completed run reaches here — a
+    // cancelled OR crashed/killed run does not, so its truncated .md stays
+    // marked partial and shows distinctly in the vault (the whole point).
+    QStringList fmLines;
+    QString fmBody;
+    QString fmError;
+    if (MdFrontmatter::read(sidecarPath(filePath), &fmLines, &fmBody, &fmError)) {
+        MdFrontmatter::upsertKey(&fmLines, QStringLiteral("partial"), QString(), /*removeIfEmpty=*/true);
+        // Silence-capture feature, phase 1: VAD didn't run (initialSilences
+        // was left nullopt above, so the "silences:" key isn't in fmLines
+        // yet) — now that the transcript exists, fill it with the
+        // transcript-gap fallback (real segment t0/t1 pairs standing in for
+        // "speech spans", complemented the exact same way the VAD path is)
+        // so a fully-completed transcription always ends up with the key
+        // one way or another, per this feature's "always present" contract.
+        if (!vadActive) {
+            const auto fallbackSilences = VadChunker::complementSpans(fallbackSpeechSpans, totalFileSeconds);
+            MdFrontmatter::upsertKey(&fmLines, QStringLiteral("silences"), formatSilencesValue(fallbackSilences));
+        }
+        writeFrontmatterBlock(sidecarPath(filePath), fmLines, fmBody, &fmError);
+    }
     emit phaseDurationMs(QStringLiteral("transcribing"), phaseTimer.elapsed());
 }

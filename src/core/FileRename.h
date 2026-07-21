@@ -18,6 +18,15 @@
 bool renameRecordingFile(const QUrl &fileUrl, const QString &newBaseName, QUrl *newUrlOut,
                           QString *errorOut = nullptr);
 
+// True if a and b denote the SAME recording — either the identical url, or two
+// siblings in one folder sharing a base name (an audio file and its transcript
+// .md, e.g. "foo.wav" <-> "foo.md"). A transcribe task carries the AUDIO url
+// while a rename/move/trash of that recording may carry the .md url (MainPanel
+// renames via currentMdUrl), so plain url equality misses the pairing — the
+// scheduler uses this to defer an instant op on either sibling behind an active
+// transcribe of the other. Empty for either argument (and unequal) => false.
+bool isSameRecording(const QUrl &a, const QUrl &b);
+
 // True if candidatePath is the vault root or lies inside it. Pure (takes the
 // vault root explicitly, no model state) so both VaultTreeModel::
 // isPathInsideVault() and the worker-thread move helper below share ONE

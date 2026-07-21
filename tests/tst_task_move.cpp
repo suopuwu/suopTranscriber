@@ -95,6 +95,31 @@ private slots:
         QVERIFY(!QFileInfo::exists(dir.path() + "/sub/clip.wav"));
     }
 
+    // The Tasks-list Undo button greys out once the undo can no longer run — the
+    // moved file is gone from where the inverse expects it (moved/renamed again).
+    void moveTask_undoStillApplicable_falseAfterResultMovedAway()
+    {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        QVERIFY(QDir(dir.path()).mkdir("sub"));
+        const QString audio = writeFile(dir.path() + "/clip.wav", "audio");
+
+        MoveTask task(QUrl::fromLocalFile(audio), QUrl::fromLocalFile(dir.path() + "/sub"),
+                      QUrl::fromLocalFile(dir.path()));
+        // Un-run: m_resultUrl is empty, so there's nothing to undo yet.
+        QVERIFY(!task.undoStillApplicable());
+
+        NullContextFixture fixture;
+        task.run(fixture.ctx);
+        QVERIFY(QFileInfo::exists(dir.path() + "/sub/clip.wav"));
+        // Result sits where the inverse expects it → undo still applicable.
+        QVERIFY(task.undoStillApplicable());
+
+        // The world moves on: the file leaves m_resultUrl (moved/renamed/deleted).
+        QVERIFY(QFile::remove(dir.path() + "/sub/clip.wav"));
+        QVERIFY(!task.undoStillApplicable());
+    }
+
     void moveTask_batchUndoLabel_summarizesMultiFileMove()
     {
         MoveTask task(QUrl::fromLocalFile("/vault/a.wav"), QUrl::fromLocalFile("/vault/sub"),

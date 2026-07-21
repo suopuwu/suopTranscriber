@@ -201,11 +201,6 @@ happens, and (where applicable) **one undo snackbar** reverses it.
   needs a real compositor. See the `qt-window-effects` skill.)*
 - [ ] **P1 [LIVE]** Frameless / titlebar toggle takes effect on Wayland.
   *(`tst_titlebar_buttons` covers button logic, not the frameless flag.)*
-- [ ] **P1 [LIVE]** Window position/size is remembered across restarts, and
-  survives a hard kill (Ctrl+C), not just a clean quit. *(See
-  `kwin-wayland-position-save` skill.)*
-- [ ] **P2 [LIVE]** Window spawns on the intended monitor. *(See
-  `kwin-wayland-window-placement` skill.)*
 - [ ] **P1 [LIVE]** Middle-click autoscroll in the transcript (Chrome-style pan)
   works and doesn't break left-click editing or hover cursors.
   *(`tst_middledragscroll` covers wiring; the gesture feel is live.)*

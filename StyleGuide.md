@@ -67,6 +67,18 @@ must show both:
   fields ONLY — a pure text box keeps its resting underline. A visibility flag tied to focus state is exactly the bug this
   fixes: the platform's native right-click "Copy" menu steals focus, and if
   that flip hides the field, the box disappears out from under the user.
+- **This is the default for any single-line editable label that fills its
+  own width** (chapter titles, the file title, speaker/tag pills): a `TextField`
+  with `background: UnderlineField { plainUntilHovered: true }`, never a
+  read-only `TextEdit` that arms into an edit on tap and hand-places the caret
+  with `positionAt`. The field owning its full width is what lets a click or
+  drag past the last character land in the text, so you never need a separate
+  tap-target strip or a "special handling for the empty space to the right."
+  **Carve-out:** a field that must stay read-only at rest because it takes part
+  in a *larger* selection surface — e.g. a transcript chapter **heading**, an
+  overlay on `transcriptArea` whose title is swept into the body selection and
+  copied by `copySelectionWithChapters()` — keeps the read-only `TextEdit`; an
+  always-editable field would swallow the drag-through and defeat the sweep.
 - If the pill/control ALSO needs a click-triggered action other than editing
   (e.g. filtering the sidebar by a speaker/tag pill) — don't gate the field's
   own editability behind a separate edit-trigger icon to make room for it.
@@ -153,6 +165,12 @@ describes a moment that has already passed, it's a snackbar.
   the pointer is over the stack. An action never has to race its own timer.
 - No confirmations and no successes that speak for themselves — a renamed row
   visibly renames itself. Post only what is otherwise silent.
+- **A message that duplicates the Tasks popup passes `taskRelated: true`.**
+  Those posts are dropped while that popup is open (and any already on screen
+  are dismissed when it opens): the popup lists the same task, in the same
+  corner, under the snackbar host — and it carries a persistent per-row Undo,
+  so the reversal stays reachable. This is not a blanket mute; a message the
+  popup does NOT convey (a rename rejection, a write failure) still posts.
 
 ## Destructive actions: trash first, confirm only what's permanent
 
@@ -207,6 +225,56 @@ describes a moment that has already passed, it's a snackbar.
   a small `Canvas` component (see `PlayGlyph.qml`), registered in `AppIcon`'s
   closed `builtins` map — never an arbitrary component URL a pack names.
 - Full architecture: DESIGN.md "Iconography".
+
+## Transcript silence divider
+
+Silence phase 3 (stored `silences:` spans from phase 1, purely visual — no
+playback effect; that's phase 2's skip-silence toggle).
+
+- **Form**: a centered, non-interactive text row rendered BETWEEN the two
+  transcript segments a stored silence span falls between — never inline
+  with either segment's own text.
+- **Glyphs**: `··· <duration> silence ···` — `·` is U+00B7 MIDDLE DOT,
+  three in a row, one on each side of the label (`MainPanel.qml`'s
+  `formatSilenceMarkerText`). Never a plain ASCII `...` or a `-`/`—` rule.
+- **Duration label**: seconds under a minute as `Ns` (e.g. `34s`); a minute
+  or more as `Nm` or `Nm Ss` (e.g. `1m`, `1m 5s`) — no fractional seconds,
+  no `HH:MM:SS` clock format (that's `formatDuration`'s job elsewhere, for
+  the playback position readout, not this label).
+- **Typography**: `font.pixelSize: 11`, `font.italic: true`, color
+  `#5a5a5a` — dimmer than the `#777777` timestamp gutter, reads as
+  ambient/secondary, never mistaken for spoken content or a clickable
+  control.
+- **Layout**: spans the full transcript width (`transcriptArea.width`,
+  including the gutter columns — a silence gap isn't scoped to one
+  speaker's column, same reasoning as a chapter heading row), horizontally
+  centered.
+- **Minimum duration to show one**: `mainPanel.silenceMarkerMinSeconds`
+  (5s), a fixed constant — deliberately NOT
+  `AppSettings.skipSilenceThresholdSeconds` (phase 2's user-configurable
+  playback-skip threshold, which can go well under a second). Marking is
+  cosmetic; showing a divider on every ordinary inter-sentence breathing
+  gap would be noise, not signal. Only a span that falls fully BETWEEN two
+  rendered segments ever gets one — leading silence (before the first
+  segment) and trailing silence (after the last) never do, since there is
+  no second segment to sit "between."
+- **Never interactive**: no hover cursor, no `HoverBorder`, no click target
+  — it carries none of the "Interactable hover behavior" conventions above,
+  because it isn't one.
+
+## Top-level pages scroll via `ScrollPage`
+
+- **Every top-level full-page screen (note, benchmark, USB, recorder, …) is a
+  `ScrollPage`**, never a hand-rolled page-level `ScrollView`. The base owns
+  the page's 16px margins, floats the vertical scrollbar in the window-edge
+  gutter (`16 - scrollBarGutter` right inset, bar ~3px off the panel edge),
+  and bakes in Chrome-style middle-click autoscroll (`MiddleDragScroll`).
+- Callers `anchors.fill: parent`, drop ONE child in as the scrolling content,
+  and bind width-filling content to `availableContentWidth` so text keeps its
+  true 16px right inset while the bar floats in the reclaimed gutter.
+- Enforced by `tst_styleguide.cpp`'s `topLevelScrollPages_useScrollPage`.
+  Nested scrollables inside a page (combo popups, preview lists) are exempt —
+  the rule is about the page-level scroller only.
 
 ## Extending this doc
 

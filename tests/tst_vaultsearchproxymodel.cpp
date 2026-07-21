@@ -538,6 +538,45 @@ private slots:
         QVERIFY(findByName(proxy, "roamer.mp3").isValid());
         QCOMPARE(proxy.fileSortKeys().value(QStringLiteral("k")).toList().size(), 3);
     }
+
+    // A rename applied via VaultTreeModel::applyRenameOutcome must flow through
+    // the proxy as an in-place move — NO proxy reset (which is what flashes the
+    // whole tree and jumps selection in the real Sidebar) — with the renamed row
+    // landing at its new alphabetical position. This is the proxy-layer proof of
+    // the "only the name changes" fix; the source-level proof lives in
+    // tst_vaulttreemodel::applyRenameOutcome_updatesInPlaceWithoutReset.
+    void applyRename_flowsThroughProxyWithoutReset()
+    {
+        QTemporaryDir vault;
+        QVERIFY(vault.isValid());
+        QVERIFY(touch(vault.filePath("a.mp3")));
+        QVERIFY(touch(vault.filePath("m.mp3")));
+        QVERIFY(touch(vault.filePath("z.mp3")));
+
+        VaultTreeModel source;
+        source.setVaultPath(QUrl::fromLocalFile(vault.path()));
+
+        VaultSearchProxyModel proxy;
+        proxy.setSourceModel(&source);
+        QCOMPARE(siblingNamesInOrder(proxy), QStringList({"a.mp3", "m.mp3", "z.mp3"}));
+
+        QSignalSpy proxyResetSpy(&proxy, &QAbstractItemModel::modelReset);
+
+        // Rename a.mp3 -> n.mp3 on disk (as RenameFileTask would) then apply the
+        // in-place model update the controller drives on success.
+        QVERIFY(QFile::rename(vault.filePath("a.mp3"), vault.filePath("n.mp3")));
+        source.applyRenameOutcome(QUrl::fromLocalFile(vault.filePath("a.mp3")),
+                                  QUrl::fromLocalFile(vault.filePath("n.mp3")));
+
+        QCOMPARE(proxyResetSpy.count(), 0); // the proxy must NOT reset — no flash
+        QCOMPARE(siblingNamesInOrder(proxy), QStringList({"m.mp3", "n.mp3", "z.mp3"}));
+
+        // The watcher echo of the same rename is swallowed at the source, so the
+        // proxy still never resets.
+        QTest::qWait(300);
+        QCOMPARE(proxyResetSpy.count(), 0);
+        QCOMPARE(siblingNamesInOrder(proxy), QStringList({"m.mp3", "n.mp3", "z.mp3"}));
+    }
 };
 
 QTEST_GUILESS_MAIN(TstVaultSearchProxyModel)

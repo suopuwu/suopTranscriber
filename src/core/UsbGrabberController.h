@@ -60,12 +60,21 @@ QVariantList usbVolumesForSerial(const QVariantList &mountedVolumes, const QStri
 // confirmed product decision that grabs only ever target whatever vault happens
 // to be open at the moment of detection.
 //
-// Auto-combine handoff: this class tracks the ids of the auto-grab jobs it has
-// enqueued and emits autoGrabsSettled() once the LAST of them leaves the queue
-// — the "only after all auto grabbings have run" barrier. It deliberately
-// stops there and does not itself combine: the combine rules live in
-// vault-scoped AppSettings and the vault's audio listing in the tree model,
-// both of which are QML's to hand over (see Main.qml's onAutoGrabsSettled).
+// Auto-combine: this class tracks the ids of the auto-grab jobs it has enqueued
+// and, once the LAST of them leaves the queue (the "only after all auto
+// grabbings have run" barrier), runs the split-recording combine itself — but
+// ONLY if the whole batch settled CLEAN (no grab cancelled, aborted, or left
+// per-file errors). An aborted grab is exactly the case where the part set on
+// disk can't be trusted as complete, so combining then risks merging a
+// truncated recording; the parts are left in place for the next clean grab to
+// finish and combine (self-healing). The combine reuses the ordinary
+// runCombineScan() path, driven by combineRules and the two auto-combine
+// settings below (all bound live from QML's vault-scoped AppSettings) plus the
+// vault's audio listing from the tree model — everything it needs is already
+// owned here, which is why the whole decision lives in C++ (testable) rather
+// than in Main.qml. autoGrabsSettled() still fires on every settled batch
+// (clean or not) as the barrier signal; autoCombineStarted() fires only when a
+// clean batch actually enqueues groups, for QML to announce.
 //
 // Mount policy: a stock KDE install does not auto-mount removable media (its
 // device_automounter kded module is off by default), so a device can be
@@ -119,6 +128,17 @@ class UsbGrabberController : public QObject {
     // launch), so a device replugged in a fresh session still recognises what
     // it already grabbed-and-combined.
     Q_PROPERTY(QVariantList combineRules READ combineRules WRITE setCombineRules NOTIFY combineRulesChanged)
+    // AppSettings.autoCombineAfterGrab / .deleteOriginalsAfterCombine, bound live
+    // from QML (Main.qml). The auto-combine that fires after a clean auto-grab
+    // batch reads both from here rather than reaching back into QML — that's what
+    // moves the whole decision into C++ where it's testable and where the batch-
+    // clean gate is computed (see maybeAutoCombineAfterGrab()). Both default off,
+    // matching the AppSettings defaults: combining moves the user's originals into
+    // .combined/, so it is opted into, never assumed.
+    Q_PROPERTY(bool autoCombineAfterGrab READ autoCombineAfterGrab WRITE setAutoCombineAfterGrab NOTIFY
+                   autoCombineAfterGrabChanged)
+    Q_PROPERTY(bool deleteOriginalsAfterCombine READ deleteOriginalsAfterCombine WRITE
+                   setDeleteOriginalsAfterCombine NOTIFY deleteOriginalsAfterCombineChanged)
     // Non-empty if the most recent triggerManualGrab() call couldn't
     // proceed (no vault open, device not currently mounted, or no enabled
     // rule for it) — mirrors AudioRecorder::lastError's surfaced-not-
@@ -140,6 +160,12 @@ public:
 
     QVariantList combineRules() const { return m_combineRules; }
     void setCombineRules(const QVariantList &rules);
+
+    bool autoCombineAfterGrab() const { return m_autoCombineAfterGrab; }
+    void setAutoCombineAfterGrab(bool on);
+
+    bool deleteOriginalsAfterCombine() const { return m_deleteOriginalsAfterCombine; }
+    void setDeleteOriginalsAfterCombine(bool on);
 
     QString lastError() const { return m_lastError; }
 
@@ -208,6 +234,8 @@ signals:
     void vaultTreeModelChanged();
     void transcriptionControllerChanged();
     void combineRulesChanged();
+    void autoCombineAfterGrabChanged();
+    void deleteOriginalsAfterCombineChanged();
     void lastErrorChanged();
     // Emitted once a grab (manual or auto) finishes, after its history entry
     // has already been appended (see handleUsbGrabFinished()'s ordering).
@@ -225,10 +253,18 @@ signals:
     // hotplug for a device whose autoGrab is off.
     //
     // Fires even if every grab in the batch copied nothing or was cancelled —
-    // it reports that the grabs are DONE, not that they found anything. The
-    // combine scan re-derives its own candidates from the vault either way, and
-    // a scan over an unchanged vault finds no ready groups and does nothing.
+    // it reports that the grabs are DONE, not that they found anything. Whether
+    // an auto-combine then runs is a SEPARATE, cleanliness-gated decision made in
+    // C++ right after this fires (see maybeAutoCombineAfterGrab()); this signal
+    // is purely the barrier, kept so callers/tests can observe batch completion
+    // independent of whether anything combined.
     void autoGrabsSettled();
+    // Emitted once per CLEAN auto-grab batch that actually found ready groups to
+    // merge, with how many — for QML to announce ("Auto-combining N groups").
+    // The combine itself already ran in C++ (see maybeAutoCombineAfterGrab());
+    // this is purely the view notification. Never emitted for a dirty batch
+    // (nothing was combined) or a clean batch with nothing ready.
+    void autoCombineStarted(int groupCount);
     // Emitted ONCE per requestGrabPreview() call, after every mounted volume of
     // the device has been previewed — entries is their combined result, so this
     // covers exactly what triggerManualGrab() would do. entries is a list of
@@ -292,6 +328,22 @@ private:
     // points can never drift apart.
     void maybeAutoGrab(const QVariantMap &info);
 
+    // Called when the last pending auto-grab leaves the queue — from BOTH
+    // handleUsbGrabFinished() (normal/cancelled completion) and
+    // reconcileInFlightJobs() (cancel-while-queued). Emits autoGrabsSettled()
+    // unconditionally (the barrier), then runs the auto-combine ONLY if the
+    // batch settled clean (m_autoBatchClean).
+    void onAutoGrabBatchSettled();
+
+    // Refresh the tree, detect the split-recording groups a rule matched and the
+    // scanner calls "ready", and enqueue their combines via
+    // TranscriptionController::runCombineScan() — the same rule-driven,
+    // 'ready'-gated path the manual combine button uses. No-op if
+    // autoCombineAfterGrab is off, there are no combine rules, no vault is open,
+    // or nothing is ready. Only ever reached for a CLEAN batch (see
+    // onAutoGrabBatchSettled()).
+    void maybeAutoCombineAfterGrab();
+
     // Shared by triggerManualGrab() and handleDeviceAdded(): the device-
     // specific rule if enabled, else the "*" catch-all rule (with
     // deviceSerial/deviceLabel overridden to this device's own identity, so
@@ -337,6 +389,8 @@ private:
     VaultTreeModel *m_vaultTreeModel = nullptr;
     TranscriptionController *m_transcriptionController = nullptr;
     QVariantList m_combineRules;
+    bool m_autoCombineAfterGrab = false;
+    bool m_deleteOriginalsAfterCombine = false;
     QString m_lastError;
 
     // What one in-flight grab job needs at completion time that its id alone
@@ -361,4 +415,14 @@ private:
     // count, so a completion for an id that isn't ours (or arrives twice) can't
     // drive the barrier negative and fire the combine early.
     QSet<int> m_pendingAutoGrabJobIds;
+
+    // True while the CURRENT auto-grab batch has had no grab cancelled, aborted,
+    // or errored. Set to true when a fresh batch's first auto-grab is enqueued
+    // (see startGrabJob()); cleared by any dirty completion (see
+    // handleUsbGrabFinished()/reconcileInFlightJobs()). Gates the auto-combine:
+    // an aborted/errored grab may have left an INCOMPLETE part set on disk, and
+    // combining a truncated split recording silently drops its tail — so a dirty
+    // batch settles the barrier but does NOT combine. The next clean grab of the
+    // re-plugged device finishes the set and combines it correctly.
+    bool m_autoBatchClean = true;
 };

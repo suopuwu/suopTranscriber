@@ -162,9 +162,10 @@ private slots:
             QVERIFY2(fractions[i] >= fractions[i - 1] - 1e-9, "progress must not go backwards");
         QVERIFY(qFuzzyCompare(fractions.last() + 1.0, 1.0 + 1.0)); // last == 1.0
 
-        // The 15 tiny skips are 15 bytes of ~4 MiB total — so the FIRST progress
-        // report (after all skips, before the big copy shows sub-file motion)
-        // must still be near 0, NOT near 94% as the old per-count logic gave.
+        // Item 056: the 15 tiny already-present files are excluded from the
+        // denominator entirely (they're skipped, not work), so the denominator
+        // is exactly the 4 MiB big file and the FIRST report is that copy's own
+        // first chunk (near 0), NOT near 94% as the old per-count logic gave.
         // At least one mid-copy sample must land in the wide (0.05, 0.95) band,
         // proving sub-file granularity rather than a single 0->1 jump.
         bool sawMidCopy = false;
@@ -172,6 +173,96 @@ private slots:
             if (f > 0.05 && f < 0.95)
                 sawMidCopy = true;
         QVERIFY2(sawMidCopy, "expected sub-file progress samples during the big copy");
+    }
+
+    // Regression for "USB grab starts at ~80%": when most of the device is
+    // ALREADY in the vault, only the bytes still to be copied size the bar. The
+    // already-present files are skipped instantly and must count toward NEITHER
+    // the denominator nor the numerator. The inverse of
+    // progress_isByteWeighted_notPerFileCount (there the duplicates are tiny;
+    // here they're the bulk — the case that surfaced the bug).
+    void progress_ignoresAlreadyPresentBytes_startsNearZero()
+    {
+        QTemporaryDir device;
+        QTemporaryDir vault;
+        QVERIFY(device.isValid() && vault.isValid());
+
+        // One big file already in the vault (identical -> skipped): the bulk.
+        const QByteArray big(16 << 20, 'a');
+        QVERIFY(writeFile(vault.filePath("big.wav"), big));
+        QVERIFY(writeFile(device.filePath("big.wav"), big));
+        QVERIFY(setMtime(vault.filePath("big.wav"), fixedMtime()));
+        QVERIFY(setMtime(device.filePath("big.wav"), fixedMtime()));
+        // One smaller NEW file (multi-chunk so sub-file progress shows) — the
+        // only thing actually grabbed.
+        QVERIFY(writeFile(device.filePath("new.wav"), QByteArray(4 << 20, 'b')));
+
+        UsbGrabRule rule;
+        rule.deviceSerial = QStringLiteral("TEST-SERIAL");
+        rule.preserveStructure = false;
+
+        QList<double> fractions;
+        int reportedTotal = -1;
+        UsbGrabScanHooks hooks;
+        hooks.onProgress = [&fractions](qint64 done, qint64 total) {
+            if (total > 0)
+                fractions.append(static_cast<double>(done) / static_cast<double>(total));
+        };
+        hooks.onTotalsKnown = [&reportedTotal](int n) { reportedTotal = n; };
+
+        const UsbGrabScanResult result = runUsbGrabScan(rule, device.path(), vault.path(), /*dryRun=*/false, hooks);
+        QCOMPARE(result.filesCopied, 1);
+        QCOMPARE(result.filesSkipped, 1);
+
+        // The label counts only the file actually grabbed, not the duplicate.
+        QCOMPARE(reportedTotal, 1);
+        QVERIFY(!fractions.isEmpty());
+        // The FIRST report is the new file's first chunk (~0.25), NOT the 0.8
+        // the old logic emitted the instant it walked the 16 MiB skip.
+        QVERIFY2(fractions.first() < 0.5, "grab must not jump to the already-present fraction");
+        // Monotonic, ends at exactly 1.0.
+        for (int i = 1; i < fractions.size(); ++i)
+            QVERIFY2(fractions[i] >= fractions[i - 1] - 1e-9, "progress must not go backwards");
+        QVERIFY(qFuzzyCompare(fractions.last() + 1.0, 1.0 + 1.0));
+    }
+
+    // onTotalsKnown fires once, before any copy, with the count of files this
+    // grab will actually copy — matching the rule's filters AND not already
+    // present/combined in the vault (item 056) — the "N files" the Tasks row
+    // names the grab by. Here all 3 .wav are new, so the count is 3; the
+    // extension-filtered-out ones are excluded, same predicate as the byte
+    // pre-count.
+    void onTotalsKnown_reportsMatchingCandidateCount()
+    {
+        QTemporaryDir device;
+        QTemporaryDir vault;
+        QVERIFY(device.isValid() && vault.isValid());
+
+        // 3 matching .wav files + 2 non-matching .txt files.
+        for (int i = 0; i < 3; ++i)
+            QVERIFY(writeFile(device.filePath(QStringLiteral("clip%1.wav").arg(i)), "audio"));
+        QVERIFY(writeFile(device.filePath("notes.txt"), "text"));
+        QVERIFY(writeFile(device.filePath("nested/readme.txt"), "text"));
+
+        UsbGrabRule rule;
+        rule.deviceSerial = QStringLiteral("TEST-SERIAL");
+        rule.preserveStructure = false;
+        rule.extensionFilter = QStringList{QStringLiteral("wav")};
+
+        int reportedTotal = -1;
+        int totalsCallbacks = 0;
+        UsbGrabScanHooks hooks;
+        // The pre-count pass (and thus onTotalsKnown) is gated on onProgress.
+        hooks.onProgress = [](qint64, qint64) {};
+        hooks.onTotalsKnown = [&](int totalFiles) {
+            reportedTotal = totalFiles;
+            ++totalsCallbacks;
+        };
+
+        const UsbGrabScanResult result = runUsbGrabScan(rule, device.path(), vault.path(), /*dryRun=*/false, hooks);
+        QCOMPARE(result.filesCopied, 3); // the .txt files were filtered out
+        QCOMPARE(totalsCallbacks, 1);    // fired exactly once
+        QCOMPARE(reportedTotal, 3);      // only the matching .wav candidates
     }
 
     void quickCheck_skipsAlreadyPresentFile_copiesNewOne()

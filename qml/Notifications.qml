@@ -46,6 +46,34 @@ QtObject {
     // Timers live on the delegates; this just gates them.
     property bool paused: false
 
+    // Bound by BottomBar to the Tasks popup's visibility. A `taskRelated: true`
+    // post is DROPPED while this is true, and any such entry already on screen
+    // is dismissed the moment the popup opens: the popup lists the same task
+    // live, in the same bottom-right corner, and the snackbar host's z:1001
+    // renders straight over it. Nothing is lost — the popup carries a
+    // persistent per-row Undo (BottomBar's `undoButton`), which is exactly the
+    // action the dropped snackbar would have offered.
+    //
+    // Deliberately NOT a blanket mute: a snackbar reporting something the popup
+    // does not say ("Couldn't rename — name taken or invalid.") must still get
+    // through, popup or no popup.
+    property bool tasksPopupOpen: false
+
+    onTasksPopupOpenChanged: {
+        if (!root.tasksPopupOpen)
+            return
+        // Collect first, dismiss after: dismiss() mutates the queue, so
+        // walking and removing in one pass would skip rows.
+        let doomed = []
+        for (let i = 0; i < root.queue.count; ++i) {
+            const row = root.queue.get(i)
+            if (row.taskRelated)
+                doomed.push(row.token)
+        }
+        for (const t of doomed)
+            root.dismiss(t)
+    }
+
     signal posted(int token)
     signal removed(int token)
 
@@ -58,9 +86,17 @@ QtObject {
     //                auto-expires — the X is for getting rid of it early, not
     //                the only way out)
     //   onDismissed: function, called when the entry leaves for any reason
+    //   taskRelated: bool — this message duplicates a Tasks-popup row, so drop
+    //                it while that popup is open (default false)
     // }
     // Returns the entry's token (pass to dismiss()).
     function post(cfg) {
+        // Redundant with the surface the user is already looking at — see
+        // tasksPopupOpen. Returns 0, which no caller may pass to dismiss()
+        // (tokens start at 1), so a dropped post is a silent no-op.
+        if (cfg.taskRelated && root.tasksPopupOpen)
+            return 0
+
         const token = root._nextToken++
         const actions = cfg.actions || []
 
@@ -76,6 +112,10 @@ QtObject {
             text: cfg.text,
             kind: cfg.kind || "info",
             timeout: cfg.timeout === undefined ? root.defaultTimeout : cfg.timeout,
+            // Always written, never conditionally omitted: ListModel fixes its
+            // roles from the FIRST append, so a row that left this out would
+            // make the role undefined for the whole model.
+            taskRelated: cfg.taskRelated === true,
             actionLabels: actions.map(a => ({ label: a.label }))
         })
         root.posted(token)

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <QString>
+#include <QStringList>
 #include <QUrl>
 
 #include "Task.h"
@@ -55,3 +56,11 @@ private:
     QString m_embeddingModelId;
     double m_threshold;
 };
+
+// Records the two diarization model LABELS (resolved from their ids via
+// ModelManager) into the frontmatter lines — exposed so tst_task_diarize can
+// verify the wiring without the heavy decode+diarize path. Keys:
+// "segmentationModel", "embeddingModel".
+void applyDiarizationModelFrontmatter(QStringList *frontmatterLines,
+                                      const QString &segmentationModelId,
+                                      const QString &embeddingModelId);

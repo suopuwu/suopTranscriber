@@ -37,6 +37,13 @@ std::unique_ptr<Task> RenameFileTask::makeUndoTask() const
     return std::make_unique<RenameFileTask>(m_resultUrl, oldBaseName);
 }
 
+bool RenameFileTask::undoStillApplicable() const
+{
+    // The inverse renames m_resultUrl back; if it's no longer there (the file
+    // was moved/renamed again), the undo can't run.
+    return !m_resultUrl.isEmpty() && QFileInfo::exists(m_resultUrl.toLocalFile());
+}
+
 void RenameFileTask::run(TaskContext &ctx)
 {
     Q_UNUSED(ctx);

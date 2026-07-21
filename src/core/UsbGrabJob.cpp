@@ -219,6 +219,24 @@ QString canonicalOrCleaned(const QString &path)
     return canonical.isEmpty() ? QDir::cleanPath(info.absoluteFilePath()) : canonical;
 }
 
+// Where a source file would land in the destination vault under this rule's
+// preserveStructure. Shared by the pre-count pass (to size the progress bar by
+// only the files that will be copied) and the copy walk, so both resolve the
+// same subfolder a file's dedup checks run against.
+QString destDirFor(const QFileInfo &sourceInfo, const QString &scanRoot,
+                   const QString &destinationVaultPath, bool preserveStructure)
+{
+    QString relativeDir;
+    if (preserveStructure) {
+        const QString rel = QDir(scanRoot).relativeFilePath(sourceInfo.absolutePath());
+        if (rel != QStringLiteral("."))
+            relativeDir = rel;
+    }
+    return relativeDir.isEmpty()
+        ? destinationVaultPath
+        : destinationVaultPath + QLatin1Char('/') + relativeDir;
+}
+
 }
 
 QString usbGrabRefusalReason(const QString &scanRoot, const QString &destinationVaultPath)
@@ -278,17 +296,30 @@ UsbGrabScanResult runUsbGrabScan(const UsbGrabRule &rule, const QString &mountPa
     // Cheap despite being a whole extra pass: this reads no file CONTENT, only
     // directory entries — the same reason the quick-check itself is instant
     // where a content hash took ~25 minutes (see alreadyPresentAtDestination()).
-    // Sum candidate BYTES (not just count) for a byte-weighted denominator —
-    // see UsbGrabScanHooks::onProgress. Stat-only, no content read, same cheap
-    // extra pass as before.
+    // Sum only the candidate BYTES the grab will ACTUALLY copy — a file already
+    // in the vault (or whose combined output already exists) is skipped
+    // instantly and must NOT inflate the total, or the bar starts at the
+    // already-grabbed fraction (e.g. 80%) instead of 0. Uses the same stat-only
+    // dedup predicates the walk uses (against the index built above), so the
+    // count matches what the walk copies.
     qint64 totalBytes = 0;
+    int totalFiles = 0;
     if (hooks.onProgress) {
         QDirIterator countIt(scanRoot, QDir::Files, QDirIterator::Subdirectories);
         while (countIt.hasNext()) {
             const QFileInfo info(countIt.next());
-            if (extensionMatches(info, rule.extensionFilter) && filenameRegexMatches(info, filenameRe))
-                totalBytes += info.size();
+            if (!extensionMatches(info, rule.extensionFilter) || !filenameRegexMatches(info, filenameRe))
+                continue;
+            const QString destDir = destDirFor(info, scanRoot, destinationVaultPath, rule.preserveStructure);
+            const bool alreadyPresent =
+                alreadyPresentAtDestination(info, destFilesByBasename.value(info.fileName()));
+            if (alreadyPresent || alreadyCombinedAtDestination(info, destDir, combineRules))
+                continue;
+            totalBytes += info.size();
+            ++totalFiles;
         }
+        if (hooks.onTotalsKnown)
+            hooks.onTotalsKnown(totalFiles);
     }
 
     // Bytes fully accounted for so far (copied + skipped). onProgress reports
@@ -312,16 +343,10 @@ UsbGrabScanResult runUsbGrabScan(const UsbGrabRule &rule, const QString &mountPa
             // Where this file would land in the vault. Computed up front
             // because BOTH the already-combined check and the copy need it —
             // but mkpath() stays down in the copy branch, so a dry-run or a
-            // skipped file never creates the folder.
-            QString relativeDir;
-            if (rule.preserveStructure) {
-                const QString rel = QDir(scanRoot).relativeFilePath(sourceInfo.absolutePath());
-                if (rel != QStringLiteral("."))
-                    relativeDir = rel;
-            }
-            const QString destDir = relativeDir.isEmpty()
-                ? destinationVaultPath
-                : destinationVaultPath + QLatin1Char('/') + relativeDir;
+            // skipped file never creates the folder. Shared with the pre-count
+            // pass (destDirFor) so both resolve the same dedup subfolder.
+            const QString destDir =
+                destDirFor(sourceInfo, scanRoot, destinationVaultPath, rule.preserveStructure);
 
             const bool alreadyPresent = alreadyPresentAtDestination(
                 sourceInfo, destFilesByBasename.value(sourceInfo.fileName()));
@@ -332,12 +357,12 @@ UsbGrabScanResult runUsbGrabScan(const UsbGrabRule &rule, const QString &mountPa
 
             if (alreadyPresent || alreadyCombined) {
                 ++result.filesSkipped;
-                // Skipped instantly, but its bytes ARE "done" — advance the
-                // byte-weighted progress so a folder of mostly-already-grabbed
-                // files reflects real remaining work, not a jump to near-100%.
-                bytesAccounted += sourceInfo.size();
-                if (hooks.onProgress && totalBytes > 0)
-                    hooks.onProgress(bytesAccounted, totalBytes);
+                // A skipped file is NOT part of the grab's work: it's excluded
+                // from the byte denominator (pre-count pass above), so its bytes
+                // must not advance the numerator either — doing so pushed the bar
+                // to the already-grabbed fraction (~80% on a re-plugged device)
+                // the instant the skips were walked. It's instant regardless, so
+                // it needs no progress report of its own.
                 if (dryRun)
                     result.previewEntries.append(makePreviewEntry(QDir(scanRoot).relativeFilePath(sourcePath),
                                                                    QStringLiteral("duplicate")));

@@ -40,8 +40,32 @@ std::vector<Window> groupSegmentsIntoWindows(const std::vector<std::pair<double,
 // fallback happens, so the caller can record it honestly in frontmatter
 // (never a silent substitution, per CLAUDE.md's "Unrecognized model id"
 // precedent for ModelManager).
+//
+// speechSpansOut (silence-capture feature, phase 1): when non-null and the
+// real VAD pass actually ran (i.e. NOT one of the graceful-fallback early
+// returns above — those leave *speechSpansOut untouched), receives the raw
+// (t0, t1) speech spans VAD detected, BEFORE they're grouped into windows —
+// the same `segments` groupSegmentsIntoWindows() consumes. The caller derives
+// silence/noise spans from this via complementSpans() below; computeWindows()
+// itself stays ignorant of "silence" as a concept.
 std::vector<Window> computeWindows(const std::vector<float> &pcm16kMono, const QString &vadModelPath,
-                                    QString *vadErrorOut = nullptr, double targetWindowSeconds = 180.0,
-                                    double maxWindowSeconds = 300.0);
+                                    QString *vadErrorOut = nullptr,
+                                    std::vector<std::pair<double, double>> *speechSpansOut = nullptr,
+                                    double targetWindowSeconds = 180.0, double maxWindowSeconds = 300.0);
+
+// Pure complement of `speechSpans` over [0, totalSeconds] — the non-speech
+// (silence-and-noise, CLAUDE.md/the silence-phase-1 decision: VAD's
+// non-speech bucket covers both, no separate RMS pass) stretches a caller
+// records as the `silences:` frontmatter list. speechSpans need not be
+// sorted; this sorts + merges overlapping/touching spans defensively before
+// complementing, so a caller can feed either VadChunker::computeWindows()'s
+// raw speech spans OR a transcript's own segment (t0, t1) pairs (the
+// VAD-unavailable fallback — see TranscribeTask.cpp) without pre-cleaning.
+// Empty speechSpans -> the whole [0, totalSeconds] file is one silence span
+// (mirrors groupSegmentsIntoWindows()'s "no segments -> one whole-file
+// window" convention). A span outside [0, totalSeconds] is clamped; totally
+// out-of-range/degenerate spans are dropped.
+std::vector<std::pair<double, double>> complementSpans(const std::vector<std::pair<double, double>> &speechSpans,
+                                                         double totalSeconds);
 
 }

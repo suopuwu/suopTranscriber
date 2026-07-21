@@ -6,6 +6,7 @@
 #include "../ModelManager.h"
 #include "ChaptersTask.h"
 #include "CombineTask.h"
+#include "DetectSilenceTask.h"
 #include "DiarizeTask.h"
 #include "DownloadTask.h"
 #include "MergeSpeakersTask.h"
@@ -43,6 +44,8 @@ std::unique_ptr<Task> createTaskFromJson(const QString &kind, const QJsonObject 
                                     : obj.value(QStringLiteral("embeddingModelId")).toString();
         task = std::make_unique<DiarizeTask>(fileUrl, vaultUrl, segId, embedId,
                                               obj.value(QStringLiteral("diarizationThreshold")).toDouble(0.5));
+    } else if (kind == QStringLiteral("detectSilence")) {
+        task = std::make_unique<DetectSilenceTask>(fileUrl, vaultUrl);
     } else if (kind == QStringLiteral("rename")) {
         task = std::make_unique<RenameSpeakerTask>(fileUrl, obj.value(QStringLiteral("oldSpeakerName")).toString(),
                                                     obj.value(QStringLiteral("newSpeakerName")).toString());

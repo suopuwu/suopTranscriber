@@ -40,7 +40,15 @@ public:
             reportPaused(true);
             msleep100();
         }
-        reportPaused(false);
+        // Only report a real resume (paused->running). If we stopped blocking
+        // because a CANCEL arrived, do NOT emit paused(false): for a task that
+        // can't abort mid-pass (cancellableMidRun=false, e.g. diarization's
+        // ignored return here) the pass keeps running to its boundary, and a
+        // paused(false) edge would misreport that as "resumed". The controller
+        // shows the honest "Cancelling" state instead (generalized
+        // activeStopping), derived from the task's own capability.
+        if (!m_control.cancelRequested())
+            reportPaused(false);
         return m_control.cancelRequested();
     }
 

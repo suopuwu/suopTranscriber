@@ -32,6 +32,13 @@ std::unique_ptr<Task> FolderMoveTask::makeUndoTask() const
     return std::make_unique<FolderMoveTask>(m_resultUrl, originalParent, vaultUrl);
 }
 
+bool FolderMoveTask::undoStillApplicable() const
+{
+    // The inverse moves m_resultUrl back; if the folder is no longer there (it
+    // was moved/renamed again), the undo can't run.
+    return !m_resultUrl.isEmpty() && QFileInfo::exists(m_resultUrl.toLocalFile());
+}
+
 void FolderMoveTask::run(TaskContext &ctx)
 {
     Q_UNUSED(ctx);

@@ -15,6 +15,7 @@
 #include <QtTest>
 
 #include <QCoreApplication>
+#include <QDateTime>
 #include <QFile>
 #include <QFileInfo>
 #include <QSignalSpy>
@@ -65,6 +66,54 @@ struct GrabFixture {
         rule[QStringLiteral("enabled")] = enabled;
         rule[QStringLiteral("autoGrab")] = autoGrab;
         controller.saveRule(rule);
+    }
+
+    bool writeVaultFile(const QString &name, const QByteArray &content)
+    {
+        QFile f(vault.filePath(name));
+        if (!f.open(QIODevice::WriteOnly))
+            return false;
+        return f.write(content) == content.size();
+    }
+
+    // Back-date a file's mtime well past the combine stability window, so a
+    // group made of it counts as "ready" rather than "pending" (a recorder may
+    // still be writing the newest part). A grab preserves the source mtime, so
+    // an old device file lands old — modelling a recording captured a while ago.
+    static bool backdate(const QString &absPath)
+    {
+        QFile f(absPath);
+        if (!f.open(QIODevice::ReadWrite))
+            return false;
+        const bool ok = f.setFileTime(QDateTime::currentDateTime().addSecs(-3600),
+                                       QFileDevice::FileModificationTime);
+        f.close();
+        return ok;
+    }
+    bool backdateDeviceFile(const QString &name) { return backdate(device.filePath(name)); }
+    bool backdateVaultFile(const QString &name) { return backdate(vault.filePath(name)); }
+
+    // A combine rule grouping REC<n>.wav parts: the digits are the sort
+    // differentiator (group 1), so the grouping key is empty and every part
+    // lands in one group ordered 1,2,3…
+    static QVariantList recCombineRules()
+    {
+        QVariantMap rule;
+        rule[QStringLiteral("name")] = QStringLiteral("Rec");
+        rule[QStringLiteral("pattern")] = QStringLiteral("REC(\\d+)\\.wav");
+        rule[QStringLiteral("enabled")] = true;
+        rule[QStringLiteral("sortGroupIndex")] = 1;
+        return QVariantList{rule};
+    }
+
+    int combineJobCount() const
+    {
+        int count = 0;
+        for (const QVariant &jobVariant : transcription.jobs()) {
+            if (jobVariant.toMap().value(QStringLiteral("kind")).toString() == QStringLiteral("combine"))
+                ++count;
+        }
+        return count;
     }
 
     // Fake a newly-mounted volume. handleDeviceAdded is a private slot; moc
@@ -554,6 +603,104 @@ private slots:
         // The batch must still settle off the back of the OTHER grab finishing.
         QTRY_COMPARE_WITH_TIMEOUT(settledSpy.count(), 1, 10000);
         QCOMPARE(fx.pendingUsbGrabJobCount(), 0);
+    }
+
+    // ---- The auto-combine, now owned by the controller (Issue 1+2) ----
+
+    // A clean auto-grab that lands a complete split recording combines it: the
+    // controller runs the combine itself (moved out of Main.qml), rule-driven
+    // and 'ready'-gated, once the batch settles.
+    void autoCombine_cleanBatchCombinesReadySplitRecording()
+    {
+        GrabFixture fx;
+        QVERIFY(fx.writeDeviceFile(QStringLiteral("REC001.wav"), "aaaa"));
+        QVERIFY(fx.writeDeviceFile(QStringLiteral("REC002.wav"), "bbbb"));
+        QVERIFY(fx.backdateDeviceFile(QStringLiteral("REC001.wav")));
+        QVERIFY(fx.backdateDeviceFile(QStringLiteral("REC002.wav")));
+        fx.saveRule(QStringLiteral("DEV-A"), /*enabled=*/true, /*autoGrab=*/true);
+        fx.controller.setCombineRules(GrabFixture::recCombineRules());
+        fx.controller.setAutoCombineAfterGrab(true);
+
+        QSignalSpy settledSpy(&fx.controller, &UsbGrabberController::autoGrabsSettled);
+        QSignalSpy combineSpy(&fx.controller, &UsbGrabberController::autoCombineStarted);
+
+        fx.hotplug(QStringLiteral("DEV-A"));
+        QTRY_COMPARE_WITH_TIMEOUT(settledSpy.count(), 1, 10000);
+
+        // Both parts landed clean, so the ready group is combined: one group
+        // announced, one combine task enqueued.
+        QCOMPARE(combineSpy.count(), 1);
+        QCOMPARE(combineSpy.first().at(0).toInt(), 1);
+        QVERIFY(fx.combineJobCount() >= 1);
+    }
+
+    // The regression this whole change exists for: a DIRTY batch (here, a
+    // cancelled auto-grab) must NOT trigger the auto-combine, even when a ready
+    // split-recording group is sitting right there in the vault. The aborted
+    // grab means the on-disk part set can't be trusted as complete — combining
+    // it could merge a truncated recording, dropping its tail. The barrier still
+    // releases (a cancelled grab must never strand it); only the combine is held.
+    void autoCombine_dirtyBatchDoesNotCombineEvenWithAReadyGroupPresent()
+    {
+        GrabFixture fx;
+        // A ready split recording already sits in the vault (say, from an
+        // earlier grab), both parts past the stability window.
+        QVERIFY(fx.writeVaultFile(QStringLiteral("REC001.wav"), "aaaa"));
+        QVERIFY(fx.writeVaultFile(QStringLiteral("REC002.wav"), "bbbb"));
+        QVERIFY(fx.backdateVaultFile(QStringLiteral("REC001.wav")));
+        QVERIFY(fx.backdateVaultFile(QStringLiteral("REC002.wav")));
+
+        // The device has an unrelated in-flight file; its auto-grab is cancelled,
+        // which is what makes THIS batch dirty.
+        QVERIFY(fx.writeDeviceFile(QStringLiteral("misc.wav"), "cccc"));
+        fx.saveRule(QStringLiteral("DEV-A"), /*enabled=*/true, /*autoGrab=*/true);
+        fx.controller.setCombineRules(GrabFixture::recCombineRules());
+        fx.controller.setAutoCombineAfterGrab(true);
+
+        QSignalSpy settledSpy(&fx.controller, &UsbGrabberController::autoGrabsSettled);
+        QSignalSpy combineSpy(&fx.controller, &UsbGrabberController::autoCombineStarted);
+
+        fx.hotplug(QStringLiteral("DEV-A"));
+        // Deterministic (see cancelledGrab_* above): the cancel atomic is set
+        // after startJob()'s reset and before the worker's first abort check.
+        fx.transcription.cancelActive();
+
+        QTRY_COMPARE_WITH_TIMEOUT(settledSpy.count(), 1, 10000);
+
+        // Barrier released, but the ready group is left alone.
+        QCOMPARE(settledSpy.count(), 1);
+        QCOMPARE(combineSpy.count(), 0);
+        QCOMPARE(fx.combineJobCount(), 0);
+    }
+
+    // The gate must not be sticky: a dirty batch does not poison the NEXT batch.
+    // After the cancelled grab above, a fresh clean auto-grab of the same ready
+    // group combines normally.
+    void autoCombine_freshCleanBatchAfterADirtyOneStillCombines()
+    {
+        GrabFixture fx;
+        QVERIFY(fx.writeDeviceFile(QStringLiteral("REC001.wav"), "aaaa"));
+        QVERIFY(fx.writeDeviceFile(QStringLiteral("REC002.wav"), "bbbb"));
+        QVERIFY(fx.backdateDeviceFile(QStringLiteral("REC001.wav")));
+        QVERIFY(fx.backdateDeviceFile(QStringLiteral("REC002.wav")));
+        fx.saveRule(QStringLiteral("DEV-A"), /*enabled=*/true, /*autoGrab=*/true);
+        fx.controller.setCombineRules(GrabFixture::recCombineRules());
+        fx.controller.setAutoCombineAfterGrab(true);
+
+        QSignalSpy settledSpy(&fx.controller, &UsbGrabberController::autoGrabsSettled);
+        QSignalSpy combineSpy(&fx.controller, &UsbGrabberController::autoCombineStarted);
+
+        // First batch: cancelled → dirty → no combine.
+        fx.hotplug(QStringLiteral("DEV-A"));
+        fx.transcription.cancelActive();
+        QTRY_COMPARE_WITH_TIMEOUT(settledSpy.count(), 1, 10000);
+        QCOMPARE(combineSpy.count(), 0);
+
+        // Second batch: clean → the fresh batch resets the clean flag and the
+        // group (parts now on disk from the retry) combines.
+        fx.hotplug(QStringLiteral("DEV-A"));
+        QTRY_COMPARE_WITH_TIMEOUT(settledSpy.count(), 2, 10000);
+        QCOMPARE(combineSpy.count(), 1);
     }
 
     void history_noVaultOpen_returnsEmptyList()

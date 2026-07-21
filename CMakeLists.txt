@@ -211,7 +211,10 @@ qt_add_qml_module(suopTranscriber
         qml/HoverBorder.qml
         qml/CombineGroupOutline.qml
         qml/UnderlineField.qml
+        qml/TextRedoShortcut.qml
+        qml/FilterSuggestions.qml
         qml/UsbRegexField.qml
+        qml/UsbToggle.qml
         qml/AppIcon.qml
         qml/PlayGlyph.qml
         qml/PauseGlyph.qml
@@ -221,14 +224,19 @@ qt_add_qml_module(suopTranscriber
         qml/BottomBar.qml
         qml/SettingsPopup.qml
         qml/BenchmarkPage.qml
+        qml/UsbGrabberPage.qml
+        qml/RecorderPage.qml
         qml/ModelsPage.qml
         qml/ModelComboBox.qml
         qml/MiddleDragScroll.qml
+        qml/ScrollPage.qml
     RESOURCES
         ${SUOP_ICON_ASSETS}
     SOURCES
         src/core/IconTheme.h
         src/core/IconTheme.cpp
+        src/core/FocusBlurFilter.h
+        src/core/FocusBlurFilter.cpp
         src/core/Segment.h
         src/core/RollingAverage.h
         src/core/RegexValidation.h
@@ -277,6 +285,8 @@ qt_add_qml_module(suopTranscriber
         src/core/EngineRegistry.cpp
         src/core/VadChunker.h
         src/core/VadChunker.cpp
+        src/core/TranscribePipeline.h
+        src/core/TranscribePipeline.cpp
         src/core/LabelingEngine.h
         src/core/LabelingEngine.cpp
         src/core/DiarizationEngine.h
@@ -322,6 +332,8 @@ qt_add_qml_module(suopTranscriber
         src/core/tasks/FolderMoveTask.cpp
         src/core/tasks/CombineTask.h
         src/core/tasks/CombineTask.cpp
+        src/core/tasks/UncombineTask.h
+        src/core/tasks/UncombineTask.cpp
         src/core/tasks/ImportTask.h
         src/core/tasks/ImportTask.cpp
         src/core/tasks/UsbGrabTask.h
@@ -332,6 +344,8 @@ qt_add_qml_module(suopTranscriber
         src/core/tasks/ChaptersTask.cpp
         src/core/tasks/DiarizeTask.h
         src/core/tasks/DiarizeTask.cpp
+        src/core/tasks/DetectSilenceTask.h
+        src/core/tasks/DetectSilenceTask.cpp
         src/core/tasks/TranscribeTask.h
         src/core/tasks/TranscribeTask.cpp
         src/core/tasks/BenchmarkTask.h

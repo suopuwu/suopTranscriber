@@ -14,20 +14,35 @@ Rectangle {
     property TranscriptionController transcriptionController
     property VaultTreeModel vaultTreeModel
     property UsbGrabberController usbGrabberController
-    // Set true/false only by TitleBar's record toggle (see Main.qml's
-    // onRecordRequested) — gates the recorder page below and hides the
-    // normal per-file content while it's showing (see the two `visible:`
-    // bindings just above the recorder page block).
+    // Set true/false only via setTopLevelScreen() below — gates the recorder
+    // page below and hides the normal per-file content while it's showing (see
+    // the two `visible:` bindings just above the recorder page block).
     property bool recording: false
-    // Set true/false only by TitleBar's USB grabber toggle (see Main.qml's
-    // onUsbGrabberRequested) — gates the USB grabber page below, mirroring
-    // `recording` above. `recording` wins if both happen to be true (see
-    // usbGrabberPage's own `visible:` binding).
+    // Set true/false only via setTopLevelScreen() below — gates the USB
+    // grabber page below, mirroring `recording` above.
     property bool usbGrabberOpen: false
-    // Set true/false only by TitleBar's benchmark toggle (see Main.qml's
-    // onBenchmarkRequested) — gates the benchmark page below, mirroring
-    // usbGrabberOpen. recording/usbGrabber win if several are true.
+    // Set true/false only via setTopLevelScreen() below — gates the benchmark
+    // page below, mirroring usbGrabberOpen.
     property bool benchmarkOpen: false
+
+    // The ONE writer of the three top-level-screen flags above. Opening any
+    // screen closes every other one, so "two screens open at once" is not a
+    // representable state — pass "" to close them all. Nothing outside this
+    // function may assign recording/usbGrabberOpen/benchmarkOpen (guarded by
+    // tst_styleguide's topLevelScreenFlags_writtenOnlyBySetTopLevelScreen).
+    // Adding a fourth screen means one flag + one line here, not a new
+    // precedence chain in every consumer.
+    function setTopLevelScreen(name) {
+        mainPanel.recording = (name === "recorder")
+        mainPanel.usbGrabberOpen = (name === "usbGrabber")
+        mainPanel.benchmarkOpen = (name === "benchmark")
+    }
+
+    // True when any top-level screen is showing — the one expression consumers
+    // should read instead of re-deriving a three-flag chain.
+    readonly property bool topLevelScreenOpen: mainPanel.recording
+                                               || mainPanel.usbGrabberOpen
+                                               || mainPanel.benchmarkOpen
     // The frontmatter/metadata of the transcript currently open, whether it's
     // an audio file's sibling .md or a standalone orphaned .md — one store for
     // both modes (see currentMdUrl / refreshMetadata). hasMetadata is true the
@@ -56,6 +71,16 @@ Rectangle {
             : (mainPanel.player ? mainPanel.player.source.toString() : "")
     }
     readonly property string currentMdUrl: mainPanel.resolvedMdUrl()
+    // True from the moment a rename of the open file is fired — from this
+    // panel's fields OR from elsewhere (set in onPendingRenamesRevisionChanged
+    // when the controller's pending-rename store gains an entry for this file) —
+    // until its RenameFileTask result comes back on onFileRenamed. renameFile()
+    // is async (instant lane, second worker thread), so a field that both
+    // commits on Enter AND on blur would otherwise fire a SECOND rename against
+    // the already-moved old path before the first result repointed the panel —
+    // the second task then hits "File does not exist." Cleared in onFileRenamed
+    // (both ok and failure), which also resyncs the fields to on-disk truth.
+    property bool renameInFlight: false
     // True only for an audio-backed file — gates the genuinely audio-specific
     // chrome (playback/seek row, model + sensitivity pickers, add-chapter-at-
     // playhead). NOT the same question as "is this transcribed": an orphaned .md
@@ -134,7 +159,7 @@ Rectangle {
 
     // Sticky "keep the newest line in view while this file transcribes." A
     // persistent flag + a reaction to the flickable's own contentHeight (see
-    // the transcriptScrollView.contentItem Connections below) — NOT a
+    // the notePage.bodyScrollView.contentItem Connections below) — NOT a
     // per-body-change Qt.callLater, which silently stopped following the moment
     // one update added more than the near-bottom threshold (a multi-segment
     // whisper tick, or a whole Parakeet window burst): it measured "am I at the
@@ -166,7 +191,7 @@ Rectangle {
         if (!c)
             return []
         const urls = c.queuedFileUrls.map(u => u.toString())
-        if (c.busy && c.currentFile.toString() !== "")
+        if (c.busy && c.activeOccupiesFile && c.currentFile.toString() !== "")
             urls.push(c.currentFile.toString())
         return urls
     }
@@ -294,10 +319,24 @@ Rectangle {
         if (!titleField.activeFocus)
             titleField.text = mainPanel.displayTitle()
         // The filename subtitle is the same always-editable one-shot binding
-        // (text: currentFileStem()) — resync it here too, skipping while the
+        // (text: currentFileBase()) — resync it here too, skipping while the
         // user is typing into it, so a rename/file-switch refreshes it.
         if (!filenameSubtitle.activeFocus)
-            filenameSubtitle.text = mainPanel.currentFileStem()
+            filenameSubtitle.text = mainPanel.currentFileBase()
+    }
+
+    // Force-resync the two always-editable identity fields (title + filename
+    // subtitle) to on-disk truth, IGNORING focus — unlike refreshMetadata()
+    // above, which skips a focused field so it never fights in-progress typing.
+    // Call this ONLY when the open file's identity actually changed underneath
+    // the panel (a rename/move that landed, or the undo of one). Committing a
+    // rename from titleField leaves it focused (onAccepted doesn't blur) and the
+    // snackbar's Undo is a TapHandler that never takes focus — so without this
+    // the focus-gated resync never fires and the panel keeps showing the old
+    // typed name while the sidebar correctly reverts.
+    function resyncIdentityFields() {
+        titleField.text = mainPanel.displayTitle()
+        filenameSubtitle.text = mainPanel.currentFileBase()
     }
 
     // Item P23: split out of refreshMetadata() above — prelude/chapters live
@@ -494,12 +533,25 @@ Rectangle {
         return true
     }
 
+    // Opening a file always drops any open top-level screen (recorder / USB
+    // grabber / benchmark). The two show* funnels below are the ONE path every
+    // file-open takes — the sidebar's onFileActivated/onOrphanedMdActivated/
+    // onTranscriptMatchActivated and the bottom bar's onTaskActivated all land
+    // here — so clearing the flags here covers every way a file opens. Routes
+    // through setTopLevelScreen("") so there stays exactly ONE writer of the
+    // three flags (see setTopLevelScreen).
+    function exitTopLevelScreens() {
+        mainPanel.setTopLevelScreen("")
+    }
+
     function showAudioFile(path) {
+        mainPanel.exitTopLevelScreens()
         mainPanel.orphanedMdPath = ""
         mainPanel.player.source = "file://" + path
     }
 
     function showOrphanedMd(path) {
+        mainPanel.exitTopLevelScreens()
         mainPanel.player.source = ""
         mainPanel.orphanedMdPath = path
         // Setting orphanedMdPath fires onOrphanedMdPathChanged (which runs the
@@ -742,14 +794,18 @@ Rectangle {
         // show the typed name); on success we repoint the player (or the
         // orphaned-md path) to the real renamed file, on failure we revert.
         function onFileRenamed(oldUrl, newUrl, ok, error) {
+            mainPanel.renameInFlight = false
             const oldStr = oldUrl.toString()
             const isOpenAudio = mainPanel.player && mainPanel.player.source.toString() === oldStr
             const isOrphaned = mainPanel.orphanedMdPath !== ""
                 && ("file://" + mainPanel.orphanedMdPath) === oldStr
             if (!ok) {
-                Notifications.error(error)
-                if (isOpenAudio)
-                    filenameSubtitle.text = mainPanel.currentFileStem() // revert optimistic field
+                // Error snackbar is owned by Sidebar.onFileRenamed (fires for
+                // every rename, panel open or not) — reporting it here too gave
+                // the user TWO identical snackbars for one failure. Here we only
+                // revert this panel's optimistic fields to on-disk truth.
+                if (isOpenAudio || isOrphaned)
+                    mainPanel.resyncIdentityFields()
                 return
             }
             if (isOpenAudio)
@@ -758,23 +814,65 @@ Rectangle {
                 mainPanel.orphanedMdPath = newUrl.toString().replace("file://", "")
                 mainPanel.refreshMetadata()
             }
+            // AFTER the repoint above (source/orphanedMdPath are what
+            // displayTitle()/currentFileStem() read), and unconditionally on
+            // focus — see resyncIdentityFields(). This is what makes the
+            // snackbar's Undo land in the panel, not just in the sidebar.
+            if (isOpenAudio || isOrphaned)
+                mainPanel.resyncIdentityFields()
+        }
+        // Optimistic cross-panel rename: a rename fired from the SIDEBAR (or
+        // anywhere) for the file open here must show the new name AT ONCE, not
+        // wait for the DEFERRED fileRenamed. The controller's pending-rename
+        // store is the single source; this fires on every revision bump but only
+        // acts while a stem is actually pending — completion (empty store) is
+        // owned by onFileRenamed above, which repoints then resyncs. A rename
+        // fired from THIS panel already shows the typed name in its focused
+        // field, so the focus guard (as in refreshMetadata) skips it.
+        function onPendingRenamesRevisionChanged() {
+            const url = mainPanel.resolvedMdUrl()
+            if (url === "" || !mainPanel.transcriptionController)
+                return
+            const stem = mainPanel.transcriptionController.pendingRenameStem(url)
+            if (stem === "")
+                return // completion/failure resync is owned by onFileRenamed
+            mainPanel.renameInFlight = true
+            const oldBase = mainPanel.currentFileBase()
+            const dot = oldBase.lastIndexOf(".")
+            const ext = dot > 0 ? oldBase.substring(dot) : ""
+            if (!filenameSubtitle.activeFocus)
+                filenameSubtitle.text = stem + ext
+            const titleIsLabel = AppSettings.useLabelsMainPanel && !!mainPanel.metadata.label
+            if (!titleIsLabel && !titleField.activeFocus)
+                titleField.text = AppSettings.hideExtensionsMainPanel ? stem : (stem + ext)
         }
         // File move is an instant-lane task like rename (see Sidebar's
         // performRowMove/moveNoteTo). A move changes the file's FOLDER, not its
-        // name, so — unlike rename — there's no optimistic filename field to
-        // revert; we only repoint the player / orphaned-md path when the file
-        // that moved is the one currently open. Failure is surfaced by the
-        // Sidebar's own onFileMoved; nothing to do here.
+        // name, so there's no optimistic filename field to revert on failure —
+        // The title/subtitle now show only the base filename (see displayTitle/
+        // currentFileBase), so an in-vault move leaves them unchanged — the
+        // resync below is a harmless no-op kept for symmetry with the rename
+        // path. We only repoint the player / orphaned-md path when the file that
+        // moved is the one currently open. Failure is surfaced by the Sidebar's
+        // own onFileMoved; nothing to do here.
         function onFileMoved(oldUrl, newUrl, ok, error) {
             if (!ok)
                 return
             const oldStr = oldUrl.toString()
-            if (mainPanel.player && mainPanel.player.source.toString() === oldStr)
+            const isOpenAudio = mainPanel.player && mainPanel.player.source.toString() === oldStr
+            const isOrphaned = mainPanel.orphanedMdPath !== ""
+                && ("file://" + mainPanel.orphanedMdPath) === oldStr
+            if (isOpenAudio)
                 mainPanel.player.source = newUrl // fires onSourceChanged -> refreshMetadata
-            if (mainPanel.orphanedMdPath !== "" && ("file://" + mainPanel.orphanedMdPath) === oldStr) {
+            if (isOrphaned) {
                 mainPanel.orphanedMdPath = newUrl.toString().replace("file://", "")
                 mainPanel.refreshMetadata()
             }
+            // The title/subtitle show only the base filename now, so an in-vault
+            // move doesn't change them; resync stays as a harmless no-op that
+            // keeps the always-editable field bindings coherent after the move.
+            if (isOpenAudio || isOrphaned)
+                mainPanel.resyncIdentityFields()
         }
         function onSpeakerRenamed(fileUrl, oldName, ok, error) {
             if (fileUrl.toString() !== mainPanel.currentFileUrl().toString())
@@ -1066,6 +1164,15 @@ Rectangle {
     function deselectTextSelections() {
         transcriptArea.deselect()
         preludeArea.deselect()
+        // Clicking empty background also blurs the identity fields, committing
+        // any pending rename/label edit through their onActiveFocusChanged
+        // (a TapHandler on a sibling does NOT move focus off a TextField on its
+        // own). This is issue 1's "can't deselect by clicking empty space" and
+        // issue 3's "clicking outside the checkmark commits too".
+        if (titleField.activeFocus)
+            titleField.focus = false
+        if (filenameSubtitle.activeFocus)
+            filenameSubtitle.focus = false
         // Item 34: clicking a non-interactive region also commits+exits any
         // in-progress chapter-title edit — the active title's onEditingChanged
         // handler forces its own blur (→ commit) when this clears.
@@ -1080,8 +1187,12 @@ Rectangle {
             return qsTr("No file selected")
         if (AppSettings.useLabelsMainPanel && mainPanel.metadata.label)
             return mainPanel.metadata.label
+        // Only ever the base filename (+ extension), never containing folders —
+        // relativeToVault() gives the vault-relative path; take its last segment
+        // (mirrors currentFileStem()/currentFileBase()).
         const rel = mainPanel.relativeToVault(url)
-        return AppSettings.hideExtensionsMainPanel ? mainPanel.stripExtension(rel) : rel
+        const base = rel.substring(rel.lastIndexOf("/") + 1)
+        return AppSettings.hideExtensionsMainPanel ? mainPanel.stripExtension(base) : base
     }
 
     function commitRename(newValue) {
@@ -1100,23 +1211,48 @@ Rectangle {
         if (url === "")
             return
 
-        if (AppSettings.useLabelsMainPanel) {
+        // The title shows the AI label ONLY when labels mode is on AND this
+        // file actually has one (mirrors displayTitle()/filenameSubtitle.visible).
+        // In that case the field edits the label; otherwise the title IS the
+        // filename, so editing renames the file — a raw audio file (issue 1) or
+        // a transcribed file with no label yet (issue 2), never inventing a label.
+        if (AppSettings.useLabelsMainPanel && mainPanel.metadata.label) {
             const oldLabel = mainPanel.metadata.label || ""
             if (trimmed !== oldLabel)
                 mainPanel.pushUndo({type: "label", fileUrl: url, oldValue: oldLabel, newValue: trimmed})
             mainPanel.transcriptionController.setLabel(url, trimmed)
             mainPanel.refreshCurrentFileMetadata()
         } else {
+            // titleField shows the base filename WITH extension (see
+            // displayTitle), but renameFile() takes a STEM and re-appends the
+            // file's real extension — so strip the typed extension before
+            // renaming (a changed extension is ignored; the file keeps its own),
+            // and no-op when the stem is unchanged so merely focusing+blurring
+            // the title never fires a rename (unguarded that renames X.ext ->
+            // X.ext.ext). Mirrors filenameSubtitle's commitFilenameRename().
+            const newStem = mainPanel.stripExtension(trimmed)
+            if (newStem === "" || newStem === mainPanel.currentFileStem()) {
+                titleField.text = mainPanel.displayTitle()
+                return
+            }
             // Instant-lane rename task — onFileRenamed repoints the player (for
             // an audio file) or orphanedMdPath (for an orphaned .md) and
-            // refreshes on success.
-            mainPanel.transcriptionController.renameFile(url, trimmed)
+            // refreshes on success. Guard against a blur firing a second rename
+            // against the already-moved old path while the first is in flight
+            // (see renameInFlight).
+            if (mainPanel.renameInFlight) {
+                titleField.text = mainPanel.displayTitle()
+                return
+            }
+            mainPanel.renameInFlight = true
+            mainPanel.transcriptionController.renameFile(url, newStem)
         }
     }
 
     // The base filename stem (no directory, no extension) of the open file —
-    // what renameFile() takes as its new-name argument and what the editable
-    // filename subtitle shows/edits.
+    // what renameFile() takes as its new-name argument. The editable filename
+    // subtitle shows currentFileBase() (stem + extension) instead and strips
+    // the extension back off on commit (see commitFilenameRename).
     function currentFileStem() {
         // resolvedMdUrl() not currentMdUrl — refreshMetadata() resyncs the
         // filename subtitle from this at file-open time, where the property is
@@ -1129,6 +1265,17 @@ Rectangle {
         return mainPanel.stripExtension(base)
     }
 
+    // The base filename WITH extension (no directory) — what the filename
+    // subtitle displays, so it names the real on-disk file. renameFile() still
+    // takes a stem, so commitFilenameRename() strips the extension back off.
+    function currentFileBase() {
+        const url = mainPanel.resolvedMdUrl()
+        if (url === "")
+            return ""
+        const rel = mainPanel.relativeToVault(url)
+        return rel.substring(rel.lastIndexOf("/") + 1)
+    }
+
     // Item: the filename subtitle (shown when the title is an AI label) is an
     // editable rename control for the REAL file. renameFile() renames the
     // audio file AND its sibling .md together (or a standalone orphaned .md),
@@ -1139,19 +1286,23 @@ Rectangle {
     // file renames aren't on the undo stack (matches commitRename's file-rename
     // branch).
     function commitFilenameRename(newValue) {
-        const trimmed = newValue.trim()
+        // The field shows the full base name (stem + ext), but renameFile()
+        // takes a STEM and re-appends the real extension itself — so strip the
+        // extension the user typed back off before renaming (any changed
+        // extension is ignored; the file keeps its real one).
+        const newStem = mainPanel.stripExtension(newValue.trim())
         const oldStem = mainPanel.currentFileStem()
-        if (!mainPanel.transcriptionController || !mainPanel.vaultTreeModel
+        if (mainPanel.renameInFlight || !mainPanel.transcriptionController || !mainPanel.vaultTreeModel
                 || mainPanel.currentMdUrl === ""
-                || trimmed === "" || trimmed === oldStem) {
-            filenameSubtitle.text = oldStem
+                || newStem === "" || newStem === oldStem) {
+            filenameSubtitle.text = mainPanel.currentFileBase()
             return
         }
+        mainPanel.renameInFlight = true
         // Instant-lane rename task (see onFileRenamed above): the field is
-        // already optimistic (shows `trimmed`); the player/orphanedMdPath
-        // repoints on success and the field reverts on failure, both in
-        // onFileRenamed.
-        mainPanel.transcriptionController.renameFile(mainPanel.currentMdUrl, trimmed)
+        // already optimistic; the player/orphanedMdPath repoints on success and
+        // the field reverts on failure, both in onFileRenamed.
+        mainPanel.transcriptionController.renameFile(mainPanel.currentMdUrl, newStem)
     }
 
     // Autosaves the prelude editor below on blur (see preludeArea's
@@ -1196,7 +1347,7 @@ Rectangle {
         const oldValues = []
         for (let i = 0; i < entries.length; i++) {
             const entry = entries[i]
-            if (entry.isChapterHeading)
+            if (entry.isChapterHeading || entry.isSilenceMarker)
                 continue // blank reserved line — not editable content, see displayData
             // entry.text may carry a trailing " (Nx)" repeat-count marker
             // beyond entry.length (see displayData's doc comment) — derive
@@ -1491,10 +1642,51 @@ Rectangle {
             const headingStart = text.length
             list.push({idx: list.length, t0: displayT0, chapterT0: chapter.t0, speaker: "", text: "", start: headingStart, length: 0,
                        showGutter: false, isChapterHeading: true, chapterTitle: chapter.title,
-                       chapterManual: !!chapter.manual})
+                       chapterManual: !!chapter.manual,
+                       // Whether THIS chapter is collapsed (body sentences dropped
+                       // below). The C++ activeSentenceIndex reads this to decide
+                       // whether the playback highlight rests ON a collapsed
+                       // chapter's heading (its only visible line) or walks back
+                       // past an expanded chapter's lead-in heading. `collapsed`
+                       // here is the local collapse map captured at the top of
+                       // displayData; the key is the object literal's field name.
+                       collapsed: !!collapsed[String(chapter.t0)]})
             text += "\n"
             previousSpeaker = null // next real sentence's gutter shows fresh after a section break
         }
+
+        // Silence phase 3 (queue item 085): a THIRD kind of zero-length
+        // pseudo-entry, reserving its own blank document line exactly like
+        // pushHeading above — isSilenceMarker (not isChapterHeading) is what
+        // tells every downstream consumer (gutterTimestampModel,
+        // speakerDimModel, firstRealSentenceIndex, commitTranscriptEdits,
+        // and the C++ activeSentenceIndex walk-back) this is decoration, not
+        // spoken content. Deliberately does NOT reset previousSpeaker (unlike
+        // pushHeading) — a silence gap is not a section break, so the next
+        // sentence's speaker gutter should still collapse into the same turn
+        // when the speaker hasn't actually changed.
+        function pushSilenceMarker(span) {
+            const markerStart = text.length
+            list.push({idx: list.length, t0: span.t0, chapterT0: currentChapterT0, speaker: "", text: "",
+                       start: markerStart, length: 0, showGutter: false, isChapterHeading: false,
+                       isSilenceMarker: true, chapterTitle: "", chapterManual: false, collapsed: false,
+                       silenceSeconds: span.t1 - span.t0})
+            text += "\n"
+        }
+
+        // Cursor into mainPanel.silenceSpans (stored raw in phase 1, sorted
+        // by t0) — advanced monotonically alongside the sentence loop below,
+        // never rescanned. previousRealT0 is the t0 of the last VISIBLE real
+        // sentence pushed (null before the first one), so a span only earns
+        // a divider when it falls fully BETWEEN two rendered segments — per
+        // the locked decision, leading silence (before the first sentence)
+        // and trailing silence (after the last) never qualify, and neither
+        // does a span buried inside a collapsed chapter (previousRealT0 only
+        // advances past sentences that actually reach `list`, exactly
+        // mirroring the `collapsed` skip below).
+        const silenceSpans = mainPanel.silenceSpans
+        let silenceIdx = 0
+        let previousRealT0 = null
 
         for (const s of mainPanel.sentences) {
             // Skip blank/whitespace-only segments entirely — whisper can
@@ -1517,6 +1709,28 @@ Rectangle {
             // Repeaters, searchCorpus()) consistent.
             if (currentChapterT0 !== -1 && collapsed[String(currentChapterT0)])
                 continue
+
+            // Silence phase 3: any stored span(s) starting at/after the
+            // previous visible sentence and ending at/before THIS one sit
+            // fully in the gap between them — mark each that clears
+            // silenceMarkerMinSeconds (sub-threshold gaps are ordinary
+            // inter-sentence breathing room, not shown; see that property's
+            // own doc comment). Spans before previousRealT0 (already passed,
+            // or interior to a since-collapsed chapter) are skipped without
+            // marking so the cursor only ever moves forward.
+            if (previousRealT0 !== null) {
+                while (silenceIdx < silenceSpans.length && silenceSpans[silenceIdx].t0 < previousRealT0)
+                    silenceIdx++
+                while (silenceIdx < silenceSpans.length
+                       && silenceSpans[silenceIdx].t0 >= previousRealT0
+                       && silenceSpans[silenceIdx].t1 <= s.t0) {
+                    const span = silenceSpans[silenceIdx]
+                    if ((span.t1 - span.t0) >= mainPanel.silenceMarkerMinSeconds)
+                        pushSilenceMarker(span)
+                    silenceIdx++
+                }
+            }
+
             const start = text.length
             const speaker = s.speaker === "" ? "" : mainPanel.effectiveSpeakerName(s.speaker)
             const showGutter = (speaker === "") || (previousSpeaker === null) || (speaker !== previousSpeaker)
@@ -1532,6 +1746,7 @@ Rectangle {
                        showGutter: showGutter, isChapterHeading: false, chapterTitle: "",
                        chapterT0: currentChapterT0, chapterManual: false})
             previousSpeaker = speaker
+            previousRealT0 = s.t0
             text += displayText + "\n"
         }
         // Any chapter at/after the last real sentence (e.g. a trailing
@@ -1582,10 +1797,13 @@ Rectangle {
     // expression the corresponding delegate used to carry.
     // Item: timestamps display on EVERY sentence line (one per segment), while
     // speaker names stay one-per-turn (only when the speaker changes). So the
-    // timestamp gutter takes every non-heading sentence; the speaker gutter
-    // keeps the showGutter (turn-boundary) gate.
+    // timestamp gutter takes every non-heading, non-silence-marker sentence
+    // (silence phase 3's divider is decoration too, same as a heading — see
+    // pushSilenceMarker's doc comment); the speaker gutter keeps the
+    // showGutter (turn-boundary) gate, which a silence marker already fails
+    // on its own (showGutter: false), so it needs no explicit exclusion here.
     readonly property var gutterTimestampModel:
-        mainPanel.displaySentences.filter(s => !s.isChapterHeading)
+        mainPanel.displaySentences.filter(s => !s.isChapterHeading && !s.isSilenceMarker)
     readonly property var gutterSpeakerModel:
         mainPanel.displaySentences.filter(s => s.showGutter && s.speaker !== "")
     // Recomputes when the user toggles a speaker filter (empty model while no
@@ -1593,9 +1811,14 @@ Rectangle {
     readonly property var speakerDimModel:
         mainPanel.gutterSpeakerFilter === "" ? []
             : mainPanel.displaySentences.filter(
-                s => !s.isChapterHeading && s.speaker !== mainPanel.gutterSpeakerFilter)
+                s => !s.isChapterHeading && !s.isSilenceMarker && s.speaker !== mainPanel.gutterSpeakerFilter)
     readonly property var chapterHeadingModel:
         mainPanel.displaySentences.filter(s => s.isChapterHeading)
+    // Silence phase 3 (queue item 085): one entry per divider reserved by
+    // pushSilenceMarker above, keyed off the same idx the timestamp/speaker
+    // gutters use (see silenceMarkerRepeater below the chapter-heading one).
+    readonly property var silenceMarkerModel:
+        mainPanel.displaySentences.filter(s => s.isSilenceMarker)
     // transcriptArea is always-editable (see its doc comment) — its
     // `text: mainPanel.displayText` binding is a one-shot, severed the
     // moment the user types (same caveat as titleField/preludeArea above).
@@ -1655,12 +1878,29 @@ Rectangle {
         font.bold: true
     }
 
-    // Compact gutter timestamp: only the start time (no range), leading
-    // zero-valued units (hours, then minutes) dropped entirely rather than
-    // shown as "0:"/"00:", and fractional-second precision governed by
-    // AppSettings.timestampDecimalPlaces (0 by default — display-only, the
-    // stored data always keeps full precision, see formatTimestamp() in
-    // TranscriptionController.cpp).
+    // Largest displayed segment start in the open file — governs how far the
+    // gutter timestamps below are zero-padded so every row aligns to one
+    // column width (see formatGutterTimestamp). Every chapter t0 is also a
+    // segment boundary, so displaySentences alone bounds the max the gutter
+    // ever shows.
+    readonly property real gutterMaxT0: {
+        let maxT0 = 0
+        for (const s of mainPanel.displaySentences)
+            maxT0 = Math.max(maxT0, s.t0)
+        return maxT0
+    }
+
+    // Compact gutter timestamp: only the start time (no range), zero-padded to
+    // fit the file's LARGEST timestamp (gutterMaxT0) so the column reads as an
+    // aligned ruler — the leading unit is widened to the digit-count of that
+    // unit in the max, lower units always two digits. A file that runs into
+    // hours renders every row as H..:MM:SS (a 3s row -> "0:00:03", or
+    // "00:00:03" past 9h); one that only reaches minutes as M..:SS ("00:03" /
+    // "0:03"); a sub-minute file as bare seconds. Fractional-second precision
+    // is governed by AppSettings.timestampDecimalPlaces (0 by default —
+    // display-only; the stored data always keeps full precision, and trims
+    // BOTH leading and trailing zeros, see formatTimestamp() in
+    // TranscriptionController.cpp — do not conflate the two).
     function formatGutterTimestamp(t0) {
         const decimals = AppSettings.timestampDecimalPlaces
         const scale = Math.pow(10, decimals)
@@ -1671,11 +1911,33 @@ Rectangle {
         const h = Math.floor(wholeSeconds / 3600)
         const m = Math.floor((wholeSeconds % 3600) / 60)
         const s = wholeSeconds % 60
-        if (h > 0)
-            return h + ":" + String(m).padStart(2, "0") + ":" + String(s).padStart(2, "0") + fracPart
-        if (m > 0)
-            return m + ":" + String(s).padStart(2, "0") + fracPart
-        return s + fracPart
+
+        // Padding tier + leading-unit width come from the file's max start.
+        const maxWhole = Math.floor(mainPanel.gutterMaxT0)
+        const maxH = Math.floor(maxWhole / 3600)
+        const maxM = Math.floor((maxWhole % 3600) / 60)
+        if (maxH > 0) {
+            const hStr = String(h).padStart(String(maxH).length, "0")
+            return hStr + ":" + String(m).padStart(2, "0") + ":" + String(s).padStart(2, "0") + fracPart
+        }
+        if (maxM > 0) {
+            const mStr = String(m).padStart(String(maxM).length, "0")
+            return mStr + ":" + String(s).padStart(2, "0") + fracPart
+        }
+        return String(s).padStart(String(maxWhole).length, "0") + fracPart
+    }
+
+    // Index of the first REAL (spoken) sentence in displaySentences, skipping
+    // any chapter heading(s) that open the transcript; -1 when there are no
+    // spoken sentences at all (only headings, or an empty transcript). The
+    // playback highlight's front-edge clamp uses this so a leading chapter
+    // heading never gets lit.
+    readonly property int firstRealSentenceIndex: {
+        const list = mainPanel.displaySentences
+        for (let i = 0; i < list.length; ++i)
+            if (!list[i].isChapterHeading && !list[i].isSilenceMarker)
+                return i
+        return -1
     }
 
     // player.position is milliseconds; segment timestamps are seconds.
@@ -1691,8 +1953,102 @@ Rectangle {
         // active one.
         if (!mainPanel.transcriptionController || mainPanel.displaySentences.length === 0)
             return -1
-        const positionSeconds = (mainPanel.player ? mainPanel.player.position : 0) / 1000.0
-        return mainPanel.transcriptionController.activeSentenceIndex(mainPanel.displaySentences, positionSeconds)
+        // The highlight tracks the audio playhead, so it only means anything
+        // when there's audio. An orphaned .md has no player.source; gating on
+        // hasAudio (not just reading a leftover player.position of 0) stops the
+        // top sentence from being spuriously highlighted for any transcript
+        // whose first segment starts at t0=0 (i.e. essentially all of them).
+        if (!mainPanel.hasAudio)
+            return -1
+        const positionSeconds = mainPanel.player.position / 1000.0
+        const idx = mainPanel.transcriptionController.activeSentenceIndex(mainPanel.displaySentences, positionSeconds)
+        // Keep exactly one sentence highlighted the whole time audio is loaded:
+        // the C++ binary search returns -1 before playback reaches the first
+        // real segment's t0, so clamp up to the first REAL sentence. Clamping to
+        // index 0 would be wrong when a chapter heading opens the transcript
+        // (displaySentences[0] is then a zero-length heading pseudo-entry and
+        // the highlight would paint a stray sliver over its title), so skip past
+        // any leading heading(s) via firstRealSentenceIndex. This extends the
+        // already-sticky-through-gaps / sticky-past-the-end behavior to the
+        // front edge, so the highlight never blanks out mid-file either.
+        return idx >= 0 ? idx : mainPanel.firstRealSentenceIndex
+    }
+
+    // The active sentence just advanced (or a new file's first sentence lit
+    // up) — re-pin it to the top if follow mode is on and audio is playing.
+    // Reading activeSentenceRect inside scrollActiveSentenceToTop forces its
+    // recompute against THIS new index, so there's no stale-rect race.
+    onActiveSentenceIndexChanged: mainPanel.scrollActiveSentenceToTop()
+
+    // Silence phase 2: the open file's stored `silences:` spans (phase 1),
+    // parsed once per metadata load via TranscriptionController.parseSilences
+    // — a pure read of the ALREADY-STORED raw VAD spans, never a
+    // re-analysis. Feeds the auto-skip Connections below (and, phase 3, the
+    // visual marking layer). metadata.silences is falsy for both "key
+    // missing" (VAD never ran) and "key present but empty" (VAD ran, found
+    // nothing) — parseSilences only needs to run when there's actually a
+    // non-empty raw value to parse.
+    readonly property var silenceSpans: (mainPanel.transcriptionController && mainPanel.metadata.silences)
+        ? mainPanel.transcriptionController.parseSilences(mainPanel.metadata.silences)
+        : []
+
+    // Silence phase 3 (queue item 085): minimum span length worth a VISUAL
+    // between-segment divider. Deliberately separate from
+    // AppSettings.skipSilenceThresholdSeconds — that one governs PLAYBACK
+    // SKIPPING (phase 2) and is user-configurable down to sub-second values
+    // via its slider. Marking is purely cosmetic: every ordinary
+    // inter-sentence breathing gap would earn its own "··· Ns silence ···"
+    // line if this were 0, which is noise, not signal — so it's a fixed
+    // constant, not a setting. See StyleGuide.md "Transcript silence
+    // divider" for the locked value and rationale.
+    readonly property real silenceMarkerMinSeconds: 5
+
+    // StyleGuide.md "Transcript silence divider": U+00B7 MIDDLE DOT x3 either
+    // side of a compact duration label, e.g. "··· 34s silence ···". One
+    // function keeps the glyphs/spacing/wording in a SINGLE place rather
+    // than string-building them ad hoc at the (one) call site.
+    function formatSilenceMarkerText(seconds) {
+        const rounded = Math.max(1, Math.round(seconds))
+        const minutes = Math.floor(rounded / 60)
+        const secs = rounded % 60
+        const durationLabel = minutes > 0
+            ? (secs > 0 ? qsTr("%1m %2s").arg(minutes).arg(secs) : qsTr("%1m").arg(minutes))
+            : qsTr("%1s").arg(secs)
+        return qsTr("··· %1 silence ···").arg(durationLabel)
+    }
+
+    // Skip-silence (silence phase 2, AppSettings.skipSilenceEnabled): while
+    // playing, the instant the head enters a STORED silence span whose
+    // length is >= AppSettings.skipSilenceThresholdSeconds, jump straight to
+    // that span's end — via the same player.position assignment every other
+    // seek in this file uses (chapter ticks, the slider), so it drives
+    // activeSentenceIndex/scrollActiveSentenceToTop exactly like a manual
+    // seek and never fights follow-scroll with bespoke scroll code (see
+    // memory feedback_livescroll_followtail_contentheight_trap for why a
+    // second hand-rolled scroll path is a trap here). nextSilenceSkipTarget()
+    // is a PURE lookup over the already-parsed silenceSpans above — changing
+    // the threshold alone changes what counts as skip-worthy, it never
+    // re-runs VAD or any other task (the whole point of storing raw spans in
+    // phase 1). A dedicated Connections on player.positionChanged (rather
+    // than folding this into the activeSentenceIndex binding above) keeps a
+    // real seek side effect out of a property binding, and fires at full
+    // position-tick granularity rather than only on sentence-boundary
+    // changes.
+    Connections {
+        target: mainPanel.player
+        function onPositionChanged() {
+            if (!AppSettings.skipSilenceEnabled)
+                return
+            if (!mainPanel.player || !mainPanel.player.playing)
+                return
+            if (!mainPanel.transcriptionController)
+                return
+            const positionSeconds = mainPanel.player.position / 1000.0
+            const skipTo = mainPanel.transcriptionController.nextSilenceSkipTarget(
+                mainPanel.silenceSpans, positionSeconds, AppSettings.skipSilenceThresholdSeconds)
+            if (skipTo >= 0)
+                mainPanel.player.position = skipTo * 1000
+        }
     }
 
     // Sentence highlight is a real overlay Rectangle (see
@@ -1737,6 +2093,17 @@ Rectangle {
         if (idx < 0 || idx >= list.length)
             return Qt.rect(0, 0, 0, 0)
         const active = list[idx]
+        if (active.isChapterHeading) {
+            // A collapsed chapter's heading holds the playback highlight
+            // directly (its body sentences are hidden — there is no spoken line
+            // to light; see activeSentenceIndex in TranscriptionController.cpp).
+            // Paint the WHOLE heading row, matching chapterHeadingRow's own
+            // geometry (gutterLineRects[idx], full transcript width), rather
+            // than the zero-width sliver active.start/length would give over the
+            // blank reserved line.
+            const rowRect = transcriptArea.gutterLineRects[idx] || Qt.rect(0, 0, 0, 0)
+            return Qt.rect(0, rowRect.y, transcriptArea.width, rowRect.height)
+        }
         const startRect = mainPanel.safePositionToRectangle(active.start)
         const endRect = mainPanel.safePositionToRectangle(active.start + active.length)
         // Sentences that wrap across multiple visual lines only get an
@@ -1893,9 +2260,10 @@ Rectangle {
     // a focused, editable control. searchMatchRect (computed above from the
     // same searchMatchStart/Length this function just set) gives the
     // match's rect in transcriptArea's own local coordinates; mapping that
-    // into transcriptScrollView's Flickable frame (same contentItem used by
-    // the live-transcription auto-scroll in onTranscriptBodyChanged, and by
-    // middleDragScrollArea) gives its on-screen position relative to the
+    // into the transcript viewport's Flickable frame (notePage.bodyScrollView.
+    // contentItem — the same one used by the live-transcription auto-scroll in
+    // onTranscriptBodyChanged and by ScrollPage's built-in middle-drag) gives
+    // its on-screen position relative to the
     // current viewport, which is then minimally clamped into view — no
     // centering, just enough scroll to reveal it, same as a browser's
     // "scroll into view".
@@ -1903,13 +2271,45 @@ Rectangle {
         const rect = mainPanel.searchMatchRect
         if (rect.width === 0 && rect.height === 0)
             return
-        const flick = transcriptScrollView.contentItem
+        const flick = notePage.bodyScrollView.contentItem
         const viewportPos = transcriptArea.mapToItem(flick, rect.x, rect.y)
         const maxContentY = Math.max(0, flick.contentHeight - flick.height)
         if (viewportPos.y < 0)
             flick.contentY = Math.max(0, flick.contentY + viewportPos.y)
         else if (viewportPos.y + rect.height > flick.height)
             flick.contentY = Math.min(maxContentY, flick.contentY + (viewportPos.y + rect.height - flick.height))
+    }
+
+    // Auto-scroll: while audio plays and follow mode is on
+    // (AppSettings.followPlaybackScroll — the toggle beside the play button),
+    // keep the active sentence pinned near the top of the transcript viewport.
+    // Called on every activeSentenceIndex change (i.e. each sentence boundary),
+    // when playback starts, and when follow mode is toggled back on.
+    //
+    // Mirrors scrollMatchIntoView's offset-safe mapping — activeSentenceRect is
+    // in transcriptArea-local coords, which sit at a variable offset below the
+    // Flickable origin (tags row, prelude, speaker rows, etc. above it), so map
+    // through mapToItem rather than adding contentY to rect.y — but targets the
+    // TOP edge instead of a minimal scroll-into-view.
+    function scrollActiveSentenceToTop() {
+        if (!AppSettings.followPlaybackScroll)
+            return
+        // Only chase the playhead while it's actually moving; a paused user is
+        // free to scroll away and read elsewhere without being yanked back.
+        if (!mainPanel.player || !mainPanel.player.playing)
+            return
+        if (mainPanel.activeSentenceIndex < 0)
+            return
+        const rect = mainPanel.activeSentenceRect
+        if (rect.width === 0 && rect.height === 0)
+            return
+        const flick = notePage.bodyScrollView.contentItem
+        const viewportPos = transcriptArea.mapToItem(flick, rect.x, rect.y)
+        const maxContentY = Math.max(0, flick.contentHeight - flick.height)
+        // A little breathing room above the pinned sentence rather than jamming
+        // it flush against the very top edge.
+        const topMargin = 12
+        flick.contentY = Math.max(0, Math.min(maxContentY, flick.contentY + viewportPos.y - topMargin))
     }
 
     function jumpToNextMatch() {
@@ -2036,6 +2436,12 @@ Rectangle {
         function onSourceChanged() {
             mainPanel.refreshMetadata()
             mainPanel.resetForFileOpen()
+        }
+        // Pressing play snaps the current sentence to the top immediately,
+        // rather than waiting for the next sentence boundary to advance.
+        // (No-ops on pause: scrollActiveSentenceToTop bails when !playing.)
+        function onPlayingChanged() {
+            mainPanel.scrollActiveSentenceToTop()
         }
     }
     // showOrphanedMd() switches files by setting orphanedMdPath directly
@@ -2223,7 +2629,7 @@ Rectangle {
         mainPanel.transcriptWasEmpty = mainPanel.transcriptBody === ""
         // Scroll-follow no longer lives here — reacting to transcriptBody meant
         // measuring against a contentHeight that had already grown (see the
-        // transcriptScrollView.contentItem Connections below, which reacts to
+        // notePage.bodyScrollView.contentItem Connections below, which reacts to
         // contentHeight itself and so never races the layout).
     }
 
@@ -2239,9 +2645,9 @@ Rectangle {
     // the fold. Gated on followingTail so ordinary browsing, a file open, or a
     // window resize never yanks the view to the bottom.
     Connections {
-        target: transcriptScrollView.contentItem
+        target: notePage.bodyScrollView.contentItem
         function onContentHeightChanged() {
-            const flick = transcriptScrollView.contentItem
+            const flick = notePage.bodyScrollView.contentItem
             const nearBottomThreshold = 40
             const prevBottom = Math.max(0, mainPanel.lastFollowContentHeight - flick.height)
             const wasAtBottom = flick.contentY >= prevBottom - nearBottomThreshold
@@ -2299,7 +2705,7 @@ Rectangle {
     // under the pointer consumes the press — a deeper handler always wins
     // Qt Quick's pointer hit-testing, so clicking INTO a field (its own
     // press grab), a timestamp/seek TapHandler, a button, or middle-drag
-    // panning (middleDragScrollArea's MiddleButton TapHandler) all still
+    // panning (ScrollPage's built-in MiddleDragScroll TapHandler) all still
     // work untouched. Deliberately a TapHandler, NOT a MouseArea: an
     // Item-attached handler carries no implicit cursor, so unlike a
     // MouseArea it can span the whole panel without poisoning the
@@ -2322,8 +2728,7 @@ Rectangle {
 
     Item {
         anchors.fill: parent
-        visible: mainPanel.vaultPath.toString() === "" && !mainPanel.recording && !mainPanel.usbGrabberOpen
-                 && !mainPanel.benchmarkOpen
+        visible: mainPanel.vaultPath.toString() === "" && !mainPanel.topLevelScreenOpen
 
         Button {
             id: openVaultButton
@@ -2348,12 +2753,21 @@ Rectangle {
         }
     }
 
-    ColumnLayout {
+    ScrollPage {
+        id: notePage
         anchors.fill: parent
-        anchors.margins: 16
-        spacing: 12
-        visible: mainPanel.vaultPath.toString() !== "" && !mainPanel.recording && !mainPanel.usbGrabberOpen
-                 && !mainPanel.benchmarkOpen
+        visible: mainPanel.vaultPath.toString() !== "" && !mainPanel.topLevelScreenOpen
+        // Preserve the "transcriptScrollView" objectName the QQuickView/offscreen
+        // harnesses look the inner ScrollView up by — ScrollPage owns the
+        // ScrollView now, so pass the name through its bodyObjectName alias.
+        bodyObjectName: "transcriptScrollView"
+
+        // Sticky header — the three fixed rows above the scrolling transcript
+        // (playback progress, title/regen/search, find/replace). They live in
+        // ScrollPage's header slot so they stay put while the transcript scrolls
+        // under them; ScrollPage's built-in middle-drag + edge-gutter scrollbar
+        // replace the old hand-rolled transcriptViewportContainer chrome.
+        header: [
 
         // Item 13: playback progress bar relocated to the very top, full
         // width, with a play/pause icon instead of a separate Play button.
@@ -2401,6 +2815,178 @@ Rectangle {
                     name: (mainPanel.player && mainPanel.player.playing) ? "pause" : "play"
                     iconSize: 14
                     color: playPauseButton.enabled ? "white" : "#666666"
+                }
+            }
+
+            // Auto-scroll toggle: when on (the default), the transcript follows
+            // playback, pinning the active sentence near the top of the view
+            // (scrollActiveSentenceToTop). A per-vault preference so someone who
+            // prefers to scroll manually isn't fought by the viewport every
+            // sentence. Lives in the playback row (visible: hasAudio), so it
+            // only shows when there's audio to follow.
+            Item {
+                id: followPlaybackButton
+                Layout.preferredWidth: 28
+                Layout.preferredHeight: 28
+
+                ToolTip.visible: followPlaybackHover.hovered
+                ToolTip.text: AppSettings.followPlaybackScroll
+                    ? qsTr("Auto-scroll on — transcript follows playback")
+                    : qsTr("Auto-scroll off — scroll manually")
+                ToolTip.delay: 500
+
+                HoverHandler {
+                    id: followPlaybackHover
+                    cursorShape: Qt.PointingHandCursor
+                }
+                TapHandler {
+                    onTapped: {
+                        AppSettings.followPlaybackScroll = !AppSettings.followPlaybackScroll
+                        // Snap to the current sentence the instant it's turned
+                        // back on, rather than waiting for the next boundary.
+                        if (AppSettings.followPlaybackScroll)
+                            mainPanel.scrollActiveSentenceToTop()
+                    }
+                }
+                Rectangle {
+                    anchors.fill: parent
+                    radius: AppSettings.borderRadius
+                    color: followPlaybackHover.hovered ? "#3a3a3a" : "#2a2a2a"
+                }
+                HoverBorder {
+                    anchors.fill: parent
+                    active: followPlaybackHover.hovered
+                }
+                AppIcon {
+                    anchors.centerIn: parent
+                    name: "follow-playback"
+                    iconSize: 14
+                    // Lit when following, dimmed when off — same on/off palette
+                    // as the play button's enabled/disabled icon.
+                    color: AppSettings.followPlaybackScroll ? "white" : "#666666"
+                }
+            }
+
+            // Skip-silence toggle (silence phase 2, queue item 084): mirrors
+            // followPlaybackButton immediately above — same 28x28 box,
+            // hover/tap idiom, background/border treatment — just gating a
+            // different playback behavior (auto-seek past long stored
+            // silence spans, see the Connections on player.positionChanged
+            // above) instead of auto-scroll. Lives in the same playback row
+            // (visible: hasAudio) for the same reason: it only means
+            // anything when there's audio and stored silence spans to skip.
+            Item {
+                id: skipSilenceButton
+                Layout.preferredWidth: 28
+                Layout.preferredHeight: 28
+
+                ToolTip.visible: skipSilenceHover.hovered
+                ToolTip.text: AppSettings.skipSilenceEnabled
+                    ? qsTr("Skip silence on — jumps past stored gaps ≥ %1s").arg(AppSettings.skipSilenceThresholdSeconds)
+                    : qsTr("Skip silence off")
+                ToolTip.delay: 500
+
+                HoverHandler {
+                    id: skipSilenceHover
+                    cursorShape: Qt.PointingHandCursor
+                }
+                TapHandler {
+                    onTapped: AppSettings.skipSilenceEnabled = !AppSettings.skipSilenceEnabled
+                }
+                Rectangle {
+                    anchors.fill: parent
+                    radius: AppSettings.borderRadius
+                    color: skipSilenceHover.hovered ? "#3a3a3a" : "#2a2a2a"
+                }
+                HoverBorder {
+                    anchors.fill: parent
+                    active: skipSilenceHover.hovered
+                }
+                AppIcon {
+                    anchors.centerIn: parent
+                    name: "skip-silence"
+                    iconSize: 14
+                    color: AppSettings.skipSilenceEnabled ? "white" : "#666666"
+                }
+            }
+
+            // Threshold (seconds) — only worth showing once skip-silence is
+            // actually on. A compact inline version of the SettingsPopup
+            // numeric-setting idiom (e.g. rimWidth's Slider + validated
+            // TextField): StyleGuide.md "Text fields" requires every
+            // TextField use the UnderlineField background, never a bare one.
+            // Vault-scoped like every other AppSettings value — edits here
+            // persist the same debounced-save way rimWidth's does.
+            RowLayout {
+                id: skipSilenceThresholdRow
+                visible: AppSettings.skipSilenceEnabled
+                spacing: 4
+
+                Slider {
+                    id: skipSilenceThresholdSlider
+                    Layout.preferredWidth: 60
+                    from: 0.5
+                    to: 10
+                    stepSize: 0.5
+                    hoverEnabled: true
+                    value: AppSettings.skipSilenceThresholdSeconds
+                    onMoved: AppSettings.skipSilenceThresholdSeconds = value
+
+                    HoverHandler {
+                        cursorShape: Qt.PointingHandCursor
+                    }
+                    HoverBorder {
+                        anchors.fill: parent
+                        active: skipSilenceThresholdSlider.hovered
+                    }
+                }
+                TextField {
+                    id: skipSilenceThresholdField
+                    Layout.preferredWidth: 40
+                    horizontalAlignment: TextInput.AlignRight
+                    hoverEnabled: true
+                    validator: DoubleValidator {
+                        bottom: skipSilenceThresholdSlider.from
+                        top: skipSilenceThresholdSlider.to
+                        decimals: 1
+                    }
+                    onEditingFinished: {
+                        const v = parseFloat(text)
+                        if (!isNaN(v)) {
+                            AppSettings.skipSilenceThresholdSeconds = Math.max(
+                                skipSilenceThresholdSlider.from,
+                                Math.min(skipSilenceThresholdSlider.to, v))
+                        }
+                        text = AppSettings.skipSilenceThresholdSeconds.toFixed(1)
+                    }
+
+                    background: UnderlineField { focused: skipSilenceThresholdField.activeFocus }
+
+                    Binding {
+                        target: skipSilenceThresholdField
+                        property: "text"
+                        value: AppSettings.skipSilenceThresholdSeconds.toFixed(1)
+                        when: !skipSilenceThresholdField.activeFocus
+                    }
+
+                    // Item 13 (StyleGuide "Cursor affordances"): an editable
+                    // text control gets the I-beam, not a pointing hand — the
+                    // rimWidthField sibling in SettingsPopup.qml uses a
+                    // pointing hand instead, but this file's own guard
+                    // (mainPanel_editableTextControlsHaveIBeamCursor) requires
+                    // IBeam for every TextField declared here.
+                    HoverHandler {
+                        cursorShape: Qt.IBeamCursor
+                    }
+                    HoverBorder {
+                        anchors.fill: parent
+                        active: skipSilenceThresholdField.hovered
+                    }
+                }
+                Label {
+                    text: qsTr("s")
+                    color: "#aaaaaa"
+                    font.pixelSize: 11
                 }
             }
 
@@ -2511,7 +3097,7 @@ Rectangle {
                     }
                 }
             }
-        }
+        },
 
         RowLayout {
             Layout.fillWidth: true
@@ -2521,6 +3107,14 @@ Rectangle {
             Item {
                 id: titleContainer
                 Layout.fillWidth: true
+                // Item 048: without a floor, this is the only fillWidth item
+                // in the sticky title RowLayout, so once the search/replace
+                // cluster expands (~350px of fixed-width controls) the
+                // RowLayout squeezes titleContainer toward 0 instead of
+                // giving it graceful room — that reads as the title getting
+                // clipped. A minimumWidth stops the collapse; searchField
+                // below gives back width in turn so the row still fits.
+                Layout.minimumWidth: 80
                 implicitHeight: titleColumn.implicitHeight
 
                 ColumnLayout {
@@ -2543,10 +3137,24 @@ Rectangle {
                         // no longer hide the field out from under the user.
                         TextField {
                             id: titleField
+                            objectName: "titleField" // located by tst_mainpanel_renameundo
                             anchors.fill: parent
                             color: "white"
                             font.pixelSize: 14
                             text: mainPanel.displayTitle()
+                            // Blocked while a transcribe of THIS file is
+                            // queued/active — in non-labels mode this field
+                            // renames the real file (commitRename → renameFile),
+                            // which must not race a running transcription (see
+                            // the delete trio's identical busyOrQueuedUrls gate,
+                            // and serialActiveConflictsWith). In labels mode it
+                            // only edits the AI label (setLabel, a live inline
+                            // edit that's fine mid-job), so stays enabled — the
+                            // file rename there lives in filenameSubtitle, which
+                            // is already guarded. player.source (the AUDIO url)
+                            // is what busyOrQueuedUrls holds, not currentMdUrl.
+                            enabled: AppSettings.useLabelsMainPanel
+                                || mainPanel.busyOrQueuedUrls.indexOf(mainPanel.player.source.toString()) === -1
                             // QQC2's Basic-style TextField has its own
                             // padding (6px, +4 more on the left) and
                             // UnderlineField's background otherwise imposes
@@ -2573,6 +3181,41 @@ Rectangle {
                             // idiom as transcriptArea/searchField.
                             HoverHandler { cursorShape: Qt.IBeamCursor }
                         }
+
+                        // Confirm-changes checkmark: appears at the field's
+                        // right edge only while the title is focused AND edited
+                        // (text differs from the committed displayTitle()).
+                        // Tapping it blurs the field, which commits via
+                        // titleField.onActiveFocusChanged → commitRename().
+                        // Clicking anywhere else commits the same way (see
+                        // deselectTextSelections()).
+                        Item {
+                            id: titleConfirmButton
+                            objectName: "titleConfirmButton" // located by tst_mainpanel_renameundo
+                            width: 18
+                            height: 18
+                            anchors.right: parent.right
+                            anchors.verticalCenter: parent.verticalCenter
+                            visible: titleField.activeFocus && titleField.text !== mainPanel.displayTitle()
+
+                            HoverHandler {
+                                id: titleConfirmHover
+                                cursorShape: Qt.PointingHandCursor
+                            }
+                            TapHandler {
+                                onTapped: titleField.focus = false
+                            }
+                            HoverBorder {
+                                anchors.fill: parent
+                                active: titleConfirmHover.hovered
+                            }
+                            AppIcon {
+                                anchors.centerIn: parent
+                                name: "check"
+                                iconSize: 12
+                                color: "#dddddd"
+                            }
+                        }
                     }
 
                     // Item P5: when "labels" mode is showing an AI-generated
@@ -2594,17 +3237,20 @@ Rectangle {
                     // StyleGuide (one TextField, UnderlineField
                     // plainUntilHovered so it reads as plain text until
                     // hovered/focused; commit on Return + blur; Esc reverts).
-                    // Shows the base stem (no dir/ext) since renameFile takes a
-                    // stem and preserves the extension. Disabled while a job is
+                    // Shows the base name WITH extension (currentFileBase) so it
+                    // names the real on-disk file; commitFilenameRename strips
+                    // the extension back off since renameFile takes a stem and
+                    // preserves the real extension. Disabled while a job is
                     // running so a rename can't race an operation.
                     TextField {
                         id: filenameSubtitle
+                        objectName: "filenameSubtitle" // located by tst_mainpanel_renameundo
                         Layout.fillWidth: true
                         visible: AppSettings.useLabelsMainPanel && !!mainPanel.metadata.label
                         enabled: !(mainPanel.transcriptionController && mainPanel.transcriptionController.busy)
                         color: "#777777"
                         font.pixelSize: 10
-                        text: mainPanel.currentFileStem()
+                        text: mainPanel.currentFileBase()
                         padding: 0
                         leftPadding: 0
                         rightPadding: 0
@@ -2613,7 +3259,7 @@ Rectangle {
 
                         onAccepted: mainPanel.commitFilenameRename(text)
                         onActiveFocusChanged: if (!activeFocus) mainPanel.commitFilenameRename(text)
-                        Keys.onEscapePressed: filenameSubtitle.text = mainPanel.currentFileStem()
+                        Keys.onEscapePressed: filenameSubtitle.text = mainPanel.currentFileBase()
 
                         background: UnderlineField { implicitHeight: 0; plainUntilHovered: true; focused: filenameSubtitle.activeFocus }
 
@@ -2638,6 +3284,7 @@ Rectangle {
 
                 readonly property bool isActive: mainPanel.transcriptionController && mainPanel.player
                     && mainPanel.transcriptionController.busy
+                    && mainPanel.transcriptionController.activeOccupiesFile
                     && mainPanel.transcriptionController.currentFile.toString() === mainPanel.player.source.toString()
                 readonly property bool isQueued: mainPanel.transcriptionController && mainPanel.player
                     && mainPanel.player.source.toString() !== ""
@@ -2697,6 +3344,7 @@ Rectangle {
                            u => u.toString() === mainPanel.player.source.toString())
                 enabled: visible && !runAllIconButton.isQueued
                          && !(mainPanel.transcriptionController.busy
+                              && mainPanel.transcriptionController.activeOccupiesFile
                               && mainPanel.transcriptionController.currentFile.toString()
                                  === mainPanel.player.source.toString())
 
@@ -2748,7 +3396,7 @@ Rectangle {
                 enabled: visible && mainPanel.busyOrQueuedUrls.indexOf(regenerateLabelButton.targetUrl.toString()) === -1
 
                 ToolTip.visible: regenerateLabelHover.hovered
-                ToolTip.text: qsTr("Regenerate label and prelude")
+                ToolTip.text: qsTr("Regenerate label, prelude, and tags")
                 ToolTip.delay: 500
 
                 HoverHandler {
@@ -3029,7 +3677,14 @@ Rectangle {
             TextField {
                 id: searchField
                 visible: mainPanel.searchExpanded
-                Layout.preferredWidth: 200
+                // Item 048: was a bare fixed Layout.preferredWidth: 200 —
+                // on a narrow panel that, plus the rest of the fixed-width
+                // search/replace cluster, couldn't fit beside titleContainer
+                // and forced the title to overflow/clip. Shrinkable instead,
+                // so it gives width back under pressure.
+                Layout.fillWidth: true
+                Layout.minimumWidth: 90
+                Layout.maximumWidth: 200
                 // Item 7: the placeholder tracks the mode, since the same
                 // field means a literal string or a regex depending on ".*".
                 placeholderText: mainPanel.findRegexEnabled
@@ -3171,7 +3826,7 @@ Rectangle {
                     color: "#dddddd"
                 }
             }
-        }
+        },
 
         // Item 7: the replace row — sticky, right under the title/search row.
         // The find half of this bar is the search row above (searchField IS
@@ -3297,77 +3952,41 @@ Rectangle {
                 wrapMode: Text.WordWrap
             }
         }
+        ] // end header slot
 
         // Item: only the playback progress bar and title/regen/search row
-        // above are "sticky" (fixed, always visible) — everything else
-        // (tags, speaker pills, detection/model controls, the transcribe
-        // button, and the transcript itself) now lives INSIDE
-        // transcriptScrollView's own scrollable content, so it scrolls away
-        // together with the transcript on a long file instead of
-        // permanently eating vertical space above it. This is the SAME
-        // ScrollView/contentItem that middleDragScrollArea and the
-        // live-transcription auto-scroll-to-bottom logic already reference
-        // (see onTranscriptBodyChanged) — moving these rows inside its
-        // single content child doesn't change either of those, since both
-        // already operate on transcriptScrollView.contentItem generically.
-        // transcriptScrollView must have exactly ONE content child for QQC2's
-        // ScrollView to correctly auto-track content size (contentWidth/
-        // contentHeight) — a second child (middleDragScrollArea used to live
-        // here too) leaves that tracking ill-defined and silently breaks
-        // scrolling entirely. So the MouseArea now lives as a sibling
-        // OVERLAY on top of the ScrollView instead, inside this wrapping
-        // Item — anchors.fill still gives it the same full-viewport
-        // coverage for middle-drag panning, it just no longer counts as
-        // flickable content itself.
-        Item {
-            id: transcriptViewportContainer
-            Layout.fillWidth: true
-            Layout.fillHeight: true
-
-            // The Basic style's vertical ScrollBar is an OVERLAY — `parent:
-            // control; x: control.width - width` (see SettingsPopup.qml's
-            // contentColumn for the same trap) — so it reserves no layout
-            // space and floats flush against the ScrollView's right edge, on
-            // top of a transcript that fills the full width. SettingsPopup
-            // solves this by narrowing its content; here the transcript is
-            // worth keeping as wide as it is, and the root ColumnLayout's
-            // 16px right margin is dead space, so the bar moves THERE
-            // instead: cancel part of that margin so the ScrollView reaches
-            // into the gutter, then subtract the same amount back off
-            // scrollableContent's width (below) so the transcript keeps
-            // exactly the bounds it had. 13 leaves the Basic bar's 10px box
-            // (6px groove + 2px padding a side) centered in the 16px gutter,
-            // 3px clear of both the transcript and the panel edge.
-            readonly property int scrollBarGutter: 13
-            Layout.rightMargin: -scrollBarGutter
-
-        ScrollView {
-            id: transcriptScrollView
-            objectName: "transcriptScrollView"
-            anchors.fill: parent
-            clip: true
-            // Item 55: while a (re)transcription for THIS file has started but
-            // no new segment has streamed in yet, dim + hard-disable the stale
-            // transcript so it can't be selected/hovered/scrolled/edited (the
-            // transcribingOverlay sibling below shows a spinner on top). The
-            // moment live output begins (awaitingFirstSegment clears on the
-            // first live tick) this reverts and the user watches it stream in.
-            // A true gaussian blur was deliberately avoided here: it needs a
-            // new QtQuick.Effects/Qt5Compat.GraphicalEffects import, and per
-            // project memory a fresh QML import can crash-on-load (or silently
-            // freeze) under AOT — uncheckable without a live GUI run — so dim
-            // is the AOT-safe half of "blur/dim".
-            enabled: !mainPanel.showTranscribingOverlay
-            opacity: mainPanel.showTranscribingOverlay ? 0.25 : 1
-            ScrollBar.horizontal.policy: ScrollBar.AlwaysOff
-
+        // above are "sticky" (fixed) — they live in ScrollPage's header slot.
+        // Everything else (tags, speaker pills, detection/model controls, the
+        // transcribe button, and the transcript itself) is ScrollPage's single
+        // scrolling content child below, so it scrolls away together with the
+        // transcript on a long file instead of permanently eating vertical
+        // space above it. ScrollPage owns the inner ScrollView (reached via
+        // notePage.bodyScrollView — its .contentItem is the same Flickable the
+        // live-transcription auto-scroll-to-bottom and the built-in middle-drag
+        // reference) and the edge-gutter scrollbar geometry, so the old wrapping
+        // transcriptViewportContainer Item and its reparented MiddleDragScroll
+        // are gone.
             ColumnLayout {
                 id: scrollableContent
-                // Give back the margin transcriptViewportContainer bled into
-                // for the overlay scrollbar (see its doc comment) — the
-                // transcript keeps its original width and right edge, and the
-                // bar now lives entirely in the reclaimed gutter.
-                width: transcriptScrollView.availableWidth - transcriptViewportContainer.scrollBarGutter
+                // Item 55: while a (re)transcription for THIS file has started
+                // but no new segment has streamed in yet, dim + hard-disable the
+                // stale transcript so it can't be selected/hovered/edited (the
+                // transcribingOverlay in the bodyOverlay slot shows a spinner on
+                // top and covers it, blocking pointer + wheel). The moment live
+                // output begins (awaitingFirstSegment clears on the first live
+                // tick) this reverts and the user watches it stream in. Applied
+                // to the content column because ScrollPage owns the ScrollView
+                // now. A true gaussian blur was deliberately avoided here: it
+                // needs a new QtQuick.Effects/Qt5Compat.GraphicalEffects import,
+                // and per project memory a fresh QML import can crash-on-load (or
+                // silently freeze) under AOT — uncheckable without a live GUI run
+                // — so dim is the AOT-safe half of "blur/dim".
+                enabled: !mainPanel.showTranscribingOverlay
+                opacity: mainPanel.showTranscribingOverlay ? 0.25 : 1
+                // Bind to ScrollPage's availableContentWidth: the transcript
+                // keeps its true 16px right inset and the overlay scrollbar
+                // floats in the reclaimed gutter (see ScrollPage.qml).
+                width: notePage.availableContentWidth
                 spacing: 12
 
                 // Item 13: there was previously no way to see generated tags at all
@@ -3793,15 +4412,31 @@ Rectangle {
                     visible: mainPanel.hasAudio && mainPanel.hasMetadata
 
                     TextEdit {
+                        objectName: "previouslyTranscribedInfo"
                         Layout.fillWidth: true
                         wrapMode: TextEdit.WordWrap
                         readOnly: true
                         selectByMouse: true
                         selectByKeyboard: true
-                        activeFocusOnPress: false
-                        text: qsTr("Previously transcribed — model: %1, speaker detection: %2")
-                              .arg(mainPanel.metadata.model || "?")
-                              .arg(mainPanel.metadata.speakerDetection ? qsTr("on") : qsTr("off"))
+                        // Focusable so a keyboard Copy (Ctrl+C) reaches this
+                        // read-only TextEdit — selectByMouse alone highlights
+                        // without focus, and StandardKey.Copy is a key event
+                        // that only lands on the focused item. Matches every
+                        // other selectable field in this panel.
+                        activeFocusOnPress: true
+                        text: {
+                            const base = qsTr("Previously transcribed — model: %1")
+                                             .arg(mainPanel.metadata.model || "?")
+                            if (!mainPanel.metadata.speakerDetection)
+                                return base + qsTr(", speaker detection: off")
+                            const seg = mainPanel.metadata.segmentationModel || ""
+                            const emb = mainPanel.metadata.embeddingModel || ""
+                            // Transcripts diarized before the models were recorded
+                            // fall back to the old "on".
+                            if (seg === "" && emb === "")
+                                return base + qsTr(", speaker detection: on")
+                            return base + qsTr(", speaker detection: %1 + %2").arg(seg).arg(emb)
+                        }
                         color: "#aaaaaa"
                         font.pixelSize: 11
 
@@ -3989,90 +4624,48 @@ Rectangle {
                                     color: "#8fdf9f"
                                 }
 
-                                // Item 34/35: click-to-edit chapter title. NOT
-                                // free-selectable at rest (readOnly + no
-                                // selectByMouse) — that's what kills the
-                                // multiple-simultaneous-highlights bug (item
-                                // 34): only when THIS chapter becomes the
-                                // single active edit (editingChapterTs === its
-                                // real t0) does it turn into a focused,
-                                // selectable field. Tapping another title (or
-                                // clicking away → deselectTextSelections)
-                                // reassigns editingChapterTs, whose change
-                                // blurs+commits this one. Commit routes through
-                                // setChapterTitle via commitChapterTitle().
-                                TextEdit {
+                                // Always-editable (StyleGuide.md "Always-editable
+                                // text"): one TextField present at all times,
+                                // styled like plain text via UnderlineField until
+                                // hovered/focused — same idiom as the main-panel
+                                // titleField. Selection works from a fresh drag in
+                                // any chapter (no arm-on-tap / editingChapterTs
+                                // gate, no manual positionAt). Commits on blur/
+                                // Return through commitChapterTitle → setChapterTitle.
+                                //
+                                // The transcript chapter HEADING deliberately keeps
+                                // the read-only-until-armed TextEdit idiom: it is an
+                                // overlay on transcriptArea whose title is swept
+                                // into the body selection and spliced into the
+                                // clipboard by copySelectionWithChapters(), which an
+                                // always-editable field would swallow. See
+                                // StyleGuide's carve-out.
+                                TextField {
                                     id: tocChapterTitle
-                                    readonly property bool editing: mainPanel.editingChapterTs === chapterRow.modelData.t0
+                                    objectName: "tocChapterTitle"
                                     Layout.fillWidth: true
-                                    clip: true
-                                    readOnly: !tocChapterTitle.editing
-                                    selectByMouse: tocChapterTitle.editing
-                                    selectByKeyboard: tocChapterTitle.editing
-                                    activeFocusOnPress: false
-                                    text: chapterRow.modelData.title
                                     color: "#cccccc"
                                     font.pixelSize: 11
+                                    padding: 0
+                                    leftPadding: 0
+                                    rightPadding: 0
+                                    topPadding: 0
+                                    bottomPadding: 0
+                                    text: chapterRow.modelData.title
+
+                                    background: UnderlineField { implicitHeight: 0; plainUntilHovered: true; focused: tocChapterTitle.activeFocus }
+
+                                    onAccepted: mainPanel.commitChapterTitle(chapterRow.modelData.t0,
+                                                                             chapterRow.modelData.title,
+                                                                             tocChapterTitle.text)
+                                    onActiveFocusChanged: if (!tocChapterTitle.activeFocus)
+                                        mainPanel.commitChapterTitle(chapterRow.modelData.t0,
+                                                                     chapterRow.modelData.title,
+                                                                     tocChapterTitle.text)
+
+                                    Keys.onEscapePressed: tocChapterTitle.text = chapterRow.modelData.title
 
                                     HoverHandler { cursorShape: Qt.IBeamCursor }
-                                    // Only the tapped instance focuses itself
-                                    // (a chapter has BOTH a TOC row and a
-                                    // transcript heading bound to the same
-                                    // editingChapterTs — focusing from
-                                    // onEditingChanged would make them fight
-                                    // over which grabs focus).
-                                    TapHandler {
-                                        onTapped: (eventPoint) => {
-                                            mainPanel.editingChapterTs = chapterRow.modelData.t0
-                                            if (!tocChapterTitle.activeFocus) {
-                                                tocChapterTitle.forceActiveFocus()
-                                                // Land the caret where the click
-                                                // was. The press itself can't do
-                                                // it (selectByMouse is still false
-                                                // at rest), and selecting the whole
-                                                // title instead would make the next
-                                                // keystroke wipe it.
-                                                tocChapterTitle.cursorPosition =
-                                                    tocChapterTitle.positionAt(eventPoint.position.x,
-                                                                               eventPoint.position.y)
-                                            }
-                                        }
-                                    }
-                                    // Exit side only: when this stops being the
-                                    // active edit while still focused, blur
-                                    // (→ commit). The unfocused twin skips this.
-                                    onEditingChanged: {
-                                        if (!tocChapterTitle.editing && tocChapterTitle.activeFocus)
-                                            tocChapterTitle.focus = false
-                                    }
-                                    onActiveFocusChanged: {
-                                        if (!tocChapterTitle.activeFocus) {
-                                            mainPanel.commitChapterTitle(chapterRow.modelData.t0,
-                                                                         chapterRow.modelData.title,
-                                                                         tocChapterTitle.text)
-                                            // Only clear if we're still the active
-                                            // one — a tap on another title already
-                                            // moved editingChapterTs, don't clobber it.
-                                            if (mainPanel.editingChapterTs === chapterRow.modelData.t0)
-                                                mainPanel.editingChapterTs = -1
-                                        }
-                                    }
-                                    // Single-line commit convention (StyleGuide):
-                                    // Return commits (blocks the newline), Escape
-                                    // reverts to the last-known-good title.
-                                    Keys.onReturnPressed: (event) => {
-                                        event.accepted = true
-                                        mainPanel.editingChapterTs = -1
-                                    }
-                                    Keys.onEnterPressed: (event) => {
-                                        event.accepted = true
-                                        mainPanel.editingChapterTs = -1
-                                    }
-                                    Keys.onEscapePressed: (event) => {
-                                        event.accepted = true
-                                        tocChapterTitle.text = chapterRow.modelData.title
-                                        mainPanel.editingChapterTs = -1
-                                    }
                                 }
 
                                 // Item 17: delete this chapter marker.
@@ -4129,6 +4722,27 @@ Rectangle {
                              && !!mainPanel.metadata.speakerDetectionError
                     text: qsTr("Speaker detection was requested but did not run: %1")
                           .arg(mainPanel.metadata.speakerDetectionError || "")
+                    color: "#e0a25a"
+                    font.pixelSize: 11
+                    wrapMode: Text.WordWrap
+                }
+
+                // Silence-skipping VAD (anti-repetition-hallucination gating +
+                // app-level windowing) was expected but couldn't run — the ~2 MB
+                // Silero model failed to download or VAD detection failed. The
+                // transcript still completed with weaker hallucination hardening
+                // (beam search / entropy_thold / suppress_nst remain). Same INLINE
+                // durable-metadata banner as speakerDetectionError above (a
+                // property of the OPEN FILE's stored metadata, not a transient
+                // action failure), NOT a snackbar. Empty vadError (subprocess
+                // engines never attempt VAD; legacy pre-vad transcripts) → no
+                // banner.
+                Label {
+                    Layout.fillWidth: true
+                    visible: mainPanel.hasAudio && mainPanel.hasMetadata
+                             && !!mainPanel.metadata.vadError
+                    text: qsTr("Silence detection did not run, so repetition artifacts are more likely: %1")
+                          .arg(mainPanel.metadata.vadError || "")
                     color: "#e0a25a"
                     font.pixelSize: 11
                     wrapMode: Text.WordWrap
@@ -4354,8 +4968,49 @@ Rectangle {
                 // itself changing; the bounds guard means an in-between
                 // stale read never warns/misbehaves, it just recomputes
                 // correctly moments later.
+                // The LIVE document's line-start offsets, one per line.
+                // displaySentences' own `start` values index displayText — the
+                // MODEL's string — and the `text: mainPanel.displayText`
+                // binding is severed the moment the user types (see
+                // onDisplayTextChanged), so every offset past the caret goes
+                // stale by the edit delta mid-edit. Feeding those to
+                // positionToRectangle() resolves each overlay to the tail of
+                // the PREVIOUS line, which is how a chapter heading ended up
+                // painted on top of a sentence with its own reserved blank
+                // line left empty. Line INDEX survives what the char offset
+                // doesn't: displayData appends exactly one line per entry and
+                // Return is blocked, so entry idx N is always document line N.
+                readonly property var liveLineStarts: {
+                    void transcriptArea.length
+                    const t = transcriptArea.text
+                    const starts = [0]
+                    let pos = t.indexOf("\n")
+                    while (pos !== -1) {
+                        starts.push(pos + 1)
+                        pos = t.indexOf("\n", pos + 1)
+                    }
+                    return starts
+                }
+
+                // Live offset of the line `entry` owns, falling back to the
+                // model offset when the two have desynced (see `aligned`).
+                function liveStartOf(entry) {
+                    const starts = transcriptArea.liveLineStarts
+                    return starts.length === mainPanel.displaySentences.length
+                        ? starts[entry.idx] : entry.start
+                }
+
                 readonly property var gutterLineRects: {
                     const len = transcriptArea.length
+                    const starts = transcriptArea.liveLineStarts
+                    // Backspace at a line start MERGES two lines, breaking the
+                    // idx-to-line correspondence. commitTranscriptEdits()
+                    // rejects that edit wholesale on blur anyway, so for that
+                    // transient fall back to the model offsets rather than
+                    // indexing off the end of a short array — no worse than the
+                    // behaviour this replaces, and no one-frame vanish of the
+                    // headings on a state that's about to be reverted.
+                    const aligned = starts.length === mainPanel.displaySentences.length
                     // Same width/padding/font dependency gap as
                     // safePositionToRectangle above — positionToRectangle()
                     // is called directly here (not through that helper), so
@@ -4364,8 +5019,10 @@ Rectangle {
                     void transcriptArea.leftPadding
                     void transcriptArea.topPadding
                     void transcriptArea.font
-                    return mainPanel.displaySentences.map(
-                        s => s.start <= len ? transcriptArea.positionToRectangle(s.start) : Qt.rect(0, 0, 0, 0))
+                    return mainPanel.displaySentences.map((s, i) => {
+                        const p = aligned ? starts[i] : s.start
+                        return p <= len ? transcriptArea.positionToRectangle(p) : Qt.rect(0, 0, 0, 0)
+                    })
                 }
 
                 // Two SEPARATE gutter columns (Item: independently stylable
@@ -4626,7 +5283,8 @@ Rectangle {
                             // drag-select mid-gesture.
                             readonly property bool sweptBySelection:
                                 !headingTitle.editing
-                                && mainPanel.selectionSweepsHeading(chapterHeadingRow.modelData.start)
+                                && mainPanel.selectionSweepsHeading(
+                                    transcriptArea.liveStartOf(chapterHeadingRow.modelData))
                             onSweptBySelectionChanged: {
                                 if (headingTitle.sweptBySelection)
                                     headingTitle.select(0, headingTitle.length)
@@ -4694,6 +5352,39 @@ Rectangle {
                     }
                 }
 
+                // Silence phase 3 (queue item 085, locked decision): one
+                // centered divider row per qualifying stored `silences:`
+                // span (mainPanel.silenceMarkerModel), interleaved into
+                // displayData/pushSilenceMarker exactly like a chapter
+                // heading — same reserved-blank-line technique, same
+                // gutterLineRects[idx] lookup for its row's geometry (see
+                // that Repeater's own doc comment just above). Never
+                // interactive (no TapHandler/MouseArea, no
+                // HoverBorder) — it is pure decoration, not an editable or
+                // clickable affordance; StyleGuide.md "Transcript silence
+                // divider" is the source of truth for the glyphs/color/size
+                // this renders (mainPanel.formatSilenceMarkerText).
+                Repeater {
+                    id: silenceMarkerRepeater
+                    model: mainPanel.silenceMarkerModel
+
+                    Text {
+                        required property var modelData
+                        readonly property rect lineRect:
+                            transcriptArea.gutterLineRects[modelData.idx] || Qt.rect(0, 0, 0, 0)
+                        x: 0
+                        y: lineRect.y
+                        width: transcriptArea.width
+                        height: lineRect.height
+                        horizontalAlignment: Text.AlignHCenter
+                        verticalAlignment: Text.AlignVCenter
+                        text: mainPanel.formatSilenceMarkerText(modelData.silenceSeconds)
+                        color: "#5a5a5a"
+                        font.italic: true
+                        font.pixelSize: 11
+                    }
+                }
+
                 Rectangle {
                     id: sentenceHighlightOverlay
                     visible: mainPanel.activeSentenceIndex >= 0
@@ -4727,8 +5418,7 @@ Rectangle {
                 }
             }
 
-            } // end scrollableContent ColumnLayout
-        } // end transcriptScrollView
+            } // end scrollableContent ColumnLayout (ScrollPage's content child)
 
         // Item 55: loading overlay shown from the instant THIS file's
         // (re)transcription starts until the first new segment lands (see
@@ -4737,12 +5427,13 @@ Rectangle {
         // BusyIndicator + a task label (transcribingOverlayLabel, keyed off
         // currentPhase so it names the actual task). It also swallows pointer
         // input (TapHandler for clicks/drags, HoverHandler for the wait
-        // cursor) so nothing underneath reacts while the old transcript is
-        // frozen. Sibling of transcriptScrollView inside
-        // transcriptViewportContainer, so it's scoped to exactly the
-        // transcript region (not the sticky header). Reuses the built-in
-        // QQC2 BusyIndicator (the app had no existing spinner component) so
-        // it inherits the app's control style.
+        // cursor); wheel over the frozen transcript is blocked too, since a
+        // covering overlay item doesn't let wheel fall through to the
+        // ScrollView sibling beneath it. Lives in ScrollPage's bodyOverlay
+        // slot, so it's scoped to exactly the scrolling body region (not the
+        // sticky header). Reuses the built-in QQC2 BusyIndicator (the app had
+        // no existing spinner component) so it inherits the app's control style.
+        bodyOverlay: [
         Rectangle {
             id: transcribingOverlay
             anchors.fill: parent
@@ -4771,31 +5462,16 @@ Rectangle {
                 }
             }
         }
+        ] // end bodyOverlay slot
 
-        // Chrome/Firefox-style middle-click autoscroll for the transcript
-        // view — see MiddleDragScroll.qml for the whole design (why it's an
-        // Item and not a MouseArea, why arming is panel-scoped but the armed
-        // phase is window-wide, which gesturePolicy and why).
-        //
-        // Declared as an overlay sibling of transcriptScrollView (not inside
-        // it, see transcriptViewportContainer's doc comment) so the ScrollView
-        // keeps exactly one flickable content child — but VISUALLY reparented
-        // to mainPanel so a middle-click anywhere on the note page arms it,
-        // not just one inside the transcript box. That reparent moves it out
-        // of the note page's ColumnLayout, so it also needs its own `visible`
-        // gate (it no longer inherits the note page's) — inert on the
-        // recorder/USB/empty pages, where there's no transcript to pan.
-        MiddleDragScroll {
-            id: middleDragScrollArea
-            parent: mainPanel
-            anchors.fill: parent
-            visible: mainPanel.vaultPath.toString() !== "" && !mainPanel.recording
-                     && !mainPanel.usbGrabberOpen && !mainPanel.benchmarkOpen
-            flickable: transcriptScrollView.contentItem as Flickable
-        }
-
-        } // end transcriptViewportContainer
-    }
+        // ScrollPage bakes in the Chrome/Firefox-style middle-click autoscroll
+        // for this page: its built-in MiddleDragScroll fills the whole ScrollPage
+        // and gates on notePage.visible, so a middle-click anywhere on the note
+        // page (tag pills / prelude / chapter list / transcript) arms the
+        // transcript's scroll — the same reach the old reparented
+        // middleDragScrollArea had, now owned by the shared base. See
+        // MiddleDragScroll.qml / ScrollPage.qml.
+    } // end notePage ScrollPage
 
     // Floating ghost label that visually represents an in-progress speaker
     // pill drag (see mainPanel.draggingSpeakerId/dragGhostX/Y) — a direct,
@@ -4820,465 +5496,33 @@ Rectangle {
         }
     }
 
-    // Recorder page: sibling of the two content blocks above (and of
-    // usbGrabberPage below), gated on mainPanel.recording (toggled by
+    // Recorder page: sibling of the two content blocks above (and of the
+    // UsbGrabberPage below), gated on mainPanel.recording (toggled by
     // TitleBar's record button, see Main.qml's onRecordRequested). Exactly
-    // one of these four top-level blocks is ever visible at once.
-    Item {
-        id: recorderPage
+    // one of these four top-level blocks is ever visible at once. Extracted
+    // into its own RecorderPage.qml component (2026-07-19 decomposition); the
+    // host wires the recorder + vault info and forwards openVaultRequested.
+    RecorderPage {
         anchors.fill: parent
         visible: mainPanel.recording
-
-        property bool useMic: true
-        property bool useSystemAudio: false
-        property string selectedMicId: ""
-        property var micDevices: []
-        // Backing string for the shared warning banner below — cleared
-        // whenever the folder picker succeeds/reopens, or whenever
-        // audioRecorder.lastError clears (see the Connections block below).
-        property string recordingFolderError: ""
-        // Recent RMS samples for the scrolling waveform Canvas, oldest
-        // first, capped at ~100 (see waveformCanvas below). AppSettings.
-        // animationsEnabled off collapses this to a single-element "static
-        // level" array instead of a scrolling history (CLAUDE.md/this
-        // app's convention: that flag kills continuous-update CPU/GPU work).
-        property var levelSamples: []
-
-        function refreshMicDevices() {
-            recorderPage.micDevices = mainPanel.audioRecorder ? mainPanel.audioRecorder.availableMicDevices() : []
-            if (recorderPage.selectedMicId === "" && recorderPage.micDevices.length > 0)
-                recorderPage.selectedMicId = recorderPage.micDevices[0].id
-        }
-
-        onVisibleChanged: if (recorderPage.visible) recorderPage.refreshMicDevices()
-        Component.onCompleted: recorderPage.refreshMicDevices()
-
-        // audioRecorder.lastError clearing (a fresh startRecording() call
-        // clears it server-side) should also clear the shared banner if
-        // it was the error currently showing.
-        Connections {
-            target: mainPanel.audioRecorder
-            function onLevelUpdated() {
-                if (AppSettings.animationsEnabled) {
-                    const samples = recorderPage.levelSamples.slice()
-                    samples.push(mainPanel.audioRecorder.currentLevel)
-                    if (samples.length > 100)
-                        samples.shift()
-                    recorderPage.levelSamples = samples
-                } else {
-                    recorderPage.levelSamples = [mainPanel.audioRecorder.currentLevel]
-                }
-                waveformCanvas.requestPaint()
-            }
-        }
-
-        // No vault open: don't let the user configure mic/folder pickers
-        // with nothing to record into. Same "Open Vault" button precedent
-        // as the empty-vault block above.
-        Item {
-            anchors.fill: parent
-            visible: mainPanel.vaultPath.toString() === ""
-
-            Button {
-                id: recorderOpenVaultButton
-                anchors.centerIn: parent
-                text: qsTr("Open Vault")
-                hoverEnabled: true
-                onClicked: mainPanel.openVaultRequested()
-
-                background: Rectangle {
-                    radius: AppSettings.borderRadius
-                    color: (recorderOpenVaultButton.hovered && recorderOpenVaultButton.enabled) ? "#3a3a3a" : "#2a2a2a"
-                    border.width: 1
-                    border.color: "#3a3a3a"
-                }
-                HoverHandler {
-                    cursorShape: Qt.PointingHandCursor
-                }
-                HoverBorder {
-                    anchors.fill: parent
-                    active: recorderOpenVaultButton.hovered
-                }
-            }
-        }
-
-        ColumnLayout {
-            id: recorderContent
-            anchors.fill: parent
-            anchors.margins: 16
-            spacing: 12
-            visible: mainPanel.vaultPath.toString() !== ""
-
-            // Microphone row: toggle + device combo + gain slider.
-            RowLayout {
-                Layout.fillWidth: true
-                spacing: 12
-
-                Item {
-                    id: micToggle
-                    Layout.preferredWidth: micToggleLabel.implicitWidth + 16
-                    Layout.preferredHeight: 24
-
-                    HoverHandler {
-                        id: micToggleHover
-                        cursorShape: Qt.PointingHandCursor
-                    }
-                    TapHandler {
-                        onTapped: recorderPage.useMic = !recorderPage.useMic
-                    }
-                    Rectangle {
-                        anchors.fill: parent
-                        radius: AppSettings.borderRadius
-                        color: recorderPage.useMic
-                               ? (micToggleHover.hovered ? "#2ecc71" : "#25a25a")
-                               : (micToggleHover.hovered ? "#3a3a3a" : "#2a2a2a")
-                        border.width: 1
-                        border.color: recorderPage.useMic ? "#2ecc71" : "#4a4a4a"
-
-                        Behavior on color { ColorAnimation { duration: AppSettings.animationsEnabled ? 100 : 0 } }
-                    }
-                    Label {
-                        id: micToggleLabel
-                        anchors.centerIn: parent
-                        text: qsTr("Microphone")
-                        color: recorderPage.useMic ? "white" : "#aaaaaa"
-                        font.pixelSize: 11
-                    }
-                }
-
-                ComboBox {
-                    id: micCombo
-                    Layout.preferredWidth: 220
-                    enabled: recorderPage.useMic
-                    hoverEnabled: true
-                    textRole: "name"
-                    valueRole: "id"
-                    model: recorderPage.micDevices
-                    onActivated: recorderPage.selectedMicId = micCombo.currentValue
-
-                    HoverHandler {
-                        cursorShape: Qt.PointingHandCursor
-                        enabled: micCombo.enabled
-                    }
-                    HoverBorder {
-                        anchors.fill: parent
-                        active: micCombo.enabled && micCombo.hovered
-                    }
-                }
-
-                Slider {
-                    id: micGainSlider
-                    Layout.fillWidth: true
-                    enabled: recorderPage.useMic
-                    hoverEnabled: true
-                    from: 0.0
-                    to: 2.0
-                    value: AppSettings.recordingMicGain
-                    onMoved: AppSettings.recordingMicGain = value
-
-                    HoverHandler {
-                        cursorShape: Qt.PointingHandCursor
-                        enabled: micGainSlider.enabled
-                    }
-                    HoverBorder {
-                        anchors.fill: parent
-                        active: micGainSlider.enabled && micGainSlider.hovered
-                    }
-                }
-            }
-
-            // System audio row: toggle (parec's default-sink monitor, "all
-            // windows" mix — see AudioRecorder.h) + its own gain slider.
-            RowLayout {
-                Layout.fillWidth: true
-                spacing: 12
-
-                Item {
-                    id: systemAudioToggle
-                    Layout.preferredWidth: systemAudioToggleLabel.implicitWidth + 16
-                    Layout.preferredHeight: 24
-
-                    HoverHandler {
-                        id: systemAudioToggleHover
-                        cursorShape: Qt.PointingHandCursor
-                    }
-                    TapHandler {
-                        onTapped: recorderPage.useSystemAudio = !recorderPage.useSystemAudio
-                    }
-                    Rectangle {
-                        anchors.fill: parent
-                        radius: AppSettings.borderRadius
-                        color: recorderPage.useSystemAudio
-                               ? (systemAudioToggleHover.hovered ? "#2ecc71" : "#25a25a")
-                               : (systemAudioToggleHover.hovered ? "#3a3a3a" : "#2a2a2a")
-                        border.width: 1
-                        border.color: recorderPage.useSystemAudio ? "#2ecc71" : "#4a4a4a"
-
-                        Behavior on color { ColorAnimation { duration: AppSettings.animationsEnabled ? 100 : 0 } }
-                    }
-                    Label {
-                        id: systemAudioToggleLabel
-                        anchors.centerIn: parent
-                        text: qsTr("System Audio")
-                        color: recorderPage.useSystemAudio ? "white" : "#aaaaaa"
-                        font.pixelSize: 11
-                    }
-                }
-
-                Slider {
-                    id: systemGainSlider
-                    Layout.fillWidth: true
-                    enabled: recorderPage.useSystemAudio
-                    hoverEnabled: true
-                    from: 0.0
-                    to: 2.0
-                    value: AppSettings.recordingSystemGain
-                    onMoved: AppSettings.recordingSystemGain = value
-
-                    HoverHandler {
-                        cursorShape: Qt.PointingHandCursor
-                        enabled: systemGainSlider.enabled
-                    }
-                    HoverBorder {
-                        anchors.fill: parent
-                        active: systemGainSlider.enabled && systemGainSlider.hovered
-                    }
-                }
-            }
-
-            // Start/Stop + disable-animations + duration counter row.
-            RowLayout {
-                Layout.fillWidth: true
-                spacing: 12
-
-                Item {
-                    id: recordToggleButton
-                    Layout.preferredWidth: 32
-                    Layout.preferredHeight: 32
-                    enabled: recorderPage.useMic || recorderPage.useSystemAudio || mainPanel.audioRecorder.recording
-
-                    HoverHandler {
-                        id: recordToggleHover
-                        cursorShape: Qt.PointingHandCursor
-                        enabled: recordToggleButton.enabled
-                    }
-                    TapHandler {
-                        enabled: recordToggleButton.enabled
-                        onTapped: {
-                            if (mainPanel.audioRecorder.recording) {
-                                mainPanel.audioRecorder.stopRecording()
-                            } else {
-                                recorderPage.recordingFolderError = ""
-                                mainPanel.audioRecorder.startRecording(
-                                    mainPanel.vaultPath, AppSettings.recordingOutputFolder,
-                                    recorderPage.useMic, recorderPage.selectedMicId,
-                                    recorderPage.useSystemAudio, AppSettings.recordingMicGain,
-                                    AppSettings.recordingSystemGain)
-                            }
-                        }
-                    }
-                    Rectangle {
-                        anchors.fill: parent
-                        radius: AppSettings.borderRadius
-                        color: (recordToggleHover.hovered && recordToggleButton.enabled) ? "#3a3a3a" : "#2a2a2a"
-                    }
-                    HoverBorder {
-                        anchors.fill: parent
-                        active: recordToggleButton.enabled && recordToggleHover.hovered
-                    }
-                    ToolTip.visible: recordToggleHover.hovered
-                    ToolTip.text: mainPanel.audioRecorder.recording ? qsTr("Stop recording") : qsTr("Start recording")
-                    ToolTip.delay: 500
-                    AppIcon {
-                        anchors.centerIn: parent
-                        name: mainPanel.audioRecorder.recording ? "stop" : "record"
-                        iconSize: 16
-                        color: mainPanel.audioRecorder.recording ? "#e07a7a" : "#6fdf9f"
-                    }
-                }
-
-                // Global animations/blur kill switch — placed here per the
-                // user's explicit placement decision, but affects the whole
-                // app (every existing Behavior/compositor blur already gates
-                // on AppSettings.animationsEnabled), not just this page.
-                Item {
-                    id: animationsToggleButton
-                    Layout.preferredWidth: 32
-                    Layout.preferredHeight: 32
-
-                    HoverHandler {
-                        id: animationsToggleHover
-                        cursorShape: Qt.PointingHandCursor
-                    }
-                    TapHandler {
-                        onTapped: AppSettings.animationsEnabled = !AppSettings.animationsEnabled
-                    }
-                    Rectangle {
-                        anchors.fill: parent
-                        radius: AppSettings.borderRadius
-                        color: animationsToggleHover.hovered ? "#3a3a3a" : "#2a2a2a"
-                    }
-                    HoverBorder {
-                        anchors.fill: parent
-                        active: animationsToggleHover.hovered
-                    }
-                    ToolTip.visible: animationsToggleHover.hovered
-                    ToolTip.text: AppSettings.animationsEnabled ? qsTr("Disable animations") : qsTr("Enable animations")
-                    ToolTip.delay: 500
-                    AppIcon {
-                        anchors.centerIn: parent
-                        name: "freeze"
-                        iconSize: 15
-                        color: AppSettings.animationsEnabled ? "#dddddd" : "#6fdf9f"
-                    }
-                }
-
-                Label {
-                    id: recordingDurationLabel
-                    text: mainPanel.formatDuration(mainPanel.audioRecorder ? mainPanel.audioRecorder.elapsedMs : 0)
-                    color: "white"
-                    font.pixelSize: 16
-                }
-
-                Item { Layout.fillWidth: true }
-
-                // Output folder picker.
-                Item {
-                    id: changeFolderButton
-                    Layout.preferredWidth: 32
-                    Layout.preferredHeight: 32
-
-                    HoverHandler {
-                        id: changeFolderHover
-                        cursorShape: Qt.PointingHandCursor
-                    }
-                    TapHandler {
-                        onTapped: {
-                            const sub = AppSettings.recordingOutputFolder
-                            recordingFolderDialog.currentFolder =
-                                "file://" + mainPanel.vaultLocalPath + (sub ? "/" + sub : "")
-                            recordingFolderDialog.open()
-                        }
-                    }
-                    Rectangle {
-                        anchors.fill: parent
-                        radius: AppSettings.borderRadius
-                        color: changeFolderHover.hovered ? "#3a3a3a" : "#2a2a2a"
-                    }
-                    HoverBorder {
-                        anchors.fill: parent
-                        active: changeFolderHover.hovered
-                    }
-                    ToolTip.visible: changeFolderHover.hovered
-                    ToolTip.text: qsTr("Change output folder")
-                    ToolTip.delay: 500
-                    AppIcon {
-                        anchors.centerIn: parent
-                        name: "folder"
-                        iconSize: 15
-                        color: "#dddddd"
-                    }
-                }
-            }
-
-            // Shared warning banner (StyleGuide.md "Warning banners"): shows
-            // whichever of the folder-picker rejection / audioRecorder's own
-            // lastError is currently non-empty. No dismiss button — clears
-            // itself the next time the folder picker succeeds/reopens, or
-            // the next time lastErrorChanged reports an empty string.
-            Label {
-                Layout.fillWidth: true
-                visible: text !== ""
-                text: recorderPage.recordingFolderError !== "" ? recorderPage.recordingFolderError
-                      : (mainPanel.audioRecorder ? mainPanel.audioRecorder.lastError : "")
-                color: "#e07a7a"
-                font.pixelSize: 11
-                wrapMode: Text.WordWrap
-            }
-
-            // Scrolling waveform/level indicator — mirrors playPauseIcon's
-            // Canvas idiom above (getContext("2d")/onPaint), fed from
-            // recorderPage.levelSamples (pushed on each throttled
-            // levelUpdated tick, see the Connections block above).
-            Canvas {
-                id: waveformCanvas
-                Layout.fillWidth: true
-                Layout.preferredHeight: 80
-
-                onWidthChanged: requestPaint()
-                onHeightChanged: requestPaint()
-
-                onPaint: {
-                    const ctx = getContext("2d")
-                    ctx.reset()
-                    ctx.fillStyle = "#1a1a1a"
-                    ctx.fillRect(0, 0, width, height)
-
-                    const samples = recorderPage.levelSamples
-                    if (samples.length === 0)
-                        return
-
-                    ctx.strokeStyle = "#6fdf9f"
-                    ctx.lineWidth = 2
-
-                    if (!AppSettings.animationsEnabled) {
-                        // Static flat line at the last-known level — no
-                        // scrolling history while animations are off.
-                        const level = samples[samples.length - 1]
-                        const y = height - level * height
-                        ctx.beginPath()
-                        ctx.moveTo(0, y)
-                        ctx.lineTo(width, y)
-                        ctx.stroke()
-                        return
-                    }
-
-                    const maxSamples = 100
-                    const stepX = width / Math.max(1, maxSamples - 1)
-                    ctx.beginPath()
-                    for (let i = 0; i < samples.length; i++) {
-                        const x = width - (samples.length - i) * stepX
-                        const y = height - samples[i] * height
-                        if (i === 0)
-                            ctx.moveTo(x, y)
-                        else
-                            ctx.lineTo(x, y)
-                    }
-                    ctx.stroke()
-                }
-            }
-        }
+        audioRecorder: mainPanel.audioRecorder
+        vaultLocalPath: mainPanel.vaultLocalPath
+        vaultPath: mainPanel.vaultPath
+        vaultTreeModel: mainPanel.vaultTreeModel
+        onOpenVaultRequested: mainPanel.openVaultRequested()
     }
 
-    FolderDialog {
-        id: recordingFolderDialog
-        onAccepted: {
-            const localPath = recordingFolderDialog.selectedFolder.toString().replace("file://", "")
-            if (!mainPanel.vaultTreeModel || !mainPanel.vaultTreeModel.isPathInsideVault(localPath)) {
-                recorderPage.recordingFolderError = qsTr("That folder is outside the vault — pick a location inside it.")
-                return
-            }
-            recorderPage.recordingFolderError = ""
-            const prefix = mainPanel.vaultLocalPath + "/"
-            AppSettings.recordingOutputFolder = localPath === mainPanel.vaultLocalPath ? ""
-                : (localPath.startsWith(prefix) ? localPath.slice(prefix.length) : localPath)
-        }
-    }
-
-    // Benchmark page: another sibling top-level block (see the mutual-exclusion
-    // negations on the content/recorder/usb blocks). Promoted out of Settings to
-    // its own TitleBar button (see Main.qml's onBenchmarkRequested). Given lower
-    // precedence than recording/usbGrabber, same as those negate each other.
-    ScrollView {
+    // Benchmark page: another sibling top-level block. Promoted out of Settings
+    // to its own TitleBar button (see Main.qml's onBenchmarkRequested). Mutually
+    // exclusive with the recorder/USB pages by construction — setTopLevelScreen()
+    // guarantees at most one flag is true, so this needs no precedence negation.
+    ScrollPage {
         id: benchmarkScroll
         anchors.fill: parent
-        anchors.margins: 16
-        visible: mainPanel.benchmarkOpen && !mainPanel.recording && !mainPanel.usbGrabberOpen
-        contentWidth: availableWidth
-        clip: true
+        visible: mainPanel.benchmarkOpen
 
         BenchmarkPage {
-            width: benchmarkScroll.availableWidth
+            width: benchmarkScroll.availableContentWidth
             active: benchmarkScroll.visible
             transcriptionController: mainPanel.transcriptionController
             vaultTreeModel: mainPanel.vaultTreeModel
@@ -5291,859 +5535,15 @@ Rectangle {
 
     // USB grabber page: sibling of the three content blocks above, gated on
     // mainPanel.usbGrabberOpen (toggled by TitleBar's USB grabber button,
-    // see Main.qml's onUsbGrabberRequested) — also hidden while recording,
-    // for full mutual exclusivity across all four top-level blocks.
-    Item {
-        id: usbGrabberPage
+    // see Main.qml's onUsbGrabberRequested). Mutually exclusive with the other
+    // top-level blocks by construction — setTopLevelScreen() keeps at most one
+    // flag true, so no precedence negation is needed here.
+    UsbGrabberPage {
         anchors.fill: parent
-        visible: mainPanel.usbGrabberOpen && !mainPanel.recording
-
-        // Raw snapshots from UsbGrabberController — re-pulled by
-        // refreshDevices()/refreshHistory() rather than bound live, since the
-        // controller exposes plain Q_INVOKABLE getters (no per-device
-        // changed signals to bind against). deviceRows below derives the
-        // actual per-row display model from these two plus a fresh
-        // ruleForDevice() read per device, so it stays current every time
-        // either snapshot is refreshed.
-        property var mountedDevices: []
-        property var savedRules: []
-        property var catchAllRule: ({enabled: false, extensionFilter: [], filenameRegex: "", preserveStructure: true, startFolder: "", deviceLabel: "", deviceSerial: "*", destinationFolder: ""})
-        property var historyEntries: []
-
-        function refreshDevices() {
-            if (!mainPanel.usbGrabberController) {
-                usbGrabberPage.mountedDevices = []
-                usbGrabberPage.savedRules = []
-                usbGrabberPage.catchAllRule = ({enabled: false, extensionFilter: [], filenameRegex: "", preserveStructure: true, startFolder: "", deviceLabel: "", deviceSerial: "*", destinationFolder: ""})
-                return
-            }
-            usbGrabberPage.mountedDevices = mainPanel.usbGrabberController.mountedDevices()
-            usbGrabberPage.savedRules = mainPanel.usbGrabberController.allRules()
-            usbGrabberPage.catchAllRule = mainPanel.usbGrabberController.ruleForDevice("*")
-        }
-
-        // Newest first — the controller returns history in file-append
-        // (oldest-first) order.
-        function refreshHistory() {
-            usbGrabberPage.historyEntries = mainPanel.usbGrabberController
-                ? mainPanel.usbGrabberController.history().slice().reverse() : []
-        }
-
-        function formatTimestamp(iso) {
-            const d = new Date(iso)
-            return isNaN(d.getTime()) ? iso : Qt.formatDateTime(d, "yyyy-MM-dd hh:mm")
-        }
-
-        // Grab preview: which device's preview is currently shown (only one
-        // at a time, rendered inline under that device's own card — see the
-        // Repeater delegate below), its raw {path,status} entries once
-        // requestGrabPreview()'s async scan completes, and a running/error
-        // flag for the interim "Scanning…" state. Cleared/reset on every new
-        // Preview click, not on every refreshDevices() poll tick, so an
-        // in-flight or just-finished preview survives the 2.5s device poll.
-        property string previewDeviceSerial: ""
-        property var previewEntries: []
-        property bool previewRunning: false
-        property string previewError: ""
-
-        // Destination-folder picker rejection (see usbDestinationFolderDialog
-        // below) — StyleGuide.md's warning-banner convention (inline Label,
-        // driven by a non-empty backing string, no dismiss button).
-        property string destinationFolderError: ""
-
-        function requestPreview(serial) {
-            if (!mainPanel.usbGrabberController)
-                return
-            usbGrabberPage.previewDeviceSerial = serial
-            usbGrabberPage.previewEntries = []
-            usbGrabberPage.previewError = ""
-            usbGrabberPage.previewRunning = true
-            mainPanel.usbGrabberController.requestGrabPreview(serial)
-        }
-
-        // Put the preview panel away. Clearing previewDeviceSerial is all it
-        // takes even mid-scan: onGrabPreviewReady discards any result whose
-        // serial no longer matches, so an in-flight walk simply lands nowhere
-        // (it copies nothing and writes nothing — there is no side effect to
-        // undo, only a panel to close). Nothing else re-shows the panel; only
-        // another Preview click does.
-        function dismissPreview() {
-            usbGrabberPage.previewDeviceSerial = ""
-            usbGrabberPage.previewEntries = []
-            usbGrabberPage.previewError = ""
-            usbGrabberPage.previewRunning = false
-        }
-
-        // Same three-state palette across color/label/summary — "will grab"
-        // reuses the same green the "connected" status label already uses
-        // (see deviceCard's mounted Label below), so the preview's meaning
-        // ("this device is eligible and this file will move") reads
-        // consistently with the rest of the page.
-        function previewStatusColor(status) {
-            switch (status) {
-            case "grab": return "#7ac07a"
-            case "duplicate": return "#888888"
-            case "filtered": return "#666666"
-            default: return "#888888"
-            }
-        }
-
-        function previewStatusLabel(status) {
-            switch (status) {
-            case "grab": return qsTr("will grab")
-            case "duplicate": return qsTr("skip — already grabbed")
-            case "filtered": return qsTr("skip — filtered out")
-            default: return status
-            }
-        }
-
-        function previewSummary(entries) {
-            let grabCount = 0, dupCount = 0, filteredCount = 0
-            for (const e of entries) {
-                if (e.status === "grab") ++grabCount
-                else if (e.status === "duplicate") ++dupCount
-                else if (e.status === "filtered") ++filteredCount
-            }
-            return qsTr("%1 will be grabbed, %2 already grabbed, %3 filtered out")
-                    .arg(grabCount).arg(dupCount).arg(filteredCount)
-        }
-
-        function escapePreviewHtml(s) {
-            return String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
-        }
-
-        function previewHtml(entries) {
-            return entries.map(function (e) {
-                return "<span style=\"color:" + usbGrabberPage.previewStatusColor(e.status) + ";\">"
-                        + usbGrabberPage.previewStatusLabel(e.status) + " — "
-                        + usbGrabberPage.escapePreviewHtml(e.path) + "</span>"
-            }).join("<br>")
-        }
-
-        // Resolves a FolderDialog's selectedFolder into a vault-relative
-        // string suitable for a rule's destinationFolder field ("" = vault
-        // root), or null if the chosen folder is outside the vault — same
-        // shape as recordingFolderDialog's onAccepted below.
-        function relativeToVault(localPath) {
-            if (!mainPanel.vaultTreeModel || !mainPanel.vaultTreeModel.isPathInsideVault(localPath))
-                return null
-            const prefix = mainPanel.vaultLocalPath + "/"
-            return localPath === mainPanel.vaultLocalPath ? ""
-                : (localPath.startsWith(prefix) ? localPath.slice(prefix.length) : localPath)
-        }
-
-        // Shared by every per-field commit below: re-reads the device's
-        // current rule (so fields this call doesn't touch are preserved),
-        // applies one field, saves, then re-derives deviceRows via
-        // refreshDevices() so the row reflects what was actually persisted.
-        //
-        // If this device's preview is currently on screen, it is now describing
-        // a rule that no longer exists — re-run it so the filename regex (and
-        // every other field: a destination change re-decides what counts as a
-        // duplicate, an extension change re-decides what's filtered) is
-        // previewed as edited, the way the combine rules' preview follows their
-        // pattern field. Deliberately NOT per keystroke, unlike the validity
-        // indicator beside the field: a preview is an async walk that stats
-        // every file on a physical device (DESIGN.md "USB import"), so it's
-        // driven by an actual commit and skipped entirely when the value didn't
-        // change — onEditingFinished fires on every focus-out, edited or not.
-        // requestPreview() re-reads the SAVED rule, so this must run after
-        // saveRule() rather than against the in-hand value.
-        function commitRuleField(serial, label, field, value) {
-            if (!mainPanel.usbGrabberController)
-                return
-            const rule = mainPanel.usbGrabberController.ruleForDevice(serial)
-            const changed = JSON.stringify(rule[field]) !== JSON.stringify(value)
-            rule[field] = value
-            if (label)
-                rule.deviceLabel = label
-            mainPanel.usbGrabberController.saveRule(rule)
-            usbGrabberPage.refreshDevices()
-            // A "*" edit also re-runs it: an on-screen preview may be resolving
-            // through the catch-all rule right now (a device whose own rule is
-            // disabled falls back to it — see resolveEffectiveRule()), and from
-            // here there's no way to tell whether it is, so re-run rather than
-            // leave a stale preview standing. Re-previewing a device that
-            // wasn't using the catch-all after all just reproduces what's
-            // already shown.
-            if (changed && usbGrabberPage.previewDeviceSerial !== ""
-                    && (usbGrabberPage.previewDeviceSerial === serial || serial === "*"))
-                usbGrabberPage.requestPreview(usbGrabberPage.previewDeviceSerial)
-        }
-
-        // Union of currently-mounted devices and previously-configured ones
-        // (from savedRules, excluding the "*" catch-all — that has its own
-        // dedicated card below), GROUPED by serial, each row carrying a
-        // fresh ruleForDevice() read so toggling/editing one field doesn't
-        // require a full round-trip before the row reflects it.
-        //
-        // One row per physical device, not per volume: rules are keyed by
-        // serial, so a device's volumes necessarily share one rule and showing
-        // them as separate rows would render one rule as several independently-
-        // toggleable-looking switches. mountedDevices is per-VOLUME though (see
-        // UsbDeviceMonitor::currentlyMountedDevices()), so volumes sharing a
-        // serial are collected into mountPaths rather than overwriting each
-        // other — the row's volume count comes from that, and "Grab now" grabs
-        // all of them via triggerManualGrab().
-        property var deviceRows: {
-            if (!mainPanel.usbGrabberController)
-                return []
-            const bySerial = {}
-            for (const d of usbGrabberPage.mountedDevices) {
-                const existing = bySerial[d.serial]
-                if (existing) {
-                    existing.mountPaths.push(d.mountPath)
-                    continue
-                }
-                const label = ((d.vendor || "") + " " + (d.model || "")).trim()
-                bySerial[d.serial] = {serial: d.serial, label: label.length > 0 ? label : d.serial,
-                                       mounted: true, mountPaths: [d.mountPath]}
-            }
-            for (const r of usbGrabberPage.savedRules) {
-                if (r.deviceSerial === "*" || bySerial[r.deviceSerial])
-                    continue
-                bySerial[r.deviceSerial] = {serial: r.deviceSerial, label: r.deviceLabel || r.deviceSerial,
-                                             mounted: false, mountPaths: []}
-            }
-            const rows = []
-            for (const serial in bySerial) {
-                const row = bySerial[serial]
-                const rule = mainPanel.usbGrabberController.ruleForDevice(serial)
-                row.enabled = rule.enabled
-                row.autoGrab = rule.autoGrab
-                row.extensionFilterText = (rule.extensionFilter || []).join(", ")
-                row.filenameRegex = rule.filenameRegex
-                row.preserveStructure = rule.preserveStructure
-                row.startFolder = rule.startFolder
-                row.destinationFolder = rule.destinationFolder
-                rows.push(row)
-            }
-            return rows
-        }
-
-        onVisibleChanged: if (usbGrabberPage.visible) { usbGrabberPage.refreshDevices(); usbGrabberPage.refreshHistory() }
-        Component.onCompleted: { usbGrabberPage.refreshDevices(); usbGrabberPage.refreshHistory() }
-
-        // No live deviceAdded/deviceRemoved signal is exposed on
-        // UsbGrabberController itself (only the underlying UsbDeviceMonitor
-        // has those) — polling is simplest for a low-frequency, non-
-        // performance-sensitive utility page like this one, and only runs
-        // while the page is actually visible.
-        Timer {
-            interval: 2500
-            running: usbGrabberPage.visible
-            repeat: true
-            onTriggered: usbGrabberPage.refreshDevices()
-        }
-
-        // A grab (manual or hotplug-triggered) just finished — refresh both
-        // the history list and the device rows (a hotplug grab may have
-        // introduced a device this page hasn't seen before).
-        Connections {
-            target: mainPanel.usbGrabberController
-            function onGrabFinished() { usbGrabberPage.refreshHistory(); usbGrabberPage.refreshDevices() }
-            function onGrabPreviewReady(serial, entries, error) {
-                if (serial !== usbGrabberPage.previewDeviceSerial)
-                    return
-                usbGrabberPage.previewRunning = false
-                usbGrabberPage.previewEntries = entries
-                usbGrabberPage.previewError = error
-            }
-        }
-
-        ScrollView {
-            id: usbScrollArea
-            anchors.fill: parent
-            anchors.margins: 16
-            clip: true
-            ScrollBar.horizontal.policy: ScrollBar.AlwaysOff
-
-            ColumnLayout {
-                // See SettingsPopup.qml's contentColumn doc comment for why
-                // this is bound to the ScrollView's own width (minus the
-                // overlay scrollbar's clearance) rather than parent.width.
-                width: usbScrollArea.width - 14
-                spacing: 16
-
-                Label {
-                    text: qsTr("USB Grabber")
-                    color: "white"
-                    font.bold: true
-                    font.pixelSize: 16
-                }
-
-                Label {
-                    Layout.fillWidth: true
-                    visible: mainPanel.usbGrabberController && mainPanel.usbGrabberController.lastError !== ""
-                    text: mainPanel.usbGrabberController ? mainPanel.usbGrabberController.lastError : ""
-                    color: "#e07a7a"
-                    font.pixelSize: 11
-                    wrapMode: Text.WordWrap
-                }
-
-                Label {
-                    Layout.fillWidth: true
-                    visible: usbGrabberPage.destinationFolderError !== ""
-                    text: usbGrabberPage.destinationFolderError
-                    color: "#e07a7a"
-                    font.pixelSize: 11
-                    wrapMode: Text.WordWrap
-                }
-
-                // "Any device" catch-all rule card — same shape as a
-                // per-device card below, minus the mounted/grab-now concept
-                // (it isn't tied to one physical device).
-                ColumnLayout {
-                    Layout.fillWidth: true
-                    spacing: 4
-
-                    Rectangle {
-                        Layout.fillWidth: true
-                        Layout.preferredHeight: 1
-                        color: "#3a3a3a"
-                    }
-
-                    RowLayout {
-                        Layout.fillWidth: true
-                        Label {
-                            Layout.fillWidth: true
-                            text: qsTr("Any USB device")
-                            color: "white"
-                        }
-                        // Auto-grab is strictly narrower than enabled (see
-                        // UsbGrabRule::autoGrab) — meaningless on a device that
-                        // can't be grabbed at all, so it's disabled until the
-                        // rule is on rather than sitting there as a live switch
-                        // that quietly does nothing.
-                        Switch {
-                            id: catchAllAutoGrabSwitch
-                            text: qsTr("Auto-grab")
-                            enabled: usbGrabberPage.catchAllRule.enabled
-                            checked: usbGrabberPage.catchAllRule.autoGrab || false
-                            hoverEnabled: true
-                            onToggled: usbGrabberPage.commitRuleField("*", "", "autoGrab", checked)
-                            HoverHandler { cursorShape: Qt.PointingHandCursor; enabled: catchAllAutoGrabSwitch.enabled }
-                            HoverBorder {
-                                anchors.fill: parent
-                                active: catchAllAutoGrabSwitch.enabled && catchAllAutoGrabSwitch.hovered
-                            }
-                            ToolTip.visible: hovered
-                            ToolTip.delay: 500
-                            ToolTip.text: qsTr("Grab from any matching device as soon as it's plugged in, without asking")
-                        }
-                        Switch {
-                            id: catchAllEnabledSwitch
-                            checked: usbGrabberPage.catchAllRule.enabled
-                            hoverEnabled: true
-                            onToggled: usbGrabberPage.commitRuleField("*", "", "enabled", checked)
-                            HoverHandler { cursorShape: Qt.PointingHandCursor }
-                            HoverBorder { anchors.fill: parent; active: catchAllEnabledSwitch.hovered }
-                        }
-                    }
-
-                    RowLayout {
-                        Layout.fillWidth: true
-                        TextField {
-                            id: catchAllExtensionField
-                            Layout.fillWidth: true
-                            placeholderText: qsTr("Extensions (comma-separated, blank = all files)")
-                            text: (usbGrabberPage.catchAllRule.extensionFilter || []).join(", ")
-                            background: UnderlineField { focused: catchAllExtensionField.activeFocus }
-                            onEditingFinished: usbGrabberPage.commitRuleField("*", "", "extensionFilter",
-                                text.split(",").map(s => s.trim()).filter(s => s.length > 0))
-                            // Item 13: editable text needs an I-beam.
-                            HoverHandler { cursorShape: Qt.IBeamCursor }
-                        }
-                        Switch {
-                            id: catchAllPreserveSwitch
-                            text: qsTr("Preserve folders")
-                            checked: usbGrabberPage.catchAllRule.preserveStructure
-                            hoverEnabled: true
-                            onToggled: usbGrabberPage.commitRuleField("*", "", "preserveStructure", checked)
-                            HoverHandler { cursorShape: Qt.PointingHandCursor }
-                            HoverBorder { anchors.fill: parent; active: catchAllPreserveSwitch.hovered }
-                        }
-                    }
-
-                    UsbRegexField {
-                        Layout.fillWidth: true
-                        pattern: usbGrabberPage.catchAllRule.filenameRegex || ""
-                        controller: mainPanel.usbGrabberController
-                        onCommitted: (newPattern) => usbGrabberPage.commitRuleField("*", "", "filenameRegex", newPattern)
-                    }
-
-                    TextField {
-                        id: catchAllStartFolderField
-                        Layout.fillWidth: true
-                        placeholderText: qsTr("Start folder (relative to device root, blank = root)")
-                        text: usbGrabberPage.catchAllRule.startFolder || ""
-                        background: UnderlineField { focused: catchAllStartFolderField.activeFocus }
-                        onEditingFinished: usbGrabberPage.commitRuleField("*", "", "startFolder", text)
-                        // Item 13: editable text needs an I-beam.
-                        HoverHandler { cursorShape: Qt.IBeamCursor }
-                    }
-
-                    RowLayout {
-                        Layout.fillWidth: true
-                        Label {
-                            Layout.fillWidth: true
-                            text: qsTr("Destination: %1").arg(
-                                usbGrabberPage.catchAllRule.destinationFolder || qsTr("vault root"))
-                            color: "#888888"
-                            font.pixelSize: 11
-                            elide: Text.ElideMiddle
-                        }
-                        Item {
-                            id: catchAllDestinationButton
-                            Layout.preferredWidth: 28
-                            Layout.preferredHeight: 28
-                            HoverHandler { id: catchAllDestinationHover; cursorShape: Qt.PointingHandCursor }
-                            TapHandler {
-                                onTapped: {
-                                    const sub = usbGrabberPage.catchAllRule.destinationFolder
-                                    usbDestinationFolderDialog.targetSerial = "*"
-                                    usbDestinationFolderDialog.targetLabel = ""
-                                    usbDestinationFolderDialog.currentFolder =
-                                        "file://" + mainPanel.vaultLocalPath + (sub ? "/" + sub : "")
-                                    usbDestinationFolderDialog.open()
-                                }
-                            }
-                            Rectangle {
-                                anchors.fill: parent
-                                radius: AppSettings.borderRadius
-                                color: catchAllDestinationHover.hovered ? "#3a3a3a" : "#2a2a2a"
-                            }
-                            HoverBorder { anchors.fill: parent; active: catchAllDestinationHover.hovered }
-                            ToolTip.visible: catchAllDestinationHover.hovered
-                            ToolTip.text: qsTr("Choose destination folder")
-                            ToolTip.delay: 500
-                            AppIcon { anchors.centerIn: parent; name: "folder"; iconSize: 13; color: "#dddddd" }
-                        }
-                    }
-                }
-
-                Label {
-                    text: qsTr("Devices")
-                    color: "#cccccc"
-                    font.pixelSize: 13
-                }
-
-                Label {
-                    Layout.fillWidth: true
-                    visible: usbGrabberPage.deviceRows.length === 0
-                    text: qsTr("No USB devices seen yet — plug one in, or rely on \"Any USB device\" above.")
-                    color: "#888888"
-                    font.pixelSize: 11
-                    wrapMode: Text.WordWrap
-                }
-
-                Repeater {
-                    model: usbGrabberPage.deviceRows
-
-                    delegate: ColumnLayout {
-                        id: deviceCard
-                        required property var modelData
-
-                        Layout.fillWidth: true
-                        spacing: 4
-
-                        Rectangle {
-                            Layout.fillWidth: true
-                            Layout.preferredHeight: 1
-                            color: "#3a3a3a"
-                        }
-
-                        RowLayout {
-                            Layout.fillWidth: true
-                            Label {
-                                Layout.fillWidth: true
-                                text: deviceCard.modelData.label
-                                color: "white"
-                                elide: Text.ElideRight
-                            }
-                            Label {
-                                // A multi-LUN device (e.g. a recorder exposing internal
-                                // memory and an SD card) mounts several volumes under one
-                                // serial and one rule — say so, since "connected" alone
-                                // would hide that "Grab now" is about to walk more than
-                                // one of them.
-                                text: !deviceCard.modelData.mounted ? qsTr("not connected")
-                                    : deviceCard.modelData.mountPaths.length > 1
-                                        ? qsTr("%1 volumes connected").arg(deviceCard.modelData.mountPaths.length)
-                                        : qsTr("connected")
-                                color: deviceCard.modelData.mounted ? "#7ac07a" : "#888888"
-                                font.pixelSize: 11
-                            }
-                            // Strictly narrower than the enable switch beside it
-                            // (see UsbGrabRule::autoGrab) — meaningless on a
-                            // device that can't be grabbed at all, so it's
-                            // disabled until the rule is on rather than sitting
-                            // there as a live switch that quietly does nothing.
-                            Switch {
-                                id: deviceAutoGrabSwitch
-                                text: qsTr("Auto-grab")
-                                enabled: deviceCard.modelData.enabled
-                                checked: deviceCard.modelData.autoGrab || false
-                                hoverEnabled: true
-                                onToggled: usbGrabberPage.commitRuleField(deviceCard.modelData.serial,
-                                    deviceCard.modelData.label, "autoGrab", checked)
-                                HoverHandler { cursorShape: Qt.PointingHandCursor; enabled: deviceAutoGrabSwitch.enabled }
-                                HoverBorder {
-                                    anchors.fill: parent
-                                    active: deviceAutoGrabSwitch.enabled && deviceAutoGrabSwitch.hovered
-                                }
-                                ToolTip.visible: hovered
-                                ToolTip.delay: 500
-                                ToolTip.text: qsTr("Grab from this device as soon as it's plugged in, without asking")
-                            }
-                            Switch {
-                                id: deviceEnabledSwitch
-                                checked: deviceCard.modelData.enabled
-                                hoverEnabled: true
-                                onToggled: usbGrabberPage.commitRuleField(deviceCard.modelData.serial,
-                                    deviceCard.modelData.label, "enabled", checked)
-                                HoverHandler { cursorShape: Qt.PointingHandCursor }
-                                HoverBorder { anchors.fill: parent; active: deviceEnabledSwitch.hovered }
-                            }
-                            Button {
-                                id: grabNowButton
-                                text: qsTr("Grab now")
-                                implicitHeight: 22
-                                enabled: deviceCard.modelData.mounted
-                                opacity: enabled ? 1 : 0.35
-                                hoverEnabled: enabled
-                                onClicked: mainPanel.usbGrabberController.triggerManualGrab(deviceCard.modelData.serial)
-                                background: Rectangle {
-                                    radius: AppSettings.borderRadius
-                                    color: "transparent"
-                                    border.width: 1
-                                    border.color: "#3a3a3a"
-                                }
-                                HoverHandler { cursorShape: Qt.PointingHandCursor; enabled: grabNowButton.enabled }
-                                HoverBorder { anchors.fill: parent; active: grabNowButton.hovered }
-                            }
-                            Button {
-                                id: previewGrabButton
-                                text: qsTr("Preview")
-                                implicitHeight: 22
-                                enabled: deviceCard.modelData.mounted
-                                opacity: enabled ? 1 : 0.35
-                                hoverEnabled: enabled
-                                onClicked: usbGrabberPage.requestPreview(deviceCard.modelData.serial)
-                                background: Rectangle {
-                                    radius: AppSettings.borderRadius
-                                    color: "transparent"
-                                    border.width: 1
-                                    border.color: "#3a3a3a"
-                                }
-                                HoverHandler { cursorShape: Qt.PointingHandCursor; enabled: previewGrabButton.enabled }
-                                HoverBorder { anchors.fill: parent; active: previewGrabButton.hovered }
-                            }
-                            Button {
-                                id: forgetDeviceButton
-                                text: qsTr("Forget")
-                                implicitHeight: 22
-                                hoverEnabled: true
-                                onClicked: {
-                                    mainPanel.usbGrabberController.removeRule(deviceCard.modelData.serial)
-                                    usbGrabberPage.refreshDevices()
-                                }
-                                background: Rectangle {
-                                    radius: AppSettings.borderRadius
-                                    color: "transparent"
-                                    border.width: 1
-                                    border.color: "#3a3a3a"
-                                }
-                                HoverHandler { cursorShape: Qt.PointingHandCursor }
-                                HoverBorder { anchors.fill: parent; active: forgetDeviceButton.hovered }
-                            }
-                        }
-
-                        RowLayout {
-                            Layout.fillWidth: true
-                            TextField {
-                                id: deviceExtensionField
-                                Layout.fillWidth: true
-                                placeholderText: qsTr("Extensions (comma-separated, blank = all files)")
-                                text: deviceCard.modelData.extensionFilterText
-                                background: UnderlineField { focused: deviceExtensionField.activeFocus }
-                                onEditingFinished: usbGrabberPage.commitRuleField(deviceCard.modelData.serial,
-                                    deviceCard.modelData.label, "extensionFilter",
-                                    text.split(",").map(s => s.trim()).filter(s => s.length > 0))
-                                // Item 13: editable text needs an I-beam.
-                                HoverHandler { cursorShape: Qt.IBeamCursor }
-                            }
-                            Switch {
-                                id: devicePreserveSwitch
-                                text: qsTr("Preserve folders")
-                                checked: deviceCard.modelData.preserveStructure
-                                hoverEnabled: true
-                                onToggled: usbGrabberPage.commitRuleField(deviceCard.modelData.serial,
-                                    deviceCard.modelData.label, "preserveStructure", checked)
-                                HoverHandler { cursorShape: Qt.PointingHandCursor }
-                                HoverBorder { anchors.fill: parent; active: devicePreserveSwitch.hovered }
-                            }
-                        }
-
-                        UsbRegexField {
-                            Layout.fillWidth: true
-                            pattern: deviceCard.modelData.filenameRegex || ""
-                            controller: mainPanel.usbGrabberController
-                            onCommitted: (newPattern) => usbGrabberPage.commitRuleField(
-                                deviceCard.modelData.serial, deviceCard.modelData.label,
-                                "filenameRegex", newPattern)
-                        }
-
-                        TextField {
-                            id: deviceStartFolderField
-                            Layout.fillWidth: true
-                            placeholderText: qsTr("Start folder (relative to device root, blank = root)")
-                            text: deviceCard.modelData.startFolder || ""
-                            background: UnderlineField { focused: deviceStartFolderField.activeFocus }
-                            onEditingFinished: usbGrabberPage.commitRuleField(deviceCard.modelData.serial,
-                                deviceCard.modelData.label, "startFolder", text)
-                            // Item 13: editable text needs an I-beam.
-                            HoverHandler { cursorShape: Qt.IBeamCursor }
-                        }
-
-                        RowLayout {
-                            Layout.fillWidth: true
-                            Label {
-                                Layout.fillWidth: true
-                                text: qsTr("Destination: %1").arg(
-                                    deviceCard.modelData.destinationFolder || qsTr("vault root"))
-                                color: "#888888"
-                                font.pixelSize: 11
-                                elide: Text.ElideMiddle
-                            }
-                            Item {
-                                id: deviceDestinationButton
-                                Layout.preferredWidth: 28
-                                Layout.preferredHeight: 28
-                                HoverHandler { id: deviceDestinationHover; cursorShape: Qt.PointingHandCursor }
-                                TapHandler {
-                                    onTapped: {
-                                        const sub = deviceCard.modelData.destinationFolder
-                                        usbDestinationFolderDialog.targetSerial = deviceCard.modelData.serial
-                                        usbDestinationFolderDialog.targetLabel = deviceCard.modelData.label
-                                        usbDestinationFolderDialog.currentFolder =
-                                            "file://" + mainPanel.vaultLocalPath + (sub ? "/" + sub : "")
-                                        usbDestinationFolderDialog.open()
-                                    }
-                                }
-                                Rectangle {
-                                    anchors.fill: parent
-                                    radius: AppSettings.borderRadius
-                                    color: deviceDestinationHover.hovered ? "#3a3a3a" : "#2a2a2a"
-                                }
-                                HoverBorder { anchors.fill: parent; active: deviceDestinationHover.hovered }
-                                ToolTip.visible: deviceDestinationHover.hovered
-                                ToolTip.text: qsTr("Choose destination folder")
-                                ToolTip.delay: 500
-                                AppIcon { anchors.centerIn: parent; name: "folder"; iconSize: 13; color: "#dddddd" }
-                            }
-                        }
-
-                        // Grab preview — rendered right under whichever device's
-                        // "Preview" button was last clicked (see
-                        // usbGrabberPage.requestPreview()/previewDeviceSerial),
-                        // styled like SettingsPopup.qml's combine-rule preview
-                        // cards (dark card, rich-text lines, per-status color).
-                        ColumnLayout {
-                            Layout.fillWidth: true
-                            spacing: 4
-                            visible: deviceCard.modelData.serial === usbGrabberPage.previewDeviceSerial
-
-                            // Preview header. The dismiss control lives HERE
-                            // rather than inside the results card below so it's
-                            // reachable in every preview state — scanning,
-                            // refused, empty, and results — not only the one
-                            // that happened to find files. Nothing else ever
-                            // takes the panel down (deliberately: it survives
-                            // the 2.5s device poll, see previewDeviceSerial),
-                            // so without this the only way out was previewing a
-                            // different device or leaving the page.
-                            RowLayout {
-                                Layout.fillWidth: true
-                                spacing: 4
-
-                                Label {
-                                    Layout.fillWidth: true
-                                    text: qsTr("Preview")
-                                    color: "#888888"
-                                    font.pixelSize: 11
-                                }
-                                Item {
-                                    id: dismissPreviewButton
-                                    Layout.preferredWidth: 20
-                                    Layout.preferredHeight: 20
-
-                                    HoverHandler {
-                                        id: dismissPreviewHover
-                                        cursorShape: Qt.PointingHandCursor
-                                    }
-                                    TapHandler { onTapped: usbGrabberPage.dismissPreview() }
-                                    HoverBorder { anchors.fill: parent; active: dismissPreviewHover.hovered }
-                                    AppIcon {
-                                        anchors.centerIn: parent
-                                        name: "close"
-                                        iconSize: 13
-                                        color: "#dddddd"
-                                    }
-                                    ToolTip.visible: dismissPreviewHover.hovered
-                                    ToolTip.delay: 500
-                                    ToolTip.text: qsTr("Dismiss preview")
-                                }
-                            }
-
-                            Label {
-                                visible: usbGrabberPage.previewRunning
-                                text: qsTr("Scanning…")
-                                color: "#888888"
-                                font.pixelSize: 11
-                            }
-                            Label {
-                                Layout.fillWidth: true
-                                visible: !usbGrabberPage.previewRunning && usbGrabberPage.previewError !== ""
-                                text: usbGrabberPage.previewError
-                                color: "#e07a7a"
-                                font.pixelSize: 11
-                                wrapMode: Text.WordWrap
-                            }
-                            Label {
-                                visible: !usbGrabberPage.previewRunning && usbGrabberPage.previewError === ""
-                                        && usbGrabberPage.previewEntries.length === 0
-                                text: qsTr("No files found.")
-                                color: "#888888"
-                                font.pixelSize: 11
-                            }
-                            Rectangle {
-                                Layout.fillWidth: true
-                                Layout.preferredHeight: previewCardColumn.implicitHeight + 12
-                                visible: !usbGrabberPage.previewRunning && usbGrabberPage.previewEntries.length > 0
-                                radius: AppSettings.borderRadius
-                                color: "#1e1e1e"
-                                border.width: 1
-                                border.color: "#3a3a3a"
-
-                                ColumnLayout {
-                                    id: previewCardColumn
-                                    anchors.fill: parent
-                                    anchors.margins: 6
-                                    spacing: 2
-
-                                    Label {
-                                        Layout.fillWidth: true
-                                        text: usbGrabberPage.previewSummary(usbGrabberPage.previewEntries)
-                                        color: "#dddddd"
-                                        font.pixelSize: 11
-                                        wrapMode: Text.WordWrap
-                                    }
-                                    TextEdit {
-                                        Layout.fillWidth: true
-                                        wrapMode: Text.WordWrap
-                                        readOnly: true
-                                        selectByMouse: true
-                                        selectionColor: Qt.rgba(0.35, 0.55, 0.85, 0.5)
-                                        color: "#dddddd"
-                                        font.pixelSize: 10
-                                        textFormat: Text.RichText
-                                        text: usbGrabberPage.previewHtml(usbGrabberPage.previewEntries)
-                                        // Item 13: selectable text needs an I-beam.
-                                        HoverHandler { cursorShape: Qt.IBeamCursor }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-
-                Label {
-                    text: qsTr("History")
-                    color: "#cccccc"
-                    font.pixelSize: 13
-                }
-
-                Label {
-                    Layout.fillWidth: true
-                    visible: usbGrabberPage.historyEntries.length === 0
-                    text: qsTr("No grabs yet.")
-                    color: "#888888"
-                    font.pixelSize: 11
-                }
-
-                Repeater {
-                    model: usbGrabberPage.historyEntries
-
-                    delegate: ColumnLayout {
-                        id: historyCard
-                        required property var modelData
-
-                        Layout.fillWidth: true
-                        spacing: 2
-
-                        Rectangle {
-                            Layout.fillWidth: true
-                            Layout.preferredHeight: 1
-                            color: "#2a2a2a"
-                        }
-
-                        RowLayout {
-                            Layout.fillWidth: true
-                            Label {
-                                text: usbGrabberPage.formatTimestamp(historyCard.modelData.timestamp)
-                                color: "#888888"
-                                font.pixelSize: 11
-                            }
-                            Label {
-                                Layout.fillWidth: true
-                                text: historyCard.modelData.deviceLabel || historyCard.modelData.deviceSerial
-                                color: "white"
-                                font.pixelSize: 11
-                                elide: Text.ElideRight
-                            }
-                            Label {
-                                text: qsTr("%1 copied, %2 skipped").arg(historyCard.modelData.filesCopied)
-                                    .arg(historyCard.modelData.filesSkipped)
-                                color: "#cccccc"
-                                font.pixelSize: 11
-                            }
-                        }
-
-                        Label {
-                            Layout.fillWidth: true
-                            visible: (historyCard.modelData.errors || []).length > 0
-                            text: (historyCard.modelData.errors || []).join("; ")
-                            color: "#e07a7a"
-                            font.pixelSize: 11
-                            wrapMode: Text.WordWrap
-                        }
-                    }
-                }
-            }
-        }
-
-        // Shared by both the catch-all card and every per-device card's
-        // destination-folder button above — targetSerial/targetLabel record
-        // which rule to commit into on accept (mirrors recordingFolderDialog's
-        // single-shared-dialog shape further below).
-        FolderDialog {
-            id: usbDestinationFolderDialog
-            property string targetSerial: ""
-            property string targetLabel: ""
-            onAccepted: {
-                const localPath = usbDestinationFolderDialog.selectedFolder.toString().replace("file://", "")
-                const relative = usbGrabberPage.relativeToVault(localPath)
-                if (relative === null) {
-                    usbGrabberPage.destinationFolderError =
-                        qsTr("That folder is outside the vault — pick a location inside it.")
-                    return
-                }
-                usbGrabberPage.destinationFolderError = ""
-                usbGrabberPage.commitRuleField(usbDestinationFolderDialog.targetSerial,
-                    usbDestinationFolderDialog.targetLabel, "destinationFolder", relative)
-            }
-        }
+        visible: mainPanel.usbGrabberOpen
+        usbGrabberController: mainPanel.usbGrabberController
+        vaultLocalPath: mainPanel.vaultLocalPath
+        vaultTreeModel: mainPanel.vaultTreeModel
     }
 
     // Item 2 (delete): reached ONLY when the trash refused the open file — a

@@ -121,6 +121,22 @@ void UsbGrabberController::setCombineRules(const QVariantList &rules)
     emit combineRulesChanged();
 }
 
+void UsbGrabberController::setAutoCombineAfterGrab(bool on)
+{
+    if (on == m_autoCombineAfterGrab)
+        return;
+    m_autoCombineAfterGrab = on;
+    emit autoCombineAfterGrabChanged();
+}
+
+void UsbGrabberController::setDeleteOriginalsAfterCombine(bool on)
+{
+    if (on == m_deleteOriginalsAfterCombine)
+        return;
+    m_deleteOriginalsAfterCombine = on;
+    emit deleteOriginalsAfterCombineChanged();
+}
+
 void UsbGrabberController::setLastError(const QString &error)
 {
     if (error == m_lastError)
@@ -323,8 +339,14 @@ void UsbGrabberController::startGrabJob(const UsbGrabRule &rule, const QString &
         QUrl::fromLocalFile(m_vaultTreeModel->vaultLocalPath()), autoTriggered, m_combineRules);
 
     m_inFlightJobs.insert(jobId, InFlightGrab { rule.deviceSerial, rule.deviceLabel, autoTriggered });
-    if (autoTriggered)
+    if (autoTriggered) {
+        // A fresh batch starts clean; auto-grabs that join a batch already in
+        // flight must NOT reset it (an earlier one may have already gone dirty).
+        // "Fresh" = the pending set was empty before this insert.
+        if (m_pendingAutoGrabJobIds.isEmpty())
+            m_autoBatchClean = true;
         m_pendingAutoGrabJobIds.insert(jobId);
+    }
 }
 
 void UsbGrabberController::handleUsbGrabFinished(int jobId, int filesCopied, int filesSkipped,
@@ -342,6 +364,14 @@ void UsbGrabberController::handleUsbGrabFinished(int jobId, int filesCopied, int
     // succeeded — see autoGrabsSettled()'s doc comment.
     const bool wasPendingAuto = m_pendingAutoGrabJobIds.remove(jobId);
     const bool settled = wasPendingAuto && m_pendingAutoGrabJobIds.isEmpty();
+
+    // A cancelled, aborted, or errored auto-grab makes the batch dirty: the part
+    // set it left on disk may be incomplete, so the auto-combine must not trust
+    // it (see m_autoBatchClean). errors is non-empty for exactly the mid-grab
+    // unplug case — copyGrabbedFile() reports "Incomplete copy — was the device
+    // removed?" per file, and the walk keeps going (an unplug is not a cancel).
+    if (wasPendingAuto && (cancelled || !errors.isEmpty()))
+        m_autoBatchClean = false;
 
     // A cancelled grab's counts are a partial tally — recording it in history
     // or announcing it would misreport a run the user stopped as a completed
@@ -370,7 +400,7 @@ void UsbGrabberController::handleUsbGrabFinished(int jobId, int filesCopied, int
     // Last, so the auto-combine it kicks off is enqueued behind nothing and
     // every grabFinished for the batch has already been delivered.
     if (settled)
-        emit autoGrabsSettled();
+        onAutoGrabBatchSettled();
 }
 
 void UsbGrabberController::reconcileInFlightJobs()
@@ -404,13 +434,70 @@ void UsbGrabberController::reconcileInFlightJobs()
         // queued, cancelAll, and any future removal path, none of which can
         // forget to call it. A completed job is already out of m_inFlightJobs
         // by the time its queueChanged lands, so this never double-retires one.
-        if (m_pendingAutoGrabJobIds.remove(it.key()) && m_pendingAutoGrabJobIds.isEmpty())
-            settled = true;
+        if (m_pendingAutoGrabJobIds.remove(it.key())) {
+            // Cancel-while-queued is a dirty outcome too: the grab never ran, so
+            // whatever parts are on disk are certainly not this run's doing and
+            // the set can't be trusted as complete — no auto-combine.
+            m_autoBatchClean = false;
+            if (m_pendingAutoGrabJobIds.isEmpty())
+                settled = true;
+        }
         it = m_inFlightJobs.erase(it);
     }
 
     if (settled)
-        emit autoGrabsSettled();
+        onAutoGrabBatchSettled();
+}
+
+void UsbGrabberController::onAutoGrabBatchSettled()
+{
+    // The barrier signal fires for every settled batch, clean or dirty — it
+    // reports that the auto-grabs are DONE, which callers/tests rely on
+    // independent of whether anything combines.
+    emit autoGrabsSettled();
+
+    // The combine, however, only runs for a CLEAN batch: a cancelled/aborted/
+    // errored grab may have left a truncated part set on disk, and merging that
+    // would silently drop the recording's tail (see m_autoBatchClean).
+    if (m_autoBatchClean)
+        maybeAutoCombineAfterGrab();
+}
+
+void UsbGrabberController::maybeAutoCombineAfterGrab()
+{
+    if (!m_autoCombineAfterGrab || m_combineRules.isEmpty())
+        return;
+    if (!m_vaultTreeModel || !m_transcriptionController || m_vaultTreeModel->vaultLocalPath().isEmpty())
+        return;
+
+    // Load-bearing refresh (moved here from Main.qml): allAudioPaths() reads the
+    // in-memory tree, which a filesystem WATCHER refreshes asynchronously — and
+    // not at all for subfolders the grab just created. Scanning without this
+    // would routinely decide against a tree that predates the grabbed files and
+    // silently find nothing to combine.
+    m_vaultTreeModel->refresh();
+    const QStringList audioPaths = m_vaultTreeModel->allAudioPaths();
+
+    // Count the ready groups only to know whether (and how loudly) to announce —
+    // runCombineScan() re-derives and enqueues them itself, rule-driven and
+    // 'ready'-gated exactly like the manual combine button.
+    int readyCount = 0;
+    const QVariantList groups = m_transcriptionController->detectCombineGroups(m_combineRules, audioPaths);
+    for (const QVariant &groupVar : groups) {
+        if (groupVar.toMap().value(QStringLiteral("status")).toString() == QStringLiteral("ready"))
+            ++readyCount;
+    }
+    if (readyCount == 0)
+        return;
+
+    m_transcriptionController->runCombineScan(m_combineRules, audioPaths,
+                                              QUrl::fromLocalFile(m_vaultTreeModel->vaultLocalPath()),
+                                              m_deleteOriginalsAfterCombine);
+
+    // The one combine the user didn't click: announced so a merge that moves
+    // their originals into .combined/ never just happens with no account of
+    // itself. The notification itself is QML's (a view concern).
+    emit autoCombineStarted(readyCount);
 }
 
 void UsbGrabberController::requestGrabPreview(const QString &deviceSerial)

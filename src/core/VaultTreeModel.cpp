@@ -3,6 +3,7 @@
 #include "AudioExtensions.h"
 #include "FileRename.h"
 
+#include <QDateTime>
 #include <QDir>
 #include <QFile>
 #include <QSaveFile>
@@ -50,7 +51,18 @@ VaultTreeModel::VaultTreeModel(QObject *parent)
     , m_root(std::make_unique<Node>())
 {
     m_root->isDir = true;
-    connect(&m_watcher, &QFileSystemWatcher::directoryChanged, this, &VaultTreeModel::rebuild);
+    // A single vault mutation (esp. a multi-file move, which dirties both the
+    // source and destination dirs per file) fires many directoryChanged events
+    // in a burst. Rebuilding on each one is a full model reset apiece — N-file
+    // move => ~2N resets, each triggering a full-vault walk + proxy re-sort +
+    // whole-tree re-expand in Sidebar.qml. Coalesce the burst into one rebuild.
+    m_rebuildDebounce.setSingleShot(true);
+    m_rebuildDebounce.setInterval(50);
+    // Lambda, not a PMF connect: rebuild() now takes a defaulted argument and
+    // the new-style connect does not honour default arguments.
+    connect(&m_rebuildDebounce, &QTimer::timeout, this, [this] { rebuild(); });
+    connect(&m_watcher, &QFileSystemWatcher::directoryChanged,
+            this, [this] { m_rebuildDebounce.start(); });
 }
 
 QUrl VaultTreeModel::vaultPath() const
@@ -69,7 +81,9 @@ void VaultTreeModel::setVaultPath(const QUrl &url)
         return;
     m_vaultPath = url;
     emit vaultPathChanged();
-    rebuild();
+    // Force: switching between two empty vaults is structurally identical, but
+    // the view must still reset onto the new root.
+    rebuild(true);
 }
 
 void VaultTreeModel::setPendingCombines(const QVariantList &pending)
@@ -128,19 +142,17 @@ void VaultTreeModel::appendCombinePlaceholders(Node *parent, const QString &dirP
     }
 }
 
-void VaultTreeModel::rebuild()
+void VaultTreeModel::rebuild(bool forceReset)
 {
-    beginResetModel();
-
-    m_root = std::make_unique<Node>();
-    m_root->isDir = true;
-
-    if (!m_watcher.directories().isEmpty())
-        m_watcher.removePaths(m_watcher.directories());
+    // Scan into a DETACHED tree first — the reset can't be opened until we know
+    // whether anything actually changed. See the header for why.
+    auto fresh = std::make_unique<Node>();
+    fresh->isDir = true;
 
     const QString rootPath = m_vaultPath.toLocalFile();
+    // Hoisted above the block so the watcher update after the scan can see it.
+    QStringList watchedDirs;
     if (!rootPath.isEmpty() && QFileInfo::exists(rootPath)) {
-        QStringList watchedDirs;
         watchedDirs << rootPath;
 
         QDir dir(rootPath);
@@ -161,9 +173,9 @@ void VaultTreeModel::rebuild()
 
         for (const QFileInfo &entry : entries) {
             if (entry.isDir()) {
-                auto child = scanDirectory(entry.absoluteFilePath(), m_root.get());
+                auto child = scanDirectory(entry.absoluteFilePath(), fresh.get());
                 watchedDirs << child->path;
-                m_root->children.push_back(std::move(child));
+                fresh->children.push_back(std::move(child));
             } else if (isHiddenByPendingCombine(entry.absoluteFilePath())) {
                 // A pending combine's source, or its half-written output —
                 // the placeholder below stands for the lot. Note this is
@@ -179,9 +191,13 @@ void VaultTreeModel::rebuild()
                 leaf->path = entry.absoluteFilePath();
                 leaf->isAudio = true;
                 const QString mdPath = entry.absolutePath() + '/' + entry.fileName() + ".md";
-                leaf->status = QFileInfo::exists(mdPath) ? TranscribedStatus : UntranscribedStatus;
-                leaf->parent = m_root.get();
-                m_root->children.push_back(std::move(leaf));
+                const QFileInfo mdInfo(mdPath);
+                leaf->status = mdInfo.exists() ? TranscribedStatus : UntranscribedStatus;
+                // Same stat, one extra field — lets rebuild() refresh a row whose
+                // transcript changed without resetting the whole model.
+                leaf->mdModified = mdInfo.exists() ? mdInfo.lastModified().toMSecsSinceEpoch() : 0;
+                leaf->parent = fresh.get();
+                fresh->children.push_back(std::move(leaf));
             } else if (entry.suffix().toLower() == "md" && !audioBaseNames.contains(entry.completeBaseName())) {
                 auto leaf = std::make_unique<Node>();
                 leaf->name = entry.fileName();
@@ -189,16 +205,85 @@ void VaultTreeModel::rebuild()
                 leaf->isAudio = false;
                 leaf->isOrphanedMd = true;
                 leaf->status = OrphanedMdStatus;
-                leaf->parent = m_root.get();
-                m_root->children.push_back(std::move(leaf));
+                leaf->mdModified = entry.lastModified().toMSecsSinceEpoch();
+                leaf->parent = fresh.get();
+                fresh->children.push_back(std::move(leaf));
             }
         }
 
-        appendCombinePlaceholders(m_root.get(), rootPath);
-        m_watcher.addPaths(watchedDirs);
+        appendCombinePlaceholders(fresh.get(), rootPath);
     }
 
+    // Watched dirs track the filesystem regardless of whether the MODEL changed
+    // — a rescan that found nothing structural still has to keep watching.
+    if (!m_watcher.directories().isEmpty())
+        m_watcher.removePaths(m_watcher.directories());
+    if (!watchedDirs.isEmpty())
+        m_watcher.addPaths(watchedDirs);
+
+    if (!forceReset && sameStructure(fresh.get(), m_root.get())) {
+        // Nothing structural changed — this is the common case for the watcher
+        // echo of a delete/undo we already rebuilt for synchronously. Refresh
+        // any row whose sidecar .md was rewritten in place, and leave every
+        // delegate, expansion state and scroll position alone.
+        emitContentChanges(fresh.get(), m_root.get());
+        return;
+    }
+
+    beginResetModel();
+    m_root = std::move(fresh);
     endResetModel();
+}
+
+bool VaultTreeModel::sameStructure(const Node *a, const Node *b)
+{
+    if (!a || !b)
+        return a == b;
+    if (a->name != b->name || a->path != b->path || a->isDir != b->isDir
+        || a->isAudio != b->isAudio || a->isOrphanedMd != b->isOrphanedMd
+        || a->isCombinePlaceholder != b->isCombinePlaceholder
+        || a->combineSourceCount != b->combineSourceCount)
+        return false;
+    if (a->children.size() != b->children.size())
+        return false;
+    for (size_t i = 0; i < a->children.size(); ++i) {
+        if (!sameStructure(a->children[i].get(), b->children[i].get()))
+            return false;
+    }
+    return true;
+}
+
+void VaultTreeModel::emitContentChanges(const Node *fresh, Node *current)
+{
+    int first = -1;
+    int last = -1;
+    for (size_t i = 0; i < current->children.size(); ++i) {
+        Node *cur = current->children[i].get();
+        const Node *nf = fresh->children[i].get();
+        if (cur->mdModified != nf->mdModified || cur->status != nf->status) {
+            cur->mdModified = nf->mdModified;
+            // Status is deliberately NOT part of sameStructure(): a sidecar
+            // appearing or disappearing changes this row's indicator colour,
+            // never the tree's shape. Refresh it in place so a finished
+            // transcription (or a Delete transcript) never resets the model
+            // and never costs the tree its expansion state and scroll offset.
+            cur->status = nf->status;
+            if (first < 0)
+                first = int(i);
+            last = int(i);
+        }
+        emitContentChanges(nf, cur);
+    }
+    if (first < 0)
+        return;
+    // One dataChanged spanning the changed range, not one per row — the roles
+    // that read the .md are LabelRole/TagsRole/SpeakersRole/TranscriptBodyRole,
+    // plus StatusRole for a sidecar appearing/disappearing (transcribed dot),
+    // which is intentionally content-not-structure here (see sameStructure());
+    // everything else came from the structure we just proved equal.
+    const QModelIndex parent = indexForNode(current);
+    emit dataChanged(index(first, 0, parent), index(last, 0, parent),
+                     {StatusRole, LabelRole, TagsRole, SpeakersRole, TranscriptBodyRole});
 }
 
 std::unique_ptr<VaultTreeModel::Node> VaultTreeModel::scanDirectory(const QString &dirPath, Node *parent) const
@@ -232,7 +317,10 @@ std::unique_ptr<VaultTreeModel::Node> VaultTreeModel::scanDirectory(const QStrin
             leaf->path = entry.absoluteFilePath();
             leaf->isAudio = true;
             const QString mdPath = entry.absolutePath() + '/' + entry.fileName() + ".md";
-            leaf->status = QFileInfo::exists(mdPath) ? TranscribedStatus : UntranscribedStatus;
+            const QFileInfo mdInfo(mdPath);
+            leaf->status = mdInfo.exists() ? TranscribedStatus : UntranscribedStatus;
+            // Same stat, one extra field — see rebuild()'s identical branch.
+            leaf->mdModified = mdInfo.exists() ? mdInfo.lastModified().toMSecsSinceEpoch() : 0;
             leaf->parent = node.get();
             node->children.push_back(std::move(leaf));
         } else if (entry.suffix().toLower() == "md" && !audioBaseNames.contains(entry.completeBaseName())) {
@@ -242,6 +330,7 @@ std::unique_ptr<VaultTreeModel::Node> VaultTreeModel::scanDirectory(const QStrin
             leaf->isAudio = false;
             leaf->isOrphanedMd = true;
             leaf->status = OrphanedMdStatus;
+            leaf->mdModified = entry.lastModified().toMSecsSinceEpoch();
             leaf->parent = node.get();
             node->children.push_back(std::move(leaf));
         }
@@ -301,6 +390,16 @@ QString VaultTreeModel::frontmatterField(const QString &mdPath, const QString &k
     }
     m_frontmatterCache[mdPath] = CachedFrontmatter{mtimeMs, size, fields};
     return fields.value(key);
+}
+
+VaultTreeModel::Status VaultTreeModel::effectiveStatus(const Node *node) const
+{
+    if (node->status != TranscribedStatus)
+        return node->status;
+    const QString mdPath = sidecarMdPath(node);
+    if (!mdPath.isEmpty() && frontmatterField(mdPath, QStringLiteral("partial")) == QLatin1String("true"))
+        return PartialStatus;
+    return TranscribedStatus;
 }
 
 // Mirrors TranscriptionController::readTranscriptBody(). Item P12: cached
@@ -404,7 +503,7 @@ QVariant VaultTreeModel::data(const QModelIndex &index, int role) const
     case IsAudioRole:
         return node->isAudio;
     case StatusRole:
-        return static_cast<int>(node->status);
+        return static_cast<int>(effectiveStatus(node));
     case IsOrphanedMdRole:
         return node->isOrphanedMd;
     case IsCombinePlaceholderRole:
@@ -468,37 +567,58 @@ bool VaultTreeModel::renameFile(const QUrl &fileUrl, const QString &newBaseName,
     return true;
 }
 
-QString VaultTreeModel::importDestinationFor(const QUrl &fileUrl, QString *errorOut) const
+QVariantMap VaultTreeModel::inspectImportCandidate(const QUrl &fileUrl) const
 {
-    auto fail = [&](const QString &msg) {
-        if (errorOut)
-            *errorOut = msg;
-        return QString();
+    auto make = [](const char *reason, const QString &dest, const QString &name) {
+        return QVariantMap{{QStringLiteral("reason"), QString::fromLatin1(reason)},
+                           {QStringLiteral("dest"), dest},
+                           {QStringLiteral("name"), name}};
     };
-
-    const QString localPath = vaultLocalPath();
-    if (localPath.isEmpty())
-        return fail(QStringLiteral("No vault is open."));
 
     const QString sourcePath = fileUrl.toLocalFile();
     const QFileInfo sourceInfo(sourcePath);
+    const QString name = sourceInfo.fileName();
+
+    const QString localPath = vaultLocalPath();
+    if (localPath.isEmpty())
+        return make("no-vault", QString(), name);
     if (!sourceInfo.exists() || !sourceInfo.isFile())
-        return fail(QStringLiteral("Not a file: %1").arg(sourceInfo.fileName()));
+        return make("not-a-file", QString(), name);
     if (!isAudioFile(sourceInfo))
-        return fail(QStringLiteral("Not a recognized audio file: %1").arg(sourceInfo.fileName()));
+        return make("not-audio", QString(), name);
 
     const QString destPath = localPath + '/' + sourceInfo.fileName();
     if (QFileInfo::exists(destPath))
-        return fail(QStringLiteral("\"%1\" already exists in the vault.").arg(sourceInfo.fileName()));
+        return make("collision", destPath, name);
+    return make("ok", destPath, name);
+}
 
+QString VaultTreeModel::importDestinationFor(const QUrl &fileUrl, QString *errorOut) const
+{
     // No copy here — the actual (potentially slow, on a large file) byte-copy
     // runs on TranscriptionController's worker thread (see importAudio()), and
     // the new file appearing in the watched vault dir fires
     // QFileSystemWatcher::directoryChanged -> rebuild(), refreshing the tree
     // without an explicit rebuild() on this (const) validation path.
-    if (errorOut)
-        errorOut->clear();
-    return destPath;
+    const QVariantMap v = inspectImportCandidate(fileUrl);
+    const QString reason = v.value(QStringLiteral("reason")).toString();
+    const QString name = v.value(QStringLiteral("name")).toString();
+    if (reason == QLatin1String("ok")) {
+        if (errorOut)
+            errorOut->clear();
+        return v.value(QStringLiteral("dest")).toString();
+    }
+    if (errorOut) {
+        if (reason == QLatin1String("no-vault"))
+            *errorOut = QStringLiteral("No vault is open.");
+        else if (reason == QLatin1String("not-a-file"))
+            *errorOut = QStringLiteral("Not a file: %1").arg(name);
+        else if (reason == QLatin1String("not-audio"))
+            *errorOut = QStringLiteral("Not a recognized audio file: %1").arg(name);
+        else // collision
+            *errorOut = QStringLiteral("\"%1\" already exists in the vault.").arg(name);
+    }
+    return QString();
 }
 
 bool VaultTreeModel::createFolder(const QUrl &parentDirUrl, const QString &name)
@@ -782,6 +902,74 @@ void VaultTreeModel::applyRestoreOutcome(const QStringList &restoredPaths)
     emitRestored(restoredPaths);
 }
 
+void VaultTreeModel::applyRenameOutcome(const QUrl &oldUrl, const QUrl &newUrl)
+{
+    const QString oldPath = oldUrl.toLocalFile();
+    const QString newPath = newUrl.toLocalFile();
+    if (oldPath.isEmpty() || newPath.isEmpty() || oldPath == newPath)
+        return;
+
+    Node *node = findNodeByPath(m_root.get(), oldPath);
+    // Unknown to the tree (e.g. spoken for by a pending combine, or a folder
+    // rename which routes elsewhere): leave the watcher rebuild to reconcile.
+    if (!node || !node->parent)
+        return;
+
+    Node *parent = node->parent;
+    std::vector<std::unique_ptr<Node>> &siblings = parent->children;
+
+    int oldRow = -1;
+    for (size_t i = 0; i < siblings.size(); ++i) {
+        if (siblings[i].get() == node) {
+            oldRow = int(i);
+            break;
+        }
+    }
+    if (oldRow < 0)
+        return;
+
+    node->name = QFileInfo(newPath).fileName();
+    node->path = newPath;
+
+    // The row's new slot, matching scanDirectory()'s QDir::DirsFirst | QDir::Name
+    // (case-sensitive) order: count the siblings that sort BEFORE the renamed
+    // node. All others are already in that order and only this node's name
+    // changed, so a single forward scan gives the insertion index.
+    int newRow = 0;
+    for (size_t i = 0; i < siblings.size(); ++i) {
+        if (int(i) == oldRow)
+            continue;
+        const Node *other = siblings[i].get();
+        const bool otherSortsFirst =
+            (other->isDir != node->isDir)
+                ? other->isDir
+                : other->name.compare(node->name, Qt::CaseSensitive) < 0;
+        if (otherSortsFirst)
+            ++newRow;
+        else
+            break;
+    }
+
+    const QModelIndex parentIdx = indexForNode(parent);
+    if (newRow != oldRow) {
+        // beginMoveRows' destinationChild is in PRE-move coordinates: moving
+        // down shifts by one because the source row vacates first.
+        const int dest = (newRow > oldRow) ? newRow + 1 : newRow;
+        if (beginMoveRows(parentIdx, oldRow, oldRow, parentIdx, dest)) {
+            std::unique_ptr<Node> owned = std::move(siblings[oldRow]);
+            siblings.erase(siblings.begin() + oldRow);
+            siblings.insert(siblings.begin() + newRow, std::move(owned));
+            endMoveRows();
+        }
+    }
+
+    // Repaint the row's text at its (possibly new) position. All roles, since
+    // both the display name and the path changed.
+    const QModelIndex idx = indexForNode(node);
+    if (idx.isValid())
+        emit dataChanged(idx, idx);
+}
+
 QStringList VaultTreeModel::vaultFolders() const
 {
     QStringList out;
@@ -866,14 +1054,14 @@ bool VaultTreeModel::writeVaultSettings(const QVariantMap &settings, QString *er
     return true;
 }
 
-QVariantList VaultTreeModel::readUsbGrabHistory() const
+QVariantList VaultTreeModel::readHistoryFile(const QString &fileName) const
 {
     QVariantList result;
     const QString localPath = vaultLocalPath();
     if (localPath.isEmpty())
         return result;
 
-    QFile file(localPath + QStringLiteral("/.transcriber/usbGrabHistory.json"));
+    QFile file(localPath + QStringLiteral("/.transcriber/") + fileName);
     if (!file.open(QIODevice::ReadOnly))
         return result;
 
@@ -883,7 +1071,7 @@ QVariantList VaultTreeModel::readUsbGrabHistory() const
     return doc.array().toVariantList();
 }
 
-bool VaultTreeModel::appendUsbGrabHistoryEntry(const QVariantMap &entry, QString *errorOut) const
+bool VaultTreeModel::appendHistoryEntry(const QString &fileName, const QVariantMap &entry, QString *errorOut) const
 {
     const QString localPath = vaultLocalPath();
     if (localPath.isEmpty()) {
@@ -899,7 +1087,7 @@ bool VaultTreeModel::appendUsbGrabHistoryEntry(const QVariantMap &entry, QString
         return false;
     }
 
-    const QString historyPath = configDir.filePath(QStringLiteral("usbGrabHistory.json"));
+    const QString historyPath = configDir.filePath(fileName);
 
     QJsonArray history;
     QFile readFile(historyPath);
@@ -927,6 +1115,26 @@ bool VaultTreeModel::appendUsbGrabHistoryEntry(const QVariantMap &entry, QString
         return false;
     }
     return true;
+}
+
+QVariantList VaultTreeModel::readUsbGrabHistory() const
+{
+    return readHistoryFile(QStringLiteral("usbGrabHistory.json"));
+}
+
+bool VaultTreeModel::appendUsbGrabHistoryEntry(const QVariantMap &entry, QString *errorOut) const
+{
+    return appendHistoryEntry(QStringLiteral("usbGrabHistory.json"), entry, errorOut);
+}
+
+QVariantList VaultTreeModel::readCombineHistory() const
+{
+    return readHistoryFile(QStringLiteral("combineHistory.json"));
+}
+
+bool VaultTreeModel::appendCombineHistoryEntry(const QVariantMap &entry, QString *errorOut) const
+{
+    return appendHistoryEntry(QStringLiteral("combineHistory.json"), entry, errorOut);
 }
 
 QVariantMap VaultTreeModel::readBenchmarkLastRun() const
@@ -1054,7 +1262,7 @@ void VaultTreeModel::collectSearchResults(const Node *node, const QString &query
             entry[QStringLiteral("path")] = node->path;
             entry[QStringLiteral("name")] = node->name;
             entry[QStringLiteral("label")] = label;
-            entry[QStringLiteral("status")] = static_cast<int>(node->status);
+            entry[QStringLiteral("status")] = static_cast<int>(effectiveStatus(node));
             entry[QStringLiteral("isAudio")] = node->isAudio;
             entry[QStringLiteral("isOrphanedMd")] = node->isOrphanedMd;
             entry[QStringLiteral("transcriptBody")] = body;

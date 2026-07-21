@@ -653,7 +653,7 @@ Item {
         // reads without the filename getting truncated mid-word — the kind
         // badge (~62) and status label (~96) are fixed, so the earlier 360
         // left the fillWidth filename too little room.
-        width: 480
+        width: 560
         // Item 21: one deliberate, symmetric inner padding used BOTH as the
         // ColumnLayout's margin (below) AND in this height calc, so the gap
         // below the task list is exactly the gap above the header/Clear-button
@@ -665,8 +665,8 @@ Item {
         // exceed the window; the inner ScrollView's own Layout.preferredHeight
         // cap (below) keeps rows scrollable well before this outer cap is hit
         // in practice, but the cap is still a needed hard backstop.
-        readonly property int innerPadding: 8
-        height: Math.min(jobColumn.implicitHeight + 2 * innerPadding, 500)
+        readonly property int innerPadding: 14
+        height: Math.min(jobColumn.implicitHeight + 2 * innerPadding, 600)
         // Item: the height calc above assumes jobColumn (anchors.fill parent +
         // margins:innerPadding) spans the WHOLE popup, so the popup's own
         // default padding must be zeroed. Left at the style default (nonzero),
@@ -694,13 +694,23 @@ Item {
             border.color: "#3a3a3a"
         }
 
+        // While this popup is up it IS the task surface: task-related
+        // snackbars are redundant with the rows below and, worse, render over
+        // them (SnackbarHost sits at z:1001 on the overlay). Same Binding-onto-
+        // a-singleton idiom SnackbarHost uses for Notifications.paused.
+        Binding {
+            target: Notifications
+            property: "tasksPopupOpen"
+            value: jobListPopup.visible
+        }
+
         ColumnLayout {
             id: jobColumn
             anchors.fill: parent
             // Item 21: symmetric with the popup height's 2*innerPadding, so
             // the padding below the list equals the padding above the header.
             anchors.margins: jobListPopup.innerPadding
-            spacing: 4
+            spacing: 8
 
             RowLayout {
                 id: taskHeaderRow
@@ -817,7 +827,7 @@ Item {
                 // intrinsic size, which collapsed the whole popup down to
                 // just the header row. Deriving from the ListView's real
                 // contentHeight (capped) breaks that cycle.
-                Layout.preferredHeight: Math.min(jobListView.contentHeight, 200)
+                Layout.preferredHeight: Math.min(jobListView.contentHeight, 320)
                 clip: true
                 ScrollBar.horizontal.policy: ScrollBar.AlwaysOff
 
@@ -901,7 +911,9 @@ Item {
                         required property var modelData
                         required property int index
                         width: entryColumn.width
-                        height: 24
+                        // Grow to fit a wrapped kind badge (kindLabel wraps to
+                        // at most 2 lines); single-line rows stay at 24.
+                        height: Math.max(24, kindLabel.implicitHeight + 6)
 
                         // Role within entryColumn: a batch's header is index 0
                         // (aggregate row), its members index > 0; a standalone
@@ -931,6 +943,17 @@ Item {
                                 case "embedding": return qsTr("speaker embedding model")
                                 default: return ""
                                 }
+                            }
+                            if (modelData.kind === "usbGrab") {
+                                // Name the row after the DRIVE, not the vault-
+                                // root destination folder (which every grab
+                                // shares — "USB grab recordings" told you
+                                // nothing). fileCount is -1 until the run's
+                                // pre-count pass reports it, so show the drive
+                                // alone until then.
+                                const drive = modelData.ruleName || qsTr("USB device")
+                                const n = modelData.fileCount
+                                return (n >= 0) ? qsTr("%1 — %2 files").arg(drive).arg(n) : drive
                             }
                             const s = modelData.fileUrl ? modelData.fileUrl.toString() : ""
                             return s.substring(s.lastIndexOf("/") + 1)
@@ -1075,7 +1098,17 @@ Item {
                                     color: jobRow.statusColor
                                 }
                                 Label {
-                                    Layout.preferredWidth: 62
+                                    id: kindLabel
+                                    Layout.preferredWidth: 80
+                                    Layout.alignment: Qt.AlignVCenter
+                                    // Longest kinds ("Generate chapters",
+                                    // "Diarization sweep") no longer truncate:
+                                    // wrap to a second line, capped at 2 so a
+                                    // pathological label can't balloon the row
+                                    // (elide is the >2-line backstop). jobRow's
+                                    // height binding grows the row to fit.
+                                    wrapMode: Text.WordWrap
+                                    maximumLineCount: 2
                                     elide: Text.ElideRight
                                     text: jobRow.kindLabel
                                     color: "#8fa8bf"
@@ -1191,13 +1224,23 @@ Item {
                                     Layout.preferredWidth: 16
                                     Layout.preferredHeight: 16
 
+                                    // The undo is still offered but no longer
+                                    // applicable — the file has moved/been renamed
+                                    // since, so the inverse would fail. Grey it
+                                    // (visible but non-clickable) rather than
+                                    // letting the user click-then-fail. See
+                                    // Task::undoStillApplicable() / jobs()' undoStale.
+                                    readonly property bool stale: modelData.undoStale === true
+                                    opacity: undoButton.stale ? 0.4 : 1
+
                                     HoverHandler {
                                         id: undoHover
-                                        cursorShape: Qt.PointingHandCursor
+                                        cursorShape: undoButton.stale ? Qt.ArrowCursor : Qt.PointingHandCursor
                                     }
                                     TapHandler {
                                         // See the main pauseButton TapHandler for
                                         // why ReleaseWithinBounds on a small icon.
+                                        enabled: !undoButton.stale
                                         gesturePolicy: TapHandler.ReleaseWithinBounds
                                         onTapped: bottomBar.transcriptionController.undoTask(
                                             jobRow.isHeader ? modelData.batchId : modelData.id)
@@ -1213,7 +1256,9 @@ Item {
                                         color: "#dddddd"
                                     }
                                     ToolTip.visible: undoHover.hovered
-                                    ToolTip.text: qsTr("Undo")
+                                    ToolTip.text: undoButton.stale
+                                        ? qsTr("Can't undo — the file has moved or been renamed since")
+                                        : qsTr("Undo")
                                 }
 
                                 // Item 3: one button for both "cancel"

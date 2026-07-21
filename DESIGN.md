@@ -466,10 +466,12 @@ Independent of highlighting granularity — this exists for the resume requireme
   is missing but a partial exists; on full completion, delete the partial.
   Current durability is coarser without this: frontmatter written at job
   start + per-segment flush of the `.md` itself (see "Vault / file layout"
-  below) — a killed job leaves a truncated `.md` and a re-run starts over
-  from scratch, it just no longer re-decodes/re-runs VAD as one giant
-  single-shot pass now that chunking exists underneath where resume will
-  eventually hook in.
+  below) — a killed job leaves a truncated `.md` (which now carries
+  `partial: true`, written up front and cleared only on completion, so it is
+  distinguishable from a done transcript — see "Transcribed indicator") and a
+  re-run starts over from scratch, it just no longer re-decodes/re-runs VAD as
+  one giant single-shot pass now that chunking exists underneath where resume
+  will eventually hook in.
 
 ## Vault / file layout (Obsidian-style)
 
@@ -507,16 +509,23 @@ vault/
 
 - **Transcribed indicator:** sibling `.md` exists → green; missing → yellow;
   orphaned `.md` (no sibling audio file) → blue.
+  sibling `.md` with `partial: true` frontmatter (a cancelled or killed
+  transcribe) → orange — a truncated transcript, not a finished one.
   Watch with `QFileSystemWatcher` for live updates.
-- **No retranscription:** presence of `.md` means done.
+- **No retranscription:** presence of `.md` means done — with one exception: a
+  `partial: true` `.md` is NOT done; it is shown distinctly (orange) and is
+  currently inert for bulk relabel/chapters/detect-speakers (making it
+  directly re-transcribe-eligible is a documented follow-up).
 - **All transcription data lives in the single `.md` — no separate JSON
   sidecar** (this supersedes an earlier draft of this doc that split timing
   into a hidden `.sentences.json`; CLAUDE.md's load-bearing constraint is the
   current decision). Format:
   - YAML-ish frontmatter: `model` (the ggml file that actually ran),
-    `speakerDetection` (bool), `transcribedAt` (ISO 8601). Frontmatter is
-    written the moment a job starts, before transcription runs, so a
-    killed/stopped job still leaves a file recording what it was run with.
+    `speakerDetection` (bool), `transcribedAt` (ISO 8601), and `partial` (bool,
+    present only while a transcribe is unfinished — written up front, cleared on
+    completion; a leftover `partial: true` marks a cancelled/killed run).
+    Frontmatter is written the moment a job starts, before transcription runs,
+    so a killed/stopped job still leaves a file recording what it was run with.
   - One `[start] text` line per segment, appended and flushed as each segment
     is produced — not buffered to the end. The timestamp is a compact start
     only (leading/trailing zeros trimmed, e.g. `[1:07]`); there is no end
@@ -615,6 +624,11 @@ the overview, not a duplicate of it.
   transcription, so it gets the same progress/pause/cancel handling. On
   success the parts move into `.combined/` (or are deleted, if
   `deleteOriginalsAfterCombine`) so the next scan doesn't re-detect the group.
+  **The merge is undoable** (`UncombineTask` — move the parts back out of
+  `.combined/`, remove the merged file), except when
+  `deleteOriginalsAfterCombine` deleted the parts, and except once the merged
+  file has been transcribed (its `.md` is real work the undo would discard —
+  the Tasks-row Undo greys out via `undoStillApplicable()`).
   A combine never also queues a transcribe — the merged file just becomes a
   normal untranscribed vault entry.
 - **The merged file inherits the first part's mtime**, rather than taking the

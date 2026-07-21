@@ -50,13 +50,15 @@ private slots:
         QVERIFY_EXCEPTION_THROWN(task.run(fixture.ctx), TaskError);
     }
 
-    void diarizationSweepTask_isBackgroundPresentation_notPausable()
+    void diarizationSweepTask_isBackgroundPresentation_pausableAndCancellable()
     {
         DiarizationSweepTask task(QUrl::fromLocalFile("/vault/a.wav"), QVariantList{});
         QCOMPARE(task.kind(), QStringLiteral("diarizationSweep"));
         QCOMPARE(task.presentation(), Task::Presentation::Background);
-        QVERIFY(!task.capabilities().pausable);
-        QVERIFY(!task.capabilities().cancellableMidRun); // no mid-pass abort hook
+        // Pausable (decode + between-tick checkpoints) and cancellable between
+        // combos — mirrors DiarizeTask/BenchmarkTask.
+        QVERIFY(task.capabilities().pausable);
+        QVERIFY(task.capabilities().cancellableMidRun);
     }
 
     void diarizationSweepTask_decodeFailure_throwsTaskError_noNetwork()

@@ -106,9 +106,26 @@ public:
     }
     Q_INVOKABLE QStringList existingVaultTags(const QUrl &) const { return {}; }
 
+    // Item 074: the pending-rename store the Sidebar's rowNameText now reads.
+    QHash<QString, QString> pendingRenames; // "file://"+localpath -> stem
+    int pendingRenamesRev = 0;
+    Q_PROPERTY(int pendingRenamesRevision READ pendingRenamesRevision NOTIFY pendingRenamesRevisionChanged)
+    int pendingRenamesRevision() const { return pendingRenamesRev; }
+    Q_INVOKABLE QString pendingRenameStem(const QUrl &fileUrl) const
+    {
+        return pendingRenames.value(fileUrl.toString());
+    }
+    Q_INVOKABLE void setPendingRename(const QUrl &fileUrl, const QString &stem)
+    {
+        pendingRenames.insert(fileUrl.toString(), stem);
+        ++pendingRenamesRev;
+        emit pendingRenamesRevisionChanged();
+    }
+
 signals:
     void finished(const QUrl &fileUrl, bool ok, const QString &error);
     void jobStatusesChanged();
+    void pendingRenamesRevisionChanged();
 };
 
 } // namespace
@@ -387,9 +404,12 @@ private slots:
         QQuickItem *field = renameFieldFor(item);
         QVERIFY(field);
         QTRY_VERIFY2(field->hasActiveFocus(), "the rename editor must take focus so the user can just type");
-        // It seeds with the BASE name — renameFile() re-appends the extension
-        // itself, so seeding "talk.mp3" would rename the file to "talk.mp3.mp3".
-        QCOMPARE(field->property("text").toString(), QStringLiteral("talk"));
+        // Item 047: the editor now seeds what the ROW shows — the full
+        // name+extension when extensions are visible (default) — with the stem
+        // pre-selected, and strips the extension back to a stem on commit
+        // (renameFile re-appends the real extension). Typing over the selected
+        // stem replaces it and keeps ".mp3", so the final path is unchanged.
+        QCOMPARE(field->property("text").toString(), QStringLiteral("talk.mp3"));
 
         typeText(&view, QStringLiteral("interview"));
         QTest::keyClick(&view, Qt::Key_Return);
@@ -401,6 +421,102 @@ private slots:
                  "the transcript sidecar must follow the audio's new name");
         QVERIFY(!QFileInfo::exists(vault.filePath(QStringLiteral("talk.mp3"))));
         QVERIFY(!QFileInfo::exists(vault.filePath(QStringLiteral("talk.mp3.md"))));
+    }
+
+    // Item 082 regression: renaming the OPEN file "took 3-4 clicks". A
+    // background model rebuild (vault watcher firing after the open, a
+    // transcription finishing, …) runs Sidebar's onModelReset, which clears
+    // selectedPaths but leaves currentPath. Before the fix, that reset landing
+    // between the select-click and the name-click destroyed the sole-selection
+    // precondition, so the next name-click only re-selected instead of renaming.
+    // This drives that exact sequence — click to select+open, force a model
+    // rebuild, then a SINGLE name-click must open the editor because the row is
+    // still the open file (currentPath) even though the selection was wiped.
+    void renameOfOpenFileSurvivesBackgroundModelReset()
+    {
+        QTemporaryDir vault;
+        QVERIFY(vault.isValid());
+        QVERIFY(touch(vault.filePath(QStringLiteral("talk.mp3"))));
+
+        QQuickView view;
+        QQuickItem *treeItem = openVault(&view, vault.path());
+        QVERIFY2(treeItem, "could not load Sidebar.qml / locate its TreeView");
+        QTRY_VERIFY(treeItem->property("rows").toInt() > 0);
+        expandEverything(treeItem);
+
+        const QString audioPath = vault.filePath(QStringLiteral("talk.mp3"));
+        int row = rowForPath(treeItem, audioPath);
+        QVERIFY2(row >= 0, "talk.mp3 must be a visible row");
+        QQuickItem *item = rowItem(treeItem, row);
+        QVERIFY(item);
+
+        // Click once: selects + opens the file (sets currentPath via onFileActivated).
+        clickAt(&view, nameTextPoint(item));
+        QVERIFY2(!renameFieldVisibleOn(item),
+                 "the first click on an unselected row opens the file, not a rename");
+
+        QObject *sidebarItem = view.rootObject()->findChild<QObject *>(QStringLiteral("sidebar"));
+        QVERIFY(sidebarItem);
+        QTRY_COMPARE(sidebarItem->property("currentPath").toString(), audioPath);
+
+        // Reproduce the background structure-change rebuild that clears the
+        // selection while a file stays open — e.g. an import / USB-grab / combine
+        // landing another file in the vault while you work. rebuild() only emits
+        // a real modelReset when the file set actually changed (an unchanged
+        // rescan early-returns with content-only refreshes), so we add a sibling
+        // file THEN refresh: onModelReset then clears selectedPaths but leaves
+        // currentPath (the still-open file) intact.
+        QVERIFY(touch(vault.filePath(QStringLiteral("other.mp3"))));
+        QObject *vaultModel = view.rootObject()->findChild<QObject *>(QStringLiteral("vaultModel"));
+        QVERIFY(vaultModel);
+        QMetaObject::invokeMethod(vaultModel, "refresh", Qt::DirectConnection);
+        QTRY_COMPARE(sidebarItem->property("selectedPaths").toList().size(), 0);
+        QCOMPARE(sidebarItem->property("currentPath").toString(), audioPath);
+
+        // The rebuild recreated every delegate; re-locate the row + item.
+        QTRY_VERIFY(treeItem->property("rows").toInt() > 0);
+        expandEverything(treeItem);
+        row = rowForPath(treeItem, audioPath);
+        QVERIFY2(row >= 0, "talk.mp3 must still be a visible row after the rebuild");
+        item = rowItem(treeItem, row);
+        QVERIFY(item);
+
+        // A SINGLE name-click on the still-open file must open the editor — no
+        // extra re-select click, because currentPath outlived the reset.
+        clickAt(&view, nameTextPoint(item));
+        QTRY_VERIFY2(renameFieldVisibleOn(item),
+                     "renaming the open file must not require re-selecting it after a background model reset");
+    }
+
+    // Item 047 regression: with extensions visible (default), the rename editor
+    // must show the FULL name+extension and pre-select just the stem, so typing
+    // replaces the name while ".mp3" stays put (the file-manager convention).
+    void renameSeedShowsExtension_andSelectsStem()
+    {
+        QTemporaryDir vault;
+        QVERIFY(vault.isValid());
+        QVERIFY(touch(vault.filePath(QStringLiteral("talk.mp3"))));
+
+        QQuickView view;
+        QQuickItem *treeItem = openVault(&view, vault.path());
+        QVERIFY2(treeItem, "could not load Sidebar.qml / locate its TreeView");
+        QTRY_VERIFY(treeItem->property("rows").toInt() > 0);
+        expandEverything(treeItem);
+
+        const int row = rowForPath(treeItem, vault.filePath(QStringLiteral("talk.mp3")));
+        QVERIFY(row >= 0);
+        QQuickItem *item = rowItem(treeItem, row);
+        QVERIFY(item);
+        // Two clicks: select, then click the name to open the inline editor.
+        clickAt(&view, nameTextPoint(item));
+        clickAt(&view, nameTextPoint(item));
+        QTRY_VERIFY2(renameFieldVisibleOn(item), "the inline rename editor must open");
+        QQuickItem *field = renameFieldFor(item);
+        QVERIFY(field);
+        QTRY_VERIFY(field->hasActiveFocus());
+
+        QCOMPARE(field->property("text").toString(), QStringLiteral("talk.mp3"));
+        QCOMPARE(field->property("selectedText").toString(), QStringLiteral("talk"));
     }
 
     // Escape abandons the edit: nothing is written, and the editor closes
@@ -665,6 +781,72 @@ private slots:
         QVERIFY2(QFileInfo::exists(vault.filePath(QStringLiteral("talk.mp3"))),
                  "editing a displayed label must NOT rename the file on disk");
         QVERIFY(QFileInfo::exists(vault.filePath(QStringLiteral("talk.mp3.md"))));
+    }
+
+    // Item 074: a file rename in flight (from ANY panel, e.g. MainPanel-
+    // initiated) is recorded in the controller's pending-rename store and shows
+    // in the Sidebar row AT ONCE, before the deferred RenameFileTask completes.
+    void pendingRename_updatesRowNameOptimistically()
+    {
+        QTemporaryDir vault;
+        QVERIFY(vault.isValid());
+        QVERIFY(touch(vault.filePath(QStringLiteral("talk.m4a"))));
+        QVERIFY(touch(vault.filePath(QStringLiteral("talk.m4a.md")),
+                      "---\nmodel: x\n---\n[0] hi\n")); // transcribed, NO label
+
+        TranscriptionControllerStub controller;
+        m_controller = &controller;
+
+        QQuickView view;
+        QQuickItem *treeItem = openVault(&view, vault.path());
+        QVERIFY2(treeItem, "could not load Sidebar.qml / locate its TreeView");
+        QTRY_VERIFY(treeItem->property("rows").toInt() > 0);
+        expandEverything(treeItem);
+
+        QQuickItem *item = rowItem(treeItem, rowForPath(treeItem, vault.filePath(QStringLiteral("talk.m4a"))));
+        QVERIFY(item);
+        QQuickItem *nameText = item->findChild<QQuickItem *>(QStringLiteral("rowNameText"));
+        QVERIFY(nameText);
+        QTRY_COMPARE_WITH_TIMEOUT(nameText->property("text").toString(),
+                                  QStringLiteral("talk.m4a"), 2000);
+
+        controller.setPendingRename(QUrl::fromLocalFile(vault.filePath(QStringLiteral("talk.m4a"))),
+                                    QStringLiteral("chat"));
+        QCOMPARE(nameText->property("text").toString(), QStringLiteral("chat.m4a"));
+    }
+
+    // Item 074 guard: a LABEL-showing row (labels mode + a label) is LEFT ALONE
+    // by a pending file rename — the store read sits AFTER the label branch in
+    // rowNameText, so a file rename never disturbs a label-shown row.
+    void pendingRename_leavesLabelRowUnchanged()
+    {
+        QTemporaryDir vault;
+        QVERIFY(vault.isValid());
+        QVERIFY(touch(vault.filePath(QStringLiteral("talk.mp3"))));
+        QVERIFY(touch(vault.filePath(QStringLiteral("talk.mp3.md")),
+                      "---\nmodel: x\nlabel: My Talk\n---\n[0] hi\n"));
+
+        TranscriptionControllerStub controller;
+        controller.label = QStringLiteral("My Talk");
+        m_controller = &controller;
+
+        QQuickView view;
+        QQuickItem *treeItem = openVault(&view, vault.path());
+        QVERIFY2(treeItem, "could not load Sidebar.qml / locate its TreeView");
+        QTRY_VERIFY(treeItem->property("rows").toInt() > 0);
+        expandEverything(treeItem);
+
+        QQuickItem *item = rowItem(treeItem, rowForPath(treeItem, vault.filePath(QStringLiteral("talk.mp3"))));
+        QVERIFY(item);
+        QQuickItem *nameText = item->findChild<QQuickItem *>(QStringLiteral("rowNameText"));
+        QVERIFY(nameText);
+        QTRY_COMPARE_WITH_TIMEOUT(nameText->property("text").toString(),
+                                  QStringLiteral("My Talk"), 2000);
+
+        controller.setPendingRename(QUrl::fromLocalFile(vault.filePath(QStringLiteral("talk.mp3"))),
+                                    QStringLiteral("chat"));
+        QTest::qWait(50); // give a stray re-eval a chance to misfire
+        QCOMPARE(nameText->property("text").toString(), QStringLiteral("My Talk"));
     }
 
     // Expand/collapse is the GLYPH's gesture. This is the half that pays for

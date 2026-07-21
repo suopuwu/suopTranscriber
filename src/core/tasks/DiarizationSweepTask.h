@@ -27,9 +27,15 @@ public:
     QString kindLabel() const override { return QStringLiteral("Diarization sweep"); }
     QString displayName() const override;
     Presentation presentation() const override { return Presentation::Background; }
-    // Cancellable between combos only — diarize() has no mid-pass abort hook
-    // (see DiarizeTask's capabilities() doc comment for the same limitation).
-    Capabilities capabilities() const override { return {/*pausable=*/false, /*cancellableMidRun=*/false}; }
+    // Comparison-only, like BenchmarkTask — see Task::occupiesFile().
+    bool occupiesFile() const override { return false; }
+    // Pausable — decode honors pause/cancel between chunks, and each combo's
+    // diarization pass blocks on pause between sherpa-onnx progress ticks
+    // (exactly like DiarizeTask). Cancellable between combos: diarize() has no
+    // mid-pass abort hook, so a cancel requested during a combo only takes
+    // effect at the boundary after it (same limitation as DiarizeTask; matches
+    // BenchmarkTask's multi-item break loop).
+    Capabilities capabilities() const override { return {/*pausable=*/true, /*cancellableMidRun=*/true}; }
     QVariantMap toVariantMap() const override;
 
     void run(TaskContext &ctx) override;

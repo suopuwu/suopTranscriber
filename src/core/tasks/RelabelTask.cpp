@@ -110,7 +110,8 @@ void RelabelTask::run(TaskContext &ctx)
     // to bias toward even in unrestricted mode. nullptr = no cache: this
     // runs on the worker thread (must not touch the GUI thread's cache) and
     // only once per task.
-    const QStringList existingTagsVocab = collectVaultTags(vaultUrl.toLocalFile(), nullptr);
+    const QStringList existingTagsVocab =
+        collectVaultFrontmatterList(vaultUrl.toLocalFile(), QStringLiteral("tags"), nullptr);
     const int wordCount =
         transcriptText.split(QRegularExpression(QStringLiteral("\\s+")), Qt::SkipEmptyParts).size();
     const double effectiveWordiness = TranscriptionController::effectiveWordinessForLength(m_wordiness, wordCount);

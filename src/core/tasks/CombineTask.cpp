@@ -1,6 +1,7 @@
 #include "CombineTask.h"
 
 #include "../ProcessRunner.h"
+#include "UncombineTask.h"
 
 #include <QDateTime>
 #include <QDir>
@@ -11,6 +12,7 @@
 #include <QTemporaryFile>
 
 #include <algorithm>
+#include <memory>
 
 CombineTask::CombineTask(QStringList sourcePaths, QUrl outputUrl, bool deleteOriginals, QObject *parent)
     : Task(parent)
@@ -122,6 +124,47 @@ void CombineTask::run(TaskContext &ctx)
         QDir combinedDir(info.absolutePath() + QStringLiteral("/.combined"));
         if (!combinedDir.exists())
             combinedDir.mkpath(QStringLiteral("."));
-        QFile::rename(path, combinedDir.absoluteFilePath(info.fileName()));
+        // Record only what really moved — a part left behind has no archived
+        // copy, so undo must not claim it can restore it.
+        if (QFile::rename(path, combinedDir.absoluteFilePath(info.fileName())))
+            m_archivedSources << path;
     }
+
+    // Success: let the controller log this merge durably (see the signal's doc
+    // comment). Last, so it only fires once the sources are actually dealt with.
+    emit combineCompleted(outputPath, m_sourcePaths, m_deleteOriginals);
+}
+
+QString CombineTask::undoLabel() const
+{
+    if (m_archivedSources.isEmpty())
+        return {}; // deleteOriginals, or run() hasn't succeeded — no inverse
+    return QStringLiteral("Combined %1 files").arg(m_archivedSources.size());
+}
+
+std::unique_ptr<Task> CombineTask::makeUndoTask() const
+{
+    if (m_archivedSources.isEmpty())
+        return nullptr;
+    return std::make_unique<UncombineTask>(m_archivedSources, fileUrl, vaultUrl);
+}
+
+bool CombineTask::undoStillApplicable() const
+{
+    if (m_archivedSources.isEmpty() || !QFileInfo::exists(fileUrl.toLocalFile()))
+        return false;
+    // Every archived part must still be sitting in .combined/, and the merge
+    // must not have been transcribed since (undo would discard that .md). The
+    // sidecar is <fileName>.md — full filename + ".md", NOT completeBaseName
+    // (see TranscriptionController's sidecarPath()).
+    const QFileInfo mergedInfo(fileUrl.toLocalFile());
+    if (QFileInfo::exists(mergedInfo.absolutePath() + QStringLiteral("/") + mergedInfo.fileName()
+                          + QStringLiteral(".md")))
+        return false;
+    for (const QString &original : m_archivedSources) {
+        const QFileInfo info(original);
+        if (!QFileInfo::exists(info.absolutePath() + QStringLiteral("/.combined/") + info.fileName()))
+            return false;
+    }
+    return true;
 }

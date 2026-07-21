@@ -30,6 +30,12 @@ const QString kDriveInterface = QStringLiteral("org.freedesktop.UDisks2.Drive");
 const QString kUDisks2Service = QStringLiteral("org.freedesktop.UDisks2");
 const QString kUDisks2RootPath = QStringLiteral("/org/freedesktop/UDisks2");
 const QString kObjectManagerInterface = QStringLiteral("org.freedesktop.DBus.ObjectManager");
+// systemd-logind. Its PrepareForSleep(b) signal is how this class learns the
+// machine has just RESUMED — false == resumed, true == about to sleep. On the
+// SYSTEM bus, same as UDisks2. See handlePrepareForSleep().
+const QString kLogin1Service = QStringLiteral("org.freedesktop.login1");
+const QString kLogin1Path = QStringLiteral("/org/freedesktop/login1");
+const QString kLogin1ManagerInterface = QStringLiteral("org.freedesktop.login1.Manager");
 const QString kPropertiesInterface = QStringLiteral("org.freedesktop.DBus.Properties");
 // What UDisks2 answers a Mount() for a volume that's already mounted — the desktop's
 // automounter having won the race, not a failure. See mountVolume().
@@ -93,6 +99,16 @@ UsbDeviceMonitor::UsbDeviceMonitor(QObject *parent)
     QDBusConnection::systemBus().connect(kUDisks2Service, kUDisks2RootPath, kObjectManagerInterface,
                                           QStringLiteral("InterfacesRemoved"), this,
                                           SLOT(handleInterfacesRemoved(QDBusObjectPath, QStringList)));
+
+    // Resume-from-sleep: a device plugged in while the machine was asleep was
+    // enumerated by the kernel across the suspend/resume transition, but this
+    // (frozen) process never received UDisks2's fire-and-forget InterfacesAdded
+    // for it and nothing redelivers it on wake. logind's PrepareForSleep(false)
+    // is the resume edge — re-enumerate then and re-fire the normal signals for
+    // anything not already reported (see handlePrepareForSleep()).
+    QDBusConnection::systemBus().connect(kLogin1Service, kLogin1Path, kLogin1ManagerInterface,
+                                          QStringLiteral("PrepareForSleep"), this,
+                                          SLOT(handlePrepareForSleep(bool)));
 
     // Seed m_knownObjectPaths from what's already mounted so a later unmount of a
     // device that was present before this monitor was constructed can still be
@@ -238,6 +254,53 @@ void UsbDeviceMonitor::rescanForNewlyMountedDevices()
             continue; // still unmounted — this rescan only ever reports NEWLY MOUNTED volumes
         m_knownObjectPaths.insert(it.key().path());
         emit deviceAdded(toVariantMap(*info));
+    }
+}
+
+void UsbDeviceMonitor::handlePrepareForSleep(bool goingToSleep)
+{
+    // false == the machine has just RESUMED (true == about to sleep, nothing to
+    // do). Re-enumerate now to catch a device plugged in while we were frozen,
+    // whose InterfacesAdded we never received (see the constructor comment).
+    if (goingToSleep)
+        return;
+    reEnumerateAfterResume();
+    // The device may finish enumerating a beat AFTER the resume edge, so one
+    // delayed retry — same one-shot race mitigation handleInterfacesAdded() uses
+    // for a slow desktop-side mount. Both passes are idempotent (m_knownObjectPaths
+    // dedupes the mounted case; a repeated unmounted emit just re-offers a mount,
+    // which UDisks2 answers AlreadyMounted for — see mountVolume()).
+    QTimer::singleShot(2500, this, &UsbDeviceMonitor::reEnumerateAfterResume);
+}
+
+void UsbDeviceMonitor::reEnumerateAfterResume()
+{
+    QDBusInterface objectManager(kUDisks2Service, kUDisks2RootPath, kObjectManagerInterface,
+                                  QDBusConnection::systemBus());
+    const QDBusReply<UsbDbusManagedObjects> reply = objectManager.call(QStringLiteral("GetManagedObjects"));
+    if (!reply.isValid())
+        return;
+
+    const UsbDbusManagedObjects objects = reply.value();
+    for (auto it = objects.constBegin(); it != objects.constEnd(); ++it) {
+        const std::optional<UsbDeviceInfo> info = readFilesystemVolume(it.key(), it.value());
+        if (!info)
+            continue;
+        if (!info->mountPath.isEmpty()) {
+            // A mounted external volume we haven't reported yet — report it as an
+            // ordinary hotplug. m_knownObjectPaths keeps this idempotent, exactly
+            // like rescanForNewlyMountedDevices(), so a device that stayed plugged
+            // and mounted across the sleep isn't re-grabbed on every wake.
+            if (!m_knownObjectPaths.contains(it.key().path())) {
+                m_knownObjectPaths.insert(it.key().path());
+                emit deviceAdded(toVariantMap(*info));
+            }
+        } else {
+            // Present but unmounted (stock KDE won't auto-mount): offer it for
+            // mounting exactly as handleInterfacesAdded() does for a live plug —
+            // this is the common resume case, and the listener re-checks its rule.
+            emit unmountedVolumeDetected(toVariantMap(*info));
+        }
     }
 }
 

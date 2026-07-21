@@ -13,7 +13,10 @@
 
 #include <QDir>
 #include <QElapsedTimer>
+#include <QFile>
 #include <QFileInfo>
+#include <QJsonDocument>
+#include <QJsonObject>
 #include <QStandardPaths>
 
 #include <algorithm>
@@ -364,6 +367,38 @@ private slots:
         // The JFK sample: "...ask not what your country can do for you..."
         QVERIFY2(toLower(allText).find("country") != std::string::npos,
                  qPrintable(QStringLiteral("transcript missing 'country': ") + QString::fromStdString(allText)));
+    }
+
+    // Spec (queue item 026): the bundled out-of-process NeMo engine
+    // (engines/parakeet/manifest.json) and the in-process sherpa-onnx model
+    // parakeet-tdt-0.6b-v2 are two DIFFERENT Parakeet backends. Their labels
+    // must not collide — the NeMo engine, being the optional fallback that is
+    // "unavailable" until NeMo is installed, must never read as the in-process
+    // Parakeet the user actually transcribes with. Guard the bundled manifest's
+    // display name at its source: it must carry a disambiguator and must not
+    // regress to the "Parakeet TDT 0.6B v2 (…)" parenthetical form that reads
+    // as the in-process model row.
+    void bundledParakeetManifestLabelIsDisambiguated()
+    {
+        QFile file(QStringLiteral(SUOP_REPO_DIR "/engines/parakeet/manifest.json"));
+        QVERIFY2(file.open(QIODevice::ReadOnly), qPrintable(file.errorString()));
+
+        QJsonParseError parseError{};
+        const QJsonDocument doc = QJsonDocument::fromJson(file.readAll(), &parseError);
+        QVERIFY2(parseError.error == QJsonParseError::NoError, qPrintable(parseError.errorString()));
+
+        const QString name = doc.object().value(QStringLiteral("name")).toString();
+        QVERIFY2(!name.isEmpty(), "bundled parakeet manifest must have a name");
+
+        // Carries a disambiguator so it reads as a separate optional backend.
+        QVERIFY2(name.contains(QStringLiteral("out-of-process"), Qt::CaseInsensitive)
+                     || name.contains(QStringLiteral("optional"), Qt::CaseInsensitive),
+                 qPrintable(QStringLiteral("NeMo engine label must disambiguate itself: ") + name));
+
+        // Never the parenthetical-suffix form that collides with the in-process
+        // model's "Parakeet TDT 0.6B v2 (English, NVIDIA) — …" display label.
+        QVERIFY2(!name.startsWith(QStringLiteral("Parakeet TDT 0.6B v2 (")),
+                 qPrintable(QStringLiteral("NeMo engine label must not read as the in-process model: ") + name));
     }
 
     // subprocessEngineJsonlProtocol: BUILT. DESIGN.md's out-of-process engines

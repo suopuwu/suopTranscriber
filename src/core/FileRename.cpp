@@ -96,6 +96,20 @@ bool renameRecordingFile(const QUrl &fileUrl, const QString &newBaseName, QUrl *
     return true;
 }
 
+bool isSameRecording(const QUrl &a, const QUrl &b)
+{
+    if (a == b)
+        return true;
+    if (a.isEmpty() || b.isEmpty())
+        return false;
+    const QFileInfo fa(a.toLocalFile());
+    const QFileInfo fb(b.toLocalFile());
+    // Same directory + same stem (completeBaseName strips only the final
+    // extension: "foo.wav"->"foo", "foo.md"->"foo").
+    return fa.absolutePath() == fb.absolutePath()
+        && fa.completeBaseName() == fb.completeBaseName();
+}
+
 bool pathIsInsideVault(const QString &candidatePath, const QString &vaultLocalPath)
 {
     if (vaultLocalPath.isEmpty() || candidatePath.isEmpty())

@@ -135,13 +135,28 @@ private slots:
 
     void perAppAudioCapture_singleApplicationIsolation()
     {
-        QSKIP("Recording feature: capturing ONE specific application's audio individually (e.g. "
-              "just Firefox, isolated from the rest of the system mix) is designed-but-not-built. "
-              "AudioRecorder (src/core/AudioRecorder.h/.cpp) only supports mic + the FULL "
-              "default-sink monitor mix via `parec`. Per-app isolation would need per-app stream "
-              "enumeration/routing (libpulse's sink-input list, or PipeWire's node graph via "
-              "libpipewire) to select just one application's stream instead of the whole monitor "
-              "— deliberately deferred out of scope for this change.");
+        QSKIP("Queue item 036: app-stream SELECTION into the one mixed WAV is now built — "
+              "AudioRecorderIO::parseSystemSources() (see tst_audiorecorder) enumerates "
+              "Stream/Output/Audio nodes via `pw-dump`, AudioRecorder::availableSystemSources() "
+              "surfaces them to the RecorderPage.qml dropdown, and AudioRecorderWorker::"
+              "startSystemAudio() taps the chosen one non-invasively via `pw-record --target` "
+              "instead of the whole default-sink monitor. What remains owed (and is NOT wanted per "
+              "the user's 2026-07-20 decision) is SIMULTANEOUS multi-track capture — recording "
+              "several sources at once into separate output tracks rather than one mixed WAV. "
+              "Capture-follows-selection itself has no offline unit path (needs a real PipeWire "
+              "server/pw-record) — see item 036's manual verification steps.");
+    }
+
+    void emptyCapture_isDiscardedNotWrittenAsZeroLengthWav()
+    {
+        QSKIP("Queue item 033: AudioRecorderWorker::finalizeAndStop() discards a capture that "
+              "wrote zero audio bytes (m_bytesWritten == 0) — removing the 44-byte header-only "
+              "file and emitting recordingFinished(\"\") instead of dropping a zero-length "
+              "suopAudio_*.wav into the vault. That branch lives inside the private worker class "
+              "and needs a REAL capture device to reach (open a source, stop before the first mix "
+              "tick), so it has no offline unit path — verified by the manual check in the item. "
+              "The GUI-side synchronous state machine IS covered by "
+              "tst_audiorecorder::startStopRecording_stateFlipsSynchronouslyOnTheCall.");
     }
 };
 

@@ -12,6 +12,7 @@
 #include <QtTest>
 
 #include <QAbstractItemModelTester>
+#include <QDateTime>
 #include <QDir>
 #include <QFile>
 #include <QFileInfo>
@@ -72,6 +73,18 @@ int statusOf(const QAbstractItemModel &m, const QString &name)
     return m.data(idx, roleByName(m, "status")).toInt();
 }
 
+// True if any dataChanged captured by `spy` carried `role` in its roles list
+// (an empty roles list means "all roles" in Qt's convention, so it counts too).
+bool dataChangedCarriedRole(const QSignalSpy &spy, int role)
+{
+    for (const QList<QVariant> &args : spy) {
+        const QList<int> roles = args.at(2).value<QList<int>>();
+        if (roles.isEmpty() || roles.contains(role))
+            return true;
+    }
+    return false;
+}
+
 // A restore that puts the file back but mangles its bytes would still pass an
 // exists() check — the round-trip tests compare content, so they need this.
 QByteArray readAll(const QString &path)
@@ -125,6 +138,18 @@ bool deleteAudioOnlyPermanentlyOne(VaultTreeModel &m, const QUrl &url)
 QVariantList restorableOf(const QVariantMap &result)
 {
     return result.value(QStringLiteral("restorable")).toList();
+}
+
+// Push a file's mtime forward so a same-size in-place rewrite is still
+// detectable by the model's mtime capture — a rewrite microseconds after the
+// initial scan could otherwise land on a coarse-resolution-identical timestamp.
+bool bumpMtime(const QString &path, int secondsForward = 3)
+{
+    QFile f(path);
+    if (!f.open(QIODevice::ReadWrite))
+        return false;
+    return f.setFileTime(QDateTime::currentDateTime().addSecs(secondsForward),
+                         QFileDevice::FileModificationTime);
 }
 
 } // namespace
@@ -184,6 +209,26 @@ private slots:
                  int(VaultTreeModel::TranscribedStatus));
         QCOMPARE(model.data(idx, roleByName(model, "isAudio")).toBool(), true);
         QCOMPARE(model.data(idx, roleByName(model, "isDir")).toBool(), false);
+    }
+
+    // A sibling .md whose frontmatter carries `partial: true` (a cancelled or
+    // killed transcribe left a truncated file) reports the distinct
+    // PartialStatus, not TranscribedStatus — while a complete .md stays green.
+    void partialFrontmatter_reportsPartialStatus_notTranscribed()
+    {
+        QTemporaryDir vault;
+        QVERIFY(vault.isValid());
+        QVERIFY(touch(vault.filePath("done.mp3")));
+        QVERIFY(touch(vault.filePath("done.mp3.md"), "---\nmodel: x\n---\n\n[0:00] hi\n"));
+        QVERIFY(touch(vault.filePath("partial.mp3")));
+        QVERIFY(touch(vault.filePath("partial.mp3.md"),
+                      "---\nmodel: x\npartial: true\n---\n\n[0:00] hi\n"));
+
+        VaultTreeModel model;
+        model.setVaultPath(QUrl::fromLocalFile(vault.path()));
+
+        QCOMPARE(statusOf(model, "done.mp3"), int(VaultTreeModel::TranscribedStatus));
+        QCOMPARE(statusOf(model, "partial.mp3"), int(VaultTreeModel::PartialStatus));
     }
 
     // CLAUDE.md: no sibling .md yet = not transcribed — yellow indicator
@@ -442,6 +487,328 @@ private slots:
 
         QTRY_COMPARE_WITH_TIMEOUT(statusOf(model, "session.opus"),
                                   int(VaultTreeModel::TranscribedStatus), 10000);
+    }
+
+    // Queue item 038: a transcript APPEARING flips status only — a row's
+    // indicator colour, never the tree's shape — so it must refresh in place
+    // with dataChanged(StatusRole) and NOT reset the model (a reset drops the
+    // TreeView's expansion state and scroll offset).
+    void transcriptCreated_emitsDataChangedNotReset()
+    {
+        QTemporaryDir vault;
+        QVERIFY(vault.isValid());
+        QVERIFY(touch(vault.filePath("session.opus")));
+
+        VaultTreeModel model;
+        model.setVaultPath(QUrl::fromLocalFile(vault.path()));
+        QCOMPARE(statusOf(model, "session.opus"), int(VaultTreeModel::UntranscribedStatus));
+
+        QSignalSpy resetSpy(&model, &QAbstractItemModel::modelReset);
+        QSignalSpy dataSpy(&model, &QAbstractItemModel::dataChanged);
+
+        QVERIFY(touch(vault.filePath("session.opus.md"), "[0] hello\n"));
+        QTRY_COMPARE_WITH_TIMEOUT(statusOf(model, "session.opus"),
+                                  int(VaultTreeModel::TranscribedStatus), 10000);
+
+        QCOMPARE(resetSpy.count(), 0);
+        QVERIFY2(dataChangedCarriedRole(dataSpy, int(VaultTreeModel::StatusRole)),
+                 "the status flip must arrive as a dataChanged carrying StatusRole");
+    }
+
+    // Queue item 038: the mirror — a transcript DISAPPEARING (Delete transcript)
+    // is also status-only and must not reset the model.
+    void transcriptDeleted_emitsDataChangedNotReset()
+    {
+        QTemporaryDir vault;
+        QVERIFY(vault.isValid());
+        QVERIFY(touch(vault.filePath("a.wav")));
+        QVERIFY(touch(vault.filePath("a.wav.md"), "[0] one\n"));
+
+        VaultTreeModel model;
+        model.setVaultPath(QUrl::fromLocalFile(vault.path()));
+        QCOMPARE(statusOf(model, "a.wav"), int(VaultTreeModel::TranscribedStatus));
+
+        QSignalSpy resetSpy(&model, &QAbstractItemModel::modelReset);
+        QSignalSpy dataSpy(&model, &QAbstractItemModel::dataChanged);
+
+        QVERIFY(trashTranscriptOne(model, QUrl::fromLocalFile(vault.filePath("a.wav"))));
+        QCOMPARE(statusOf(model, "a.wav"), int(VaultTreeModel::UntranscribedStatus));
+
+        QCOMPARE(resetSpy.count(), 0);
+        QVERIFY2(dataChangedCarriedRole(dataSpy, int(VaultTreeModel::StatusRole)),
+                 "the status flip must arrive as a dataChanged carrying StatusRole");
+    }
+
+    // Queue item 038: the whole point is a STABLE QModelIndex across the flip —
+    // a QPersistentModelIndex taken before the transcript appears must survive
+    // it. A model reset would invalidate it; this fails loudly if someone
+    // re-adds status to sameStructure().
+    void expansionSurvivesTranscriptStatusFlip()
+    {
+        QTemporaryDir vault;
+        QVERIFY(vault.isValid());
+        QVERIFY(touch(vault.filePath("folder/nested.wav")));
+
+        VaultTreeModel model;
+        model.setVaultPath(QUrl::fromLocalFile(vault.path()));
+
+        const QPersistentModelIndex nested(findByName(model, "nested.wav"));
+        QVERIFY(nested.isValid());
+        QCOMPARE(statusOf(model, "nested.wav"), int(VaultTreeModel::UntranscribedStatus));
+
+        QVERIFY(touch(vault.filePath("folder/nested.wav.md"), "[0] hi\n"));
+        QTRY_COMPARE_WITH_TIMEOUT(statusOf(model, "nested.wav"),
+                                  int(VaultTreeModel::TranscribedStatus), 10000);
+
+        QVERIFY2(nested.isValid(),
+                 "the persistent index was invalidated — a status flip must not reset the model");
+    }
+
+    // --- watcher-driven rebuild coalescing (perf fix: move/delete jank) --------
+
+    // A multi-file move dirties BOTH the source and destination dir per file, so
+    // an N-file move fires ~2N directoryChanged events in a burst. Each one used
+    // to trigger its own full model reset (and, in QML, a full-vault walk + proxy
+    // re-sort + whole-tree re-expand). The watcher->rebuild path now debounces,
+    // so the whole burst collapses into a SINGLE rebuild. This mimics MoveTask,
+    // which does a pure filesystem move and leans on the watcher — so it renames
+    // on disk directly rather than calling model.moveFile() (which rebuilds
+    // synchronously and would defeat the point of the test).
+    void multiFileMove_coalescesIntoOneRebuild()
+    {
+        QTemporaryDir vault;
+        QVERIFY(vault.isValid());
+        // A destination folder must already hold audio so it is watched from the
+        // initial build (an unwatched dir fires no directoryChanged on the move).
+        QVERIFY(touch(vault.filePath("sub/seed.wav"), "audio"));
+        const int n = 8;
+        for (int i = 0; i < n; ++i)
+            QVERIFY(touch(vault.filePath(QStringLiteral("clip%1.wav").arg(i)), "audio"));
+
+        VaultTreeModel model;
+        model.setVaultPath(QUrl::fromLocalFile(vault.path()));
+        QCOMPARE(statusOf(model, "clip0.wav"), int(VaultTreeModel::UntranscribedStatus));
+
+        QSignalSpy resetSpy(&model, &QAbstractItemModel::modelReset);
+        for (int i = 0; i < n; ++i) {
+            QVERIFY(QFile::rename(vault.filePath(QStringLiteral("clip%1.wav").arg(i)),
+                                  vault.filePath(QStringLiteral("sub/clip%1.wav").arg(i))));
+        }
+
+        // The debounce (50ms) fires once after the burst settles; wait well past
+        // it AND any straggling event, then assert exactly one rebuild — not ~2N.
+        QTRY_VERIFY_WITH_TIMEOUT(resetSpy.count() >= 1, 5000);
+        QTest::qWait(300);
+        QCOMPARE(resetSpy.count(), 1);
+        // The moves really happened (guards against the test passing on a no-op).
+        QCOMPARE(statusOf(model, "clip0.wav"), int(VaultTreeModel::UntranscribedStatus));
+        QVERIFY(findByName(model, "sub").isValid());
+    }
+
+    // --- no-op rebuild suppression (perf fix: delete/undo reflows twice) --------
+
+    // A STRUCTURAL delete resets the model exactly ONCE — the explicit
+    // synchronous rebuild in applyRemovalOutcome(). The watcher's
+    // directoryChanged echo of the same change rescans, finds the tree
+    // structurally identical (the explicit rebuild already applied the removal)
+    // and returns without a second reset. A transcript-only trash is NOT
+    // structural (item 038): it only flips status, refreshed in place with
+    // dataChanged and no reset at all.
+    void deleteTrash_resetsOnlyForStructuralChanges()
+    {
+        QTemporaryDir vault;
+        QVERIFY(vault.isValid());
+        QVERIFY(touch(vault.filePath("a.wav")));
+        QVERIFY(touch(vault.filePath("a.wav.md"), "[0] one\n"));
+        QVERIFY(touch(vault.filePath("b.wav")));
+        QVERIFY(touch(vault.filePath("b.wav.md"), "[0] two\n"));
+        QVERIFY(touch(vault.filePath("c.wav")));
+        QVERIFY(touch(vault.filePath("c.wav.md"), "[0] three\n"));
+
+        VaultTreeModel model;
+        model.setVaultPath(QUrl::fromLocalFile(vault.path()));
+
+        QSignalSpy resetSpy(&model, &QAbstractItemModel::modelReset);
+
+        // Whole-file trash.
+        QVERIFY(trashOne(model, QUrl::fromLocalFile(vault.filePath("a.wav"))));
+        QCOMPARE(resetSpy.count(), 1); // the explicit applyRemovalOutcome rebuild
+        QTest::qWait(300);             // let the watcher echo fire and be swallowed
+        QCOMPARE(resetSpy.count(), 1);
+
+        // Transcript-only trash (b.wav flips transcribed -> untranscribed):
+        // status is content, not structure (item 038), so this refreshes the
+        // row in place with dataChanged and fires NO model reset.
+        QVERIFY(trashTranscriptOne(model, QUrl::fromLocalFile(vault.filePath("b.wav"))));
+        QCOMPARE(resetSpy.count(), 1);
+        QTest::qWait(300);
+        QCOMPARE(resetSpy.count(), 1);
+
+        // Audio-only trash (c.wav's .md survives as an orphaned .md row) IS
+        // structural (isOrphanedMd flips), so it still resets exactly once.
+        QVERIFY(trashAudioOnlyOne(model, QUrl::fromLocalFile(vault.filePath("c.wav"))));
+        QCOMPARE(resetSpy.count(), 2);
+        QTest::qWait(300);
+        QCOMPARE(resetSpy.count(), 2);
+    }
+
+    // Queue item 021: a rename genuinely IS structural (the node's name/path
+    // change, so sameStructure() fails), and unlike delete there is no explicit
+    // synchronous rebuild — the WATCHER path is the authoritative one, and it
+    // must reset exactly ONCE. This guards the direction the 021 fix could break:
+    // Sidebar.onFinished now stands down for structural tasks, so if this
+    // watcher-driven reset ever stopped firing the tree would never reflow at all.
+    void rename_resetsTheModelOnlyOnce()
+    {
+        QTemporaryDir vault;
+        QVERIFY(vault.isValid());
+        QVERIFY(touch(vault.filePath("a.wav")));
+        QVERIFY(touch(vault.filePath("a.wav.md"), "[0] one\n"));
+        QVERIFY(touch(vault.filePath("b.wav")));
+
+        VaultTreeModel model;
+        model.setVaultPath(QUrl::fromLocalFile(vault.path()));
+
+        QSignalSpy resetSpy(&model, &QAbstractItemModel::modelReset);
+
+        // Rename the pair on disk behind the model's back — exactly what a
+        // RenameFileTask does; only the watcher can notice it.
+        QVERIFY(QFile::rename(vault.filePath("a.wav"), vault.filePath("z.wav")));
+        QVERIFY(QFile::rename(vault.filePath("a.wav.md"), vault.filePath("z.wav.md")));
+
+        // One reset, once the 50ms rebuild debounce coalesces both file events.
+        QTRY_COMPARE_WITH_TIMEOUT(resetSpy.count(), 1, 3000);
+        QTest::qWait(300); // a second, redundant reset would land in this window
+        QCOMPARE(resetSpy.count(), 1);
+    }
+
+    // applyRenameOutcome() updates the tree IN PLACE — the renamed node's
+    // name/path change and its row slides to the new alphabetical slot via
+    // beginMoveRows/dataChanged, with ZERO model resets. And because the in-place
+    // node then matches what a fresh scan produces, the watcher's directoryChanged
+    // echo finds sameStructure() true and is swallowed — still zero resets. This
+    // is what makes a rename show ONLY the name changing, no whole-tree flash.
+    void applyRenameOutcome_updatesInPlaceWithoutReset()
+    {
+        QTemporaryDir vault;
+        QVERIFY(vault.isValid());
+        QVERIFY(touch(vault.filePath("a.wav")));
+        QVERIFY(touch(vault.filePath("a.wav.md"), "[0] one\n"));
+        QVERIFY(touch(vault.filePath("m.wav")));
+        QVERIFY(touch(vault.filePath("z.wav")));
+
+        VaultTreeModel model;
+        model.setVaultPath(QUrl::fromLocalFile(vault.path()));
+        QCOMPARE(model.rowCount(), 3);
+
+        auto orderedNames = [&] {
+            QStringList names;
+            const int nameRole = roleByName(model, "name");
+            for (int r = 0; r < model.rowCount(); ++r)
+                names << model.data(model.index(r, 0), nameRole).toString();
+            return names;
+        };
+        QCOMPARE(orderedNames(), (QStringList{"a.wav", "m.wav", "z.wav"}));
+
+        QSignalSpy resetSpy(&model, &QAbstractItemModel::modelReset);
+        QSignalSpy movedSpy(&model, &QAbstractItemModel::rowsMoved);
+
+        // Rename a.wav -> n.wav on disk (as RenameFileTask would), then apply the
+        // in-place update the controller drives on success.
+        QVERIFY(QFile::rename(vault.filePath("a.wav"), vault.filePath("n.wav")));
+        QVERIFY(QFile::rename(vault.filePath("a.wav.md"), vault.filePath("n.wav.md")));
+        model.applyRenameOutcome(QUrl::fromLocalFile(vault.filePath("a.wav")),
+                                 QUrl::fromLocalFile(vault.filePath("n.wav")));
+
+        // In place: no reset, the row moved (a -> n sorts after m), text updated.
+        QCOMPARE(resetSpy.count(), 0);
+        QCOMPARE(movedSpy.count(), 1);
+        QCOMPARE(orderedNames(), (QStringList{"m.wav", "n.wav", "z.wav"}));
+
+        // The watcher echo of the same rename must be swallowed — sameStructure()
+        // now holds because the in-place node matches the fresh scan.
+        QTest::qWait(300);
+        QCOMPARE(resetSpy.count(), 0);
+        QCOMPARE(orderedNames(), (QStringList{"m.wav", "n.wav", "z.wav"}));
+    }
+
+    // Undo of a delete resets the model exactly ONCE — the explicit rebuild in
+    // applyRestoreOutcome(); the watcher echo of the restore is swallowed.
+    void undoOfDelete_resetsTheModelOnlyOnce()
+    {
+        QTemporaryDir vault;
+        QVERIFY(vault.isValid());
+        QVERIFY(touch(vault.filePath("gone.wav")));
+        QVERIFY(touch(vault.filePath("gone.wav.md"), "[0] hi\n"));
+
+        VaultTreeModel model;
+        model.setVaultPath(QUrl::fromLocalFile(vault.path()));
+
+        const QVariantMap trashResult = model.trashFiles({ QUrl::fromLocalFile(vault.filePath("gone.wav")) });
+        QCOMPARE(trashResult.value(QStringLiteral("trashed")).toInt(), 1);
+        QTest::qWait(300); // let the trash's own echo settle before we start counting
+
+        // A transcribed file trashes as audio + its .md sidecar, so restore
+        // brings back every "restorable" entry (2 here), in one rebuild.
+        const QVariantList restorable = restorableOf(trashResult);
+        QSignalSpy resetSpy(&model, &QAbstractItemModel::modelReset);
+        QCOMPARE(model.restoreFromTrash(restorable), int(restorable.size()));
+        QCOMPARE(resetSpy.count(), 1); // the explicit applyRestoreOutcome rebuild
+        QTest::qWait(300);
+        QCOMPARE(resetSpy.count(), 1);
+        QVERIFY(findByName(model, "gone.wav").isValid()); // really came back
+    }
+
+    // A rescan that finds nothing changed on disk must NOT reset the model —
+    // the structural compare short-circuits before beginResetModel().
+    void unchangedRescan_doesNotResetTheModel()
+    {
+        QTemporaryDir vault;
+        QVERIFY(vault.isValid());
+        QVERIFY(touch(vault.filePath("x.wav")));
+        QVERIFY(touch(vault.filePath("x.wav.md"), "[0] hi\n"));
+        QVERIFY(touch(vault.filePath("y.wav")));
+
+        VaultTreeModel model;
+        model.setVaultPath(QUrl::fromLocalFile(vault.path()));
+
+        QSignalSpy resetSpy(&model, &QAbstractItemModel::modelReset);
+        model.refresh(); // rebuild() with nothing changed on disk
+        QCOMPARE(resetSpy.count(), 0);
+    }
+
+    // A sidecar .md rewritten IN PLACE (a relabel — same file, new content) is a
+    // content change, not a structural one: rebuild() emits dataChanged for that
+    // row rather than resetting the whole model, and the new label is visible.
+    void sidecarRewrittenInPlace_emitsDataChangedNotReset()
+    {
+        QTemporaryDir vault;
+        QVERIFY(vault.isValid());
+        QVERIFY(touch(vault.filePath("talk.wav")));
+        QVERIFY(touch(vault.filePath("talk.wav.md"),
+                      "---\nmodel: base\nlabel: Before\n---\n\n[0] hi\n"));
+
+        VaultTreeModel model;
+        model.setVaultPath(QUrl::fromLocalFile(vault.path()));
+
+        const int labelRole = roleByName(model, "label");
+        QVERIFY(labelRole >= 0);
+        QCOMPARE(model.data(findByName(model, "talk.wav"), labelRole).toString(), QStringLiteral("Before"));
+
+        QSignalSpy resetSpy(&model, &QAbstractItemModel::modelReset);
+        QSignalSpy dataSpy(&model, &QAbstractItemModel::dataChanged);
+
+        // In-place relabel with a bumped mtime (a same-mtime rewrite is
+        // invisible to the model by design — see Node::mdModified).
+        QVERIFY(touch(vault.filePath("talk.wav.md"),
+                      "---\nmodel: base\nlabel: After\n---\n\n[0] hi\n"));
+        QVERIFY(bumpMtime(vault.filePath("talk.wav.md")));
+
+        model.refresh();
+
+        QCOMPARE(resetSpy.count(), 0);
+        QVERIFY(dataSpy.count() >= 1);
+        QCOMPARE(model.data(findByName(model, "talk.wav"), labelRole).toString(), QStringLiteral("After"));
     }
 
     // --- frontmatterField() caching (perf fix: UI lag) -------------------------
@@ -1269,8 +1636,11 @@ private slots:
         }
     }
 
-    // The whole reason these take a list. One user action, one rescan.
-    void trashTranscript_batch_resetsTheModelOnce_notOncePerEntry()
+    // The whole reason these take a list: one user action, one rescan. A batch
+    // transcript trash is status-only (item 038), so it refreshes the rows in
+    // place with dataChanged and fires NO model reset — and certainly not one
+    // reset per entry.
+    void trashTranscript_batch_refreshesInPlace_notOncePerEntry()
     {
         QTemporaryDir vault;
         QVERIFY(vault.isValid());
@@ -1283,10 +1653,15 @@ private slots:
         model.setVaultPath(QUrl::fromLocalFile(vault.path()));
 
         QSignalSpy resetSpy(&model, &QAbstractItemModel::modelReset);
+        QSignalSpy dataSpy(&model, &QAbstractItemModel::dataChanged);
         model.trashTranscript({ QUrl::fromLocalFile(vault.filePath("a.mp3")),
                                 QUrl::fromLocalFile(vault.filePath("b.mp3")),
                                 QUrl::fromLocalFile(vault.filePath("c.mp3")) });
-        QCOMPARE(resetSpy.count(), 1);
+        QCOMPARE(resetSpy.count(), 0);
+        for (const QString &stem : { QStringLiteral("a"), QStringLiteral("b"), QStringLiteral("c") })
+            QCOMPARE(statusOf(model, stem + ".mp3"), int(VaultTreeModel::UntranscribedStatus));
+        QVERIFY2(dataChangedCarriedRole(dataSpy, int(VaultTreeModel::StatusRole)),
+                 "a batch transcript trash must refresh status in place via dataChanged");
     }
 
     // A batch is a set of independent entries: one bad entry must not strand
@@ -2214,6 +2589,87 @@ private slots:
         QVERIFY(!error.isEmpty());
     }
 
+    // --- inspectImportCandidate (item 078: QML-readable per-candidate verdict) -
+    //
+    // importDestinationFor() collapses every failure to "" with the message in
+    // a QString* QML can't read, so the drop handler can't distinguish a name
+    // COLLISION (offer Overwrite/Skip) from a hard rejection.
+    // inspectImportCandidate() is the new source of truth; importDestinationFor
+    // now delegates to it. These tests assert the new verdict shape; the four
+    // importDestinationFor_* tests above are the regression guard that the
+    // delegation kept its existing contract (deliberately left unchanged).
+
+    // A same-named file already at the vault root reports "collision" (not a
+    // flat failure) with the would-be destination path and source name, so the
+    // caller can offer Overwrite.
+    void inspectImportCandidate_reportsCollision_withDest()
+    {
+        QTemporaryDir vault;
+        QVERIFY(vault.isValid());
+        QVERIFY(touch(vault.filePath("song.mp3"), "original"));
+        QTemporaryDir source;
+        QVERIFY(source.isValid());
+        QVERIFY(touch(source.filePath("song.mp3"), "different bytes"));
+
+        VaultTreeModel model;
+        model.setVaultPath(QUrl::fromLocalFile(vault.path()));
+
+        const QVariantMap v =
+            model.inspectImportCandidate(QUrl::fromLocalFile(source.filePath("song.mp3")));
+        QCOMPARE(v.value("reason").toString(), QStringLiteral("collision"));
+        QVERIFY(v.value("dest").toString().endsWith(QStringLiteral("/song.mp3")));
+        QCOMPARE(v.value("name").toString(), QStringLiteral("song.mp3"));
+    }
+
+    // A fresh, non-colliding audio file reports "ok" with a non-empty
+    // destination.
+    void inspectImportCandidate_reportsOk_withDest()
+    {
+        QTemporaryDir vault;
+        QVERIFY(vault.isValid());
+        QTemporaryDir source;
+        QVERIFY(source.isValid());
+        QVERIFY(touch(source.filePath("clip.mp3"), "audio bytes"));
+
+        VaultTreeModel model;
+        model.setVaultPath(QUrl::fromLocalFile(vault.path()));
+
+        const QVariantMap v =
+            model.inspectImportCandidate(QUrl::fromLocalFile(source.filePath("clip.mp3")));
+        QCOMPARE(v.value("reason").toString(), QStringLiteral("ok"));
+        QVERIFY(!v.value("dest").toString().isEmpty());
+    }
+
+    // An unrecognized extension reports "not-audio".
+    void inspectImportCandidate_reportsNotAudio()
+    {
+        QTemporaryDir vault;
+        QVERIFY(vault.isValid());
+        QTemporaryDir source;
+        QVERIFY(source.isValid());
+        QVERIFY(touch(source.filePath("notes.txt")));
+
+        VaultTreeModel model;
+        model.setVaultPath(QUrl::fromLocalFile(vault.path()));
+
+        const QVariantMap v =
+            model.inspectImportCandidate(QUrl::fromLocalFile(source.filePath("notes.txt")));
+        QCOMPARE(v.value("reason").toString(), QStringLiteral("not-audio"));
+    }
+
+    // No vault open reports "no-vault".
+    void inspectImportCandidate_reportsNoVault()
+    {
+        QTemporaryDir source;
+        QVERIFY(source.isValid());
+        QVERIFY(touch(source.filePath("clip.mp3")));
+
+        VaultTreeModel model;
+        const QVariantMap v =
+            model.inspectImportCandidate(QUrl::fromLocalFile(source.filePath("clip.mp3")));
+        QCOMPARE(v.value("reason").toString(), QStringLiteral("no-vault"));
+    }
+
     // --- Search support roles (Item 9: LabelRole/TagsRole/TranscriptBodyRole) --
 
     // An audio file's frontmatter label/tags are exposed via LabelRole/
@@ -2873,6 +3329,48 @@ private slots:
                 ++found;
         }
         QCOMPARE(found, 1);
+    }
+
+    // Durable combine log (Issue 3): a merge is recorded to
+    // .transcriber/combineHistory.json so an auto-combine that moved the user's
+    // originals leaves an account of itself beyond the in-session Tasks row/undo.
+    // Round-trips through the same array-of-entries store as the grab history,
+    // and appends (never overwrites) so the log accumulates across merges.
+    void combineHistory_appendsAndReadsBack()
+    {
+        QTemporaryDir vault;
+        QVERIFY(vault.isValid());
+
+        VaultTreeModel model;
+        model.setVaultPath(QUrl::fromLocalFile(vault.path()));
+
+        // Nothing logged yet: an empty list, not an error.
+        QVERIFY(model.readCombineHistory().isEmpty());
+
+        QVariantMap first{ { "outputPath", vault.filePath("Rec.combined.wav") },
+                           { "sourcePaths", QStringList{ vault.filePath("REC001.wav"),
+                                                         vault.filePath("REC002.wav") } },
+                           { "partCount", 2 },
+                           { "deleteOriginals", false } };
+        QString err;
+        QVERIFY2(model.appendCombineHistoryEntry(first, &err), qUtf8Printable(err));
+
+        // The file lives under .transcriber/, alongside the grab history.
+        QVERIFY(QFileInfo::exists(vault.filePath(".transcriber/combineHistory.json")));
+
+        QVariantList history = model.readCombineHistory();
+        QCOMPARE(history.size(), 1);
+        QCOMPARE(history.first().toMap().value("partCount").toInt(), 2);
+        QCOMPARE(history.first().toMap().value("deleteOriginals").toBool(), false);
+
+        // A second merge appends rather than replacing.
+        QVariantMap second{ { "outputPath", vault.filePath("Other.combined.wav") },
+                            { "partCount", 3 },
+                            { "deleteOriginals", true } };
+        QVERIFY(model.appendCombineHistoryEntry(second, nullptr));
+        history = model.readCombineHistory();
+        QCOMPARE(history.size(), 2);
+        QCOMPARE(history.at(1).toMap().value("deleteOriginals").toBool(), true);
     }
 };
 

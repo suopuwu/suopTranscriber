@@ -49,7 +49,12 @@ public:
     // (calls TaskContext::checkpoint()). cancellableMidRun: a cancel takes
     // effect before the task finishes naturally (false for atomic single-pass
     // kinds — rename/merge/diarize have no mid-pass abort hook, so a cancel is
-    // only honored at the next task boundary).
+    // only honored at the next task boundary). LOAD-BEARING: a
+    // pausable && !cancellableMidRun task, when cancelled, is shown as
+    // "Cancelling" (pause disabled) until its pass boundary instead of looking
+    // resumed — the queue derives that honest state from THIS flag, so declaring
+    // it correctly is all a new kind needs (see TranscriptionController's cancel
+    // paths + isActiveStopping()).
     struct Capabilities {
         bool pausable = false;
         bool cancellableMidRun = true;
@@ -122,6 +127,42 @@ public:
     // onTaskFinished plus an op=="import" check in the ModelIoTask wiring) that
     // a new model-affecting kind had to remember to join. Default: false.
     virtual bool completionChangesModelSet() const { return false; }
+    // True iff this task MOVES files on disk (rename/move/import/combine/grab),
+    // so the vault's QFileSystemWatcher rebuild will find a changed name/path/
+    // child-count, fail sameStructure(), and emit a full modelReset. That reset
+    // is the authoritative tree refresh, which makes the Sidebar's generic
+    // `finished`-signal refresh (refreshTreeOrdering/refreshSearchResults)
+    // redundant for these kinds — running both is what reflowed the left panel
+    // TWICE for one rename. Sidebar.onFinished skips its refresh when this is
+    // true and lets the reset do the single reflow.
+    //
+    // Default FALSE, and deliberately so for the in-place kinds (relabel/tags/
+    // chapters/speaker rename/merge): they rewrite an existing .md without
+    // changing the node, so sameStructure() holds, the watcher emits only
+    // dataChanged, NO reset ever arrives — and `finished` is their ONLY reflow
+    // trigger. Marking such a kind true would leave the tree stale, so this is
+    // the dangerous direction: when unsure, leave it false (worst case is the
+    // benign double reflow, not a missed one).
+    //
+    // NOT overridden by transcribe: re-transcribing an ALREADY-transcribed file
+    // leaves the node's status untouched, so sameStructure() holds and no reset
+    // follows — it only resets on the first transcribe, when status flips.
+    // Nor by trash/delete/restore: those apply their model change synchronously
+    // (VaultTreeModel::applyRemovalOutcome/applyRestoreOutcome) rather than via
+    // the watcher, a different refresh path this flag does not model.
+    virtual bool isStructuralFileOp() const { return false; }
+    // True iff this task OCCUPIES its fileUrl for per-file gating purposes:
+    // the isQueued() enqueue-dedup, queuedFileUrls(), the path->status index
+    // the file tree reads (rebuildJobStatusIndex), and the MainPanel/Sidebar
+    // per-file action enable/disable. Default true — a transcribe/diarize/
+    // relabel/chapters/rename/move/import genuinely owns the file while it runs,
+    // so a second op on the same file must wait (and the UI must show it busy).
+    // FALSE for a comparison-only run (benchmark / diarization sweep) that reads
+    // the file but writes NOTHING to the vault: it must not grey out Transcribe
+    // on the very file you're benchmarking, nor make isQueued() swallow a
+    // transcribe queued on it. Such a run is still a real queued task (Tasks row
+    // + glow) — it just doesn't monopolize its file's per-file UI.
+    virtual bool occupiesFile() const { return true; }
     // Opt-IN persistence (default: not saved across a restart). A kind whose
     // inputs name an external/removable path (import, usbGrab) simply never
     // overrides this — no more persistQueue() opt-OUT that a new kind forgets.
@@ -168,6 +209,17 @@ public:
     // persistent equivalent of the auto snackbar). Only meaningful once Done —
     // makeUndoTask() captures run()'s result, so callers gate on status first.
     bool isUndoable() const { return !undoLabel().isEmpty() && makeUndoTask() != nullptr; }
+
+    // Is the undo STILL applicable — i.e. would makeUndoTask()'s inverse still
+    // find its source where it expects it? Undo is only offered for a Done
+    // task, but by the time the user clicks, the world may have moved on (the
+    // file was moved/renamed again), leaving the inverse pointing at a path
+    // that no longer holds the file. A kind whose undo can go stale overrides
+    // this to say so; the Tasks-list Undo button greys out (stays visible,
+    // becomes non-clickable) when it returns false. Default: always applicable
+    // (kinds with no filesystem precondition, e.g. TrashTask's restore-from-
+    // trash, never go stale this way).
+    virtual bool undoStillApplicable() const { return true; }
 
     // The undo-snackbar label when this task is undone as part of a BATCH of
     // `count` sibling tasks (a multi-select move/trash enqueued via

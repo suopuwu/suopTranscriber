@@ -125,15 +125,13 @@ private slots:
 
     // The actual claim under test: clicking selectAllButton (and, equally,
     // pressing Ctrl+A with the tree focused) populates selectedPaths with
-    // every visible note; and bulkTargetPaths() itself now always narrows to
-    // that selection — an empty selection intersects to an empty target set,
-    // never "everything eligible" (the pre-change behavior for 0/1
-    // selected). The ribbon buttons' own `enabled` bindings additionally
-    // gate on `sidebar.transcriptionController`, which this harness leaves
-    // null (see TranscriptionControllerStub's comment above) — so this test
-    // calls bulkTargetPaths() directly with a hand-built eligibility map
-    // instead of reading a button's `enabled` property, to isolate the
-    // selection-narrowing behavior from that unrelated controller gate.
+    // every visible note. Item 041: the ribbon now derives eligibility from
+    // the MODEL (refreshSelectionEligibility() narrowing searchResultNotes()
+    // to the selection), not from a delegate-fed map, so there is no
+    // bulkTargetPaths() to call here anymore — the selection→eligibility
+    // narrowing over unrealized rows is covered by
+    // bulkEligibilityCoversUnrealizedRows() below. This test pins the
+    // selection-population half only.
     void selectAllButtonAndCtrlAPopulateSelection()
     {
         QTemporaryDir vault;
@@ -178,23 +176,8 @@ private slots:
         QVERIFY2(sidebarItem->findChild<QQuickItem *>(QStringLiteral("transcribeAllButton")),
                  "ribbon must expose an id: transcribeAllButton");
 
-        // A fake "every note is eligible" map, built independently of the
-        // (controller-gated, always-empty-in-this-harness) real eligibility
-        // maps — isolates bulkTargetPaths()'s own selection-narrowing logic.
-        QVariantMap fakeEligibleMap;
-        for (const QString &p : notePaths)
-            fakeEligibleMap.insert(p, true);
-        auto bulkTargetCount = [&]() -> int {
-            QVariant result;
-            QMetaObject::invokeMethod(sidebarItem, "bulkTargetPaths", Qt::DirectConnection,
-                                       Q_RETURN_ARG(QVariant, result), Q_ARG(QVariant, fakeEligibleMap));
-            return result.toList().size();
-        };
-
-        // Nothing selected yet — must intersect to nothing, not fall back to
-        // "everything eligible" (the pre-change 0/1-selected behavior).
+        // Nothing selected yet.
         QCOMPARE(sidebarItem->property("selectedPaths").toList().size(), 0);
-        QCOMPARE(bulkTargetCount(), 0);
 
         // Click selectAllButton.
         const QPointF selectAllCenter(selectAllButton->width() / 2, selectAllButton->height() / 2);
@@ -203,7 +186,6 @@ private slots:
         QTest::qWait(20);
 
         QCOMPARE(sidebarItem->property("selectedPaths").toList().size(), 5);
-        QCOMPARE(bulkTargetCount(), 5);
 
         // Click row 0 to collapse back to a single selection and grab
         // keyboard focus for the tree (Ctrl+A's Shortcut is gated on
@@ -217,13 +199,66 @@ private slots:
         QTest::qWait(20);
         QVERIFY(treeItem->property("activeFocus").toBool());
         QCOMPARE(sidebarItem->property("selectedPaths").toList().size(), 1);
-        QCOMPARE(bulkTargetCount(), 1);
 
         // Ctrl+A must reproduce exactly what the button click did above.
         QTest::keyClick(&view, Qt::Key_A, Qt::ControlModifier);
         QTest::qWait(20);
         QCOMPARE(sidebarItem->property("selectedPaths").toList().size(), 5);
-        QCOMPARE(bulkTargetCount(), 5);
+    }
+
+    // Item 041 regression: the ribbon's eligibility must cover EVERY selected
+    // row, not just the handful TreeView has realized. The old delegate-fed
+    // maps only described realized rows, so a select-all in a vault taller than
+    // the viewport left most eligible files invisible to the ribbon — buttons
+    // sat dim. Eligibility is now model-derived, so it must reach unrealized
+    // rows too. This harness's controller is null, so use the relabel/chapters
+    // rules (pure status/isOrphanedMd), not selectionTranscribePaths.
+    void bulkEligibilityCoversUnrealizedRows()
+    {
+        QTemporaryDir vault;
+        QVERIFY(vault.isValid());
+        const int n = 60;
+        for (int i = 0; i < n; ++i) {
+            const QString base = vault.filePath(QStringLiteral("clip%1.mp3").arg(i, 3, 10, QLatin1Char('0')));
+            QVERIFY(touch(base));
+            // A sibling .md with valid frontmatter → VaultTreeModel reports
+            // TranscribedStatus (== 2), which the relabel/chapters rules need.
+            QVERIFY(touch(base + ".md",
+                          "---\nmodel: ggml-base.en.bin\nspeakerDetection: false\n---\n\n[0] hello\n"));
+        }
+
+        QQuickView view;
+        view.engine()->addImportPath(m_moduleDir.path());
+        view.engine()->addImageProvider(QString::fromLatin1(IconImageProvider::kProviderId),
+                                        new IconImageProvider);
+        view.rootContext()->setContextProperty(QStringLiteral("vaultUrl"),
+                                                QUrl::fromLocalFile(vault.path()));
+        view.setSource(QUrl::fromLocalFile(m_driverQmlPath));
+        QVERIFY(view.status() == QQuickView::Ready);
+        view.show();
+        QVERIFY(QTest::qWaitForWindowExposed(&view));
+
+        QQuickItem *root = view.rootObject();
+        QVERIFY(root);
+        QQuickItem *sidebarItem = root->findChild<QQuickItem *>(QStringLiteral("sidebar"));
+        QVERIFY(sidebarItem);
+        QQuickItem *treeItem = findByClassNamePrefix(sidebarItem, "QQuickTreeView");
+        QVERIFY(treeItem);
+        // All 60 rows exist in the model even though the 260px-high driver only
+        // realizes ~10 delegates at a time — that gap is the whole point.
+        QTRY_COMPARE(treeItem->property("rows").toInt(), n);
+
+        QQuickItem *selectAllButton = sidebarItem->findChild<QQuickItem *>(QStringLiteral("selectAllButton"));
+        QVERIFY(selectAllButton);
+        const QPoint selectAllScenePos = selectAllButton->mapToScene(
+            QPointF(selectAllButton->width() / 2, selectAllButton->height() / 2)).toPoint();
+        QTest::mouseClick(&view, Qt::LeftButton, Qt::NoModifier, selectAllScenePos);
+
+        QTRY_COMPARE(sidebarItem->property("selectedPaths").toList().size(), n);
+        // The regression: every transcribed row is eligible, including the ~50
+        // never realized. Under the old delegate-fed maps this was ~10.
+        QTRY_COMPARE(sidebarItem->property("selectionRelabelPaths").toList().size(), n);
+        QTRY_COMPARE(sidebarItem->property("selectionChaptersPaths").toList().size(), n);
     }
 
     // Bug (live test #3): a file restored by undoing its delete was NOT a true

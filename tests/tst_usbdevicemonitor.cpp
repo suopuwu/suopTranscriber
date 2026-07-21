@@ -17,6 +17,8 @@
 
 #include <QtTest>
 
+#include <QFile>
+
 #include <QVariantMap>
 
 #include "UsbDeviceMonitor.h"
@@ -264,6 +266,44 @@ private slots:
         const auto volume = usbVolumeFromProperties(QStringLiteral("/org/freedesktop/UDisks2/block_devices/nvme0n1p3"),
                                                      QString(), systemDriveBlockProps(), systemDriveDriveProps());
         QVERIFY(!volume.has_value());
+    }
+
+    // The resume-from-sleep detection (item 057) is pure D-Bus/logind plumbing
+    // with no unit-test seam (needs a fake system bus + real hardware — see this
+    // file's header), so these are source-scan guards, the sanctioned tool when
+    // there's no direct test path (CLAUDE.md).
+    void resumeFromSleep_subscribesToPrepareForSleep()
+    {
+        const QString src = readSource();
+        QVERIFY2(!src.isEmpty(), "UsbDeviceMonitor.cpp must be readable via SUOP_SRC_DIR");
+        QVERIFY2(src.contains(QStringLiteral("PrepareForSleep")) && src.contains(QStringLiteral("login1")),
+                 "UsbDeviceMonitor must subscribe to logind's PrepareForSleep so a device plugged in "
+                 "while asleep is detected on wake (item 057)");
+    }
+
+    void resumeFromSleep_reEnumeratesAndReoffersBothMountedAndUnmounted()
+    {
+        const QString src = readSource();
+        QVERIFY(!src.isEmpty());
+        QVERIFY2(src.contains(QStringLiteral("reEnumerateAfterResume")),
+                 "resume must re-enumerate via reEnumerateAfterResume() (item 057)");
+        QVERIFY2(src.contains(QStringLiteral("GetManagedObjects")),
+                 "the resume re-enumeration must query UDisks2 GetManagedObjects");
+        // Both halves matter: the unmounted re-offer is load-bearing because a
+        // stock KDE (automount off) leaves a slept-through device unmounted on wake.
+        QVERIFY2(src.contains(QStringLiteral("emit deviceAdded"))
+                     && src.contains(QStringLiteral("emit unmountedVolumeDetected")),
+                 "resume re-enumeration must re-fire BOTH deviceAdded (mounted) and "
+                 "unmountedVolumeDetected (present-but-unmounted) — item 057");
+    }
+
+private:
+    static QString readSource()
+    {
+        QFile f(QStringLiteral(SUOP_SRC_DIR "/core/UsbDeviceMonitor.cpp"));
+        if (!f.open(QIODevice::ReadOnly | QIODevice::Text))
+            return QString();
+        return QString::fromUtf8(f.readAll());
     }
 };
 

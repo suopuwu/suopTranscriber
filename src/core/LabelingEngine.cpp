@@ -133,6 +133,32 @@ constexpr auto kChapterMergeGrammar = R"GBNF(
 root ::= "yes" | "no"
 )GBNF";
 
+// openingChapterTitle() pass: a single short title. Wrapped in a JSON object
+// rather than emitted as a bare JSON string so QJsonDocument::fromJson() can
+// parse it (it only accepts an object or array at top level) — and it matches
+// the shape kGrammar/kChapterGrammar already use.
+constexpr auto kOpeningTitleGrammar = R"GBNF(
+root   ::= "{" ws "\"title\"" ws ":" ws string ws "}"
+string ::= "\"" ( [^"\\\x7F\x00-\x1F] | "\\" (["\\bfnrt] | "u" [0-9a-fA-F]{4}) )* "\""
+ws     ::= [ \t\n]*
+)GBNF";
+
+// One short title in a tiny fixed JSON object — same "small fixed output" case
+// as kMaxOutputTokens above, not the chapter-count-scaled kMaxChapterOutputTokens.
+// Slack left over the "a few words" the prompt asks for, for an odd tokenization.
+constexpr int kOpeningTitleOutputTokens = 48;
+
+// Deliberately scoped to "what you are shown", not the transcript as a whole:
+// the caller passes ONLY the opening chapter's own segments, and a title that
+// summarized the whole file would duplicate the file's label instead of naming
+// this chapter.
+const char *kOpeningTitleSystemPrompt =
+    "You are given the OPENING stretch of an audio transcript — its first chapter, which runs "
+    "from the very start until the topic first changes. Produce a short (a few words) "
+    "descriptive title for what this opening stretch is about. Title only what you are shown, "
+    "not the transcript as a whole. Respond with ONLY a JSON object of the form "
+    "{\"title\": \"...\"}, nothing else.";
+
 // Companion to chapterSystemPrompt(): rather than tuning that prompt further
 // to make the model more conservative about proposing boundaries in the
 // first place (small instruct models are unreliable at open-ended "how many
@@ -298,7 +324,8 @@ LabelingEngine::~LabelingEngine()
 
 std::optional<QString> LabelingEngine::runGrammarConstrained(const QString &systemPrompt, const QString &userText,
                                                                const char *grammar, int maxOutputTokens,
-                                                               QString *errorOut)
+                                                               QString *errorOut,
+                                                               const std::function<void(int)> &onTokens)
 {
     if (!isValid()) {
         if (errorOut)
@@ -385,6 +412,10 @@ std::optional<QString> LabelingEngine::runGrammarConstrained(const QString &syst
         if (n < 0)
             break;
         response.append(buf, n);
+        // Throttled: one callback per 8 tokens is well under any repaint
+        // rate and keeps the per-token cost of the hook negligible.
+        if (onTokens && (i % 8) == 0)
+            onTokens(i + 1);
 
         batch = llama_batch_get_one(&newToken, 1);
     }
@@ -432,7 +463,8 @@ QString LabelingEngine::chapterSystemPrompt(double density)
 }
 
 std::optional<QList<Chapter>> LabelingEngine::generateChapters(const QStringList &segmentTexts, double density,
-                                                                QString *errorOut)
+                                                                QString *errorOut,
+                                                                const std::function<void(int)> &onTokens)
 {
     QString indexed;
     indexed.reserve(segmentTexts.size() * 24);
@@ -453,7 +485,7 @@ std::optional<QList<Chapter>> LabelingEngine::generateChapters(const QStringList
     }
 
     const auto response = runGrammarConstrained(chapterSystemPrompt(density), indexed, kChapterGrammar,
-                                                 kMaxChapterOutputTokens, errorOut);
+                                                 kMaxChapterOutputTokens, errorOut, onTokens);
     if (!response)
         return std::nullopt;
 
@@ -479,7 +511,8 @@ std::optional<QList<Chapter>> LabelingEngine::generateChapters(const QStringList
 
 std::optional<QList<Chapter>> LabelingEngine::mergeSimilarChapters(const QList<Chapter> &chapters,
                                                                      const QStringList &segmentTexts,
-                                                                     double density, QString *errorOut)
+                                                                     double density, QString *errorOut,
+                                                                     const std::function<void(int, int)> &onPair)
 {
     if (chapters.size() < 2)
         return chapters;
@@ -514,10 +547,41 @@ std::optional<QList<Chapter>> LabelingEngine::mergeSimilarChapters(const QList<C
         // this is just picking between the two rather than general parsing.
         if (response->trimmed() != QStringLiteral("yes"))
             merged.append(candidate);
+        if (onPair)
+            onPair(i, chapters.size() - 1);
         // else: candidate absorbed into `kept` — drop its boundary/title and
         // move on to comparing `kept` against the segment after next.
     }
     return merged;
+}
+
+std::optional<QString> LabelingEngine::openingChapterTitle(const QStringList &segmentTexts, QString *errorOut)
+{
+    if (segmentTexts.isEmpty()) {
+        if (errorOut)
+            *errorOut = QStringLiteral("no segments to title an opening chapter from");
+        return std::nullopt;
+    }
+
+    // Plain concatenated text, NOT the "INDEX: text" indexed form
+    // generateChapters() builds — nothing in this pass's answer refers back to
+    // a segment index, so the numbering would be pure prompt noise.
+    QString text = segmentTexts.join(QLatin1Char(' '));
+    if (text.size() > LabelingEngine::kMaxChapterInputChars)
+        text.truncate(LabelingEngine::kMaxChapterInputChars);
+
+    const auto response = runGrammarConstrained(QString::fromUtf8(kOpeningTitleSystemPrompt), text,
+                                                 kOpeningTitleGrammar, kOpeningTitleOutputTokens, errorOut);
+    if (!response)
+        return std::nullopt;
+
+    const QJsonDocument doc = QJsonDocument::fromJson(response->toUtf8());
+    if (!doc.isObject()) {
+        if (errorOut)
+            *errorOut = QStringLiteral("model did not produce valid JSON: %1").arg(*response);
+        return std::nullopt;
+    }
+    return doc.object().value(QStringLiteral("title")).toString().trimmed();
 }
 
 #else // !SUOP_ENABLE_LABELING — built without llama.cpp (no AI auto-labeling).
@@ -541,7 +605,8 @@ std::optional<LabelResult> LabelingEngine::label(const QString &, const QStringL
     return std::nullopt;
 }
 
-std::optional<QList<Chapter>> LabelingEngine::generateChapters(const QStringList &, double, QString *errorOut)
+std::optional<QList<Chapter>> LabelingEngine::generateChapters(const QStringList &, double, QString *errorOut,
+                                                                const std::function<void(int)> &)
 {
     if (errorOut)
         *errorOut = QStringLiteral("auto-labeling was disabled at build time (SUOP_ENABLE_LABELING=OFF)");
@@ -549,9 +614,17 @@ std::optional<QList<Chapter>> LabelingEngine::generateChapters(const QStringList
 }
 
 std::optional<QList<Chapter>> LabelingEngine::mergeSimilarChapters(const QList<Chapter> &chapters, const QStringList &,
-                                                                   double, QString *)
+                                                                   double, QString *,
+                                                                   const std::function<void(int, int)> &)
 {
     return chapters; // nothing to merge without the model — return input unchanged
+}
+
+std::optional<QString> LabelingEngine::openingChapterTitle(const QStringList &, QString *errorOut)
+{
+    if (errorOut)
+        *errorOut = QStringLiteral("auto-labeling was disabled at build time (SUOP_ENABLE_LABELING=OFF)");
+    return std::nullopt;
 }
 
 QString LabelingEngine::chapterSystemPrompt(double)

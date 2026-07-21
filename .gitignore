@@ -1,6 +1,7 @@
 # --- Local agent / tooling ---
 CLAUDE.md
 .task/
+.taskQueue/
 
 # --- CMake / C++ build ---
 build/

@@ -12,6 +12,10 @@
 //   1. selectedFilePath follows currentFilePath — i.e. a left-panel selection
 //      switches the benchmark file automatically, and while the page is hidden.
 //   2. there is NO file-picker ComboBox left in the page.
+//   3. per-model result cards render as a wrapping Flow of square resultCards
+//      (not a vertical column), transcript off the card.
+//   4. clicking a card with a transcript opens transcriptPreviewPopup showing
+//      that model's full transcript.
 
 #include <QtTest>
 
@@ -21,6 +25,7 @@
 #include <QQmlEngine>
 #include <QQuickItem>
 #include <QQuickView>
+#include <QSet>
 #include <QTemporaryDir>
 #include <QUrl>
 
@@ -44,6 +49,17 @@ bool touch(const QString &path, const QByteArray &content = "x")
 class TranscriptionControllerStub : public QObject {
     Q_OBJECT
 };
+
+// Repeater delegates are VISUAL children of the Flow but their QObject parent
+// is elsewhere, so findChildren() misses them — walk the visual childItems tree.
+void collectByObjectName(QQuickItem *root, const QString &name, QList<QQuickItem *> &out)
+{
+    for (QQuickItem *child : root->childItems()) {
+        if (child->objectName() == name)
+            out.append(child);
+        collectByObjectName(child, name, out);
+    }
+}
 
 // The Basic style's ComboBox is a QML type ("ComboBox_QMLTYPE_*"), not the bare
 // C++ QQuickComboBox — matched by QML type-name prefix.
@@ -139,6 +155,164 @@ private slots:
                  "the in-page file-picker ComboBox must be gone — the benchmark file follows the "
                  "left-panel selection (currentFilePath) now");
     }
+
+    // The per-model results render as a wrapping Flow of square resultCards
+    // (not a full-width vertical column), and the click-to-expand popup exists
+    // but is closed until a card is clicked.
+    void resultsRenderAsWrappingCards()
+    {
+        QTemporaryDir vault;
+        QVERIFY(vault.isValid());
+        QVERIFY(touch(vault.filePath(QStringLiteral("one.mp3"))));
+
+        QQuickView view;
+        QObject *settings = nullptr;
+        QQuickItem *bench = load(&view, vault.path(), &settings);
+        QVERIFY2(bench, "could not load BenchmarkPage");
+
+        auto mkResult = [](const QString &label, bool ok, const QString &text,
+                           const QString &error) {
+            QVariantMap m;
+            m.insert(QStringLiteral("label"), label);
+            m.insert(QStringLiteral("kind"), QStringLiteral("whisper"));
+            m.insert(QStringLiteral("ok"), ok);
+            m.insert(QStringLiteral("text"), text);
+            m.insert(QStringLiteral("error"), error);
+            m.insert(QStringLiteral("runtimeMs"), 1200);
+            m.insert(QStringLiteral("realtimeFactor"), 3.0);
+            m.insert(QStringLiteral("segmentCount"), 2);
+            m.insert(QStringLiteral("wordCount"), 5);
+            m.insert(QStringLiteral("charCount"), 20);
+            return m;
+        };
+        QVariantList results;
+        results << mkResult(QStringLiteral("tiny"), true, QStringLiteral("hello one"), QString());
+        results << mkResult(QStringLiteral("base"), true, QStringLiteral("hello two"), QString());
+        results << mkResult(QStringLiteral("broken"), false, QString(),
+                            QStringLiteral("unavailable"));
+        bench->setProperty("results", results);
+
+        QQuickItem *flow = bench->findChild<QQuickItem *>(QStringLiteral("resultsFlow"));
+        QVERIFY2(flow, "the results must render in a resultsFlow");
+        QVERIFY2(QByteArray(flow->metaObject()->className()).startsWith("QQuickFlow"),
+                 "result cards must be a wrapping Flow, not a vertical column");
+
+        QList<QQuickItem *> cards;
+        QTRY_VERIFY([&] {
+            cards.clear();
+            collectByObjectName(bench, QStringLiteral("resultCard"), cards);
+            return cards.size() == 3;
+        }());
+        QCOMPARE(cards.size(), 3);
+
+        QObject *popup = bench->findChild<QObject *>(QStringLiteral("transcriptPreviewPopup"));
+        QVERIFY2(popup, "the click-to-expand transcriptPreviewPopup must exist");
+        QVERIFY2(!popup->property("visible").toBool(),
+                 "the preview popup must be closed until a card is clicked");
+    }
+
+    // The card kind badge must reflect the backend's three-way `kind` value
+    // ("whisper" / "parakeet" / "engine") instead of collapsing parakeet into
+    // whisper (the regression this test guards against).
+    void cardKindBadgeReflectsKind()
+    {
+        QTemporaryDir vault;
+        QVERIFY(vault.isValid());
+        QVERIFY(touch(vault.filePath(QStringLiteral("one.mp3"))));
+
+        QQuickView view;
+        QObject *settings = nullptr;
+        QQuickItem *bench = load(&view, vault.path(), &settings);
+        QVERIFY2(bench, "could not load BenchmarkPage");
+
+        auto mkResult = [](const QString &label, const QString &kind) {
+            QVariantMap m;
+            m.insert(QStringLiteral("label"), label);
+            m.insert(QStringLiteral("kind"), kind);
+            m.insert(QStringLiteral("ok"), true);
+            m.insert(QStringLiteral("text"), QStringLiteral("hello"));
+            m.insert(QStringLiteral("error"), QString());
+            m.insert(QStringLiteral("runtimeMs"), 1200);
+            m.insert(QStringLiteral("realtimeFactor"), 3.0);
+            m.insert(QStringLiteral("segmentCount"), 1);
+            m.insert(QStringLiteral("wordCount"), 1);
+            m.insert(QStringLiteral("charCount"), 5);
+            return m;
+        };
+        QVariantList results;
+        results << mkResult(QStringLiteral("tiny"), QStringLiteral("whisper"));
+        results << mkResult(QStringLiteral("parakeet-tdt-0.6b-v2"), QStringLiteral("parakeet"));
+        results << mkResult(QStringLiteral("engine:foo"), QStringLiteral("engine"));
+        bench->setProperty("results", results);
+
+        QList<QQuickItem *> cards;
+        QTRY_VERIFY([&] {
+            cards.clear();
+            collectByObjectName(bench, QStringLiteral("resultCard"), cards);
+            return cards.size() == 3;
+        }());
+
+        QList<QQuickItem *> badges;
+        collectByObjectName(bench, QStringLiteral("cardKindBadge"), badges);
+        QCOMPARE(badges.size(), 3);
+
+        QSet<QString> badgeTexts;
+        for (QQuickItem *badge : badges)
+            badgeTexts.insert(badge->property("text").toString());
+
+        QSet<QString> expected{QStringLiteral("whisper"), QStringLiteral("parakeet"),
+                                QStringLiteral("engine")};
+        QCOMPARE(badgeTexts, expected);
+    }
+
+    // Clicking a card that has a transcript opens the preview popup showing that
+    // model's full transcript.
+    void clickingCardOpensPreviewPopup()
+    {
+        QTemporaryDir vault;
+        QVERIFY(vault.isValid());
+        QVERIFY(touch(vault.filePath(QStringLiteral("one.mp3"))));
+
+        QQuickView view;
+        QObject *settings = nullptr;
+        QQuickItem *bench = load(&view, vault.path(), &settings);
+        QVERIFY2(bench, "could not load BenchmarkPage");
+
+        const QString wanted = QStringLiteral("hello benchmark world");
+        QVariantMap m;
+        m.insert(QStringLiteral("label"), QStringLiteral("tiny"));
+        m.insert(QStringLiteral("kind"), QStringLiteral("whisper"));
+        m.insert(QStringLiteral("ok"), true);
+        m.insert(QStringLiteral("text"), wanted);
+        m.insert(QStringLiteral("runtimeMs"), 1200);
+        m.insert(QStringLiteral("realtimeFactor"), 3.0);
+        m.insert(QStringLiteral("segmentCount"), 1);
+        m.insert(QStringLiteral("wordCount"), 3);
+        m.insert(QStringLiteral("charCount"), 21);
+        bench->setProperty("results", QVariantList{m});
+
+        QList<QQuickItem *> cards;
+        QTRY_VERIFY([&] {
+            cards.clear();
+            collectByObjectName(bench, QStringLiteral("resultCard"), cards);
+            return !cards.isEmpty();
+        }());
+        QQuickItem *card = cards.first();
+        QVERIFY2(card, "a resultCard must exist for the seeded result");
+
+        const QPointF center = card->mapToScene(card->boundingRect().center());
+        QTest::mouseClick(&view, Qt::LeftButton, Qt::NoModifier, center.toPoint());
+
+        QObject *popup = bench->findChild<QObject *>(QStringLiteral("transcriptPreviewPopup"));
+        QVERIFY2(popup, "the transcriptPreviewPopup must exist");
+        QTRY_VERIFY2(popup->property("visible").toBool(),
+                     "clicking a card must open the preview popup");
+
+        QQuickItem *previewText =
+            bench->findChild<QQuickItem *>(QStringLiteral("previewTranscriptText"));
+        QVERIFY2(previewText, "the popup must contain previewTranscriptText");
+        QTRY_COMPARE(previewText->property("text").toString(), wanted);
+    }
 };
 
 void TstBenchmarkPageFileSync::buildModule()
@@ -159,6 +333,7 @@ void TstBenchmarkPageFileSync::buildModule()
                   "singleton AppSettings 1.0 qml/AppSettings.qml\n"
                   "singleton Notifications 1.0 qml/Notifications.qml\n"
                   "HoverBorder 1.0 qml/HoverBorder.qml\n"
+                  "MiddleDragScroll 1.0 qml/MiddleDragScroll.qml\n"
                   "BenchmarkPage 1.0 qml/BenchmarkPage.qml\n");
     qmldir.close();
 

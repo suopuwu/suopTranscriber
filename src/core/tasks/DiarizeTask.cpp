@@ -6,6 +6,7 @@
 #include "../AudioDecoder.h"
 #include "../DiarizationEngine.h"
 #include "../MdFrontmatter.h"
+#include "../ModelManager.h"
 #include "../TranscriptionController.h"
 #include "EngineCache.h"
 
@@ -54,6 +55,16 @@ ModelPrerequisites DiarizeTask::prerequisites() const
 {
     return {{ModelDownloadTarget::SegmentationModel, m_segmentationModelId},
             {ModelDownloadTarget::EmbeddingModel, m_embeddingModelId}};
+}
+
+void applyDiarizationModelFrontmatter(QStringList *frontmatterLines,
+                                      const QString &segmentationModelId,
+                                      const QString &embeddingModelId)
+{
+    MdFrontmatter::upsertKey(frontmatterLines, QStringLiteral("segmentationModel"),
+                             ModelManager::segmentationModelInfo(segmentationModelId).label);
+    MdFrontmatter::upsertKey(frontmatterLines, QStringLiteral("embeddingModel"),
+                             ModelManager::embeddingModelInfo(embeddingModelId).label);
 }
 
 void DiarizeTask::run(TaskContext &ctx)
@@ -150,6 +161,9 @@ void DiarizeTask::run(TaskContext &ctx)
     // Empty applied set removes the "speakers:" allowlist; otherwise upserts it.
     MdFrontmatter::upsertKey(&frontmatterLines, QStringLiteral("speakers"),
                              appliedSpeakers.join(QStringLiteral(", ")), /*removeIfEmpty=*/true);
+    // Record which two models produced these speakers (see the info line in
+    // MainPanel.qml). Labels, not ids — consistent with the ASR `model:` key.
+    applyDiarizationModelFrontmatter(&frontmatterLines, m_segmentationModelId, m_embeddingModelId);
 
     QString writeError;
     if (!writeFrontmatterBlock(mdPath, frontmatterLines, newBody, &writeError))

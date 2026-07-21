@@ -6,9 +6,10 @@
 
 #include <algorithm>
 
-ImportTask::ImportTask(QString sourcePath, QUrl destUrl, QObject *parent)
+ImportTask::ImportTask(QString sourcePath, QUrl destUrl, bool overwrite, QObject *parent)
     : Task(parent)
     , m_sourcePath(std::move(sourcePath))
+    , m_overwrite(overwrite)
 {
     fileUrl = std::move(destUrl);
 }
@@ -32,8 +33,9 @@ void ImportTask::run(TaskContext &ctx)
     if (!src.open(QIODevice::ReadOnly))
         throw TaskError(QStringLiteral("could not open source file"));
     // Collision could have appeared between validation and now — never
-    // silently overwrite.
-    if (QFileInfo::exists(destPath))
+    // silently overwrite, unless the caller explicitly opted into overwrite
+    // (the drop handler's Overwrite/Skip snackbar action).
+    if (!m_overwrite && QFileInfo::exists(destPath))
         throw TaskError(QStringLiteral("a file with that name already exists in the vault"));
     QFile dst(destPath);
     if (!dst.open(QIODevice::WriteOnly | QIODevice::Truncate))
@@ -76,5 +78,19 @@ void ImportTask::run(TaskContext &ctx)
     }
     dst.flush();
     dst.close();
+
+    // Preserve the source's mtime on the copy, exactly like UsbGrabJob's
+    // restamp (and CombineTask's): the file-tree "Date Modified" sort keys off
+    // the audio file's mtime to mean recording time, and QFile writes stamp the
+    // copy with the time of the copy — so without this an old recording
+    // imported today sorts as if it were brand new. Best-effort, matching
+    // UsbGrabJob: a copy that won't reopen still imported fine.
+    QFile copiedFile(destPath);
+    if (copiedFile.open(QIODevice::ReadWrite)) {
+        copiedFile.setFileTime(QFileInfo(m_sourcePath).lastModified(),
+                               QFileDevice::FileModificationTime);
+        copiedFile.close();
+    }
+
     emit progress(1.0);
 }

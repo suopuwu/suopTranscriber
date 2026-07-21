@@ -99,6 +99,50 @@ private slots:
         }
     }
 
+    // The real failure mode of ANY icon edit: update one pack's manifest and
+    // leave the other with a missing key. The slot above only proves the
+    // fallback is a SUPERSET; this pins every pack to the SAME key set, so a
+    // name added to material alone (which would silently fall back, showing
+    // users on classic a different icon than the one just authored) fails
+    // here instead of shipping.
+    void packs_declareIdenticalIconKeySets()
+    {
+        IconTheme theme;
+        const QStringList names = theme.iconNames();
+        QVERIFY(!names.isEmpty());
+        for (const QString &pack : theme.packIds()) {
+            QStringList missing;
+            for (const QString &name : names) {
+                if (!theme.packHasIcon(pack, name))
+                    missing.append(name);
+            }
+            QVERIFY2(missing.isEmpty(),
+                      qPrintable(QStringLiteral("pack '%1' is missing icon key(s) another pack "
+                                                "defines: %2").arg(pack, missing.join(", "))));
+        }
+    }
+
+    // Companion to the key-set guard: a key can be present in the manifest and
+    // still point at an SVG that was never committed (or that failed to
+    // vendor), which renders nothing at all. Rasterizing each one through the
+    // real provider is the cheap way to catch that.
+    void materialPack_everySvgEntryActuallyRenders()
+    {
+        IconTheme theme;
+        IconImageProvider provider;
+        for (const QString &name : theme.iconNames()) {
+            const QVariantMap r = theme.resolve(name, QStringLiteral("material"), {});
+            if (r.value(QStringLiteral("kind")).toString() != QStringLiteral("svg"))
+                continue;  // classic-style builtin/glyph entries have no file to miss
+            QSize size;
+            const QString id = QStringLiteral("material/%1?color=%23ffffff&size=24")
+                                   .arg(r.value(QStringLiteral("value")).toString());
+            QVERIFY2(!provider.requestImage(id, &size, {}).isNull(),
+                      qPrintable(QStringLiteral("material icon '%1' -> '%2' rendered nothing — "
+                                                "missing or invalid svg").arg(name, id)));
+        }
+    }
+
     void resolve_usesActivePackWhenNoOverride()
     {
         IconTheme theme;

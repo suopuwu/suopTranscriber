@@ -20,6 +20,16 @@ class TstVadChunking : public QObject
 {
     Q_OBJECT
 
+private:
+    // QCOMPARE needs QTest::toString<T> for a readable failure message —
+    // rather than lean on whatever generic fallback Qt supplies (or doesn't)
+    // for std::pair<double,double>, compare the two doubles directly.
+    static void checkSpan(const std::pair<double, double> &span, double expectedStart, double expectedEnd)
+    {
+        QCOMPARE(span.first, expectedStart);
+        QCOMPARE(span.second, expectedEnd);
+    }
+
 private slots:
     // Spec: a file with no detected speech (silence/instrumental) degrades
     // to exactly one window spanning the whole file — same as "no chunking".
@@ -157,6 +167,111 @@ private slots:
         QVERIFY(!windows.empty());
         QCOMPARE(windows.front().startSeconds, 0.0);
         QCOMPARE(windows.back().endSeconds, 20.0);
+    }
+
+    // Silence-capture feature, phase 1: computeWindows()'s new speechSpansOut
+    // out-param is populated by the SAME real VAD pass the windows come from
+    // — on pure silence that's an empty (but touched) list, not an untouched
+    // default. Same real-model gating as the test above (this is the only
+    // path that exercises the actual whisper_vad_segments_from_samples() call
+    // this out-param is threaded through).
+    void computeWindows_realModel_fillsSpeechSpansOutParam()
+    {
+        const QString modelPath = qEnvironmentVariable("SUOP_TEST_VAD_MODEL");
+        if (modelPath.isEmpty() || !QFileInfo::exists(modelPath))
+            QSKIP("no real Silero VAD ggml model available; set SUOP_TEST_VAD_MODEL to one "
+                  "(see third_party/whisper.cpp/models/download-vad-model.sh)");
+
+        std::vector<float> pcm(16000 * 20, 0.0f); // 20s silence
+        QString vadError;
+        std::vector<std::pair<double, double>> speechSpans{{999.0, 1000.0}}; // sentinel — must be overwritten
+        const auto windows = VadChunker::computeWindows(pcm, modelPath, &vadError, &speechSpans);
+        QVERIFY2(vadError.isEmpty(), qPrintable(vadError));
+        QVERIFY(!windows.empty());
+        // Pure silence -> VAD finds no speech spans (the sentinel is gone).
+        QVERIFY(speechSpans.empty());
+    }
+
+    // Spec: the graceful-fallback paths (no model path / bad model path)
+    // never touch speechSpansOut — a caller distinguishes "VAD genuinely ran
+    // and found nothing" from "VAD didn't run at all" via vadActive (the
+    // caller-side flag TranscribePipeline::planWindows() derives from
+    // vadErrorOut), not by inspecting the out-param's contents.
+    void computeWindows_fallbackPaths_leaveSpeechSpansOutUntouched()
+    {
+        std::vector<float> pcm(16000 * 5, 0.0f);
+        QString vadError;
+        std::vector<std::pair<double, double>> speechSpans{{1.0, 2.0}}; // sentinel
+        VadChunker::computeWindows(pcm, QString(), &vadError, &speechSpans);
+        QCOMPARE(speechSpans.size(), std::size_t(1));
+        checkSpan(speechSpans.front(), 1.0, 2.0);
+    }
+
+    // --- complementSpans() — pure, unit-testable core of "silence/noise is
+    // the complement of VAD's speech spans over [0, totalSeconds]" (silence-
+    // capture feature, phase 1's Decision B: store the silence spans, not
+    // the speech spans). ---
+
+    // Leading AND trailing silence around one speech span in the middle.
+    void leadingAndTrailingSilence()
+    {
+        const std::vector<std::pair<double, double>> speech{{10.0, 20.0}};
+        const auto silence = VadChunker::complementSpans(speech, 30.0);
+        QCOMPARE(silence.size(), std::size_t(2));
+        checkSpan(silence[0], 0.0, 10.0);
+        checkSpan(silence[1], 20.0, 30.0);
+    }
+
+    // No speech detected at all -> the whole file is one silence span (same
+    // "empty -> whole file" convention groupSegmentsIntoWindows() uses).
+    void wholeFileSilent_emptySpeechYieldsOneWholeFileSpan()
+    {
+        const auto silence = VadChunker::complementSpans({}, 42.0);
+        QCOMPARE(silence.size(), std::size_t(1));
+        checkSpan(silence.front(), 0.0, 42.0);
+    }
+
+    // Speech spans that exactly cover [0, totalSeconds] with no gaps between
+    // them -> no silence at all.
+    void noGaps_backToBackSpeechYieldsNoSilence()
+    {
+        const std::vector<std::pair<double, double>> speech{{0.0, 10.0}, {10.0, 20.0}, {20.0, 30.0}};
+        const auto silence = VadChunker::complementSpans(speech, 30.0);
+        QVERIFY(silence.empty());
+    }
+
+    // Adjacent (touching, e.g. [5,10) and [10,15)) AND overlapping speech
+    // spans must merge into one before complementing — otherwise a
+    // zero-length "silence" gap could appear exactly at the touch point.
+    void adjacentAndOverlappingSpansMergeBeforeComplementing()
+    {
+        const std::vector<std::pair<double, double>> speech{{5.0, 10.0}, {10.0, 15.0}, {14.0, 20.0}};
+        const auto silence = VadChunker::complementSpans(speech, 25.0);
+        QCOMPARE(silence.size(), std::size_t(2));
+        checkSpan(silence[0], 0.0, 5.0);
+        checkSpan(silence[1], 20.0, 25.0);
+    }
+
+    // Unsorted input is sorted before complementing — a caller (e.g. a
+    // transcript-gap fallback built from segment order) isn't required to
+    // pre-sort.
+    void unsortedSpeechSpansAreSortedFirst()
+    {
+        const std::vector<std::pair<double, double>> speech{{20.0, 25.0}, {0.0, 5.0}, {10.0, 15.0}};
+        const auto silence = VadChunker::complementSpans(speech, 30.0);
+        QCOMPARE(silence.size(), std::size_t(3));
+        checkSpan(silence[0], 5.0, 10.0);
+        checkSpan(silence[1], 15.0, 20.0);
+        checkSpan(silence[2], 25.0, 30.0);
+    }
+
+    // A speech span covering the ENTIRE file leaves no silence at all —
+    // distinct from the "empty speech" case above (that one has a silence
+    // span; this one has none).
+    void speechCoveringWholeFile_yieldsNoSilence()
+    {
+        const std::vector<std::pair<double, double>> speech{{0.0, 30.0}};
+        QVERIFY(VadChunker::complementSpans(speech, 30.0).empty());
     }
 };
 

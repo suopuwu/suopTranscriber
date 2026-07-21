@@ -175,7 +175,13 @@ ColumnLayout {
                 text: qsTr("Download")
                 onClicked: {
                     modelsPage.transcriptionController.downloadModel(row.modelData.id)
-                    Notifications.info(qsTr("Downloading — see Tasks for progress."))
+                    // Literally a pointer at the Tasks popup — pointless when
+                    // that popup is already open.
+                    Notifications.post({
+                        text: qsTr("Downloading — see Tasks for progress."),
+                        kind: "info",
+                        taskRelated: true
+                    })
                 }
             }
 

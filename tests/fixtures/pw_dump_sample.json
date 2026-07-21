@@ -1,0 +1,82 @@
+[
+  {
+    "id": 65,
+    "type": "PipeWire:Interface:Node",
+    "info": {
+      "props": {
+        "media.class": "Audio/Sink",
+        "node.name": "alsa_output.usb-Acme_USB_Headset_0000000000000000-00.analog-stereo",
+        "node.description": "Acme USB Headset",
+        "object.serial": 65
+      }
+    }
+  },
+  {
+    "id": 45,
+    "type": "PipeWire:Interface:Node",
+    "info": {
+      "props": {
+        "media.class": "Audio/Sink",
+        "node.name": "alsa_output.usb-Generic_USB_AUDIO-00.analog-stereo",
+        "node.description": "Desk Speakers LT",
+        "object.serial": 45
+      }
+    }
+  },
+  {
+    "id": 120,
+    "type": "PipeWire:Interface:Node",
+    "info": {
+      "props": {
+        "media.class": "Stream/Output/Audio",
+        "node.name": "Firefox",
+        "application.name": "Firefox",
+        "media.name": "Playback",
+        "object.serial": 120
+      }
+    }
+  },
+  {
+    "id": 130,
+    "type": "PipeWire:Interface:Node",
+    "info": {
+      "props": {
+        "media.class": "Stream/Output/Audio",
+        "node.name": "aplay",
+        "media.name": "ALSA Playback",
+        "object.serial": 130
+      }
+    }
+  },
+  {
+    "id": 140,
+    "type": "PipeWire:Interface:Node",
+    "info": {
+      "props": {
+        "media.class": "Stream/Output/Audio",
+        "node.name": "unnamed-stream-node"
+      }
+    }
+  },
+  {
+    "id": 12,
+    "type": "PipeWire:Interface:Node",
+    "info": {
+      "props": {
+        "media.class": "Audio/Source",
+        "node.name": "alsa_input.usb-Generic_Condenser_Microphone-00.mono-fallback",
+        "node.description": "USB Condenser Microphone",
+        "object.serial": 12
+      }
+    }
+  },
+  {
+    "id": 3,
+    "type": "PipeWire:Interface:Client",
+    "info": {
+      "props": {
+        "application.name": "wireplumber"
+      }
+    }
+  }
+]

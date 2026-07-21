@@ -4,6 +4,7 @@
 #include <QFileSystemWatcher>
 #include <QList>
 #include <QStringList>
+#include <QTimer>
 #include <QUrl>
 #include <QVariantList>
 #include <QVariantMap>
@@ -52,6 +53,7 @@ public:
         UntranscribedStatus = 1,
         TranscribedStatus = 2,
         OrphanedMdStatus = 3,
+        PartialStatus = 4, // a cancelled/killed transcribe left a `partial: true` .md
     };
     Q_ENUM(Status)
 
@@ -95,6 +97,15 @@ public:
     // source url to TranscriptionController::importAudio() to do the copy off
     // the GUI thread as a tracked task.
     Q_INVOKABLE QString importDestinationFor(const QUrl &fileUrl, QString *errorOut = nullptr) const;
+
+    // Drag-and-drop import verdict for QML. importDestinationFor() collapses
+    // every failure to "" (and its human message goes to a QString* QML can't
+    // read), so the drop handler can't tell a name COLLISION (offer overwrite)
+    // from a hard rejection. Returns { reason, dest, name } where reason ∈
+    // "ok" | "no-vault" | "not-a-file" | "not-audio" | "collision"; `dest` is
+    // the in-vault destination path, set for BOTH "ok" and "collision" so an
+    // overwrite can reuse it; `name` is the source filename for messaging.
+    Q_INVOKABLE QVariantMap inspectImportCandidate(const QUrl &fileUrl) const;
 
     // Item 40 (folder management): creates a new subfolder named `name`
     // inside parentDirUrl (QDir::mkpath). Rejects an empty/whitespace-only
@@ -274,6 +285,28 @@ public:
     // contract as applyRemovalOutcome().
     void applyRestoreOutcome(const QStringList &restoredPaths);
 
+    // Apply an already-done file rename to the tree IN PLACE — update the
+    // renamed node's name/path and slide its row to the new alphabetical slot
+    // with beginMoveRows/endMoveRows + dataChanged, NEVER a full model reset.
+    // A reset is what a rename otherwise causes: unlike delete (which mutates
+    // the model synchronously so the watcher echo finds sameStructure() true and
+    // is swallowed), a rename has no synchronous applier, so the watcher rescan
+    // sees a changed name/path, fails sameStructure(), and resets — destroying
+    // expansion/selection/scroll and re-running expandAll() (a visible flash,
+    // and selection surviving by row number lands on a DIFFERENT file). Only the
+    // RenameFileTask knows the old->new identity (a filesystem rescan can't tell
+    // a rename from delete-old + add-new), so the controller drives this on
+    // success, BEFORE the watcher fires. The in-place node then MATCHES the
+    // fresh scan, so the watcher echo is swallowed with no reset.
+    //
+    // Best-effort by design: the new slot is computed with a comparator matching
+    // scanDirectory()'s QDir::DirsFirst | QDir::Name order. If it diverges in
+    // some locale corner, the watcher rebuild simply falls back to today's full
+    // reset instead of the smooth move — degraded, never wrong. oldUrl/newUrl
+    // are the recording's PRIMARY file (audio if any, else the orphaned .md),
+    // matching the node's path; a no-op / unknown path returns quietly.
+    void applyRenameOutcome(const QUrl &oldUrl, const QUrl &newUrl);
+
     // Item 40: every real directory inside the vault (walks the filesystem
     // directly, NOT the pruned tree — a freshly-created empty folder must be a
     // valid move destination even though it's hidden from the tree until it
@@ -308,6 +341,16 @@ public:
     // convention as writeVaultSettings()); callers are expected to supply
     // timestamp/deviceSerial/deviceLabel/filesCopied/filesSkipped/errors.
     Q_INVOKABLE bool appendUsbGrabHistoryEntry(const QVariantMap &entry, QString *errorOut = nullptr) const;
+
+    // Durable log of past COMBINE operations (`.transcriber/combineHistory.json`),
+    // the same array-of-entries shape and permissive passthrough as the grab
+    // history above. Exists so an auto-combine — the one merge the user didn't
+    // click, which moves their original parts into .combined/ (or deletes them)
+    // — leaves a durable account of itself beyond the in-session Tasks row and
+    // undo, both of which vanish on restart. Callers supply timestamp/outputPath/
+    // sourcePaths/archivedCount/deleteOriginals/auto.
+    Q_INVOKABLE QVariantList readCombineHistory() const;
+    Q_INVOKABLE bool appendCombineHistoryEntry(const QVariantMap &entry, QString *errorOut = nullptr) const;
 
     // Model-benchmark last-run cache (`.transcriber/benchmarkLastRun.json`) —
     // same `.transcriber/`-creates-if-missing behavior as the settings/history
@@ -508,6 +551,13 @@ signals:
     void transcriptRestored(const QUrl &fileUrl);
 
 private:
+    // Shared backing for the two array-shaped history logs (grab, combine):
+    // read the whole `.transcriber/<fileName>` array, or append one entry and
+    // rewrite it. Keeps the read-append-rewrite logic in one place so a new log
+    // is a two-line delegation rather than a copy of the whole dance.
+    QVariantList readHistoryFile(const QString &fileName) const;
+    bool appendHistoryEntry(const QString &fileName, const QVariantMap &entry, QString *errorOut) const;
+
     struct Node {
         QString name;
         QString path;
@@ -520,6 +570,12 @@ private:
         bool isCombinePlaceholder = false;
         int combineSourceCount = 0;
         Status status = NoneStatus;
+        // Last-modified of this node's sidecar .md (see sidecarMdPath(); for an
+        // orphaned .md that's the file itself), 0 when there is none. Not part
+        // of the tree's STRUCTURE — it exists so rebuild() can tell a genuine
+        // content change apart from a rescan that found nothing new, and refresh
+        // the affected rows with dataChanged instead of a full model reset.
+        qint64 mdModified = 0;
         Node *parent = nullptr;
         std::vector<std::unique_ptr<Node>> children;
     };
@@ -534,7 +590,26 @@ private:
         }
     };
 
-    void rebuild();
+    // Rescans the vault from disk. Emits a full model reset ONLY when the fresh
+    // scan differs structurally from the current tree (or forceReset is set) —
+    // a reset destroys every delegate and all TreeView expansion state, and
+    // fans out in Sidebar.qml into a full-vault walk + proxy re-sort +
+    // re-expandAll, so a reset that carries no new information is a visible
+    // whole-UI reflow for nothing. The delete/undo path deliberately rebuilds
+    // synchronously (applyRemovalOutcome/applyRestoreOutcome) AND then gets the
+    // watcher's directoryChanged echo of the same change; the echo now rescans
+    // and quietly finds nothing. Content-only differences (a sidecar .md
+    // rewritten in place) emit dataChanged for the affected rows instead.
+    // forceReset is for setVaultPath(), where an empty vault replacing another
+    // empty vault is structurally identical yet must still reset.
+    void rebuild(bool forceReset = false);
+
+    // Deep structural compare of two subtrees: name/path/flags/status/child
+    // order, deliberately NOT mdModified (see Node::mdModified).
+    static bool sameStructure(const Node *a, const Node *b);
+    // Walks both trees in lockstep (callers guarantee sameStructure) emitting
+    // one dataChanged per parent whose children's mdModified moved.
+    void emitContentChanges(const Node *fresh, Node *current);
 
     // Is this scanned file spoken for by a pending combine — one of its sources,
     // or the half-written output itself? Such a path is omitted from the tree in
@@ -609,6 +684,13 @@ private:
     // relabel/retag rewrite fires no watcher signal, but does change
     // mtime/size, which is checked on every call regardless of trigger.
     QString frontmatterField(const QString &mdPath, const QString &key) const;
+
+    // TranscribedStatus refined to PartialStatus when the sidecar's frontmatter
+    // carries `partial: true` (a cancelled/killed transcribe left a truncated
+    // .md). A read-time overlay off the cached frontmatter — node->status stays
+    // a pure sibling-.md-exists classification so a partial file's body is
+    // still served/searchable.
+    Status effectiveStatus(const Node *node) const;
     // Item P12: transcriptBody() backs search's transcript-content matching
     // (VaultSearchProxyModel::matchesDirect) — before this cache, every
     // keystroke re-opened and re-read every transcribed file's ENTIRE body
@@ -639,6 +721,10 @@ private:
     QUrl m_vaultPath;
     std::unique_ptr<Node> m_root;
     QFileSystemWatcher m_watcher;
+    // Coalesces a burst of directoryChanged events (an N-file move dirties
+    // ~2N watched dirs) into ONE rebuild, instead of one full model reset
+    // per event. See the constructor wiring.
+    QTimer m_rebuildDebounce;
     // See setPendingCombines(). Kept as the given list (rather than only the
     // derived lookups) so a push can be compared against the last one and skip
     // the rebuild when nothing actually changed.

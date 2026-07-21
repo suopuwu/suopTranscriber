@@ -41,6 +41,8 @@
     "pause": "pause.svg",
     "record": "record.svg",
     "stop": "stop.svg",
+    "follow-playback": "follow-playback.svg",
+    "skip-silence": "skip-silence.svg",
     "move-up": "move-up.svg",
     "move-down": "move-down.svg",
     "drag-handle": "drag-handle.svg",

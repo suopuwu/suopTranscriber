@@ -159,6 +159,15 @@ ColumnLayout {
     // requiredId is present; cancelling clears it.
     property var pendingRun: null
 
+    // The result whose full transcript the click-to-expand popup is showing.
+    // Set by clicking a result card; the popup (transcriptPreviewPopup) binds
+    // its header + transcript to it. Empty object when nothing is open.
+    property var previewResult: ({})
+    function openTranscriptPreview(result) {
+        benchmarkPage.previewResult = result
+        transcriptPreviewPopup.open()
+    }
+
     function missingModelIds(ids) {
         const missing = []
         for (let i = 0; i < ids.length; i++)
@@ -357,9 +366,32 @@ ColumnLayout {
 
         function onBenchmarkModelStarted(modelId, index, total) {
             benchmarkPage.statusText = qsTr("Running %1 of %2…").arg(index + 1).arg(total)
+            // Placeholder card the live text grows into; finalized by
+            // onBenchmarkModelDone. label falls back to the id until the result
+            // lands. `running: true` selects the "transcribing…" card state.
+            benchmarkPage.results = benchmarkPage.results.concat([{
+                modelId: modelId, label: modelId, running: true, text: "", ok: undefined
+            }])
+        }
+        // Grow the running card's text as segments stream in (index-keyed so a
+        // sweep with duplicate ids still addresses the right card).
+        function onBenchmarkModelProgressText(modelIndex, partialText) {
+            const r = benchmarkPage.results.slice()
+            if (modelIndex >= 0 && modelIndex < r.length) {
+                r[modelIndex] = Object.assign({}, r[modelIndex], {text: partialText})
+                benchmarkPage.results = r
+            }
         }
         function onBenchmarkModelDone(result) {
-            benchmarkPage.results = benchmarkPage.results.concat([result])
+            const r = benchmarkPage.results.slice()
+            // Replace the trailing running placeholder for this model in place
+            // (index-keyed) instead of appending a duplicate.
+            let idx = -1
+            for (let k = r.length - 1; k >= 0; k--)
+                if (r[k].running && r[k].modelId === result.modelId) { idx = k; break }
+            if (idx >= 0) r[idx] = result
+            else r.push(result)
+            benchmarkPage.results = r
         }
         function onBenchmarkFinished(run) {
             benchmarkPage.running = false
@@ -618,31 +650,37 @@ ColumnLayout {
         }
     }
 
-    // --- Per-model result cards ----------------------------------------------
-    Repeater {
-        model: benchmarkPage.results
-        ColumnLayout {
-            id: card
-            required property var modelData
-            Layout.fillWidth: true
-            spacing: 4
-
+    // --- Per-model result cards (square, wrapping grid) ----------------------
+    // A Flow so the fixed-size square cards wrap to as many columns as the page
+    // width allows — one column on a narrow window, several on a wide one (the
+    // "flex layout for large screens"). The transcript itself is NOT on the
+    // card: it's a short elided preview, and clicking a card with a transcript
+    // opens the full text in transcriptPreviewPopup (scrollable, middle-drag).
+    Flow {
+        id: resultsFlow
+        objectName: "resultsFlow"
+        Layout.fillWidth: true
+        Layout.topMargin: 4
+        spacing: 12
+        Repeater {
+            model: benchmarkPage.results
             Rectangle {
-                Layout.fillWidth: true
-                Layout.preferredHeight: cardContent.implicitHeight + 16
+                id: card
+                objectName: "resultCard"
+                required property var modelData
+                // Only ok results with actual text are clickable/enlargeable.
+                readonly property bool hasTranscript:
+                    card.modelData.ok === true && (card.modelData.text || "") !== ""
+
+                width: 240
+                height: 240
                 radius: AppSettings.borderRadius
-                color: "#2a2a2a"
+                color: (card.hasTranscript && cardHover.hovered) ? "#333333" : "#2a2a2a"
                 border.width: 1
                 border.color: "#3a3a3a"
 
                 ColumnLayout {
-                    id: cardContent
-                    // Anchor top/left/right only (NOT fill/bottom): the card
-                    // Rectangle's height is derived from this column's
-                    // implicitHeight, so filling it would be a binding loop.
-                    anchors.top: parent.top
-                    anchors.left: parent.left
-                    anchors.right: parent.right
+                    anchors.fill: parent
                     anchors.margins: 8
                     spacing: 4
 
@@ -650,67 +688,187 @@ ColumnLayout {
                         Layout.fillWidth: true
                         spacing: 8
                         Label {
+                            Layout.fillWidth: true
                             text: card.modelData.label
                             color: "white"
                             font.bold: true
                             font.pixelSize: 13
+                            elide: Text.ElideRight
                         }
                         Label {
-                            text: card.modelData.kind === "engine" ? qsTr("engine") : qsTr("whisper")
+                            objectName: "cardKindBadge"
+                            text: card.modelData.kind === "engine" ? qsTr("engine")
+                                  : (card.modelData.kind === "parakeet" ? qsTr("parakeet")
+                                     : qsTr("whisper"))
                             color: "#888888"
                             font.pixelSize: 10
-                        }
-                        Item { Layout.fillWidth: true }
-                        Label {
-                            visible: card.modelData.ok === true
-                            text: qsTr("%1s  ·  %2× realtime")
-                                  .arg(((card.modelData.runtimeMs || 0) / 1000).toFixed(1))
-                                  .arg((card.modelData.realtimeFactor || 0).toFixed(1))
-                            color: "#8fce9e"
-                            font.pixelSize: 12
                         }
                     }
 
                     Label {
                         visible: card.modelData.ok === true
-                        text: qsTr("%1 segments · %2 words · %3 chars")
+                        text: qsTr("%1s · %2× realtime")
+                              .arg(((card.modelData.runtimeMs || 0) / 1000).toFixed(1))
+                              .arg((card.modelData.realtimeFactor || 0).toFixed(1))
+                        color: "#8fce9e"
+                        font.pixelSize: 11
+                    }
+                    Label {
+                        visible: card.modelData.ok === true
+                        text: qsTr("%1 seg · %2 words · %3 chars")
                               .arg(card.modelData.segmentCount || 0)
                               .arg(card.modelData.wordCount || 0)
                               .arg(card.modelData.charCount || 0)
                         color: "#999999"
+                        font.pixelSize: 10
+                    }
+
+                    // Still transcribing: muted affordance while live text grows
+                    // in below (ok is still undefined for a running placeholder).
+                    Label {
+                        visible: card.modelData.running === true
+                        text: qsTr("transcribing…")
+                        color: "#888888"
                         font.pixelSize: 11
                     }
 
-                    // Failed/unavailable model: show why, no transcript.
+                    // Failed/unavailable model: show why, no transcript. Not a
+                    // running placeholder (which also has ok !== true).
                     Label {
-                        visible: card.modelData.ok !== true
+                        visible: card.modelData.ok !== true && card.modelData.running !== true
                         Layout.fillWidth: true
+                        Layout.fillHeight: true
                         wrapMode: Text.WordWrap
+                        elide: Text.ElideRight
                         text: qsTr("Skipped: %1").arg(card.modelData.error || qsTr("unavailable"))
                         color: "#c98500"
                         font.pixelSize: 12
                     }
 
-                    ScrollView {
-                        visible: card.modelData.ok === true && (card.modelData.text || "") !== ""
+                    // Transcript PREVIEW — short, elided, fills the rest of the
+                    // square. Shows live text while running AND the final text
+                    // when ok; the full text lives in the click-to-expand popup.
+                    Text {
+                        visible: (card.modelData.text || "") !== ""
+                                 && (card.modelData.ok === true || card.modelData.running === true)
                         Layout.fillWidth: true
-                        Layout.preferredHeight: Math.min(160, transcriptText.implicitHeight + 8)
+                        Layout.fillHeight: true
                         clip: true
-                        TextArea {
-                            id: transcriptText
-                            readOnly: true
-                            wrapMode: TextArea.WordWrap
-                            selectByMouse: true
-                            text: card.modelData.text || ""
-                            color: "#dddddd"
-                            font.pixelSize: 12
-                            background: null
-                            // StyleGuide "editable/selectable text" convention:
-                            // a selectByMouse control shows an I-beam.
-                            HoverHandler { cursorShape: Qt.IBeamCursor }
-                        }
+                        wrapMode: Text.WordWrap
+                        elide: Text.ElideRight
+                        text: card.modelData.text || ""
+                        color: "#bbbbbb"
+                        font.pixelSize: 11
+                    }
+
+                    // Affordance that the card expands.
+                    Label {
+                        visible: card.hasTranscript
+                        text: qsTr("Click to expand")
+                        color: "#777777"
+                        font.pixelSize: 10
                     }
                 }
+
+                // Clickable only when there's a transcript to enlarge; the
+                // StyleGuide hover pair (pointing cursor + 1px HoverBorder).
+                HoverHandler {
+                    id: cardHover
+                    enabled: card.hasTranscript
+                    cursorShape: Qt.PointingHandCursor
+                }
+                HoverBorder { anchors.fill: parent; active: card.hasTranscript && cardHover.hovered }
+                TapHandler {
+                    enabled: card.hasTranscript
+                    onTapped: benchmarkPage.openTranscriptPreview(card.modelData)
+                }
+            }
+        }
+    }
+
+    // Click-to-expand transcript popup — the full model transcript, scrollable
+    // by wheel AND by the app's Chrome-style middle-mouse autoscroll
+    // (MiddleDragScroll, same as the main transcript view / settings / tree).
+    // contentItem is a plain Item (NOT a Layout) so the ScrollView and the
+    // MiddleDragScroll overlay can be siblings that anchor to each other — the
+    // overlay must sit OVER the ScrollView, not be laid out as content of it
+    // (see MiddleDragScroll.qml and SettingsPopup.qml's middleDragScrollArea).
+    Popup {
+        id: transcriptPreviewPopup
+        objectName: "transcriptPreviewPopup"
+        parent: Overlay.overlay
+        modal: true
+        anchors.centerIn: Overlay.overlay
+        width: Overlay.overlay ? Math.min(760, Overlay.overlay.width - 80) : 600
+        height: Overlay.overlay ? Math.min(620, Overlay.overlay.height - 80) : 500
+        // Suspended while the autoscroll is armed: Escape / click-outside are
+        // how Chrome-style autoscroll cancels itself, so let it disarm the
+        // scroll instead of closing the popup (SettingsPopup does the same).
+        closePolicy: middleDragPreview.armed
+                     ? Popup.NoAutoClose
+                     : (Popup.CloseOnEscape | Popup.CloseOnPressOutside)
+        background: Rectangle {
+            radius: AppSettings.borderRadius
+            color: "#1e1e1e"
+            border.width: 1
+            border.color: "#3a3a3a"
+        }
+
+        contentItem: Item {
+            RowLayout {
+                id: previewHeader
+                anchors.top: parent.top
+                anchors.left: parent.left
+                anchors.right: parent.right
+                spacing: 8
+                Label {
+                    Layout.fillWidth: true
+                    text: benchmarkPage.previewResult.label || ""
+                    color: "white"
+                    font.bold: true
+                    font.pixelSize: 14
+                    elide: Text.ElideRight
+                }
+                Label {
+                    text: benchmarkPage.previewResult.ok === true
+                          ? qsTr("%1s · %2× realtime")
+                            .arg(((benchmarkPage.previewResult.runtimeMs || 0) / 1000).toFixed(1))
+                            .arg((benchmarkPage.previewResult.realtimeFactor || 0).toFixed(1))
+                          : ""
+                    color: "#8fce9e"
+                    font.pixelSize: 12
+                }
+            }
+
+            ScrollView {
+                id: previewScroll
+                anchors.top: previewHeader.bottom
+                anchors.topMargin: 8
+                anchors.left: parent.left
+                anchors.right: parent.right
+                anchors.bottom: parent.bottom
+                clip: true
+                TextArea {
+                    id: previewTranscriptText
+                    objectName: "previewTranscriptText"
+                    readOnly: true
+                    wrapMode: TextArea.WordWrap
+                    selectByMouse: true
+                    text: benchmarkPage.previewResult.text || ""
+                    color: "#dddddd"
+                    font.pixelSize: 13
+                    background: null
+                    // StyleGuide "editable/selectable text": I-beam cursor.
+                    HoverHandler { cursorShape: Qt.IBeamCursor }
+                }
+            }
+
+            // Chrome-style middle-click autoscroll over the transcript — a
+            // sibling overlay of previewScroll (not its content), sized over it.
+            MiddleDragScroll {
+                id: middleDragPreview
+                anchors.fill: previewScroll
+                flickable: previewScroll.contentItem as Flickable
             }
         }
     }

@@ -161,6 +161,20 @@ private:
         return row->findChild<QQuickItem *>(QStringLiteral("rowHoverBorder"));
     }
 
+    // Same helpers tst_sidebar_rename.cpp uses to locate/observe the inline
+    // rename TextField: every row owns its own rowRenameField instance, hidden
+    // until that row is the one named by sidebar.renamingPath.
+    static QQuickItem *renameFieldFor(QQuickItem *row)
+    {
+        return row->findChild<QQuickItem *>(QStringLiteral("rowRenameField"));
+    }
+
+    static bool renameFieldVisibleOn(QQuickItem *row)
+    {
+        QQuickItem *field = renameFieldFor(row);
+        return field && field->isVisible();
+    }
+
     // One drag, delivered the way a mouse actually delivers one: press, then
     // SEVERAL small moves (a single jump to the destination can be swallowed —
     // handlers need movement past the drag threshold to activate, and the
@@ -321,6 +335,76 @@ private slots:
                  "the sibling .md transcript must travel with the audio it belongs to");
         QVERIFY2(!QFile::exists(vault.filePath(QStringLiteral("talk.mp3.md"))),
                  "the .md must not be left behind in the vault root");
+    }
+
+    // Regression (work order 050): while a row is being inline-renamed, a
+    // press-drag over it must NOT start the file-move drag — rowDragHandler
+    // has to be disarmed so the rename TextField's own text-selection gets
+    // the grab instead. Drive rename via beginRename() (same entry point
+    // tst_sidebar_rename.cpp uses), then run the exact drag gesture the other
+    // tests in this file use and assert it never arms: sidebar.rowDragActive
+    // must stay false through the whole press+move stroke, and the file must
+    // not have moved. Under the pre-fix `enabled:` (type-only, no
+    // !renamingThisRow term) this drag DOES start — verified by temporarily
+    // reverting the Sidebar.qml gate and re-running this test, which failed
+    // with rowDragActive true mid-drag and the file relocated into Interviews/.
+    void dragWhileRenaming_doesNotStartMove()
+    {
+        QTemporaryDir vault;
+        QVERIFY(vault.isValid());
+        QVERIFY(touch(vault.filePath(QStringLiteral("Interviews/seed.mp3"))));
+        QVERIFY(touch(vault.filePath(QStringLiteral("talk.mp3"))));
+
+        QQuickView view;
+        QQuickItem *sidebarItem = nullptr;
+        QQuickItem *treeItem = openVault(&view, vault.path(), &sidebarItem);
+        QVERIFY2(treeItem, "could not load Sidebar.qml / locate its TreeView");
+        QTRY_VERIFY(treeItem->property("rows").toInt() > 0);
+        QTest::qWait(50); // let the auto-expand pass settle
+
+        const QString notePath = vault.filePath(QStringLiteral("talk.mp3"));
+        const int folderRow = rowForPath(treeItem, vault.filePath(QStringLiteral("Interviews")));
+        const int noteRow = rowForPath(treeItem, notePath);
+        QVERIFY2(folderRow >= 0, "the Interviews folder must be a visible row");
+        QVERIFY2(noteRow >= 0, "talk.mp3 must be a visible row");
+
+        QQuickItem *noteItem = rowItem(treeItem, noteRow);
+        QQuickItem *folderItem = rowItem(treeItem, folderRow);
+        QVERIFY(noteItem && folderItem);
+
+        // Enter rename mode on the note row, exactly as tst_sidebar_rename.cpp
+        // does via beginRename() (the same function the row-name click and the
+        // context menu's "Rename" both call).
+        QMetaObject::invokeMethod(sidebarItem, "beginRename", Q_ARG(QVariant, notePath),
+                                   Q_ARG(QVariant, false), Q_ARG(QVariant, QString()));
+        QTRY_VERIFY2(renameFieldVisibleOn(noteItem),
+                     "beginRename() must open the inline editor on the note row");
+
+        // Same gesture dragNoteOntoFolder_movesFileAndSidecar uses to move a
+        // file: press on the row, several moves past the drag threshold toward
+        // the folder row, then release. If rowDragHandler is still armed this
+        // both starts a row drag AND relocates the file; if it's disarmed the
+        // stroke is left for the rename field's own text-selection instead.
+        const QPoint from = rowCenter(noteItem);
+        const QPoint to = rowCenter(folderItem);
+        QTest::mousePress(&view, Qt::LeftButton, Qt::NoModifier, from);
+        const int steps = 12;
+        for (int i = 1; i <= steps; ++i) {
+            QTest::mouseMove(&view, QPoint(from.x() + (to.x() - from.x()) * i / steps,
+                                            from.y() + (to.y() - from.y()) * i / steps));
+            QTest::qWait(8);
+        }
+        QVERIFY2(!sidebarItem->property("rowDragActive").toBool(),
+                 "a press-drag inside an active rename must not arm the row-move drag");
+        QTest::mouseRelease(&view, Qt::LeftButton, Qt::NoModifier, to);
+        QTest::qWait(80);
+
+        QVERIFY2(!sidebarItem->property("rowDragActive").toBool(),
+                 "the row-move drag must never have become active across the whole stroke");
+        QVERIFY2(QFile::exists(notePath),
+                 "the file being renamed must not have moved out of the vault root");
+        QVERIFY2(!QFile::exists(vault.filePath(QStringLiteral("Interviews/talk.mp3"))),
+                 "the file must not have been relocated into Interviews/ by a hijacked drag");
     }
 
     // An EMPTY folder is a drop target like any other. This is the case the
@@ -539,6 +623,67 @@ private slots:
                  "a folder dropped into its own descendant must not move anywhere");
         QVERIFY2(!QDir(vault.filePath(QStringLiteral("Outer/Inner/Outer"))).exists(),
                  "the folder must not have been moved inside itself");
+    }
+
+    // Change-your-mind: a note dropped back on the folder it already lives in
+    // must be OFFERED as a target (the origin folder lights up) and be a silent
+    // no-op — the file stays put, no error. Before the fix canDropRowsOn()
+    // refused the origin outright, so there was no "put it back" target and the
+    // drag read as forcing a relocation. The discriminating assertion is the
+    // in-flight highlight (rowDragDest == the origin folder); file-stays-put
+    // alone would pass even under the old refuse-everything behavior.
+    void dragNoteBackOntoOwnFolder_highlightsAndIsNoOp()
+    {
+        QTemporaryDir vault;
+        QVERIFY(vault.isValid());
+        QVERIFY(touch(vault.filePath(QStringLiteral("Interviews/talk.mp3"))));
+        QVERIFY(touch(vault.filePath(QStringLiteral("Interviews/seed.mp3"))));
+
+        QQuickView view;
+        QQuickItem *sidebarItem = nullptr;
+        QQuickItem *treeItem = openVault(&view, vault.path(), &sidebarItem);
+        QVERIFY2(treeItem, "could not load Sidebar.qml / locate its TreeView");
+        QTRY_VERIFY(treeItem->property("rows").toInt() > 0);
+        expandEverything(treeItem);
+
+        const int folderRow = rowForPath(treeItem, vault.filePath(QStringLiteral("Interviews")));
+        const int talkRow = rowForPath(treeItem, vault.filePath(QStringLiteral("Interviews/talk.mp3")));
+        const int seedRow = rowForPath(treeItem, vault.filePath(QStringLiteral("Interviews/seed.mp3")));
+        QVERIFY(folderRow >= 0 && talkRow >= 0 && seedRow >= 0);
+        QQuickItem *folderItem = rowItem(treeItem, folderRow);
+        QQuickItem *dragItem = rowItem(treeItem, talkRow);
+        QQuickItem *seedItem = rowItem(treeItem, seedRow);
+        QVERIFY(folderItem && dragItem && seedItem);
+
+        // Drag talk.mp3 over its sibling seed.mp3 — both in Interviews, so the
+        // resolved destination is the origin folder itself. Hold, don't release.
+        const QPoint from = rowCenter(dragItem);
+        const QPoint to = rowCenter(seedItem);
+        QTest::mousePress(&view, Qt::LeftButton, Qt::NoModifier, from);
+        const int steps = 12;
+        for (int i = 1; i <= steps; ++i) {
+            QTest::mouseMove(&view, QPoint(from.x() + (to.x() - from.x()) * i / steps,
+                                            from.y() + (to.y() - from.y()) * i / steps));
+            QTest::qWait(8);
+        }
+
+        QVERIFY2(sidebarItem->property("rowDragActive").toBool(),
+                 "the drag must actually be in flight, or the rest proves nothing");
+        QCOMPARE(sidebarItem->property("rowDragDest").toString(),
+                 vault.filePath(QStringLiteral("Interviews")));
+        QQuickItem *folderHighlight =
+            folderItem->findChild<QQuickItem *>(QStringLiteral("rowDropHighlight"));
+        QVERIFY(folderHighlight);
+        QVERIFY2(folderHighlight->isVisible(),
+                 "a file's own folder must light up so a change-your-mind drop has a target");
+
+        QTest::mouseRelease(&view, Qt::LeftButton, Qt::NoModifier, to);
+        QTest::qWait(80);
+
+        QVERIFY2(QFile::exists(vault.filePath(QStringLiteral("Interviews/talk.mp3"))),
+                 "dropping a file back on its own folder must leave it in place");
+        QVERIFY2(QFile::exists(vault.filePath(QStringLiteral("Interviews/seed.mp3"))),
+                 "the sibling must be untouched");
     }
 
     // What the user sees WHILE the ghost is in the air, which every other test

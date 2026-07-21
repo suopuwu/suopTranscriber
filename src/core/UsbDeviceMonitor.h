@@ -216,6 +216,13 @@ private slots:
     void handleInterfacesAdded(const QDBusObjectPath &objectPath, const UsbDbusInterfaces &interfaces);
     void handleInterfacesRemoved(const QDBusObjectPath &objectPath, const QStringList &interfaces);
 
+    // Bound to systemd-logind's PrepareForSleep(b) on the system bus (see the
+    // constructor). goingToSleep==false is the RESUME edge, which re-enumerates
+    // (reEnumerateAfterResume) to catch a device plugged in while this process
+    // was frozen. Slot (not a plain method) so the SLOT()-string D-Bus subscription
+    // can find it, matching the bool ('b') signal signature.
+    void handlePrepareForSleep(bool goingToSleep);
+
 private:
     // Shared by handleInterfacesAdded() and currentlyMountedDevices() so the
     // Filesystem/Block/Drive property-reading logic — and the external-media filter —
@@ -254,6 +261,16 @@ private:
     // on every hotplug of a device the user has a rule for, and whichever lands first,
     // the volume is reported exactly once.
     void rescanForNewlyMountedDevices();
+
+    // Full re-enumeration after a resume-from-sleep: for every external volume
+    // GetManagedObjects reports, emit deviceAdded (mounted + not yet known) or
+    // unmountedVolumeDetected (present but unmounted). Unlike
+    // rescanForNewlyMountedDevices(), this ALSO re-offers unmounted volumes,
+    // because on a stock KDE (automount off) a device plugged in during sleep is
+    // unmounted on wake and would otherwise never be mounted or grabbed. Idempotent
+    // (m_knownObjectPaths dedupes the mounted path; a repeated unmounted emit is a
+    // harmless re-offer). See handlePrepareForSleep().
+    void reEnumerateAfterResume();
 
     // org.freedesktop.DBus.Properties.GetAll on the given Drive object
     // (interface org.freedesktop.UDisks2.Drive) — Vendor/Model/Serial. Empty map if

@@ -11,18 +11,26 @@
 #include "../ParakeetEngine.h"
 #include "../Segment.h"
 #include "../SubprocessEngine.h"
+#include "../TranscribePipeline.h"
 #include "../TranscriptionController.h"
 #include "../TranscriptionEngine.h"
 #include "../WhisperCppEngine.h"
 
 namespace {
 
+// Minimum spacing between benchmarkModelProgressText() emissions — a chatty
+// stretch of audio can produce several segments within milliseconds, and each
+// live-update tick costs QML a full card re-render, so bursts are coalesced
+// down to this rate. Same value/rationale as TranscribeTask's kLiveUpdateThrottleMs.
+constexpr qint64 kLiveUpdateThrottleMs = 200;
+
 // Builds and runs a SHORT-LIVED engine for one model over the already-
 // decoded chunk — deliberately not EngineCache-backed (see BenchmarkTask.h's
 // class doc comment). onAbort is checked deep inside the engine's own
 // decode loop, same mechanism a real transcribe uses.
 QVariantMap runOneBenchmarkModel(const QString &modelId, const QString &vaultPath, const AudioChunk &chunk,
-                                  double audioSeconds, const AbortCallback &onAbort)
+                                  double audioSeconds, const AbortCallback &onAbort,
+                                  const SegmentCallback &onSegment = {})
 {
     QVariantMap row;
     row["modelId"] = modelId;
@@ -76,9 +84,16 @@ QVariantMap runOneBenchmarkModel(const QString &modelId, const QString &vaultPat
         engine = std::move(whisper);
     }
 
+    // Same windowing + streaming the real transcriber uses (TranscribePipeline)
+    // so segment granularity and timing are representative — NOT one unbounded
+    // whole-file call. selfSegmenting == true only for out-of-process engines.
+    const bool selfSegmenting = isEngineModelId(modelId);
+    const TranscribePipeline::Windowing win =
+        TranscribePipeline::planWindows(selfSegmenting, chunk.pcm16kMono, *engine);
     QElapsedTimer timer;
     timer.start();
-    const std::vector<Segment> segments = engine->transcribe(chunk, {}, {}, onAbort);
+    const std::vector<Segment> segments =
+        TranscribePipeline::runWindows(*engine, chunk.pcm16kMono, win.windows, {}, onSegment, onAbort);
     const qint64 runtimeMs = timer.elapsed();
 
     QString text;
@@ -157,7 +172,29 @@ void BenchmarkTask::run(TaskContext &ctx)
         const QString modelId = m_modelIds.at(i);
         emit benchmarkModelStarted(modelId, i, m_modelIds.size());
 
-        QVariantMap result = runOneBenchmarkModel(modelId, vaultPath, chunk, audioSeconds, onAbort);
+        // Stream the transcript into the running card sentence-by-sentence,
+        // throttled so a burst of segments doesn't thrash QML. Index-keyed (not
+        // modelId) so a sweep with duplicate ids still addresses the right card.
+        QString liveText;
+        QElapsedTimer liveTimer;
+        liveTimer.start();
+        qint64 lastLiveTickMs = -kLiveUpdateThrottleMs;
+        const int modelIndex = i;
+        const SegmentCallback onSegment = [&, this](const Segment &seg) {
+            const QString t = QString::fromStdString(seg.text).trimmed();
+            if (t.isEmpty())
+                return;
+            if (!liveText.isEmpty())
+                liveText += QLatin1Char(' ');
+            liveText += t;
+            const qint64 nowMs = liveTimer.elapsed();
+            if (nowMs - lastLiveTickMs >= kLiveUpdateThrottleMs) {
+                lastLiveTickMs = nowMs;
+                emit benchmarkModelProgressText(modelIndex, liveText);
+            }
+        };
+        QVariantMap result =
+            runOneBenchmarkModel(modelId, vaultPath, chunk, audioSeconds, onAbort, onSegment);
         results.append(result);
         emit benchmarkModelDone(result);
         if (!m_modelIds.isEmpty())

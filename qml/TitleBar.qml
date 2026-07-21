@@ -13,6 +13,11 @@ Item {
     property bool recording: false
     property bool usbGrabberOpen: false
     property bool benchmarkOpen: false
+    // DISTINCT from `recording` above, which means "the recorder page is
+    // open". This one means capture is actually running (AudioRecorder's own
+    // recording property) and is what turns the record glyph red — so the
+    // cue is visible from every page, not just the recorder's.
+    property bool recordingActive: false
     signal settingsRequested()
     signal forceRetranscribeAllRequested()
     signal recordRequested()
@@ -120,7 +125,9 @@ Item {
             anchors.centerIn: parent
             name: "record"
             iconSize: 14
-            color: "white"
+            color: titleBar.recordingActive ? AppSettings.recordingActiveColor : "white"
+
+            Behavior on color { ColorAnimation { duration: AppSettings.animationsEnabled ? 150 : 0 } }
         }
     }
 

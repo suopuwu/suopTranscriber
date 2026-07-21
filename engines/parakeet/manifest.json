@@ -1,5 +1,5 @@
 {
-  "name": "Parakeet TDT 0.6B v2 (NVIDIA NeMo)",
+  "name": "Parakeet TDT 0.6B v2 — out-of-process NeMo engine (optional)",
   "command": ["python3", "run.py"],
   "capabilities": {
     "languages": ["en"],

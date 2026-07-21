@@ -1,6 +1,7 @@
 import QtQuick
 import QtQuick.Controls
 import QtQuick.Layouts
+import QtQuick.Window
 import SuopTranscriber
 
 Rectangle {
@@ -62,31 +63,50 @@ Rectangle {
         sidebar.speakerFilterText = existing.join(", ")
     }
 
-    // Item 17: suggestions for the tag fragment currently being typed (text
-    // after the last comma), excluding tags already present earlier in the
-    // field. Vault vocabulary via TranscriptionController.existingVaultTags
-    // (Q_INVOKABLE, scans every .md's tags: frontmatter line fresh).
-    function tagSuggestions() {
-        if (!sidebar.transcriptionController || sidebar.vaultPath.toString() === "")
-            return []
-        const parts = sidebar.tagFilterText.split(",")
+    // Item 17 / filter-suggestions rework: the comma-separated-fragment logic
+    // behind BOTH filter autocompletes (tags and speakers). Generic over the
+    // field text and its vocabulary so the two call sites below share one
+    // implementation — see FilterSuggestions.qml for the shared UI half.
+    //
+    // "Fragment" = the text after the last comma, i.e. the entry currently
+    // being typed. Entries already committed earlier in the field are
+    // excluded from the candidates so a tag can't be suggested twice.
+    function fragmentSuggestions(fieldText, vocabulary) {
+        const parts = fieldText.split(",")
         const fragment = parts[parts.length - 1].trim().toLowerCase()
         if (fragment === "")
             return []
         const already = parts.slice(0, -1).map(t => t.trim().toLowerCase())
-        const vocabulary = sidebar.transcriptionController.existingVaultTags(sidebar.vaultPath)
-        return vocabulary.filter(tag =>
-            tag.toLowerCase().startsWith(fragment) && !already.includes(tag.toLowerCase()))
+        return vocabulary.filter(entry =>
+            entry.toLowerCase().startsWith(fragment) && !already.includes(entry.toLowerCase()))
     }
 
-    // Replaces the in-progress (last, possibly partial) tag fragment with
-    // the chosen suggestion, leaving a trailing ", " ready for the next tag.
-    function acceptTagSuggestion(tag) {
-        const parts = sidebar.tagFilterText.split(",")
-        parts[parts.length - 1] = " " + tag
-        sidebar.tagFilterText = parts.map(t => t.trim()).join(", ") + ", "
-        tagFilterField.forceActiveFocus()
-        tagFilterField.cursorPosition = tagFilterField.text.length
+    // Replaces the in-progress (last, possibly partial) fragment with the
+    // chosen value, leaving a trailing ", " ready for the next entry.
+    // Returns the new field text; the caller assigns it and restores focus.
+    function acceptFragment(fieldText, value) {
+        const parts = fieldText.split(",")
+        parts[parts.length - 1] = " " + value
+        return parts.map(t => t.trim()).join(", ") + ", "
+    }
+
+    function tagSuggestions() {
+        if (!sidebar.transcriptionController || sidebar.vaultPath.toString() === "")
+            return []
+        return sidebar.fragmentSuggestions(
+            sidebar.tagFilterText,
+            sidebar.transcriptionController.existingVaultTags(sidebar.vaultPath))
+    }
+
+    // The speaker mirror — vocabulary from existingVaultSpeakers() (see
+    // queue item 045), which scans the same `speakers:` frontmatter the
+    // speaker filter itself matches against.
+    function speakerSuggestions() {
+        if (!sidebar.transcriptionController || sidebar.vaultPath.toString() === "")
+            return []
+        return sidebar.fragmentSuggestions(
+            sidebar.speakerFilterText,
+            sidebar.transcriptionController.existingVaultSpeakers(sidebar.vaultPath))
     }
 
     // --- Item 9 helpers: match highlighting + transcript snippet ------------
@@ -140,7 +160,7 @@ Rectangle {
         const before = (start > 0 ? "… " : "") + sidebar.escapeHtml(body.substring(start, idx))
         const match = sidebar.escapeHtml(body.substring(idx, idx + q.length))
         const after = sidebar.escapeHtml(body.substring(idx + q.length, end)) + (end < body.length ? " …" : "")
-        return before + "<span style=\"background-color:" + AppSettings.highlightColor + "\">" + match + "</span>" + after
+        return before + "<span style=\"background-color:" + AppSettings.highlightColor + ";color:white;font-weight:bold\">" + match + "</span>" + after
     }
 
     VaultSearchProxyModel {
@@ -372,17 +392,13 @@ Rectangle {
     }
 
     // transcribeAllButton/relabelAllButton/chaptersAllButton/
-    // detectSpeakersAllButton/runAllButton (see the ribbon below) each pass
-    // their own eligibility map (untranscribedPaths/transcribedPaths/
-    // chaptersPaths) here — the ribbon always narrows to the CURRENT
-    // SELECTION (intersected with eligibility), never "everything eligible".
-    // An empty selection means an empty target set, so the buttons dim; that
-    // pairs with the ribbon's prepended selectAllButton (and its Ctrl+A
-    // mirror) for the old "act on everything" workflow.
-    function bulkTargetPaths(eligibleMap) {
-        const eligible = Object.keys(eligibleMap)
-        return eligible.filter((p) => sidebar.selectedPaths.indexOf(p) >= 0)
-    }
+    // detectSpeakersAllButton/runAllButton (see the ribbon below) read the
+    // selection*Paths properties, which refreshSelectionEligibility() derives
+    // from the MODEL (searchResultNotes()) narrowed to the CURRENT SELECTION —
+    // never "everything eligible". An empty selection means an empty target
+    // set, so the buttons dim; that pairs with the ribbon's prepended
+    // selectAllButton (and its Ctrl+A mirror) for the old "act on everything"
+    // workflow.
 
     // Item 39: run-all over the CURRENT SEARCH/FILTER RESULTS (the third,
     // search-menu home for the transcribe/relabel/chapters actions, alongside
@@ -735,6 +751,9 @@ Rectangle {
     }
     onSearchQueryChanged: {
         sidebar.refreshSearchResults()
+        // The visible note set is an input to ribbon eligibility (see
+        // refreshSelectionEligibility); re-derive when it changes.
+        sidebar.refreshSelectionEligibility()
         // Item 3: entering/leaving text search swaps which flattened order
         // visibleNotePaths() walks (searchResultsList vs. the TreeView row
         // walk) — a Shift-range anchor or selection built in one context
@@ -747,7 +766,10 @@ Rectangle {
         // change, destroying the row being renamed along with it.
         sidebar.cancelRename()
     }
-    onSearchIncludeTranscriptionsChanged: sidebar.refreshSearchResults()
+    onSearchIncludeTranscriptionsChanged: {
+        sidebar.refreshSearchResults()
+        sidebar.refreshSelectionEligibility()
+    }
     Connections {
         // Vault contents changed (file added/removed/renamed) — re-run the
         // search against the fresh tree. sidebar.model is itself the
@@ -758,6 +780,7 @@ Rectangle {
         target: sidebar.model
         function onModelReset() {
             sidebar.refreshSearchResults()
+            sidebar.refreshSelectionEligibility()
             sidebar.refreshTreeOrdering()
             // Item 3: vault contents changed (file added/removed/renamed) —
             // a stale selectedPaths entry could point at a file that no
@@ -826,6 +849,16 @@ Rectangle {
             if (!ok)
                 Notifications.error(error === "" ? qsTr("Couldn't rename — name taken or invalid.") : error)
             sidebar.clearOptimisticRename()
+            // In-place rename (VaultTreeModel::applyRenameOutcome) updates the
+            // tree WITHOUT a modelReset, so onModelReset never re-runs
+            // refreshTreeOrdering — and fileSortKeys is keyed by PATH, so the
+            // renamed file's NEW path has no key and drops to the proxy's
+            // keyless tier (sorts after every audio file — the row visibly
+            // slides down under an mtime sort though its mtime never changed).
+            // Recompute the keys from the fresh tree. Success only: a refused
+            // rename left every path unchanged.
+            if (ok)
+                sidebar.refreshTreeOrdering()
         }
         // File move is an instant-lane task like rename (see performRowMove).
         // On failure, surface the error; success needs nothing here — the
@@ -857,11 +890,22 @@ Rectangle {
             if (!ok)
                 Notifications.error(error === "" ? qsTr("Couldn't move folder — name taken or invalid.") : error)
         }
-        function onFinished(fileUrl, ok, error) {
-            sidebar.refreshTreeOrdering()
-            // A label/tag/transcript change can change what the active search
-            // matches, so re-run it (was previously driven by metadataRevision).
-            sidebar.refreshSearchResults()
+        function onFinished(fileUrl, ok, error, structural) {
+            // A STRUCTURAL task (rename/move/import/combine/grab — see
+            // Task::isStructuralFileOp) moved files, so the vault watcher's
+            // rebuild is about to emit a full modelReset, and onModelReset below
+            // already re-runs BOTH of these plus expandAll(). Doing them here
+            // too is what reflowed the panel twice for one rename: a re-sort now,
+            // then the authoritative reset ~50ms later. Stand down and let the
+            // reset own it. In-place edits (label/tags/chapters/speaker) never
+            // produce a reset, so for them this stays their only reflow trigger.
+            if (!structural) {
+                sidebar.refreshTreeOrdering()
+                // A label/tag/transcript change can change what the active search
+                // matches, so re-run it (was previously driven by metadataRevision).
+                sidebar.refreshSearchResults()
+                sidebar.refreshSelectionEligibility()
+            }
             // Item 6: labels/tags/chapters are written in-place into an
             // already-existing .md, which QFileSystemWatcher::directoryChanged
             // never fires for — so the tree row would stay stale until some
@@ -874,6 +918,10 @@ Rectangle {
         }
         function onJobStatusesChanged() {
             sidebar.jobStatusRevision += 1
+            // Eligibility is a function of on-disk transcription state, which a
+            // finishing job changes under a selection that never moved — the
+            // ribbon must re-derive rather than wait for the next click.
+            sidebar.refreshSelectionEligibility()
             // Deliberately does NOT call refreshTreeOrdering() (it used to).
             // Job status is queue state (queued/active/paused/...); tree
             // ORDER is a pure function of the filesystem + settings —
@@ -1296,44 +1344,69 @@ Rectangle {
         return (row < 0 || row >= rowCount) ? -1 : tree.depth(row)
     }
 
-    // path -> true, populated/depopulated by delegates as they realize/
-    // destroy — used on-demand by "transcribe all" (item 15) to avoid
-    // needing raw numeric model roles from QML for a manual tree walk.
-    property var untranscribedPaths: ({})
-    function setBulkEligible(path, eligible) {
-        if (eligible)
-            sidebar.untranscribedPaths[path] = true
-        else
-            delete sidebar.untranscribedPaths[path]
+    // The ribbon's bulk targets: the CURRENT SELECTION intersected with each
+    // action's eligibility rule.
+    //
+    // Bug (same class as combineReadyPaths' rowPaths bug below): these used to
+    // be untranscribedPaths/transcribedPaths/chaptersPaths, path -> true maps
+    // pushed bottom-up by each realized TreeView delegate. That only ever
+    // described whichever rows TreeView happened to have realized, and it was
+    // wrong in BOTH directions at once: reuseItems recycles a fixed delegate
+    // pool, so a pooled Item reassigned from an eligible row to another
+    // eligible row saw NO change in its eligibility binding, never fired
+    // onXEligibleChanged, and so never registered the new path (while the old
+    // path's key leaked, since Component.onDestruction doesn't run for a
+    // pooled reuse). Net effect: select a perfectly eligible file and the
+    // ribbon button sat there dim.
+    //
+    // Derived from the MODEL instead, via the same searchResultNotes() walk
+    // (all proxy rows, or the flat searchResultsList in text-search mode) that
+    // already backs the search-scoped mirrors below — one source of truth for
+    // each rule, and realization-independent by construction.
+    //
+    // Plain properties + an explicit refresh, NOT a binding that reads a
+    // revision counter as a dependency trick — same idiom (and same
+    // qmlcachegen reason) as searchResultsList/refreshSearchResults() above.
+    property var selectionTranscribePaths: []
+    property var selectionRelabelPaths: []
+    property var selectionChaptersPaths: []
+    property bool selectionEligibilityRefreshPending: false
+    // DEFERRED + coalesced, deliberately: the search*Paths() helpers walk
+    // searchProxy.data(...) over every proxy row, and several callers fire
+    // during a model reset (the vault-reset handler below, a job finishing, a
+    // selection cleared by a rebuild). Reading the proxy WHILE its source reset
+    // is in flight walks freed Nodes (the proxy-invalidate-during-reset UAF
+    // class — see VaultSearchProxyModel). Qt.callLater pushes the walk to the
+    // next event-loop turn, after any in-flight reset has fully settled, and
+    // the pending flag collapses a burst of triggers into one walk.
+    function refreshSelectionEligibility() {
+        if (sidebar.selectionEligibilityRefreshPending)
+            return
+        sidebar.selectionEligibilityRefreshPending = true
+        Qt.callLater(sidebar.doRefreshSelectionEligibility)
     }
-
-    // Same tracking pattern, inverted: already-transcribed audio files, for
-    // "regenerate all labels" (Wave D item 7).
-    property var transcribedPaths: ({})
-    function setRelabelEligible(path, eligible) {
-        if (eligible)
-            sidebar.transcribedPaths[path] = true
-        else
-            delete sidebar.transcribedPaths[path]
+    function doRefreshSelectionEligibility() {
+        sidebar.selectionEligibilityRefreshPending = false
+        const selected = sidebar.selectedPaths
+        if (selected.length === 0) {
+            // Nothing selected → every narrowed set is empty; skip the proxy
+            // walk entirely (also the common case right after a reset clears
+            // the selection).
+            sidebar.selectionTranscribePaths = []
+            sidebar.selectionRelabelPaths = []
+            sidebar.selectionChaptersPaths = []
+            return
+        }
+        const narrow = (paths) => paths.filter((p) => selected.indexOf(p) >= 0)
+        sidebar.selectionTranscribePaths = narrow(sidebar.searchTranscribePaths())
+        sidebar.selectionRelabelPaths = narrow(sidebar.searchRelabelPaths())
+        sidebar.selectionChaptersPaths = narrow(sidebar.searchChaptersPaths())
     }
+    onSelectedPathsChanged: sidebar.refreshSelectionEligibility()
 
-    // Same tracking pattern again, for "regenerate all chapters"
-    // (chaptersAllButton) — a superset of transcribedPaths above, since
-    // chapter generation (TranscriptionController::generateChaptersJob())
-    // only ever reads the .md's existing transcript body and never touches
-    // audio, so an orphaned .md (audio deleted, text still present) is just
-    // as eligible as a transcribed audio row. See treeDelegate.chaptersEligible.
-    property var chaptersPaths: ({})
-    function setChaptersEligible(path, eligible) {
-        if (eligible)
-            sidebar.chaptersPaths[path] = true
-        else
-            delete sidebar.chaptersPaths[path]
-    }
-
-    // TitleBar's "⋯" menu action: unlike transcribeAllButton (which only
-    // targets untranscribedPaths/bulkEligible files realized in the current
-    // TreeView viewport), this queues every audio file in the vault,
+    // TitleBar's "⋯" menu action: unlike transcribeAllButton (which targets
+    // the current SELECTION narrowed to untranscribed audio, see
+    // selectionTranscribePaths), this queues every audio file in the vault,
     // including already-transcribed ones — VaultTreeModel.allAudioPaths()
     // walks the full tree directly rather than relying on realized
     // delegates. transcribe()'s only in-flight gate is isQueued(), so this
@@ -1526,8 +1599,27 @@ Rectangle {
             return base
         if (AppSettings.useLabelsSidebar && label)
             return label
+        // A filename edit seeds the SAME text the row shows (rowNameText): the
+        // full base+extension when extensions are visible, the stem alone when
+        // hidden. renameFile() takes a stem and re-appends the real extension
+        // itself, so renameBaseValue() strips the extension back off on commit
+        // (mirrors MainPanel's filenameSubtitle / commitFilenameRename).
+        if (!AppSettings.hideExtensionsSidebar)
+            return base
         const dot = base.lastIndexOf(".")
         return dot > 0 ? base.substring(0, dot) : base
+    }
+
+    // The value the write actually consumes, derived from the editor's display
+    // text: a folder or a label edits its full text, but a filename edit shows
+    // the extension (when visible) that renameFile() must NOT receive — strip
+    // it back to the stem. Any extension the user typed is ignored; the file
+    // keeps its real one (same contract as MainPanel's commitFilenameRename).
+    function renameBaseValue(path, isDir, label, text) {
+        if (isDir || (AppSettings.useLabelsSidebar && label) || AppSettings.hideExtensionsSidebar)
+            return text
+        const dot = text.lastIndexOf(".")
+        return dot > 0 ? text.substring(0, dot) : text
     }
 
     // Commits whatever rename is currently open, from the sidebar's own copy of
@@ -1549,10 +1641,12 @@ Rectangle {
         // Set the optimistic display BEFORE clearing renamingPath, so the frame
         // where this row falls back to rowNameText already shows the new name
         // (see optimisticRenamePath's doc comment). performRename() clears it.
-        const trimmed = newValue.trim()
-        if (trimmed !== "" && trimmed !== sidebar.renameInitialText(path, isDir, label)) {
+        const baseValue = sidebar.renameBaseValue(path, isDir, label, newValue.trim())
+        const originalBase = sidebar.renameBaseValue(path, isDir, label,
+                                                     sidebar.renameInitialText(path, isDir, label))
+        if (baseValue !== "" && baseValue !== originalBase) {
             sidebar.optimisticRenamePath = path
-            sidebar.optimisticRenameName = sidebar.optimisticDisplayName(path, isDir, label, trimmed)
+            sidebar.optimisticRenameName = sidebar.optimisticDisplayName(path, isDir, label, baseValue)
         }
         sidebar.renamingPath = ""
         sidebar.renamingText = ""
@@ -1565,8 +1659,10 @@ Rectangle {
     }
 
     function performRename(path, isDir, label, newValue) {
-        const trimmed = newValue.trim()
-        if (trimmed === "" || trimmed === sidebar.renameInitialText(path, isDir, label)) {
+        const baseValue = sidebar.renameBaseValue(path, isDir, label, newValue.trim())
+        const originalBase = sidebar.renameBaseValue(path, isDir, label,
+                                                     sidebar.renameInitialText(path, isDir, label))
+        if (baseValue === "" || baseValue === originalBase) {
             sidebar.clearOptimisticRename()
             return // empty or unchanged — silently keep the old name
         }
@@ -1579,10 +1675,10 @@ Rectangle {
             // model.renameFolder() is the no-controller fallback (rebuild is
             // immediate, so clear now).
             if (sidebar.transcriptionController) {
-                sidebar.transcriptionController.renameFolder("file://" + path, trimmed, sidebar.vaultPath)
+                sidebar.transcriptionController.renameFolder("file://" + path, baseValue, sidebar.vaultPath)
                 return
             }
-            if (sidebar.model && !sidebar.model.renameFolder("file://" + path, trimmed))
+            if (sidebar.model && !sidebar.model.renameFolder("file://" + path, baseValue))
                 Notifications.error(qsTr("Couldn't rename folder — name taken or invalid."))
             sidebar.clearOptimisticRename()
             return
@@ -1594,7 +1690,7 @@ Rectangle {
         // no rebuild, so nothing extra to nudge here.
         if (AppSettings.useLabelsSidebar && label) {
             if (sidebar.transcriptionController)
-                sidebar.transcriptionController.setLabel("file://" + path, trimmed)
+                sidebar.transcriptionController.setLabel("file://" + path, baseValue)
             sidebar.clearOptimisticRename()
             return
         }
@@ -1612,9 +1708,9 @@ Rectangle {
         // synchronous VaultTreeModel.renameFile() (which rebuilds inline, so
         // the override is safe to clear immediately).
         if (sidebar.transcriptionController) {
-            sidebar.transcriptionController.renameFile("file://" + path, trimmed)
+            sidebar.transcriptionController.renameFile("file://" + path, baseValue)
         } else {
-            if (sidebar.model && !sidebar.model.renameFile("file://" + path, trimmed))
+            if (sidebar.model && !sidebar.model.renameFile("file://" + path, baseValue))
                 Notifications.error(qsTr("Couldn't rename — name taken or invalid."))
             sidebar.clearOptimisticRename()
         }
@@ -1686,22 +1782,33 @@ Rectangle {
 
     // Cheap synchronous pre-check deciding whether a destination highlights and
     // accepts at all. The C++ guards in moveFile()/moveFolder() remain the real
-    // authority (vault containment, collisions, sidecar integrity) — this only
-    // covers the two rejections a user causes by AIMING, so the drop target
-    // simply refuses to light up instead of taking the drop and failing: a
-    // no-op move into the row's own current directory, and a folder into itself
-    // or one of its own descendants.
+    // authority (vault containment, collisions, sidecar integrity). A folder
+    // into itself or a descendant is impossible, so it stays dark and refuses.
+    // A drop back onto the row's OWN current directory is offered (it lights up
+    // and accepts) so a mid-drag user can change their mind — performRowMove()
+    // then makes that drop do nothing. A mixed selection where only SOME rows
+    // already live in destDir has no single clean meaning and is refused.
     function canDropRowsOn(destDir) {
         if (!sidebar.rowDragActive || destDir === "")
             return false
+        let inDest = 0
         for (let i = 0; i < sidebar.rowDragPaths.length; i++) {
             const p = sidebar.rowDragPaths[i]
-            if (p.substring(0, p.lastIndexOf("/")) === destDir)
-                return false
+            // A folder onto itself or one of its own descendants is impossible —
+            // no move could ever satisfy it, so it stays dark and refuses.
             if (sidebar.rowDragIsDir && (destDir === p || destDir.startsWith(p + "/")))
                 return false
+            if (p.substring(0, p.lastIndexOf("/")) === destDir)
+                inDest++
         }
-        return true
+        // Two clean cases light up and accept: a real move (nothing already
+        // lives in destDir) and the pure no-op of releasing every row back on
+        // its origin folder (everything does). The no-op is short-circuited in
+        // performRowMove(), so a user who changed their mind has a safe place to
+        // drop — the change-your-mind affordance a same-folder refusal removed.
+        // A MIXED selection (only SOME rows already in destDir) has no single
+        // clean meaning and stays refused, exactly as before.
+        return inDest === 0 || inDest === sidebar.rowDragPaths.length
     }
 
     function beginRowDrag(path, isDir, scenePoint) {
@@ -1750,6 +1857,19 @@ Rectangle {
     // pushed to the next event-loop turn, after the gesture has fully unwound.
     function performRowMove(paths, isDir, destDir) {
         if (destDir === "")
+            return
+        // Change-your-mind no-op: every row already lives directly in destDir
+        // (the user released back on the origin folder, which canDropRowsOn now
+        // lights up as a target). Nothing to move — and enqueuing a
+        // same-directory move would only raise a spurious collision error — so
+        // just return.
+        let allInDest = true
+        for (let i = 0; i < paths.length; i++)
+            if (paths[i].substring(0, paths[i].lastIndexOf("/")) !== destDir) {
+                allInDest = false
+                break
+            }
+        if (allInDest)
             return
         // With a controller, moves are async instant-lane tasks (visible +
         // undoable): FILE moves collapse into one undo BATCH for the whole drag
@@ -2052,6 +2172,29 @@ Rectangle {
     readonly property bool noteShortcutsEnabled:
         (tree.activeFocus || searchResultsView.activeFocus) && sidebar.renamingPath === ""
 
+    // True when keyboard focus currently sits in a text-editing field anywhere
+    // in the window — the inline rename editor, the sidebar's search/tag
+    // fields, or (window-wide) MainPanel's transcript/title/prelude editors.
+    // Duck-typed on cursorPosition, a property only TextInput/TextEdit-based
+    // items expose; a plain Item, Button, or the TreeView returns undefined.
+    // Keeps deleteShortcutEnabled below from hijacking an in-progress edit's
+    // own Delete keystroke.
+    readonly property bool textFieldHasFocus: {
+        const fi = Window.activeFocusItem
+        return fi !== null && fi.cursorPosition !== undefined
+    }
+
+    // The Delete key deletes the current sidebar selection whenever one exists
+    // and no text field is being edited — deliberately NOT gated on
+    // tree.activeFocus (unlike the navigation shortcuts), because the selection
+    // stays highlighted in the left panel after focus drifts to the main panel,
+    // and a visible selection that Delete ignores is the bug this fixes. The
+    // renamingPath guard is belt-and-braces over textFieldHasFocus (the rename
+    // editor is itself a text field).
+    readonly property bool deleteShortcutEnabled:
+        sidebar.selectedPaths.length > 0 && sidebar.renamingPath === ""
+        && !sidebar.textFieldHasFocus
+
     // Vertical arrow-key navigation between notes.
     Shortcut {
         sequence: "Up"
@@ -2123,21 +2266,29 @@ Rectangle {
     // only ever holds notes (a directory row's TapHandler toggles expand and
     // never selects — see treeDelegate), so this can't recursively take a
     // folder. Deleting a folder stays an explicit right-click action.
+    //
+    // Gated on deleteShortcutEnabled (selection + not editing text) rather than
+    // noteShortcutsEnabled, so it fires even when focus has left the tree — the
+    // selection stays highlighted in the left panel the whole time.
     Shortcut {
         sequence: StandardKey.Delete
-        enabled: sidebar.noteShortcutsEnabled && sidebar.selectedPaths.length > 0
+        enabled: sidebar.deleteShortcutEnabled
         onActivated: sidebar.beginDeleteFile(sidebar.selectedPaths.slice())
     }
 
     // Escape collapses a multi-selection back to just the open file (see
-    // deselectExceptCurrent). Gated on an actual multi-selection existing so it
-    // never swallows Escape from anything else when there's nothing to clear;
-    // the `renamingPath === ""` half of noteShortcutsEnabled also keeps it off
-    // while an inline rename editor is open (Escape there reverts the edit —
-    // see rowRenameField's Keys.onEscapePressed).
+    // deselectExceptCurrent). Deliberately NOT gated on tree/search focus
+    // (unlike noteShortcutsEnabled above) — the selection stays highlighted in
+    // the left panel after focus drifts to the main panel, and the cancel
+    // button/empty-space taps that mirror this already clear it regardless of
+    // focus, so Escape should too. Gated on an actual multi-selection existing
+    // so it never swallows Escape from anything else when there's nothing to
+    // clear; `renamingPath === ""` keeps it off while an inline rename editor
+    // is open (Escape there reverts the edit — see rowRenameField's
+    // Keys.onEscapePressed).
     Shortcut {
         sequence: "Escape"
-        enabled: sidebar.noteShortcutsEnabled && sidebar.selectedPaths.length > 1
+        enabled: sidebar.renamingPath === "" && sidebar.selectedPaths.length > 1
         onActivated: sidebar.deselectExceptCurrent()
     }
 
@@ -2203,7 +2354,7 @@ Rectangle {
 
             // Prepended select-all: mirrors the Ctrl+A shortcut above, and
             // is what makes the bulk buttons to its right ("apply to the
-            // current selection", see bulkTargetPaths()) able to reach
+            // current selection", see refreshSelectionEligibility()) able to reach
             // "everything" again without requiring a manual Shift-click
             // drag across the whole tree.
             Item {
@@ -2267,10 +2418,10 @@ Rectangle {
                 width: 22
                 height: 22
                 // Item 3 (reworked): the ribbon always narrows to the
-                // current selection now (see bulkTargetPaths()'s comment) —
+                // current selection now (see refreshSelectionEligibility()) —
                 // an empty selection means nothing to transcribe, so dim
                 // like the other bulk buttons rather than silently no-op.
-                enabled: sidebar.transcriptionController && sidebar.bulkTargetPaths(sidebar.untranscribedPaths).length > 0
+                enabled: sidebar.transcriptionController && sidebar.selectionTranscribePaths.length > 0
 
                 HoverHandler {
                     id: transcribeAllHover
@@ -2280,7 +2431,7 @@ Rectangle {
                 TapHandler {
                     enabled: transcribeAllButton.enabled
                     onTapped: {
-                        const paths = sidebar.bulkTargetPaths(sidebar.untranscribedPaths)
+                        const paths = sidebar.selectionTranscribePaths
                         // Model paths are raw local paths, not file:// URLs
                         // (see VaultTreeModel's PathRole) — Q_INVOKABLE
                         // QUrl params need the scheme or QUrl::toLocalFile()
@@ -2315,9 +2466,9 @@ Rectangle {
                 id: relabelAllButton
                 width: 22
                 height: 22
-                // Item 3 (reworked): same bulkTargetPaths narrowing as
+                // Item 3 (reworked): same selection-narrowing as
                 // transcribeAllButton above.
-                enabled: sidebar.transcriptionController && sidebar.bulkTargetPaths(sidebar.transcribedPaths).length > 0
+                enabled: sidebar.transcriptionController && sidebar.selectionRelabelPaths.length > 0
 
                 HoverHandler {
                     id: relabelAllHover
@@ -2327,7 +2478,7 @@ Rectangle {
                 TapHandler {
                     enabled: relabelAllButton.enabled
                     onTapped: {
-                        const paths = sidebar.bulkTargetPaths(sidebar.transcribedPaths)
+                        const paths = sidebar.selectionRelabelPaths
                         const urls = paths.map((p) => "file://" + p)
                         sidebar.transcriptionController.relabelAll(urls, sidebar.vaultPath,
                                                                      AppSettings.restrictTagsToExisting,
@@ -2359,9 +2510,9 @@ Rectangle {
                 id: chaptersAllButton
                 width: 22
                 height: 22
-                // Item 3 (reworked): same bulkTargetPaths narrowing as
+                // Item 3 (reworked): same selection-narrowing as
                 // transcribeAllButton above.
-                enabled: sidebar.transcriptionController && sidebar.bulkTargetPaths(sidebar.chaptersPaths).length > 0
+                enabled: sidebar.transcriptionController && sidebar.selectionChaptersPaths.length > 0
 
                 HoverHandler {
                     id: chaptersAllHover
@@ -2371,7 +2522,7 @@ Rectangle {
                 TapHandler {
                     enabled: chaptersAllButton.enabled
                     onTapped: {
-                        const paths = sidebar.bulkTargetPaths(sidebar.chaptersPaths)
+                        const paths = sidebar.selectionChaptersPaths
                         const urls = paths.map((p) => "file://" + p)
                         sidebar.transcriptionController.generateChaptersAll(urls, sidebar.vaultPath,
                                                                               AppSettings.chapterDensity)
@@ -2402,8 +2553,8 @@ Rectangle {
                 id: detectSpeakersAllButton
                 width: 22
                 height: 22
-                // Same bulkTargetPaths narrowing as the other ribbon buttons.
-                enabled: sidebar.transcriptionController && sidebar.bulkTargetPaths(sidebar.transcribedPaths).length > 0
+                // Same selection-narrowing as the other ribbon buttons.
+                enabled: sidebar.transcriptionController && sidebar.selectionRelabelPaths.length > 0
 
                 HoverHandler {
                     id: detectSpeakersAllHover
@@ -2413,7 +2564,7 @@ Rectangle {
                 TapHandler {
                     enabled: detectSpeakersAllButton.enabled
                     onTapped: {
-                        const paths = sidebar.bulkTargetPaths(sidebar.transcribedPaths)
+                        const paths = sidebar.selectionRelabelPaths
                         const urls = paths.map((p) => "file://" + p)
                         sidebar.transcriptionController.diarizeFilesForPaths(urls, sidebar.vaultPath,
                                                                             AppSettings.diarizationSegmentationModel,
@@ -2448,7 +2599,7 @@ Rectangle {
                 width: 22
                 height: 22
                 enabled: sidebar.transcriptionController
-                         && sidebar.bulkTargetPaths(sidebar.untranscribedPaths).length > 0
+                         && sidebar.selectionTranscribePaths.length > 0
 
                 HoverHandler {
                     id: runAllHover
@@ -2458,7 +2609,7 @@ Rectangle {
                 TapHandler {
                     enabled: runAllButton.enabled
                     onTapped: {
-                        const paths = sidebar.bulkTargetPaths(sidebar.untranscribedPaths)
+                        const paths = sidebar.selectionTranscribePaths
                         if (paths.length === 0)
                             return
                         const urls = paths.map((p) => "file://" + p)
@@ -2487,6 +2638,25 @@ Rectangle {
                 ToolTip.visible: runAllHover.hovered
                 ToolTip.text: qsTr("Run all jobs on selected files (transcribe, label, chapters)")
                 ToolTip.delay: 500
+            }
+
+            // Separates the per-file bulk pipeline (transcribe/label/chapters/
+            // speakers/run-all, all narrowed to the current selection via the
+            // selection*Paths) from combine, which is a different kind of
+            // action: a vault-wide scan over allAudioPaths() that ignores the
+            // selection entirely. Same shape/reasoning as ribbonDivider above.
+            Item {
+                id: ribbonCombineDivider
+                objectName: "ribbonCombineDivider"
+                width: 1
+                height: 22
+
+                Rectangle {
+                    anchors.centerIn: parent
+                    width: 1
+                    height: 18
+                    color: "#3a3a3a"
+                }
             }
 
             // Split-recording combine, run on demand rather than
@@ -2699,7 +2869,7 @@ Rectangle {
                 objectName: "deleteTranscriptAllButton"
                 width: 22
                 height: 22
-                enabled: sidebar.model && sidebar.bulkTargetPaths(sidebar.transcribedPaths).length > 0
+                enabled: sidebar.model && sidebar.selectionRelabelPaths.length > 0
 
                 HoverHandler {
                     id: deleteTranscriptAllHover
@@ -2709,7 +2879,7 @@ Rectangle {
                 TapHandler {
                     enabled: deleteTranscriptAllButton.enabled
                     onTapped: sidebar.beginDeleteTranscript(
-                                  sidebar.bulkTargetPaths(sidebar.transcribedPaths))
+                                  sidebar.selectionRelabelPaths)
                 }
                 HoverBorder {
                     anchors.fill: parent
@@ -2732,7 +2902,7 @@ Rectangle {
                 objectName: "deleteAudioOnlyAllButton"
                 width: 22
                 height: 22
-                enabled: sidebar.model && sidebar.bulkTargetPaths(sidebar.transcribedPaths).length > 0
+                enabled: sidebar.model && sidebar.selectionRelabelPaths.length > 0
 
                 HoverHandler {
                     id: deleteAudioOnlyAllHover
@@ -2742,7 +2912,7 @@ Rectangle {
                 TapHandler {
                     enabled: deleteAudioOnlyAllButton.enabled
                     onTapped: sidebar.beginDeleteAudioOnly(
-                                  sidebar.bulkTargetPaths(sidebar.transcribedPaths))
+                                  sidebar.selectionRelabelPaths)
                 }
                 HoverBorder {
                     anchors.fill: parent
@@ -2968,16 +3138,67 @@ Rectangle {
 
             TextField {
                 id: tagFilterField
+                objectName: "tagFilterField"
                 Layout.fillWidth: true
                 Layout.preferredHeight: 24
                 placeholderText: qsTr("Filter by tags (comma-separated)…")
                 text: sidebar.tagFilterText
-                onTextChanged: sidebar.tagFilterText = text
+                onTextChanged: {
+                    sidebar.tagFilterText = text
+                    // Typing revives a dismissed list — an Escape suppresses
+                    // the CURRENT fragment's suggestions, not the field's
+                    // autocomplete forever.
+                    tagSuggestionsPopup.dismissed = false
+                }
 
                 background: UnderlineField { focused: tagFilterField.activeFocus }
 
                 HoverHandler {
                     cursorShape: Qt.IBeamCursor
+                }
+
+                // Arrow/Enter/Escape reach the popup only while it is showing;
+                // otherwise they must fall through so Escape still collapses
+                // search and Enter still behaves normally in the field.
+                Keys.onDownPressed: (event) => {
+                    if (tagSuggestionsPopup.visible) tagSuggestionsPopup.moveDown()
+                    else event.accepted = false
+                }
+                Keys.onUpPressed: (event) => {
+                    if (tagSuggestionsPopup.visible) tagSuggestionsPopup.moveUp()
+                    else event.accepted = false
+                }
+                Keys.onReturnPressed: (event) => {
+                    if (tagSuggestionsPopup.visible) tagSuggestionsPopup.acceptCurrent()
+                    else event.accepted = false
+                }
+                Keys.onEnterPressed: (event) => {
+                    if (tagSuggestionsPopup.visible) tagSuggestionsPopup.acceptCurrent()
+                    else event.accepted = false
+                }
+                // Tab accepts the highlighted suggestion like Enter (the
+                // conventional autocomplete-commit key); when the popup is
+                // hidden it falls through to normal focus navigation.
+                Keys.onTabPressed: (event) => {
+                    if (tagSuggestionsPopup.visible) tagSuggestionsPopup.acceptCurrent()
+                    else event.accepted = false
+                }
+                Keys.onEscapePressed: (event) => {
+                    if (tagSuggestionsPopup.visible) tagSuggestionsPopup.dismiss()
+                    else event.accepted = false
+                }
+
+                FilterSuggestions {
+                    id: tagSuggestionsPopup
+                    objectName: "tagSuggestionsPopup"
+                    field: tagFilterField
+                    enabledWhen: sidebar.searchExpanded
+                    suggestions: sidebar.tagSuggestions()
+                    onAccepted: (value) => {
+                        sidebar.tagFilterText = sidebar.acceptFragment(sidebar.tagFilterText, value)
+                        tagFilterField.forceActiveFocus()
+                        tagFilterField.cursorPosition = tagFilterField.text.length
+                    }
                 }
             }
 
@@ -3080,9 +3301,11 @@ Rectangle {
         // Speaker filter — mirrors the tag filter immediately above
         // (RowLayout TextField+clear, then a removable-chips Flow) but
         // against VaultSearchProxyModel.speakerFilter/VaultTreeModel's
-        // SpeakersRole instead of tags. No autocomplete-suggestions popup
-        // (unlike tagFilterField's tagSuggestions()) — not requested, and
-        // speaker vocabulary isn't vault-wide indexed the way tags are.
+        // SpeakersRole instead of tags — including the autocomplete popup,
+        // which is literally the same FilterSuggestions component over
+        // speakerSuggestions() (existingVaultSpeakers' vault-wide
+        // `speakers:` vocabulary). Keep the two call sites structurally
+        // identical; divergence here is the bug this replaced.
         RowLayout {
             width: parent.width
             height: 24
@@ -3090,16 +3313,67 @@ Rectangle {
 
             TextField {
                 id: speakerFilterField
+                objectName: "speakerFilterField"
                 Layout.fillWidth: true
                 Layout.preferredHeight: 24
                 placeholderText: qsTr("Filter by speakers (comma-separated)…")
                 text: sidebar.speakerFilterText
-                onTextChanged: sidebar.speakerFilterText = text
+                onTextChanged: {
+                    sidebar.speakerFilterText = text
+                    // Typing revives a dismissed list — an Escape suppresses
+                    // the CURRENT fragment's suggestions, not the field's
+                    // autocomplete forever.
+                    speakerSuggestionsPopup.dismissed = false
+                }
 
                 background: UnderlineField { focused: speakerFilterField.activeFocus }
 
                 HoverHandler {
                     cursorShape: Qt.IBeamCursor
+                }
+
+                // Arrow/Enter/Escape reach the popup only while it is showing;
+                // otherwise they must fall through so Escape still collapses
+                // search and Enter still behaves normally in the field.
+                Keys.onDownPressed: (event) => {
+                    if (speakerSuggestionsPopup.visible) speakerSuggestionsPopup.moveDown()
+                    else event.accepted = false
+                }
+                Keys.onUpPressed: (event) => {
+                    if (speakerSuggestionsPopup.visible) speakerSuggestionsPopup.moveUp()
+                    else event.accepted = false
+                }
+                Keys.onReturnPressed: (event) => {
+                    if (speakerSuggestionsPopup.visible) speakerSuggestionsPopup.acceptCurrent()
+                    else event.accepted = false
+                }
+                Keys.onEnterPressed: (event) => {
+                    if (speakerSuggestionsPopup.visible) speakerSuggestionsPopup.acceptCurrent()
+                    else event.accepted = false
+                }
+                // Tab accepts the highlighted suggestion like Enter (the
+                // conventional autocomplete-commit key); when the popup is
+                // hidden it falls through to normal focus navigation.
+                Keys.onTabPressed: (event) => {
+                    if (speakerSuggestionsPopup.visible) speakerSuggestionsPopup.acceptCurrent()
+                    else event.accepted = false
+                }
+                Keys.onEscapePressed: (event) => {
+                    if (speakerSuggestionsPopup.visible) speakerSuggestionsPopup.dismiss()
+                    else event.accepted = false
+                }
+
+                FilterSuggestions {
+                    id: speakerSuggestionsPopup
+                    objectName: "speakerSuggestionsPopup"
+                    field: speakerFilterField
+                    enabledWhen: sidebar.searchExpanded
+                    suggestions: sidebar.speakerSuggestions()
+                    onAccepted: (value) => {
+                        sidebar.speakerFilterText = sidebar.acceptFragment(sidebar.speakerFilterText, value)
+                        speakerFilterField.forceActiveFocus()
+                        speakerFilterField.cursorPosition = speakerFilterField.text.length
+                    }
                 }
             }
 
@@ -3199,7 +3473,7 @@ Rectangle {
         // treeDelegate cluster = per-row, this = filtered set). Each button
         // reuses the EXACT controller-call idiom + args its ribbon counterpart
         // uses (transcribeAll/relabelAll/generateChaptersAll), just over its
-        // eligible subset of the filtered set instead of bulkTargetPaths(...).
+        // eligible subset of the filtered set instead of the selection*Paths.
         // Disabled unless a filter is actually active AND that action's
         // eligible subset is non-empty (see searchFilterActive + the per-action
         // helpers above), so they never silently run over the whole vault.
@@ -3425,62 +3699,6 @@ Rectangle {
         }
         }
 
-        // Item 17: autofill suggestions for the tag currently being typed
-        // (the fragment after the last comma) — vault tag vocabulary
-        // filtered to those starting with that fragment, excluding tags
-        // already present in the field.
-        Popup {
-            id: tagSuggestionsPopup
-            y: ribbon.height
-            x: 6
-            width: 220
-            padding: 4
-            visible: sidebar.searchExpanded && tagFilterField.activeFocus && tagSuggestionsList.model.length > 0
-            focus: false
-            modal: true
-            closePolicy: Popup.NoAutoClose
-
-            background: Rectangle {
-                color: "#242424"
-                radius: AppSettings.borderRadius
-                border.width: 1
-                border.color: "#3a3a3a"
-            }
-
-            ListView {
-                id: tagSuggestionsList
-                implicitHeight: Math.min(contentHeight, 140)
-                width: parent.width
-                model: sidebar.tagSuggestions()
-
-                delegate: Item {
-                    required property string modelData
-                    width: tagSuggestionsList.width
-                    height: 22
-
-                    HoverHandler {
-                        id: suggestionHover
-                        cursorShape: Qt.PointingHandCursor
-                    }
-                    TapHandler {
-                        onTapped: sidebar.acceptTagSuggestion(modelData)
-                    }
-                    Rectangle {
-                        anchors.fill: parent
-                        color: suggestionHover.hovered ? "#3a3a3a" : "transparent"
-                        radius: AppSettings.borderRadius
-                    }
-                    Text {
-                        anchors.verticalCenter: parent.verticalCenter
-                        anchors.left: parent.left
-                        anchors.leftMargin: 6
-                        text: parent.modelData
-                        color: "#dddddd"
-                        font.pixelSize: 11
-                    }
-                }
-            }
-        }
     }
 
     // Item 40 (drag-to-move): the tree's empty space below the last row stands
@@ -3629,6 +3847,23 @@ Rectangle {
         // flashing in while a scroll is in progress.
         ScrollBar.vertical: ScrollBar { policy: ScrollBar.AlwaysOn }
 
+        // A non-empty text query hides this whole TreeView (visible:
+        // sidebar.searchQuery === "") and shows searchResultsView instead. A
+        // QQuickTableView releases its realized delegates while invisible, so
+        // contentHeight collapses toward the viewport height — and the
+        // forceLayout()s fired by the search Connections below run either while
+        // still invisible or on the very tick `visible` flips back to true
+        // (before the item is re-polished), so they rebuild against a
+        // not-yet-laid-out view and contentHeight stays stale-small. Result:
+        // after exiting search the scrollbar thumb fills the track and the tree
+        // won't scroll to the files below the fold. Re-lay-out once the tree is
+        // genuinely visible again, deferred a turn so it runs after visible:
+        // true is applied and the view re-polished.
+        onVisibleChanged: {
+            if (tree.visible)
+                Qt.callLater(tree.forceLayout)
+        }
+
         // Item 40: right-click on empty tree space (below the rows) opens the
         // context menu targeting the vault root — so "New folder" at the root
         // is reachable even with no rows to right-click.
@@ -3711,6 +3946,25 @@ Rectangle {
         property bool expandPending: false
         property bool expanding: false
 
+        // Scroll-offset preservation across a model reset. A reset drops every
+        // QModelIndex, so the view collapses to root rows, contentHeight
+        // shrinks, and the Flickable CLAMPS contentY — by the time
+        // expandAllNow() has put the rows back, the offset is already gone.
+        // So remember where the user actually was and put it back afterwards.
+        //
+        // Sampled continuously rather than read inside onModelReset: that
+        // would depend on this QML Connections being invoked before
+        // TreeView's own internal reset handler, and if that ordering ever
+        // flipped, the bug would come back silently (restoring 0 over 0).
+        // Anything that moves contentY WHILE recovering is the collapse
+        // itself, never the user — hence the gate.
+        property real lastUserContentY: 0
+        property real pendingContentY: -1
+        onContentYChanged: {
+            if (!tree.expandPending && !tree.expanding)
+                tree.lastUserContentY = tree.contentY
+        }
+
         // insideLayout: true when the caller is itself running inside
         // TableView's layout pass (onRowsChanged is), which changes only how
         // the trailing forceLayout() is scheduled — see below.
@@ -3744,6 +3998,25 @@ Rectangle {
             tree.expanding = false
             tree.expandPending = false
             expandRetryTimer.stop()
+            tree.restorePendingContentY()
+        }
+
+        // Deferred, always: in the insideLayout case forceLayout() itself is
+        // only queued above, so contentHeight isn't final yet. Qt.callLater
+        // callbacks run in queue order, so this lands after that layout.
+        // Clamped rather than assigned raw — the tree may genuinely be shorter
+        // now (rows were deleted), and an out-of-range contentY leaves the
+        // Flickable showing blank space below the last row.
+        function restorePendingContentY() {
+            if (tree.pendingContentY < 0)
+                return
+            const target = tree.pendingContentY
+            tree.pendingContentY = -1
+            Qt.callLater(function() {
+                const maxY = Math.max(0, tree.contentHeight - tree.height)
+                tree.contentY = Math.max(0, Math.min(target, maxY))
+                tree.lastUserContentY = tree.contentY
+            })
         }
 
         // The view has NOT processed the reset when this runs — a QML
@@ -3757,8 +4030,20 @@ Rectangle {
         Connections {
             target: searchProxy
             function onModelReset() {
+                tree.pendingContentY = tree.lastUserContentY
                 tree.expandPending = true
                 expandRetryTimer.start()
+            }
+        }
+
+        // Opening a DIFFERENT vault resets the model as well, but there is no
+        // previous position to preserve — start at the top.
+        Connections {
+            target: sidebar.model
+            ignoreUnknownSignals: true
+            function onVaultPathChanged() {
+                tree.pendingContentY = -1
+                tree.lastUserContentY = 0
             }
         }
 
@@ -3901,19 +4186,16 @@ Rectangle {
             readonly property bool bulkEligible: treeDelegate.isAudio && sidebar.transcriptionController
                 && !sidebar.transcriptionController.matchesExistingTranscription(
                        "file://" + treeDelegate.path, AppSettings.defaultModel)
-            onBulkEligibleChanged: sidebar.setBulkEligible(treeDelegate.path, treeDelegate.bulkEligible)
 
             // Wave D item 7: inverse of bulkEligible — already-transcribed
             // audio files, for the per-row + bulk "regenerate auto-title".
             readonly property bool relabelEligible: treeDelegate.isAudio && treeDelegate.status === 2
-            onRelabelEligibleChanged: sidebar.setRelabelEligible(treeDelegate.path, treeDelegate.relabelEligible)
 
             // Chapters, unlike relabel, only ever read the .md's existing
             // transcript body (TranscriptionController::generateChaptersJob()
             // never touches audio) — so an orphaned .md is just as eligible
             // as an already-transcribed audio row.
             readonly property bool chaptersEligible: treeDelegate.relabelEligible || treeDelegate.isOrphanedMd
-            onChaptersEligibleChanged: sidebar.setChaptersEligible(treeDelegate.path, treeDelegate.chaptersEligible)
 
             // A folder highlight covers the folder AND everything inside it,
             // so what's about to be acted on reads as one whole container
@@ -4046,15 +4328,9 @@ Rectangle {
             }
 
             Component.onCompleted: {
-                sidebar.setBulkEligible(treeDelegate.path, treeDelegate.bulkEligible)
-                sidebar.setRelabelEligible(treeDelegate.path, treeDelegate.relabelEligible)
-                sidebar.setChaptersEligible(treeDelegate.path, treeDelegate.chaptersEligible)
                 treeDelegate.refreshJobStatus()
             }
             Component.onDestruction: {
-                sidebar.setBulkEligible(treeDelegate.path, false)
-                sidebar.setRelabelEligible(treeDelegate.path, false)
-                sidebar.setChaptersEligible(treeDelegate.path, false)
                 // Balance the hover count if this row is destroyed (e.g.
                 // TreeView recycling) WHILE still counted as hovering —
                 // otherwise that increment would never be decremented and
@@ -4268,7 +4544,23 @@ Rectangle {
                         // is being built.
                         const soleSelection = sidebar.selectedPaths.length === 1
                                 && sidebar.selectedPaths[0] === treeDelegate.path
-                        if (plainTap && soleSelection
+                        // Item 082: renaming the OPEN file could need an extra
+                        // click. A background STRUCTURE-change rebuild (an import,
+                        // USB grab, combine, or delete landing another file while
+                        // you work — VaultTreeModel::rebuild only resets on a
+                        // changed file set, not on a transcript rewrite) runs
+                        // onModelReset, which clears selectedPaths — but NOT
+                        // currentPath. If that reset lands between the
+                        // select-click and the name-click, the soleSelection
+                        // precondition is gone and the next click only re-selects
+                        // instead of renaming. currentPath survives the reset, so
+                        // honor it: the open file stays renameable in one
+                        // name-click. Gated on an EMPTY selection (exactly the
+                        // post-reset state) so this changes nothing when any file
+                        // is actually selected.
+                        const openFileNoSelection = sidebar.selectedPaths.length === 0
+                                && treeDelegate.path === sidebar.currentPath
+                        if (plainTap && (soleSelection || openFileNoSelection)
                                 && treeDelegate.tapIsOnRowName(treeRowTap.point.position)) {
                             sidebar.beginRename(treeDelegate.path, false, treeDelegate.label)
                             return
@@ -4293,7 +4585,13 @@ Rectangle {
                 // no torn-out row to put back if the drag is abandoned.
                 target: null
                 acceptedButtons: Qt.LeftButton
-                enabled: treeDelegate.isDir || treeDelegate.isAudio || treeDelegate.isOrphanedMd
+                // Disarmed while THIS row is being inline-renamed, so a press-drag
+                // inside the rename field selects text instead of starting a
+                // file-move drag (the handler's default grabPermissions would
+                // otherwise steal the TextInput's selection grab). Mirrors the
+                // !renamingThisRow gate already used on the row's name element.
+                enabled: (treeDelegate.isDir || treeDelegate.isAudio || treeDelegate.isOrphanedMd)
+                         && !treeDelegate.renamingThisRow
                 // grabPermissions is deliberately left at the DEFAULT. The
                 // obvious worry is that the enclosing TreeView (a Flickable)
                 // steals the grab once the stroke passes its own flick
@@ -4678,7 +4976,9 @@ Rectangle {
                         Layout.preferredWidth: 8
                         Layout.preferredHeight: 8
                         radius: 4
-                        color: treeDelegate.status === 2 ? "#2ecc71" : (treeDelegate.isOrphanedMd ? "#3498db" : "#f1c40f")
+                        color: treeDelegate.status === 2 ? "#2ecc71"
+                             : treeDelegate.status === 4 ? "#e67e22"
+                             : (treeDelegate.isOrphanedMd ? "#3498db" : "#f1c40f")
                     }
 
                     // P6: separate small dot for an in-progress transcription
@@ -4810,6 +5110,20 @@ Rectangle {
                                 if (!treeDelegate.isDir && AppSettings.useLabelsSidebar
                                         && treeDelegate.label)
                                     return treeDelegate.label
+                                // Optimistic cross-panel rename: a file rename in
+                                // flight for this row (from EITHER panel), still
+                                // deferred behind a same-file transcription. Read
+                                // pendingRenamesRevision so this re-evaluates when
+                                // the store changes (bare invokable ⇒ no dep).
+                                // After the label branch ⇒ never disturbs a
+                                // label-shown row (a file rename doesn't change it).
+                                if (sidebar.transcriptionController
+                                        && sidebar.transcriptionController.pendingRenamesRevision >= 0) {
+                                    const stem = sidebar.transcriptionController
+                                        .pendingRenameStem("file://" + treeDelegate.path)
+                                    if (stem !== "")
+                                        return sidebar.optimisticDisplayName(treeDelegate.path, false, "", stem)
+                                }
                                 if (treeDelegate.isDir || !AppSettings.hideExtensionsSidebar)
                                     return treeDelegate.name
                                 const dot = treeDelegate.name.lastIndexOf(".")
@@ -4863,7 +5177,18 @@ Rectangle {
                             // shows it.
                             rowRenameField.text = sidebar.renamingText
                             rowRenameField.forceActiveFocus()
-                            rowRenameField.selectAll()
+                            // Select the stem only when the seed carries a file
+                            // extension (never a folder or a label), so typing
+                            // replaces the name but keeps the extension visible —
+                            // the file-manager convention. Otherwise select all.
+                            const isFileName = !treeDelegate.isDir
+                                    && !(AppSettings.useLabelsSidebar && treeDelegate.label)
+                                    && !AppSettings.hideExtensionsSidebar
+                            const dot = rowRenameField.text.lastIndexOf(".")
+                            if (isFileName && dot > 0)
+                                rowRenameField.select(0, dot)
+                            else
+                                rowRenameField.selectAll()
                         }
 
                         // Keeps the sidebar's authoritative copy live. onTextEdited

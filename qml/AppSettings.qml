@@ -50,6 +50,26 @@ Item {
     // "opt-out feature flag" shape as sidebarBlur/mainBlur above.
     property bool animationsEnabled: true
 
+    // While audio plays, the transcript auto-scrolls to keep the active
+    // sentence pinned near the top of the view (MainPanel's
+    // scrollActiveSentenceToTop). On by default — the toggle beside the play
+    // button lets a user who prefers to scroll manually turn it off. Vault-
+    // scoped like every other behavior toggle here.
+    property bool followPlaybackScroll: true
+
+    // Silence phase 2 (skip-silence during playback): while audio plays and
+    // this is on, the head auto-seeks past any STORED `silences:` span (see
+    // VadChunker::complementSpans / phase 1) whose length is >=
+    // skipSilenceThresholdSeconds — see TranscriptionController::
+    // nextSilenceSkipTarget and MainPanel.qml's player.positionChanged
+    // Connections. Off by default (a behavior change to playback shouldn't
+    // silently switch on). The threshold is a PURE UI FILTER over the
+    // already-stored raw VAD spans — changing it never re-runs VAD or any
+    // other task, only what counts as "long enough to skip" (locked Decision,
+    // queue item 084). Vault-scoped like every other behavior toggle here.
+    property bool skipSilenceEnabled: false
+    property real skipSilenceThresholdSeconds: 3
+
     // AI auto-labeling (DESIGN.md "Model management"): opt-in second pass
     // after transcription, populates label/prelude/tags via LabelingEngine.
     // Off by default — it's an extra ~2.5GB model download plus GPU time
@@ -86,6 +106,14 @@ Item {
     property bool rimEnabled: true
     property real rimWidth: 1
     property color rimColor: "#99ffffff"
+
+    // "A recording is running" signal, shown app-wide so it survives
+    // navigating away from the recorder page: the titlebar record button's
+    // icon and the window rim both take this colour while
+    // audioRecorder.recording is true. Defaults to the same soft red the
+    // in-page stop button already uses (MainPanel's recordToggleButton), so
+    // the three cues read as one state.
+    property color recordingActiveColor: "#e07a7a"
 
     // false = "forgo labels": ignore (but don't delete) any stored label
     // frontmatter and rename the actual audio+transcript files instead.
@@ -295,10 +323,14 @@ Item {
         rimEnabled: true,
         rimWidth: 1,
         rimColor: "#99ffffff",
+        recordingActiveColor: "#e07a7a",
         useLabelsMainPanel: true,
         useLabelsSidebar: true,
         hideExtensionsSidebar: false,
         hideExtensionsMainPanel: false,
+        followPlaybackScroll: true,
+        skipSilenceEnabled: false,
+        skipSilenceThresholdSeconds: 3,
         autoLabelEnabled: false,
         restrictTagsToExisting: false,
         tagReuseBias: 0.5,
@@ -435,6 +467,9 @@ Item {
         function onUseLabelsSidebarChanged() { appSettings.scheduleSave() }
         function onHideExtensionsSidebarChanged() { appSettings.scheduleSave() }
         function onHideExtensionsMainPanelChanged() { appSettings.scheduleSave() }
+        function onFollowPlaybackScrollChanged() { appSettings.scheduleSave() }
+        function onSkipSilenceEnabledChanged() { appSettings.scheduleSave() }
+        function onSkipSilenceThresholdSecondsChanged() { appSettings.scheduleSave() }
         function onAutoLabelEnabledChanged() { appSettings.scheduleSave() }
         function onRestrictTagsToExistingChanged() { appSettings.scheduleSave() }
         function onTagReuseBiasChanged() { appSettings.scheduleSave() }

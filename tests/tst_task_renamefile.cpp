@@ -9,6 +9,7 @@
 #include <QUrl>
 #include <QtTest>
 
+#include "FileRename.h"
 #include "tasks/EngineCache.h"
 #include "tasks/RenameFileTask.h"
 #include "tasks/TaskContext.h"
@@ -90,6 +91,24 @@ private slots:
         QVERIFY(!renamedSpy.constFirst().at(2).toBool()); // ok == false
         // Original untouched.
         QVERIFY(QFileInfo::exists(audio));
+    }
+
+    // A transcribe task carries the AUDIO url while a rename of that recording
+    // carries the sibling .md url, so plain url equality misses the pairing and
+    // the scheduler wouldn't defer the rename behind a running transcription.
+    // isSameRecording() pairs an audio file with its <stem>.md so
+    // serialActiveConflictsWith catches it (queue item 015).
+    void isSameRecording_pairsAudioAndSiblingMd_notUnrelatedFiles()
+    {
+        const QUrl wav = QUrl::fromLocalFile(QStringLiteral("/v/dir/foo.wav"));
+        const QUrl md  = QUrl::fromLocalFile(QStringLiteral("/v/dir/foo.md"));
+        QVERIFY(isSameRecording(wav, md));        // audio <-> its transcript
+        QVERIFY(isSameRecording(wav, wav));       // identity
+        QVERIFY(!isSameRecording(wav,
+            QUrl::fromLocalFile(QStringLiteral("/v/dir/bar.md"))));   // different stem
+        QVERIFY(!isSameRecording(wav,
+            QUrl::fromLocalFile(QStringLiteral("/v/other/foo.md")))); // different dir
+        QVERIFY(!isSameRecording(wav, QUrl()));    // empty
     }
 };
 

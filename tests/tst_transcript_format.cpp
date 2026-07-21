@@ -27,6 +27,7 @@
 
 #include <unistd.h> // geteuid() — the failed-write test needs to skip under root
 
+#include "MdFrontmatter.h"
 #include "ModelManager.h"
 #include "TranscriptionController.h"
 
@@ -148,6 +149,32 @@ private slots:
         QCOMPARE(meta.value("transcribedAt").toString(), QStringLiteral("2026-07-06T10:12:13"));
     }
 
+    // DiarizeTask records which two models produced a transcript's speakers as
+    // frontmatter labels (segmentationModel/embeddingModel); readMetadata is a
+    // generic key:value parser, so they surface unchanged for the info line to
+    // format. This pins that read/display contract on the reader side.
+    void readMetadata_parsesDiarizationModelLabels()
+    {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        const QString md = QStringLiteral(
+            "---\n"
+            "model: ggml-base.en.bin\n"
+            "speakerDetection: true\n"
+            "segmentationModel: pyannote 3.0 (default, MIT)\n"
+            "embeddingModel: WeSpeaker ResNet293-LM (default, ~115 MB)\n"
+            "---\n"
+            "\n"
+            "[00:00:00.000 - 00:00:02.000] hi\n");
+        QVERIFY(!writeFixture(dir.path(), "meeting.wav.md", md).isEmpty());
+
+        TranscriptionController controller;
+        const QVariantMap meta = controller.readMetadata(QUrl::fromLocalFile(dir.path() + "/meeting.wav"));
+        QCOMPARE(meta.value("segmentationModel").toString(), QStringLiteral("pyannote 3.0 (default, MIT)"));
+        QCOMPARE(meta.value("embeddingModel").toString(),
+                 QStringLiteral("WeSpeaker ResNet293-LM (default, ~115 MB)"));
+    }
+
     // --- existingVaultTags() + its per-file cache (perf fix: UI lag) ----------
 
     // Item 17: existingVaultTags() is the vault-wide tag vocabulary behind the
@@ -201,6 +228,73 @@ private slots:
         QVERIFY(QFile::remove(vault.path() + "/b.wav.md"));
         QCOMPARE(controller.existingVaultTags(vaultUrl),
                  (QStringList{QStringLiteral("banana"), QStringLiteral("quokka")}));
+    }
+
+    // Queue item 045: existingVaultSpeakers() is the speaker equivalent of
+    // existingVaultTags() over the `speakers:` frontmatter key — deduped,
+    // case-insensitively sorted, cache-served on the second call, and it
+    // survives in-place vault edits.
+    void existingVaultSpeakers_dedupesAndSorts_andSurvivesVaultEdits()
+    {
+        QTemporaryDir vault;
+        QVERIFY(vault.isValid());
+        QVERIFY(!writeFixture(vault.path(), "a.wav.md",
+                              QStringLiteral("---\nmodel: base\nspeakerDetection: true\n"
+                                             "speakers: Bob, Alice\n---\n\n[0] [Alice] hi\n")).isEmpty());
+        // Overlapping speaker ("Bob") — deduped across files.
+        QVERIFY(!writeFixture(vault.path(), "b.wav.md",
+                              QStringLiteral("---\nmodel: base\nspeakerDetection: true\n"
+                                             "speakers: Bob, carol\n---\n\n[0] [Bob] hi\n")).isEmpty());
+        // A file with NO speakers: key (detection was off) must contribute
+        // nothing and must not break the scan — the case tags never exercise.
+        QVERIFY(!writeFixture(vault.path(), "c.wav.md",
+                              QStringLiteral("---\nmodel: base\nspeakerDetection: false\n---\n\n[0] hi\n")).isEmpty());
+
+        TranscriptionController controller;
+        const QUrl vaultUrl = QUrl::fromLocalFile(vault.path());
+
+        const QStringList expected{QStringLiteral("Alice"), QStringLiteral("Bob"), QStringLiteral("carol")};
+        QCOMPARE(controller.existingVaultSpeakers(vaultUrl), expected); // fresh
+        QCOMPARE(controller.existingVaultSpeakers(vaultUrl), expected); // cache-served
+
+        // In-place rewrite: the cached entry for a.wav.md must be discarded.
+        QVERIFY(!writeFixture(vault.path(), "a.wav.md",
+                              QStringLiteral("---\nmodel: base\nspeakerDetection: true\n"
+                                             "speakers: Dave\n---\n\n[0] [Dave] hi\n")).isEmpty());
+        QCOMPARE(controller.existingVaultSpeakers(vaultUrl),
+                 (QStringList{QStringLiteral("Bob"), QStringLiteral("carol"), QStringLiteral("Dave")}));
+    }
+
+    // Queue item 045: the tags and speakers scans use SEPARATE per-key caches,
+    // so a vault whose files carry BOTH keys must return each key's own values
+    // regardless of the order the two scans run in — a single shared path-keyed
+    // cache would hand the second scan the first scan's answer.
+    void existingVaultTagsAndSpeakers_cachesDoNotCrossContaminate()
+    {
+        QTemporaryDir vault;
+        QVERIFY(vault.isValid());
+        QVERIFY(!writeFixture(vault.path(), "a.wav.md",
+                              QStringLiteral("---\nmodel: base\nspeakerDetection: true\n"
+                                             "tags: politics, history\nspeakers: Alice, Bob\n---\n\n"
+                                             "[0] [Alice] hi\n")).isEmpty());
+
+        const QStringList tags{QStringLiteral("history"), QStringLiteral("politics")};
+        const QStringList speakers{QStringLiteral("Alice"), QStringLiteral("Bob")};
+
+        // tags first, then speakers.
+        {
+            TranscriptionController c;
+            const QUrl v = QUrl::fromLocalFile(vault.path());
+            QCOMPARE(c.existingVaultTags(v), tags);
+            QCOMPARE(c.existingVaultSpeakers(v), speakers);
+        }
+        // speakers first, then tags — a shared cache would fail exactly here.
+        {
+            TranscriptionController c;
+            const QUrl v = QUrl::fromLocalFile(vault.path());
+            QCOMPARE(c.existingVaultSpeakers(v), speakers);
+            QCOMPARE(c.existingVaultTags(v), tags);
+        }
     }
 
     // A vault whose .md files have no tags: at all yields an empty vocabulary
@@ -686,6 +780,187 @@ private slots:
         QCOMPARE(controller.activeSentenceIndex(QVariantList(), 5.0), -1); // empty list
     }
 
+    // Chapter headings are zero-length pseudo-entries interleaved into the
+    // displaySentences list (isChapterHeading), not spoken content — the
+    // playback highlight must never land on one. activeSentenceIndex walks back
+    // over a heading to the previous REAL sentence; when only headings precede
+    // the position (a chapter opens the transcript) it returns -1 and the QML
+    // front-edge clamp lights the first real sentence instead.
+    void activeSentenceIndex_skipsChapterHeadings()
+    {
+        TranscriptionController controller;
+        auto sentence = [](double t0, const QString &text) {
+            QVariantMap s;
+            s["t0"] = t0;
+            s["text"] = text;
+            return s;
+        };
+        auto heading = [](double t0) {
+            QVariantMap s;
+            s["t0"] = t0;
+            s["text"] = QString();
+            s["isChapterHeading"] = true;
+            return s;
+        };
+
+        // Sentence A @10, a chapter heading @20, sentence B @25.
+        QVariantList list;
+        list.append(sentence(10.0, QStringLiteral("A")));
+        list.append(heading(20.0));
+        list.append(sentence(25.0, QStringLiteral("B")));
+        QCOMPARE(controller.activeSentenceIndex(list, 22.0), 0); // in the silence after the marker -> sticky on A, NOT the heading
+        QCOMPARE(controller.activeSentenceIndex(list, 25.0), 2); // on B
+        QCOMPARE(controller.activeSentenceIndex(list, 20.0), 0); // exactly on the heading t0 -> still A
+
+        // A chapter heading @0 opening the transcript, first sentence @0.5.
+        QVariantList leading;
+        leading.append(heading(0.0));
+        leading.append(sentence(0.5, QStringLiteral("first")));
+        QCOMPARE(controller.activeSentenceIndex(leading, 0.0), -1); // only a heading precedes -> -1
+        QCOMPARE(controller.activeSentenceIndex(leading, 0.4), -1);
+        QCOMPARE(controller.activeSentenceIndex(leading, 0.5), 1);  // first real sentence
+
+        // Two consecutive leading headings then a sentence -> still -1 before it.
+        QVariantList twoHeadings;
+        twoHeadings.append(heading(0.0));
+        twoHeadings.append(heading(0.1));
+        twoHeadings.append(sentence(1.0, QStringLiteral("first")));
+        QCOMPARE(controller.activeSentenceIndex(twoHeadings, 0.5), -1);
+    }
+
+    // Queue item 054: a COLLAPSED chapter's heading is the only visible line for
+    // that chapter (its body is dropped from displaySentences), so playback
+    // inside its time range must hold the highlight ON the heading rather than
+    // walking back to the previous chapter's last line.
+    void activeSentenceIndex_holdsOnCollapsedChapterHeading()
+    {
+        TranscriptionController controller;
+        auto sentence = [](double t0, const QString &text) {
+            QVariantMap s;
+            s["t0"] = t0;
+            s["text"] = text;
+            return s;
+        };
+        auto heading = [](double t0) {
+            QVariantMap s;
+            s["t0"] = t0;
+            s["isChapterHeading"] = true;
+            return s;
+        };
+        auto collapsedHeading = [](double t0) {
+            QVariantMap s;
+            s["t0"] = t0;
+            s["isChapterHeading"] = true;
+            s["collapsed"] = true;
+            return s;
+        };
+
+        // Sentence A @10, COLLAPSED heading @20 (body dropped), next entry @40.
+        QVariantList list;
+        list.append(sentence(10.0, QStringLiteral("A")));
+        list.append(collapsedHeading(20.0));
+        list.append(sentence(40.0, QStringLiteral("B")));
+        QCOMPARE(controller.activeSentenceIndex(list, 25.0), 1); // inside collapsed chapter -> on the heading
+        QCOMPARE(controller.activeSentenceIndex(list, 20.0), 1); // exactly on it
+        QCOMPARE(controller.activeSentenceIndex(list, 39.9), 1); // sticky across the whole collapsed range
+        QCOMPARE(controller.activeSentenceIndex(list, 40.0), 2); // moved on to the next entry
+
+        // A collapsed heading merely PASSED OVER (not landed in) is still
+        // skipped: A @10, collapsed C @20, EXPANDED D @30, sentence B @35. In
+        // D's lead-in silence (pos 32) walk back over D and C to A.
+        QVariantList mixed;
+        mixed.append(sentence(10.0, QStringLiteral("A")));
+        mixed.append(collapsedHeading(20.0));
+        mixed.append(heading(30.0));
+        mixed.append(sentence(35.0, QStringLiteral("B")));
+        QCOMPARE(controller.activeSentenceIndex(mixed, 32.0), 0);
+
+        // A collapsed chapter that OPENS the transcript takes the highlight
+        // from the start (contrast the leading-EXPANDED-heading -1 case above).
+        QVariantList leading;
+        leading.append(collapsedHeading(0.0));
+        leading.append(sentence(5.0, QStringLiteral("first")));
+        QCOMPARE(controller.activeSentenceIndex(leading, 0.0), 0);
+        QCOMPARE(controller.activeSentenceIndex(leading, 3.0), 0);
+
+        // Item 077: a collapsed chapter OPENS the transcript at t0 > 0 (its real
+        // marker is a hair into the file — lead-in silence — even though the
+        // gutter floors it to "0:00"). Before playback reaches that t0, the
+        // highlight must STILL rest on the collapsed heading, not fall through
+        // to the first real sentence past it.
+        QVariantList leadingGap;
+        leadingGap.append(collapsedHeading(0.5));
+        leadingGap.append(sentence(5.0, QStringLiteral("first")));
+        QCOMPARE(controller.activeSentenceIndex(leadingGap, 0.0), 0);  // 0:00, before the marker
+        QCOMPARE(controller.activeSentenceIndex(leadingGap, 0.4), 0);  // still in the lead-in
+        QCOMPARE(controller.activeSentenceIndex(leadingGap, 0.5), 0);  // exactly on the marker
+        QCOMPARE(controller.activeSentenceIndex(leadingGap, 5.0), 1);  // moved to the first real sentence
+
+        // Contrast: an EXPANDED chapter opening the transcript at t0 > 0 still
+        // yields -1 before its marker (the QML front-edge clamp then lights the
+        // first real sentence, per item 010) — proves the fix keys strictly on
+        // the `collapsed` flag, not merely on a leading heading.
+        QVariantList leadingExpandedGap;
+        leadingExpandedGap.append(heading(0.5));
+        leadingExpandedGap.append(sentence(5.0, QStringLiteral("first")));
+        QCOMPARE(controller.activeSentenceIndex(leadingExpandedGap, 0.0), -1);
+        QCOMPARE(controller.activeSentenceIndex(leadingExpandedGap, 0.4), -1);
+    }
+
+    // Silence phase 3 (queue item 085): the between-segment divider is
+    // ANOTHER zero-length pseudo-entry interleaved into displaySentences
+    // (isSilenceMarker), same treatment as a chapter heading — the
+    // sentence-level playback highlight must never land on it, and (unlike a
+    // collapsed chapter heading) there is no landed-on exception: it's pure
+    // decoration, nothing is ever hidden behind it.
+    void activeSentenceIndex_skipsSilenceMarkers()
+    {
+        TranscriptionController controller;
+        auto sentence = [](double t0, const QString &text) {
+            QVariantMap s;
+            s["t0"] = t0;
+            s["text"] = text;
+            return s;
+        };
+        auto silenceMarker = [](double t0) {
+            QVariantMap s;
+            s["t0"] = t0;
+            s["text"] = QString();
+            s["isSilenceMarker"] = true;
+            return s;
+        };
+
+        // Sentence A @10, a silence divider @20, sentence B @25.
+        QVariantList list;
+        list.append(sentence(10.0, QStringLiteral("A")));
+        list.append(silenceMarker(20.0));
+        list.append(sentence(25.0, QStringLiteral("B")));
+        QCOMPARE(controller.activeSentenceIndex(list, 22.0), 0); // in the marker's gap -> sticky on A, NOT the divider
+        QCOMPARE(controller.activeSentenceIndex(list, 25.0), 2); // on B
+        QCOMPARE(controller.activeSentenceIndex(list, 20.0), 0); // exactly on the marker's t0 -> still A
+
+        // A silence marker mixed with a chapter heading in the same walk-back:
+        // A @10, marker @15, EXPANDED heading @20, B @25 — landing between the
+        // heading and B must walk back over BOTH pseudo-kinds to A.
+        QVariantList mixed;
+        mixed.append(sentence(10.0, QStringLiteral("A")));
+        mixed.append(silenceMarker(15.0));
+        QVariantMap heading;
+        heading["t0"] = 20.0;
+        heading["isChapterHeading"] = true;
+        mixed.append(heading);
+        mixed.append(sentence(25.0, QStringLiteral("B")));
+        QCOMPARE(controller.activeSentenceIndex(mixed, 22.0), 0);
+
+        // Two consecutive leading silence markers then a sentence -> still -1
+        // before it (mirrors the leading-chapter-heading case).
+        QVariantList leading;
+        leading.append(silenceMarker(0.0));
+        leading.append(silenceMarker(0.1));
+        leading.append(sentence(1.0, QStringLiteral("first")));
+        QCOMPARE(controller.activeSentenceIndex(leading, 0.5), -1);
+    }
+
     // setLabel adds a `label:` key inside the existing frontmatter block,
     // preserving every other key AND the transcript body byte-for-byte
     // (including the blank line after the closing "---"). Setting it again
@@ -847,6 +1122,212 @@ private slots:
         QVERIFY2(!ok, "setLabel must report failure when the write cannot be committed");
         QVERIFY2(!error.isEmpty(), "a failed write must surface a non-empty error");
         QCOMPARE(readAllBytes(mdPath), kFixtureMd);
+    }
+
+    // writeFrontmatter emits `partial: true` iff asked. TranscribeTask writes
+    // it up front and clears it on completion, so a cancelled/killed run's
+    // truncated .md keeps the marker and reads back as PartialStatus.
+    void writeFrontmatter_partialFlag_emittedWhenTrue_absentWhenFalse()
+    {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        auto raw = [&](bool partial) -> QString {
+            const QString path = dir.filePath(partial ? "p.md" : "c.md");
+            QFile f(path);
+            if (!f.open(QIODevice::WriteOnly | QIODevice::Truncate))
+                return {};
+            writeFrontmatter(f, QStringLiteral("ggml-tiny.en.bin"), /*speakerDetection=*/false,
+                             /*modelFallback=*/false, QStringLiteral("tiny.en"), /*speakerLabels=*/{},
+                             /*speakerDetectionError=*/QString(), /*vad=*/true, /*vadError=*/QString(),
+                             partial);
+            f.close();
+            QFile r(path);
+            if (!r.open(QIODevice::ReadOnly | QIODevice::Text))
+                return {};
+            return QString::fromUtf8(r.readAll());
+        };
+        const QString withPartial = raw(true);
+        const QString withoutPartial = raw(false);
+        QVERIFY(!withPartial.isEmpty());
+        QVERIFY(!withoutPartial.isEmpty());
+        QVERIFY(withPartial.contains(QStringLiteral("partial: true")));
+        QVERIFY(!withoutPartial.contains(QStringLiteral("partial")));
+    }
+
+    // Silence-capture feature, phase 1: writeFrontmatter()'s new `silences`
+    // param round-trips through readMetadata() with the SAME generic
+    // key:value parsing every other frontmatter field already uses (see
+    // readMetadata_parsesVadKeys() above) — no special-casing needed. Also
+    // asserts the compact "start-end, start-end" shape formatSilencesValue()
+    // produces (same trimmed-timestamp style formatTimestamp() uses for
+    // segment lines).
+    void writeFrontmatter_silences_roundTripsCompactFormat()
+    {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        const QString mdPath = dir.filePath("silent.wav.md");
+        QFile f(mdPath);
+        QVERIFY(f.open(QIODevice::WriteOnly | QIODevice::Truncate));
+        const std::vector<std::pair<double, double>> silences{{12.4, 18.9}, {45.0, 52.3}};
+        writeFrontmatter(f, QStringLiteral("ggml-base.en.bin"), /*speakerDetection=*/false,
+                         /*modelFallback=*/false, QString(), /*speakerLabels=*/{},
+                         /*speakerDetectionError=*/QString(), /*vad=*/true, /*vadError=*/QString(),
+                         /*partial=*/false, silences);
+        f.close();
+        QFile audio(dir.filePath("silent.wav"));
+        QVERIFY(audio.open(QIODevice::WriteOnly));
+        audio.close();
+
+        TranscriptionController controller;
+        const QVariantMap meta = controller.readMetadata(QUrl::fromLocalFile(dir.filePath("silent.wav")));
+        QCOMPARE(meta.value(QStringLiteral("silences")).toString(), QStringLiteral("12.4-18.9, 45-52.3"));
+    }
+
+    // nullopt (VAD hasn't run/answered yet) must OMIT the "silences:" key
+    // entirely; a present-but-empty vector (VAD ran and genuinely found no
+    // silence) must still WRITE the key with an empty value — the two are
+    // semantically distinct ("not yet known" vs "checked, none found") and
+    // must stay visibly distinct on disk, not both collapse to "key absent"
+    // (see writeFrontmatter()'s doc comment in TranscriptionController.h).
+    void writeFrontmatter_silences_nulloptOmitsKey_emptyVectorWritesPresentKey()
+    {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        auto raw = [&](const std::optional<std::vector<std::pair<double, double>>> &silences,
+                      const QString &name) -> QString {
+            const QString path = dir.filePath(name);
+            QFile f(path);
+            if (!f.open(QIODevice::WriteOnly | QIODevice::Truncate))
+                return {};
+            writeFrontmatter(f, QStringLiteral("ggml-base.en.bin"), /*speakerDetection=*/false,
+                             /*modelFallback=*/false, QString(), /*speakerLabels=*/{},
+                             /*speakerDetectionError=*/QString(), /*vad=*/true, /*vadError=*/QString(),
+                             /*partial=*/false, silences);
+            f.close();
+            return readAllBytes(path);
+        };
+        const QString omitted = raw(std::nullopt, QStringLiteral("a.md"));
+        const QString present = raw(std::vector<std::pair<double, double>>{}, QStringLiteral("b.md"));
+        QVERIFY(!omitted.isEmpty());
+        QVERIFY(!present.isEmpty());
+        QVERIFY2(!omitted.contains(QStringLiteral("silences")), "nullopt must omit the silences: key entirely");
+        QVERIFY2(present.contains(QStringLiteral("silences: \n")),
+                 "a present-but-empty silence list must still write an (empty-valued) silences: key");
+    }
+
+    // The upsertKey() contract (CLAUDE.md; also what DetectSilenceTask's
+    // in-place backfill relies on): adding "silences:" to an ALREADY-WRITTEN
+    // .md must leave every OTHER frontmatter key and the entire body
+    // byte-for-byte untouched — same guarantee applyDiarizationModelFrontmatter()
+    // (tst_task_diarize.cpp) already relies on for its two keys.
+    void silencesUpsert_preservesUnrelatedFrontmatterAndBody_byteForByte()
+    {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        const QString original = QStringLiteral("---\n"
+                                                  "model: ggml-base.en.bin\n"
+                                                  "speakerDetection: true\n"
+                                                  "speakers: Speaker 1, Speaker 2\n"
+                                                  "label: Weekly sync\n"
+                                                  "tags: meetings, engineering\n"
+                                                  "vad: true\n"
+                                                  "transcribedAt: 2026-07-06T10:12:13\n"
+                                                  "---\n\n"
+                                                  "## [0] Opening\n"
+                                                  "[0] [Speaker 1] hi\n"
+                                                  "[3.5] [Speaker 2] hello\n");
+        const QString path = writeFixture(dir.path(), "meeting.wav.md", original);
+        QVERIFY(!path.isEmpty());
+
+        QStringList lines;
+        QString body;
+        QString error;
+        QVERIFY(MdFrontmatter::read(path, &lines, &body, &error));
+        const std::vector<std::pair<double, double>> silences{{20.0, 25.5}};
+        MdFrontmatter::upsertKey(&lines, QStringLiteral("silences"), formatSilencesValue(silences));
+        QString writeError;
+        QVERIFY(writeFrontmatterBlock(path, lines, body, &writeError));
+
+        const QString rewritten = readAllBytes(path);
+        QVERIFY2(rewritten.contains(QStringLiteral("silences: 20-25.5")), qPrintable(rewritten));
+        // Every original line still present verbatim — only the new key was
+        // added, nothing else moved or changed.
+        for (const QString &originalLine : original.split(QLatin1Char('\n'))) {
+            if (originalLine.isEmpty())
+                continue;
+            QVERIFY2(rewritten.contains(originalLine), qPrintable(originalLine));
+        }
+        // Body (segments/chapters/speaker tags) byte-for-byte unchanged.
+        QStringList newLines;
+        QString newBody;
+        QVERIFY(MdFrontmatter::read(path, &newLines, &newBody, &error));
+        QCOMPARE(newBody, body);
+    }
+
+    // Silence phase 2 (queue item 084): parseSilences() is formatSilencesValue()'s
+    // inverse, turning the compact "start-end, start-end" frontmatter value
+    // back into the {t0, t1} map list nextSilenceSkipTarget() below consumes.
+    void parseSilences_roundTripsCompactFormatAndHandlesEmpty()
+    {
+        TranscriptionController controller;
+
+        const QVariantList spans = controller.parseSilences(QStringLiteral("12.4-18.9, 45-52.3"));
+        QCOMPARE(spans.size(), 2);
+        QCOMPARE(spans.at(0).toMap().value(QStringLiteral("t0")).toDouble(), 12.4);
+        QCOMPARE(spans.at(0).toMap().value(QStringLiteral("t1")).toDouble(), 18.9);
+        QCOMPARE(spans.at(1).toMap().value(QStringLiteral("t0")).toDouble(), 45.0);
+        QCOMPARE(spans.at(1).toMap().value(QStringLiteral("t1")).toDouble(), 52.3);
+
+        // "VAD hasn't run" (missing key) and "VAD ran, found nothing" (present
+        // but empty value) both round-trip to an empty list — never a crash or
+        // a bogus single span.
+        QVERIFY(controller.parseSilences(QString()).isEmpty());
+        QVERIFY(controller.parseSilences(QStringLiteral("   ")).isEmpty());
+    }
+
+    // Silence phase 2 (queue item 084): nextSilenceSkipTarget() is a PURE
+    // lookup over already-parsed spans — this is what makes the threshold a
+    // UI filter rather than a re-analysis trigger. Covers every case the
+    // work order calls out: a gap below threshold is NOT skipped; a position
+    // inside a >=threshold span returns its end; a position outside any span
+    // returns the -1 sentinel; and changing ONLY the threshold (same spans,
+    // same position) flips the outcome with nothing re-derived.
+    void nextSilenceSkipTarget_thresholdIsAPureFilterOverStoredSpans()
+    {
+        TranscriptionController controller;
+        QVariantList silences;
+        auto addSpan = [&](double t0, double t1) {
+            QVariantMap s;
+            s["t0"] = t0;
+            s["t1"] = t1;
+            silences.append(s);
+        };
+        addSpan(10.0, 11.5);  // 1.5s gap: below the default 3s threshold
+        addSpan(20.0, 25.0);  // 5s gap: at/above threshold
+
+        // Below-threshold gap is never skipped, regardless of where inside it
+        // the head lands.
+        QCOMPARE(controller.nextSilenceSkipTarget(silences, 10.0, 3.0), -1.0);
+        QCOMPARE(controller.nextSilenceSkipTarget(silences, 11.0, 3.0), -1.0);
+
+        // Head inside the >=threshold span returns that span's END, not its
+        // own position or the span's start.
+        QCOMPARE(controller.nextSilenceSkipTarget(silences, 20.0, 3.0), 25.0);
+        QCOMPARE(controller.nextSilenceSkipTarget(silences, 22.5, 3.0), 25.0);
+        // Landing exactly ON the end must not report itself again (no
+        // infinite-skip loop when spans are adjacent).
+        QCOMPARE(controller.nextSilenceSkipTarget(silences, 25.0, 3.0), -1.0);
+
+        // Head outside every span (mid-speech) -> sentinel.
+        QCOMPARE(controller.nextSilenceSkipTarget(silences, 15.0, 3.0), -1.0);
+        QCOMPARE(controller.nextSilenceSkipTarget(silences, 1000.0, 3.0), -1.0);
+        QCOMPARE(controller.nextSilenceSkipTarget(QVariantList(), 20.0, 3.0), -1.0);
+
+        // Threshold change ALONE flips the outcome for the very same spans and
+        // position — no spans were re-derived, only the filter moved: this is
+        // the phase-1/phase-2 contract (store raw, filter at render).
+        QCOMPARE(controller.nextSilenceSkipTarget(silences, 10.0, 1.0), 11.5);   // now above a 1s threshold
+        QCOMPARE(controller.nextSilenceSkipTarget(silences, 20.0, 10.0), -1.0);  // now below a 10s threshold
     }
 
     // Feature 2: setPrelude() on a body with no existing "<!-- prelude
@@ -1898,6 +2379,51 @@ private slots:
                      qPrintable(QStringLiteral("tag \"%1\" wasn't in the vault-scanned vocabulary "
                                                 "(from other/unrelated.md's tags: politics, history, cooking)")
                                     .arg(trimmed)));
+        }
+    }
+
+    // Queue item 027: a benchmark / diarization-sweep that fails in run()
+    // (here: a non-decodable file → BenchmarkTask/DiarizationSweepTask throw
+    // before emitting their run-finished summary) MUST route the failure to
+    // benchmarkFailed, so the Benchmark page leaves its "Running…" state and
+    // shows the reason. The controller's onTaskFinished used to emit nothing
+    // on this path (benchmarkFailed had zero emit sites since the task-system
+    // refactor), pinning the page on "Running…" forever. Failure must go to
+    // benchmarkFailed, NOT benchmarkFinished.
+    void benchmarkFailure_emitsBenchmarkFailedNotFinished()
+    {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        // A text file with a .wav name: ffmpeg cannot decode it, so both tasks
+        // throw at their decode step before touching any model/combo.
+        const QString bogusPath = dir.path() + "/not-audio.wav";
+        {
+            QFile f(bogusPath);
+            QVERIFY(f.open(QIODevice::WriteOnly));
+            f.write("this is not audio");
+        }
+        const QUrl bogusUrl = QUrl::fromLocalFile(bogusPath);
+
+        {
+            TranscriptionController controller;
+            QSignalSpy failedSpy(&controller, &TranscriptionController::benchmarkFailed);
+            QSignalSpy finishedSpy(&controller, &TranscriptionController::benchmarkFinished);
+            controller.runBenchmark(bogusUrl, QStringList{QStringLiteral("base.en")});
+            QVERIFY2(failedSpy.wait(30000), "benchmark failure must emit benchmarkFailed");
+            QCOMPARE(failedSpy.count(), 1);
+            QVERIFY2(!failedSpy.at(0).at(0).toString().isEmpty(),
+                     "benchmarkFailed must carry a non-empty reason for the page to show");
+            QCOMPARE(finishedSpy.count(), 0);
+        }
+
+        {
+            TranscriptionController controller;
+            QSignalSpy failedSpy(&controller, &TranscriptionController::benchmarkFailed);
+            QSignalSpy finishedSpy(&controller, &TranscriptionController::diarizationBenchmarkFinished);
+            controller.runDiarizationBenchmark(bogusUrl, QVariantList{});
+            QVERIFY2(failedSpy.wait(30000), "diarization-sweep failure must emit benchmarkFailed");
+            QCOMPARE(failedSpy.count(), 1);
+            QCOMPARE(finishedSpy.count(), 0);
         }
     }
 };

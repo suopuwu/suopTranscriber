@@ -14,11 +14,13 @@ set(SUOP_CORE_DIR ${CMAKE_SOURCE_DIR}/src/core)
 set(SUOP_TASK_SOURCES
     tasks/Task.cpp tasks/TaskContext.cpp tasks/EngineCache.cpp tasks/TaskRunner.cpp tasks/TaskFactory.cpp
     tasks/DownloadTask.cpp tasks/TranscribeTask.cpp tasks/RelabelTask.cpp tasks/ChaptersTask.cpp
-    tasks/DiarizeTask.cpp tasks/RenameSpeakerTask.cpp tasks/MergeSpeakersTask.cpp tasks/CombineTask.cpp
+    tasks/DiarizeTask.cpp tasks/DetectSilenceTask.cpp tasks/RenameSpeakerTask.cpp tasks/MergeSpeakersTask.cpp tasks/CombineTask.cpp
+    tasks/UncombineTask.cpp
     tasks/ImportTask.cpp tasks/UsbGrabTask.cpp tasks/BenchmarkTask.cpp tasks/DiarizationSweepTask.cpp
     tasks/RenameFileTask.cpp tasks/MoveTask.cpp tasks/ModelIoTask.cpp
     tasks/TrashTask.cpp tasks/DeleteTask.cpp tasks/RestoreTask.cpp
-    tasks/FolderRenameTask.cpp tasks/FolderMoveTask.cpp FileRename.cpp VaultFileOps.cpp)
+    tasks/FolderRenameTask.cpp tasks/FolderMoveTask.cpp FileRename.cpp VaultFileOps.cpp
+    TranscribePipeline.cpp)
 
 # Each test compiles the core sources it needs directly — no core static lib,
 # so the app target stays untouched. QML_ELEMENT headers compile outside the
@@ -140,11 +142,19 @@ suop_add_test(tst_bottombar_pathsegments LINK_QUICK LINK_SVG ICON_ASSETS SOURCES
 # because the assertion is what actually lands on the clipboard; hence LINK_GUI.
 # See its top-of-file comment.
 suop_add_test(tst_mainpanel_chapterselection LINK_QUICK LINK_SVG ICON_ASSETS LINK_GUI SOURCES IconTheme.cpp Clipboard.cpp)
+suop_add_test(tst_mainpanel_guttertimestamp LINK_QUICK LINK_SVG ICON_ASSETS LINK_GUI SOURCES IconTheme.cpp Clipboard.cpp)
 suop_add_test(tst_scratch_headingrepro LINK_QUICK LINK_SVG ICON_ASSETS LINK_GUI SOURCES IconTheme.cpp Clipboard.cpp)
 # Loads the real BenchmarkPage.qml inside a modal Popup -> ScrollView (its
 # SettingsPopup nesting) and proves the benchmark file follows the left panel's
 # currentFilePath (the in-page file-picker ComboBox was removed).
 suop_add_test(tst_benchmarkpage_filesync LINK_QUICK SOURCES VaultTreeModel.cpp VaultSearchProxyModel.cpp FileRename.cpp VaultFileOps.cpp)
+# Source-scan guard for the Benchmark page's LIVE transcript streaming (item
+# 066): the running card is created as a `running: true` placeholder on start,
+# grown by onBenchmarkModelProgressText as segments stream in, and finalized in
+# place on done (not append-at-done). No QQuickView can drive the Connections
+# handlers here (their controller is null in the filesync harness), so this
+# scans qml/BenchmarkPage.qml per the tst_styleguide fallback pattern.
+suop_add_test(tst_benchmarkpage_livestream)
 # Loads the real MainPanel.qml in a QQuickView AND wires a REAL
 # TranscriptionController into it — the assertion is what the panel reads back
 # off disk for the file that's actually open, so a stubbed readChapters() would
@@ -183,6 +193,28 @@ suop_add_test(tst_mainpanel_livescroll LINK_QUICK LINK_SVG ICON_ASSETS LINK_GUI
 suop_add_test(tst_mainpanel_deleteundo LINK_QUICK LINK_SVG ICON_ASSETS LINK_GUI
     LINK_WHISPER LINK_LLAMA LINK_SHERPA_ONNX
     SOURCES IconTheme.cpp Clipboard.cpp VaultTreeModel.cpp TranscriptionController.cpp
+            WhisperCppEngine.cpp VadChunker.cpp ModelManager.cpp AudioDecoder.cpp
+            LabelingEngine.cpp DiarizationEngine.cpp
+            EngineManifest.cpp GpuProbe.cpp SubprocessEngine.cpp EngineRegistry.cpp ParakeetEngine.cpp
+            UsbGrabJob.cpp UsbRuleStore.cpp
+            ${SUOP_TASK_SOURCES})
+suop_add_test(tst_mainpanel_renameundo LINK_QUICK LINK_SVG ICON_ASSETS LINK_GUI
+    LINK_WHISPER LINK_LLAMA LINK_SHERPA_ONNX
+    SOURCES IconTheme.cpp Clipboard.cpp VaultTreeModel.cpp TranscriptionController.cpp
+            WhisperCppEngine.cpp VadChunker.cpp ModelManager.cpp AudioDecoder.cpp
+            LabelingEngine.cpp DiarizationEngine.cpp
+            EngineManifest.cpp GpuProbe.cpp SubprocessEngine.cpp EngineRegistry.cpp ParakeetEngine.cpp
+            UsbGrabJob.cpp UsbRuleStore.cpp
+            ${SUOP_TASK_SOURCES})
+suop_add_test(tst_mainpanel_exittoplevel LINK_QUICK LINK_SVG ICON_ASSETS LINK_GUI SOURCES IconTheme.cpp Clipboard.cpp)
+# Queue item 072: loads the REAL MainPanel.qml and installs the PRODUCTION
+# FocusBlurFilter on qApp to prove the app-wide "click outside blurs the focused
+# field" survives a press swallowed by the transcript ScrollView — the exact gap
+# a source scan can't see. Same real-controller dep set as the other MainPanel
+# harnesses, plus FocusBlurFilter.cpp (the thing under test).
+suop_add_test(tst_focusblurfilter LINK_QUICK LINK_SVG ICON_ASSETS LINK_GUI
+    LINK_WHISPER LINK_LLAMA LINK_SHERPA_ONNX
+    SOURCES IconTheme.cpp Clipboard.cpp FocusBlurFilter.cpp VaultTreeModel.cpp TranscriptionController.cpp
             WhisperCppEngine.cpp VadChunker.cpp ModelManager.cpp AudioDecoder.cpp
             LabelingEngine.cpp DiarizationEngine.cpp
             EngineManifest.cpp GpuProbe.cpp SubprocessEngine.cpp EngineRegistry.cpp ParakeetEngine.cpp
@@ -296,6 +328,15 @@ suop_add_test(tst_task_diarize LINK_WHISPER LINK_LLAMA LINK_SHERPA_ONNX
             LabelingEngine.cpp DiarizationEngine.cpp EngineManifest.cpp GpuProbe.cpp SubprocessEngine.cpp
             EngineRegistry.cpp ParakeetEngine.cpp UsbGrabJob.cpp UsbRuleStore.cpp VaultTreeModel.cpp
             ${SUOP_TASK_SOURCES})
+# DetectSilenceTask calls the shared transcript-format helpers
+# (sidecarPath/parsedSegmentsFromTranscriptBody/parseSpeakersList/
+# formatSilencesValue) TranscriptionController.h exposes — same full
+# dependency set as tst_task_diarize.
+suop_add_test(tst_task_silence LINK_WHISPER LINK_LLAMA LINK_SHERPA_ONNX
+    SOURCES TranscriptionController.cpp WhisperCppEngine.cpp VadChunker.cpp ModelManager.cpp AudioDecoder.cpp
+            LabelingEngine.cpp DiarizationEngine.cpp EngineManifest.cpp GpuProbe.cpp SubprocessEngine.cpp
+            EngineRegistry.cpp ParakeetEngine.cpp UsbGrabJob.cpp UsbRuleStore.cpp VaultTreeModel.cpp
+            ${SUOP_TASK_SOURCES})
 suop_add_test(tst_task_transcribe LINK_WHISPER LINK_LLAMA LINK_SHERPA_ONNX
     SOURCES TranscriptionController.cpp WhisperCppEngine.cpp VadChunker.cpp ModelManager.cpp AudioDecoder.cpp
             LabelingEngine.cpp DiarizationEngine.cpp EngineManifest.cpp GpuProbe.cpp SubprocessEngine.cpp
@@ -309,6 +350,8 @@ suop_add_test(tst_task_benchmark LINK_WHISPER LINK_LLAMA LINK_SHERPA_ONNX
 suop_add_test(tst_subprocessengine SOURCES SubprocessEngine.cpp EngineManifest.cpp)
 suop_add_test(tst_engineregistry SOURCES EngineRegistry.cpp EngineManifest.cpp GpuProbe.cpp)
 suop_add_test(tst_vadchunking LINK_WHISPER SOURCES VadChunker.cpp)
+suop_add_test(tst_transcribe_pipeline LINK_WHISPER
+    SOURCES TranscribePipeline.cpp VadChunker.cpp ModelManager.cpp WhisperCppEngine.cpp)
 suop_add_test(tst_audiodecoder SOURCES AudioDecoder.cpp)
 suop_add_test(tst_audiorecorder LINK_MULTIMEDIA SOURCES AudioRecorder.cpp)
 suop_add_test(tst_labelingengine LINK_LLAMA SOURCES LabelingEngine.cpp)
@@ -331,6 +374,11 @@ suop_add_test(tst_snackbar LINK_QUICK LINK_SVG ICON_ASSETS SOURCES IconTheme.cpp
 # from this module and needs no C++ types), so it links Quick but compiles no
 # core sources.
 suop_add_test(tst_middledragscroll LINK_QUICK)
+# TextRedoShortcut.qml's harness: a QQuickView driver with a real
+# TextField/TextArea, so the Ctrl+Y redo chord is proven against actual Qt
+# text-editing behavior. No app C++ and no icons — the component imports
+# nothing from the module.
+suop_add_test(tst_textredoshortcut LINK_QUICK)
 # TitleBar.qml's own harness: loads the real TitleBar (frameless-mode custom
 # titlebar), so like the sidebar harnesses below it needs IconTheme (its
 # singleton + image provider) and the icon-pack resources for AppIcon.
@@ -341,10 +389,13 @@ suop_add_test(tst_titlebar_buttons LINK_QUICK LINK_SVG ICON_ASSETS SOURCES IconT
 # "IconTheme is not defined" at load.
 suop_add_test(tst_sidebar_keynav LINK_QUICK LINK_SVG ICON_ASSETS SOURCES VaultTreeModel.cpp VaultSearchProxyModel.cpp IconTheme.cpp FileRename.cpp VaultFileOps.cpp)
 suop_add_test(tst_sidebar_dragmove LINK_QUICK LINK_SVG ICON_ASSETS SOURCES VaultTreeModel.cpp VaultSearchProxyModel.cpp IconTheme.cpp FileRename.cpp VaultFileOps.cpp)
+suop_add_test(tst_sidebar_searchscroll LINK_QUICK LINK_SVG ICON_ASSETS SOURCES VaultTreeModel.cpp VaultSearchProxyModel.cpp IconTheme.cpp FileRename.cpp VaultFileOps.cpp)
 suop_add_test(tst_sidebar_rename LINK_QUICK LINK_SVG ICON_ASSETS SOURCES VaultTreeModel.cpp VaultSearchProxyModel.cpp IconTheme.cpp FileRename.cpp VaultFileOps.cpp)
 suop_add_test(tst_sidebar_expand LINK_QUICK LINK_SVG ICON_ASSETS SOURCES VaultTreeModel.cpp VaultSearchProxyModel.cpp IconTheme.cpp FileRename.cpp VaultFileOps.cpp)
+suop_add_test(tst_sidebar_scroll LINK_QUICK LINK_SVG ICON_ASSETS SOURCES VaultTreeModel.cpp VaultSearchProxyModel.cpp IconTheme.cpp FileRename.cpp VaultFileOps.cpp)
 suop_add_test(tst_sidebar_guides LINK_QUICK LINK_SVG ICON_ASSETS SOURCES VaultTreeModel.cpp VaultSearchProxyModel.cpp IconTheme.cpp FileRename.cpp VaultFileOps.cpp)
 suop_add_test(tst_sidebar_selectall LINK_QUICK LINK_SVG ICON_ASSETS SOURCES VaultTreeModel.cpp VaultSearchProxyModel.cpp IconTheme.cpp FileRename.cpp VaultFileOps.cpp)
+suop_add_test(tst_sidebar_filtersuggestions LINK_QUICK LINK_SVG ICON_ASSETS SOURCES VaultTreeModel.cpp VaultSearchProxyModel.cpp IconTheme.cpp FileRename.cpp VaultFileOps.cpp)
 # The ONLY sidebar harness that renders inside a real ApplicationWindow (hence a
 # real Overlay + SnackbarHost), which is what the context menu's modal dimming
 # needs — the QQuickView harnesses above structurally cannot show it. See its

@@ -21,6 +21,7 @@
 #include <functional>
 #include <memory>
 #include <optional>
+#include <utility>
 #include <vector>
 
 #include "EngineRegistry.h" // EngineDescriptor — discoverEngines()/resolveEngine() return it
@@ -218,9 +219,28 @@ extern const QString kPreludeEndMarker;
 // happens, so a killed/stopped run still leaves a file recording what it was
 // run with. See the definition site for the full field-by-field contract
 // (modelFallback/requestedModelId, speakers: allowlist, vad/vadError).
+//
+// silences (silence-capture feature, phase 1): std::nullopt means "not yet
+// known" (VAD didn't run — TranscribeTask fills the real value in with a
+// transcript-gap fallback once the transcript exists, see its doc comment)
+// and OMITS the "silences:" key entirely; a present-but-empty vector means
+// "checked, genuinely no silence found" and WRITES the key with an empty
+// value — the key is present for every transcription that got a real answer
+// one way or another, distinct from "never checked".
 void writeFrontmatter(QFile &mdFile, const QString &modelUsed, bool speakerDetection, bool modelFallback,
                       const QString &requestedModelId, const QStringList &speakerLabels,
-                      const QString &speakerDetectionError, bool vad, const QString &vadError);
+                      const QString &speakerDetectionError, bool vad, const QString &vadError, bool partial,
+                      const std::optional<std::vector<std::pair<double, double>>> &silences = std::nullopt);
+
+// Formats a list of (start, end) SILENCE spans (VadChunker::complementSpans()'
+// output) into the compact "12.4-18.9, 45-52.3" frontmatter value — the same
+// trimmed-timestamp style formatTimestamp() already uses for segment lines.
+// Shared by writeFrontmatter()'s initial write and DetectSilenceTask's
+// in-place MdFrontmatter::upsertKey() call, so every writer produces
+// byte-for-byte the same shape. Empty input yields an empty string (see
+// writeFrontmatter()'s doc comment for how "empty because none found" is
+// distinguished from "not yet known").
+QString formatSilencesValue(const std::vector<std::pair<double, double>> &silences);
 
 // Splices a LabelingEngine result's label/tags/prelude fields into an
 // already-transcribed .md in place. Used by both the manual "regenerate
@@ -322,6 +342,14 @@ std::optional<EngineDescriptor> resolveEngine(const QString &engineId, const QSt
 class TranscriptionController : public QObject {
     Q_OBJECT
     QML_ELEMENT
+    // Test-only seam: the queue's cancel/pause state machine can only be
+    // exercised against a task that is Active AND pausable && !cancellableMidRun
+    // (diarization's shape — the cancel-while-paused "phantom resume" class of
+    // bug). There is no public enqueue for an arbitrary Task, and the only such
+    // real kind (DiarizeTask) needs heavy diarization models, so the queue test
+    // injects a throwaway fake Task via enqueueTask(). Grants nothing to
+    // production code.
+    friend class TstTranscriptionQueue;
     Q_PROPERTY(bool busy READ isBusy NOTIFY busyChanged)
     Q_PROPERTY(double progress READ progress NOTIFY progressChanged)
     // Item 6 (user correction, 2026-07-08): the PROGRESS BAR fill should
@@ -384,6 +412,14 @@ class TranscriptionController : public QObject {
     // through, and the overlay label had to key off currentPhase to work
     // around it. A dedicated signal makes the property honest mid-pipeline.
     Q_PROPERTY(QString currentJobKind READ currentJobKind NOTIFY currentJobKindChanged)
+    // Whether the Active task occupies its file for per-file gating (Task::
+    // occupiesFile()) — false when idle or when the Active task is a comparison-
+    // only benchmark/sweep. The MainPanel per-file action buttons AND their
+    // to-a-benchmark of the open file: `busy && currentFile == open` is true for
+    // an Active benchmark too, so they additionally check this to stay enabled.
+    // Same NOTIFY as currentJobKind — both change exactly when the Active task
+    // does (startTask/onTaskFinished).
+    Q_PROPERTY(bool activeOccupiesFile READ activeOccupiesFile NOTIFY currentJobKindChanged)
     // The Active task's human category label (Task::kindLabel(), e.g. "Move to
     // trash") — what the bottom bar shows before the filename. Parallel to
     // currentJobKind (the slug); same NOTIFY. Lets the bottom bar read the label
@@ -423,6 +459,7 @@ class TranscriptionController : public QObject {
     // update tick re-reads+re-parses the whole file and rebuilds the whole
     // transcript view — tying it to progress was clogging the GUI thread.
     Q_PROPERTY(int liveUpdateTick READ liveUpdateTick NOTIFY liveUpdateTickChanged)
+    Q_PROPERTY(int pendingRenamesRevision READ pendingRenamesRevision NOTIFY pendingRenamesRevisionChanged)
     // Wave N (task system): true while the Active job is paused. Only
     // "transcribe" and "download" jobs are truly pausable (see pauseActive()'s
     // doc comment) — false at all other times, including whenever nothing is
@@ -506,7 +543,13 @@ public:
     ~TranscriptionController() override;
 
     bool isBusy() const { return m_busy; }
-    double progress() const { return m_progress; }
+    // The CURRENT phase's own 0..1 fraction: the real callback value for phases
+    // that report one (detecting-speakers/transcribing), or an
+    // elapsed-vs-average synthetic sweep for the no-callback phases
+    // (loading/decoding/detecting-speech), so the bottom bar's per-phase
+    // percentage counts up instead of sitting at 0% until the phase flips (see
+    // phaseRelativeSyntheticProgress()).
+    double progress() const { return phaseRelativeSyntheticProgress(); }
     // See the overallProgress Q_PROPERTY doc comment above.
     double overallProgress() const { return m_overallProgress; }
     // True iff a task is Active AND it declares Presentation::Foreground —
@@ -515,6 +558,11 @@ public:
     // row + the glow via isBusy(). See the activeIsForeground Q_PROPERTY doc
     // comment above.
     bool activeIsForeground() const { return m_activeIsForeground; }
+    bool activeOccupiesFile() const
+    {
+        return m_activeIndex >= 0 && m_activeIndex < static_cast<int>(m_tasks.size())
+            && m_tasks[m_activeIndex]->occupiesFile();
+    }
     bool activeCanPause() const;
     QString currentPhase() const { return m_phase; }
     // Human-readable label for a phase slug ("loading" -> "loading model…"),
@@ -541,7 +589,7 @@ public:
     // See the activePaused Q_PROPERTY doc comment above.
     bool isActivePaused() const { return m_activePaused; }
     // See the activeStopping Q_PROPERTY doc comment above.
-    bool isActiveStopping() const { return m_pausingActiveAsRestart; }
+    bool isActiveStopping() const { return m_pausingActiveAsRestart || m_activeCancelling; }
     // See the activeBackendName Q_PROPERTY doc comment above.
     QString activeBackendName() const { return m_activeBackendName; }
     // See the activeBackendKind Q_PROPERTY doc comment above.
@@ -684,7 +732,10 @@ public:
     // happens on the worker (e.g. source vanished mid-copy, disk full)
     // surfaces as a Failed job, mirroring every other kind. Dedup follows the
     // same Queued/Active rule as transcribe() (keyed on destUrl).
-    Q_INVOKABLE void importAudio(const QUrl &sourceUrl, const QUrl &destUrl, const QUrl &vaultUrl);
+    // `overwrite` (default false) threads through to ImportTask: true lifts
+    // its collision guard so the copy replaces the existing destination file's
+    // bytes (audio only — see ImportTask.h's doc comment on the sibling .md).
+    Q_INVOKABLE void importAudio(const QUrl &sourceUrl, const QUrl &destUrl, const QUrl &vaultUrl, bool overwrite = false);
 
     // One USB grab — the recursive scan+copy of ONE mounted volume under ONE
     // resolved rule — as a tracked, queued task. Returns the new job's id so
@@ -749,6 +800,19 @@ public:
     Q_INVOKABLE void diarizeFilesForPaths(const QVariantList &fileUrls, const QUrl &vaultUrl,
                                           const QString &segmentationModelId = QString(),
                                           const QString &embeddingModelId = QString(), double sensitivity = 0.5);
+
+    // Silence phase 1 (backfill): standalone "detect silences" on an
+    // ALREADY-transcribed file — reruns VAD (or its transcript-gap fallback,
+    // same rule TranscribeTask's inline capture uses) and upserts the
+    // "silences:" frontmatter key WITHOUT touching segments/speakers/
+    // chapters/label. For files transcribed before this feature landed, or
+    // whose transcribe-time VAD pass failed/was unavailable (a subprocess
+    // engine). Mirrors diarizeFile(): same dedup rule (Queued/Active entry on
+    // fileUrl blocks a duplicate), queued as a DetectSilenceTask (Serial
+    // lane — see its class doc comment), reports via the generic finished()
+    // signal like every other Serial-lane kind (no dedicated result signal
+    // needed, same as DiarizeTask).
+    Q_INVOKABLE void detectSilences(const QUrl &fileUrl, const QUrl &vaultUrl);
 
     // True if fileUrl currently has a Queued or Active entry.
     Q_INVOKABLE bool isQueued(const QUrl &fileUrl) const;
@@ -891,7 +955,11 @@ public:
     // speakerDetectionError (why) — MainPanel surfaces this as a warning.
     // Parses every "key: value" frontmatter line generically (not just a
     // fixed allowlist) — any key LabelingEngine or a future writer adds
-    // (e.g. "tags") is automatically present here with no extra code.
+    // (e.g. "tags") is automatically present here with no extra code. This is
+    // how the silence-capture feature's "silences:" key round-trips too (see
+    // writeFrontmatter()'s doc comment) — no special-casing needed here,
+    // mirroring vad/vadError exactly (see tst_transcript_format.cpp's
+    // readMetadata_parsesVadKeys()).
     // Note: the prelude (Feature 2) lives in the BODY, not frontmatter (it
     // needs real newlines) — use readPrelude() for that, not this map.
     // Item O19: cached (see m_frontmatterCache) behind a cheap
@@ -1084,7 +1152,7 @@ public:
 
     // Item P15: sets/replaces the `tags:` frontmatter key, same reopen/
     // rewrite shape as setLabel() above. tags is joined with ", " to match
-    // the exact comma-separated format collectVaultTags()/readMetadata()
+    // the exact comma-separated format collectVaultFrontmatterList()/readMetadata()
     // already parse (auto-label writes this same shape via
     // writeLabelingFields()'s spliceOrAppend) — individual tags must not
     // themselves contain commas.
@@ -1189,6 +1257,16 @@ public:
     // calls (that method stays for direct callers/tests).
     Q_INVOKABLE void renameFile(const QUrl &fileUrl, const QString &newBaseName);
 
+    // Optimistic pending renames: a file rename is an instant-lane task DEFERRED
+    // behind a same-file transcription, so its fileRenamed (which repoints panels
+    // / updates the tree) can be a whole job away. renameFile() records the new
+    // stem here synchronously so every view shows the new name AT ONCE; the entry
+    // is erased when fileRenamed lands (ok or fail). Returns the pending new stem
+    // for fileUrl, or "" if none. NOTE: read pendingRenamesRevision in the same
+    // binding or this subscribes to nothing (bare Q_INVOKABLE ⇒ no dependency).
+    Q_INVOKABLE QString pendingRenameStem(const QUrl &fileUrl) const;
+    int pendingRenamesRevision() const { return m_pendingRenamesRevision; }
+
     // Moves one or more recording files (each carrying its .md sidecar +
     // .partial.jsonl resume state) into destDirUrl, as instant-lane tasks —
     // one MoveTask per file, all in ONE undo batch (a single "Moved N files"
@@ -1287,8 +1365,37 @@ public:
     // in the silence gap between sentence i's t1 and sentence i+1's t0 still
     // reports i, so the highlight doesn't blank out between segments.
     // Returns -1 if positionSeconds is before the first sentence's t0 (or
-    // the list is empty).
+    // the list is empty). Two kinds of zero-length pseudo-entries can be
+    // interleaved into `sentences` (chapter headings, and — silence phase 3
+    // — silence-divider markers, both flagged rather than spoken content);
+    // this walks back over either to the previous REAL sentence so the
+    // sentence-level highlight (DESIGN.md) never lands on pure decoration,
+    // with one exception: a landed-on COLLAPSED chapter heading, which is
+    // the sole visible line for its (hidden) body.
     Q_INVOKABLE int activeSentenceIndex(const QVariantList &sentences, double positionSeconds) const;
+
+    // Silence phase 2 (skip-silence during playback): inverse of
+    // formatSilencesValue() — parses a frontmatter "silences: 12.4-18.9,
+    // 45-52.3" raw value (as returned by readMetadata()'s generic
+    // key/QString map — see MainPanel.qml's mainPanel.metadata.silences)
+    // back into a QVariantList of {t0, t1} maps, the same shape convention
+    // parseSentences()'s sentence maps use, so nextSilenceSkipTarget() below
+    // (and activeSentenceIndex()'s existing idiom) can read spans via
+    // toMap().value("t0")/"t1". An empty/missing raw value yields an empty
+    // list (VAD hasn't run yet, or found no silence).
+    Q_INVOKABLE QVariantList parseSilences(const QString &raw) const;
+
+    // Pure, deterministic lookup over ALREADY-PARSED spans (parseSilences()
+    // above) — this is what makes "changing the threshold" a UI filter and
+    // NEVER a re-analysis trigger (locked Decision, queue item 084): no
+    // audio, VAD, or task involvement whatsoever, just a scan of the spans
+    // already stored in frontmatter. Returns the END of the first span
+    // containing positionSeconds whose length is >= thresholdSeconds, or -1
+    // (sentinel: nothing to skip) when positionSeconds isn't inside a
+    // skip-worthy span. Used by MainPanel.qml's player.positionChanged
+    // handler, gated on AppSettings.skipSilenceEnabled.
+    Q_INVOKABLE double nextSilenceSkipTarget(const QVariantList &silences, double positionSeconds,
+                                              double thresholdSeconds) const;
 
     // Wave N (task system, item 1): loads `<vaultUrl>/.transcriber/tasks.json`
     // (written by this same class — see persistQueue()) if present, and
@@ -1350,12 +1457,12 @@ public:
     // Item 17: de-duplicated, sorted list of every tag already used anywhere
     // in the vault — feeds the sidebar's tag-input autocomplete. Same scan
     // LabelingEngine's "restrict to existing tags" mode already uses
-    // internally (collectVaultTags, TranscriptionController.cpp); exposed
+    // internally (collectVaultFrontmatterList, TranscriptionController.cpp); exposed
     // here so QML doesn't need its own duplicate frontmatter-scanning logic.
     //
     // GUI THREAD ONLY — it consults m_vaultTagFileCache, which is not
     // mutex-guarded (unlike the transcript caches). The labeling job's own
-    // call to collectVaultTags() runs on the worker thread and deliberately
+    // call to collectVaultFrontmatterList() runs on the worker thread and deliberately
     // passes no cache, so the two never share state.
     //
     // Backed by that per-file cache because Sidebar.qml's tagSuggestions()
@@ -1367,15 +1474,32 @@ public:
     // argument VaultTreeModel's two caches use.
     Q_INVOKABLE QStringList existingVaultTags(const QUrl &vaultUrl) const;
 
-    // One .md file's parsed `tags:` values plus the stat they were read at.
-    // Public only so the file-local collectVaultTags() helper can name it;
-    // the cache itself (m_vaultTagFileCache) is private. Per-path, unlike the
-    // three single-slot transcript caches below, since existingVaultTags()
-    // touches every .md in the vault on each call.
-    struct CachedFileTags {
+    // Every distinct speaker name used anywhere in the vault — the speaker
+    // equivalent of existingVaultTags() above, backing the sidebar's speaker
+    // filter autocomplete. Same contract in every respect (GUI THREAD ONLY,
+    // per-file mtime+size cache, deduped, case-insensitively sorted), just
+    // over the `speakers:` frontmatter key instead of `tags:`; see that
+    // function's doc comment for the full rationale.
+    //
+    // Frontmatter is the right source, not a body scan: writeFrontmatter()
+    // only emits `speakers:` when speaker detection ran, and
+    // syncSpeakersFrontmatterToBody() keeps that line equal to the speaker
+    // tags actually present in the body — so the line is authoritative and
+    // costs one parse instead of a full-body regex pass per file.
+    Q_INVOKABLE QStringList existingVaultSpeakers(const QUrl &vaultUrl) const;
+
+    // One .md file's parsed values for ONE frontmatter key (`tags:` or
+    // `speakers:`) plus the stat they were read at. Public only so the
+    // file-local collectVaultFrontmatterList() helper can name it; the caches
+    // themselves (m_vaultTagFileCache/m_vaultSpeakerFileCache) are private.
+    // Per-path, unlike the three single-slot transcript caches below, since
+    // each scan touches every .md in the vault on each call. One cache per
+    // key — a single shared cache would key-collide, since two different keys
+    // yield different values for the same unchanged file.
+    struct CachedFileValues {
         qint64 mtimeMs = 0;
         qint64 size = -1;
-        QStringList tags;
+        QStringList values;
     };
 
     // Split-recording combine: matches vault audio filenames against
@@ -1450,6 +1574,10 @@ signals:
     // it couldn't start (e.g. decode failed).
     void benchmarkModelStarted(const QString &modelId, int index, int total);
     void benchmarkModelDone(const QVariantMap &result);
+    // Live partial transcript for the model at index `modelIndex`, re-emitted on
+    // the GUI thread so the Benchmark page grows the running card as segments
+    // stream in (before benchmarkModelDone).
+    void benchmarkModelProgressText(int modelIndex, const QString &partialText);
     void benchmarkFinished(const QVariantMap &run);
     void benchmarkFailed(const QString &error);
     // Diarization sweep (see runDiarizationBenchmark()) — per-combo start, per
@@ -1512,7 +1640,17 @@ signals:
     // is otherwise driven by) only fires on a directory's file add/remove/
     // rename, never on an existing file's content changing — see
     // VaultTreeModel::refreshFile()'s doc comment for the full explanation.
-    void finished(const QUrl &fileUrl, bool ok, const QString &error) const;
+    //
+    // `structural` is the finishing task's Task::isStructuralFileOp() — true
+    // when it MOVED files, so the vault watcher's rebuild will emit a full
+    // modelReset that reflows the tree authoritatively. A listener that also
+    // reflows on this signal (Sidebar's refreshTreeOrdering/refreshSearchResults)
+    // must SKIP that work when structural is true, or the panel reflows twice
+    // for one rename. Defaults to false, which is the correct value for every
+    // emit that isn't a task completion (an in-place edit like setLabel, or a
+    // cancel): those never produce a reset, so `finished` is their only reflow
+    // trigger and it must keep doing that work.
+    void finished(const QUrl &fileUrl, bool ok, const QString &error, bool structural = false) const;
     // Fired when a renameSpeaker() call's background rewrite completes — IN
     // ADDITION to the generic finished() above (a rename is queued through
     // the SAME job queue as transcribe/relabel, see renameSpeaker()'s doc
@@ -1526,6 +1664,10 @@ signals:
     // player to newUrl on success, rolls back its optimistic filename field on
     // failure.
     void fileRenamed(const QUrl &oldUrl, const QUrl &newUrl, bool ok, const QString &error);
+    // Bumped whenever the pending-rename table changes (a rename enqueued, or its
+    // task completing/failing). Views read pendingRenameStem() gated on this so
+    // the read is reactive — see pendingRenameStem()'s doc comment.
+    void pendingRenamesRevisionChanged();
     // Fired per file when a moveFiles() task completes. oldUrl is the file's
     // original location; newUrl is its new location (empty on failure). QML
     // repoints the player to newUrl when the moved file was the open one.
@@ -1666,6 +1808,12 @@ private:
     // runCombineScan() and startJob() so both enqueue combine jobs identically.
     void enqueueCombineJob(const CombineGroup &group, const QUrl &vaultUrl, bool deleteOriginals,
                             int insertIndex = -1);
+    // Shared spine of runCombineScan() (bulk) and combineGroup() (single):
+    // caches the scan inputs, then enqueues a combine job for every "ready",
+    // not-already-queued group passing outputPathFilter (empty = all), kicking
+    // the queue once if anything was inserted. Returns the number enqueued.
+    int enqueueReadyCombineGroups(const QVariantList &rules, const QStringList &audioPaths, const QUrl &vaultUrl,
+                                   bool deleteOriginals, const QString &outputPathFilter = QString());
     // Safety-net re-check, called from the very top of startJob() before any
     // state mutation — "double check the file being transcribed for parts
     // before or after, whenever it is being transcribed" (the user's last
@@ -1898,6 +2046,14 @@ private:
     // by that phase's own rolling average, clamped to 0.95 so a slower-than-
     // average run never LOOKS finished before the real phase transition
     // actually happens.
+    // The phases with no native per-item progress callback — their within-phase
+    // fraction is synthesized from elapsed-vs-average
+    // (phaseRelativeSyntheticProgress()) and driven by m_indeterminatePhaseTimer.
+    // ONE predicate both the timer-start gate and the synthetic-fraction branch
+    // consult, so the two phase sets can never drift again (they had: this class
+    // once synthesized for "detecting-speech" but only ran the timer for
+    // loading/decoding, so that phase's bar sat frozen).
+    static bool isSyntheticProgressPhase(const QString &phase);
     double phaseRelativeSyntheticProgress() const;
     // Populates m_phaseTimings from QSettings' "phaseTimings" group — one key
     // per (phase, modelId, speakerDetection) combination ever recorded (see
@@ -1930,6 +2086,8 @@ private:
     // call applyRemovalOutcome()/applyRestoreOutcome() after a trash/delete/
     // restore task completes — see setVaultTreeModel()'s doc comment.
     VaultTreeModel *m_vaultModel = nullptr;
+    QHash<QString, QString> m_pendingRenames; // oldLocalFilePath -> new stem
+    int m_pendingRenamesRevision = 0;
     bool m_busy = false;
     double m_progress = 0.0;
     // Wave N (task system, item 6): the SAME 0..1 fraction run() used to
@@ -2028,6 +2186,14 @@ private:
     // real cancel/failure of the SAME underlying "requestCancel() then
     // finished(false, "Cancelled")" mechanism. Cleared the instant it's read.
     bool m_pausingActiveAsRestart = false;
+    // True from the moment a cancel is requested on an Active task that can't
+    // stop instantly (pausable && !capabilities().cancellableMidRun — e.g.
+    // diarization, whose pass runs to its boundary before the cancel lands)
+    // until that task reaches terminal. Folds into isActiveStopping() so the
+    // UI shows "Cancelling", disables pause, and never flips back to a
+    // running-looking state. Derived from the task's OWN declared capability,
+    // so any future non-mid-cancellable kind gets this for free.
+    bool m_activeCancelling = false;
     // Wave N (task system, item 4/7): wall-clock ms the Active job has
     // actually been RUNNING, excluding paused stretches — see
     // activeElapsedMs()'s doc comment. m_activeSegmentTimer covers the
@@ -2096,15 +2262,24 @@ private:
     // Per-.md-file parsed `tags:` values, keyed by absolute path — backs
     // existingVaultTags() only; see its doc comment for why it exists and why
     // it needs no mutex (GUI thread only).
-    mutable QHash<QString, CachedFileTags> m_vaultTagFileCache;
+    mutable QHash<QString, CachedFileValues> m_vaultTagFileCache;
+
+    // The `speakers:` counterpart of m_vaultTagFileCache, backing
+    // existingVaultSpeakers(). Separate hash, not a shared one: the cached
+    // value is per-KEY, so one hash keyed by path alone would hand a tags
+    // lookup the speakers answer for any file both scans have seen.
+    mutable QHash<QString, CachedFileValues> m_vaultSpeakerFileCache;
 };
 
-// Every distinct "tags:" value used anywhere in the vault — feeds a labeling
-// pass's tag vocabulary (existing-tag reuse bias / restrict-to-existing).
+// Every distinct value of ONE frontmatter key (`key` == "tags" or "speakers")
+// used anywhere in the vault. For "tags" it feeds a labeling pass's tag
+// vocabulary (existing-tag reuse bias / restrict-to-existing); for "speakers"
+// it backs the sidebar's speaker-filter autocomplete (existingVaultSpeakers()).
 // cache: nullptr when called from a Task's run() (worker thread; must not
 // touch the GUI thread's cache) — pass a real cache only from a GUI-thread
 // caller that re-enters this on every keystroke (see existingVaultTags()).
 // Declared after the class (not alongside the other transcript-format
-// helpers above) because CachedFileTags is a nested type of
+// helpers above) because CachedFileValues is a nested type of
 // TranscriptionController and isn't visible until the class body closes.
-QStringList collectVaultTags(const QString &vaultLocalPath, QHash<QString, TranscriptionController::CachedFileTags> *cache);
+QStringList collectVaultFrontmatterList(const QString &vaultLocalPath, const QString &key,
+                                        QHash<QString, TranscriptionController::CachedFileValues> *cache);

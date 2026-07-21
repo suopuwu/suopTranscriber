@@ -208,6 +208,10 @@ private slots:
             "            } }]\n"
             "        })\n"
             "    }\n"
+            "    function postTaskRelated(text) {\n"
+            "        return Notifications.post({ text: text, timeout: 0, taskRelated: true })\n"
+            "    }\n"
+            "    function setTasksPopupOpen(v) { Notifications.tasksPopupOpen = v }\n"
             "    function dismissToken(t) { Notifications.dismiss(t) }\n"
             "    function focusField() { field.forceActiveFocus() }\n"
             "    function fieldHasFocus() { return field.activeFocus }\n"
@@ -467,6 +471,50 @@ private slots:
         QTRY_COMPARE(queueCount(), 0);
         QMetaObject::invokeMethod(m_window, "fieldHasFocus", Q_RETURN_ARG(QVariant, hasFocus));
         QVERIFY2(hasFocus.toBool(), "the dismiss X must not steal focus either");
+    }
+
+    // A `taskRelated: true` post is dropped while the Tasks popup is open — it
+    // duplicates a row already listed there, under a snackbar host that renders
+    // straight over the popup. But this is a targeted drop, NOT a blanket mute:
+    // a message the popup does not carry (a rename rejection) still posts.
+    void taskRelatedPost_isDroppedWhileTasksPopupOpen()
+    {
+        QVERIFY(openWindow());
+        QMetaObject::invokeMethod(m_window, "setTasksPopupOpen", Q_ARG(QVariant, true));
+
+        QVariant ret;
+        QMetaObject::invokeMethod(m_window, "postTaskRelated", Q_RETURN_ARG(QVariant, ret),
+                                  Q_ARG(QVariant, QStringLiteral("Renamed a.wav")));
+        QCOMPARE(ret.toInt(), 0); // dropped posts return the reserved 0 token
+        QTRY_COMPARE(queueCount(), 0);
+        QCOMPARE(snackbars().size(), 0);
+
+        // The half that proves it isn't a blanket mute: an unrelated message
+        // still gets through with the popup open.
+        QMetaObject::invokeMethod(m_window, "postPlain", Q_RETURN_ARG(QVariant, ret),
+                                  Q_ARG(QVariant, QStringLiteral("Couldn't rename — name taken or invalid.")),
+                                  Q_ARG(QVariant, 0));
+        QTRY_COMPARE(snackbars().size(), 1);
+    }
+
+    // Opening the Tasks popup also clears any task-related snackbar ALREADY on
+    // screen (it would otherwise render over the popup), while leaving an
+    // unrelated one standing.
+    void openingTasksPopup_dismissesTaskRelatedSnackbarsAlreadyOnScreen()
+    {
+        QVERIFY(openWindow());
+        QVariant ret;
+        QMetaObject::invokeMethod(m_window, "postTaskRelated", Q_RETURN_ARG(QVariant, ret),
+                                  Q_ARG(QVariant, QStringLiteral("Renamed a.wav")));
+        QMetaObject::invokeMethod(m_window, "postPlain", Q_RETURN_ARG(QVariant, ret),
+                                  Q_ARG(QVariant, QStringLiteral("Couldn't rename — name taken or invalid.")),
+                                  Q_ARG(QVariant, 0));
+        QTRY_COMPARE(snackbars().size(), 2);
+
+        QMetaObject::invokeMethod(m_window, "setTasksPopupOpen", Q_ARG(QVariant, true));
+        QTRY_COMPARE(snackbars().size(), 1);
+        QCOMPARE(snackbars().first()->property("text").toString(),
+                 QStringLiteral("Couldn't rename — name taken or invalid."));
     }
 
     // Colors are StyleGuide-fixed per kind, and shared with the inline banners

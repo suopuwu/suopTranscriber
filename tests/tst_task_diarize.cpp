@@ -8,6 +8,7 @@
 #include <QtTest>
 #include <QTemporaryDir>
 
+#include "ModelManager.h"
 #include "tasks/DiarizeTask.h"
 #include "tasks/EngineCache.h"
 #include "tasks/TaskContext.h"
@@ -60,6 +61,28 @@ private slots:
         QCOMPARE(map.value(QStringLiteral("segmentationModelId")).toString(), QStringLiteral("seg-x"));
         QCOMPARE(map.value(QStringLiteral("embeddingModelId")).toString(), QStringLiteral("embed-y"));
         QCOMPARE(map.value(QStringLiteral("diarizationThreshold")).toDouble(), 0.7);
+    }
+
+    // When diarization finishes, DiarizeTask records which two models ran into
+    // the .md frontmatter (LABELS, resolved from ids via ModelManager — matching
+    // how `model:` stores a name, not an id) so the info line can name them.
+    // This unit tests that wiring directly, without the heavy decode+diarize path.
+    void applyDiarizationModelFrontmatter_recordsBothLabels()
+    {
+        QStringList lines{QStringLiteral("model: base"), QStringLiteral("speakerDetection: true")};
+        applyDiarizationModelFrontmatter(&lines, QString::fromLatin1(ModelManager::kDefaultSegmentationModelId),
+                                         QString::fromLatin1(ModelManager::kDefaultEmbeddingModelId));
+
+        const QString expectedSeg =
+            ModelManager::segmentationModelInfo(QString::fromLatin1(ModelManager::kDefaultSegmentationModelId)).label;
+        const QString expectedEmb =
+            ModelManager::embeddingModelInfo(QString::fromLatin1(ModelManager::kDefaultEmbeddingModelId)).label;
+        QVERIFY(!expectedSeg.isEmpty());
+        QVERIFY(!expectedEmb.isEmpty());
+        QVERIFY2(lines.contains(QStringLiteral("segmentationModel: ") + expectedSeg),
+                 "the segmentationModel label must be upserted into frontmatter");
+        QVERIFY2(lines.contains(QStringLiteral("embeddingModel: ") + expectedEmb),
+                 "the embeddingModel label must be upserted into frontmatter");
     }
 };
 

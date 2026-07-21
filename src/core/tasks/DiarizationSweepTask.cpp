@@ -31,8 +31,22 @@ void DiarizationSweepTask::run(TaskContext &ctx)
 {
     const QString filePath = fileUrl.toLocalFile();
 
+    // Decode the sibling audio once, honoring pause/cancel between chunks —
+    // same DecodeControl pattern DiarizeTask uses.
+    emit phase(QStringLiteral("decoding"));
+    bool decodePausedSignaled = false;
+    AudioDecoder::DecodeControl decodeControl;
+    decodeControl.paused = [&ctx, &decodePausedSignaled] {
+        const bool p = ctx.pauseRequested();
+        if (p != decodePausedSignaled) {
+            decodePausedSignaled = p;
+            ctx.reportPaused(p);
+        }
+        return p;
+    };
+    decodeControl.cancelled = [&ctx] { return ctx.cancelRequested(); };
     QString decodeError;
-    auto pcm = AudioDecoder::decodeTo16kMono(filePath, &decodeError);
+    auto pcm = AudioDecoder::decodeTo16kMono(filePath, &decodeError, decodeControl);
     if (!pcm)
         throw TaskError(decodeError.isEmpty() ? QStringLiteral("audio decode failed") : decodeError);
     const double audioSeconds = static_cast<double>(pcm->size()) / 16000.0;
@@ -46,7 +60,9 @@ void DiarizationSweepTask::run(TaskContext &ctx)
     emit phase(QStringLiteral("benchmarking"));
     emit progress(0.0);
     for (int i = 0; i < m_combos.size(); ++i) {
-        if (ctx.cancelRequested())
+        // Blocks here while paused; breaks out the instant a cancel lands —
+        // both take effect at this combo boundary.
+        if (ctx.checkpoint())
             break;
         const QVariantMap combo = m_combos.at(i).toMap();
         const QString segId = combo.value("segmentationModelId").toString();
@@ -81,7 +97,11 @@ void DiarizationSweepTask::run(TaskContext &ctx)
 
         QElapsedTimer comboTimer;
         comboTimer.start();
-        const std::vector<DiarizedTurn> turns = engine.diarize(*pcm);
+        // Callback blocks on pause between sherpa-onnx ticks (cancel is not
+        // actionable mid-pass — no abort hook — so it lands at the loop
+        // boundary above). Same discipline as DiarizeTask's diarize() call.
+        const std::vector<DiarizedTurn> turns =
+            engine.diarize(*pcm, [&ctx](double) { ctx.checkpoint(); });
         const qint64 runtimeMs = comboTimer.elapsed();
         int maxSpeaker = -1;
         for (const DiarizedTurn &turn : turns)

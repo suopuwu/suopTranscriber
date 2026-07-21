@@ -188,6 +188,7 @@ Popup {
                 || !AppSettings.isDefault("rimEnabled")
                 || !AppSettings.isDefault("rimWidth")
                 || !AppSettings.isDefault("rimColor")
+                || !AppSettings.isDefault("recordingActiveColor")
                 || !AppSettings.isDefault("highlightColor")
                 || !AppSettings.isDefault("highlightRadius")
                 || !AppSettings.isDefault("sidebarSelectionColor")
@@ -924,6 +925,14 @@ Popup {
     }
 
     ColorDialog {
+        id: recordingActiveColorDialog
+        title: qsTr("Recording Indicator Color")
+        selectedColor: AppSettings.recordingActiveColor
+        options: ColorDialog.ShowAlphaChannel
+        onAccepted: AppSettings.recordingActiveColor = selectedColor
+    }
+
+    ColorDialog {
         id: accentColorDialog
         title: qsTr("Accent Color")
         selectedColor: AppSettings.accentColor
@@ -1165,7 +1174,8 @@ Popup {
                 Layout.fillWidth: true
                 Label {
                     Layout.preferredWidth: 90
-                    elide: Text.ElideRight
+                    Layout.alignment: Qt.AlignVCenter
+                    wrapMode: Text.WordWrap
                     color: "white"
                     text: qsTr("Icon pack")
                 }
@@ -1349,7 +1359,13 @@ Popup {
                 Layout.fillWidth: true
                 Label {
                     Layout.preferredWidth: 90
-                    elide: Text.ElideRight
+                    Layout.alignment: Qt.AlignVCenter
+                    // Shared name column for every slider/combo row in this
+                    // popup. Long names ("Left content margin", "Tag reuse
+                    // bias") don't fit 90px on one line, so they WRAP — an
+                    // elide here would let the slider cut the name off. The
+                    // rows have no fixed height, so they grow to fit.
+                    wrapMode: Text.WordWrap
                     color: "white"
                     text: qsTr("Border radius")
                 }
@@ -1551,7 +1567,8 @@ Popup {
                 Layout.fillWidth: true
                 Label {
                     Layout.preferredWidth: 90
-                    elide: Text.ElideRight
+                    Layout.alignment: Qt.AlignVCenter
+                    wrapMode: Text.WordWrap
                     color: "white"
                     text: qsTr("Opacity")
                 }
@@ -1794,7 +1811,8 @@ Popup {
                 Layout.fillWidth: true
                 Label {
                     Layout.preferredWidth: 90
-                    elide: Text.ElideRight
+                    Layout.alignment: Qt.AlignVCenter
+                    wrapMode: Text.WordWrap
                     color: "white"
                     text: qsTr("Left edge margin")
                 }
@@ -1878,7 +1896,8 @@ Popup {
                 Layout.fillWidth: true
                 Label {
                     Layout.preferredWidth: 90
-                    elide: Text.ElideRight
+                    Layout.alignment: Qt.AlignVCenter
+                    wrapMode: Text.WordWrap
                     color: "white"
                     text: qsTr("Left content margin")
                 }
@@ -1962,7 +1981,8 @@ Popup {
                 Layout.fillWidth: true
                 Label {
                     Layout.preferredWidth: 90
-                    elide: Text.ElideRight
+                    Layout.alignment: Qt.AlignVCenter
+                    wrapMode: Text.WordWrap
                     color: "white"
                     text: qsTr("Right margin")
                 }
@@ -2115,7 +2135,8 @@ Popup {
                 Layout.fillWidth: true
                 Label {
                     Layout.preferredWidth: 90
-                    elide: Text.ElideRight
+                    Layout.alignment: Qt.AlignVCenter
+                    wrapMode: Text.WordWrap
                     color: "white"
                     text: qsTr("Opacity")
                 }
@@ -2311,7 +2332,8 @@ Popup {
                 Layout.fillWidth: true
                 Label {
                     Layout.preferredWidth: 90
-                    elide: Text.ElideRight
+                    Layout.alignment: Qt.AlignVCenter
+                    wrapMode: Text.WordWrap
                     color: "white"
                     text: qsTr("Width")
                 }
@@ -2442,6 +2464,61 @@ Popup {
                     HoverBorder {
                         anchors.fill: parent
                         active: rimColorResetButton.enabled && rimColorResetButton.hovered
+                    }
+                }
+            }
+
+            RowLayout {
+                Layout.fillWidth: true
+                Label {
+                    Layout.fillWidth: true
+                    color: "white"
+                    text: qsTr("Recording indicator")
+                }
+                Button {
+                    id: recordingActiveColorButton
+                    text: qsTr("Choose…")
+                    hoverEnabled: true
+                    onClicked: recordingActiveColorDialog.open()
+
+                    background: Rectangle {
+                        radius: AppSettings.borderRadius
+                        color: (recordingActiveColorButton.hovered && recordingActiveColorButton.enabled) ? "#3a3a3a" : "#2a2a2a"
+                        border.width: 1
+                        border.color: "#3a3a3a"
+                    }
+                    HoverHandler {
+                        cursorShape: Qt.PointingHandCursor
+                    }
+                    HoverBorder {
+                        anchors.fill: parent
+                        active: recordingActiveColorButton.hovered
+                    }
+                }
+                Button {
+                    id: recordingActiveColorResetButton
+                    contentItem: AppIcon { name: "reset"; iconSize: 14; color: "#dddddd"; anchors.centerIn: parent }
+                    implicitWidth: 22
+                    implicitHeight: 22
+
+                    background: Rectangle {
+                        radius: AppSettings.borderRadius
+                        color: "transparent"
+                        border.width: 1
+                        border.color: "#3a3a3a"
+                    }
+                    enabled: !AppSettings.isDefault("recordingActiveColor")
+                    opacity: enabled ? 1 : 0.35
+                    hoverEnabled: enabled
+                    onClicked: AppSettings.resetProperty("recordingActiveColor")
+
+                    HoverHandler {
+                        cursorShape: Qt.PointingHandCursor
+                        enabled: recordingActiveColorResetButton.enabled
+                    }
+                    HoverBorder {
+                        anchors.fill: parent
+                        active: recordingActiveColorResetButton.enabled && recordingActiveColorResetButton.hovered
                     }
                 }
             }
@@ -2594,7 +2671,8 @@ Popup {
                 Layout.fillWidth: true
                 Label {
                     Layout.preferredWidth: 90
-                    elide: Text.ElideRight
+                    Layout.alignment: Qt.AlignVCenter
+                    wrapMode: Text.WordWrap
                     color: "white"
                     text: qsTr("Radius")
                 }
@@ -2815,7 +2893,8 @@ Popup {
                 visible: progressGlowEnabledSwitch.checked
                 Label {
                     Layout.preferredWidth: 90
-                    elide: Text.ElideRight
+                    Layout.alignment: Qt.AlignVCenter
+                    wrapMode: Text.WordWrap
                     color: "white"
                     text: qsTr("Width")
                 }
@@ -2900,7 +2979,8 @@ Popup {
                 visible: progressGlowEnabledSwitch.checked
                 Label {
                     Layout.preferredWidth: 90
-                    elide: Text.ElideRight
+                    Layout.alignment: Qt.AlignVCenter
+                    wrapMode: Text.WordWrap
                     color: "white"
                     text: qsTr("Glow radius")
                 }
@@ -2985,7 +3065,8 @@ Popup {
                 visible: progressGlowEnabledSwitch.checked
                 Label {
                     Layout.preferredWidth: 90
-                    elide: Text.ElideRight
+                    Layout.alignment: Qt.AlignVCenter
+                    wrapMode: Text.WordWrap
                     color: "white"
                     text: qsTr("Layers")
                 }
@@ -3144,7 +3225,8 @@ Popup {
                 Layout.fillWidth: true
                 Label {
                     Layout.preferredWidth: 90
-                    elide: Text.ElideRight
+                    Layout.alignment: Qt.AlignVCenter
+                    wrapMode: Text.WordWrap
                     color: "white"
                     text: qsTr("Decimal places")
                 }
@@ -3482,7 +3564,8 @@ Popup {
                 Layout.fillWidth: true
                 Label {
                     Layout.preferredWidth: 90
-                    elide: Text.ElideRight
+                    Layout.alignment: Qt.AlignVCenter
+                    wrapMode: Text.WordWrap
                     color: "white"
                     text: qsTr("Segmentation")
                 }
@@ -3544,7 +3627,8 @@ Popup {
                 Layout.fillWidth: true
                 Label {
                     Layout.preferredWidth: 90
-                    elide: Text.ElideRight
+                    Layout.alignment: Qt.AlignVCenter
+                    wrapMode: Text.WordWrap
                     color: "white"
                     text: qsTr("Embedding")
                 }
@@ -3615,7 +3699,8 @@ Popup {
                 Layout.fillWidth: true
                 Label {
                     Layout.preferredWidth: 90
-                    elide: Text.ElideRight
+                    Layout.alignment: Qt.AlignVCenter
+                    wrapMode: Text.WordWrap
                     color: "white"
                     text: qsTr("Sensitivity")
                 }
@@ -3821,7 +3906,8 @@ Popup {
                 visible: autoLabelEnabledSwitch.checked && !restrictTagsToExistingSwitch.checked
                 Label {
                     Layout.preferredWidth: 90
-                    elide: Text.ElideRight
+                    Layout.alignment: Qt.AlignVCenter
+                    wrapMode: Text.WordWrap
                     color: "white"
                     text: qsTr("Tag reuse bias")
                 }
@@ -3900,7 +3986,8 @@ Popup {
                 visible: autoLabelEnabledSwitch.checked
                 Label {
                     Layout.preferredWidth: 90
-                    elide: Text.ElideRight
+                    Layout.alignment: Qt.AlignVCenter
+                    wrapMode: Text.WordWrap
                     color: "white"
                     text: qsTr("Label wordiness")
                 }
@@ -3983,7 +4070,8 @@ Popup {
                 Layout.fillWidth: true
                 Label {
                     Layout.preferredWidth: 90
-                    elide: Text.ElideRight
+                    Layout.alignment: Qt.AlignVCenter
+                    wrapMode: Text.WordWrap
                     color: "white"
                     text: qsTr("Chapter density")
                 }

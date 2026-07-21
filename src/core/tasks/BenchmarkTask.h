@@ -27,6 +27,9 @@ public:
     QString kindLabel() const override { return QStringLiteral("Benchmark"); }
     QString displayName() const override;
     Presentation presentation() const override { return Presentation::Background; }
+    // A comparison-only run — writes no vault file, so it must not gate per-file
+    // UI on the benchmarked file (see Task::occupiesFile()).
+    bool occupiesFile() const override { return false; }
     // Cancellable (between models, and within one via the same abort-
     // callback mechanism a real transcribe uses) but never pausable — the
     // old runBenchmark()/cancelBenchmark() never offered a pause control.
@@ -42,6 +45,10 @@ public:
 signals:
     void benchmarkModelStarted(const QString &modelId, int index, int total);
     void benchmarkModelDone(const QVariantMap &result);
+    // Live partial transcript for the model at index `modelIndex` in this run,
+    // emitted (throttled) as segments stream in so the Benchmark page can grow
+    // the running card sentence-by-sentence before benchmarkModelDone.
+    void benchmarkModelProgressText(int modelIndex, const QString &partialText);
     // The whole run's summary, once every model has been attempted (or the
     // sweep was cancelled partway through) — what the Benchmark page
     // persists via VaultTreeModel::writeBenchmarkLastRun.

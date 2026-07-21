@@ -1,5 +1,7 @@
 #pragma once
 
+#include <atomic>
+
 #include <QString>
 #include <QUrl>
 #include <QVariantList>
@@ -34,6 +36,9 @@ public:
                 QVariantList combineRules, QObject *parent = nullptr);
 
     QString kind() const override { return QStringLiteral("usbGrab"); }
+    // Creates/moves files in the vault -> the watcher rebuild resets the model,
+    // which is the authoritative reflow (see Task::isStructuralFileOp).
+    bool isStructuralFileOp() const override { return true; }
     QString kindLabel() const override { return QStringLiteral("USB grab"); }
     QString displayName() const override;
     // Pausable between files (QFile::copy() itself is uninterruptible, so a
@@ -55,10 +60,18 @@ public:
 
 signals:
     void grabCompleted(int filesCopied, int filesSkipped, const QStringList &errors, bool cancelled);
+    // Fired once the run's pre-count pass knows how many files match — lets the
+    // Tasks row rename itself from "<drive>" to "<drive> — N files". Emitted on
+    // the worker thread; the controller turns it into a queueChanged().
+    void fileCountKnown();
 
 private:
     UsbGrabRule m_rule;
     QString m_mountPath;
     bool m_autoTriggered;
     QVariantList m_combineRules;
+    // Candidate file count from the pre-count pass, -1 until known. Written on
+    // the worker thread (run()'s onTotalsKnown hook), read on the GUI thread
+    // (toVariantMap) — atomic so the cross-thread read is defined.
+    std::atomic<int> m_fileCount{-1};
 };

@@ -123,6 +123,18 @@ private:
         return firstByObjectName(headingRow, QStringLiteral("chapterHeadingTitle"));
     }
 
+    // Each rendered heading's scene y, keyed by its title — keyed rather than
+    // indexed so an assertion can't be satisfied by the rows swapping places.
+    static QMap<QString, qreal> headingYByTitle(QQuickItem *panel)
+    {
+        QMap<QString, qreal> out;
+        for (QQuickItem *row : headingRowsOf(panel)) {
+            if (QQuickItem *title = titleFieldOf(row))
+                out.insert(title->property("text").toString(), row->mapToScene(QPointF(0, 0)).y());
+        }
+        return out;
+    }
+
     QQuickItem *m_panel = nullptr;
     QQuickItem *m_area = nullptr;
 
@@ -486,6 +498,205 @@ private slots:
         QCOMPARE(alpha->property("selectedText").toString(), QString());
         QCOMPARE(beta->property("selectedText").toString(), QStringLiteral("Beta"));
         QCOMPARE(copyWithChapters(), QStringLiteral("Beta\nSecond line"));
+    }
+
+    // The overlay offsets must track the LIVE document, not the model's
+    // precomputed `start` values. displaySentences' offsets index displayText,
+    // and the `text: mainPanel.displayText` binding is severed the moment the
+    // user types — so mid-edit every offset past the caret is stale by the edit
+    // delta, and positionToRectangle() resolves each overlay to the tail of the
+    // PREVIOUS line. On a heading (a full-width bold row) that meant a title
+    // painted directly on top of a sentence with its own reserved blank line
+    // left empty. Typing one character used to move every heading below the
+    // caret up exactly one line height; this pins that it moves nothing.
+    void headingsStayOnTheirLineWhileTyping()
+    {
+        QQuickView view;
+        QVERIFY2(openPanel(&view,
+                            QVariantList{sentence(0, QStringLiteral("Hello world")),
+                                          sentence(5, QStringLiteral("Second line")),
+                                          sentence(10, QStringLiteral("Third line"))},
+                            QVariantList{chapter(3, QStringLiteral("Chapter One")),
+                                          chapter(7, QStringLiteral("Chapter Two"))}),
+                 "could not load MainPanel.qml / locate it");
+        QVERIFY2(m_area, "could not locate transcriptArea");
+
+        // Lines 0..4, with a heading's reserved blank line at 1 and 3 — so
+        // there is body both above and below each heading.
+        QCOMPARE(displayText(), QStringLiteral("Hello world\n\nSecond line\n\nThird line"));
+        const int lineCount = m_panel->property("displaySentences").toList().size();
+        QCOMPARE(lineCount, 5);
+
+        const QMap<QString, qreal> before = headingYByTitle(m_panel);
+        QCOMPARE(before.size(), 2);
+        QVERIFY(before.value(QStringLiteral("Chapter One"))
+                < before.value(QStringLiteral("Chapter Two")));
+
+        // Mutate the LIVE DOCUMENT, not the model — the defect lives entirely
+        // in the divergence between the two, so setting `sentences` would
+        // paper over it. insert() is used rather than QTest::keyClick because
+        // the offscreen platform never activates the window, so synthesized
+        // key events reach no focus item; insert() severs the
+        // `text: mainPanel.displayText` binding exactly as typing does, and
+        // focus is held so the onDisplayTextChanged resync stays skipped —
+        // which is precisely the mid-edit state the user hits.
+        m_area->forceActiveFocus();
+        QVERIFY2(m_area->hasActiveFocus(), "transcriptArea did not take focus");
+        QMetaObject::invokeMethod(m_area, "insert", Q_ARG(int, 5), Q_ARG(QString, QStringLiteral("X")));
+        QTRY_COMPARE(m_area->property("text").toString(),
+                     QStringLiteral("HelloX world\n\nSecond line\n\nThird line"));
+
+        // The invariant the whole fix rests on: one live line per entry. A
+        // future change that let Return through would break this first.
+        QCOMPARE(m_area->property("liveLineStarts").toList().size(), lineCount);
+
+        const QMap<QString, qreal> afterInsert = headingYByTitle(m_panel);
+        QCOMPARE(afterInsert.keys(), before.keys());
+        for (const QString &title : before.keys()) {
+            QVERIFY2(qFuzzyCompare(1.0 + afterInsert.value(title), 1.0 + before.value(title)),
+                      qPrintable(QStringLiteral("heading '%1' moved from y=%2 to y=%3 on a keystroke")
+                                     .arg(title).arg(before.value(title)).arg(afterInsert.value(title))));
+        }
+
+        // ...and the drift runs the other way on a delete.
+        QMetaObject::invokeMethod(m_area, "remove", Q_ARG(int, 5), Q_ARG(int, 6));
+        QTRY_COMPARE(m_area->property("text").toString(),
+                     QStringLiteral("Hello world\n\nSecond line\n\nThird line"));
+        QCOMPARE(m_area->property("liveLineStarts").toList().size(), lineCount);
+        const QMap<QString, qreal> afterDelete = headingYByTitle(m_panel);
+        for (const QString &title : before.keys()) {
+            QVERIFY2(qFuzzyCompare(1.0 + afterDelete.value(title), 1.0 + before.value(title)),
+                      qPrintable(QStringLiteral("heading '%1' moved on a delete").arg(title)));
+        }
+    }
+
+    // The overlap condition itself, stated directly: a heading's row must never
+    // land on the same y as a line of actual transcript text. This is what the
+    // user saw — bold green title painted over a sentence.
+    void headingsNeverShareALineWithTranscriptText()
+    {
+        QQuickView view;
+        QVERIFY2(openPanel(&view,
+                            QVariantList{sentence(0, QStringLiteral("Hello world")),
+                                          sentence(5, QStringLiteral("Second line")),
+                                          sentence(10, QStringLiteral("Third line"))},
+                            QVariantList{chapter(3, QStringLiteral("Chapter One")),
+                                          chapter(7, QStringLiteral("Chapter Two"))}),
+                 "could not load MainPanel.qml / locate it");
+        QVERIFY(m_area);
+
+        m_area->forceActiveFocus();
+        QMetaObject::invokeMethod(m_area, "insert", Q_ARG(int, 5), Q_ARG(QString, QStringLiteral("X")));
+        QTRY_COMPARE(m_area->property("text").toString().length(), 37);
+
+        // gutterLineRects is what positions every overlay; a heading's rect
+        // colliding with a body line's rect IS the overlap.
+        const QVariantList rects = m_area->property("gutterLineRects").toList();
+        QCOMPARE(rects.size(), 5);
+        const QVariantList entries = m_panel->property("displaySentences").toList();
+        QCOMPARE(entries.size(), 5);
+
+        QList<qreal> headingYs;
+        QList<qreal> bodyYs;
+        for (int i = 0; i < entries.size(); ++i) {
+            const qreal y = rects.at(i).toRectF().y();
+            if (entries.at(i).toMap().value(QStringLiteral("isChapterHeading")).toBool())
+                headingYs.append(y);
+            else
+                bodyYs.append(y);
+        }
+        QCOMPARE(headingYs.size(), 2);
+        QCOMPARE(bodyYs.size(), 3);
+        for (qreal hy : headingYs) {
+            for (qreal by : bodyYs) {
+                QVERIFY2(!qFuzzyCompare(1.0 + hy, 1.0 + by),
+                          qPrintable(QStringLiteral("a chapter heading is painted on a transcript "
+                                                    "line — both at y=%1").arg(hy)));
+            }
+        }
+    }
+
+    // firstRealSentenceIndex is the playback highlight's front-edge clamp: it
+    // skips any chapter heading(s) that open the transcript so a leading heading
+    // never gets lit. It's a pure derived property over displaySentences, so it
+    // is testable here even though the full activeSentenceIndex binding needs a
+    // controller this harness leaves null.
+    void firstRealSentenceIndex_skipsLeadingChapterHeadings()
+    {
+        {
+            QQuickView view;
+            QVERIFY2(openPanel(&view, basicSentences(),
+                                QVariantList{chapter(0, QStringLiteral("Intro"))}),
+                     "could not load MainPanel.qml / locate it");
+            // displaySentences[0] is the leading heading -> first real is 1.
+            QCOMPARE(m_panel->property("firstRealSentenceIndex").toInt(), 1);
+        }
+        {
+            QQuickView view;
+            QVERIFY2(openPanel(&view, basicSentences(),
+                                QVariantList{chapter(3, QStringLiteral("Mid"))}),
+                     "could not load MainPanel.qml / locate it");
+            // The heading falls between the two sentences -> first real is 0.
+            QCOMPARE(m_panel->property("firstRealSentenceIndex").toInt(), 0);
+        }
+        {
+            QQuickView view;
+            QVERIFY2(openPanel(&view, QVariantList{},
+                                QVariantList{chapter(0, QStringLiteral("Empty"))}),
+                     "could not load MainPanel.qml / locate it");
+            // Only a heading (no spoken sentences) -> -1.
+            QCOMPARE(m_panel->property("firstRealSentenceIndex").toInt(), -1);
+        }
+    }
+
+    // Queue item 054: collapsing a chapter drops its body sentences from
+    // displaySentences AND stamps `collapsed: true` on the surviving heading
+    // entry — the one bit the C++ activeSentenceIndex reads to hold the
+    // playback highlight on a collapsed chapter's heading.
+    void collapsedChapterDropsBodyAndStampsHeading()
+    {
+        QQuickView view;
+        // basicSentences(): "Hello world" @0, "Second line" @5. Chapter "Two"
+        // @5 covers "Second line".
+        QVERIFY2(openPanel(&view, basicSentences(),
+                            QVariantList{chapter(5, QStringLiteral("Two"))}),
+                 "could not load MainPanel.qml / locate it");
+
+        // Not collapsed: 3 entries (2 sentences + heading), heading.collapsed=false.
+        {
+            const QVariantList entries = m_panel->property("displaySentences").toList();
+            QCOMPARE(entries.size(), 3);
+            bool sawHeading = false;
+            for (const QVariant &v : entries) {
+                const QVariantMap e = v.toMap();
+                if (e.value(QStringLiteral("isChapterHeading")).toBool()) {
+                    sawHeading = true;
+                    QCOMPARE(e.value(QStringLiteral("collapsed")).toBool(), false);
+                }
+            }
+            QVERIFY(sawHeading);
+        }
+
+        // Collapse chapter @5: its body ("Second line") drops, heading stays
+        // with collapsed=true.
+        QVariantMap collapsed;
+        collapsed.insert(QStringLiteral("5"), true);
+        m_panel->setProperty("collapsedChapters", collapsed);
+        QTest::qWait(50);
+
+        const QVariantList entries = m_panel->property("displaySentences").toList();
+        QCOMPARE(entries.size(), 2); // "Hello world" + the collapsed heading
+        bool sawCollapsedHeading = false;
+        for (const QVariant &v : entries) {
+            const QVariantMap e = v.toMap();
+            QVERIFY2(e.value(QStringLiteral("text")).toString() != QStringLiteral("Second line"),
+                     "the collapsed chapter's body sentence must be dropped");
+            if (e.value(QStringLiteral("isChapterHeading")).toBool()) {
+                sawCollapsedHeading = true;
+                QCOMPARE(e.value(QStringLiteral("collapsed")).toBool(), true);
+            }
+        }
+        QVERIFY2(sawCollapsedHeading, "the heading entry must survive with collapsed=true");
     }
 };
 

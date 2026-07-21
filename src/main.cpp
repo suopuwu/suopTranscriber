@@ -7,6 +7,7 @@
 
 #include <unistd.h>
 
+#include "core/FocusBlurFilter.h"
 #include "core/IconTheme.h"
 
 int main(int argc, char *argv[])
@@ -82,6 +83,13 @@ int main(int argc, char *argv[])
     // restart.
     QCoreApplication::setOrganizationName("suopTranscriber");
     QCoreApplication::setApplicationName("suopTranscriber");
+
+    // App-wide "click outside a focused text field blurs (commits) it". Installed
+    // on the application so it observes every press BEFORE any QML grab — the
+    // reason a Flickable/ScrollView/MouseArea eating the press no longer defeats
+    // it. Lives on the stack for the whole app.exec(); never consumes events.
+    FocusBlurFilter focusBlurFilter;
+    app.installEventFilter(&focusBlurFilter);
 
     QQmlApplicationEngine engine;
     // Serves AppIcon.qml's "image://suopicons/..." sources — SVG icons
