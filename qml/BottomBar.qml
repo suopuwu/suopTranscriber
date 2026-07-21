@@ -402,7 +402,7 @@ Item {
                 anchors.centerIn: parent
                 name: "settings"
                 iconSize: 12
-                color: "#aaaaaa"
+                color: Theme.textMuted
             }
         }
 
@@ -421,7 +421,7 @@ Item {
                 visible: bottomBar.vaultLocalPath === ""
                 Layout.fillWidth: true
                 text: qsTr("No vault open")
-                color: "#aaaaaa"
+                color: Theme.textMuted
                 font.pixelSize: 11
             }
 
@@ -446,7 +446,7 @@ Item {
                     elide: segment.isRoot ? Text.ElideMiddle : Text.ElideRight
                     text: segment.modelData.text
                     // Wave D item 2: the in-vault part is dimmer than the root.
-                    color: segment.isRoot ? "#aaaaaa" : "#666666"
+                    color: segment.isRoot ? Theme.textMuted : Theme.textDisabled
                     font.pixelSize: 11
                     // Underline only the hovered segment, not the whole path:
                     // each segment is its own target, so underlining all of
@@ -479,7 +479,7 @@ Item {
             elide: Text.ElideMiddle
             visible: bottomBar.hasDisplayJob
             text: bottomBar.displayJobKindLabel + ": " + bottomBar.displayJobFileName
-            color: "#aaaaaa"
+            color: Theme.textMuted
             font.pixelSize: 11
         }
 
@@ -501,7 +501,7 @@ Item {
                     ? qsTr("(paused)")
                     : "(" + bottomBar.currentPhaseLabel + " "
                       + (bottomBar.taskProgress * 100).toFixed(1) + "%)"
-            color: "#888888"
+            color: Theme.textSecondary
             font.pixelSize: 11
         }
 
@@ -509,7 +509,7 @@ Item {
         Label {
             visible: bottomBar.busy && bottomBar.elapsedEtaText !== ""
             text: bottomBar.elapsedEtaText
-            color: "#888888"
+            color: Theme.textSecondary
             font.pixelSize: 11
         }
 
@@ -565,7 +565,7 @@ Item {
                 anchors.centerIn: parent
                 name: bottomBar.playPauseIconName()
                 iconSize: 11
-                color: "#dddddd"
+                color: Theme.textPrimary
             }
         }
 
@@ -604,7 +604,7 @@ Item {
         Label {
             text: bottomBar.transcriptionController ? bottomBar.transcriptionController.activeBackendKind : ""
             visible: text !== ""
-            color: "#888888"
+            color: Theme.textSecondary
             font.pixelSize: 11
         }
 
@@ -630,7 +630,7 @@ Item {
             Label {
                 id: tasksLabel
                 text: qsTr("%1/%2 tasks").arg(bottomBar.tasksCompleted).arg(bottomBar.tasksTotal)
-                color: "#aaaaaa"
+                color: Theme.textMuted
                 font.pixelSize: 11
                 font.underline: tasksHover.hovered
             }
@@ -688,10 +688,10 @@ Item {
         closePolicy: Popup.CloseOnPressOutside | Popup.CloseOnEscape
 
         background: Rectangle {
-            color: "#242424"
+            color: Theme.surfaceDialog
             radius: AppSettings.borderRadius
             border.width: 1
-            border.color: "#3a3a3a"
+            border.color: Theme.border
         }
 
         // While this popup is up it IS the task surface: task-related
@@ -767,7 +767,7 @@ Item {
                         anchors.centerIn: parent
                         name: bottomBar.playPauseIconName()
                         iconSize: 12
-                        color: "#dddddd"
+                        color: Theme.textPrimary
                     }
                 }
                 // Item 3: cancels every Queued job, then the Active one too
@@ -783,9 +783,9 @@ Item {
 
                     background: Rectangle {
                         radius: AppSettings.borderRadius
-                        color: (cancelAllButton.hovered && cancelAllButton.enabled) ? "#3a3a3a" : "#2a2a2a"
+                        color: (cancelAllButton.hovered && cancelAllButton.enabled) ? Theme.surfaceHover : Theme.surface
                         border.width: 1
-                        border.color: "#3a3a3a"
+                        border.color: Theme.border
                     }
                     HoverHandler {
                         cursorShape: Qt.PointingHandCursor
@@ -803,9 +803,9 @@ Item {
 
                     background: Rectangle {
                         radius: AppSettings.borderRadius
-                        color: (clearButton.hovered && clearButton.enabled) ? "#3a3a3a" : "#2a2a2a"
+                        color: (clearButton.hovered && clearButton.enabled) ? Theme.surfaceHover : Theme.surface
                         border.width: 1
-                        border.color: "#3a3a3a"
+                        border.color: Theme.border
                     }
                     HoverHandler {
                         cursorShape: Qt.PointingHandCursor
@@ -1128,7 +1128,7 @@ Item {
                                     elide: Text.ElideRight
                                     horizontalAlignment: Text.AlignRight
                                     text: jobRow.statusText + (jobRow.detailText !== "" ? " (" + jobRow.detailText + ")" : "")
-                                    color: "#888888"
+                                    color: Theme.textSecondary
                                     font.pixelSize: 9
 
                                     // O20: surface the real error message on
@@ -1173,7 +1173,7 @@ Item {
                                         anchors.centerIn: parent
                                         name: "move-up"
                                         iconSize: 9
-                                        color: "#dddddd"
+                                        color: Theme.textPrimary
                                     }
                                 }
                                 Item {
@@ -1200,7 +1200,7 @@ Item {
                                         anchors.centerIn: parent
                                         name: "move-down"
                                         iconSize: 9
-                                        color: "#dddddd"
+                                        color: Theme.textPrimary
                                     }
                                 }
 
@@ -1253,7 +1253,7 @@ Item {
                                         anchors.centerIn: parent
                                         name: "undo"
                                         iconSize: 13
-                                        color: "#dddddd"
+                                        color: Theme.textPrimary
                                     }
                                     ToolTip.visible: undoHover.hovered
                                     ToolTip.text: undoButton.stale
@@ -1307,7 +1307,7 @@ Item {
                                         anchors.centerIn: parent
                                         name: "close"
                                         iconSize: 13
-                                        color: "#dddddd"
+                                        color: Theme.textPrimary
                                     }
                                 }
                             }

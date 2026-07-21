@@ -94,10 +94,10 @@ ComboBox {
     // Closed-state box gets the app's own corner radius (QQC2's default box is
     // square-cornered), matching the popup background below.
     background: Rectangle {
-        color: "#242424"
+        color: Theme.surfaceDialog
         radius: AppSettings.borderRadius
         border.width: 1
-        border.color: "#3a3a3a"
+        border.color: Theme.border
     }
 
     // Small dot per entry — green if the weights are on disk, gray if picking
@@ -125,7 +125,7 @@ ComboBox {
                 width: 8
                 height: 8
                 radius: 4
-                color: modelDelegate.modelData.downloaded ? "#2ecc71" : "#555555"
+                color: modelDelegate.modelData.downloaded ? Theme.success : "#555555"
                 Layout.alignment: Qt.AlignVCenter
             }
         }
@@ -164,10 +164,10 @@ ComboBox {
         }
 
         background: Rectangle {
-            color: "#242424"
+            color: Theme.surfaceDialog
             radius: AppSettings.borderRadius
             border.width: 1
-            border.color: "#3a3a3a"
+            border.color: Theme.border
         }
     }
 }

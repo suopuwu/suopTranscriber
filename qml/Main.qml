@@ -380,7 +380,7 @@ ApplicationWindow {
                 color: "transparent"
                 radius: AppSettings.borderRadius
                 border.width: 2
-                border.color: "#2ecc71"
+                border.color: Theme.success
             }
         }
 

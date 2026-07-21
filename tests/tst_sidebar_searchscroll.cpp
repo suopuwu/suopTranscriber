@@ -24,6 +24,7 @@
 #include <QUrl>
 
 #include "IconTheme.h"
+#include "TreeOrdering.h"
 #include "VaultSearchProxyModel.h"
 #include "VaultTreeModel.h"
 
@@ -105,10 +106,13 @@ private slots:
         QVERIFY(qmldir.open(QIODevice::WriteOnly | QIODevice::Text));
         qmldir.write("module SuopTranscriber\n"
                       "singleton AppSettings 1.0 qml/AppSettings.qml\n"
+                      "singleton Theme 1.0 qml/Theme.qml\n"
                       "singleton Notifications 1.0 qml/Notifications.qml\n"
                       "HoverBorder 1.0 qml/HoverBorder.qml\n"
                       "CombineGroupOutline 1.0 qml/CombineGroupOutline.qml\n"
                       "AppIcon 1.0 qml/AppIcon.qml\n"
+                      "AppIconButton 1.0 qml/AppIconButton.qml\n"
+                      "ConfirmPopup 1.0 qml/ConfirmPopup.qml\n"
                       "PlayGlyph 1.0 qml/PlayGlyph.qml\n"
                       "PauseGlyph 1.0 qml/PauseGlyph.qml\n"
                       "Sidebar 1.0 qml/Sidebar.qml\n");
@@ -117,6 +121,12 @@ private slots:
         qmlRegisterSingletonType<IconTheme>(
             "SuopTranscriber", 1, 0, "IconTheme",
             [](QQmlEngine *, QJSEngine *) -> QObject * { return new IconTheme; });
+        // TreeOrdering is the C++ singleton refreshTreeOrdering() calls to
+        // compute the tree's ordering (see src/core/TreeOrdering.h) — without
+        // it registered, Sidebar.qml fails to load outright.
+        qmlRegisterSingletonType<TreeOrdering>(
+            "SuopTranscriber", 1, 0, "TreeOrdering",
+            [](QQmlEngine *, QJSEngine *) -> QObject * { return new TreeOrdering; });
         qmlRegisterType<VaultTreeModel>("SuopTranscriber", 1, 0, "VaultTreeModel");
         qmlRegisterType<VaultSearchProxyModel>("SuopTranscriber", 1, 0, "VaultSearchProxyModel");
         qmlRegisterUncreatableType<TranscriptionControllerStub>(

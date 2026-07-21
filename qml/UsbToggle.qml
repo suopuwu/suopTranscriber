@@ -35,17 +35,17 @@ Item {
         radius: AppSettings.borderRadius
         opacity: root.enabled ? 1.0 : 0.4
         color: root.checked
-               ? (hover.hovered ? "#2ecc71" : "#25a25a")
-               : (hover.hovered ? "#3a3a3a" : "#2a2a2a")
+               ? (hover.hovered ? Theme.success : Theme.successDim)
+               : (hover.hovered ? Theme.surfaceHover : Theme.surface)
         border.width: 1
-        border.color: root.checked ? "#2ecc71" : "#4a4a4a"
+        border.color: root.checked ? Theme.success : Theme.borderStrong
         Behavior on color { ColorAnimation { duration: AppSettings.animationsEnabled ? 100 : 0 } }
     }
     Label {
         id: toggleLabel
         anchors.centerIn: parent
         text: root.text
-        color: root.checked ? "white" : "#aaaaaa"
+        color: root.checked ? "white" : Theme.textMuted
         font.pixelSize: 11
     }
     ToolTip.visible: hover.hovered && root.tooltip !== ""

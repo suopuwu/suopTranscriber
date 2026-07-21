@@ -24,9 +24,12 @@
 #include <utility>
 #include <vector>
 
+#include "CombineScanner.h" // full type — CombineGroup is a by-value parameter/return
+                            // type of the combine queue glue below
 #include "EngineRegistry.h" // EngineDescriptor — discoverEngines()/resolveEngine() return it
                             // by value (std::vector<>/std::optional<>), which needs the
                             // complete type, not just a forward declaration.
+#include "PhaseTimer.h" // full type — m_phaseTimer is called from inline getters
 #include "RollingAverage.h"
 #include "Segment.h"
 #include "UsbRuleStore.h"
@@ -45,115 +48,13 @@ class TaskRunner;
 // (VaultTreeModel is included above, not forward-declared — see the include note.)
                       // so the model still owns the per-file delete/restore
                       // signal emission MainPanel depends on.
-struct DiarizedTurn; // DiarizationEngine.h — forward-declared so this header
-                     // needn't pull in sherpa-onnx (spliceBodySpeakers only
-                     // takes a const-ref to a vector of these).
-struct LabelResult; // LabelingEngine.h — forward-declared for writeLabelingFields()
 
-// Writes segment lines to an open sidecar .md file (see appendSegmentLine's
-// former doc comment / CLAUDE.md "vault layout"), merging a REPEATING CYCLE
-// of consecutive segments (period 1..maxCycleLength — one repeated line, or
-// a repeating block of 2, 3, ... lines) into just ONE copy of the cycle —
-// whisper.cpp occasionally hallucinates the exact same sentence, OR the
-// exact same short alternating pattern (e.g. "[MUSIC PLAYING]" / "[APPLAUSE]"
-// back and forth), across many consecutive segments during a silence
-// stretch, and per the user's request that must be merged IN THE FILE
-// ITSELF, not just hidden by a display-layer dedup. Each line of a merged
-// cycle keeps its own FIRST-occurrence timestamp and gets its own trailing
-// " (×N)" repeat-count marker (see segmentLinePattern() in
-// TranscriptionController.cpp for the parse side) — N is how many times
-// THAT particular line occurred, which for every line in a repeating cycle
-// is the same N (the cycle's repeat count). Two lines with identical text
-// but DIFFERENT speakers are never merged.
-//
-// maxCycleLength bounds the search purely for performance — every new
-// segment does an O(maxCycleLength^2) check against a small trailing
-// window, never a full-file scan, so this stays cheap regardless of
-// transcript length. Configurable (AppSettings.duplicateCycleWindow in QML
-// -> TranscriptionController::transcribe()'s duplicateCycleWindow param),
-// default 3 (checks period 1, 2, AND 3 — not just 3 alone).
-//
-// Durability is preserved despite the merge: each append() call leaves the
-// file in a fully valid, flushed state — a duplicate cycle doesn't append
-// new lines, it seeks back to the start of the EARLIEST line in the
-// matched cycle (valid because writes are always sequential/at EOF, and
-// every LineRecord's fileOffset is kept up to date across rewrites) and
-// rewrites just that one copy in place with incremented counts, so a kill
-// mid-run still leaves a correctly-formatted (if not-yet-fully-repeated)
-// file. Declared here (rather than file-local in the .cpp) so tests can
-// drive it directly with synthetic Segments, without needing a real
-// whisper model.
-class SegmentLineWriter {
-public:
-    explicit SegmentLineWriter(QFile &mdFile, int maxCycleLength = 3);
-
-    // speakerLabel: empty = speaker detection wasn't on (or produced no
-    // label) for this segment — no leading tag written, matching the
-    // legacy no-detection format exactly. Non-empty = the real diarized
-    // speaker label ("Speaker 1", "Speaker 2", ...; see DiarizationEngine).
-    // Segments with empty (whitespace-only) text are silently skipped, same
-    // as the old appendSegmentLine did.
-    void append(const Segment &segment, const QString &speakerLabel);
-
-private:
-    // One physical line currently at the tail of the file, as it stands
-    // right now (fileOffset/repeatCount reflect the CURRENT on-disk state,
-    // which may already have been rewritten by an earlier merge).
-    struct LineRecord {
-        qint64 fileOffset = 0;
-        QString speakerLabel;
-        QString text;
-        double t0 = 0.0;
-        int repeatCount = 1;
-    };
-
-    void writeRecord(const LineRecord &record);
-    void tryMergeCycle();
-
-    QFile &m_mdFile;
-    int m_maxCycleLength;
-    // Bounded to the last 2*maxCycleLength entries (see tryMergeCycle()) —
-    // that's all a period-<=maxCycleLength check can ever need to look at.
-    QVector<LineRecord> m_tail;
-};
-
-// Feature 3a ("generate chapters"): one resolved chapter boundary, ready to
-// splice into a transcript body — t0 already resolved from whatever segment
-// index the LLM proposed (see LabelingEngine::generateChapters()'s doc
-// comment for why the raw index is never trusted as a timestamp directly;
-// that resolution happens in TranscriptionController.cpp's
-// TranscriptionWorker::generateChaptersJob(), against its own freshly-parsed
-// segment list, before this struct is ever built).
-struct ResolvedChapter {
-    double t0 = 0.0;
-    QString title;
-};
-
-// Strips every existing "## [timestamp] title" chapter marker line out of
-// `body` (regeneration must replace the old marker set wholesale, never
-// accumulate duplicates across repeated "generate chapters" runs — same
-// unconditional-overwrite policy as Feature 2's prelude), then inserts each
-// of `chapters`' marker lines immediately before the segment line whose own
-// leading "[timestamp]" exactly matches that chapter's t0 (formatted via the
-// same formatTimestamp() every segment line already uses, so the match is
-// exact by construction whenever t0 came from parsing this same file — see
-// formatSegmentLine() in the .cpp). A chapter whose t0 doesn't match any
-// segment line is silently skipped rather than corrupting the body.
-//
-// Collision-free with segmentLinePattern() by construction (not just lower
-// risk, unlike the prelude's numbered-list false-positive — see
-// stripPreludeIfPresent()'s doc comment): that pattern is anchored on a
-// literal "^\[", and a line starting with "## " can never match it.
-//
-// Chapters are inserted internally in DESCENDING offset order (the
-// last-in-the-file chapter first) — inserting by ascending string offset
-// would invalidate every not-yet-inserted chapter's offset as each earlier
-// insertion shifts the string. Callers don't need to pre-sort `chapters`.
-//
-// Declared here (rather than file-local in the .cpp, mirroring
-// SegmentLineWriter above) so tests can drive the splicing logic directly
-// with synthetic values, without needing a real label model.
-QString spliceBodyChapters(const QString &body, const QList<ResolvedChapter> &chapters);
+#include "TranscriptFormat.h" // the transcript .md file format (SegmentLineWriter,
+                             // ResolvedChapter/ParsedSegment, the frontmatter
+                             // writers, the body splices) — split out of
+                             // TranscriptionController.cpp verbatim. Included
+                             // (not forward-declared) so every existing caller of
+                             // these helpers keeps compiling against this header.
 
 // Item P34 / item 28: splits a transcript's segment list into consecutive
 // windows, each formatted-char count kept within LabelingEngine::
@@ -170,148 +71,6 @@ QString spliceBodyChapters(const QString &body, const QList<ResolvedChapter> &ch
 // directly with synthetic segment text, without a real label model.
 QList<int> computeChapterWindows(const QStringList &segmentTexts);
 
-// Item 52 (standalone speaker diarization): given an already-transcribed
-// .md's `body` and its frontmatter "speakers:" allowlist (`knownSpeakers`),
-// assigns each segment line the diarized speaker `turns` say it overlaps
-// (labelForSegment()'s time-overlap rule) and splices a "[Speaker N]" tag
-// into that line IN PLACE — replacing an existing tag if the line already had
-// one (a re-diarize), or inserting one right after the timestamp if not
-// (adding speakers to a file transcribed without them). Everything else
-// (prelude, "## [ts] title" chapter markers, "(×N)" repeat markers, the
-// spoken text itself) is preserved byte-for-byte; edits are spliced from the
-// end of the body backward so earlier captured offsets stay valid. A
-// hallucinated non-speech annotation line (isNonSpeechAnnotation, e.g.
-// "[MUSIC]") is never tagged, matching run()'s inline path. `totalSeconds`
-// (the decoded audio length) stands in for the LAST segment's end time —
-// every earlier segment's end is the next segment's start (the file format
-// stores no t1). *appliedSpeakersOut, if given, receives the distinct labels
-// actually applied, in first-appearance (file) order — what the caller writes
-// back as the "speakers:" frontmatter list (mirrors
-// syncSpeakersFrontmatterToBody()'s "only tags that really landed" rule).
-// Declared here (like spliceBodyChapters above) so the splicing logic is
-// unit-testable with synthetic turns, no real DiarizationEngine needed.
-QString spliceBodySpeakers(const QString &body, const QStringList &knownSpeakers,
-                            const std::vector<DiarizedTurn> &turns, double totalSeconds,
-                            QStringList *appliedSpeakersOut = nullptr);
-
-// --- Transcript-format / vault-file helpers (Wave N task system) ---------
-// Declared here (definitions stay in the .cpp, same file-scope-not-anonymous
-// pattern already used above for isEngineModelId/discoverEngines/etc. and for
-// spliceBodySpeakers/spliceBodyChapters) so a Task subclass in src/core/tasks/
-// can call them directly without duplicating this parsing/writing logic — the
-// whole point of the task-system refactor (.task/plan.md) is that a kind's
-// doing-code has exactly ONE home. TranscriptionController.cpp remains the
-// only .cpp that DEFINES them until step 3 of that plan deletes the old
-// per-kind worker-slot bodies that used to be their only caller.
-
-// Item P7: see this function's definition-site doc comment for the full
-// audio-file-name-vs-stem collision rationale. Every sidecar-path call site
-// in this file and in VaultTreeModel.cpp must stay consistent with it.
-QString sidecarPath(const QString &audioFilePath);
-
-// The sentinel marking the end of an AI-generated prelude in a transcript
-// body (see stripPreludeIfPresent()/spliceBodyPrelude() at the definition
-// site) — a RelabelTask/ChaptersTask's skipIfAlreadyLabeled check looks for
-// this to tell "already labeled" from "never labeled".
-extern const QString kPreludeEndMarker;
-
-// Written immediately when a transcribe task starts, before any decoding
-// happens, so a killed/stopped run still leaves a file recording what it was
-// run with. See the definition site for the full field-by-field contract
-// (modelFallback/requestedModelId, speakers: allowlist, vad/vadError).
-//
-// silences (silence-capture feature, phase 1): std::nullopt means "not yet
-// known" (VAD didn't run — TranscribeTask fills the real value in with a
-// transcript-gap fallback once the transcript exists, see its doc comment)
-// and OMITS the "silences:" key entirely; a present-but-empty vector means
-// "checked, genuinely no silence found" and WRITES the key with an empty
-// value — the key is present for every transcription that got a real answer
-// one way or another, distinct from "never checked".
-void writeFrontmatter(QFile &mdFile, const QString &modelUsed, bool speakerDetection, bool modelFallback,
-                      const QString &requestedModelId, const QStringList &speakerLabels,
-                      const QString &speakerDetectionError, bool vad, const QString &vadError, bool partial,
-                      const std::optional<std::vector<std::pair<double, double>>> &silences = std::nullopt);
-
-// Formats a list of (start, end) SILENCE spans (VadChunker::complementSpans()'
-// output) into the compact "12.4-18.9, 45-52.3" frontmatter value — the same
-// trimmed-timestamp style formatTimestamp() already uses for segment lines.
-// Shared by writeFrontmatter()'s initial write and DetectSilenceTask's
-// in-place MdFrontmatter::upsertKey() call, so every writer produces
-// byte-for-byte the same shape. Empty input yields an empty string (see
-// writeFrontmatter()'s doc comment for how "empty because none found" is
-// distinguished from "not yet known").
-QString formatSilencesValue(const std::vector<std::pair<double, double>> &silences);
-
-// Splices a LabelingEngine result's label/tags/prelude fields into an
-// already-transcribed .md in place. Used by both the manual "regenerate
-// label" action and the auto-label follow-up after a transcribe.
-void writeLabelingFields(const QString &mdPath, const LabelResult &result);
-
-// Speaker-rename/merge, operating directly on a sidecar .md's frontmatter +
-// body (see segmentLinePattern()'s doc comment in the .cpp for how a "[tag]"
-// is recognized). renameSpeakerInFile REJECTS colliding with an existing
-// name (typo protection); mergeSpeakersInFile deliberately allows it (an
-// explicit "combine these two speakers" action). Both no-op successfully if
-// old==new / source==target.
-bool renameSpeakerInFile(const QString &path, const QString &oldName, const QString &newName, QString *errorOut);
-bool mergeSpeakersInFile(const QString &path, const QString &sourceName, const QString &targetName,
-                          QString *errorOut);
-
-// Splits an already-written .md into its raw frontmatter lines (minus the
-// "---" delimiters), body, the line index of "speakers:" within
-// frontmatterLines (-1 if absent), its parsed value (knownSpeakers), and
-// every speaker tag actually PRESENT in the body (distinctTags — the set
-// segmentLinePattern() matched, which may differ from the frontmatter
-// allowlist). false + *errorOut on a missing/malformed file. A DiarizeTask
-// uses this directly (not just via rename/merge) to read the file it's
-// about to splice speaker tags into.
-bool parseSpeakerTaggedFile(const QString &path, QStringList *frontmatterLines, QString *body,
-                             int *speakersLineIndex, QStringList *knownSpeakers, QStringList *distinctTags,
-                             QString *errorOut);
-
-// Rewrites path's frontmatter block + body from already-edited pieces (the
-// inverse of parseSpeakerTaggedFile) — the shared write-back every speaker-
-// tag-editing kind (rename/merge/diarize) funnels through.
-bool writeFrontmatterBlock(const QString &path, const QStringList &frontmatterLines, const QString &body,
-                           QString *errorOut);
-
-// Rewrites a .md's "speakers:" frontmatter line to exactly the tags that
-// actually appear in the body (first-appearance order), dropping the line
-// entirely if none do — see the definition site for why a raw diarization
-// cluster count can otherwise leave a phantom, never-used entry.
-void syncSpeakersFrontmatterToBody(const QString &path);
-
-// Splits a frontmatter "speakers: A, B, C" value into trimmed, non-empty
-// names. Empty/missing input (speaker detection was off, or predates this
-// key) yields an empty list.
-QStringList parseSpeakersList(const QString &raw);
-
-// Extracts the plain spoken text from a transcript body — strips prelude/
-// chapter-marker/timestamp/speaker-tag/repeat-marker decoration, leaving just
-// what was said (knownSpeakers scopes which "[tag]" runs are recognized as
-// speaker tags rather than ordinary bracketed text — see
-// segmentLinePattern()'s doc comment in the .cpp). Feeds a relabel/chapters
-// task's LLM call.
-QString plainTextFromTranscriptBody(const QString &body, const QStringList &knownSpeakers);
-
-// One segment's parsed identity from a transcript body — its position in the
-// returned QList IS its index, the same indexing LabelingEngine::
-// generateChapters() expects and returns "afterSegment" against. A
-// ChaptersTask needs both t0 (to resolve an LLM-returned index to a real
-// timestamp before anything touches disk) and text (what's shown to the
-// model) — plainTextFromTranscriptBody() above discards t0, so this is a
-// separate walk, not a wrapper around it.
-struct ParsedSegment {
-    double t0 = 0.0;
-    QString text;
-};
-QList<ParsedSegment> parsedSegmentsFromTranscriptBody(const QString &body, const QStringList &knownSpeakers);
-
-// Splices resolved chapter markers into mdPath's "## [ts] title" region and
-// rewrites the file — see spliceBodyChapters()'s doc comment for the
-// splicing rule itself; this is the file-write wrapper a ChaptersTask calls
-// once chapter indices are resolved to real timestamps.
-bool writeChaptersField(const QString &mdPath, const QList<ResolvedChapter> &chapters, QString *errorOut);
 
 // A model id with the "engine:" prefix routes to an out-of-process
 // SubprocessEngine (DESIGN.md "Pluggable engines"); anything else is a
@@ -505,38 +264,12 @@ public:
     // "no task for this path" is still the -1 sentinel that enum deliberately
     // has no member for (jobStatusForPath returns a raw -1).
 
-    // Fallback "average duration" (ms) a phase with zero recorded samples
-    // yet uses — for BOTH recomputeOverallProgress()'s weight normalization
-    // AND phaseRelativeSyntheticProgress()'s elapsed-vs-average synthetic
-    // math ("loading"/"decoding" only). MUST be a plausible real duration,
-    // not an arbitrary small constant: phaseRelativeSyntheticProgress()
-    // divides elapsed-ms by it, so too small a fallback makes the bar (and,
-    // before any RollingAverage has a single sample, the SYNTHESIZED
-    // per-phase progress specifically) jump to ~full within milliseconds of
-    // a phase starting — exactly the "whole bar filled at all times" bug
-    // report (2026-07-10) from a value of 1.0 here on the very first-ever
-    // run. User correction (2026-07-10): default to the SAME fixed 50/50
-    // split between "detecting-speakers"/"transcribing" this feature
-    // replaced, rather than a naive equal four-way split — "loading"/
-    // "decoding" get their own modest, plausible default durations instead
-    // of participating in that 50/50.
-    //
-    // Public (rather than tucked away private like the rest of this feature's
-    // internals) specifically so tst_transcription_queue.cpp can assert this
-    // directly, deterministically, with no wall-clock timing involved — an
-    // integration test that instead tries to catch the SYMPTOM (elapsed time
-    // during "loading" growing overallProgress too fast) turned out to be
-    // unreliable on fast hardware, where a real model's "loading" phase can
-    // complete before even one recomputeOverallProgress() timer tick fires,
-    // masking the bug entirely regardless of whether it's fixed.
+    // The phase-timing subsystem moved to PhaseTimer (2026-07-20) — see its
+    // class doc comment. These two stay here as the names tests (and any
+    // caller holding only a controller) already spell; both are pure
+    // forwarders to the canonical definitions on PhaseTimer, where their full
+    // doc comments now live.
     static double defaultPhaseDurationMs(const QString &phase);
-    // The phase names m_phaseTimings/QSettings' "phaseTimings" group/
-    // defaultPhaseDurationMs() all key on. "detecting-speech" (VAD windowing,
-    // part of every transcribe job) and "detecting-speakers" (the standalone
-    // diarize job — see m_activeSpeakerDetection) are both included even though
-    // each is specific to a job shape — they're still things worth separately
-    // timing. Public for the same testability reason as defaultPhaseDurationMs()
-    // above.
     static const QStringList kTimedPhases;
 
     explicit TranscriptionController(QObject *parent = nullptr);
@@ -549,9 +282,19 @@ public:
     // (loading/decoding/detecting-speech), so the bottom bar's per-phase
     // percentage counts up instead of sitting at 0% until the phase flips (see
     // phaseRelativeSyntheticProgress()).
-    double progress() const { return phaseRelativeSyntheticProgress(); }
-    // See the overallProgress Q_PROPERTY doc comment above.
-    double overallProgress() const { return m_overallProgress; }
+    // PhaseTimer owns the math; the active-job context it needs (current
+    // phase, model, diarization flag, the real callback fraction, and how long
+    // this phase has been running) is serial-lane display state that only this
+    // object can observe, so it's passed in per call.
+    double progress() const
+    {
+        return m_phaseTimer->phaseRelativeSyntheticProgress(m_phase, activeModelIdForTiming(),
+                                                            m_activeSpeakerDetection, m_progress,
+                                                            activeElapsedMs() - m_phaseStartMs);
+    }
+    // See the overallProgress Q_PROPERTY doc comment above. Stored on
+    // PhaseTimer, which also owns the change signal this class re-emits.
+    double overallProgress() const { return m_phaseTimer->overallProgress(); }
     // True iff a task is Active AND it declares Presentation::Foreground —
     // i.e. it owns the main-panel overlay. False when idle, and false for a
     // Background task (benchmark/sweep/download), which still shows a Tasks
@@ -565,19 +308,12 @@ public:
     }
     bool activeCanPause() const;
     QString currentPhase() const { return m_phase; }
-    // Human-readable label for a phase slug ("loading" -> "loading model…"),
-    // the SINGLE source of truth for the phase vocabulary's display text.
-    // Replaced BottomBar's phaseLabel(phase) switch — a new emitted phase that
-    // forgot a QML case rendered blank; now the label lives next to the rest
-    // of the phase semantics (kTimedPhases/phaseBucket/canonicalPhaseKey), and
-    // tst_styleguide guards that every emitted phase slug is covered here.
-    // Returns empty for an unknown slug.
+    // The phase-vocabulary REGISTRY (slug -> bottom-bar label / main-panel
+    // overlay title) moved to JobListFormatter (2026-07-20) — see its class
+    // doc comment, where these two carry their full docs. They stay here as
+    // the Q_INVOKABLE names QML already spells (BottomBar's phase text,
+    // MainPanel's transcribingOverlayLabel); both are pure forwarders.
     Q_INVOKABLE QString phaseLabel(const QString &phase) const;
-    // The blocking-overlay title for a phase ("loading" -> "Loading model…"),
-    // the title-case action variant of phaseLabel. Empty for a phase that
-    // never raises the main-panel overlay (a Background kind) or an unknown
-    // slug — MainPanel falls back to a generic "Transcribing…". Same single
-    // phase registry as phaseLabel(); this is its overlay column.
     Q_INVOKABLE QString phaseOverlayLabel(const QString &phase) const;
     QUrl currentFile() const { return m_currentFile; }
     // See the liveUpdateTick Q_PROPERTY doc comment above.
@@ -630,10 +366,13 @@ public:
     Q_INVOKABLE qint64 estimatedRemainingMs() const;
     // Derived from m_jobs: total entry count / Done+Failed count. Both only
     // grow until dismiss()/clearFinished() shrink the list (see class doc).
+    // Thin forwarders to TaskQuery — pure over the task list; they stay here
+    // because they're the Q_PROPERTY surface QML binds to.
     int tasksTotal() const;
     int tasksCompleted() const;
     // fileUrls of jobs still Queued (not yet started) — used by QML to show
-    // a "Queued…" state distinct from the currently-Active job.
+    // a "Queued…" state distinct from the currently-Active job. Forwards to
+    // TaskQuery::queuedFileUrls().
     QVariantList queuedFileUrls() const;
     // Every job for this session (Queued+Active+Done+Failed), each as
     // {fileUrl, status ("queued"/"active"/"done"/"failed"), error,
@@ -644,30 +383,16 @@ public:
     QVariantList jobs() const;
 
     // Item 11: jobs() reordered for display — see the sortedJobs Q_PROPERTY
-    // doc comment. Delegates the partitioning to the pure static helper
-    // below so the ordering is unit-testable with synthetic entries.
+    // doc comment. Walking m_tasks (jobs()) is the part only this class can
+    // do; the collapsing and partitioning are pure transforms over that list
+    // and live on JobListFormatter.
     QVariantList sortedJobs() const;
-    // Pure partition of a jobs()-shaped list (each entry a QVariantMap with a
-    // "status" key of "active"/"queued"/"paused"/"done"/"failed"): Active,
-    // then Queued, then Paused, then finished (done/failed) — the last group
-    // reversed so most-recently-appended (≈ most-recently-finished, since
-    // jobs run and finish in append order) is first. Relative order WITHIN
-    // the non-finished groups is preserved (stable), so Queued stays in run
-    // order. Static + public purely so tst_transcription_queue can assert the
-    // ordering deterministically without spinning up real jobs.
-    static QVariantList sortJobsForDisplay(const QVariantList &jobEntries);
 
-    // Collapse the rows of a multi-select batch (each carrying the same
-    // non-zero "batchId", stamped by enqueueBatch()) into ONE aggregate row so
-    // a bulk op appears as a single Tasks entry — "at least visually" one task,
-    // while the underlying per-file tasks keep running/reporting individually
-    // (that per-file granularity is what the queue, the tree's status dots, and
-    // per-file cancel all depend on; see DESIGN.md "Task system"). The
-    // aggregate carries a "members" list (the original per-task rows) for the
-    // expandable UI, plus aggregate status/counts. A batch of ONE member is
-    // emitted flat (no pointless "1 file" row). Standalone rows (batchId 0)
-    // pass through untouched. Pure + static so it's unit-testable like
-    // sortJobsForDisplay(); sortedJobs() applies it before partitioning.
+    // The two pure jobs()-list display transforms moved to JobListFormatter
+    // (2026-07-20) — see its class doc comment, where their full doc comments
+    // now live. They stay here as the public static names
+    // tst_transcription_queue already spells; both are pure forwarders.
+    static QVariantList sortJobsForDisplay(const QVariantList &jobEntries);
     static QVariantList collapseBatches(const QVariantList &jobEntries);
 
     // Item P6: lets the sidebar's file tree query a single path's job status
@@ -814,7 +539,8 @@ public:
     // needed, same as DiarizeTask).
     Q_INVOKABLE void detectSilences(const QUrl &fileUrl, const QUrl &vaultUrl);
 
-    // True if fileUrl currently has a Queued or Active entry.
+    // True if fileUrl currently has a Queued or Active entry. Forwards to
+    // TaskQuery::isQueued().
     Q_INVOKABLE bool isQueued(const QUrl &fileUrl) const;
 
     // True if fileUrl's stored transcription (frontmatter) already used
@@ -1140,6 +866,11 @@ public:
     // underlying list. No-op if id doesn't name a currently-Queued entry.
     // Active/Done/Failed entries are never reorderable (an Active job's
     // position is meaningless to move; history is append-only).
+    //
+    // Split: the index math (which real index moves where, and the no-op
+    // cases) is TaskQuery::planQueuedMove(); what stays here is the actual
+    // reorder of the owning vector, the m_activeIndex fixups, and the
+    // queueChanged() emission.
     Q_INVOKABLE void moveQueuedJob(int id, int newIndex);
 
     // Sets/replaces the `label:` frontmatter key on an already-transcribed
@@ -1502,45 +1233,16 @@ public:
         QStringList values;
     };
 
-    // Split-recording combine: matches vault audio filenames against
-    // user-authored regex rules (AppSettings.combineRules) to find groups of
-    // files that are really one recording split by the recorder — see
-    // findCombineGroups() in the .cpp for the full matching/grouping
-    // semantics. Pure over its inputs (only touches disk via QFileInfo stats
-    // on the paths passed in), so this same entry point backs both the
-    // Settings "test this rule" preview AND runCombineScan()'s real enqueue
-    // decisions below. Each rule map: {name, pattern, enabled, sortGroupIndex}.
-    // Returns one entry per detected group: {ruleName, key, capturedValues
-    // (QStringList, the rule's GROUPING capture groups un-concatenated — key
-    // is these joined with no separator), files (QStringList, in combine
-    // order — see findCombineGroups()'s doc comment for the sort
-    // differentiator / mtime-default ordering rules), outputPath, status
-    // ("ready"/"singleton"/"alreadyTranscribed"/"alreadyCombined"/"pending")}.
+    // The split-recording combine DETECTION subsystem moved to CombineScanner
+    // (2026-07-20) — see its class doc comment. These three stay here as the
+    // Q_INVOKABLE names QML (SettingsPopup.qml's combine page, Sidebar.qml's
+    // group outlines) and tests already spell; all three are pure forwarders
+    // to the canonical definitions on CombineScanner, where their full doc
+    // comments now live. The queue glue below (runCombineScan()/
+    // combineGroup() and their private helpers) is what did NOT move: it
+    // mutates m_tasks.
     Q_INVOKABLE QVariantList detectCombineGroups(const QVariantList &rules, const QStringList &audioPaths) const;
-
-    // Live validity check for a combine-rule pattern as the user types it in
-    // Settings — validates against the EXACT SAME regex engine
-    // findCombineGroups()/matchRuleCapturedKey() actually use (QRegularExpression),
-    // not QML/JS RegExp, whose syntax isn't guaranteed identical. Empty pattern
-    // is not an error (that's just "no rule authored yet"); returns the empty
-    // string on success, QRegularExpression's own errorString() otherwise.
     Q_INVOKABLE QString regexValidationError(const QString &pattern) const;
-
-    // Backs Settings' per-rule "differentiator" buttons (SettingsPopup.qml):
-    // a differentiator is just a capturing group whose captured text joins
-    // matchRuleCapturedKey()'s combine-grouping key, but ONLY if it
-    // actually participates in every match — a capturing group sitting in
-    // an alternation branch that isn't always taken (e.g.
-    // `(sometext)|(some other text)`) doesn't reliably differentiate
-    // anything for the files that took the OTHER branch. Returns the
-    // subset of audioPaths where `pattern` (already the CANDIDATE pattern
-    // text — this method does no wrapping/rewriting itself) matches the
-    // filename overall but capture group `groupIndex` (1-based) has
-    // QRegularExpressionMatch::capturedStart() < 0, i.e. did not
-    // participate in that match at all. A valid-but-zero-length
-    // participation (e.g. `\d*` matching "") is NOT flagged — only
-    // non-participation is. Empty result = safe to use as a differentiator
-    // across every file currently in the vault.
     Q_INVOKABLE QStringList differentiatorNonParticipatingFiles(const QString &pattern, int groupIndex,
                                                                   const QStringList &audioPaths) const;
 
@@ -1724,83 +1426,14 @@ private:
     // places and one could silently be forgotten.
 
 
-    // One detected group of split-recording parts — see findCombineGroups()'s
-    // doc comment for the matching/grouping/status semantics. Mirrors
-    // detectCombineGroups()'s QVariantMap shape one-to-one; kept as a real
-    // struct internally so startJob()'s per-job safety check and
-    // runCombineScan() don't have to round-trip through QVariant.
-    struct CombineGroup {
-        QString ruleName;
-        QString key;
-        // The rule's GROUPING capture groups, un-concatenated (key is these
-        // joined with no separator) — deliberately excludes the sort
-        // differentiator's own group, if the rule has one (see
-        // findCombineGroups()'s doc comment: a sort differentiator is
-        // explicitly not a grouping one). Exposed to detectCombineGroups()'s
-        // QVariantList so the Settings preview can show a header of exactly
-        // which differentiator values grouped these files, not just the
-        // flattened key.
-        QStringList capturedValues;
-        QStringList files; // combine order — see findCombineGroups()'s doc comment
-        QString outputPath;
-        QString status; // "ready"/"singleton"/"alreadyTranscribed"/"alreadyCombined"/"pending"
-    };
+    // The CombineGroup struct and findCombineGroups() (pure detection over
+    // (rules, audioPaths)) moved to CombineScanner (2026-07-20) — see that
+    // header. What stays below is the QUEUE glue that consumes them, which
+    // needs m_tasks.
 
-    // Matches every path in audioPaths against every enabled rule in `rules`
-    // ({name, pattern, enabled, sortGroupIndex} maps) using QRegularExpression
-    // SEARCH semantics (not anchored unless the pattern itself has ^/$)
-    // against the full filename (name+ext). A match's capture groups
-    // (captured(1..N), concatenated, EXCLUDING the sortGroupIndex one if the
-    // rule has one — see below) are the group-identity "key", together with
-    // the file's CONTAINING FOLDER: a rule only ever sees the bare filename,
-    // so identically-named parts sitting in two different folders are two
-    // separate groups, never one cross-folder group. They're unrelated
-    // recordings that merely share a naming scheme, and the vault tree can't
-    // draw one outline around rows that aren't siblings regardless. This also
-    // makes outputPath unambiguous — the merged file always lands in the
-    // group's own folder. An
-    // uncaptured wildcard span (bare `.`, `\d{3}`, `.*`, ...) varies freely
-    // between members without affecting grouping, matching the user's
-    // stated model of "the rule gets the real string with the wildcard
-    // replaced; same real string = combine". A rule with zero grouping
-    // capture groups therefore groups EVERY file it matches into one bucket
-    // (expected regex behavior, not a special case).
-    //
-    // Combine ORDER within a group: `sortGroupIndex` (1-based capture-group
-    // number, -1/absent = none) optionally names ONE of the rule's capture
-    // groups as the SORT differentiator instead of a grouping one — the
-    // Settings UI enforces "at most one, and it stops being a grouping
-    // differentiator the moment it's chosen" (matchRuleCapturedKey() excludes
-    // it from `key`/capturedValues entirely). When every member of a group
-    // captured a value for it, members are ordered by that value — compared
-    // numerically (QString::toDouble()) if EVERY member's value parses as a
-    // number, else compared as plain strings; "numeric or not" is decided
-    // once for the whole group, not per pair, since a comparator that
-    // switches between numeric and lexicographic per pair isn't a strict
-    // weak ordering (undefined behavior for std::sort). Falls back to mtime
-    // ascending — the default, and the ONLY order when no sort
-    // differentiator is configured — deliberately NOT file creation/birth
-    // time: birth time doesn't survive a plain file copy on Linux (cp/rsync/
-    // a cross-filesystem mv all stamp a fresh one on the destination), while
-    // mtime is preserved by every standard copy tool, and this app has no
-    // way to know (or reason to assume) whether a given vault's audio was
-    // recorded directly onto the vault path or copied in from an SD card —
-    // mtime is the only signal that's correct either way.
-    //
-    // outputPath is derived from (sanitized ruleName, sanitized key) rather
-    // than any single member's filename, so it's re-derivable from just one
-    // surviving filename even after the rest have been moved into
-    // .combined/ — see startJob()'s safety-net re-check, which relies on
-    // exactly that. status: "singleton" (only one match), "alreadyTranscribed"
-    // (skip — some member already has a sibling .md, never silently discard
-    // existing work), "alreadyCombined" (outputPath already exists on disk),
-    // "pending" (would be ready, but the group's true most-recently-modified
-    // member — independent of whatever order the group ended up sorted into
-    // above — has an mtime inside kCombineStabilityWindowSecs of "now": the
-    // recorder may still be writing it), else "ready".
-    static QList<CombineGroup> findCombineGroups(const QVariantList &rules, const QStringList &audioPaths);
     // True if a Queued/Active "combine" job already targets this exact
     // outputPath — runCombineScan()'s dedup check, mirrors isDownloadQueued().
+    // Forwards to TaskQuery::isCombineQueued().
     bool isCombineQueued(const QString &outputPath) const;
     // Builds and inserts a Queued Job for `group` at frontOfQueueInsertIndex()
     // (or the given insertIndex, for callers that already computed a
@@ -1824,7 +1457,7 @@ private:
     // immediately for anything else. Two outcomes when it does act:
     // (1) the merged output for this exact fileUrl's filename already
     // exists (recomputed from the filename alone, not group membership —
-    // see findCombineGroups()'s outputPath doc comment) -> redirects
+    // see CombineScanner::findCombineGroups()'s outputPath doc comment) -> redirects
     // job.fileUrl in place and returns false, so startJob() falls through to
     // its normal dispatch against the now-merged file; (2) fileUrl is a
     // member of a currently-"ready" group per the last runCombineScan() run
@@ -1924,7 +1557,8 @@ private:
     void withBatch(const QString &displayLabel, const std::function<void()> &fn);
     // True iff some task in m_tasks still carries this (non-zero) batchId — the
     // "does this batch still exist" check behind withBatch()'s empty-batch
-    // label prune and dismissBatch()/cancelBatch()'s label cleanup.
+    // label prune and dismissBatch()/cancelBatch()'s label cleanup. Forwards
+    // to TaskQuery::batchHasMembers().
     bool batchHasMembers(int batchId) const;
     // The ONE way a task enters the queue. Assigns its id, queues any
     // prerequisites() ahead of it, inserts it, emits queueChanged(), and
@@ -1941,6 +1575,7 @@ private:
     void onTaskFinished(Task *task, bool ok, const QString &error);
     // Index of `task` in m_tasks, or -1. The runner hands back a raw pointer;
     // the task may have been removed (cancelled/dismissed) in the meantime.
+    // Forwards to TaskQuery::indexOfTask().
     int indexOfTask(const Task *task) const;
 
     // Item 17: the three public chapter editors (addChapter/setChapterTitle/
@@ -1987,10 +1622,11 @@ private:
     // a Paused job, which startNext() already treats as higher priority
     // than Queued — see its doc comment; and never before Done/Failed
     // history, which is append-only by design — see the class doc comment).
+    // Forwards to TaskQuery::frontOfQueueInsertIndex(m_tasks, m_activeIndex).
     int frontOfQueueInsertIndex() const;
     // True if ANY Queued/Active job already targets this exact download
     // (same vaultUrl + target + modelId) — maybeQueueDownloadJob()'s dedup
-    // check.
+    // check. Forwards to TaskQuery::isDownloadQueued().
     bool isDownloadQueued(ModelDownloadTarget target, const QUrl &vaultUrl, const QString &modelId) const;
 
     // Wave N (task system, item 1): serializes every Queued job (an Active
@@ -2004,72 +1640,37 @@ private:
     // (`if (job.importOnly) continue;`) that a new kind could silently forget
     // and thereby persist a mount path that names a different device next
     // session. See .task/plan.md invariant 3.
+    //
+    // Split: the JSON is built by TaskQuery::serializeQueue() (pure over the
+    // task list — that's where the Queued-only / opt-in-persistable rules
+    // actually live); what's left here is the m_vaultUrl guard, the path
+    // resolution, and the QSaveFile write.
     void persistQueue() const;
     static QString tasksJsonPath(const QUrl &vaultUrl);
 
-    // 2026-07-10 (rolling-average phase weighting): records that `phase` (one
-    // of kTimedPhases) just took `durationMs` on the job that just finished
-    // it, then recomputes m_overallProgress so the CURRENT phase's own slice
-    // reflects the freshly-updated average right away rather than waiting
-    // for the next tick. Connected to TranscriptionWorker::phaseDurationMs.
-    // Item P3: m_phaseTimings is now keyed per-CONFIGURATION (phase + modelId
-    // + speakerDetection, see canonicalPhaseKey() in the .cpp), not just
-    // phase name — modelId/speakerDetection are read from the Active job
-    // (activeModelIdForTiming()/m_activeSpeakerDetection) right here rather
-    // than threaded through the phaseDurationMs signal itself, since both are
-    // already available on the controller side whenever this runs.
+    // Still the slot TranscribeTask::phaseDurationMs connects to — the signal
+    // carries only (phase, durationMs), while the per-CONFIGURATION timing key
+    // also needs modelId + speakerDetection, both of which are Active-job state
+    // that lives here (activeModelIdForTiming()/m_activeSpeakerDetection).
+    // So this stays the connect target, reads that context, hands it to
+    // PhaseTimer::recordPhaseDuration(), and then recomputes the overall bar so
+    // the CURRENT phase's own slice reflects the freshly-updated average right
+    // away rather than waiting for the next tick.
     void recordPhaseDuration(const QString &phase, qint64 durationMs);
     // modelId of whichever job is currently Active, or empty if none/not
     // applicable — see recordPhaseDuration()'s doc comment above for why this
     // reads m_jobs/m_activeIndex directly instead of needing a parameter
     // threaded in from the worker's signal.
     QString activeModelIdForTiming() const;
-    // Rebuilds m_overallProgress from scratch: m_phase's active-phase set
-    // (loading/decoding/[detecting-speakers]/transcribing — detecting-
-    // speakers only counted when m_activeSpeakerDetection is set), each
-    // phase's rolling-average share of that set (m_phaseTimings, falling
-    // back to defaultPhaseDurationMs() per phase with no samples yet — a
-    // fixed 50/50 detecting-speakers/transcribing split by default, see its
-    // doc comment), and phaseRelativeSyntheticProgress() for the current
-    // phase's own within-phase fraction. Called on every phase()
-    // transition, every worker progress() tick, AND on m_indeterminatePhaseTimer's
-    // tick (the only way "loading"/"decoding" — which have no real progress
-    // callback — ever advance mid-phase). A no-op (leaves m_overallProgress
-    // untouched) while m_phase is empty or "downloading", neither of which
-    // this weighting scheme covers (downloadProgress's handler sets
-    // m_overallProgress directly instead — see its doc comment).
+    // Gathers the Active-job context PhaseTimer::recomputeOverallProgress()
+    // needs — the Active task's ProgressModel and its ordered phase set, plus
+    // m_phase/m_progress/m_phaseStartMs/m_activeSpeakerDetection — and hands it
+    // over. Called on every phase() transition, every task progress() tick, AND
+    // on m_indeterminatePhaseTimer's tick (the only way "loading"/"decoding" —
+    // which have no real progress callback — ever advance mid-phase). See
+    // PhaseTimer's doc comments for the weighting itself and for when it's a
+    // no-op.
     void recomputeOverallProgress();
-    // This phase's OWN 0..1 fraction — m_progress directly for phases with a
-    // real progress callback (detecting-speakers/transcribing), or, for
-    // "loading"/"decoding" (no callback exists — see run()'s doc comments),
-    // elapsed-time-in-this-phase (activeElapsedMs() - m_phaseStartMs) divided
-    // by that phase's own rolling average, clamped to 0.95 so a slower-than-
-    // average run never LOOKS finished before the real phase transition
-    // actually happens.
-    // The phases with no native per-item progress callback — their within-phase
-    // fraction is synthesized from elapsed-vs-average
-    // (phaseRelativeSyntheticProgress()) and driven by m_indeterminatePhaseTimer.
-    // ONE predicate both the timer-start gate and the synthetic-fraction branch
-    // consult, so the two phase sets can never drift again (they had: this class
-    // once synthesized for "detecting-speech" but only ran the timer for
-    // loading/decoding, so that phase's bar sat frozen).
-    static bool isSyntheticProgressPhase(const QString &phase);
-    double phaseRelativeSyntheticProgress() const;
-    // Populates m_phaseTimings from QSettings' "phaseTimings" group — one key
-    // per (phase, modelId, speakerDetection) combination ever recorded (see
-    // canonicalPhaseKey() in the .cpp), each a QVariantList of up to
-    // RollingAverage::kCapacity raw millisecond samples — called once from
-    // the constructor. Item P3: since the composite key embeds an
-    // open-ended modelId, this enumerates whatever keys are actually
-    // persisted (QSettings::childKeys()) rather than a fixed list. App-scoped
-    // (not per-vault): how long a phase takes is a property of this machine
-    // + whichever model was used, not something that should differ by vault.
-    void loadPhaseTimings();
-    // Writes JUST `key`'s (the composite canonicalPhaseKey() string) current
-    // sample list back to QSettings — called right after recordPhaseDuration()
-    // adds a new sample. Per-key (not a single bulk save) since jobs
-    // typically complete one phase at a time, not all four at once.
-    void savePhaseTiming(const QString &key);
 
     QThread m_thread;
     TaskRunner *m_runner = nullptr;
@@ -2090,30 +1691,17 @@ private:
     int m_pendingRenamesRevision = 0;
     bool m_busy = false;
     double m_progress = 0.0;
-    // Wave N (task system, item 6): the SAME 0..1 fraction run() used to
-    // blend across diarization+transcription phases (see currentPhase's doc
-    // comment for why that blending moved OUT of the displayed m_progress) —
-    // kept purely for estimatedRemainingMs()'s ETA math, never shown
-    // directly. Computed by recomputeOverallProgress() (see its doc
-    // comment), not emitted by the worker anymore, EXCEPT for a "downloading"
-    // job (see the downloadProgress connection in the constructor).
-    double m_overallProgress = 0.0;
     // See the activeIsForeground Q_PROPERTY doc comment — recomputed in
     // startTask()/onTaskFinished() from the Active task's presentation().
     bool m_activeIsForeground = false;
-    // Rolling (last RollingAverage::kCapacity samples) average duration of
-    // each named phase, keyed by a COMPOSITE string — phase bucket + modelId
-    // + speakerDetection (see canonicalPhaseKey() in the .cpp), not just the
-    // phase name TranscriptionWorker::phase emits
-    // ("loading"/"decoding"/"detecting-speakers"/"transcribing"). Item P3: a
-    // large model's phases take materially longer than a tiny one's, and
-    // diarization adds real overhead, so different configurations must not
-    // share one rolling average — see recomputeOverallProgress()'s doc
-    // comment for how these become the progress bar's per-phase widths.
-    // Loaded once in the constructor (loadPhaseTimings()), updated+persisted
-    // per-key as jobs complete each phase (recordPhaseDuration()/
-    // savePhaseTiming()).
-    QMap<QString, RollingAverage> m_phaseTimings;
+    // The phase-timing / progress-estimation collaborator: owns the persisted
+    // rolling averages AND the blended 0..1 overallProgress the QML bar binds
+    // to. Owned (QObject child, constructed first in the constructor so the
+    // inline progress()/overallProgress() getters are safe from that point on);
+    // its overallProgressChanged is forwarded to this class's same-named signal
+    // there too, which is what keeps the QML-facing Q_PROPERTY notifying
+    // exactly as it did before the split.
+    PhaseTimer *m_phaseTimer = nullptr;
     // Whether the Active job is the standalone diarize job — set in startJob()
     // from job.diarizeOnly so recomputeOverallProgress() knows whether the
     // active-phase set is the diarize shape (decoding/detecting-speakers) or

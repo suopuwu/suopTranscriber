@@ -164,7 +164,7 @@ ColumnLayout {
     Label {
         Layout.fillWidth: true
         font.pixelSize: 11
-        color: "#888888"
+        color: Theme.textSecondary
         wrapMode: Text.WordWrap
         text: qsTr("Matched against the file name only (not the folder path), and matches "
                    + "anywhere in the name unless anchored with ^ or $. \\d digit · \\w letter/digit "

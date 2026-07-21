@@ -41,7 +41,7 @@ QVariantMap rule(const QString &name, const QString &pattern, bool enabled = tru
 
 // Backdated well past findCombineGroups()'s stability window so these don't
 // read as "pending" (the recorder might still be writing the newest part) —
-// see kCombineStabilityWindowSecs in TranscriptionController.cpp.
+// see kCombineStabilityWindowSecs in CombineScanner.cpp.
 QString touchFile(const QString &dir, const QString &name, int secondsAgo)
 {
     const QString path = dir + "/" + name;

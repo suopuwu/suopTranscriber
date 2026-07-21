@@ -159,7 +159,9 @@ private slots:
         QVERIFY(qmldir.open(QIODevice::WriteOnly | QIODevice::Text));
         qmldir.write("module SuopTranscriber\n"
                      "singleton AppSettings 1.0 qml/AppSettings.qml\n"
-                     "AppIcon 1.0 qml/AppIcon.qml\n");
+                     "singleton Theme 1.0 qml/Theme.qml\n"
+                     "AppIcon 1.0 qml/AppIcon.qml\n"
+                     "AppIconButton 1.0 qml/AppIconButton.qml\n");
         qmldir.close();
         qmlRegisterSingletonType<IconTheme>(
             "SuopTranscriber", 1, 0, "IconTheme",

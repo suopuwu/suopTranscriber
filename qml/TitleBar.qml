@@ -248,10 +248,10 @@ Item {
         onClosed: titleBar.forceRetranscribeConfirming = false
 
         background: Rectangle {
-            color: "#242424"
+            color: Theme.surfaceDialog
             radius: AppSettings.borderRadius
             border.width: 1
-            border.color: "#3a3a3a"
+            border.color: Theme.border
         }
 
         Item {
@@ -271,7 +271,7 @@ Item {
             Rectangle {
                 anchors.fill: parent
                 radius: AppSettings.borderRadius
-                color: forceRetranscribeHover.hovered ? "#3a3a3a" : "transparent"
+                color: forceRetranscribeHover.hovered ? Theme.surfaceHover : "transparent"
             }
             Text {
                 anchors.left: parent.left
@@ -294,7 +294,7 @@ Item {
                 Text {
                     anchors.verticalCenter: parent.verticalCenter
                     text: qsTr("Retranscribe entire vault?")
-                    color: "#dddddd"
+                    color: Theme.textPrimary
                     font.pixelSize: 11
                 }
                 AppIcon {
@@ -315,7 +315,7 @@ Item {
                     anchors.verticalCenter: parent.verticalCenter
                     name: "cancel"
                     iconSize: 12
-                    color: "#e07a7a"
+                    color: Theme.danger
                     HoverHandler { cursorShape: Qt.PointingHandCursor }
                     TapHandler { onTapped: titleBar.forceRetranscribeConfirming = false }
                 }
@@ -355,7 +355,7 @@ Item {
                 anchors.fill: parent
                 anchors.margins: 4
                 radius: AppSettings.borderRadius
-                color: hover.hovered ? "#3a3a3a" : "transparent"
+                color: hover.hovered ? Theme.surfaceHover : "transparent"
             }
             AppIcon {
                 anchors.centerIn: parent

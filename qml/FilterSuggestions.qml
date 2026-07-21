@@ -78,10 +78,10 @@ Popup {
     function dismiss() { suggestionsPopup.dismissed = true }
 
     background: Rectangle {
-        color: "#242424"
+        color: Theme.surfaceDialog
         radius: AppSettings.borderRadius
         border.width: 1
-        border.color: "#3a3a3a"
+        border.color: Theme.border
     }
 
     contentItem: ListView {
@@ -111,7 +111,7 @@ Popup {
                 // Keyboard selection and hover share one highlight — two
                 // different-looking "current" rows would be confusing.
                 color: (suggestionsList.currentIndex === suggestionDelegate.index
-                        || suggestionHover.hovered) ? "#3a3a3a" : "transparent"
+                        || suggestionHover.hovered) ? Theme.surfaceHover : "transparent"
                 radius: AppSettings.borderRadius
             }
             Text {
@@ -119,7 +119,7 @@ Popup {
                 anchors.left: parent.left
                 anchors.leftMargin: 6
                 text: suggestionDelegate.modelData
-                color: "#dddddd"
+                color: Theme.textPrimary
                 font.pixelSize: 11
             }
         }

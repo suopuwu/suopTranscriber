@@ -27,7 +27,7 @@ Rectangle {
     // Colors follow StyleGuide.md "Warning banners" so a snackbar and an
     // inline banner reporting the same class of thing read the same:
     // #e07a7a error, #e0a25a soft warning. Info borrows the accent.
-    readonly property color kindColor: kind === "error" ? "#e07a7a"
+    readonly property color kindColor: kind === "error" ? Theme.danger
                                      : kind === "warning" ? "#e0a25a"
                                      : AppSettings.accentColor
 
@@ -92,7 +92,7 @@ Rectangle {
             Layout.fillWidth: true
             Layout.maximumWidth: 260
             text: snackbar.text
-            color: "#dddddd"
+            color: Theme.textPrimary
             font.pixelSize: 12
             wrapMode: Text.WordWrap
         }
@@ -162,7 +162,7 @@ Rectangle {
                 anchors.centerIn: parent
                 name: "close"
                 iconSize: 13
-                color: closeHover.hovered ? "#dddddd" : "#888888"
+                color: closeHover.hovered ? Theme.textPrimary : Theme.textSecondary
             }
         }
     }

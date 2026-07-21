@@ -97,6 +97,7 @@ private slots:
         QVERIFY(qmldir.open(QIODevice::WriteOnly | QIODevice::Text));
         qmldir.write("module SuopTranscriber\n"
                       "singleton AppSettings 1.0 qml/AppSettings.qml\n"
+                      "singleton Theme 1.0 qml/Theme.qml\n"
                       "HoverBorder 1.0 qml/HoverBorder.qml\n"
                       "UnderlineField 1.0 qml/UnderlineField.qml\n"
                       "UsbRegexField 1.0 qml/UsbRegexField.qml\n");

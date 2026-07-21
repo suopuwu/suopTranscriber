@@ -128,6 +128,59 @@ class TstStyleGuide : public QObject
         return src.mid(open);
     }
 
+    // The functionBody() equivalent for a binding whose value is a single CALL
+    // rather than a braced block — e.g.
+    // `readonly property var displayData: TranscriptDisplayBuilder.build(...)`.
+    // There is no brace for functionBody()/enclosingBlock() to match, and a
+    // fixed-width src.mid() window is exactly the silently-rotting pattern
+    // this file's other helpers exist to avoid, so balance the call's own
+    // parentheses from the anchor forward. Returns empty if `anchor` isn't
+    // found or the parens never balance.
+    static QString bindingCall(const QString &src, const QString &anchor)
+    {
+        const int anchorIdx = src.indexOf(anchor);
+        if (anchorIdx < 0)
+            return QString();
+        int depth = 0;
+        for (int i = anchorIdx; i < src.size(); ++i) {
+            if (src.at(i) == QLatin1Char('(')) {
+                ++depth;
+            } else if (src.at(i) == QLatin1Char(')')) {
+                if (--depth == 0)
+                    return src.mid(anchorIdx, i - anchorIdx + 1);
+            }
+        }
+        return QString();
+    }
+
+    // Sidebar tree-row code now lives in TreeRowDelegate.qml; reverse its
+    // self-shadow rename so this file's existing `sidebar.`/`tree.` guard
+    // literals still match. Concatenate with Sidebar.qml so guards that also
+    // check non-delegate Sidebar code keep working.
+    static QString sidebarTreeSrc()
+    {
+        QString delegate = readAll(QStringLiteral(SUOP_QML_DIR "/TreeRowDelegate.qml"));
+        delegate.replace(QStringLiteral("sidebarRoot."), QStringLiteral("sidebar."));
+        delegate.replace(QStringLiteral("treeRoot."), QStringLiteral("tree."));
+        return readAll(QStringLiteral(SUOP_QML_DIR "/Sidebar.qml")) + delegate;
+    }
+
+    // MainPanel seek bar + chapter heading now live in SeekBar.qml /
+    // ChapterHeadingRow.qml; reverse their `panel.`->`mainPanel.` /
+    // `txArea.`->`transcriptArea.` rename. Apply the replace ONLY to the
+    // extracted files (MainPanel.qml already has real `mainPanel.`, and
+    // `mainPanel.` CONTAINS `panel.` — replacing on the whole concat would
+    // corrupt it to `mainmainPanel.`).
+    static QString mainPanelSrc()
+    {
+        QString seek = readAll(QStringLiteral(SUOP_QML_DIR "/SeekBar.qml"));
+        seek.replace(QStringLiteral("panel."), QStringLiteral("mainPanel."));
+        QString chapter = readAll(QStringLiteral(SUOP_QML_DIR "/ChapterHeadingRow.qml"));
+        chapter.replace(QStringLiteral("panel."), QStringLiteral("mainPanel."));
+        chapter.replace(QStringLiteral("txArea."), QStringLiteral("transcriptArea."));
+        return readAll(QStringLiteral(SUOP_QML_DIR "/MainPanel.qml")) + seek + chapter;
+    }
+
 private slots:
     // Guards functionBody() itself — it is the thing standing between
     // "onJobStatusesChanged is clean" and a test that silently asserts against
@@ -158,6 +211,46 @@ private slots:
                  "functionBody() must return onFinished's own body");
         QVERIFY2(!first.contains(QStringLiteral("jobStatusRevision")),
                  "functionBody() must stop at onFinished's close, not run on into its sibling");
+    }
+
+    // Hazard guard: searchProxy.fileSortKeys must be assigned in EXACTLY ONE
+    // place, and that place is the tail of refreshTreeOrdering().
+    //
+    // Writing it re-enters VaultSearchProxyModel's invalidate, which once
+    // segfaulted by walking freed Nodes when the write landed in the middle of
+    // a source-model reset (fixed by deferring the invalidate inside the
+    // proxy — see tst_vaultsearchproxymodel's reset tests). The fix holds only
+    // while the write stays on this one well-understood path: a second
+    // assignment site, or one hoisted out of refreshTreeOrdering into a
+    // handler that fires during a reset, re-opens a use-after-free that
+    // release builds pass by luck.
+    //
+    // This guard was added when refreshTreeOrdering()'s ~150 lines of
+    // derivation moved to TreeOrdering::compute() (2026-07-20). That refactor
+    // deliberately changed only WHERE the ordering is computed, never WHEN or
+    // HOW it is assigned — this pins the half that must not move.
+    void sidebar_assignsFileSortKeysExactlyOnce()
+    {
+        const QString src = stripComments(readAll(QStringLiteral(SUOP_QML_DIR "/Sidebar.qml")));
+        QVERIFY2(!src.isEmpty(), "qml/Sidebar.qml must exist");
+
+        // Assignments only — `searchProxy.fileSortKeys =`, not a read.
+        static const QRegularExpression assign(
+            QStringLiteral("searchProxy\\s*\\.\\s*fileSortKeys\\s*=[^=]"));
+        int writes = 0;
+        auto it = assign.globalMatch(src);
+        while (it.hasNext()) {
+            it.next();
+            ++writes;
+        }
+        QCOMPARE(writes, 1);
+
+        const QString body = functionBody(src, QStringLiteral("function refreshTreeOrdering()"));
+        QVERIFY2(!body.isEmpty(), "refreshTreeOrdering must exist");
+        QVERIFY2(body.contains(QStringLiteral("searchProxy.fileSortKeys =")),
+                 "the one fileSortKeys assignment must live in refreshTreeOrdering() — "
+                 "moving it to a handler that can fire mid source-model reset re-opens "
+                 "the deferred-invalidate use-after-free");
     }
 
     // Regression (queue 070): an in-place file rename updates the tree via
@@ -221,10 +314,13 @@ private slots:
     // Queue item 017.
     void searchBlurbMatchIsBoldAndRecolored()
     {
-        const QString src = stripComments(readAll(QStringLiteral(SUOP_QML_DIR "/Sidebar.qml")));
-        QVERIFY2(!src.isEmpty(), "qml/Sidebar.qml must exist");
+        // transcriptSnippet() moved out of Sidebar.qml into the shared pure
+        // helper module qml/TextFormat.js (2026-07-20); the guard follows the
+        // code, its intent unchanged.
+        const QString src = stripComments(readAll(QStringLiteral(SUOP_QML_DIR "/TextFormat.js")));
+        QVERIFY2(!src.isEmpty(), "qml/TextFormat.js must exist");
         const QString snip = functionBody(src, QStringLiteral("function transcriptSnippet"));
-        QVERIFY2(!snip.isEmpty(), "transcriptSnippet() must exist in Sidebar.qml");
+        QVERIFY2(!snip.isEmpty(), "transcriptSnippet() must exist in TextFormat.js");
         QVERIFY2(snip.contains(QStringLiteral("font-weight:bold")),
                  "the blurb match span must be bold");
         QVERIFY2(snip.contains(QStringLiteral("color:white")),
@@ -259,7 +355,7 @@ private slots:
     // guard against the fix regressing rather than a behavioral test.
     void treeDelegate_refreshesJobStatusOnRecycle()
     {
-        const QString src = readAll(QStringLiteral(SUOP_QML_DIR "/Sidebar.qml"));
+        const QString src = sidebarTreeSrc();
         QVERIFY2(!src.isEmpty(), "qml/Sidebar.qml must exist");
         // The label side of the recycling fix: it must be a bound role, not an
         // imperative push, so it can't go stale on reuse.
@@ -298,7 +394,7 @@ private slots:
     // from painting over the icon cluster while elide is off.
     void treeDelegate_filenameTextReservesSpaceForRowIconCluster()
     {
-        const QString src = readAll(QStringLiteral(SUOP_QML_DIR "/Sidebar.qml"));
+        const QString src = sidebarTreeSrc();
         QVERIFY2(!src.isEmpty(), "qml/Sidebar.qml must exist");
         const int rowIdx = src.indexOf(QStringLiteral("id: groupMergeButton"));
         QVERIFY2(rowIdx >= 0, "groupMergeButton must exist in Sidebar.qml's treeDelegate");
@@ -504,7 +600,7 @@ private slots:
     // deletion closes the current file (onFileDeleted sets player.source = "").
     void mainPanel_playbackControlsInertWithNoAudio()
     {
-        const QString src = stripComments(readAll(QStringLiteral(SUOP_QML_DIR "/MainPanel.qml")));
+        const QString src = stripComments(mainPanelSrc());
         QVERIFY2(!src.isEmpty(), "qml/MainPanel.qml must exist");
 
         QVERIFY2(src.contains(QStringLiteral("readonly property bool hasPlayableSource")),
@@ -575,7 +671,7 @@ private slots:
     // defaulting to on (AppSettings.followPlaybackScroll: true).
     void mainPanel_autoScrollFollowsPlayback()
     {
-        const QString src = stripComments(readAll(QStringLiteral(SUOP_QML_DIR "/MainPanel.qml")));
+        const QString src = stripComments(mainPanelSrc());
         QVERIFY2(!src.isEmpty(), "qml/MainPanel.qml must exist");
 
         // The scroll routine must gate on BOTH the toggle and active playback —
@@ -616,7 +712,7 @@ private slots:
     // positionChanged binding (CLAUDE.md "no direct unit-test path").
     void mainPanel_skipSilenceGatedOnToggle()
     {
-        const QString src = stripComments(readAll(QStringLiteral(SUOP_QML_DIR "/MainPanel.qml")));
+        const QString src = stripComments(mainPanelSrc());
         QVERIFY2(!src.isEmpty(), "qml/MainPanel.qml must exist");
 
         const QString handler = functionBody(src, QStringLiteral("function onPositionChanged()"));
@@ -660,9 +756,15 @@ private slots:
         const QString src = stripComments(readAll(QStringLiteral(SUOP_QML_DIR "/MainPanel.qml")));
         QVERIFY2(!src.isEmpty(), "qml/MainPanel.qml must exist");
 
-        // The glyph form lives in exactly one function.
-        const QString formatter = functionBody(src, QStringLiteral("function formatSilenceMarkerText("));
-        QVERIFY2(!formatter.isEmpty(), "formatSilenceMarkerText must exist in MainPanel.qml");
+        // The glyph form lives in exactly one function — which moved out of
+        // MainPanel.qml into qml/TextFormat.js (2026-07-20). MainPanel keeps a
+        // one-line wrapper; the glyphs themselves are guarded where they live.
+        const QString textFormatSrc =
+            stripComments(readAll(QStringLiteral(SUOP_QML_DIR "/TextFormat.js")));
+        QVERIFY2(!textFormatSrc.isEmpty(), "qml/TextFormat.js must exist");
+        const QString formatter =
+            functionBody(textFormatSrc, QStringLiteral("function formatSilenceMarkerText("));
+        QVERIFY2(!formatter.isEmpty(), "formatSilenceMarkerText must exist in TextFormat.js");
         QVERIFY2(formatter.contains(QStringLiteral("··· %1 silence ···")),
                  "the divider text must read \"··· <duration> silence ···\" "
                  "(StyleGuide.md \"Transcript silence divider\")");
@@ -672,14 +774,28 @@ private slots:
         // playback-skip threshold, a different, user-configurable concern).
         QVERIFY2(src.contains(QStringLiteral("readonly property real silenceMarkerMinSeconds: 5")),
                  "silenceMarkerMinSeconds must exist and default to 5 (StyleGuide.md)");
-        const QString displayData = functionBody(src, QStringLiteral("readonly property var displayData:"));
+        // displayData is no longer a braced JS block — the assembly moved to
+        // src/core/TranscriptDisplayBuilder.cpp (2026-07-20) and the binding
+        // is now a single call into it — so it's bounded by bindingCall()
+        // (paren-balanced) rather than functionBody(), which needs a brace.
+        const QString displayData =
+            bindingCall(src, QStringLiteral("readonly property var displayData:"));
         QVERIFY2(!displayData.isEmpty(), "the displayData binding must exist in MainPanel.qml");
+        QVERIFY2(displayData.contains(QStringLiteral("TranscriptDisplayBuilder.build(")),
+                 "displayData must be the C++ display-model builder's output");
         QVERIFY2(displayData.contains(QStringLiteral("mainPanel.silenceMarkerMinSeconds")),
                  "a stored silence span must be gated on silenceMarkerMinSeconds before it earns a "
                  "divider, or every ordinary inter-sentence gap would show one");
         QVERIFY2(!displayData.contains(QStringLiteral("skipSilenceThresholdSeconds")),
                  "the visual marker's threshold must stay independent of the phase 2 playback-skip "
                  "threshold — conflating them would make the skip slider silently reshape the marking too");
+        // ...and the builder must actually USE it as the gate, rather than
+        // accepting the argument and ignoring it.
+        const QString builder = stripComments(
+            readAll(QStringLiteral(SUOP_SRC_DIR "/core/TranscriptDisplayBuilder.cpp")));
+        QVERIFY2(!builder.isEmpty(), "src/core/TranscriptDisplayBuilder.cpp must exist");
+        QVERIFY2(builder.contains(QStringLiteral(">= minSilenceSeconds")),
+                 "the builder must gate a span on the passed-in minimum before pushing a divider");
 
         // Every pseudo-entry pushSilenceMarker reserves is flagged so it
         // never becomes real spoken content: excluded from the timestamp
@@ -941,7 +1057,7 @@ private slots:
     // optimistic new name over the deferred-write window.
     void sidebar_renameHasOptimisticAntiFlash()
     {
-        const QString src = readAll(QStringLiteral(SUOP_QML_DIR "/Sidebar.qml"));
+        const QString src = sidebarTreeSrc();
         QVERIFY2(src.contains(QStringLiteral("optimisticRenamePath")),
                  "the inline rename must carry an optimistic display name to avoid the old-name flash");
         QVERIFY2(src.contains(QStringLiteral("sidebar.optimisticRenamePath === treeDelegate.path")),
@@ -1009,7 +1125,7 @@ private slots:
         // The play/pause icon that used to be a bespoke Canvas in MainPanel is
         // now an AppIcon resolving to the PlayGlyph/PauseGlyph builtins — the
         // hand-drawn shapes moved into their own reusable components.
-        const QString mainPanel = readAll(QStringLiteral(SUOP_QML_DIR "/MainPanel.qml"));
+        const QString mainPanel = mainPanelSrc();
         QVERIFY2(mainPanel.contains(QStringLiteral("? \"pause\" : \"play\"")),
                  "MainPanel's play/pause must be an AppIcon selecting the pause/play name, not a Canvas");
         for (const QString &comp : {QStringLiteral("PlayGlyph.qml"), QStringLiteral("PauseGlyph.qml")}) {
@@ -1303,7 +1419,7 @@ private slots:
     // line real, clickable, drag-selectable text.
     void mainPanel_chapterHeadingRowClicksNeverLandInTheTranscript()
     {
-        const QString src = stripComments(readAll(QStringLiteral(SUOP_QML_DIR "/MainPanel.qml")));
+        const QString src = stripComments(mainPanelSrc());
         QVERIFY2(!src.isEmpty(), "qml/MainPanel.qml must exist");
 
         const QString row = enclosingBlock(src, QStringLiteral("id: chapterHeadingRow"));
@@ -1405,7 +1521,12 @@ private slots:
     // insert-token toolbar all still exist, rather than a behavioral test.
     void settingsPopup_combineRulePatternAuthoringAids()
     {
-        const QString src = readAll(QStringLiteral(SUOP_QML_DIR "/SettingsPopup.qml"));
+        // The pure pattern-analysis functions were lifted into CombineRuleRegex.js
+        // (a .pragma library module); the QML wiring that calls them stays in
+        // SettingsPopup.qml. Scan both so each assertion finds the machinery
+        // wherever it now lives.
+        const QString src = readAll(QStringLiteral(SUOP_QML_DIR "/SettingsPopup.qml"))
+                            + readAll(QStringLiteral(SUOP_QML_DIR "/CombineRuleRegex.js"));
         QVERIFY2(!src.isEmpty(), "qml/SettingsPopup.qml must exist");
 
         QVERIFY2(src.contains(QStringLiteral("transcriptionController.regexValidationError(")),
@@ -1488,7 +1609,11 @@ private slots:
     // rule-overlap warning all still exist, rather than a behavioral test.
     void settingsPopup_combineRuleDifferentiatorButtons()
     {
-        const QString src = readAll(QStringLiteral(SUOP_QML_DIR "/SettingsPopup.qml"));
+        // Pure functions live in CombineRuleRegex.js; the QML wiring
+        // (differentiatorNonParticipatingFiles call, blocked gating,
+        // computeRuleOverlaps) stays in SettingsPopup.qml. Scan both.
+        const QString src = readAll(QStringLiteral(SUOP_QML_DIR "/SettingsPopup.qml"))
+                            + readAll(QStringLiteral(SUOP_QML_DIR "/CombineRuleRegex.js"));
         QVERIFY2(!src.isEmpty(), "qml/SettingsPopup.qml must exist");
 
         QVERIFY2(src.contains(QStringLiteral("function findDifferentiatorRuns(")),
@@ -1524,10 +1649,13 @@ private slots:
     // button/preview color pairing all still exist.
     void settingsPopup_differentiatorsHaveDistinctPreviewColors()
     {
-        const QString src = readAll(QStringLiteral(SUOP_QML_DIR "/SettingsPopup.qml"));
+        const QString src = readAll(QStringLiteral(SUOP_QML_DIR "/SettingsPopup.qml"))
+                            + readAll(QStringLiteral(SUOP_QML_DIR "/CombineRuleRegex.js"));
         QVERIFY2(!src.isEmpty(), "qml/SettingsPopup.qml must exist");
 
-        QVERIFY2(src.contains(QStringLiteral("property var differentiatorPalette:")),
+        // The palette moved into CombineRuleRegex.js as a module-local const
+        // (was a QML `property var`); still a fixed-order categorical list.
+        QVERIFY2(src.contains(QStringLiteral("differentiatorPalette = [")),
                  "must define a fixed-order categorical palette rather than generating hues ad hoc");
         QVERIFY2(src.contains(QStringLiteral("function differentiatorColor(")),
                  "must expose one lookup function so the palette has a single source of truth, "
@@ -1544,7 +1672,7 @@ private slots:
                  "the filename-preview coloring must overlay differentiatorColor() per captured group, "
                  "not just the base literal/special/none classification");
 
-        QVERIFY2(src.contains(QStringLiteral("settingsPopup.differentiatorColor(modelData.groupIndex)")),
+        QVERIFY2(src.contains(QStringLiteral("CombineRuleRegex.differentiatorColor(modelData.groupIndex)")),
                  "an ON GROUPING differentiator button must use the SAME palette color as its span in "
                  "the preview below, pairing color to a labeled button (the palette's CVD floor-band "
                  "warning's accessibility mitigation, not just decoration)");
@@ -1571,7 +1699,11 @@ private slots:
     // disambiguation machinery still exists, not a behavioral test.
     void settingsPopup_sortDifferentiatorDisambiguatesDuplicateText()
     {
-        const QString src = readAll(QStringLiteral(SUOP_QML_DIR "/SettingsPopup.qml"));
+        // resolveSortGroupIndex() moved into CombineRuleRegex.js; the occurrence
+        // threading/persistence (commitPatternChange, AppSettings.combineRules)
+        // stays in SettingsPopup.qml. Scan both.
+        const QString src = readAll(QStringLiteral(SUOP_QML_DIR "/SettingsPopup.qml"))
+                            + readAll(QStringLiteral(SUOP_QML_DIR "/CombineRuleRegex.js"));
         QVERIFY2(!src.isEmpty(), "qml/SettingsPopup.qml must exist");
 
         QVERIFY2(src.contains(QStringLiteral("function resolveSortGroupIndex(pattern, sortGroupText, sortGroupOccurrence)")),
@@ -1670,7 +1802,7 @@ private slots:
     // invokable wiring all exist rather than a behavioral test.
     void sidebar_folderManagementContextMenu()
     {
-        const QString src = readAll(QStringLiteral(SUOP_QML_DIR "/Sidebar.qml"));
+        const QString src = sidebarTreeSrc();
         QVERIFY2(!src.isEmpty(), "qml/Sidebar.qml must exist");
 
         // Right-click triggers: a per-row menu (treeRowContextTap) and an
@@ -1829,7 +1961,7 @@ private slots:
     // the field out from under the user (MainPanel's old renamingTitle bug).
     void sidebar_inlineRenameIsGatedOnRenamingPathNotFocus()
     {
-        const QString src = readAll(QStringLiteral(SUOP_QML_DIR "/Sidebar.qml"));
+        const QString src = sidebarTreeSrc();
         QVERIFY2(!src.isEmpty(), "qml/Sidebar.qml must exist");
 
         QVERIFY2(src.contains(QStringLiteral("property string renamingPath")),
@@ -1870,12 +2002,15 @@ private slots:
 
         // Renaming rebuilds the model, destroying the delegate whose handler is
         // mid-execution — same hazard the drop handler defers for.
-        const int commitIdx = src.indexOf(QStringLiteral("function commitActiveRename("));
-        QVERIFY2(commitIdx >= 0, "commitActiveRename() must exist");
-        // Window widened from 700: commitActiveRename now also seeds the
-        // optimistic-rename display (anti-flash) before deferring, so Qt.callLater
-        // sits a few lines further down.
-        QVERIFY2(src.mid(commitIdx, 1200).contains(QStringLiteral("Qt.callLater")),
+        // Brace-balanced functionBody(), not a fixed-width src.mid() window:
+        // the window had already been widened once (700 -> 1200) and broke
+        // again when the rename text derivation moved to TextFormat.js and the
+        // call sites grew their lifted AppSettings arguments. A char count is
+        // not the property being guarded — "inside commitActiveRename()" is.
+        const QString commitBody =
+            functionBody(stripComments(src), QStringLiteral("function commitActiveRename("));
+        QVERIFY2(!commitBody.isEmpty(), "commitActiveRename() must exist");
+        QVERIFY2(commitBody.contains(QStringLiteral("Qt.callLater")),
                  "the rename commit must be deferred (Qt.callLater) — renameFile()/renameFolder() rebuild "
                  "the model and destroy the delegate the commit handler is running on");
 
@@ -1923,7 +2058,7 @@ private slots:
     // source-scan guard per CLAUDE.md.
     void sidebar_dragToMoveRows()
     {
-        const QString src = readAll(QStringLiteral(SUOP_QML_DIR "/Sidebar.qml"));
+        const QString src = sidebarTreeSrc();
         QVERIFY2(!src.isEmpty(), "qml/Sidebar.qml must exist");
 
         // The gesture itself: a per-row DragHandler.
@@ -2019,8 +2154,8 @@ private slots:
 
     // Item 5 / design-review #4 (living doc): every job phase a Task announces
     // via phase() must have a row in the ONE phase registry
-    // (TranscriptionController::phaseInfoFor's table, surfaced through
-    // phaseLabel/phaseOverlayLabel) — a phase with no row renders blank in the
+    // (JobListFormatter's phaseInfoFor() table, surfaced through
+    // phaseLabel/phaseOverlayLabel — forwarded by the controller) — a phase with no row renders blank in the
     // bottom bar. This caught two real gaps historically ("labeling",
     // "benchmarking"). The label used to live in a BottomBar.qml switch (plus
     // a second, drifting switch in MainPanel); both are gone, so the guard now
@@ -2103,14 +2238,19 @@ private slots:
         QVERIFY2(emitted.contains(QStringLiteral("detecting-speakers-segmenting")),
                  "sub-phase scan drifted — DiarizeTask's finer detecting-speakers phases not seen");
 
-        // The registry lives in the controller (not BottomBar/MainBar), so read
-        // it there. A row is `{QStringLiteral("slug"), TranscriptionController::tr(`.
-        const QString registry = readAll(QStringLiteral(SUOP_SRC_DIR "/core/TranscriptionController.cpp"));
+        // The registry lives in JobListFormatter (not the controller, and not
+        // BottomBar/MainPanel — it moved out of TranscriptionController.cpp on
+        // 2026-07-20), so read it there. A row is
+        // `{QStringLiteral("slug"), JobListFormatter::tr(`.
+        const QString registry = readAll(QStringLiteral(SUOP_SRC_DIR "/core/JobListFormatter.cpp"));
+        QVERIFY2(!registry.isEmpty(),
+                 "src/core/JobListFormatter.cpp must exist — the phase registry moved there, and an "
+                 "unreadable path would silently stop this guard from checking anything");
         for (const QString &phase : emitted) {
-            const QString row = QStringLiteral("{QStringLiteral(\"%1\"), TranscriptionController::tr(").arg(phase);
+            const QString row = QStringLiteral("{QStringLiteral(\"%1\"), JobListFormatter::tr(").arg(phase);
             QVERIFY2(registry.contains(row),
                      qPrintable(QStringLiteral("phase \"%1\" is emitted by a Task but has no row in "
-                                               "TranscriptionController's phase registry — phaseLabel() "
+                                               "JobListFormatter's phase registry — phaseLabel() "
                                                "would return blank (design-review #4)")
                                     .arg(phase)));
         }
@@ -2158,26 +2298,47 @@ private slots:
                  "real Shift-anchorable selection, not just the currentPath outline");
     }
 
-    // Item 7 (drift fix): ModelsPage's delete-confirm popup must match its
-    // sibling confirm dialogs (Sidebar's fileDeleteConfirmPopup, MainPanel's) —
-    // modal + dim + focus + closePolicy so Escape / click-outside cancel and
-    // the backdrop dims. It previously set only `modal`, so the same "delete?"
-    // UX behaved differently depending on which page you were on.
+    // Item 7 (drift fix, now enforced structurally): the three delete-confirm
+    // dialogs must be the ONE shared ConfirmPopup, not hand-kept siblings. They
+    // used to be three copies of the same Popup chrome that drifted apart (one
+    // page's dialog set only `modal`, so Escape / click-outside / backdrop-dim
+    // behaved differently depending on which page you were on). ConfirmPopup
+    // bakes in modal + dim + focus + closePolicy, so "they behave the same" is
+    // now guaranteed by construction — this guards that each call site actually
+    // uses it and that the component still carries the shared behavior.
     void modelsPage_deleteConfirmMatchesSiblingDialogs()
     {
-        const QString src = stripComments(readAll(QStringLiteral(SUOP_QML_DIR "/ModelsPage.qml")));
-        const int anchor = src.indexOf(QStringLiteral("id: deleteConfirmPopup"));
-        QVERIFY2(anchor >= 0, "could not find deleteConfirmPopup");
-        // Scope to the popup's property block (up to its content ColumnLayout).
-        const int blockEnd = src.indexOf(QStringLiteral("ColumnLayout"), anchor);
-        QVERIFY2(blockEnd > anchor, "could not bound the deleteConfirmPopup block");
-        const QString block = src.mid(anchor, blockEnd - anchor);
-        QVERIFY2(block.contains(QStringLiteral("closePolicy")),
-                 "deleteConfirmPopup must set closePolicy (Escape/click-outside cancels), like its siblings");
-        QVERIFY2(block.contains(QStringLiteral("dim: true")),
-                 "deleteConfirmPopup must dim the backdrop, like its siblings");
-        QVERIFY2(block.contains(QStringLiteral("focus: true")),
-                 "deleteConfirmPopup must take focus (so Escape works), like its siblings");
+        // Each of the three delete dialogs is a ConfirmPopup (not a bespoke Popup).
+        struct Site { const char *file; const char *id; };
+        const Site sites[] = {
+            {SUOP_QML_DIR "/ModelsPage.qml", "id: deleteConfirmPopup"},
+            {SUOP_QML_DIR "/Sidebar.qml", "id: fileDeleteConfirmPopup"},
+            {SUOP_QML_DIR "/MainPanel.qml", "id: deleteFileConfirmPopup"},
+        };
+        for (const Site &s : sites) {
+            const QString src = stripComments(readAll(QString::fromLatin1(s.file)));
+            const int anchor = src.indexOf(QString::fromLatin1(s.id));
+            QVERIFY2(anchor >= 0, qPrintable(QStringLiteral("could not find %1").arg(s.id)));
+            // The type name sits just before the id line, within the couple
+            // hundred chars preceding it — scope the search to that window so a
+            // later "ConfirmPopup" elsewhere in the file can't satisfy it.
+            const int windowStart = qMax(0, anchor - 200);
+            const QString before = src.mid(windowStart, anchor - windowStart);
+            QVERIFY2(before.contains(QStringLiteral("ConfirmPopup {")),
+                     qPrintable(QStringLiteral("%1 must be a ConfirmPopup so its "
+                                               "delete UX matches the other pages").arg(s.id)));
+        }
+        // ...and ConfirmPopup itself carries the shared modal/dim/focus/closePolicy
+        // behavior the three used to each spell out (and drift on).
+        const QString comp = stripComments(readAll(QStringLiteral(SUOP_QML_DIR "/ConfirmPopup.qml")));
+        QVERIFY2(comp.contains(QStringLiteral("closePolicy")),
+                 "ConfirmPopup must set closePolicy (Escape/click-outside cancels)");
+        QVERIFY2(comp.contains(QStringLiteral("dim: true")),
+                 "ConfirmPopup must dim the backdrop");
+        QVERIFY2(comp.contains(QStringLiteral("focus: true")),
+                 "ConfirmPopup must take focus (so Escape works)");
+        QVERIFY2(comp.contains(QStringLiteral("modal: true")),
+                 "ConfirmPopup must be modal");
     }
 
     // Milestone 2 decision: the desktop's QQC2 theme (KDE Breeze) breaks this
@@ -2236,7 +2397,7 @@ private slots:
     // focus on click so a freshly-clicked row is what Up/Down moves from.
     void sidebar_arrowKeyNavigatesNotes()
     {
-        const QString src = stripComments(readAll(QStringLiteral(SUOP_QML_DIR "/Sidebar.qml")));
+        const QString src = stripComments(sidebarTreeSrc());
         QVERIFY2(!src.isEmpty(), "qml/Sidebar.qml must exist");
 
         QVERIFY2(src.contains(QStringLiteral("function moveNoteSelection(direction)")),
@@ -2289,22 +2450,32 @@ private slots:
     // Slider, so this is a source-scan guard that stepSize/snapMode are set.
     void settingsPopup_autoLabelSlidersSnapToDiscreteTiers()
     {
-        const QString src = readAll(QStringLiteral(SUOP_QML_DIR "/SettingsPopup.qml"));
+        const QString src = stripComments(readAll(QStringLiteral(SUOP_QML_DIR "/SettingsPopup.qml")));
         QVERIFY2(!src.isEmpty(), "qml/SettingsPopup.qml must exist");
 
+        // (a) The tier call sites are now SliderSetting rows; each still passes a
+        // non-zero stepSize (0.5) so the row snaps to the 3-tier low/mid/high
+        // phrasing — no finer granularity actually exists.
         for (const QString &sliderId : {QStringLiteral("tagReuseBiasSlider"), QStringLiteral("wordinessSlider")}) {
-            const int idx = src.indexOf(QStringLiteral("id: %1").arg(sliderId));
-            QVERIFY2(idx >= 0, qPrintable(sliderId + QStringLiteral(" must exist")));
-            const QString block = src.mid(idx, 400);
+            const QString block = enclosingBlock(src, QStringLiteral("id: %1").arg(sliderId));
+            QVERIFY2(!block.isEmpty(), qPrintable(sliderId + QStringLiteral(" must exist")));
             QVERIFY2(block.contains(QStringLiteral("stepSize: 0.5")),
                      qPrintable(sliderId
-                                + QStringLiteral(" must use stepSize: 0.5 to match the 3-tier prompt phrasing "
+                                + QStringLiteral(" must pass stepSize: 0.5 to match the 3-tier prompt phrasing "
                                                   "(low/mid/high) — no finer granularity actually exists")));
-            QVERIFY2(block.contains(QStringLiteral("snapMode: Slider.SnapAlways")),
-                     qPrintable(sliderId
-                                + QStringLiteral(" must use snapMode: Slider.SnapAlways so dragging actually "
-                                                  "lands on a tier instead of an intermediate value")));
         }
+
+        // (b) The snap itself is derived, not spelled out per row: SliderSetting
+        // turns a non-zero stepSize into Slider.SnapAlways so dragging lands on a
+        // tier instead of an intermediate value. If that derivation regresses to
+        // NoSnap, the call sites above look correct but no row would actually snap.
+        const QString row = stripComments(readAll(QStringLiteral(SUOP_QML_DIR "/SliderSetting.qml")));
+        QVERIFY2(!row.isEmpty(), "qml/SliderSetting.qml must exist");
+        const QRegularExpression snap(
+            QStringLiteral("snapMode:\\s*root\\.stepSize\\s*>\\s*0\\s*\\?\\s*Slider\\.SnapAlways"));
+        QVERIFY2(snap.match(row).hasMatch(),
+                 "SliderSetting.qml must derive snapMode: Slider.SnapAlways from a non-zero stepSize "
+                 "(root.stepSize > 0 ? Slider.SnapAlways : ...) so the tier rows above snap to low/mid/high");
     }
 
     // Queue item 044: every settings row's leading name Label shares one
@@ -2312,30 +2483,67 @@ private slots:
     // must WRAP there rather than elide — a single-line elided label lets the
     // slider truncate the name. Source-scan: QML layout inside a Popup, no
     // QQuickView harness.
+    //
+    // The bulk of these rows now live in the SliderSetting / ToggleSetting
+    // components, so the wrapping idiom is asserted THERE (once) plus on the
+    // handful of rows still spelled out inline in SettingsPopup.qml.
     void settingsPopup_rowNameLabelsWrapInsteadOfEliding()
     {
-        const QString src = stripComments(readAll(QStringLiteral(SUOP_QML_DIR "/SettingsPopup.qml")));
-        QVERIFY2(!src.isEmpty(), "qml/SettingsPopup.qml must exist");
-
+        const QRegularExpression wrapped(
+            QStringLiteral("Layout\\.preferredWidth:\\s*90\\s*\\n\\s*Layout\\.alignment:\\s*Qt\\.AlignVCenter"
+                           "\\s*\\n\\s*wrapMode:\\s*Text\\.WordWrap"));
         const QRegularExpression elided(
             QStringLiteral("Layout\\.preferredWidth:\\s*90\\s*\\n\\s*elide:"));
+
+        // The shared name column: SliderSetting's leading Label owns the 90px
+        // wrapping column every numeric row inherits. If this regresses to an
+        // elide, every slider row's name would truncate at once.
+        const QString slider = stripComments(readAll(QStringLiteral(SUOP_QML_DIR "/SliderSetting.qml")));
+        QVERIFY2(!slider.isEmpty(), "qml/SliderSetting.qml must exist");
+        QVERIFY2(wrapped.match(slider).hasMatch(),
+                 "SliderSetting.qml's name Label must use the wrapping name-column idiom "
+                 "(Layout.preferredWidth: 90 + Layout.alignment: Qt.AlignVCenter + wrapMode: Text.WordWrap) — "
+                 "an elide here would truncate every slider row's name behind its slider");
+        QVERIFY2(!elided.match(slider).hasMatch(),
+                 "SliderSetting.qml's name Label must not be single-line elided");
+
+        // ToggleSetting keeps wrapping opt-in (labelWrap, default off) because
+        // only the two long-caption switch rows ever needed it — but the knob and
+        // its WordWrap branch must still exist so those rows can wrap.
+        const QString toggle = stripComments(readAll(QStringLiteral(SUOP_QML_DIR "/ToggleSetting.qml")));
+        QVERIFY2(!toggle.isEmpty(), "qml/ToggleSetting.qml must exist");
+        QVERIFY2(toggle.contains(QStringLiteral("property bool labelWrap")),
+                 "ToggleSetting.qml must expose a labelWrap knob so a long switch caption can wrap");
+        const QRegularExpression toggleWrap(
+            QStringLiteral("wrapMode:\\s*root\\.labelWrap\\s*\\?\\s*Text\\.WordWrap"));
+        QVERIFY2(toggleWrap.match(toggle).hasMatch(),
+                 "ToggleSetting.qml's caption Label must wrap when labelWrap is set "
+                 "(wrapMode: root.labelWrap ? Text.WordWrap : ...)");
+
+        // The long-caption switch rows must actually turn wrapping on — otherwise
+        // labelWrap exists but nothing uses it and the captions run under the Switch.
+        const QString src = stripComments(readAll(QStringLiteral(SUOP_QML_DIR "/SettingsPopup.qml")));
+        QVERIFY2(!src.isEmpty(), "qml/SettingsPopup.qml must exist");
+        QVERIFY2(src.count(QStringLiteral("labelWrap: true")) >= 2,
+                 "both long-caption ToggleSetting rows (\"Delete original parts…\", \"Combine "
+                 "automatically…\") must pass labelWrap: true");
+
+        // Rows still authored inline in SettingsPopup.qml (icon-pack, the two
+        // diarization-model pickers, chapter density) must keep wrapping too, and
+        // none may elide.
         QVERIFY2(!elided.match(src).hasMatch(),
                  "a settings row name Label must not be single-line elided — long names "
                  "like \"Left content margin\" get truncated by the slider beside them; "
                  "use Layout.alignment: Qt.AlignVCenter + wrapMode: Text.WordWrap instead");
-
-        const QRegularExpression wrapped(
-            QStringLiteral("Layout\\.preferredWidth:\\s*90\\s*\\n\\s*Layout\\.alignment:\\s*Qt\\.AlignVCenter"
-                           "\\s*\\n\\s*wrapMode:\\s*Text\\.WordWrap"));
         int wrappedRows = 0;
         auto it = wrapped.globalMatch(src);
         while (it.hasNext()) {
             it.next();
             ++wrappedRows;
         }
-        QVERIFY2(wrappedRows >= 19,
-                 qPrintable(QStringLiteral("every settings row name Label (19 at the time of writing) must "
-                                           "use the wrapping name-column idiom; found %1")
+        QVERIFY2(wrappedRows >= 4,
+                 qPrintable(QStringLiteral("every inline settings row name Label (4 at the time of writing) "
+                                           "must use the wrapping name-column idiom; found %1")
                                 .arg(wrappedRows)));
     }
 
@@ -2373,7 +2581,7 @@ private slots:
     // "everything eligible") behavior all still exist.
     void sidebar_multiSelectShiftCtrlClick()
     {
-        const QString src = readAll(QStringLiteral(SUOP_QML_DIR "/Sidebar.qml"));
+        const QString src = sidebarTreeSrc();
         QVERIFY2(!src.isEmpty(), "qml/Sidebar.qml must exist");
 
         QVERIFY2(src.contains(QStringLiteral("property var selectedPaths: []")),
@@ -2603,7 +2811,7 @@ private slots:
     // ffmpeg finishes. See VaultTreeModel::setPendingCombines()'s doc comment.
     void sidebar_pendingCombines_pushedFromTheQueue_andRenderedAsAnonymousProgress()
     {
-        const QString src = stripComments(readAll(QStringLiteral(SUOP_QML_DIR "/Sidebar.qml")));
+        const QString src = stripComments(sidebarTreeSrc());
         QVERIFY2(!src.isEmpty(), "qml/Sidebar.qml must exist");
 
         // Derived from the controller's own jobs list — a combine job already
@@ -2664,7 +2872,7 @@ private slots:
     // so this is a source-scan guard that it doesn't come back.
     void sidebar_combineIsRuleDrivenOnly()
     {
-        const QString src = readAll(QStringLiteral(SUOP_QML_DIR "/Sidebar.qml"));
+        const QString src = sidebarTreeSrc();
         QVERIFY2(!src.isEmpty(), "qml/Sidebar.qml must exist");
 
         QVERIFY2(!src.contains(QStringLiteral("combineSelected")),
@@ -3210,8 +3418,18 @@ private slots:
         const QString src = readAll(QStringLiteral(SUOP_QML_DIR "/MainPanel.qml"));
         QVERIFY2(!src.isEmpty(), "qml/MainPanel.qml must exist");
 
-        QVERIFY2(src.contains(QStringLiteral("property var redoStack")),
-                 "a redoStack must exist alongside undoStack (item 46)");
+        // The undo/redo STORAGE (both stacks + push/pop + redo-invalidation)
+        // moved to src/core/UndoStack (2026-07-20): a per-panel instantiable
+        // UndoStack element the MainPanel owns. The view-entangled APPLY step
+        // (applyHistoryEntry) and the shortcuts stayed in QML.
+        const QString undoSrc = readAll(QStringLiteral(SUOP_SRC_DIR "/core/UndoStack.cpp"));
+        QVERIFY2(!undoSrc.isEmpty(), "src/core/UndoStack.cpp must exist");
+
+        QVERIFY2(src.contains(QStringLiteral("UndoStack {")),
+                 "MainPanel must own an instantiable UndoStack element (per-panel undo/redo "
+                 "state, not a singleton) — item 46");
+        QVERIFY2(undoSrc.contains(QStringLiteral("UndoStack::takeRedo")),
+                 "UndoStack must own a redo stack (takeRedo) alongside the undo stack (item 46)");
         QVERIFY2(src.contains(QStringLiteral("function redoLast(")),
                  "redoLast() must exist to re-apply the last undone edit (item 46)");
         QVERIFY2(src.contains(QStringLiteral("function applyHistoryEntry(")),
@@ -3224,15 +3442,15 @@ private slots:
         const int redoShortcutIdx = src.indexOf(QStringLiteral("mainPanel.redoLast()"));
         QVERIFY2(redoShortcutIdx >= 0, "a Shortcut must call redoLast()");
 
-        // Standard semantics: a fresh edit clears the redo branch. pushUndo
-        // is the single choke point for every user edit, so the clear lives
-        // there.
-        const int pushIdx = src.indexOf(QStringLiteral("function pushUndo("));
-        QVERIFY2(pushIdx >= 0, "pushUndo() must exist");
-        const QString pushBlock = src.mid(pushIdx, 800);
-        QVERIFY2(pushBlock.contains(QStringLiteral("redoStack = []")),
-                 "pushUndo() must clear redoStack — a fresh user edit invalidates the redo branch "
-                 "(standard undo/redo semantics, item 46)");
+        // Standard semantics: a fresh edit clears the redo branch. UndoStack::
+        // push() is the single choke point for every user edit, so the clear
+        // lives there. functionBody() (not a fixed mid() window) so the guard
+        // can't silently rot as the method grows.
+        const QString pushBody = functionBody(undoSrc, QStringLiteral("UndoStack::push"));
+        QVERIFY2(!pushBody.isEmpty(), "UndoStack::push() must exist");
+        QVERIFY2(pushBody.contains(QStringLiteral("m_redo.clear()")),
+                 "UndoStack::push() must clear the redo stack — a fresh user edit invalidates the "
+                 "redo branch (standard undo/redo semantics, item 46)");
     }
 
     // Item 7: find & replace over the transcript, with a regex mode. No
@@ -3448,14 +3666,27 @@ private slots:
         QVERIFY2(appSettings.contains(QStringLiteral("onChapterDensityChanged()")),
                  "chapterDensity must have a debounced save hook like every other persisted key (item 27)");
 
-        const QString popup = readAll(QStringLiteral(SUOP_QML_DIR "/SettingsPopup.qml"));
+        const QString popup = stripComments(readAll(QStringLiteral(SUOP_QML_DIR "/SettingsPopup.qml")));
         QVERIFY2(!popup.isEmpty(), "qml/SettingsPopup.qml must exist");
         QVERIFY2(popup.contains(QStringLiteral("id: chapterDensitySlider")),
                  "SettingsPopup must expose a chapter-density slider (item 27)");
         QVERIFY2(popup.contains(QStringLiteral("AppSettings.chapterDensity = value")),
                  "the slider must write AppSettings.chapterDensity on move (item 27)");
-        QVERIFY2(popup.contains(QStringLiteral("AppSettings.resetProperty(\"chapterDensity\")")),
-                 "the slider must have a reset-to-default button (item 27)");
+        // The reset button was collapsed into the shared SettingResetButton
+        // component (the slider itself stays inline). The row must instantiate it
+        // for the chapterDensity property...
+        const QRegularExpression resetBtn(
+            QStringLiteral("SettingResetButton\\s*\\{\\s*propertyName:\\s*\"chapterDensity\""));
+        QVERIFY2(resetBtn.match(popup).hasMatch(),
+                 "the chapter-density row must have a reset-to-default button — "
+                 "SettingResetButton { propertyName: \"chapterDensity\" } (item 27)");
+        // ...and that component must actually revert/gate on the named property.
+        const QString resetSrc = stripComments(readAll(QStringLiteral(SUOP_QML_DIR "/SettingResetButton.qml")));
+        QVERIFY2(!resetSrc.isEmpty(), "qml/SettingResetButton.qml must exist");
+        QVERIFY2(resetSrc.contains(QStringLiteral("AppSettings.resetProperty(root.propertyName)")),
+                 "SettingResetButton must reset the named AppSettings property on click (item 27)");
+        QVERIFY2(resetSrc.contains(QStringLiteral("AppSettings.isDefault(root.propertyName)")),
+                 "SettingResetButton must grey out via AppSettings.isDefault(propertyName) (item 27)");
 
         const QString main = readAll(QStringLiteral(SUOP_QML_DIR "/MainPanel.qml"));
         QVERIFY2(!main.isEmpty(), "qml/MainPanel.qml must exist");
@@ -3500,7 +3731,7 @@ private slots:
     // source-scan guard.
     void mainPanel_chapterAddEditDeleteWiredToBackend()
     {
-        const QString src = readAll(QStringLiteral(SUOP_QML_DIR "/MainPanel.qml"));
+        const QString src = mainPanelSrc();
         QVERIFY2(!src.isEmpty(), "qml/MainPanel.qml must exist");
 
         // Item 17: an add affordance that inserts at the playhead, and a delete
@@ -3555,7 +3786,7 @@ private slots:
     // QQuickView here, so this is a source-scan guard.
     void mainPanel_chapterTitleSingleActiveEdit()
     {
-        const QString src = readAll(QStringLiteral(SUOP_QML_DIR "/MainPanel.qml"));
+        const QString src = mainPanelSrc();
         QVERIFY2(!src.isEmpty(), "qml/MainPanel.qml must exist");
 
         QVERIFY2(src.contains(QStringLiteral("property real editingChapterTs")),
@@ -3594,7 +3825,7 @@ private slots:
     // hand-place one. No QQuickView here, so this is a source scan.
     void mainPanel_chapterTitleClickDoesNotSelectAll()
     {
-        const QString src = stripComments(readAll(QStringLiteral(SUOP_QML_DIR "/MainPanel.qml")));
+        const QString src = stripComments(mainPanelSrc());
         QVERIFY2(!src.isEmpty(), "qml/MainPanel.qml must exist");
 
         const QString toc = enclosingBlock(src, QStringLiteral("id: tocChapterTitle"));
@@ -3627,7 +3858,7 @@ private slots:
     // No QQuickView harness for MainPanel, so this is a source-scan guard.
     void mainPanel_chapterTitlesSelectAndCopyWithTheTranscript()
     {
-        const QString src = stripComments(readAll(QStringLiteral(SUOP_QML_DIR "/MainPanel.qml")));
+        const QString src = stripComments(mainPanelSrc());
         QVERIFY2(!src.isEmpty(), "qml/MainPanel.qml must exist");
 
         const QString sweeps = functionBody(src, QStringLiteral("function selectionSweepsHeading("));
@@ -3696,7 +3927,7 @@ private slots:
     // so this is a source-scan guard.
     void mainPanel_transcriptChaptersCollapsible()
     {
-        const QString src = readAll(QStringLiteral(SUOP_QML_DIR "/MainPanel.qml"));
+        const QString src = mainPanelSrc();
         QVERIFY2(!src.isEmpty(), "qml/MainPanel.qml must exist");
 
         QVERIFY2(src.contains(QStringLiteral("property var collapsedChapters")),
@@ -3712,16 +3943,24 @@ private slots:
         QVERIFY2(headingBody.contains(QStringLiteral("mainPanel.toggleChapterCollapse(")),
                  "the transcript heading must have a collapse affordance calling toggleChapterCollapse() "
                  "(item 33)");
-        // displayData must actually drop collapsed-chapter sentences. Brace-
-        // matched via functionBody() (never a fixed-width src.mid() window —
-        // see this file's own doc comment on that helper: a window rots
-        // silently the moment displayData grows past it, exactly what
-        // happened here once silence phase 3's divider logic landed above
-        // this check, queue item 085).
-        const QString ddBody = functionBody(src, QStringLiteral("readonly property var displayData:"));
-        QVERIFY2(!ddBody.isEmpty(), "displayData must exist");
-        QVERIFY2(ddBody.contains(QStringLiteral("collapsed[String(currentChapterT0)]")),
-                 "displayData must skip a collapsed chapter's body sentences so they hide from the "
+        // displayData must actually drop collapsed-chapter sentences. The
+        // assembly moved to src/core/TranscriptDisplayBuilder.cpp
+        // (2026-07-20), so this now checks BOTH halves: MainPanel still feeds
+        // the collapse map in, and the builder still skips the body. Scanned
+        // against the real source rather than a fixed-width window — the
+        // window this used to be rotted silently the moment silence phase 3's
+        // divider logic landed above the check (queue item 085).
+        const QString ddCall = bindingCall(stripComments(src),
+                                           QStringLiteral("readonly property var displayData:"));
+        QVERIFY2(!ddCall.isEmpty(), "displayData must exist");
+        QVERIFY2(ddCall.contains(QStringLiteral("mainPanel.collapsedChapters")),
+                 "MainPanel must feed the collapse map into the display-model builder (item 33)");
+        const QString builder = stripComments(
+            readAll(QStringLiteral(SUOP_SRC_DIR "/core/TranscriptDisplayBuilder.cpp")));
+        QVERIFY2(!builder.isEmpty(), "src/core/TranscriptDisplayBuilder.cpp must exist");
+        QVERIFY2(builder.contains(QStringLiteral("isCollapsed(currentChapterT0)"))
+                     && builder.contains(QStringLiteral("continue;")),
+                 "the builder must skip a collapsed chapter's body sentences so they hide from the "
                  "monolithic transcript string and every offset consumer (item 33)");
         // The pre-existing whole-TOC collapse must remain a separate control.
         QVERIFY2(src.contains(QStringLiteral("property bool chaptersExpanded")),
@@ -4209,7 +4448,7 @@ private slots:
     // guard.
     void generateChapters_orphanedMdEligibleAcrossAllSites()
     {
-        const QString sidebar = readAll(QStringLiteral(SUOP_QML_DIR "/Sidebar.qml"));
+        const QString sidebar = sidebarTreeSrc();
         QVERIFY2(!sidebar.isEmpty(), "qml/Sidebar.qml must exist");
         const QString mainPanel = readAll(QStringLiteral(SUOP_QML_DIR "/MainPanel.qml"));
         QVERIFY2(!mainPanel.isEmpty(), "qml/MainPanel.qml must exist");
@@ -4746,13 +4985,21 @@ private slots:
     // isSyntheticProgressPhase predicate, never a hand-rolled phase list.
     void syntheticProgressPhaseSet_hasOneSourceOfTruth()
     {
+        // 2026-07-20: the predicate and the synthetic-fraction branch moved to
+        // PhaseTimer with the rest of the phase-timing subsystem; the
+        // timer-start gate stayed on the controller (it drives a controller-owned
+        // QTimer). So this guard now spans both files — the point is unchanged:
+        // ONE predicate, two consumers.
+        const QString timer = stripComments(
+            readAll(QStringLiteral(SUOP_SRC_DIR "/core/PhaseTimer.cpp")));
+        QVERIFY2(!timer.isEmpty(), "PhaseTimer.cpp must exist");
         const QString src = stripComments(
             readAll(QStringLiteral(SUOP_SRC_DIR "/core/TranscriptionController.cpp")));
         QVERIFY2(!src.isEmpty(), "TranscriptionController.cpp must exist");
 
         // The predicate must exist and name all three no-callback phases.
-        const QString body = functionBody(src,
-            QStringLiteral("bool TranscriptionController::isSyntheticProgressPhase(const QString &phase)"));
+        const QString body = functionBody(timer,
+            QStringLiteral("bool PhaseTimer::isSyntheticProgressPhase(const QString &phase)"));
         QVERIFY2(!body.isEmpty(), "isSyntheticProgressPhase() must exist");
         for (const char *p : {"loading", "decoding", "detecting-speech"})
             QVERIFY2(body.contains(QLatin1String(p)),
@@ -4760,11 +5007,11 @@ private slots:
 
         // Both consumers must go through the predicate — no hand-rolled phase
         // list that could omit one (that drift is exactly what froze detecting-speech).
-        const QString synth = functionBody(src,
-            QStringLiteral("double TranscriptionController::phaseRelativeSyntheticProgress() const"));
+        const QString synth = functionBody(timer,
+            QStringLiteral("double PhaseTimer::phaseRelativeSyntheticProgress(const QString &phase"));
         QVERIFY2(synth.contains(QStringLiteral("isSyntheticProgressPhase")),
                  "phaseRelativeSyntheticProgress() must gate on isSyntheticProgressPhase, not a literal phase list");
-        QVERIFY2(src.contains(QStringLiteral("if (isSyntheticProgressPhase(phase))")),
+        QVERIFY2(src.contains(QStringLiteral("if (PhaseTimer::isSyntheticProgressPhase(phase))")),
                  "the m_indeterminatePhaseTimer start gate must use isSyntheticProgressPhase, not a literal phase list");
     }
 

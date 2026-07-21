@@ -346,8 +346,9 @@ private slots:
     // Two paths sharing groupRank (element 0) and clusterKey (element 1) but
     // differing in memberRank (element 2) sort adjacently, ordered by
     // memberRank within the pair — the "cluster then order within the
-    // cluster" composite key Sidebar.qml builds (see refreshTreeOrdering()'s
-    // doc comment).
+    // cluster" composite key TreeOrdering::compute() builds (see its doc
+    // comment, and tst_tree_ordering.cpp for the producer half of this
+    // contract).
     void fileSortKeys_sameGroupRank_ordersByOwnRankAndStaysAdjacent()
     {
         QTemporaryDir vault;

@@ -4,8 +4,10 @@
 
 namespace {
 // Length of a well-formed fileSortKeys entry (groupRank, cluster identity,
-// position within the cluster) — Sidebar.qml's refreshTreeOrdering() builds
-// them; anything else is treated as "no key" by lessThan() below.
+// position within the cluster) — TreeOrdering::compute() builds them (see
+// TreeOrdering.h; it sits next to this file precisely so the producer and
+// this consumer can't drift apart); anything else is treated as "no key" by
+// lessThan() below.
 constexpr int kFileSortKeyElements = 3;
 }
 
@@ -338,9 +340,9 @@ bool VaultSearchProxyModel::lessThan(const QModelIndex &left, const QModelIndex 
         if (leftHasKey != rightHasKey)
             return leftHasKey;
         if (leftHasKey) {
-            // Element order is Sidebar.qml's, not this file's: groupRank,
-            // then cluster identity, then position within the cluster — see
-            // refreshTreeOrdering()'s sortKeys comment for why identity is
+            // Element order is TreeOrdering::compute()'s, not this file's:
+            // groupRank, then cluster identity, then position within the
+            // cluster — see its sortKeys comment for why identity is
             // its own tier (without it, two groups with an equal groupRank
             // interleave their members instead of staying clustered).
             for (int i = 0; i < kFileSortKeyElements; ++i) {

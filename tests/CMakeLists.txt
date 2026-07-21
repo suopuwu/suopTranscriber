@@ -20,7 +20,32 @@ set(SUOP_TASK_SOURCES
     tasks/RenameFileTask.cpp tasks/MoveTask.cpp tasks/ModelIoTask.cpp
     tasks/TrashTask.cpp tasks/DeleteTask.cpp tasks/RestoreTask.cpp
     tasks/FolderRenameTask.cpp tasks/FolderMoveTask.cpp FileRename.cpp VaultFileOps.cpp
-    TranscribePipeline.cpp)
+    TranscribePipeline.cpp
+    # The transcript .md file-format helpers (formatTimestamp/writeFrontmatter/
+    # SegmentLineWriter/the body splices) split out of TranscriptionController.cpp
+    # — every task kind that touches a sidecar calls them, so it belongs in the
+    # same one list rather than N per-target additions.
+    TranscriptFormat.cpp
+    # The phase-timing / progress-estimation collaborator split out of
+    # TranscriptionController.cpp — the controller holds one as a member, so
+    # it's needed by exactly the same set of targets, hence the same one list.
+    PhaseTimer.cpp
+    # The split-recording combine DETECTION collaborator split out of
+    # TranscriptionController.cpp — the controller's combine queue glue calls
+    # it directly, so it's needed by exactly the same set of targets, hence
+    # the same one list.
+    CombineScanner.cpp
+    # The job-list PRESENTATION collaborator (phase registry + the pure
+    # collapse/sort display transforms) split out of
+    # TranscriptionController.cpp — the controller forwards to it directly, so
+    # it's needed by exactly the same set of targets, hence the same one list.
+    JobListFormatter.cpp
+    # The pure task-list QUERY/SERIALIZATION collaborator (indexOfTask/
+    # isQueued/tasksTotal/frontOfQueueInsertIndex/the moveQueuedJob index math/
+    # persistQueue's JSON) split out of TranscriptionController.cpp — the
+    # controller forwards to it directly, so it's needed by exactly the same
+    # set of targets, hence the same one list.
+    TaskQuery.cpp)
 
 # Each test compiles the core sources it needs directly — no core static lib,
 # so the app target stays untouched. QML_ELEMENT headers compile outside the
@@ -141,9 +166,9 @@ suop_add_test(tst_bottombar_pathsegments LINK_QUICK LINK_SVG ICON_ASSETS SOURCES
 # structurally cannot check). Compiles the REAL Clipboard.cpp — not a stub —
 # because the assertion is what actually lands on the clipboard; hence LINK_GUI.
 # See its top-of-file comment.
-suop_add_test(tst_mainpanel_chapterselection LINK_QUICK LINK_SVG ICON_ASSETS LINK_GUI SOURCES IconTheme.cpp Clipboard.cpp)
-suop_add_test(tst_mainpanel_guttertimestamp LINK_QUICK LINK_SVG ICON_ASSETS LINK_GUI SOURCES IconTheme.cpp Clipboard.cpp)
-suop_add_test(tst_scratch_headingrepro LINK_QUICK LINK_SVG ICON_ASSETS LINK_GUI SOURCES IconTheme.cpp Clipboard.cpp)
+suop_add_test(tst_mainpanel_chapterselection LINK_QUICK LINK_SVG ICON_ASSETS LINK_GUI SOURCES IconTheme.cpp Clipboard.cpp TranscriptDisplayBuilder.cpp UndoStack.cpp)
+suop_add_test(tst_mainpanel_guttertimestamp LINK_QUICK LINK_SVG ICON_ASSETS LINK_GUI SOURCES IconTheme.cpp Clipboard.cpp TranscriptDisplayBuilder.cpp UndoStack.cpp)
+suop_add_test(tst_scratch_headingrepro LINK_QUICK LINK_SVG ICON_ASSETS LINK_GUI SOURCES IconTheme.cpp Clipboard.cpp TranscriptDisplayBuilder.cpp UndoStack.cpp)
 # Loads the real BenchmarkPage.qml inside a modal Popup -> ScrollView (its
 # SettingsPopup nesting) and proves the benchmark file follows the left panel's
 # currentFilePath (the in-page file-picker ComboBox was removed).
@@ -162,7 +187,7 @@ suop_add_test(tst_benchmarkpage_livestream)
 # the other MainPanel QML tests don't need. See its top-of-file comment.
 suop_add_test(tst_mainpanel_chapterrefresh LINK_QUICK LINK_SVG ICON_ASSETS LINK_GUI
     LINK_WHISPER LINK_LLAMA LINK_SHERPA_ONNX
-    SOURCES IconTheme.cpp Clipboard.cpp TranscriptionController.cpp WhisperCppEngine.cpp VadChunker.cpp
+    SOURCES IconTheme.cpp Clipboard.cpp TranscriptDisplayBuilder.cpp UndoStack.cpp TranscriptionController.cpp WhisperCppEngine.cpp VadChunker.cpp
             ModelManager.cpp AudioDecoder.cpp LabelingEngine.cpp DiarizationEngine.cpp
             EngineManifest.cpp GpuProbe.cpp SubprocessEngine.cpp EngineRegistry.cpp ParakeetEngine.cpp
             UsbGrabJob.cpp UsbRuleStore.cpp VaultTreeModel.cpp
@@ -173,7 +198,7 @@ suop_add_test(tst_mainpanel_chapterrefresh LINK_QUICK LINK_SVG ICON_ASSETS LINK_
 # link deps as the other real-controller MainPanel harness. See its top comment.
 suop_add_test(tst_mainpanel_buttonstate LINK_QUICK LINK_SVG ICON_ASSETS LINK_GUI
     LINK_WHISPER LINK_LLAMA LINK_SHERPA_ONNX
-    SOURCES IconTheme.cpp Clipboard.cpp TranscriptionController.cpp WhisperCppEngine.cpp VadChunker.cpp
+    SOURCES IconTheme.cpp Clipboard.cpp TranscriptDisplayBuilder.cpp UndoStack.cpp TranscriptionController.cpp WhisperCppEngine.cpp VadChunker.cpp
             ModelManager.cpp AudioDecoder.cpp LabelingEngine.cpp DiarizationEngine.cpp
             EngineManifest.cpp GpuProbe.cpp SubprocessEngine.cpp EngineRegistry.cpp ParakeetEngine.cpp
             UsbGrabJob.cpp UsbRuleStore.cpp VaultTreeModel.cpp
@@ -185,14 +210,14 @@ suop_add_test(tst_mainpanel_buttonstate LINK_QUICK LINK_SVG ICON_ASSETS LINK_GUI
 # MainPanel harnesses. See its top-of-file comment.
 suop_add_test(tst_mainpanel_livescroll LINK_QUICK LINK_SVG ICON_ASSETS LINK_GUI
     LINK_WHISPER LINK_LLAMA LINK_SHERPA_ONNX
-    SOURCES IconTheme.cpp Clipboard.cpp TranscriptionController.cpp WhisperCppEngine.cpp VadChunker.cpp
+    SOURCES IconTheme.cpp Clipboard.cpp TranscriptDisplayBuilder.cpp UndoStack.cpp TranscriptionController.cpp WhisperCppEngine.cpp VadChunker.cpp
             ModelManager.cpp AudioDecoder.cpp LabelingEngine.cpp DiarizationEngine.cpp
             EngineManifest.cpp GpuProbe.cpp SubprocessEngine.cpp EngineRegistry.cpp ParakeetEngine.cpp
             UsbGrabJob.cpp UsbRuleStore.cpp VaultTreeModel.cpp
             ${SUOP_TASK_SOURCES})
 suop_add_test(tst_mainpanel_deleteundo LINK_QUICK LINK_SVG ICON_ASSETS LINK_GUI
     LINK_WHISPER LINK_LLAMA LINK_SHERPA_ONNX
-    SOURCES IconTheme.cpp Clipboard.cpp VaultTreeModel.cpp TranscriptionController.cpp
+    SOURCES IconTheme.cpp Clipboard.cpp TranscriptDisplayBuilder.cpp UndoStack.cpp VaultTreeModel.cpp TranscriptionController.cpp
             WhisperCppEngine.cpp VadChunker.cpp ModelManager.cpp AudioDecoder.cpp
             LabelingEngine.cpp DiarizationEngine.cpp
             EngineManifest.cpp GpuProbe.cpp SubprocessEngine.cpp EngineRegistry.cpp ParakeetEngine.cpp
@@ -200,13 +225,13 @@ suop_add_test(tst_mainpanel_deleteundo LINK_QUICK LINK_SVG ICON_ASSETS LINK_GUI
             ${SUOP_TASK_SOURCES})
 suop_add_test(tst_mainpanel_renameundo LINK_QUICK LINK_SVG ICON_ASSETS LINK_GUI
     LINK_WHISPER LINK_LLAMA LINK_SHERPA_ONNX
-    SOURCES IconTheme.cpp Clipboard.cpp VaultTreeModel.cpp TranscriptionController.cpp
+    SOURCES IconTheme.cpp Clipboard.cpp TranscriptDisplayBuilder.cpp UndoStack.cpp VaultTreeModel.cpp TranscriptionController.cpp
             WhisperCppEngine.cpp VadChunker.cpp ModelManager.cpp AudioDecoder.cpp
             LabelingEngine.cpp DiarizationEngine.cpp
             EngineManifest.cpp GpuProbe.cpp SubprocessEngine.cpp EngineRegistry.cpp ParakeetEngine.cpp
             UsbGrabJob.cpp UsbRuleStore.cpp
             ${SUOP_TASK_SOURCES})
-suop_add_test(tst_mainpanel_exittoplevel LINK_QUICK LINK_SVG ICON_ASSETS LINK_GUI SOURCES IconTheme.cpp Clipboard.cpp)
+suop_add_test(tst_mainpanel_exittoplevel LINK_QUICK LINK_SVG ICON_ASSETS LINK_GUI SOURCES IconTheme.cpp Clipboard.cpp TranscriptDisplayBuilder.cpp UndoStack.cpp)
 # Queue item 072: loads the REAL MainPanel.qml and installs the PRODUCTION
 # FocusBlurFilter on qApp to prove the app-wide "click outside blurs the focused
 # field" survives a press swallowed by the transcript ScrollView — the exact gap
@@ -214,7 +239,7 @@ suop_add_test(tst_mainpanel_exittoplevel LINK_QUICK LINK_SVG ICON_ASSETS LINK_GU
 # harnesses, plus FocusBlurFilter.cpp (the thing under test).
 suop_add_test(tst_focusblurfilter LINK_QUICK LINK_SVG ICON_ASSETS LINK_GUI
     LINK_WHISPER LINK_LLAMA LINK_SHERPA_ONNX
-    SOURCES IconTheme.cpp Clipboard.cpp FocusBlurFilter.cpp VaultTreeModel.cpp TranscriptionController.cpp
+    SOURCES IconTheme.cpp Clipboard.cpp TranscriptDisplayBuilder.cpp UndoStack.cpp FocusBlurFilter.cpp VaultTreeModel.cpp TranscriptionController.cpp
             WhisperCppEngine.cpp VadChunker.cpp ModelManager.cpp AudioDecoder.cpp
             LabelingEngine.cpp DiarizationEngine.cpp
             EngineManifest.cpp GpuProbe.cpp SubprocessEngine.cpp EngineRegistry.cpp ParakeetEngine.cpp
@@ -222,6 +247,16 @@ suop_add_test(tst_focusblurfilter LINK_QUICK LINK_SVG ICON_ASSETS LINK_GUI
             ${SUOP_TASK_SOURCES})
 suop_add_test(tst_vaultsearchproxymodel SOURCES VaultTreeModel.cpp VaultSearchProxyModel.cpp FileRename.cpp VaultFileOps.cpp)
 suop_add_test(tst_modelmanager SOURCES ModelManager.cpp)
+# Characterization test for the transcript display-model builder lifted out of
+# MainPanel.qml's displayData binding — a pure data-in/data-out transform, so
+# it needs no QQuickView (and deliberately doesn't use one: the point is to
+# pin the assembly rules themselves, independent of any QML wiring).
+suop_add_test(tst_transcript_display_builder SOURCES TranscriptDisplayBuilder.cpp)
+# Characterization test for the file-tree ordering computation lifted out of
+# Sidebar.qml's refreshTreeOrdering(). Pure data-in/data-out, so no QQuickView
+# — it pins the PRODUCER half of the fileSortKeys contract, with
+# tst_vaultsearchproxymodel covering the CONSUMER half (lessThan()).
+suop_add_test(tst_tree_ordering SOURCES TreeOrdering.cpp)
 suop_add_test(tst_transcript_format LINK_WHISPER LINK_LLAMA LINK_SHERPA_ONNX
     SOURCES TranscriptionController.cpp WhisperCppEngine.cpp VadChunker.cpp ModelManager.cpp AudioDecoder.cpp LabelingEngine.cpp DiarizationEngine.cpp
             EngineManifest.cpp GpuProbe.cpp SubprocessEngine.cpp EngineRegistry.cpp ParakeetEngine.cpp
@@ -387,20 +422,20 @@ suop_add_test(tst_titlebar_buttons LINK_QUICK LINK_SVG ICON_ASSETS SOURCES IconT
 # AppIcon — so they need IconTheme (its singleton + image provider) and the
 # icon-pack resources, exactly as the app does, or AppIcon.qml throws
 # "IconTheme is not defined" at load.
-suop_add_test(tst_sidebar_keynav LINK_QUICK LINK_SVG ICON_ASSETS SOURCES VaultTreeModel.cpp VaultSearchProxyModel.cpp IconTheme.cpp FileRename.cpp VaultFileOps.cpp)
-suop_add_test(tst_sidebar_dragmove LINK_QUICK LINK_SVG ICON_ASSETS SOURCES VaultTreeModel.cpp VaultSearchProxyModel.cpp IconTheme.cpp FileRename.cpp VaultFileOps.cpp)
-suop_add_test(tst_sidebar_searchscroll LINK_QUICK LINK_SVG ICON_ASSETS SOURCES VaultTreeModel.cpp VaultSearchProxyModel.cpp IconTheme.cpp FileRename.cpp VaultFileOps.cpp)
-suop_add_test(tst_sidebar_rename LINK_QUICK LINK_SVG ICON_ASSETS SOURCES VaultTreeModel.cpp VaultSearchProxyModel.cpp IconTheme.cpp FileRename.cpp VaultFileOps.cpp)
-suop_add_test(tst_sidebar_expand LINK_QUICK LINK_SVG ICON_ASSETS SOURCES VaultTreeModel.cpp VaultSearchProxyModel.cpp IconTheme.cpp FileRename.cpp VaultFileOps.cpp)
-suop_add_test(tst_sidebar_scroll LINK_QUICK LINK_SVG ICON_ASSETS SOURCES VaultTreeModel.cpp VaultSearchProxyModel.cpp IconTheme.cpp FileRename.cpp VaultFileOps.cpp)
-suop_add_test(tst_sidebar_guides LINK_QUICK LINK_SVG ICON_ASSETS SOURCES VaultTreeModel.cpp VaultSearchProxyModel.cpp IconTheme.cpp FileRename.cpp VaultFileOps.cpp)
-suop_add_test(tst_sidebar_selectall LINK_QUICK LINK_SVG ICON_ASSETS SOURCES VaultTreeModel.cpp VaultSearchProxyModel.cpp IconTheme.cpp FileRename.cpp VaultFileOps.cpp)
-suop_add_test(tst_sidebar_filtersuggestions LINK_QUICK LINK_SVG ICON_ASSETS SOURCES VaultTreeModel.cpp VaultSearchProxyModel.cpp IconTheme.cpp FileRename.cpp VaultFileOps.cpp)
+suop_add_test(tst_sidebar_keynav LINK_QUICK LINK_SVG ICON_ASSETS SOURCES VaultTreeModel.cpp VaultSearchProxyModel.cpp IconTheme.cpp TreeOrdering.cpp FileRename.cpp VaultFileOps.cpp)
+suop_add_test(tst_sidebar_dragmove LINK_QUICK LINK_SVG ICON_ASSETS SOURCES VaultTreeModel.cpp VaultSearchProxyModel.cpp IconTheme.cpp TreeOrdering.cpp FileRename.cpp VaultFileOps.cpp)
+suop_add_test(tst_sidebar_searchscroll LINK_QUICK LINK_SVG ICON_ASSETS SOURCES VaultTreeModel.cpp VaultSearchProxyModel.cpp IconTheme.cpp TreeOrdering.cpp FileRename.cpp VaultFileOps.cpp)
+suop_add_test(tst_sidebar_rename LINK_QUICK LINK_SVG ICON_ASSETS SOURCES VaultTreeModel.cpp VaultSearchProxyModel.cpp IconTheme.cpp TreeOrdering.cpp FileRename.cpp VaultFileOps.cpp)
+suop_add_test(tst_sidebar_expand LINK_QUICK LINK_SVG ICON_ASSETS SOURCES VaultTreeModel.cpp VaultSearchProxyModel.cpp IconTheme.cpp TreeOrdering.cpp FileRename.cpp VaultFileOps.cpp)
+suop_add_test(tst_sidebar_scroll LINK_QUICK LINK_SVG ICON_ASSETS SOURCES VaultTreeModel.cpp VaultSearchProxyModel.cpp IconTheme.cpp TreeOrdering.cpp FileRename.cpp VaultFileOps.cpp)
+suop_add_test(tst_sidebar_guides LINK_QUICK LINK_SVG ICON_ASSETS SOURCES VaultTreeModel.cpp VaultSearchProxyModel.cpp IconTheme.cpp TreeOrdering.cpp FileRename.cpp VaultFileOps.cpp)
+suop_add_test(tst_sidebar_selectall LINK_QUICK LINK_SVG ICON_ASSETS SOURCES VaultTreeModel.cpp VaultSearchProxyModel.cpp IconTheme.cpp TreeOrdering.cpp FileRename.cpp VaultFileOps.cpp)
+suop_add_test(tst_sidebar_filtersuggestions LINK_QUICK LINK_SVG ICON_ASSETS SOURCES VaultTreeModel.cpp VaultSearchProxyModel.cpp IconTheme.cpp TreeOrdering.cpp FileRename.cpp VaultFileOps.cpp)
 # The ONLY sidebar harness that renders inside a real ApplicationWindow (hence a
 # real Overlay + SnackbarHost), which is what the context menu's modal dimming
 # needs — the QQuickView harnesses above structurally cannot show it. See its
 # top-of-file comment.
-suop_add_test(tst_sidebar_contextmenu LINK_QUICK LINK_SVG ICON_ASSETS SOURCES VaultTreeModel.cpp VaultSearchProxyModel.cpp IconTheme.cpp FileRename.cpp VaultFileOps.cpp)
+suop_add_test(tst_sidebar_contextmenu LINK_QUICK LINK_SVG ICON_ASSETS SOURCES VaultTreeModel.cpp VaultSearchProxyModel.cpp IconTheme.cpp TreeOrdering.cpp FileRename.cpp VaultFileOps.cpp)
 suop_add_test(tst_usbdevicemonitor LINK_DBUS SOURCES UsbDeviceMonitor.cpp)
 suop_add_test(tst_usbrulestore SOURCES UsbRuleStore.cpp)
 suop_add_test(tst_usbgrabjob SOURCES UsbGrabJob.cpp UsbRuleStore.cpp VaultTreeModel.cpp FileRename.cpp VaultFileOps.cpp)

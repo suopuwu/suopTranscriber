@@ -1,6 +1,7 @@
 #include <QtTest>
 
 #include <QFile>
+#include <QRegularExpression>
 
 // Source-scan guards for the benchmark overhaul + diarization tuning UI. These
 // are QML-delegate behaviors with no QQuickView harness (same rationale as
@@ -18,6 +19,46 @@ class TstBenchmarkCombos : public QObject
         if (!f.open(QIODevice::ReadOnly | QIODevice::Text))
             return QString();
         return QString::fromUtf8(f.readAll());
+    }
+
+    // `src` with its // line comments removed, so a "does the code do X" scan
+    // can't be satisfied by prose merely MENTIONING X (a comment naming a moved
+    // literal would otherwise keep a stale guard passing). Skips '//' inside
+    // double-quoted strings so literals like "file://" survive. Mirrors
+    // tst_styleguide.cpp's helper of the same name.
+    static QString stripComments(const QString &src)
+    {
+        QString out;
+        out.reserve(src.size());
+        bool inString = false;
+        for (int i = 0; i < src.size(); ++i) {
+            const QChar c = src.at(i);
+            if (inString) {
+                if (c == QLatin1Char('\\') && i + 1 < src.size()) {
+                    out += c;
+                    out += src.at(++i);
+                    continue;
+                }
+                if (c == QLatin1Char('"'))
+                    inString = false;
+                out += c;
+                continue;
+            }
+            if (c == QLatin1Char('"')) {
+                inString = true;
+                out += c;
+                continue;
+            }
+            if (c == QLatin1Char('/') && i + 1 < src.size() && src.at(i + 1) == QLatin1Char('/')) {
+                while (i < src.size() && src.at(i) != QLatin1Char('\n'))
+                    ++i;
+                if (i < src.size())
+                    out += QLatin1Char('\n');
+                continue;
+            }
+            out += c;
+        }
+        return out;
     }
 
 private slots:
@@ -70,15 +111,30 @@ private slots:
     // Settings and carry the StyleGuide hover treatment (HoverBorder).
     void settingsHasDiarizationControls_withHoverTreatment()
     {
-        const QString settings = readAll(QStringLiteral(SUOP_QML_DIR "/SettingsPopup.qml"));
+        const QString settings = stripComments(readAll(QStringLiteral(SUOP_QML_DIR "/SettingsPopup.qml")));
         QVERIFY2(settings.contains(QStringLiteral("segmentationModelCombo")), "no segmentation picker");
         QVERIFY2(settings.contains(QStringLiteral("embeddingModelCombo")), "no embedding picker");
-        QVERIFY2(settings.contains(QStringLiteral("diarizationSensitivitySlider")), "no sensitivity slider");
-        // StyleGuide: interactive controls show a HoverBorder.
+        // StyleGuide: interactive controls show a HoverBorder. The segmentation
+        // picker is still inline, so its HoverBorder is asserted here directly.
         QVERIFY2(settings.contains(QStringLiteral("active: segmentationModelCombo.hovered")),
                  "segmentation picker missing HoverBorder");
-        QVERIFY2(settings.contains(QStringLiteral("active: diarizationSensitivitySlider.hovered")),
-                 "sensitivity slider missing HoverBorder");
+
+        // The sensitivity row was collapsed into a SliderSetting. It must exist
+        // as such in the popup...
+        const QRegularExpression sensitivityRow(
+            QStringLiteral("SliderSetting\\s*\\{[^}]*id:\\s*diarizationSensitivitySlider"));
+        QVERIFY2(sensitivityRow.match(settings).hasMatch(),
+                 "sensitivity control must be a SliderSetting { id: diarizationSensitivitySlider ... }");
+
+        // ...and SliderSetting must give its Slider a HoverBorder driven by the
+        // slider's own hovered state, so every SliderSetting row (this one
+        // included) carries the StyleGuide hover treatment.
+        const QString sliderSetting = stripComments(readAll(QStringLiteral(SUOP_QML_DIR "/SliderSetting.qml")));
+        QVERIFY2(!sliderSetting.isEmpty(), "qml/SliderSetting.qml must exist");
+        QVERIFY2(sliderSetting.contains(QStringLiteral("HoverBorder")), "SliderSetting missing HoverBorder");
+        QVERIFY2(sliderSetting.contains(QStringLiteral("active: control.hovered")),
+                 "SliderSetting's Slider must drive its HoverBorder from control.hovered (the slider's own "
+                 "hover state) — otherwise the sensitivity row loses the StyleGuide hover treatment");
     }
 };
 

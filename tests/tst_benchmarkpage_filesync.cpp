@@ -331,6 +331,7 @@ void TstBenchmarkPageFileSync::buildModule()
     QVERIFY(qmldir.open(QIODevice::WriteOnly | QIODevice::Text));
     qmldir.write("module SuopTranscriber\n"
                   "singleton AppSettings 1.0 qml/AppSettings.qml\n"
+                  "singleton Theme 1.0 qml/Theme.qml\n"
                   "singleton Notifications 1.0 qml/Notifications.qml\n"
                   "HoverBorder 1.0 qml/HoverBorder.qml\n"
                   "MiddleDragScroll 1.0 qml/MiddleDragScroll.qml\n"

@@ -49,13 +49,19 @@ private:
         // grab) the whole SettingsPopup and everything it imports.
         qmldir.write("module SuopTranscriber\n"
                       "singleton AppSettings 1.0 qml/AppSettings.qml\n"
+                      "singleton Theme 1.0 qml/Theme.qml\n"
                       "AppIcon 1.0 qml/AppIcon.qml\n"
+                      "AppIconButton 1.0 qml/AppIconButton.qml\n"
+                      "ConfirmPopup 1.0 qml/ConfirmPopup.qml\n"
                       "PlayGlyph 1.0 qml/PlayGlyph.qml\n"
                       "PauseGlyph 1.0 qml/PauseGlyph.qml\n"
                       "HoverBorder 1.0 qml/HoverBorder.qml\n"
                       "UnderlineField 1.0 qml/UnderlineField.qml\n"
                       "CombineGroupOutline 1.0 qml/CombineGroupOutline.qml\n"
-                      "SettingsPopup 1.0 qml/SettingsPopup.qml\n");
+                      "SettingsPopup 1.0 qml/SettingsPopup.qml\n"
+                      "SettingResetButton 1.0 qml/SettingResetButton.qml\n"
+                      "ToggleSetting 1.0 qml/ToggleSetting.qml\n"
+                      "SliderSetting 1.0 qml/SliderSetting.qml\n");
         qmldir.close();
         return suopDir;
     }

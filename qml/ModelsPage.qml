@@ -81,7 +81,7 @@ ColumnLayout {
         text: qsTr("Downloaded models are shared across all vaults, stored once on this machine. "
                    + "Predownload one you'll want later, delete ones you don't, or export a copy "
                    + "to back it up — so a broken download link can't leave you stuck (re-import the file).")
-        color: "#aaaaaa"
+        color: Theme.textMuted
         font.pixelSize: 12
     }
 
@@ -111,7 +111,7 @@ ColumnLayout {
         wrapMode: Text.WordWrap
         text: qsTr("Downloaded automatically when their feature first runs (auto-labeling, "
                    + "chunking, speaker detection). Manage them here too.")
-        color: "#888888"
+        color: Theme.textSecondary
         font.pixelSize: 11
     }
     Repeater {
@@ -137,7 +137,7 @@ ColumnLayout {
                 implicitWidth: 10
                 implicitHeight: 10
                 radius: 5
-                color: row.modelData.downloaded ? "#2ecc71" : "#555555"
+                color: row.modelData.downloaded ? Theme.success : "#555555"
             }
 
             ColumnLayout {
@@ -155,7 +155,7 @@ ColumnLayout {
                     text: row.modelData.bundledOnly
                           ? qsTr("%1 · bundled (read-only)").arg(row.modelData.sizeText)
                           : row.modelData.sizeText
-                    color: "#888888"
+                    color: Theme.textSecondary
                     font.pixelSize: 11
                 }
             }
@@ -252,52 +252,12 @@ ColumnLayout {
     // --- Delete confirmation (a model delete is permanent — re-download may
     // fail, which is exactly the risk the user worried about — so unlike a
     // vault file it is NOT trashed, and IS confirmed). -------------------------
-    Popup {
+    ConfirmPopup {
         id: deleteConfirmPopup
-        anchors.centerIn: Overlay.overlay
-        modal: true
-        // Match every other confirm dialog (Sidebar's fileDeleteConfirmPopup,
-        // MainPanel's) — dim the backdrop, take focus, and let Escape /
-        // click-outside cancel. This popup previously set only `modal`, so it
-        // behaved differently (no dim, Escape/outside-click didn't dismiss it)
-        // depending on which page you were on.
-        dim: true
-        focus: true
-        closePolicy: Popup.CloseOnPressOutside | Popup.CloseOnEscape
-        padding: 16
-        background: Rectangle {
-            color: "#242424"
-            radius: AppSettings.borderRadius
-            border.width: 1
-            border.color: "#3a3a3a"
-        }
-        ColumnLayout {
-            spacing: 12
-            Label {
-                Layout.maximumWidth: 320
-                wrapMode: Text.WordWrap
-                text: qsTr("Delete \"%1\"? This removes the files from disk. "
-                           + "You can download or import it again later.").arg(modelsPage.pendingDeleteLabel)
-                color: "white"
-                font.pixelSize: 12
-            }
-            RowLayout {
-                Layout.alignment: Qt.AlignRight
-                spacing: 8
-                ModelActionButton {
-                    text: qsTr("Cancel")
-                    onClicked: deleteConfirmPopup.close()
-                }
-                ModelActionButton {
-                    text: qsTr("Delete")
-                    destructive: true
-                    onClicked: {
-                        modelsPage.transcriptionController.deleteModel(modelsPage.pendingDeleteId)
-                        deleteConfirmPopup.close()
-                    }
-                }
-            }
-        }
+        message: qsTr("Delete \"%1\"? This removes the files from disk. "
+                      + "You can download or import it again later.").arg(modelsPage.pendingDeleteLabel)
+        confirmText: qsTr("Delete")
+        onConfirmed: modelsPage.transcriptionController.deleteModel(modelsPage.pendingDeleteId)
     }
 
     // Small labeled button matching BenchmarkPage's controls (hoverEnabled +
@@ -311,15 +271,15 @@ ColumnLayout {
         contentItem: Label {
             text: actionButton.text
             font: actionButton.font
-            color: actionButton.destructive ? "#e07a7a" : "#dddddd"
+            color: actionButton.destructive ? Theme.danger : Theme.textPrimary
             horizontalAlignment: Text.AlignHCenter
             verticalAlignment: Text.AlignVCenter
         }
         background: Rectangle {
             radius: AppSettings.borderRadius
-            color: actionButton.hovered ? "#3a3a3a" : "#2a2a2a"
+            color: actionButton.hovered ? Theme.surfaceHover : Theme.surface
             border.width: 1
-            border.color: "#3a3a3a"
+            border.color: Theme.border
         }
         HoverHandler { cursorShape: Qt.PointingHandCursor }
         HoverBorder { anchors.fill: parent; active: actionButton.hovered }

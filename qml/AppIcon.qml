@@ -21,7 +21,7 @@ Item {
     property string name: ""
     // The box the icon occupies, in logical px.
     property real iconSize: 15
-    property color color: "#dddddd"
+    property color color: Theme.textPrimary
     // Force a specific pack, ignoring the user's settings — for previewing a
     // pack the user hasn't selected (e.g. the Settings pack-picker chips).
     // Empty (the default) means "follow AppSettings", the normal case.

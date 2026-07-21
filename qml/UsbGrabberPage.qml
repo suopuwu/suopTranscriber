@@ -287,7 +287,7 @@ Item {
                 Layout.fillWidth: true
                 visible: usbGrabberPage.usbGrabberController && usbGrabberPage.usbGrabberController.lastError !== ""
                 text: usbGrabberPage.usbGrabberController ? usbGrabberPage.usbGrabberController.lastError : ""
-                color: "#e07a7a"
+                color: Theme.danger
                 font.pixelSize: 11
                 wrapMode: Text.WordWrap
             }
@@ -296,7 +296,7 @@ Item {
                 Layout.fillWidth: true
                 visible: usbGrabberPage.destinationFolderError !== ""
                 text: usbGrabberPage.destinationFolderError
-                color: "#e07a7a"
+                color: Theme.danger
                 font.pixelSize: 11
                 wrapMode: Text.WordWrap
             }
@@ -311,7 +311,7 @@ Item {
                 Rectangle {
                     Layout.fillWidth: true
                     Layout.preferredHeight: 1
-                    color: "#3a3a3a"
+                    color: Theme.border
                 }
 
                 RowLayout {
@@ -388,7 +388,7 @@ Item {
                         Layout.fillWidth: true
                         text: qsTr("Destination: %1").arg(
                             usbGrabberPage.catchAllRule.destinationFolder || qsTr("vault root"))
-                        color: "#888888"
+                        color: Theme.textSecondary
                         font.pixelSize: 11
                         elide: Text.ElideMiddle
                     }
@@ -410,13 +410,13 @@ Item {
                         Rectangle {
                             anchors.fill: parent
                             radius: AppSettings.borderRadius
-                            color: catchAllDestinationHover.hovered ? "#3a3a3a" : "#2a2a2a"
+                            color: catchAllDestinationHover.hovered ? Theme.surfaceHover : Theme.surface
                         }
                         HoverBorder { anchors.fill: parent; active: catchAllDestinationHover.hovered }
                         ToolTip.visible: catchAllDestinationHover.hovered
                         ToolTip.text: qsTr("Choose destination folder")
                         ToolTip.delay: 500
-                        AppIcon { anchors.centerIn: parent; name: "folder"; iconSize: 13; color: "#dddddd" }
+                        AppIcon { anchors.centerIn: parent; name: "folder"; iconSize: 13; color: Theme.textPrimary }
                     }
                 }
             }
@@ -431,7 +431,7 @@ Item {
                 Layout.fillWidth: true
                 visible: usbGrabberPage.deviceRows.length === 0
                 text: qsTr("No USB devices seen yet — plug one in, or rely on \"Any USB device\" above.")
-                color: "#888888"
+                color: Theme.textSecondary
                 font.pixelSize: 11
                 wrapMode: Text.WordWrap
             }
@@ -449,7 +449,7 @@ Item {
                     Rectangle {
                         Layout.fillWidth: true
                         Layout.preferredHeight: 1
-                        color: "#3a3a3a"
+                        color: Theme.border
                     }
 
                     RowLayout {
@@ -470,7 +470,7 @@ Item {
                                 : deviceCard.modelData.mountPaths.length > 1
                                     ? qsTr("%1 volumes connected").arg(deviceCard.modelData.mountPaths.length)
                                     : qsTr("connected")
-                            color: deviceCard.modelData.mounted ? "#7ac07a" : "#888888"
+                            color: deviceCard.modelData.mounted ? "#7ac07a" : Theme.textSecondary
                             font.pixelSize: 11
                         }
                         // Strictly narrower than the enable switch beside it
@@ -504,7 +504,7 @@ Item {
                                 radius: AppSettings.borderRadius
                                 color: "transparent"
                                 border.width: 1
-                                border.color: "#3a3a3a"
+                                border.color: Theme.border
                             }
                             HoverHandler { cursorShape: Qt.PointingHandCursor; enabled: grabNowButton.enabled }
                             HoverBorder { anchors.fill: parent; active: grabNowButton.hovered }
@@ -521,7 +521,7 @@ Item {
                                 radius: AppSettings.borderRadius
                                 color: "transparent"
                                 border.width: 1
-                                border.color: "#3a3a3a"
+                                border.color: Theme.border
                             }
                             HoverHandler { cursorShape: Qt.PointingHandCursor; enabled: previewGrabButton.enabled }
                             HoverBorder { anchors.fill: parent; active: previewGrabButton.hovered }
@@ -539,7 +539,7 @@ Item {
                                 radius: AppSettings.borderRadius
                                 color: "transparent"
                                 border.width: 1
-                                border.color: "#3a3a3a"
+                                border.color: Theme.border
                             }
                             HoverHandler { cursorShape: Qt.PointingHandCursor }
                             HoverBorder { anchors.fill: parent; active: forgetDeviceButton.hovered }
@@ -599,7 +599,7 @@ Item {
                             Layout.fillWidth: true
                             text: qsTr("Destination: %1").arg(
                                 deviceCard.modelData.destinationFolder || qsTr("vault root"))
-                            color: "#888888"
+                            color: Theme.textSecondary
                             font.pixelSize: 11
                             elide: Text.ElideMiddle
                         }
@@ -621,13 +621,13 @@ Item {
                             Rectangle {
                                 anchors.fill: parent
                                 radius: AppSettings.borderRadius
-                                color: deviceDestinationHover.hovered ? "#3a3a3a" : "#2a2a2a"
+                                color: deviceDestinationHover.hovered ? Theme.surfaceHover : Theme.surface
                             }
                             HoverBorder { anchors.fill: parent; active: deviceDestinationHover.hovered }
                             ToolTip.visible: deviceDestinationHover.hovered
                             ToolTip.text: qsTr("Choose destination folder")
                             ToolTip.delay: 500
-                            AppIcon { anchors.centerIn: parent; name: "folder"; iconSize: 13; color: "#dddddd" }
+                            AppIcon { anchors.centerIn: parent; name: "folder"; iconSize: 13; color: Theme.textPrimary }
                         }
                     }
 
@@ -657,7 +657,7 @@ Item {
                             Label {
                                 Layout.fillWidth: true
                                 text: qsTr("Preview")
-                                color: "#888888"
+                                color: Theme.textSecondary
                                 font.pixelSize: 11
                             }
                             Item {
@@ -675,7 +675,7 @@ Item {
                                     anchors.centerIn: parent
                                     name: "close"
                                     iconSize: 13
-                                    color: "#dddddd"
+                                    color: Theme.textPrimary
                                 }
                                 ToolTip.visible: dismissPreviewHover.hovered
                                 ToolTip.delay: 500
@@ -686,14 +686,14 @@ Item {
                         Label {
                             visible: usbGrabberPage.previewRunning
                             text: qsTr("Scanning…")
-                            color: "#888888"
+                            color: Theme.textSecondary
                             font.pixelSize: 11
                         }
                         Label {
                             Layout.fillWidth: true
                             visible: !usbGrabberPage.previewRunning && usbGrabberPage.previewError !== ""
                             text: usbGrabberPage.previewError
-                            color: "#e07a7a"
+                            color: Theme.danger
                             font.pixelSize: 11
                             wrapMode: Text.WordWrap
                         }
@@ -701,7 +701,7 @@ Item {
                             visible: !usbGrabberPage.previewRunning && usbGrabberPage.previewError === ""
                                     && usbGrabberPage.previewEntries.length === 0
                             text: qsTr("No files found.")
-                            color: "#888888"
+                            color: Theme.textSecondary
                             font.pixelSize: 11
                         }
                         Rectangle {
@@ -711,7 +711,7 @@ Item {
                             radius: AppSettings.borderRadius
                             color: "#1e1e1e"
                             border.width: 1
-                            border.color: "#3a3a3a"
+                            border.color: Theme.border
 
                             ColumnLayout {
                                 id: previewCardColumn
@@ -722,7 +722,7 @@ Item {
                                 Label {
                                     Layout.fillWidth: true
                                     text: usbGrabberPage.previewSummary(usbGrabberPage.previewEntries)
-                                    color: "#dddddd"
+                                    color: Theme.textPrimary
                                     font.pixelSize: 11
                                     wrapMode: Text.WordWrap
                                 }
@@ -732,7 +732,7 @@ Item {
                                     readOnly: true
                                     selectByMouse: true
                                     selectionColor: Qt.rgba(0.35, 0.55, 0.85, 0.5)
-                                    color: "#dddddd"
+                                    color: Theme.textPrimary
                                     font.pixelSize: 10
                                     textFormat: Text.RichText
                                     text: usbGrabberPage.previewHtml(usbGrabberPage.previewEntries)
@@ -755,7 +755,7 @@ Item {
                 Layout.fillWidth: true
                 visible: usbGrabberPage.historyEntries.length === 0
                 text: qsTr("No grabs yet.")
-                color: "#888888"
+                color: Theme.textSecondary
                 font.pixelSize: 11
             }
 
@@ -779,7 +779,7 @@ Item {
                         Layout.fillWidth: true
                         Label {
                             text: usbGrabberPage.formatTimestamp(historyCard.modelData.timestamp)
-                            color: "#888888"
+                            color: Theme.textSecondary
                             font.pixelSize: 11
                         }
                         Label {
@@ -801,7 +801,7 @@ Item {
                         Layout.fillWidth: true
                         visible: (historyCard.modelData.errors || []).length > 0
                         text: (historyCard.modelData.errors || []).join("; ")
-                        color: "#e07a7a"
+                        color: Theme.danger
                         font.pixelSize: 11
                         wrapMode: Text.WordWrap
                     }

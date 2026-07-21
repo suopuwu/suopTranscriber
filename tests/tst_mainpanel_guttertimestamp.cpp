@@ -20,6 +20,8 @@
 #include <QTemporaryDir>
 
 #include "Clipboard.h"
+#include "TranscriptDisplayBuilder.h"
+#include "UndoStack.h"
 #include "IconTheme.h"
 
 namespace {
@@ -115,8 +117,11 @@ private slots:
         QVERIFY(qmldir.open(QIODevice::WriteOnly | QIODevice::Text));
         qmldir.write("module SuopTranscriber\n"
                       "singleton AppSettings 1.0 qml/AppSettings.qml\n"
+                      "singleton Theme 1.0 qml/Theme.qml\n"
                       "singleton Notifications 1.0 qml/Notifications.qml\n"
                       "AppIcon 1.0 qml/AppIcon.qml\n"
+                      "AppIconButton 1.0 qml/AppIconButton.qml\n"
+                      "ConfirmPopup 1.0 qml/ConfirmPopup.qml\n"
                       "HoverBorder 1.0 qml/HoverBorder.qml\n"
                       "UnderlineField 1.0 qml/UnderlineField.qml\n"
                       "MiddleDragScroll 1.0 qml/MiddleDragScroll.qml\n"
@@ -133,6 +138,15 @@ private slots:
         qmlRegisterSingletonType<Clipboard>(
             "SuopTranscriber", 1, 0, "Clipboard",
             [](QQmlEngine *, QJSEngine *) -> QObject * { return new Clipboard; });
+        // MainPanel's displayData binding calls into this (the transcript
+        // display-model builder lifted out of the QML) — without it the whole
+        // panel fails to load.
+        qmlRegisterSingletonType<TranscriptDisplayBuilder>(
+            "SuopTranscriber", 1, 0, "TranscriptDisplayBuilder",
+            [](QQmlEngine *, QJSEngine *) -> QObject * { return new TranscriptDisplayBuilder; });
+        // MainPanel now owns an instantiable `UndoStack { id: undoStack }`
+        // (per-panel undo/redo storage); without this the .qml fails to load.
+        qmlRegisterType<UndoStack>("SuopTranscriber", 1, 0, "UndoStack");
         qmlRegisterUncreatableType<AudioPlayerStub>(
             "SuopTranscriber", 1, 0, "AudioPlayer", QStringLiteral("stub — this harness leaves it null"));
         qmlRegisterUncreatableType<AudioRecorderStub>(

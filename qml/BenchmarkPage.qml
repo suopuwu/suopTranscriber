@@ -471,7 +471,7 @@ ColumnLayout {
         wrapMode: Text.WordWrap
         text: qsTr("Pick models to run on one file and compare. Undownloaded models are downloaded "
                    + "before the run. Nothing is saved to the vault — this is for comparison only.")
-        color: "#aaaaaa"
+        color: Theme.textMuted
         font.pixelSize: 12
     }
 
@@ -480,7 +480,7 @@ ColumnLayout {
     // engines. Undownloaded models ARE selectable — startBenchmark downloads
     // any checked-but-missing one first, then runs. The list refreshes on
     // modelsChanged so a finished download drops the "(not downloaded)" note.
-    Label { text: qsTr("Models"); color: "#dddddd"; font.pixelSize: 12 }
+    Label { text: qsTr("Models"); color: Theme.textPrimary; font.pixelSize: 12 }
     Flow {
         Layout.fillWidth: true
         spacing: 12
@@ -536,7 +536,7 @@ ColumnLayout {
                   ? qsTr("No file selected — pick one in the left panel")
                   : benchmarkPage.selectedFilePath.substring(
                         benchmarkPage.selectedFilePath.lastIndexOf("/") + 1)
-            color: benchmarkPage.selectedFilePath === "" ? "#c98500" : "#dddddd"
+            color: benchmarkPage.selectedFilePath === "" ? "#c98500" : Theme.textPrimary
             font.pixelSize: 12
             elide: Text.ElideRight
         }
@@ -555,9 +555,9 @@ ColumnLayout {
             onClicked: benchmarkPage.startBenchmark()
             background: Rectangle {
                 radius: AppSettings.borderRadius
-                color: (runButton.hovered && runButton.enabled) ? "#3a3a3a" : "#2a2a2a"
+                color: (runButton.hovered && runButton.enabled) ? Theme.surfaceHover : Theme.surface
                 border.width: 1
-                border.color: "#3a3a3a"
+                border.color: Theme.border
             }
             HoverHandler { cursorShape: Qt.PointingHandCursor; enabled: runButton.enabled }
             HoverBorder { anchors.fill: parent; active: runButton.enabled && runButton.hovered }
@@ -580,9 +580,9 @@ ColumnLayout {
             }
             background: Rectangle {
                 radius: AppSettings.borderRadius
-                color: cancelButton.hovered ? "#3a3a3a" : "#2a2a2a"
+                color: cancelButton.hovered ? Theme.surfaceHover : Theme.surface
                 border.width: 1
-                border.color: "#3a3a3a"
+                border.color: Theme.border
             }
             HoverHandler { cursorShape: Qt.PointingHandCursor }
             HoverBorder { anchors.fill: parent; active: cancelButton.hovered }
@@ -609,7 +609,7 @@ ColumnLayout {
                 spacing: 6
                 Rectangle {
                     implicitWidth: 8; implicitHeight: 8; radius: 4
-                    color: modelData.available ? "#2ecc71" : "#777777"
+                    color: modelData.available ? Theme.success : "#777777"
                 }
                 Label {
                     text: modelData.label
@@ -636,17 +636,17 @@ ColumnLayout {
         Label {
             text: qsTr("Audio: %1").arg(benchmarkPage.formatDuration(
                       benchmarkPage.lastRun ? benchmarkPage.lastRun.audioSeconds : 0))
-            color: "#dddddd"; font.pixelSize: 12
+            color: Theme.textPrimary; font.pixelSize: 12
         }
         Label {
             text: qsTr("Models: %1").arg(benchmarkPage.results.length)
-            color: "#dddddd"; font.pixelSize: 12
+            color: Theme.textPrimary; font.pixelSize: 12
         }
         Label {
             visible: benchmarkPage.lastRun && benchmarkPage.lastRun.totalRuntimeMs !== undefined
             text: qsTr("Total: %1s").arg(((benchmarkPage.lastRun ? benchmarkPage.lastRun.totalRuntimeMs : 0)
                                           / 1000).toFixed(1))
-            color: "#dddddd"; font.pixelSize: 12
+            color: Theme.textPrimary; font.pixelSize: 12
         }
     }
 
@@ -675,9 +675,9 @@ ColumnLayout {
                 width: 240
                 height: 240
                 radius: AppSettings.borderRadius
-                color: (card.hasTranscript && cardHover.hovered) ? "#333333" : "#2a2a2a"
+                color: (card.hasTranscript && cardHover.hovered) ? "#333333" : Theme.surface
                 border.width: 1
-                border.color: "#3a3a3a"
+                border.color: Theme.border
 
                 ColumnLayout {
                     anchors.fill: parent
@@ -700,7 +700,7 @@ ColumnLayout {
                             text: card.modelData.kind === "engine" ? qsTr("engine")
                                   : (card.modelData.kind === "parakeet" ? qsTr("parakeet")
                                      : qsTr("whisper"))
-                            color: "#888888"
+                            color: Theme.textSecondary
                             font.pixelSize: 10
                         }
                     }
@@ -728,7 +728,7 @@ ColumnLayout {
                     Label {
                         visible: card.modelData.running === true
                         text: qsTr("transcribing…")
-                        color: "#888888"
+                        color: Theme.textSecondary
                         font.pixelSize: 11
                     }
 
@@ -811,7 +811,7 @@ ColumnLayout {
             radius: AppSettings.borderRadius
             color: "#1e1e1e"
             border.width: 1
-            border.color: "#3a3a3a"
+            border.color: Theme.border
         }
 
         contentItem: Item {
@@ -855,7 +855,7 @@ ColumnLayout {
                     wrapMode: TextArea.WordWrap
                     selectByMouse: true
                     text: benchmarkPage.previewResult.text || ""
-                    color: "#dddddd"
+                    color: Theme.textPrimary
                     font.pixelSize: 13
                     background: null
                     // StyleGuide "editable/selectable text": I-beam cursor.
@@ -878,7 +878,7 @@ ColumnLayout {
         Layout.fillWidth: true
         Layout.topMargin: 12
         Layout.preferredHeight: 1
-        color: "#3a3a3a"
+        color: Theme.border
     }
 
     Label {
@@ -892,12 +892,12 @@ ColumnLayout {
         text: qsTr("Run combinations of segmentation × embedding × sensitivity over the same file and "
                    + "compare how many speakers each finds. Undownloaded models are downloaded before the "
                    + "run. Nothing is saved to the vault.")
-        color: "#aaaaaa"
+        color: Theme.textMuted
         font.pixelSize: 12
     }
 
     // Segmentation model checkboxes.
-    Label { text: qsTr("Segmentation models"); color: "#dddddd"; font.pixelSize: 12 }
+    Label { text: qsTr("Segmentation models"); color: Theme.textPrimary; font.pixelSize: 12 }
     Flow {
         Layout.fillWidth: true
         spacing: 12
@@ -912,7 +912,7 @@ ColumnLayout {
                 checked: benchmarkPage.selectedSegIds.indexOf(modelData.id) >= 0
                 contentItem: Label {
                     text: parent.text
-                    color: modelData.downloaded ? "white" : "#aaaaaa"
+                    color: modelData.downloaded ? "white" : Theme.textMuted
                     leftPadding: parent.indicator.width + 6
                     verticalAlignment: Text.AlignVCenter
                 }
@@ -924,7 +924,7 @@ ColumnLayout {
     }
 
     // Embedding model checkboxes.
-    Label { text: qsTr("Embedding models"); color: "#dddddd"; font.pixelSize: 12 }
+    Label { text: qsTr("Embedding models"); color: Theme.textPrimary; font.pixelSize: 12 }
     Flow {
         Layout.fillWidth: true
         spacing: 12
@@ -937,7 +937,7 @@ ColumnLayout {
                 checked: benchmarkPage.selectedEmbedIds.indexOf(modelData.id) >= 0
                 contentItem: Label {
                     text: parent.text
-                    color: modelData.downloaded ? "white" : "#aaaaaa"
+                    color: modelData.downloaded ? "white" : Theme.textMuted
                     leftPadding: parent.indicator.width + 6
                     verticalAlignment: Text.AlignVCenter
                 }
@@ -949,7 +949,7 @@ ColumnLayout {
     }
 
     // Sensitivity value chips.
-    Label { text: qsTr("Sensitivity values (lower = more speakers)"); color: "#dddddd"; font.pixelSize: 12 }
+    Label { text: qsTr("Sensitivity values (lower = more speakers)"); color: Theme.textPrimary; font.pixelSize: 12 }
     Flow {
         Layout.fillWidth: true
         spacing: 12
@@ -979,7 +979,7 @@ ColumnLayout {
             Layout.fillWidth: true
             text: qsTr("%1 tests").arg(benchmarkPage.diarizationComboCount())
                   + (benchmarkPage.diarizationComboCount() > 10 ? qsTr("  ⚠ large sweep") : "")
-            color: benchmarkPage.diarizationComboCount() > 10 ? "#c9a227" : "#dddddd"
+            color: benchmarkPage.diarizationComboCount() > 10 ? "#c9a227" : Theme.textPrimary
             font.pixelSize: 12
         }
         Button {
@@ -997,9 +997,9 @@ ColumnLayout {
             onClicked: benchmarkPage.startDiarizationBenchmark()
             background: Rectangle {
                 radius: AppSettings.borderRadius
-                color: (diarRunButton.hovered && diarRunButton.enabled) ? "#3a3a3a" : "#2a2a2a"
+                color: (diarRunButton.hovered && diarRunButton.enabled) ? Theme.surfaceHover : Theme.surface
                 border.width: 1
-                border.color: "#3a3a3a"
+                border.color: Theme.border
             }
             HoverHandler { cursorShape: Qt.PointingHandCursor; enabled: diarRunButton.enabled }
             HoverBorder { anchors.fill: parent; active: diarRunButton.enabled && diarRunButton.hovered }
@@ -1019,9 +1019,9 @@ ColumnLayout {
             }
             background: Rectangle {
                 radius: AppSettings.borderRadius
-                color: diarCancelButton.hovered ? "#3a3a3a" : "#2a2a2a"
+                color: diarCancelButton.hovered ? Theme.surfaceHover : Theme.surface
                 border.width: 1
-                border.color: "#3a3a3a"
+                border.color: Theme.border
             }
             HoverHandler { cursorShape: Qt.PointingHandCursor }
             HoverBorder { anchors.fill: parent; active: diarCancelButton.hovered }
@@ -1043,9 +1043,9 @@ ColumnLayout {
             Layout.fillWidth: true
             Layout.preferredHeight: diarCardCol.implicitHeight + 16
             radius: AppSettings.borderRadius
-            color: "#2a2a2a"
+            color: Theme.surface
             border.width: 1
-            border.color: "#3a3a3a"
+            border.color: Theme.border
 
             ColumnLayout {
                 id: diarCardCol

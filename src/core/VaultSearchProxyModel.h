@@ -53,10 +53,11 @@ public:
     // plus keeping combine-candidate groups tree-adjacent): path -> a
     // 3-element [groupRank, clusterKey, memberRank] string list, compared in
     // that order (clusterKey is what keeps two groups sharing a groupRank
-    // from interleaving — see refreshTreeOrdering()'s own comment),
-    // precomputed in QML (it already has both AppSettings.combineRules and
-    // TranscriptionController::detectCombineGroups() available) and pushed
-    // here as one map so lessThan() only ever does a plain QString compare —
+    // from interleaving — see TreeOrdering::compute()'s own comment),
+    // precomputed by TreeOrdering (src/core/TreeOrdering.h) from
+    // allAudioPaths()/audioLastModified()/detectCombineGroups() and pushed
+    // here as one map by Sidebar.qml's refreshTreeOrdering(), so lessThan()
+    // only ever does a plain QString compare —
     // same "QML computes, proxy just compares" shape as MatchesSearchRole
     // above, avoiding a second copy of the grouping logic in C++.
     QVariantMap fileSortKeys() const;

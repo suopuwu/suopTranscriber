@@ -175,6 +175,7 @@ qt_add_executable(suopTranscriber
 # property — it does not scan file contents for `pragma Singleton`.
 set_source_files_properties(qml/AppSettings.qml PROPERTIES QT_QML_SINGLETON_TYPE TRUE)
 set_source_files_properties(qml/Notifications.qml PROPERTIES QT_QML_SINGLETON_TYPE TRUE)
+set_source_files_properties(qml/Theme.qml PROPERTIES QT_QML_SINGLETON_TYPE TRUE)
 
 # Icon packs (see DESIGN.md "Iconography"): each assets/icons/<id>/ directory
 # holds a pack.json manifest plus, for svg packs, the SVGs it names.
@@ -206,6 +207,7 @@ qt_add_qml_module(suopTranscriber
         qml/Main.qml
         qml/AppSettings.qml
         qml/Notifications.qml
+        qml/Theme.qml
         qml/Snackbar.qml
         qml/SnackbarHost.qml
         qml/HoverBorder.qml
@@ -216,11 +218,19 @@ qt_add_qml_module(suopTranscriber
         qml/UsbRegexField.qml
         qml/UsbToggle.qml
         qml/AppIcon.qml
+        qml/AppIconButton.qml
+        qml/SettingResetButton.qml
+        qml/ToggleSetting.qml
+        qml/SliderSetting.qml
+        qml/ConfirmPopup.qml
         qml/PlayGlyph.qml
         qml/PauseGlyph.qml
         qml/TitleBar.qml
         qml/Sidebar.qml
+        qml/TreeRowDelegate.qml
         qml/MainPanel.qml
+        qml/SeekBar.qml
+        qml/ChapterHeadingRow.qml
         qml/BottomBar.qml
         qml/SettingsPopup.qml
         qml/BenchmarkPage.qml
@@ -230,6 +240,8 @@ qt_add_qml_module(suopTranscriber
         qml/ModelComboBox.qml
         qml/MiddleDragScroll.qml
         qml/ScrollPage.qml
+        qml/CombineRuleRegex.js
+        qml/TextFormat.js
     RESOURCES
         ${SUOP_ICON_ASSETS}
     SOURCES
@@ -268,6 +280,12 @@ qt_add_qml_module(suopTranscriber
         src/core/DesktopIntegration.cpp
         src/core/Clipboard.h
         src/core/Clipboard.cpp
+        src/core/TranscriptDisplayBuilder.h
+        src/core/TranscriptDisplayBuilder.cpp
+        src/core/TreeOrdering.h
+        src/core/TreeOrdering.cpp
+        src/core/UndoStack.h
+        src/core/UndoStack.cpp
         src/core/AudioDecoder.h
         src/core/AudioDecoder.cpp
         src/core/ProcessRunner.h
@@ -294,6 +312,16 @@ qt_add_qml_module(suopTranscriber
         src/core/ModelManager.h
         src/core/ModelManager.cpp
         src/core/MdFrontmatter.h
+        src/core/TranscriptFormat.h
+        src/core/TranscriptFormat.cpp
+        src/core/PhaseTimer.h
+        src/core/PhaseTimer.cpp
+        src/core/CombineScanner.h
+        src/core/CombineScanner.cpp
+        src/core/JobListFormatter.h
+        src/core/JobListFormatter.cpp
+        src/core/TaskQuery.h
+        src/core/TaskQuery.cpp
         src/core/TranscriptionController.h
         src/core/TranscriptionController.cpp
         src/core/tasks/TaskControl.h

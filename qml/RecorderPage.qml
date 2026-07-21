@@ -103,9 +103,9 @@ Item {
 
             background: Rectangle {
                 radius: AppSettings.borderRadius
-                color: (recorderOpenVaultButton.hovered && recorderOpenVaultButton.enabled) ? "#3a3a3a" : "#2a2a2a"
+                color: (recorderOpenVaultButton.hovered && recorderOpenVaultButton.enabled) ? Theme.surfaceHover : Theme.surface
                 border.width: 1
-                border.color: "#3a3a3a"
+                border.color: Theme.border
             }
             HoverHandler {
                 cursorShape: Qt.PointingHandCursor
@@ -165,7 +165,7 @@ Item {
                     Rectangle {
                         anchors.fill: parent
                         radius: AppSettings.borderRadius
-                        color: (recordToggleHover.hovered && recordToggleButton.enabled) ? "#3a3a3a" : "#2a2a2a"
+                        color: (recordToggleHover.hovered && recordToggleButton.enabled) ? Theme.surfaceHover : Theme.surface
                     }
                     HoverBorder {
                         anchors.fill: parent
@@ -201,7 +201,7 @@ Item {
                     Rectangle {
                         anchors.fill: parent
                         radius: AppSettings.borderRadius
-                        color: animationsToggleHover.hovered ? "#3a3a3a" : "#2a2a2a"
+                        color: animationsToggleHover.hovered ? Theme.surfaceHover : Theme.surface
                     }
                     HoverBorder {
                         anchors.fill: parent
@@ -214,7 +214,7 @@ Item {
                         anchors.centerIn: parent
                         name: "freeze"
                         iconSize: 15
-                        color: AppSettings.animationsEnabled ? "#dddddd" : "#6fdf9f"
+                        color: AppSettings.animationsEnabled ? Theme.textPrimary : "#6fdf9f"
                     }
                 }
 
@@ -238,7 +238,7 @@ Item {
                     text: AppSettings.recordingOutputFolder === ""
                           ? qsTr("Vault root")
                           : AppSettings.recordingOutputFolder
-                    color: "#aaaaaa"
+                    color: Theme.textMuted
                     font.pixelSize: 11
                     elide: Text.ElideLeft
 
@@ -274,7 +274,7 @@ Item {
                     Rectangle {
                         anchors.fill: parent
                         radius: AppSettings.borderRadius
-                        color: changeFolderHover.hovered ? "#3a3a3a" : "#2a2a2a"
+                        color: changeFolderHover.hovered ? Theme.surfaceHover : Theme.surface
                     }
                     HoverBorder {
                         anchors.fill: parent
@@ -287,7 +287,7 @@ Item {
                         anchors.centerIn: parent
                         name: "folder"
                         iconSize: 15
-                        color: "#dddddd"
+                        color: Theme.textPrimary
                     }
                 }
             }
@@ -362,7 +362,7 @@ Item {
                 visible: text !== ""
                 text: recorderPage.recordingFolderError !== "" ? recorderPage.recordingFolderError
                       : (recorderPage.audioRecorder ? recorderPage.audioRecorder.lastError : "")
-                color: "#e07a7a"
+                color: Theme.danger
                 font.pixelSize: 11
                 wrapMode: Text.WordWrap
             }
@@ -392,10 +392,10 @@ Item {
                         anchors.fill: parent
                         radius: AppSettings.borderRadius
                         color: recorderPage.useMic
-                               ? (micToggleHover.hovered ? "#2ecc71" : "#25a25a")
-                               : (micToggleHover.hovered ? "#3a3a3a" : "#2a2a2a")
+                               ? (micToggleHover.hovered ? Theme.success : Theme.successDim)
+                               : (micToggleHover.hovered ? Theme.surfaceHover : Theme.surface)
                         border.width: 1
-                        border.color: recorderPage.useMic ? "#2ecc71" : "#4a4a4a"
+                        border.color: recorderPage.useMic ? Theme.success : Theme.borderStrong
 
                         Behavior on color { ColorAnimation { duration: AppSettings.animationsEnabled ? 100 : 0 } }
                     }
@@ -403,7 +403,7 @@ Item {
                         id: micToggleLabel
                         anchors.centerIn: parent
                         text: qsTr("Microphone")
-                        color: recorderPage.useMic ? "white" : "#aaaaaa"
+                        color: recorderPage.useMic ? "white" : Theme.textMuted
                         font.pixelSize: 11
                     }
                 }
@@ -475,10 +475,10 @@ Item {
                         anchors.fill: parent
                         radius: AppSettings.borderRadius
                         color: recorderPage.useSystemAudio
-                               ? (systemAudioToggleHover.hovered ? "#2ecc71" : "#25a25a")
-                               : (systemAudioToggleHover.hovered ? "#3a3a3a" : "#2a2a2a")
+                               ? (systemAudioToggleHover.hovered ? Theme.success : Theme.successDim)
+                               : (systemAudioToggleHover.hovered ? Theme.surfaceHover : Theme.surface)
                         border.width: 1
-                        border.color: recorderPage.useSystemAudio ? "#2ecc71" : "#4a4a4a"
+                        border.color: recorderPage.useSystemAudio ? Theme.success : Theme.borderStrong
 
                         Behavior on color { ColorAnimation { duration: AppSettings.animationsEnabled ? 100 : 0 } }
                     }
@@ -486,7 +486,7 @@ Item {
                         id: systemAudioToggleLabel
                         anchors.centerIn: parent
                         text: qsTr("System Audio")
-                        color: recorderPage.useSystemAudio ? "white" : "#aaaaaa"
+                        color: recorderPage.useSystemAudio ? "white" : Theme.textMuted
                         font.pixelSize: 11
                     }
                 }
