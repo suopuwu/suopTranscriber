@@ -28,6 +28,7 @@
 // for its jobs to settle before returning.
 
 #include <QCoreApplication>
+#include <QDateTime>
 #include <QDirIterator>
 #include <QElapsedTimer>
 #include <QJsonObject>
@@ -126,6 +127,89 @@ public:
 
     std::atomic<bool> m_passDone{false};
 };
+
+// --- Characterization-only fakes (added 2026-07-20) ---------------------------
+// These pin the queue engine's OBSERVABLE behavior before a refactor. They use
+// the same friend enqueueTask() seam as FakePausablePassTask; none touch a
+// model, a vault file, or the worker's real work.
+
+// The simplest possible Serial task: run() returns immediately, emitting NO
+// progress()/phase(), so it ends Done deterministically. Used to capture the
+// controller's bare start->finish signal ORDER with zero mid-run noise. fileUrl
+// is settable so two of them can occupy different recordings.
+class FakeQuietSerialTask : public Task {
+public:
+    explicit FakeQuietSerialTask(const QUrl &file = {}) { fileUrl = file; }
+    QString kind() const override { return QStringLiteral("fakeQuietSerial"); }
+    QString displayName() const override { return QStringLiteral("Fake quiet serial"); }
+    void run(TaskContext &) override {} // returns at once -> Done, emits nothing
+};
+
+// A Serial task that BLOCKS in run() until released (m_release), so a test can
+// hold the serial lane Active while it probes the instant lane. It honors a
+// cancel at its checkpoint (returns, ending the task) so controller teardown —
+// which requests cancel then wait()s the worker thread — can never hang even if
+// a test forgets to release it.
+class FakeBlockingSerialTask : public Task {
+public:
+    explicit FakeBlockingSerialTask(const QUrl &file = {}) { fileUrl = file; }
+    QString kind() const override { return QStringLiteral("fakeBlockingSerial"); }
+    QString displayName() const override { return QStringLiteral("Fake blocking serial"); }
+    Capabilities capabilities() const override { return {/*pausable*/ true, /*cancellableMidRun*/ true}; }
+    void run(TaskContext &ctx) override
+    {
+        while (!m_release.load()) {
+            if (ctx.checkpoint())
+                return; // honor cancel so teardown can't hang
+            QThread::msleep(5);
+        }
+    }
+    std::atomic<bool> m_release{false};
+};
+
+// An Instant-lane task that records that its run() executed and finishes at
+// once. Used to observe same-file gating (stays Queued behind an Active serial
+// task on the same recording) vs different-file parallelism (runs immediately).
+class FakeInstantTask : public Task {
+public:
+    explicit FakeInstantTask(const QUrl &file = {}) { fileUrl = file; }
+    QString kind() const override { return QStringLiteral("fakeInstant"); }
+    QString displayName() const override { return QStringLiteral("Fake instant"); }
+    Lane lane() const override { return Lane::Instant; }
+    void run(TaskContext &) override { m_ran.store(true); }
+    std::atomic<bool> m_ran{false};
+};
+
+// Combine-rule map shape (mirrors tst_filecombine's rule()) for the
+// maybeRedirectForCombine characterization test.
+inline QVariantMap combineRule(const QString &name, const QString &pattern)
+{
+    QVariantMap m;
+    m[QStringLiteral("name")] = name;
+    m[QStringLiteral("pattern")] = pattern;
+    m[QStringLiteral("enabled")] = true;
+    m[QStringLiteral("sortGroupIndex")] = -1;
+    return m;
+}
+
+// Writes a file and backdates its mtime past the combine stability window, so
+// findCombineGroups() reads its group as "ready" (not "pending") — same
+// close-then-retime dance as tst_filecombine's touchFile().
+inline QString touchBackdated(const QString &dir, const QString &name, int secondsAgo)
+{
+    const QString path = dir + QStringLiteral("/") + name;
+    QFile f(path);
+    const bool opened = f.open(QIODevice::WriteOnly);
+    Q_ASSERT(opened);
+    f.write("x");
+    f.close();
+    QFile retime(path);
+    const bool reopened = retime.open(QIODevice::ReadWrite);
+    Q_ASSERT(reopened);
+    retime.setFileTime(QDateTime::currentDateTime().addSecs(-secondsAgo), QFileDevice::FileModificationTime);
+    retime.close();
+    return path;
+}
 
 // Same detection strategy as tst_transcript_format's locateRealModel(): env
 // override first, else the user's real vault, preferring a plain (non-tdrz)
@@ -2240,6 +2324,194 @@ private slots:
         // No doubled tags introduced.
         QVERIFY2(!out.contains(QStringLiteral("[Speaker 1] [Speaker")), qPrintable(out));
         QCOMPARE(applied, (QStringList{QStringLiteral("Speaker 1"), QStringLiteral("Speaker 2")}));
+    }
+
+    // ==========================================================================
+    // CHARACTERIZATION TESTS (2026-07-20) — pin the OBSERVABLE queue-engine
+    // behavior before its refactor. They assert CURRENT reality; if one fails,
+    // the fake/scenario is wrong, not the production code.
+    // ==========================================================================
+
+    // Test 1: the FULL signal-emission ORDER for one deterministic serial task
+    // run to completion on an empty queue (drain branch). FakeQuietSerialTask's
+    // run() returns at once emitting NO progress()/phase(), so the sequence is
+    // noise-free. The recorded list is the golden below — enqueueTask()'s own
+    // queueChanged, then startTask()'s ordered burst, then onTaskFinished()'s
+    // drain-branch burst ending in finished(). Confirmed stable across 3 runs.
+    void characterize_singleSerialTask_emissionOrder_drainBranch()
+    {
+        TranscriptionController controller;
+        QStringList seq;
+        connect(&controller, &TranscriptionController::busyChanged, this, [&] { seq << QStringLiteral("busy"); });
+        connect(&controller, &TranscriptionController::currentFileChanged, this, [&] { seq << QStringLiteral("file"); });
+        connect(&controller, &TranscriptionController::currentJobKindChanged, this, [&] { seq << QStringLiteral("jobKind"); });
+        connect(&controller, &TranscriptionController::currentPhaseChanged, this, [&] { seq << QStringLiteral("phase"); });
+        connect(&controller, &TranscriptionController::activeIsForegroundChanged, this, [&] { seq << QStringLiteral("foreground"); });
+        connect(&controller, &TranscriptionController::activePausedChanged, this, [&] { seq << QStringLiteral("activePaused"); });
+        connect(&controller, &TranscriptionController::activeStoppingChanged, this, [&] { seq << QStringLiteral("activeStopping"); });
+        connect(&controller, &TranscriptionController::progressChanged, this, [&] { seq << QStringLiteral("progress"); });
+        connect(&controller, &TranscriptionController::queueChanged, this, [&] { seq << QStringLiteral("queue"); });
+        connect(&controller, &TranscriptionController::finished, this, [&] { seq << QStringLiteral("finished"); });
+
+        auto task = std::make_unique<FakeQuietSerialTask>(QUrl::fromLocalFile(QStringLiteral("/v/quiet.wav")));
+        controller.enqueueTask(std::move(task)); // friend seam
+        QTRY_VERIFY(seq.contains(QStringLiteral("finished")));
+
+        const QStringList golden = {
+            // enqueueTask(): queueChanged before pumpQueues.
+            QStringLiteral("queue"),
+            // startTask(): the ordered start burst (foreground flips false->true).
+            QStringLiteral("activePaused"), QStringLiteral("busy"), QStringLiteral("foreground"),
+            QStringLiteral("progress"), QStringLiteral("phase"), QStringLiteral("file"),
+            QStringLiteral("jobKind"), QStringLiteral("queue"),
+            // onTaskFinished() serial + drain branch (foreground flips back).
+            QStringLiteral("busy"), QStringLiteral("foreground"), QStringLiteral("activePaused"),
+            QStringLiteral("file"), QStringLiteral("jobKind"), QStringLiteral("queue"),
+            QStringLiteral("finished"),
+        };
+        QCOMPARE(seq, golden);
+    }
+
+    // Test 2: two serial tasks on DIFFERENT files. When the first finishes and
+    // the second starts, the drain branch does NOT fire — currentFile
+    // transitions directly file1 -> file2, never cleared to empty in between.
+    // (Contrast test 1, whose sole task drains to empty.)
+    void characterize_twoSerialTasks_currentFileNeverClearsBetween()
+    {
+        TranscriptionController controller;
+        const QUrl file1 = QUrl::fromLocalFile(QStringLiteral("/v/one.wav"));
+        const QUrl file2 = QUrl::fromLocalFile(QStringLiteral("/v/two.wav"));
+
+        QList<QUrl> fileValues;
+        connect(&controller, &TranscriptionController::currentFileChanged, this,
+                [&] { fileValues << controller.currentFile(); });
+
+        controller.enqueueTask(std::make_unique<FakeQuietSerialTask>(file1));
+        controller.enqueueTask(std::make_unique<FakeQuietSerialTask>(file2));
+
+        QTRY_COMPARE(controller.tasksCompleted(), 2);
+        QTRY_COMPARE(controller.currentFile(), QUrl()); // fully drained at the very end
+
+        // The recorded currentFile edges: file1 (task1 starts), file2 (task2
+        // starts — NO empty in between), then empty (final drain).
+        QCOMPARE(fileValues, (QList<QUrl>{file1, file2, QUrl()}));
+        // The load-bearing pin vs test 1: no empty-string intermediate before
+        // the final drain.
+        for (int i = 0; i < fileValues.size() - 1; ++i)
+            QVERIFY2(!fileValues.at(i).isEmpty(), "currentFile must not clear to empty mid-transition");
+    }
+
+    // Test 3: serialActiveConflictsWith() gating (currently untested). An Instant
+    // task on the SAME recording as an ACTIVE serial task stays Queued (does not
+    // start) until that serial task finishes, then runs to completion.
+    void characterize_instantSameFile_gatedUntilSerialFinishes()
+    {
+        TranscriptionController controller;
+        const QUrl fileX = QUrl::fromLocalFile(QStringLiteral("/v/x.wav"));
+
+        auto blocker = std::make_unique<FakeBlockingSerialTask>(fileX);
+        FakeBlockingSerialTask *blockerRaw = blocker.get();
+        controller.enqueueTask(std::move(blocker));
+        QTRY_COMPARE(blockerRaw->status, Task::Status::Active); // serial lane held
+
+        auto instant = std::make_unique<FakeInstantTask>(fileX); // SAME recording
+        FakeInstantTask *instantRaw = instant.get();
+        controller.enqueueTask(std::move(instant));
+
+        // Gated: stays Queued and never ran while the same-file serial is Active.
+        QCOMPARE(instantRaw->status, Task::Status::Queued);
+        QVERIFY(!instantRaw->m_ran.load());
+        QTest::qWait(200); // give any stray dispatch time to (wrongly) fire
+        QCOMPARE(instantRaw->status, Task::Status::Queued);
+        QVERIFY(!instantRaw->m_ran.load());
+        QCOMPARE(blockerRaw->status, Task::Status::Active);
+
+        // Release the serial task: the instant task now unblocks and completes.
+        blockerRaw->m_release.store(true);
+        QTRY_COMPARE(instantRaw->status, Task::Status::Done);
+        QVERIFY(instantRaw->m_ran.load());
+        QTRY_COMPARE(blockerRaw->status, Task::Status::Done);
+    }
+
+    // Test 4: parallel lanes on DIFFERENT files (currently untested). An Instant
+    // task on file Y runs to completion WHILE a serial task on file X is still
+    // Active — the two lanes execute in parallel.
+    void characterize_instantDifferentFile_runsParallelToActiveSerial()
+    {
+        TranscriptionController controller;
+        const QUrl fileX = QUrl::fromLocalFile(QStringLiteral("/v/x.wav"));
+        const QUrl fileY = QUrl::fromLocalFile(QStringLiteral("/v/y.wav"));
+
+        auto blocker = std::make_unique<FakeBlockingSerialTask>(fileX);
+        FakeBlockingSerialTask *blockerRaw = blocker.get();
+        controller.enqueueTask(std::move(blocker));
+        QTRY_COMPARE(blockerRaw->status, Task::Status::Active);
+
+        auto instant = std::make_unique<FakeInstantTask>(fileY); // DIFFERENT recording
+        FakeInstantTask *instantRaw = instant.get();
+        controller.enqueueTask(std::move(instant));
+
+        // The instant task completes while the serial task is STILL Active.
+        QTRY_COMPARE(instantRaw->status, Task::Status::Done);
+        QVERIFY(instantRaw->m_ran.load());
+        QCOMPARE(blockerRaw->status, Task::Status::Active); // serial still running in parallel
+
+        // Clean up the still-blocked serial task before teardown.
+        blockerRaw->m_release.store(true);
+        QTRY_COMPARE(blockerRaw->status, Task::Status::Done);
+    }
+
+    // Test 5: maybeRedirectForCombine() Outcome 2 (currently untested). A
+    // TranscribeTask enqueued on a combine FRAGMENT, while a ready combine group
+    // for it is cached, is retargeted: its fileUrl is rewritten to the merged
+    // output path and a CombineTask is inserted AHEAD of it. This is a pure
+    // GUI-thread, QFileInfo-only redirect (no ffmpeg/models needed for the
+    // assertion), so it is captured synchronously right after enqueue, before
+    // the event loop runs any of the retargeted work.
+    void characterize_combineRedirect_retargetsTranscribeAndInsertsCombineTask()
+    {
+        VaultFixture vault; // fake whisper model present -> no download prereq queued
+        // Two fragments of one recording, backdated past the stability window so
+        // the group reads "ready".
+        const QString frag1 = touchBackdated(vault.dir.path(), QStringLiteral("TX02_PART1.wav"), 60);
+        touchBackdated(vault.dir.path(), QStringLiteral("TX02_PART2.wav"), 40);
+        const QUrl frag1Url = QUrl::fromLocalFile(frag1);
+        const QVariantList rules = {combineRule(QStringLiteral("parts"), QStringLiteral("^(TX\\d{2})_PART\\d+\\.wav$"))};
+        const QStringList audioPaths = {frag1, vault.dir.path() + QStringLiteral("/TX02_PART2.wav")};
+
+        // The merged output the redirect should target (derived from the rule +
+        // key alone, per findCombineGroups()).
+        const QVariantList groups = TranscriptionController().detectCombineGroups(rules, audioPaths);
+        QCOMPARE(groups.size(), 1);
+        QCOMPARE(groups.first().toMap().value(QStringLiteral("status")).toString(), QStringLiteral("ready"));
+        const QUrl mergedOutput =
+            QUrl::fromLocalFile(groups.first().toMap().value(QStringLiteral("outputPath")).toString());
+        QVERIFY(mergedOutput != frag1Url);
+
+        TranscriptionController controller;
+        // Seed the cached scan inputs maybeRedirectForCombine() re-checks (the
+        // friend seam lets the test set these directly, WITHOUT enqueuing the
+        // combine job itself — runCombineScan() would have pre-queued it).
+        controller.m_combineRules = rules;
+        controller.m_combineAudioPaths = audioPaths;
+        controller.m_combineDeleteOriginals = false;
+
+        controller.transcribe(frag1Url, vault.vaultUrl, kModelId);
+
+        // Synchronous, deterministic redirect (asserted before the event loop
+        // runs any retargeted work): a CombineTask was inserted ahead and is
+        // Active; the transcribe entry now targets the merged output, not the
+        // fragment.
+        const QVariantList jobs = controller.jobs();
+        QCOMPARE(jobs.size(), 2);
+        QCOMPARE(jobs.at(0).toMap().value(QStringLiteral("kind")).toString(), QStringLiteral("combine"));
+        QCOMPARE(jobs.at(0).toMap().value(QStringLiteral("status")).toString(), QStringLiteral("active"));
+        QCOMPARE(jobs.at(1).toMap().value(QStringLiteral("kind")).toString(), QStringLiteral("transcribe"));
+        QCOMPARE(jobs.at(1).toMap().value(QStringLiteral("fileUrl")).toUrl(), mergedOutput);
+
+        // Let both tasks settle (they fail fast — no real audio to merge/decode)
+        // so teardown is clean.
+        QTRY_COMPARE(controller.tasksCompleted(), 2);
     }
 };
 
