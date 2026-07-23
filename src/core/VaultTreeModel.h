@@ -72,7 +72,7 @@ public:
 
     // Renames the audio file at fileUrl (and its sibling .md, if any) to
     // newBaseName, preserving each file's extension. Also handles orphaned
-    // .md-only nodes (Feature: Milestone 5 item 19 "forgo labels" mode).
+    // .md-only nodes (Feature: Milestone 5 "forgo labels" mode).
     // Returns false and sets *errorOut on validation or filesystem failure,
     // without leaving the audio/.md pair mismatched. Synchronous convenience
     // wrapper: calls renameFileOnDisk() then rebuild(). QML now routes rename
@@ -81,7 +81,7 @@ public:
     // this instance method stays for any direct/synchronous caller + tests.
     Q_INVOKABLE bool renameFile(const QUrl &fileUrl, const QString &newBaseName, QString *errorOut = nullptr);
 
-    // Item 37: synchronous, cheap VALIDATOR for a drag-and-drop / external
+    // Synchronous, cheap VALIDATOR for a drag-and-drop / external
     // audio import — the actual byte-copy is now an async worker-thread job in
     // TranscriptionController (see importAudio()), so the freeze from a large
     // blocking QFile::copy on the GUI thread is gone. This half stays on the
@@ -117,10 +117,10 @@ public:
     // folder and the (still empty) folder appears in the tree right away.
     Q_INVOKABLE bool createFolder(const QUrl &parentDirUrl, const QString &name);
 
-    // Item 40: moves a single file (QFile::rename) into destDirUrl. When the
+    // Moves a single file (QFile::rename) into destDirUrl. When the
     // moved file is an AUDIO file it carries its sibling transcript data too —
     // the <fileName>.md sidecar (same full-filename convention as
-    // sidecarMdPath()/renameFile(), NOT a stripped stem — see item P7) and, if
+    // sidecarMdPath()/renameFile(), NOT a stripped stem —) and, if
     // present, the .<fileName>.partial.jsonl resume-state file (CLAUDE.md
     // vault layout). A standalone orphaned .md (or any non-audio file) moves
     // on its own. Rejects a move whose source/destination escapes the vault,
@@ -141,7 +141,7 @@ public:
     // collision failure. Returns false and sets *errorOut otherwise.
     Q_INVOKABLE bool renameFolder(const QUrl &folderUrl, const QString &newName, QString *errorOut = nullptr);
 
-    // Item 40: moves/renames a folder into destParentUrl (QDir::rename).
+    // Moves/renames a folder into destParentUrl (QDir::rename).
     // Guarded like deleteFolder() (never the vault root, never outside the
     // vault) plus: refuses to move a folder into itself or one of its own
     // descendants, and refuses a name collision at the destination. rebuild()s
@@ -200,7 +200,7 @@ public:
     // guards and same single-rebuild batching; returns how many were removed.
     Q_INVOKABLE int deleteFilesPermanently(const QList<QUrl> &urls);
 
-    // Item 40: trashes folderUrl and everything under it (moveToTrash takes the
+    // Trashes folderUrl and everything under it (moveToTrash takes the
     // tree intact), same result map as trashFiles(). A SEPARATE call from
     // trashFiles() on purpose, not for tidiness: a folder delete is recursive
     // and takes every transcript under it, so it must never be reachable from
@@ -307,7 +307,7 @@ public:
     // matching the node's path; a no-op / unknown path returns quietly.
     void applyRenameOutcome(const QUrl &oldUrl, const QUrl &newUrl);
 
-    // Item 40: every real directory inside the vault (walks the filesystem
+    // Every real directory inside the vault (walks the filesystem
     // directly, NOT the pruned tree — a freshly-created empty folder must be a
     // valid move destination even though it's hidden from the tree until it
     // has content), vault root first, then subfolders depth-first by name.
@@ -691,7 +691,7 @@ private:
     // a pure sibling-.md-exists classification so a partial file's body is
     // still served/searchable.
     Status effectiveStatus(const Node *node) const;
-    // Item P12: transcriptBody() backs search's transcript-content matching
+    // transcriptBody() backs search's transcript-content matching
     // (VaultSearchProxyModel::matchesDirect) — before this cache, every
     // keystroke re-opened and re-read every transcribed file's ENTIRE body
     // from disk, for every candidate row, on every filter pass. Now a
@@ -733,7 +733,7 @@ private:
     // outputPath. Derived once per push; isHiddenByPendingCombine() is called
     // per scanned file, so it must not walk the list.
     QSet<QString> m_pendingCombineHidden;
-    // Item P12: keyed by sidecar .md path — see transcriptBody()'s doc
+    // Keyed by sidecar .md path — see transcriptBody()'s doc
     // comment. mutable so transcriptBody() can stay callable from data()
     // const.
     mutable QHash<QString, CachedBody> m_transcriptBodyCache;

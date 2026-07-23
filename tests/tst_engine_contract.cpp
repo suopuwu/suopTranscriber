@@ -175,6 +175,14 @@ private slots:
         QVERIFY(wparams.no_context);
     }
 
+    // flash attention is opted in at context creation (whisper defaults leave
+    // it off) — a faster encoder-attention kernel, free on the CUDA path.
+    void contextParamsEnablesFlashAttention()
+    {
+        const whisper_context_params cparams = WhisperCppEngine::contextParams();
+        QVERIFY(cparams.flash_attn);
+    }
+
     // Spec (DESIGN.md "Engine architecture" + CLAUDE.md): engines return
     // chunk-relative timestamps; the APP applies offsetSeconds during the
     // merge. Demonstrated with a FakeEngine standing in for "any engine" —

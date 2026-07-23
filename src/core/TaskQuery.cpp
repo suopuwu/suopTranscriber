@@ -76,6 +76,34 @@ bool TaskQuery::isQueued(const TaskList &tasks, const QUrl &fileUrl)
     return false;
 }
 
+bool TaskQuery::isKindQueued(const TaskList &tasks, const QUrl &fileUrl, const QString &kind)
+{
+    for (const auto &task : tasks) {
+        if (!task->occupiesFile())
+            continue;
+        if (task->fileUrl == fileUrl && task->kind() == kind
+            && (task->status == Task::Status::Queued || task->status == Task::Status::Active
+                || task->status == Task::Status::Paused))
+            return true;
+    }
+    return false;
+}
+
+int TaskQuery::insertIndexAfterFileTasks(const TaskList &tasks, const QUrl &fileUrl)
+{
+    int last = -1;
+    for (int i = 0; i < static_cast<int>(tasks.size()); ++i) {
+        const auto &task = tasks[i];
+        if (!task->occupiesFile())
+            continue;
+        if (task->fileUrl == fileUrl
+            && (task->status == Task::Status::Queued || task->status == Task::Status::Active
+                || task->status == Task::Status::Paused))
+            last = i;
+    }
+    return last < 0 ? -1 : last + 1;
+}
+
 bool TaskQuery::isCombineQueued(const TaskList &tasks, const QString &outputPath)
 {
     const QUrl outputUrl = QUrl::fromLocalFile(outputPath);

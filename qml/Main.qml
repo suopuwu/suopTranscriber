@@ -339,13 +339,28 @@ ApplicationWindow {
         id: rootContent
         anchors.fill: parent
 
-        // A left-click on genuinely empty space anywhere in the window drops
-        // keyboard focus from whatever text field currently holds it —
-        // forceActiveFocus() on this container pulls active focus off the
-        // field, whose own onActiveFocusChanged then commits it (matching the
-        // platform expectation that clicking off a field deselects it). A
-        // deeper handler (a field, button, tree row, timestamp seek, middle-
-        // drag pan) grabs the press first, so this only fires on empty space.
+        // A left-click that lands while a TEXT FIELD holds keyboard focus
+        // drops that focus (its own onActiveFocusChanged then commits it),
+        // matching the platform expectation that clicking off a field
+        // deselects it. Gated on a text field actually being focused —
+        // duck-typed on cursorPosition (only TextInput/TextEdit expose it),
+        // the same idiom as Sidebar's textFieldHasFocus — because this
+        // handler spans the whole window and, being a passive TapHandler,
+        // ALSO fires when a deeper passive handler already handled the same
+        // tap. An unconditional forceActiveFocus() here therefore clobbered a
+        // sidebar tree row's own focus grab the instant it happened, leaving
+        // tree.activeFocus false and killing Up/Down note navigation. The gate
+        // makes it a no-op unless there's genuinely a text editor to blur, so
+        // it can never steal focus a row/button/tree deliberately took.
+        //
+        // Same hazard, one step worse for the sidebar's INLINE RENAME: the very
+        // click that opens the rename editor leaves that editor (a text field)
+        // focused, so this passive handler fired on that same tap and blurred it
+        // instantly — the editor's blur-commit then closed it. The rename could
+        // not stick until a click's handler ordering happened to spare it, so it
+        // took several clicks. Gating on sidebar.renamingPath === "" leaves an
+        // open rename alone (beginRename sets renamingPath synchronously during
+        // the tap, before this passive handler runs).
         // Deliberately an Item-attached TapHandler, NOT a MouseArea: it carries
         // no implicit cursor, so it can span the whole window without poisoning
         // the I-beam/pointer cursor resolution of everything above it (see
@@ -356,7 +371,15 @@ ApplicationWindow {
         // press, so it does not intercept this.
         TapHandler {
             acceptedButtons: Qt.LeftButton
-            onTapped: rootContent.forceActiveFocus()
+            onTapped: {
+                // `window` is the root ApplicationWindow; activeFocusItem is a
+                // real QQuickWindow property, so read it off the window rather
+                // than via the Window attached type (which doesn't resolve on a
+                // non-Item handler like this one).
+                const fi = window.activeFocusItem
+                if (fi && fi.cursorPosition !== undefined && sidebar.renamingPath === "")
+                    rootContent.forceActiveFocus()
+            }
         }
 
         // Item: drag-and-drop import — dropping OS file(s) anywhere over the

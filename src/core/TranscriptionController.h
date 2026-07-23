@@ -43,7 +43,7 @@
 #include "tasks/ModelDownloadTarget.h"
 #include "tasks/Task.h"
 
-#include "TaskScheduler.h" // the display-blind queue engine (PHASE Q) + the
+#include "TaskScheduler.h" // the display-blind queue engine + the
                           // TaskSchedulerObserver interface this class implements.
                           // Full type: the observer overrides + the inline getters
                           // below call m_scheduler-> directly.
@@ -51,8 +51,6 @@
 class QTimer;
 class TaskRunner;
 // (VaultTreeModel is included above, not forward-declared — see the include note.)
-                      // so the model still owns the per-file delete/restore
-                      // signal emission MainPanel depends on.
 
 #include "TranscriptFormat.h" // the transcript .md file format (SegmentLineWriter,
                              // ResolvedChapter/ParsedSegment, the frontmatter
@@ -61,13 +59,13 @@ class TaskRunner;
                              // (not forward-declared) so every existing caller of
                              // these helpers keeps compiling against this header.
 
-// Item P34 / item 28: splits a transcript's segment list into consecutive
+// Splits a transcript's segment list into consecutive
 // windows, each formatted-char count kept within LabelingEngine::
 // kMaxChapterInputChars, so TranscriptionWorker::generateChaptersJob() can
 // call generateChapters() once per window instead of silently truncating one
 // oversized call. Returns the segment index each window STARTS at (always
 // [0, ...]); window w spans [result[w], result[w+1]) (or to the end for the
-// last). Item 28 bug: a tiny trailing window is folded into the previous one
+// last). Bug: a tiny trailing window is folded into the previous one
 // ONLY when the combined window still fits kMaxChapterInputChars — otherwise
 // the fold would push the merged window back over budget and
 // generateChapters() would truncate exactly the folded-in tail, so the final
@@ -116,94 +114,59 @@ class TranscriptionController : public QObject, public TaskSchedulerObserver {
     friend class TstTranscriptionQueue;
     Q_PROPERTY(bool busy READ isBusy NOTIFY busyChanged)
     Q_PROPERTY(double progress READ progress NOTIFY progressChanged)
-    // Item 6 (user correction, 2026-07-08): the PROGRESS BAR fill should
-    // still sweep smoothly across a job's WHOLE lifetime (diarization then
-    // transcription treated as one continuous 0..1, same blend `progress`
-    // used before this wave) — only the PERCENTAGE TEXT should be phase-
-    // relative (see `progress`'s own doc comment). QML binds the ProgressBar
-    // `value` to this and the percentage text to `progress`.
-    //
-    // 2026-07-10: each active phase's SLICE of this 0..1 range is no longer
-    // a fixed guess (used to be a hardcoded diarization=first-half/
-    // transcription=second-half split, loading/decoding excluded entirely)
-    // — it's this phase's share of the ROLLING AVERAGE of how long each
-    // phase has actually taken over the last 10 completed jobs (see
-    // RollingAverage, m_phaseTimings, recomputeOverallProgress()). "loading"
-    // and "decoding" have no native progress hook, so their within-phase
-    // fraction is synthesized from elapsed-time-in-phase vs. that phase's
-    // own rolling average (see phaseRelativeSyntheticProgress()) rather than
-    // going indeterminate — the bar now gives every phase real, historically-
-    // proportioned width instead of just the two that happened to have a
-    // progress callback.
+    // The whole-job 0..1 sweep the ProgressBar `value` binds to; the percentage
+    // TEXT binds to `progress`, which is phase-relative instead. Each phase's
+    // slice of the range is its share of the rolling average of how long that
+    // phase has actually taken, so every phase gets historically-proportioned
+    // width — including loading/decoding, which have no native progress hook and
+    // synthesize their within-phase fraction from elapsed-vs-average rather than
+    // going indeterminate. PhaseTimer owns the math.
     Q_PROPERTY(double overallProgress READ overallProgress NOTIFY overallProgressChanged)
-    // Wave N (task system): benchmarkActive/benchmarkProgress are GONE.
-    // They existed because a benchmark needed the bottom-bar glow but must
-    // NOT raise MainPanel's blocking overlay, and `busy` was overloaded to
-    // mean both — so a benchmark left the queue entirely and grew a parallel
-    // glow path, which is exactly how a task ends up invisible to the Tasks
-    // list. The axis is now explicit: EVERY task is queued and gets a row +
-    // the glow (`busy`), while Task::presentation() alone decides whether it
-    // also takes the overlay. `activeIsForeground` below is what the overlay
-    // binds to. See .task/plan.md invariant 2.
+    // True iff a task is Active AND declares Presentation::Foreground — i.e. it
+    // owns the main-panel overlay. EVERY task is queued and gets a Tasks row +
+    // the glow (`busy`); presentation() alone decides the overlay. That split is
+    // why a benchmark no longer needs a side door out of the queue to avoid
+    // raising an overlay over the transcript you're reading.
     Q_PROPERTY(bool activeIsForeground READ activeIsForeground NOTIFY activeIsForegroundChanged)
-    // "loading" (whisper model load — no native progress hook exists for
-    // this; `progress` here is synthesized from elapsed-vs-historical-
-    // average, see overallProgress's doc comment), "detecting-speakers-
-    // segmenting" / "detecting-speakers-identifying" (diarization pass, REAL
-    // progress via DiarizationEngine's sherpa-onnx-backed callback — split
-    // into two sub-phases at fraction==0.30, the exact boundary where
-    // sherpa-onnx's own internal work moves from finding WHERE speech is to
-    // figuring out WHOSE voice it is, so the label switches right when the
-    // real work does, not on a guess), "transcribing" (whisper's own
-    // per-segment progress, as before), or empty when idle or for a
-    // relabel/rename job (neither has phases worth naming). Each phase's own
-    // progress() is phase-relative (its own 0->1); overallProgress blends
-    // them into one continuous whole-job sweep (see its doc comment) rather
-    // than each phase getting a full-width 0->1, which would look like the
-    // bar finishes then restarts. Exists because "huge delay before it
-    // starts transcribing" on bigger models was previously invisible — the
-    // progress bar sat frozen at 0 during model load and (once diarization
-    // landed) during the whole diarization pass too, indistinguishable from
-    // a hang.
+    // The active phase slug — "loading", "detecting-speakers-segmenting" /
+    // "detecting-speakers-identifying" (the diarization pass, split at
+    // fraction==0.30, the point sherpa-onnx's own work moves from finding WHERE
+    // speech is to whose voice it is, so the label switches when the real work
+    // does), "transcribing" — or empty when idle or for a job with no phases
+    // worth naming. Each phase's progress() is phase-relative; overallProgress
+    // blends them into one continuous sweep so the bar doesn't look like it
+    // finishes and restarts. Exists because model load and the diarization pass
+    // used to sit frozen at 0, indistinguishable from a hang.
     Q_PROPERTY(QString currentPhase READ currentPhase NOTIFY currentPhaseChanged)
     Q_PROPERTY(QUrl currentFile READ currentFile NOTIFY currentFileChanged)
-    // The kind slug of whichever task is Active right now (see jobs()' "kind"
-    // key — same values), empty when idle. Wave N bugfix: this now has its
-    // OWN NOTIFY, fired in startTask()/onTaskFinished(). It used to reuse
-    // currentFileChanged, which only fires when the FILE changes — so a
-    // pipeline of same-file steps (transcribe→diarize→relabel→chapters, all
-    // on one fileUrl) left currentJobKind reading "transcribe" the whole way
-    // through, and the overlay label had to key off currentPhase to work
-    // around it. A dedicated signal makes the property honest mid-pipeline.
+    // The kind slug of whichever task is Active (same values as jobs()' "kind"),
+    // empty when idle. Has its OWN NOTIFY rather than reusing currentFileChanged:
+    // a pipeline of same-file steps (transcribe→diarize→relabel→chapters) never
+    // changes the file, so this would otherwise read "transcribe" throughout.
     Q_PROPERTY(QString currentJobKind READ currentJobKind NOTIFY currentJobKindChanged)
-    // Whether the Active task occupies its file for per-file gating (Task::
-    // occupiesFile()) — false when idle or when the Active task is a comparison-
-    // only benchmark/sweep. The MainPanel per-file action buttons AND their
-    // to-a-benchmark of the open file: `busy && currentFile == open` is true for
-    // an Active benchmark too, so they additionally check this to stay enabled.
-    // Same NOTIFY as currentJobKind — both change exactly when the Active task
-    // does (startTask/onTaskFinished).
+    // Whether the Active task occupies its file for per-file gating
+    // (Task::occupiesFile()) — false when idle, and false for a comparison-only
+    // benchmark/sweep. MainPanel's per-file buttons check this in addition to
+    // `busy && currentFile == open`, which is also true while a benchmark of the
+    // open file runs, so they stay enabled through one. Same NOTIFY as
+    // currentJobKind — both change exactly when the Active task does.
     Q_PROPERTY(bool activeOccupiesFile READ activeOccupiesFile NOTIFY currentJobKindChanged)
     // The Active task's human category label (Task::kindLabel(), e.g. "Move to
-    // trash") — what the bottom bar shows before the filename. Parallel to
-    // currentJobKind (the slug); same NOTIFY. Lets the bottom bar read the label
-    // straight off the task instead of re-deriving it from the slug in QML.
+    // trash") — what the bottom bar shows before the filename. Read off the task
+    // rather than re-derived from the slug in QML. Same NOTIFY as currentJobKind.
     Q_PROPERTY(QString currentJobKindLabel READ currentJobKindLabel NOTIFY currentJobKindChanged)
-    // Whether the Active task can be paused at all — read straight off its
-    // Task::capabilities().pausable. Wave N: this REPLACES BottomBar's own
-    // canPause(kind) string allowlist ("transcribe"/"download"/…), which was a
-    // re-implementation of the same fact that could drift from the C++ side.
-    // The task is the single source of truth now, which is the whole point of
-    // capabilities() (the 2026-07-09 pause bug was exactly such a drift). This
-    // is coarse "could this kind ever pause" — the finer "may I pause RIGHT
-    // NOW" (not mid-"loading", not while a soft-restart is in flight) still
-    // lives in BottomBar.canPauseNow(), gated additionally on phase.
+    // Whether the Active task can be paused at all — read straight off
+    // Task::capabilities().pausable, the single source of truth. This replaced a
+    // BottomBar-side kind allowlist that re-implemented the same fact and drifted
+    // from C++, which is what caused the pause-vs-cancel latch bug. Coarse: the
+    // finer "may I pause RIGHT NOW" (not mid-"loading", not during a soft-restart)
+    // stays in BottomBar.canPauseNow(), gated additionally on phase.
     Q_PROPERTY(bool activeCanPause READ activeCanPause NOTIFY currentJobKindChanged)
     Q_PROPERTY(int tasksTotal READ tasksTotal NOTIFY queueChanged)
     Q_PROPERTY(int tasksCompleted READ tasksCompleted NOTIFY queueChanged)
     Q_PROPERTY(QVariantList queuedFileUrls READ queuedFileUrls NOTIFY queueChanged)
     Q_PROPERTY(QVariantList jobs READ jobs NOTIFY queueChanged)
-    // Item 11: the SAME entries jobs() returns, but partitioned for display —
+    // The SAME entries jobs() returns, but partitioned for display —
     // Active first, then Queued in run order, then Paused, then finished
     // (Done/Failed, most-recently-finished first). jobs() stays in raw
     // append/insertion order (run order == append order — see startNext());
@@ -212,46 +175,31 @@ class TranscriptionController : public QObject, public TaskSchedulerObserver {
     // history sinks to the bottom. Everything else (queuedPositionOf(),
     // moveQueuedJob(), etc.) keeps walking the raw jobs() order, unaffected.
     Q_PROPERTY(QVariantList sortedJobs READ sortedJobs NOTIFY queueChanged)
-    // Bumps once for each real new segment line written to the .md sidecar
-    // during an in-progress transcription — throttled (see run()'s
-    // liveUpdateTimer) so a burst of short segments still coalesces into at
-    // most a few ticks per second. QML's "live updates as segments are
-    // written" hooks (MainPanel.qml's transcriptBody/sentences bindings)
-    // must depend on THIS, not progress: progress fires on whisper's every
-    // internal decode-loop iteration (including decode retries/fallbacks),
-    // far more often than real new content actually appears, and each live-
-    // update tick re-reads+re-parses the whole file and rebuilds the whole
-    // transcript view — tying it to progress was clogging the GUI thread.
+    // Bumps once per real new segment line written to the .md, throttled so a
+    // burst of short segments coalesces into a few ticks per second. QML's live
+    // update hooks must depend on THIS, not progress: progress fires on every
+    // whisper decode-loop iteration (including retries), far more often than new
+    // content appears, and each tick re-reads and re-parses the whole file —
+    // tying it to progress clogged the GUI thread.
     Q_PROPERTY(int liveUpdateTick READ liveUpdateTick NOTIFY liveUpdateTickChanged)
     Q_PROPERTY(int pendingRenamesRevision READ pendingRenamesRevision NOTIFY pendingRenamesRevisionChanged)
-    // Wave N (task system): true while the Active job is paused. Only
-    // "transcribe" and "download" jobs are truly pausable (see pauseActive()'s
-    // doc comment) — false at all other times, including whenever nothing is
-    // Active.
+    // True while the Active job is paused; false whenever nothing is Active.
+    // Only transcribe/download are truly pausable — see pauseActive().
     Q_PROPERTY(bool activePaused READ isActivePaused NOTIFY activePausedChanged)
-    // True from the moment a pause click during "loading" fires the
-    // soft-cancel-as-restart (see JobStatus::Paused's doc comment) until it
-    // actually resolves to Paused. QML uses this to disable the pause button
-    // meanwhile — with no such guard, a second click in that window (nothing
-    // visibly changes until the underlying blocking call returns) stacks a
-    // real pauseActive() request on top of the still-pending cancel, which
-    // permanently breaks pause for that job (see togglePauseActive()'s doc
-    // comment for why).
+    // True from a pause click during "loading" firing the soft-cancel-as-restart
+    // until it resolves to Paused. QML disables the pause button meanwhile:
+    // nothing visibly changes until the blocking call returns, so a second click
+    // would stack a real pause request on the pending cancel and permanently
+    // break pause for that job (see togglePauseActive()).
     Q_PROPERTY(bool activeStopping READ isActiveStopping NOTIFY activeStoppingChanged)
-    // Item O35: "CUDA"/"Vulkan"/"CPU" — whichever backend whisper.cpp picked
-    // at the most recent model load (see WhisperCppEngine::activeBackendName()'s
-    // doc comment). Empty until the first model finishes loading this
-    // session; QML is expected to hide its indicator until then rather than
-    // show a blank/placeholder value. Never populated for a relabel/rename/
-    // merge/download job — none of those touch WhisperCppEngine.
+    // "CUDA"/"Vulkan"/"CPU" — whichever backend whisper.cpp picked at the most
+    // recent model load. Empty until the first load completes this session (QML
+    // hides its indicator rather than showing a placeholder), and never populated
+    // for a relabel/rename/merge/download job — none touch WhisperCppEngine.
     Q_PROPERTY(QString activeBackendName READ activeBackendName NOTIFY activeBackendNameChanged)
-    // Item 25: a coarser, user-facing reduction of activeBackendName — "gpu"
-    // for any real accelerator (CUDA/Vulkan/…), "cpu" for the CPU backend,
-    // empty (same as activeBackendName) until the first model finishes
-    // loading. Exposed as its own derived property so every display site can
-    // show just "gpu"/"cpu" (the user asked for exactly those two words,
-    // lowercase) off ONE mapping instead of each re-deriving it. QML hides
-    // its indicator on empty, same convention as activeBackendName.
+    // Coarser user-facing reduction of activeBackendName: "gpu" for any real
+    // accelerator, "cpu" for the CPU backend, empty until the first load. Its own
+    // property so every display site reads ONE mapping instead of re-deriving it.
     Q_PROPERTY(QString activeBackendKind READ activeBackendKind NOTIFY activeBackendNameChanged)
     // The vault tree model, bound from Main.qml (`vaultTreeModel: vaultModel`),
     // same as UsbGrabberController. The controller calls its applyRemovalOutcome()/
@@ -263,13 +211,11 @@ class TranscriptionController : public QObject, public TaskSchedulerObserver {
                    vaultTreeModelChanged)
 
 public:
-    // Wave N (task system): the job status enum lives on Task now
-    // (Task::Status). Its member VALUES are unchanged (Queued=0..Failed=4),
-    // so jobStatusForPath()'s int contract with QML/Sidebar is preserved;
-    // "no task for this path" is still the -1 sentinel that enum deliberately
-    // has no member for (jobStatusForPath returns a raw -1).
+    // The job status enum lives on Task (Task::Status), values Queued=0..Failed=4.
+    // "No task for this path" is the -1 sentinel that enum deliberately has no
+    // member for — jobStatusForPath() returns a raw -1.
 
-    // The phase-timing subsystem moved to PhaseTimer (2026-07-20) — see its
+    // The phase-timing subsystem moved to PhaseTimer — see its
     // class doc comment. These two stay here as the names tests (and any
     // caller holding only a controller) already spell; both are pure
     // forwarders to the canonical definitions on PhaseTimer, where their full
@@ -314,7 +260,7 @@ public:
     bool activeCanPause() const;
     QString currentPhase() const { return m_phase; }
     // The phase-vocabulary REGISTRY (slug -> bottom-bar label / main-panel
-    // overlay title) moved to JobListFormatter (2026-07-20) — see its class
+    // overlay title) moved to JobListFormatter — see its class
     // doc comment, where these two carry their full docs. They stay here as
     // the Q_INVOKABLE names QML already spells (BottomBar's phase text,
     // MainPanel's transcribingOverlayLabel); both are pure forwarders.
@@ -337,11 +283,11 @@ public:
     QString activeBackendName() const { return m_activeBackendName; }
     // See the activeBackendKind Q_PROPERTY doc comment above.
     QString activeBackendKind() const { return backendKind(m_activeBackendName); }
-    // Item 25: pure mapping "CUDA"/"Vulkan"/…/"CPU"/"" -> "gpu"/"cpu"/"".
+    // Pure mapping "CUDA"/"Vulkan"/…/"CPU"/"" -> "gpu"/"cpu"/"".
     // Static + public so it's unit-testable directly without a live backend
     // load. Case-insensitive "CPU" match; anything else non-empty is "gpu".
     static QString backendKind(const QString &backendName);
-    // Item P29 / item 58: the transcript-length-aware EFFECTIVE wordiness a
+    // The transcript-length-aware EFFECTIVE wordiness a
     // label/prelude pass actually uses, given the user's base wordiness slider
     // and the transcript's word count. Caps DOWN for short transcripts (a
     // 3-sentence transcript shouldn't get a 5-paragraph prelude — P29) AND
@@ -389,20 +335,20 @@ public:
     // queue/worker thread).
     QVariantList jobs() const;
 
-    // Item 11: jobs() reordered for display — see the sortedJobs Q_PROPERTY
+    // jobs() reordered for display — see the sortedJobs Q_PROPERTY
     // doc comment. Walking m_tasks (jobs()) is the part only this class can
     // do; the collapsing and partitioning are pure transforms over that list
     // and live on JobListFormatter.
     QVariantList sortedJobs() const;
 
     // The two pure jobs()-list display transforms moved to JobListFormatter
-    // (2026-07-20) — see its class doc comment, where their full doc comments
+    // — see its class doc comment, where their full doc comments
     // now live. They stay here as the public static names
     // tst_transcription_queue already spells; both are pure forwarders.
     static QVariantList sortJobsForDisplay(const QVariantList &jobEntries);
     static QVariantList collapseBatches(const QVariantList &jobEntries);
 
-    // Item P6: lets the sidebar's file tree query a single path's job status
+    // Lets the sidebar's file tree query a single path's job status
     // directly, without walking the whole jobs() list itself. path must be an
     // absolute local file path (QUrl::toLocalFile()), matching what m_jobs'
     // Job::fileUrl resolves to — same convention every other path-keyed
@@ -428,11 +374,11 @@ public:
     // fails, still runs next and fails on its own (nothing to label yet) —
     // it is never silently skipped just because its upstream job failed, so
     // the Tasks list always reflects exactly what was requested up front.
-    // restrictTagsToExisting (item 14 "auto-categorize" mode): when true,
+    // restrictTagsToExisting ("auto-categorize" mode): when true,
     // the labeling pass is instructed to only pick tags already used
     // elsewhere in this vault (scanned fresh per job), leaving tags empty
     // rather than inventing a new one if none fit. Ignored when autoLabel
-    // is false. tagReuseBias (item 15, Wave E): 0.0-1.0 soft nudge between
+    // is false. tagReuseBias: 0.0-1.0 soft nudge between
     // inventing new tags vs. reusing existing ones — only meaningful when
     // restrictTagsToExisting is false (that's already a hard constraint).
     // wordiness (Feature 1): 0.0-1.0 soft nudge on how verbose the generated
@@ -449,7 +395,7 @@ public:
                                     bool restrictTagsToExisting = false, double tagReuseBias = 0.5,
                                     double wordiness = 0.5);
 
-    // Item 37: drag-and-drop / external audio import as a tracked, async
+    // Drag-and-drop / external audio import as a tracked, async
     // task. sourceUrl is the external file the user dropped; destUrl is the
     // in-vault destination VaultTreeModel::importDestinationFor() already
     // validated (wrong-type / collision / no-vault are rejected there,
@@ -498,7 +444,7 @@ public:
     int enqueueUsbGrab(const UsbGrabRule &rule, const QString &mountPath, const QUrl &destUrl, const QUrl &vaultUrl,
                        bool autoTriggered, const QVariantList &combineRules = {});
 
-    // Item 52: standalone speaker diarization on an ALREADY-transcribed file
+    // Standalone speaker diarization on an ALREADY-transcribed file
     // — adds (or re-runs) speaker detection WITHOUT re-transcribing the audio.
     // Reads the existing sibling .md's segment lines, decodes the audio,
     // runs the SAME diarization core the inline transcribe-time speakerDetection
@@ -561,7 +507,7 @@ public:
     // not part of this equality check.
     Q_INVOKABLE bool matchesExistingTranscription(const QUrl &fileUrl, const QString &modelId) const;
 
-    // "Regenerate auto-title" (item 9): re-runs just the AI auto-labeling
+    // "Regenerate auto-title": re-runs just the AI auto-labeling
     // pass on an already-transcribed file — reads the EXISTING transcript
     // text, does not re-transcribe audio. Queued through the same job/worker
     // infrastructure as transcribe() (dedup, persistent job list) since it's
@@ -595,7 +541,7 @@ public:
     // an already-chaptered file) strips the old AUTO marker set first — never
     // accumulates duplicates across repeated runs — but PRESERVES any manual
     // markers the user added/edited (see spliceBodyChapters() / addChapter()).
-    // Item 27: density (0.0-1.0, default 0.5) controls how many chapters to
+    // Density (0.0-1.0, default 0.5) controls how many chapters to
     // propose (see LabelingEngine::generateChapters()); the QML will pass an
     // AppSettings value once its slider lands (owed, later wave) — defaulted
     // here so existing call sites still compile.
@@ -695,7 +641,7 @@ public:
     // readMetadata_parsesVadKeys()).
     // Note: the prelude (Feature 2) lives in the BODY, not frontmatter (it
     // needs real newlines) — use readPrelude() for that, not this map.
-    // Item O19: cached (see m_frontmatterCache) behind a cheap
+    // Cached (see m_frontmatterCache) behind a cheap
     // file-size+mtime check, since this is called on every liveUpdateTick
     // (transitively, via parseSentences()) while a transcription is
     // actively running on the currently-open file.
@@ -703,6 +649,22 @@ public:
 
     // {id, label} pairs for the model dropdown (see ModelManager).
     Q_INVOKABLE QVariantList availableModels() const;
+
+    // Whether transcribing `modelId` runs through the app's Silero VAD path —
+    // i.e. gets VAD-computed silence-gated windows (fewer repetition
+    // hallucinations, split at natural pauses), matching the per-transcription
+    // `vadActive` frontmatter flag. True for in-process engines (whisper,
+    // parakeet); false for self-segmenting subprocess engines that receive the
+    // whole file. Drives MainPanel's VAD status dot. See TranscribePipeline.
+    Q_INVOKABLE bool modelUsesVad(const QString &modelId) const;
+
+    // The STRONGER of the two VAD roles: whisper.cpp's own per-window silence
+    // GATING (`wparams.vad`, set only on a WhisperCppEngine — see
+    // TranscribePipeline's dynamic_cast guard), which actually drops silent /
+    // non-speech frames so the model isn't fed empty stretches. True for
+    // whisper only; parakeet gets modelUsesVad windowing (pause-split chunks)
+    // but NOT this gating, so its dot is green with a scoped tooltip.
+    Q_INVOKABLE bool modelUsesVadGating(const QString &modelId) const;
 
     // {id, label, downloaded, nonCommercial} for the diarization SEGMENTATION /
     // EMBEDDING model pickers (Settings → Transcription & AI), and the
@@ -888,7 +850,7 @@ public:
     // read+write, no model/engine involvement.
     Q_INVOKABLE bool setLabel(const QUrl &fileUrl, const QString &label, QString *errorOut = nullptr) const;
 
-    // Item P15: sets/replaces the `tags:` frontmatter key, same reopen/
+    // Sets/replaces the `tags:` frontmatter key, same reopen/
     // rewrite shape as setLabel() above. tags is joined with ", " to match
     // the exact comma-separated format collectVaultFrontmatterList()/readMetadata()
     // already parse (auto-label writes this same shape via
@@ -1054,7 +1016,7 @@ public:
 
     // Everything after the frontmatter's closing "---" line (i.e. the
     // segment text), for main-panel search. Empty string if untranscribed
-    // or unreadable. Item O19: cached (see m_bodyCache) behind a cheap
+    // or unreadable. Cached (see m_bodyCache) behind a cheap
     // file-size+mtime check, since this is called on every liveUpdateTick
     // while a transcription is actively running on the currently-open file.
     Q_INVOKABLE QString readTranscriptBody(const QUrl &fileUrl) const;
@@ -1077,12 +1039,21 @@ public:
     // at write time, in the file itself, not just in this parsed view. For
     // sentence-level highlighting synced to playback (see DESIGN.md /
     // CLAUDE.md "sentence-level only, binary-search on positionChanged").
-    // Item O19: cached (see m_sentenceCache) — an append-only live
+    // Cached (see m_sentenceCache) — an append-only live
     // transcription only regex-parses its NEW trailing bytes per call
     // instead of re-parsing the whole (ever-growing) body from scratch.
     Q_INVOKABLE QVariantList parseSentences(const QUrl &fileUrl) const;
 
-    // Item P23: cold-opening a large already-transcribed file used to block
+    // True iff two URLs name the same local file, comparing decoded local paths
+    // (toLocalFile()) rather than toString(). QML gates that decide "is the
+    // finished task's file the one currently open?" must use this: a filename
+    // with spaces (or other percent-encodable chars) can stringify differently
+    // depending on how each QUrl was built — fromLocalFile vs a QUrl(string) —
+    // so a toString() compare can spuriously say "different file" and silently
+    // skip the live reload. toLocalFile() normalizes both sides.
+    Q_INVOKABLE bool isSameFile(const QUrl &a, const QUrl &b) const;
+
+    // Cold-opening a large already-transcribed file used to block
     // the GUI thread for the entire readTranscriptBody()+parseSentences()
     // pass (a single regex sweep over the whole body, cost scaling with
     // file size) — this runs that SAME pair of (cached) calls on a
@@ -1135,7 +1106,7 @@ public:
     Q_INVOKABLE double nextSilenceSkipTarget(const QVariantList &silences, double positionSeconds,
                                               double thresholdSeconds) const;
 
-    // Wave N (task system, item 1): loads `<vaultUrl>/.transcriber/tasks.json`
+    // Task system: loads `<vaultUrl>/.transcriber/tasks.json`
     // (written by this same class — see persistQueue()) if present, and
     // re-enqueues every entry as a fresh Queued job (see
     // enqueueReplayedJob()). Also remembers vaultUrl as the destination for
@@ -1157,7 +1128,7 @@ public:
     // sessions", not "auto-resumed".
     Q_INVOKABLE void loadPersistedQueue(const QUrl &vaultUrl);
 
-    // Wave N (task system, user correction 2026-07-09): starts the
+    // Task system: starts the
     // front-most Queued job — the "play" button QML shows in place of the
     // pause button whenever nothing is Active but the queue isn't empty
     // (most commonly right after loadPersistedQueue() restored one).
@@ -1192,7 +1163,7 @@ public:
     // waits on the same slow-to-interrupt native call underneath.
     Q_INVOKABLE void terminateApplicationImmediately() const;
 
-    // Item 17: de-duplicated, sorted list of every tag already used anywhere
+    // De-duplicated, sorted list of every tag already used anywhere
     // in the vault — feeds the sidebar's tag-input autocomplete. Same scan
     // LabelingEngine's "restrict to existing tags" mode already uses
     // internally (collectVaultFrontmatterList, TranscriptionController.cpp); exposed
@@ -1241,13 +1212,18 @@ public:
     };
 
     // The split-recording combine DETECTION subsystem moved to CombineScanner
-    // (2026-07-20) — see its class doc comment. These three stay here as the
+    // — see its class doc comment. These three stay here as the
     // Q_INVOKABLE names QML (SettingsPopup.qml's combine page, Sidebar.qml's
     // group outlines) and tests already spell; all three are pure forwarders
     // to the canonical definitions on CombineScanner, where their full doc
     // comments now live. The queue glue below (runCombineScan()/
     // combineGroup() and their private helpers) is what did NOT move: it
     // mutates m_tasks.
+    // The combine stability window (secs) — the sidebar's passive combine
+    // re-scan timer waits this long for a just-arrived group to settle from
+    // "pending" to "ready". Forwarded so QML reads the SAME value the scan
+    // uses, not a hardcoded parallel one. See CombineScanner::kCombineStabilityWindowSecs.
+    Q_INVOKABLE int combineStabilityWindowSecs() const;
     Q_INVOKABLE QVariantList detectCombineGroups(const QVariantList &rules, const QStringList &audioPaths) const;
     Q_INVOKABLE QString regexValidationError(const QString &pattern) const;
     Q_INVOKABLE QStringList differentiatorNonParticipatingFiles(const QString &pattern, int groupIndex,
@@ -1264,7 +1240,7 @@ public:
     Q_INVOKABLE void runCombineScan(const QVariantList &rules, const QStringList &audioPaths, const QUrl &vaultUrl,
                                      bool deleteOriginals);
 
-    // Sidebar per-row "combine this group" hover button (item 51): same
+    // Sidebar per-row "combine this group" hover button: same
     // matching/enqueue machinery as runCombineScan() above but scoped to the
     // ONE group whose outputPath matches — see runCombineScan()'s doc
     // comment for why the ribbon button's "scan everything ready" behavior
@@ -1313,14 +1289,14 @@ signals:
     void currentPhaseChanged();
     void currentFileChanged();
     void queueChanged();
-    // Item P6: fired whenever the path->JobStatus index (m_jobStatusByPath)
+    // Fired whenever the path->JobStatus index (m_jobStatusByPath)
     // actually changes — i.e. on every queueChanged() that changes at least
     // one path's resolved status, see rebuildJobStatusIndex(). QML's file
     // tree delegates connect to this to know when to re-poll
     // jobStatusForPath() for their own path, without depending on the
     // (unrelated-to-them) full jobs() list shape.
     void jobStatusesChanged();
-    // Item P23: see loadTranscriptAsync()'s doc comment. Always emitted on
+    // See loadTranscriptAsync()'s doc comment. Always emitted on
     // the GUI thread (the background QThread marshals back via
     // QMetaObject::invokeMethod/Qt::QueuedConnection) — safe for QML to
     // react to directly, no cross-thread concerns for the receiver.
@@ -1329,7 +1305,7 @@ signals:
     void activePausedChanged();
     void activeStoppingChanged();
     void activeBackendNameChanged();
-    // const: also emitted from setLabel()/setPrelude()/setTags() (item P19),
+    // const: also emitted from setLabel()/setPrelude()/setTags(),
     // which are themselves const (pure file-rewrite helpers, no member state
     // touched) — Qt signals may be declared const, and doing so here lets
     // those synchronous, non-queued edit paths notify the sidebar the same
@@ -1422,7 +1398,7 @@ signals:
     void usbGrabFinished(int jobId, int filesCopied, int filesSkipped, const QStringList &errors, bool cancelled);
 
 private:
-    // Wave N (task system): the Job struct, the DownloadTarget enum, and
+    // Task system: the Job struct, the DownloadTarget enum, and
     // jobKind() that used to live here are GONE. A queued unit of work is now
     // a polymorphic Task (src/core/tasks/Task.h) — one subclass per kind,
     // owning its own doing-code, result signals, row fields, capabilities,
@@ -1473,7 +1449,7 @@ private:
         emit finished(fileUrl, false, QStringLiteral("Cancelled"));
     }
 
-    // Item P6: rebuilds m_jobStatusByPath from scratch off the current
+    // Rebuilds m_jobStatusByPath from scratch off the current
     // m_jobs, emitting jobStatusesChanged() iff the resolved per-path status
     // actually changed. Connected to queueChanged() in the constructor
     // (alongside persistQueue()) rather than called individually from every
@@ -1502,7 +1478,7 @@ private:
     // helper keep the same call site. Returns the new task's id.
     int enqueueTask(std::unique_ptr<Task> task, int insertIndex = -1);
 
-    // Item 17: the three public chapter editors (addChapter/setChapterTitle/
+    // The three public chapter editors (addChapter/setChapterTitle/
     // deleteChapter) all reopen the .md, carry frontmatter through untouched,
     // mutate the body's "## [timestamp] title" marker set, and write back —
     // the exact reopen/rewrite shape setPrelude() uses. Factored here so the
@@ -1515,7 +1491,7 @@ private:
     enum class ChapterEditOp { Add, SetTitle, Delete };
     bool editChapterMarker(const QUrl &fileUrl, ChapterEditOp op, double timestampSeconds, const QString &title,
                             QString *errorOut) const;
-    // Wave N (task system, item 5): pushes a Queued "download" job for
+    // Task system: pushes a Queued "download" job for
     // whichever model file `target` names, UNLESS one is already
     // Queued/Active or the file is already on disk (checked fresh here, not
     // cached — models can be deleted out from under the app between calls).
@@ -1523,7 +1499,7 @@ private:
     // download (if needed) lands just ahead of it in m_jobs and therefore
     // runs first. Returns the new job's id, or -1 if no download was needed.
     //
-    // insertIndex (item O15): where to insert the download job, if one is
+    // insertIndex: where to insert the download job, if one is
     // queued — -1 (default) appends to the end of m_jobs, which is what
     // queue-REPLAY callers (enqueueReplayedJob()/loadPersistedQueue()) want,
     // since restoring a persisted session must reproduce its exact saved
@@ -1532,7 +1508,7 @@ private:
     // jumps ahead of whatever's already Queued (see their own doc comments).
     int maybeQueueDownloadTask(ModelDownloadTarget target, const QUrl &vaultUrl, const QString &modelId,
                                 int insertIndex = -1);
-    // Item O15: where a freshly requested job should land in m_jobs so it
+    // Where a freshly requested job should land in m_jobs so it
     // runs NEXT once whatever's currently running finishes, ahead of
     // anything already Queued — right after the Active job if one exists
     // (never ahead of it: this must not preempt work already in flight), or
@@ -1547,7 +1523,7 @@ private:
     // check. Forwards to TaskQuery::isDownloadQueued().
     bool isDownloadQueued(ModelDownloadTarget target, const QUrl &vaultUrl, const QString &modelId) const;
 
-    // Wave N (task system, item 1): serializes every Queued job (an Active
+    // Task system: serializes every Queued job (an Active
     // job is written as Queued — see loadPersistedQueue()'s doc comment for
     // why) to m_vaultUrl's tasks.json. Connected to queueChanged() in the
     // constructor, so this fires automatically after every mutation; a
@@ -1589,6 +1565,12 @@ private:
     // PhaseTimer's doc comments for the weighting itself and for when it's a
     // no-op.
     void recomputeOverallProgress();
+    // The frozen-bar safety net: on the indeterminate timer's tick, RAISE the
+    // bar via PhaseTimer::selfCumulativeSyntheticProgress() for a SelfCumulative
+    // Active task that has emitted phase() but not yet any real progress(). A
+    // no-op once m_activeHadRealProgress flips (real ticks then drive the bar) or
+    // for a WeightedPhases task (recomputeOverallProgress() owns that path).
+    void advanceSelfCumulativeSynthetic();
 
     // PHASE Q: the display-blind queue engine. Owns the task list, the two
     // worker threads/runners, and the pause/cancel INTENT — everything this
@@ -1609,6 +1591,13 @@ private:
     int m_pendingRenamesRevision = 0;
     bool m_busy = false;
     double m_progress = 0.0;
+    // True once the Active SelfCumulative task emits its first real progress()
+    // tick — from that point the synthetic frozen-bar fallback
+    // (advanceSelfCumulativeSynthetic()) stands down and the real fraction owns
+    // the bar. Reset per task in onSerialTaskStarting(). Job-scoped, not
+    // per-phase: a task that reports progress at all doesn't need the fallback;
+    // one that never does (RelabelTask) is exactly the frozen-bar case.
+    bool m_activeHadRealProgress = false;
     // See the activeIsForeground Q_PROPERTY doc comment — recomputed in
     // startTask()/onTaskFinished() from the Active task's presentation().
     bool m_activeIsForeground = false;
@@ -1646,7 +1635,7 @@ private:
     // by the scheduler's task list and forgotten via onTaskRemoved() as they're
     // erased.
     QSet<const Task *> m_connectedTasks;
-    // Item P6: rebuilt from m_jobs by rebuildJobStatusIndex() (see its own
+    // Rebuilt from m_jobs by rebuildJobStatusIndex() (see its own
     // doc comment) — keyed by absolute local file path, mirrors jobs()'
     // per-path status but as an O(1) lookup for jobStatusForPath() instead of
     // a linear jobs() scan.
@@ -1656,7 +1645,7 @@ private:
     QUrl m_vaultUrl;
     // See isActivePaused()'s doc comment.
     bool m_activePaused = false;
-    // Wave N (task system, item 4/7): wall-clock ms the Active job has
+    // Task system: wall-clock ms the Active job has
     // actually been RUNNING, excluding paused stretches — see
     // activeElapsedMs()'s doc comment. m_activeSegmentTimer covers the
     // current (unpaused) running stretch since job start or last resume;
@@ -1666,7 +1655,7 @@ private:
     // See activeBackendName Q_PROPERTY's doc comment.
     QString m_activeBackendName;
 
-    // Item O19: readMetadata()/readTranscriptBody()/parseSentences() are all
+    // readMetadata()/readTranscriptBody()/parseSentences() are all
     // Q_INVOKABLE and called synchronously from QML bindings on every
     // liveUpdateTick (~5x/sec, see its own doc comment) while a
     // transcription is actively running on the currently-open file — each
@@ -1706,7 +1695,7 @@ private:
         bool valid = false;
     };
     mutable SentenceCache m_sentenceCache;
-    // Item P23: readMetadata()/readTranscriptBody()/parseSentences() are now
+    // readMetadata()/readTranscriptBody()/parseSentences() are now
     // also invoked from a background QThread by loadTranscriptAsync() (see
     // its doc comment), concurrently with the GUI thread's own synchronous
     // calls to the same three functions (the existing liveUpdateTick-driven

@@ -120,7 +120,7 @@ QString taskStatusToString(Task::Status status)
     return QString();
 }
 
-// Item P6: priority order rebuildJobStatusIndex() uses to pick ONE status
+// Priority order rebuildJobStatusIndex() uses to pick ONE status
 // when multiple m_tasks entries share a path (e.g. a Done history entry plus
 // a freshly re-queued run) — "in progress" beats "finished", and among
 // finished entries Failed beats Done since a failure is the more actionable
@@ -143,7 +143,7 @@ int taskStatusPriority(Task::Status status)
 }
 
 
-// Item 14 "auto-categorize" mode: the existing tag vocabulary for a vault.
+// "auto-categorize" mode: the existing tag vocabulary for a vault.
 // Reads every .md's `tags:` frontmatter line directly rather than going
 // through readMetadata()'s full parse, since that's all that's needed here.
 // Returns a de-duplicated, sorted list of individual tags.
@@ -251,7 +251,7 @@ QList<int> computeChapterWindows(const QStringList &segmentTexts)
     }
     // Don't waste a whole extra LLM call on a pathologically small trailing
     // window (e.g. one segment left over) — fold it into the previous window
-    // IF the combined window still fits kMaxChapterInputChars. Item 28 bug:
+    // IF the combined window still fits kMaxChapterInputChars. Bug:
     // the old code folded unconditionally, producing a merged window that
     // exceeded the budget, which LabelingEngine::generateChapters() then
     // silently truncated back down — dropping exactly the folded-in tail, so
@@ -377,7 +377,7 @@ std::optional<EngineDescriptor> resolveEngine(const QString &engineId, const QSt
     return std::nullopt;
 }
 
-// Wave N (task system): TranscriptionWorker is GONE (1601 lines). It was one
+// Task system: TranscriptionWorker is GONE (1601 lines). It was one
 // QObject with 12 kind-specific slots and ~22 unioned signals, owning the warm
 // engines and every kind's doing-code in one body. All of it now lives in
 // src/core/tasks/: one Task subclass per kind (its own run() + its own typed
@@ -414,7 +414,8 @@ TranscriptionController::TranscriptionController(QObject *parent)
     // advance on this tick alone — re-notify both so QML repaints.
     connect(m_indeterminatePhaseTimer, &QTimer::timeout, this, [this] {
         emit progressChanged();
-        recomputeOverallProgress();
+        recomputeOverallProgress();       // WeightedPhases no-callback phases
+        advanceSelfCumulativeSynthetic(); // SelfCumulative frozen-bar fallback
     });
 
     // PHASE Q: the display-blind queue engine. It owns the task list, the two
@@ -504,6 +505,11 @@ void TranscriptionController::connectTask(Task *task)
         // emits an already-cumulative fraction — assign it straight to the bar;
         // a WeightedPhases kind (transcribe/diarize) blends its phases.
         if (task->progressModel() == Task::ProgressModel::SelfCumulative) {
+            // A real fraction has arrived — the synthetic frozen-bar fallback
+            // (advanceSelfCumulativeSynthetic()) stands down for the rest of the
+            // job so it can never run ahead of the true value.
+            m_activeHadRealProgress = true;
+            m_indeterminatePhaseTimer->stop();
             m_phaseTimer->setOverallProgress(fraction);
         } else {
             recomputeOverallProgress();
@@ -521,8 +527,16 @@ void TranscriptionController::connectTask(Task *task)
         // The no-callback phases (isSyntheticProgressPhase) have no progress
         // signal of their own, so this timer is the only thing that advances
         // BOTH progress() and overallProgress() mid-phase; every other phase
-        // gets its ticks from the real Task::progress signal instead.
-        if (PhaseTimer::isSyntheticProgressPhase(phase))
+        // gets its ticks from the real Task::progress signal instead. It ALSO
+        // drives the SelfCumulative frozen-bar fallback: a SelfCumulative task
+        // that hasn't reported real progress needs the ramp for ANY phase, not
+        // just the three WeightedPhases names — a real progress() tick stops the
+        // timer and takes over (see the progress handler above).
+        Task *active = m_scheduler->activeTask();
+        const bool selfCumulativeNeedsSynthetic = active
+            && active->progressModel() == Task::ProgressModel::SelfCumulative
+            && !m_activeHadRealProgress;
+        if (PhaseTimer::isSyntheticProgressPhase(phase) || selfCumulativeNeedsSynthetic)
             m_indeterminatePhaseTimer->start();
         else
             m_indeterminatePhaseTimer->stop();
@@ -683,7 +697,7 @@ TranscriptionController::~TranscriptionController()
     m_scheduler = nullptr;
 }
 
-// The phase-timing subsystem lives in PhaseTimer now (2026-07-20) — the
+// The phase-timing subsystem lives in PhaseTimer now — the
 // rolling averages and their QSettings persistence, the phase vocabulary
 // (phaseBucket/canonicalPhaseKey are file-scope statics over there), and the
 // blended overallProgress bar. What stays here is the Active-job context that
@@ -734,6 +748,24 @@ void TranscriptionController::recomputeOverallProgress()
         weightedPhases ? task->progressPhases() : QStringList(), weightedPhases, m_phase,
         activeModelIdForTiming(), m_activeSpeakerDetection, m_progress,
         activeElapsedMs() - m_phaseStartMs);
+}
+
+void TranscriptionController::advanceSelfCumulativeSynthetic()
+{
+    Task *task = m_scheduler->activeTask();
+    // Only a SelfCumulative task that has emitted a phase but no real progress
+    // yet needs synthesizing — a WeightedPhases task is handled by
+    // recomputeOverallProgress(), and a real progress() tick has already stopped
+    // this timer for a SelfCumulative one.
+    if (!task || task->progressModel() != Task::ProgressModel::SelfCumulative
+        || m_activeHadRealProgress || m_phase.isEmpty())
+        return;
+    const double synthetic = m_phaseTimer->selfCumulativeSyntheticProgress(
+        m_phase, task->kind(), activeModelIdForTiming(), activeElapsedMs());
+    // Only ever raise the bar — the ramp is monotonic and clamped (<0.95), so it
+    // moves the frozen 0% forward without ever reversing or claiming completion.
+    if (synthetic > m_phaseTimer->overallProgress())
+        m_phaseTimer->setOverallProgress(synthetic);
 }
 
 bool TranscriptionController::isQueued(const QUrl &fileUrl) const
@@ -814,7 +846,7 @@ void TranscriptionController::transcribe(const QUrl &fileUrl, const QUrl &vaultU
     if (isQueued(fileUrl))
         return;
 
-    // Item 23: a transcribe call ONLY transcribes now. It used to chain a
+    // A transcribe call ONLY transcribes now. It used to chain a
     // second relabel-only job whenever autoLabel was true, so clicking
     // "Transcribe" silently also labeled — the dedicated "Regenerate label"
     // action is the sole way to label. The autoLabel parameter is kept (QML
@@ -873,9 +905,11 @@ void TranscriptionController::diarizeFile(const QUrl &fileUrl, const QUrl &vault
                                           const QString &segmentationModelId, const QString &embeddingModelId,
                                           double sensitivity)
 {
-    // Same dedup rule as transcribe()/relabel(): a Queued/Active entry blocks
-    // a duplicate request.
-    if (isQueued(fileUrl))
+    // Per-KIND dedup, not per-file: a transcribe still in flight for this file
+    // must not block queueing detect-speakers behind it (it lands after the
+    // transcribe via the ordered insert below) — only a diarize already in
+    // flight blocks a duplicate.
+    if (TaskQuery::isKindQueued(m_scheduler->tasks(), fileUrl, QStringLiteral("diarize")))
         return;
 
     // Empty id ⇒ the ModelManager default (keeps the task's recorded ids
@@ -887,7 +921,8 @@ void TranscriptionController::diarizeFile(const QUrl &fileUrl, const QUrl &vault
                                 ? QString::fromLatin1(ModelManager::kDefaultEmbeddingModelId)
                                 : embeddingModelId;
 
-    enqueueTask(std::make_unique<DiarizeTask>(fileUrl, vaultUrl, segId, embedId, sensitivity));
+    enqueueTask(std::make_unique<DiarizeTask>(fileUrl, vaultUrl, segId, embedId, sensitivity),
+                TaskQuery::insertIndexAfterFileTasks(m_scheduler->tasks(), fileUrl));
 }
 
 void TranscriptionController::diarizeFilesForPaths(const QVariantList &fileUrls, const QUrl &vaultUrl,
@@ -914,13 +949,16 @@ void TranscriptionController::detectSilences(const QUrl &fileUrl, const QUrl &va
 void TranscriptionController::relabel(const QUrl &fileUrl, const QUrl &vaultUrl, bool restrictTagsToExisting,
                                        double tagReuseBias, double wordiness)
 {
-    // Same dedup rule as transcribe(): a Queued/Active entry (whether a full
-    // transcribe or a relabel-only task) blocks a duplicate request.
-    if (isQueued(fileUrl))
+    // Per-KIND dedup, not per-file: a transcribe still in flight for this file
+    // must not block queueing a relabel behind it (it lands after the
+    // transcribe via the ordered insert below) — only a relabel already in
+    // flight blocks a duplicate.
+    if (TaskQuery::isKindQueued(m_scheduler->tasks(), fileUrl, QStringLiteral("relabel")))
         return;
 
     enqueueTask(std::make_unique<RelabelTask>(fileUrl, vaultUrl, restrictTagsToExisting, tagReuseBias, wordiness,
-                                               /*skipIfAlreadyLabeled=*/false));
+                                               /*skipIfAlreadyLabeled=*/false),
+                TaskQuery::insertIndexAfterFileTasks(m_scheduler->tasks(), fileUrl));
 }
 
 void TranscriptionController::relabelAll(const QVariantList &fileUrls, const QUrl &vaultUrl,
@@ -935,11 +973,12 @@ void TranscriptionController::relabelAll(const QVariantList &fileUrls, const QUr
 
 void TranscriptionController::generateChapters(const QUrl &fileUrl, const QUrl &vaultUrl, double density)
 {
-    // Same dedup rule as relabel() — see its doc comment.
-    if (isQueued(fileUrl))
+    // Per-KIND dedup, not per-file — see relabel()'s doc comment.
+    if (TaskQuery::isKindQueued(m_scheduler->tasks(), fileUrl, QStringLiteral("chapters")))
         return;
 
-    enqueueTask(std::make_unique<ChaptersTask>(fileUrl, vaultUrl, density));
+    enqueueTask(std::make_unique<ChaptersTask>(fileUrl, vaultUrl, density),
+                TaskQuery::insertIndexAfterFileTasks(m_scheduler->tasks(), fileUrl));
 }
 
 void TranscriptionController::generateChaptersAll(const QVariantList &fileUrls, const QUrl &vaultUrl, double density)
@@ -977,7 +1016,7 @@ void TranscriptionController::runAllJobs(const QUrl &fileUrl, const QUrl &vaultU
     // sidecarPath() is itself, so this is true for those too.
     const bool alreadyTranscribed = QFileInfo::exists(sidecarPath(fileUrl.toLocalFile()));
 
-    // Item O15: jump ahead of whatever's already Queued, but keep this file's
+    // Jump ahead of whatever's already Queued, but keep this file's
     // tasks CONTIGUOUS and IN ORDER by walking insertAt forward as each is
     // inserted (rather than each new task re-jumping to the very front —
     // which is exactly why this doesn't just call transcribe()/diarizeFile()/
@@ -1065,6 +1104,7 @@ void TranscriptionController::onSerialTaskStarting(Task *task, bool wasCancellin
         emit activeIsForegroundChanged();
     }
     m_progress = 0.0;
+    m_activeHadRealProgress = false;
     emit progressChanged();
     // Cleared so a kind that never emits phase() doesn't inherit a stale phase.
     m_phase.clear();
@@ -1130,7 +1170,17 @@ qint64 TranscriptionController::onSerialTaskTerminal(Task *task, bool ok, const 
     // Active-work elapsed (excludes paused stretches — see activeElapsedMs()).
     // Read while the scheduler's active slot is still this task (m_activeIndex
     // not yet cleared), matching the old timing.
-    return activeElapsedMs();
+    const qint64 elapsed = activeElapsedMs();
+    // Teach the SelfCumulative frozen-bar fallback: a task that completed OK
+    // having emitted phase() but never a real progress() tick (the very case the
+    // ramp exists for) just measured its final phase's real duration — record it
+    // so next time the ramp is elapsed-vs-real-average, not vs a fixed guess.
+    // m_phase/elapsed still hold this task's final values here.
+    if (ok && !m_activeHadRealProgress && !m_phase.isEmpty()
+        && task->progressModel() == Task::ProgressModel::SelfCumulative)
+        m_phaseTimer->recordSelfCumulativePhaseDuration(m_phase, task->kind(),
+                                                        activeModelIdForTiming(), elapsed);
+    return elapsed;
 }
 
 // --- TaskSchedulerObserver: serial finish phase 3 ("active slot cleared").
@@ -1358,6 +1408,11 @@ int TranscriptionController::frontOfQueueInsertIndex() const
     return m_scheduler->frontOfQueueInsertIndex();
 }
 
+int TranscriptionController::combineStabilityWindowSecs() const
+{
+    return int(CombineScanner::kCombineStabilityWindowSecs);
+}
+
 QVariantList TranscriptionController::detectCombineGroups(const QVariantList &rules,
                                                             const QStringList &audioPaths) const
 {
@@ -1442,7 +1497,7 @@ void TranscriptionController::terminateApplicationImmediately() const
 
 QVariantMap TranscriptionController::readMetadata(const QUrl &fileUrl) const
 {
-    // Item P23: see m_transcriptCacheMutex's doc comment — this function is
+    // See m_transcriptCacheMutex's doc comment — this function is
     // now also called from loadTranscriptAsync()'s background thread.
     QMutexLocker locker(&m_transcriptCacheMutex);
 
@@ -1451,7 +1506,7 @@ QVariantMap TranscriptionController::readMetadata(const QUrl &fileUrl) const
     if (!fi.exists())
         return QVariantMap();
 
-    // Item O19: a cheap stat guard — frontmatter is written once up front
+    // A cheap stat guard — frontmatter is written once up front
     // and only touched again at a job's very end (see
     // syncSpeakersFrontmatterToBody()/writeLabelingFields()), so on the
     // common "nothing changed since last call" tick this skips the file
@@ -1517,7 +1572,7 @@ bool TranscriptionController::setLabel(const QUrl &fileUrl, const QString &label
 
     if (!writeFrontmatterBlock(path, frontmatterLines, body, errorOut))
         return false;
-    // Item P19: this manual (non-queued) rewrite otherwise leaves the
+    // This manual (non-queued) rewrite otherwise leaves the
     // sidebar's cached per-row metadata stale until an unrelated job
     // finishes or a full VaultTreeModel rebuild happens — see finished()'s
     // doc comment. A listener is expected to call
@@ -1692,7 +1747,7 @@ bool TranscriptionController::setPrelude(const QUrl &fileUrl, const QString &pre
 
     if (!writeFrontmatterBlock(path, frontmatterLines, newBody, errorOut))
         return false;
-    // Item P19: see setLabel()'s matching emit for why
+    // See setLabel()'s matching emit for why
     // (VaultTreeModel::refreshFile(fileUrl)).
     emit finished(fileUrl, true, QString());
     return true;
@@ -1715,7 +1770,7 @@ QVariantList TranscriptionController::readChapters(const QUrl &fileUrl) const
         const QRegularExpressionMatch m = it.next();
         QVariantMap chapter;
         chapter["t0"] = parseCompactTimestamp(m.captured(1));
-        // Item 17: the manual sentinel is stripped from the DISPLAYED title
+        // The manual sentinel is stripped from the DISPLAYED title
         // but its presence is surfaced as a "manual" flag (so the TOC can
         // show manual chapters distinctly / know editing an auto one promotes
         // it). Plain (auto) titles pass through unchanged.
@@ -1791,7 +1846,7 @@ void TranscriptionController::addChapter(const QUrl &fileUrl, double timestampSe
     QString error;
     const bool ok = editChapterMarker(fileUrl, ChapterEditOp::Add, timestampSeconds, title, &error);
     // Mirror setPrelude()/setLabel(): notify listeners so the sidebar/main
-    // panel refresh this file's chapters immediately (item P19).
+    // panel refresh this file's chapters immediately.
     emit finished(fileUrl, ok, error);
 }
 
@@ -1921,7 +1976,7 @@ void TranscriptionController::moveFolder(const QUrl &folderUrl, const QUrl &dest
 
 QString TranscriptionController::readTranscriptBody(const QUrl &fileUrl) const
 {
-    // Item P23: see m_transcriptCacheMutex's doc comment.
+    // See m_transcriptCacheMutex's doc comment.
     QMutexLocker locker(&m_transcriptCacheMutex);
 
     const QString mdPath = sidecarPath(fileUrl.toLocalFile());
@@ -1929,7 +1984,7 @@ QString TranscriptionController::readTranscriptBody(const QUrl &fileUrl) const
     if (!fi.exists())
         return QString();
 
-    // Item O19: see m_bodyCache's doc comment — during an ACTIVE
+    // See m_bodyCache's doc comment — during an ACTIVE
     // transcription this is invoked on every live-update tick while the
     // file is constantly growing, so this stat-based guard alone rarely
     // skips work THEN, but it does for every other caller polling a file
@@ -1965,7 +2020,7 @@ QString TranscriptionController::readTranscriptBody(const QUrl &fileUrl) const
 
 QVariantList TranscriptionController::parseSentences(const QUrl &fileUrl) const
 {
-    // Item P23: see m_transcriptCacheMutex's doc comment — RECURSIVE lock,
+    // See m_transcriptCacheMutex's doc comment — RECURSIVE lock,
     // since readTranscriptBody()/readMetadata() below each lock it again.
     QMutexLocker locker(&m_transcriptCacheMutex);
 
@@ -1984,7 +2039,7 @@ QVariantList TranscriptionController::parseSentences(const QUrl &fileUrl) const
     const QStringList knownSpeakers =
         parseSpeakersList(readMetadata(fileUrl).value(QStringLiteral("speakers")).toString());
 
-    // Item O19: segments are only ever APPENDED to a live-running
+    // Segments are only ever APPENDED to a live-running
     // transcript (SegmentLineWriter's repeat-cycle merge is the one
     // exception — it rewrites the last couple of lines IN PLACE rather than
     // appending, see its own doc comment) — so once `body`'s first
@@ -2055,6 +2110,17 @@ QVariantList TranscriptionController::parseSentences(const QUrl &fileUrl) const
     m_sentenceCache.sentences = sentences;
     m_sentenceCache.valid = true;
     return sentences;
+}
+
+bool TranscriptionController::isSameFile(const QUrl &a, const QUrl &b) const
+{
+    // Decoded local paths, not toString(): the two URLs may have been built
+    // differently (fromLocalFile vs a QUrl(string)) and so encode a space as a
+    // literal ' ' on one side and "%20" on the other — see the header doc.
+    // Both empty (neither is a local file) is not "the same file".
+    const QString pa = a.toLocalFile();
+    const QString pb = b.toLocalFile();
+    return !pa.isEmpty() && pa == pb;
 }
 
 void TranscriptionController::loadTranscriptAsync(const QUrl &fileUrl)
@@ -2296,8 +2362,8 @@ double TranscriptionController::effectiveWordinessForLength(double baseWordiness
 {
     // Coarse tiers, not a precise formula — this only needs to keep the prelude
     // PROPORTIONATE to the transcript, not fine-tune prose length. Downward
-    // caps (item P29): a tiny transcript never gets a disproportionately long
-    // prelude no matter how high the slider. Upward floors (item 58): a long
+    // caps: a tiny transcript never gets a disproportionately long
+    // prelude no matter how high the slider. Upward floors: a long
     // transcript is ALLOWED a fuller prelude even at a modest slider setting —
     // a 2-3 hour recording (roughly 20k+ words at ~150 wpm) reaches
     // labelPreludePhrasing()'s top >=0.9 "walk through each major topic" tier.
@@ -2340,7 +2406,7 @@ QVariantList TranscriptionController::availableModels() const
         QVariantMap entry;
         entry["id"] = info.id;
         entry["label"] = info.label;
-        // Item O31: whether this tier's .bin is already on disk for the
+        // Whether this tier's .bin is already on disk for the
         // CURRENTLY open vault (m_vaultUrl — set once per vault open by
         // loadPersistedQueue(), empty/false for every entry until then) —
         // lets the model dropdown show which tiers would need a fresh
@@ -2349,6 +2415,22 @@ QVariantList TranscriptionController::availableModels() const
         list.append(entry);
     }
     return list;
+}
+
+bool TranscriptionController::modelUsesVad(const QString &modelId) const
+{
+    // The one predictor of VAD windowing: only self-segmenting subprocess
+    // engines bypass it (TranscribePipeline::planWindows' selfSegmenting arg).
+    // Whisper and in-process parakeet both take the VAD-windowed path.
+    return !isEngineModelId(modelId);
+}
+
+bool TranscriptionController::modelUsesVadGating(const QString &modelId) const
+{
+    // Per-window silence gating is a WhisperCppEngine-only feature (the
+    // dynamic_cast in TranscribePipeline::planWindows). Parakeet is in-process
+    // but a different engine class, so it takes windowing without gating.
+    return !isEngineModelId(modelId) && !ModelManager::isParakeetModelId(modelId);
 }
 
 QVariantList TranscriptionController::availableSegmentationModels() const
@@ -2486,7 +2568,7 @@ void TranscriptionController::deleteModel(const QString &modelId)
 
 void TranscriptionController::importModel(const QString &modelId, const QUrl &sourceUrl)
 {
-    // Wave N (task system): a REAL queued task now, not a fire-and-forget
+    // Task system: a REAL queued task now, not a fire-and-forget
     // QThread with no Tasks row. Serial lane — a multi-GB copy is heavy on the
     // disk, so it queues behind (and never thrashes against) a transcription;
     // Background presentation keeps it off the main-panel overlay (see
@@ -2502,7 +2584,7 @@ void TranscriptionController::exportModel(const QString &modelId, const QUrl &de
 
 void TranscriptionController::runBenchmark(const QUrl &fileUrl, const QStringList &modelIds)
 {
-    // Wave N (task system): a REAL queued task now. This used to bypass the
+    // Task system: a REAL queued task now. This used to bypass the
     // queue entirely — invoking a worker slot directly, with "no queue entry,
     // no file writes" and its own parallel setBenchmarkGlow() path — purely
     // because a queue entry would have raised MainPanel's blocking overlay

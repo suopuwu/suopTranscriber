@@ -262,7 +262,9 @@ private:
 
     // QTest::keyClicks() is a QWidget-only API — the QWindow overloads only
     // cover a single key, so type character by character into whatever has
-    // focus. The first keystroke replaces the editor's initial selectAll().
+    // focus. To REPLACE the whole name (rather than insert at the click caret),
+    // callers select the field first (invokeMethod "selectAll") — a name-click
+    // rename now seeds a plain caret, not a selected stem.
     static void typeText(QQuickView *view, const QString &text)
     {
         for (const QChar &c : text)
@@ -421,6 +423,9 @@ private slots:
         // stem replaces it and keeps ".mp3", so the final path is unchanged.
         QCOMPARE(field->property("text").toString(), QStringLiteral("talk.mp3"));
 
+        // A name-click now drops a plain caret (no stem selection), so select
+        // all before typing to replace the whole name.
+        QMetaObject::invokeMethod(renameFieldFor(item), "selectAll");
         typeText(&view, QStringLiteral("interview"));
         QTest::keyClick(&view, Qt::Key_Return);
         QTest::qWait(150); // let the Qt.callLater commit + model rebuild run
@@ -498,10 +503,12 @@ private slots:
                      "renaming the open file must not require re-selecting it after a background model reset");
     }
 
-    // Item 047 regression: with extensions visible (default), the rename editor
-    // must show the FULL name+extension and pre-select just the stem, so typing
-    // replaces the name while ".mp3" stays put (the file-manager convention).
-    void renameSeedShowsExtension_andSelectsStem()
+    // The rename editor shows the FULL name+extension, but places a plain caret
+    // where the user clicked rather than pre-selecting the stem — typing extends
+    // the name (nothing is replaced), and there is no selection. It must also sit
+    // flush with the rowNameText it replaces (leftPadding 0), not shifted right
+    // by QQC2's default text-field padding.
+    void renameSeed_showsExtension_placesCaretNoSelection_andIsLeftAligned()
     {
         QTemporaryDir vault;
         QVERIFY(vault.isValid());
@@ -517,7 +524,7 @@ private slots:
         QVERIFY(row >= 0);
         QQuickItem *item = rowItem(treeItem, row);
         QVERIFY(item);
-        // Two clicks: select, then click the name to open the inline editor.
+        // Two clicks: select, then click the middle of the name to open the editor.
         clickAt(&view, nameTextPoint(item));
         clickAt(&view, nameTextPoint(item));
         QTRY_VERIFY2(renameFieldVisibleOn(item), "the inline rename editor must open");
@@ -525,8 +532,78 @@ private slots:
         QVERIFY(field);
         QTRY_VERIFY(field->hasActiveFocus());
 
+        // Full name shown, extension included.
         QCOMPARE(field->property("text").toString(), QStringLiteral("talk.mp3"));
-        QCOMPARE(field->property("selectedText").toString(), QStringLiteral("talk"));
+        // No pre-selection — a plain caret, not a selected stem.
+        QCOMPARE(field->property("selectedText").toString(), QString());
+        // The caret landed inside the name near where the click fell (the middle
+        // of the painted glyphs), not pinned to an end. Robust against exact
+        // font metrics: it's simply somewhere strictly interior.
+        const int caret = field->property("cursorPosition").toInt();
+        QVERIFY2(caret > 0 && caret < QStringLiteral("talk.mp3").size(),
+                 "a click in the middle of the name must drop the caret there, not at an end");
+        // Flush with the row text it replaces — no QQC2 leftPadding shift.
+        QCOMPARE(field->property("leftPadding").toInt(), 0);
+    }
+
+    // Clicking in the empty space to the RIGHT of the (short) name drops the
+    // caret at the very end — positionAt clamps a past-the-text click to length.
+    void renameCaret_clickPastNameGoesToEnd()
+    {
+        QTemporaryDir vault;
+        QVERIFY(vault.isValid());
+        QVERIFY(touch(vault.filePath(QStringLiteral("talk.mp3"))));
+
+        QQuickView view;
+        QQuickItem *treeItem = openVault(&view, vault.path());
+        QVERIFY2(treeItem, "could not load Sidebar.qml / locate its TreeView");
+        QTRY_VERIFY(treeItem->property("rows").toInt() > 0);
+        expandEverything(treeItem);
+
+        const int row = rowForPath(treeItem, vault.filePath(QStringLiteral("talk.mp3")));
+        QVERIFY(row >= 0);
+        QQuickItem *item = rowItem(treeItem, row);
+        QVERIFY(item);
+        clickAt(&view, nameTextPoint(item));     // select
+        clickAt(&view, pastNameTextPoint(item)); // open, clicking past the name
+        QTRY_VERIFY2(renameFieldVisibleOn(item), "the inline rename editor must open");
+        QQuickItem *field = renameFieldFor(item);
+        QVERIFY(field);
+        QTRY_VERIFY(field->hasActiveFocus());
+        QCOMPARE(field->property("selectedText").toString(), QString());
+        QTRY_COMPARE(field->property("cursorPosition").toInt(), int(QStringLiteral("talk.mp3").size()));
+    }
+
+    // Source-scan guard for a fix with no QQuickView path here: the inline
+    // rename editor was being closed the instant it opened because Main.qml's
+    // window-spanning "click off a text field to blur it" TapHandler fired on the
+    // very click that opened the editor, stealing its focus (its blur-commit then
+    // closed it) — so renaming took several clicks. That handler lives in
+    // Main.qml, which this Sidebar-only harness never loads, so guard the fix at
+    // the source: the window blur must NOT fire while a sidebar rename is open,
+    // i.e. its forceActiveFocus() is gated on sidebar.renamingPath.
+    void windowClickBlur_isGatedOnActiveRename_sourceGuard()
+    {
+        QFile f(QStringLiteral(SUOP_QML_DIR) + QStringLiteral("/Main.qml"));
+        QVERIFY2(f.open(QIODevice::ReadOnly | QIODevice::Text), "cannot read Main.qml");
+        const QString src = QString::fromUtf8(f.readAll());
+
+        // Strip // line comments so the doc comment that names renamingPath can't
+        // satisfy the guard on its own (the tst_styleguide stripComments idiom).
+        QString code;
+        for (const QString &line : src.split(QLatin1Char('\n'))) {
+            const int c = line.indexOf(QStringLiteral("//"));
+            code += (c >= 0 ? line.left(c) : line) + QLatin1Char('\n');
+        }
+
+        const int call = code.indexOf(QStringLiteral("rootContent.forceActiveFocus()"));
+        QVERIFY2(call >= 0, "Main.qml's window blur handler (rootContent.forceActiveFocus) is gone — "
+                            "if it moved, move this guard with it");
+        // The gate sits in the enclosing `if` just above the call.
+        const QString before = code.mid(qMax(0, call - 400), qMin(400, call));
+        QVERIFY2(before.contains(QStringLiteral("renamingPath")),
+                 "Main.qml's window-wide blur must be gated on sidebar.renamingPath, or the inline "
+                 "rename editor gets its focus stolen and closes the instant it opens (multi-click rename)");
     }
 
     // Escape abandons the edit: nothing is written, and the editor closes
@@ -588,6 +665,7 @@ private slots:
         clickAt(&view, nameTextPoint(item));
         QTRY_VERIFY(renameFieldVisibleOn(item));
 
+        QMetaObject::invokeMethod(renameFieldFor(item), "selectAll");
         typeText(&view, QStringLiteral("renamed"));
         // Click a different row -> the editor blurs.
         const int otherRow = rowForPath(treeItem, vault.filePath(QStringLiteral("other.mp3")));
@@ -733,6 +811,12 @@ private slots:
         // A folder seeds with its own name, extension-stripping never applies.
         QCOMPARE(field->property("text").toString(), QStringLiteral("Interviews"));
 
+        // The editor's caret/selection is placed a frame after it opens
+        // (Qt.callLater — see placeCaret). The click-driven tests get this wait
+        // for free from clickAt(); this programmatic entry must wait explicitly,
+        // so the deferred selectAll can't land mid-typing and garble the name.
+        QTest::qWait(60);
+        QMetaObject::invokeMethod(renameFieldFor(item), "selectAll");
         typeText(&view, QStringLiteral("Talks"));
         QTest::keyClick(&view, Qt::Key_Return);
         QTest::qWait(150);
@@ -781,6 +865,7 @@ private slots:
         QTRY_VERIFY(field->hasActiveFocus());
         QCOMPARE(field->property("text").toString(), QStringLiteral("Board meeting"));
 
+        QMetaObject::invokeMethod(renameFieldFor(item), "selectAll");
         typeText(&view, QStringLiteral("Standup"));
         QTest::keyClick(&view, Qt::Key_Return);
         QTest::qWait(150);
@@ -923,6 +1008,7 @@ private slots:
         QTRY_VERIFY(field->hasActiveFocus());
         QCOMPARE(field->property("text").toString(), QStringLiteral("Interviews"));
 
+        QMetaObject::invokeMethod(renameFieldFor(item), "selectAll");
         typeText(&view, QStringLiteral("Talks"));
         QTest::keyClick(&view, Qt::Key_Return);
         QTest::qWait(150);
@@ -1016,6 +1102,7 @@ private slots:
         clickAt(&view, nameTextPoint(item));
         QTRY_VERIFY(renameFieldVisibleOn(item));
 
+        QMetaObject::invokeMethod(renameFieldFor(item), "selectAll");
         typeText(&view, QStringLiteral("taken"));
         QTest::keyClick(&view, Qt::Key_Return);
         QTest::qWait(150);

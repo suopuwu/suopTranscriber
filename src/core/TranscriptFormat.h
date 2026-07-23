@@ -174,7 +174,7 @@ QString spliceBodySpeakers(const QString &body, const QStringList &knownSpeakers
 // only .cpp that DEFINES them until step 3 of that plan deletes the old
 // per-kind worker-slot bodies that used to be their only caller.
 
-// Item P7: see this function's definition-site doc comment for the full
+// See this function's definition-site doc comment for the full
 // audio-file-name-vs-stem collision rationale. Every sidecar-path call site
 // in this file and in VaultTreeModel.cpp must stay consistent with it.
 QString sidecarPath(const QString &audioFilePath);

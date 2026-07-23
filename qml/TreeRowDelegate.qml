@@ -439,8 +439,10 @@ Item {
                 if (treeDelegate.tapIsOnExpandGlyph(treeRowTap.point.position))
                     treeDelegate.toggleThisDir()
                 else if (plainTap
-                         && treeDelegate.tapIsOnRowName(treeRowTap.point.position))
+                         && treeDelegate.tapIsOnRowName(treeRowTap.point.position)) {
                     sidebarRoot.beginRename(treeDelegate.path, true, "")
+                    sidebarRoot.renamingCaretScenePos = treeRowTap.point.scenePosition
+                }
             } else if (treeDelegate.isAudio || treeDelegate.isOrphanedMd) {
                 // Click the name of a row that's ALREADY the sole
                 // selection -> rename it, rather than re-opening the
@@ -469,6 +471,7 @@ Item {
                 if (plainTap && (soleSelection || openFileNoSelection)
                         && treeDelegate.tapIsOnRowName(treeRowTap.point.position)) {
                     sidebarRoot.beginRename(treeDelegate.path, false, treeDelegate.label)
+                    sidebarRoot.renamingCaretScenePos = treeRowTap.point.scenePosition
                     return
                 }
                 // Item 3: Shift/Ctrl-click multi-select — see
@@ -1056,7 +1059,12 @@ Item {
                 visible: treeDelegate.renamingThisRow
                 color: "white"
                 font.pixelSize: rowNameText.font.pixelSize
+                // padding:0 alone leaves QQC2's 4px leftPadding in place, which
+                // shifts the editor's text right of the rowNameText it replaces.
+                // Zero the horizontal paddings explicitly so the two align.
                 padding: 0
+                leftPadding: 0
+                rightPadding: 0
                 // StyleGuide.md "Text fields": underline background, not
                 // the default boxed one.
                 background: UnderlineField { focused: rowRenameField.activeFocus }
@@ -1086,18 +1094,28 @@ Item {
                     // shows it.
                     rowRenameField.text = sidebarRoot.renamingText
                     rowRenameField.forceActiveFocus()
-                    // Select the stem only when the seed carries a file
-                    // extension (never a folder or a label), so typing
-                    // replaces the name but keeps the extension visible —
-                    // the file-manager convention. Otherwise select all.
-                    const isFileName = !treeDelegate.isDir
-                            && !(AppSettings.useLabelsSidebar && treeDelegate.label)
-                            && !AppSettings.hideExtensionsSidebar
-                    const dot = rowRenameField.text.lastIndexOf(".")
-                    if (isFileName && dot > 0)
-                        rowRenameField.select(0, dot)
-                    else
+                    // A name-CLICK rename drops the caret where the pointer landed
+                    // (no selection); a menu/programmatic rename (no click point)
+                    // selects the whole name so typing replaces it. positionAt
+                    // needs the field laid out with its seeded text, which isn't
+                    // true on the tick `visible` flips — so defer a frame.
+                    Qt.callLater(rowRenameField.placeCaret)
+                }
+
+                function placeCaret() {
+                    if (!rowRenameField.visible)
+                        return
+                    const sp = sidebarRoot.renamingCaretScenePos
+                    if (!sp) {
                         rowRenameField.selectAll()
+                        return
+                    }
+                    const local = rowRenameField.mapFromItem(null, sp.x, sp.y)
+                    // positionAt clamps to [0, length], so a click past the name's
+                    // end lands the caret at the end — the desired behavior for the
+                    // row's wide empty right-hand space.
+                    rowRenameField.deselect()
+                    rowRenameField.cursorPosition = rowRenameField.positionAt(local.x, local.y)
                 }
 
                 // Keeps the sidebarRoot's authoritative copy live. onTextEdited

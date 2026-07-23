@@ -162,7 +162,17 @@ class TstStyleGuide : public QObject
         QString delegate = readAll(QStringLiteral(SUOP_QML_DIR "/TreeRowDelegate.qml"));
         delegate.replace(QStringLiteral("sidebarRoot."), QStringLiteral("sidebar."));
         delegate.replace(QStringLiteral("treeRoot."), QStringLiteral("tree."));
-        return readAll(QStringLiteral(SUOP_QML_DIR "/Sidebar.qml")) + delegate;
+        // The flat search-results delegate now lives in SearchResultDelegate.qml;
+        // reverse its sidebarRoot.->sidebar. / listView.->searchResultsView. rename
+        // so this file's existing guard literals still match.
+        QString searchDelegate = readAll(QStringLiteral(SUOP_QML_DIR "/SearchResultDelegate.qml"));
+        searchDelegate.replace(QStringLiteral("sidebarRoot."), QStringLiteral("sidebar."));
+        searchDelegate.replace(QStringLiteral("listView."), QStringLiteral("searchResultsView."));
+        // The ribbon's bulk-action button flow now lives in SidebarRibbon.qml;
+        // same sidebarRoot.->sidebar. reversal so guard literals still match.
+        QString ribbon = readAll(QStringLiteral(SUOP_QML_DIR "/SidebarRibbon.qml"));
+        ribbon.replace(QStringLiteral("sidebarRoot."), QStringLiteral("sidebar."));
+        return readAll(QStringLiteral(SUOP_QML_DIR "/Sidebar.qml")) + delegate + searchDelegate + ribbon;
     }
 
     // MainPanel seek bar + chapter heading now live in SeekBar.qml /
@@ -178,7 +188,16 @@ class TstStyleGuide : public QObject
         QString chapter = readAll(QStringLiteral(SUOP_QML_DIR "/ChapterHeadingRow.qml"));
         chapter.replace(QStringLiteral("panel."), QStringLiteral("mainPanel."));
         chapter.replace(QStringLiteral("txArea."), QStringLiteral("transcriptArea."));
-        return readAll(QStringLiteral(SUOP_QML_DIR "/MainPanel.qml")) + seek + chapter;
+        QString prelude = readAll(QStringLiteral(SUOP_QML_DIR "/PreludeEditor.qml"));
+        prelude.replace(QStringLiteral("panel."), QStringLiteral("mainPanel."));
+        QString toc = readAll(QStringLiteral(SUOP_QML_DIR "/ChapterTocList.qml"));
+        toc.replace(QStringLiteral("panel."), QStringLiteral("mainPanel."));
+        QString findBar = readAll(QStringLiteral(SUOP_QML_DIR "/SearchReplaceBar.qml"));
+        findBar.replace(QStringLiteral("panel."), QStringLiteral("mainPanel."));
+        QString replaceRow = readAll(QStringLiteral(SUOP_QML_DIR "/ReplaceRow.qml"));
+        replaceRow.replace(QStringLiteral("panel."), QStringLiteral("mainPanel."));
+        return readAll(QStringLiteral(SUOP_QML_DIR "/MainPanel.qml")) + seek + chapter + prelude + toc
+                + findBar + replaceRow;
     }
 
 private slots:
@@ -273,6 +292,28 @@ private slots:
                  "drops below every keyed audio file in the folder");
     }
 
+    // Regression (queue 001): a freshly-formed combine group reads as "pending"
+    // (newest member inside the stability window) and is absent from
+    // combineReadyPaths, so it shows no candidate outline. "pending" resolves
+    // only by the passage of time, and nothing else re-runs the scan once the
+    // file settles — so refreshTreeOrdering() must re-schedule itself while any
+    // group is pending, else the outline lags one filesystem event behind.
+    void sidebar_reschedulesCombineScanWhilePending()
+    {
+        const QString src = stripComments(readAll(QStringLiteral(SUOP_QML_DIR "/Sidebar.qml")));
+        QVERIFY2(!src.isEmpty(), "qml/Sidebar.qml must exist");
+        const QString body = functionBody(src, QStringLiteral("function refreshTreeOrdering()"));
+        QVERIFY2(!body.isEmpty(), "refreshTreeOrdering must exist");
+        QVERIFY2(body.contains(QStringLiteral("pending")),
+                 "refreshTreeOrdering must detect a pending combine group");
+        QVERIFY2(body.contains(QStringLiteral("combinePendingRescanTimer")),
+                 "refreshTreeOrdering must re-arm a re-scan while a group is "
+                 "pending, else the combine outline lags one event behind");
+        // The re-scan timer itself must exist and re-run the ordering.
+        QVERIFY2(src.contains(QStringLiteral("id: combinePendingRescanTimer")),
+                 "combinePendingRescanTimer must be declared");
+    }
+
     // The gate that drops task-related snackbars (Notifications.tasksPopupOpen)
     // is dead code unless something sets it. BottomBar must Bind it to the Tasks
     // popup's visibility. Stripped first — the change adds doc comments that name
@@ -306,6 +347,82 @@ private slots:
         QVERIFY2(src.contains(QStringLiteral("Math.max(24, kindLabel.implicitHeight")),
                  "the task row height must grow with the wrapped kind badge "
                  "(floored at 24) — a fixed height:24 would clip the second line");
+    }
+
+    // The VAD status dot beside the transcription model dropdown: green
+    // (Theme.success) when the selected model runs through the app's Silero VAD
+    // path, red (Theme.danger) when the engine self-segments and bypasses it,
+    // keyed on the controller's modelUsesVad() (NOT a QML-side copy of the
+    // engine-id convention — that's a parity seam). It ALSO flips red on a
+    // runtime failure: the open file's stored transcript recorded a VAD failure
+    // (metadata.vadError), the same signal the fallback banner reads. Carries a
+    // hover tooltip explaining VAD. Source-scan (QML element in MainPanel, no
+    // QQuickView here).
+    void mainPanel_vadIndicatorReflectsModelUsesVad()
+    {
+        const QString src = stripComments(readAll(QStringLiteral(SUOP_QML_DIR "/MainPanel.qml")));
+        QVERIFY2(!src.isEmpty(), "qml/MainPanel.qml must exist");
+        const QString block = enclosingBlock(src, QStringLiteral("id: vadIndicator"));
+        QVERIFY2(!block.isEmpty(), "the VAD status dot must have id: vadIndicator");
+        QVERIFY2(block.contains(QStringLiteral("modelUsesVad")),
+                 "the VAD dot's state must come from the controller's modelUsesVad(), "
+                 "not a QML-side duplicate of the engine-id convention");
+        QVERIFY2(block.contains(QStringLiteral("metadata.vadError")),
+                 "the VAD dot must also flip red on a runtime VAD failure recorded "
+                 "in the open file's metadata (metadata.vadError)");
+        QVERIFY2(block.contains(QStringLiteral("modelUsesVadGating")),
+                 "the green tooltip must scope its silence-skipping claim to whisper "
+                 "via modelUsesVadGating() — parakeet gets windowing but not gating");
+        QVERIFY2(block.contains(QStringLiteral("Theme.success")) && block.contains(QStringLiteral("Theme.danger")),
+                 "the VAD dot must be green (Theme.success) when VAD is used and red "
+                 "(Theme.danger) when it is not");
+        QVERIFY2(block.contains(QStringLiteral("ToolTip")),
+                 "the VAD dot must carry a hover ToolTip explaining what VAD does");
+    }
+
+    // 005: the onFinished live-reload gate must compare the finished file to the
+    // open file by LOCAL PATH (controller.isSameFile), not
+    // fileUrl.toString() === player.source.toString(). A detect-speakers run on a
+    // spaced filename emits a fileUrl that can stringify differently from
+    // player.source (literal ' ' vs "%20"), so the old toString() compare
+    // silently skipped the reload and the new speaker tags never appeared live.
+    // Source-scan (QML element in MainPanel, no QQuickView here).
+    void mainPanel_onFinishedReloadComparesByLocalPath()
+    {
+        const QString src = stripComments(readAll(QStringLiteral(SUOP_QML_DIR "/MainPanel.qml")));
+        QVERIFY2(!src.isEmpty(), "qml/MainPanel.qml must exist");
+        QVERIFY2(src.contains(QStringLiteral("isSameFile(fileUrl, mainPanel.player.source)")),
+                 "onFinished's live-reload gate must use controller.isSameFile(fileUrl, player.source) "
+                 "(local-path compare) so a detect-speakers run on a spaced filename still refreshes");
+        QVERIFY2(!src.contains(QStringLiteral("fileUrl.toString() === mainPanel.player.source.toString()")),
+                 "the fragile toString()-based onFinished reload compare must be gone — it silently "
+                 "skips the live reload when a spaced filename stringifies differently on each side");
+    }
+
+    // A download triggered by transcribing an undownloaded model fires the
+    // controller's central modelsChanged() (DownloadTask::completionChangesModelSet).
+    // MainPanel's three model pickers must therefore NOT bind model: to the
+    // untracked availableModels()/availableSegmentationModels()/
+    // availableEmbeddingModels() invokables (they evaluate once, so a picker's
+    // downloaded dot never flips green live) — they read imperatively-refreshed
+    // properties re-fetched on modelsChanged(), the ModelsPage/BenchmarkPage fix.
+    void mainPanel_modelPickersRefreshOnModelsChanged()
+    {
+        const QString src = stripComments(readAll(QStringLiteral(SUOP_QML_DIR "/MainPanel.qml")));
+        QVERIFY2(!src.isEmpty(), "qml/MainPanel.qml must exist");
+        QVERIFY2(!src.contains(QStringLiteral(
+                     "model: mainPanel.transcriptionController ? mainPanel.transcriptionController.availableModels()")),
+                 "MainPanel's transcription picker must not bind model: to the untracked "
+                 "availableModels() invokable (it evaluates once) — bind an imperatively "
+                 "refreshed property so a transcribe-triggered download flips the dot on modelsChanged()");
+        QVERIFY2(!src.contains(QStringLiteral(
+                     "model: mainPanel.transcriptionController ? mainPanel.transcriptionController.availableSegmentationModels()")),
+                 "MainPanel's segmentation picker must read a refreshed property, not the untracked invokable");
+        QVERIFY2(!src.contains(QStringLiteral(
+                     "model: mainPanel.transcriptionController ? mainPanel.transcriptionController.availableEmbeddingModels()")),
+                 "MainPanel's embedding picker must read a refreshed property, not the untracked invokable");
+        QVERIFY2(src.contains(QStringLiteral("onModelsChanged")),
+                 "MainPanel must refresh its model pickers on the controller's modelsChanged()");
     }
 
     // The search-result blurb (transcriptSnippet) must make the matched
@@ -1181,7 +1298,9 @@ private slots:
     // into, so hiding its underline at rest just makes it read as a label.
     void underlineField_onlyAlwaysEditableFieldsGoPlain()
     {
-        const QString mainPanel = readAll(QStringLiteral(SUOP_QML_DIR "/MainPanel.qml"));
+        // mainPanelSrc(), not the raw file: the prelude field lives in
+        // PreludeEditor.qml since its extraction (the shim appends it).
+        const QString mainPanel = mainPanelSrc();
         QVERIFY2(!mainPanel.isEmpty(), "qml/MainPanel.qml must exist");
 
         // Every always-editable field must opt out (StyleGuide.md
@@ -1228,7 +1347,9 @@ private slots:
     // behavior directly.
     void mainPanel_hasNoDisplayEditSwapStateForAlwaysEditableFields()
     {
-        const QString src = readAll(QStringLiteral(SUOP_QML_DIR "/MainPanel.qml"));
+        // mainPanelSrc(), not the raw file: preludeArea lives in
+        // PreludeEditor.qml since its extraction (the shim appends it).
+        const QString src = mainPanelSrc();
         QVERIFY2(!src.isEmpty(), "qml/MainPanel.qml must exist");
         QVERIFY2(!src.contains(QStringLiteral("renamingTitle")),
                  "titleField must be always-editable, not swapped via a renamingTitle bool");
@@ -2196,6 +2317,22 @@ private slots:
                  "the merge pass must emit its own phase slug");
     }
 
+    // RelabelTask is SelfCumulative (its emitted fraction IS the bar) and its
+    // one label() call is the only long stretch — without a progress callback
+    // the bar sits at 0 for the whole pass and snaps to 100% at the end (the
+    // "labeling stays at 0% then jumps to 100" report). The LLM path needs a
+    // real GGUF, so this is a source scan, same as the ChaptersTask guard above.
+    void relabelTaskReportsProgressInsideItsLlmPass()
+    {
+        const QString src = stripComments(readAll(QStringLiteral(SUOP_SRC_DIR "/core/tasks/RelabelTask.cpp")));
+        QVERIFY2(!src.isEmpty(), "src/core/tasks/RelabelTask.cpp must exist");
+        const QString body = functionBody(src, QStringLiteral("void RelabelTask::run("));
+        QVERIFY2(!body.isEmpty(), "RelabelTask::run() not found — scan anchor drifted");
+        QVERIFY2(body.contains(QStringLiteral("label(")) && body.contains(QStringLiteral("&genError, [")),
+                 "RelabelTask::run() must pass a progress callback into label() — without it the labeling "
+                 "bar freezes at 0% and jumps to 100% when the single LLM call returns");
+    }
+
     // The cancel→partial wiring in TranscribeTask::run() can't be unit-tested
     // without a real downloaded model, so guard both halves of the marker
     // lifecycle by source scan: the `partial: true` frontmatter is written up
@@ -2702,7 +2839,13 @@ private slots:
         const QString src = stripComments(readAll(QStringLiteral(SUOP_QML_DIR "/Sidebar.qml")));
         QVERIFY2(!src.isEmpty(), "qml/Sidebar.qml must exist");
 
-        const int ribbonFlowIdx = src.indexOf(QStringLiteral("id: ribbonFlow"));
+        // The button flow was extracted to SidebarRibbon.qml, whose ROOT is the
+        // Flow — so the type/id check reads that file directly. (Sidebar.qml
+        // still has `id: ribbonFlow` on the SidebarRibbon instance, which is
+        // what the ribbon height binding below refers to.)
+        const QString flowSrc = stripComments(readAll(QStringLiteral(SUOP_QML_DIR "/SidebarRibbon.qml")));
+        QVERIFY2(!flowSrc.isEmpty(), "qml/SidebarRibbon.qml must exist");
+        const int ribbonFlowIdx = flowSrc.indexOf(QStringLiteral("id: ribbonFlow"));
         QVERIFY2(ribbonFlowIdx >= 0, "the ribbon's button container must be `Flow { id: ribbonFlow }` "
                                       "so the buttons wrap at a narrow sidebar width");
         // The element type sits just before the id: line. A small backward
@@ -2710,9 +2853,9 @@ private slots:
         // the guard — this file's own doc comments warn against fixed windows
         // that rot silently, but a "does the token appear right here" check is
         // exactly what a small window is for.
-        QVERIFY2(src.mid(qMax(0, ribbonFlowIdx - 40), 40).contains(QStringLiteral("Flow {")),
+        QVERIFY2(flowSrc.mid(qMax(0, ribbonFlowIdx - 40), 40).contains(QStringLiteral("Flow {")),
                  "ribbonFlow must be a Flow — a RowLayout does not wrap");
-        const QString ribbonFlow = enclosingBlock(src, QStringLiteral("id: ribbonFlow"));
+        const QString ribbonFlow = enclosingBlock(flowSrc, QStringLiteral("id: ribbonFlow"));
         QVERIFY(!ribbonFlow.isEmpty());
 
         // No Layout.* attachment may survive inside it. Layout.preferredWidth/
@@ -3555,7 +3698,9 @@ private slots:
     // pressure instead of forcing the row to overflow).
     void mainPanel_titleContainerAndSearchFieldShrinkGracefully()
     {
-        const QString src = stripComments(readAll(QStringLiteral(SUOP_QML_DIR "/MainPanel.qml")));
+        // mainPanelSrc(): searchField lives in SearchReplaceBar.qml now, while
+        // titleContainer stays in MainPanel.qml — the concat covers both.
+        const QString src = stripComments(mainPanelSrc());
         QVERIFY2(!src.isEmpty(), "qml/MainPanel.qml must exist");
 
         const QString titleContainer = enclosingBlock(src, QStringLiteral("id: titleContainer"));
@@ -4170,7 +4315,8 @@ private slots:
     // No QQuickView here, so this is a source-scan guard.
     void sidebar_runAllJobsActionParityAcrossAllSites()
     {
-        const QString sidebar = readAll(QStringLiteral(SUOP_QML_DIR "/Sidebar.qml"));
+        // sidebarTreeSrc(): the ribbon button flow lives in SidebarRibbon.qml now.
+        const QString sidebar = sidebarTreeSrc();
         QVERIFY2(!sidebar.isEmpty(), "qml/Sidebar.qml must exist");
         const QString mainPanel = readAll(QStringLiteral(SUOP_QML_DIR "/MainPanel.qml"));
         QVERIFY2(!mainPanel.isEmpty(), "qml/MainPanel.qml must exist");
@@ -4248,7 +4394,8 @@ private slots:
     // is a source-scan guard that the wiring exists.
     void delete_transcriptAndFile_wiredInSidebarAndMainPanel()
     {
-        const QString sidebar = readAll(QStringLiteral(SUOP_QML_DIR "/Sidebar.qml"));
+        // sidebarTreeSrc(): the ribbon button flow lives in SidebarRibbon.qml now.
+        const QString sidebar = sidebarTreeSrc();
         QVERIFY2(!sidebar.isEmpty(), "qml/Sidebar.qml must exist");
 
         // Stripped: every assertion below is a PRESENCE one, and those pass on
@@ -4372,7 +4519,8 @@ private slots:
     // for chapters kicked off from the sidebar.
     void sidebar_generateChaptersCallsPassChapterDensity()
     {
-        const QString sidebar = readAll(QStringLiteral(SUOP_QML_DIR "/Sidebar.qml"));
+        // sidebarTreeSrc(): the ribbon button flow lives in SidebarRibbon.qml now.
+        const QString sidebar = sidebarTreeSrc();
         QVERIFY2(!sidebar.isEmpty(), "qml/Sidebar.qml must exist");
 
         int idx = 0;
@@ -4405,7 +4553,8 @@ private slots:
     // diarizeFilesForPaths().
     void sidebar_detectSpeakersActionParityAcrossAllSites()
     {
-        const QString sidebar = readAll(QStringLiteral(SUOP_QML_DIR "/Sidebar.qml"));
+        // sidebarTreeSrc(): the ribbon button flow lives in SidebarRibbon.qml now.
+        const QString sidebar = sidebarTreeSrc();
         QVERIFY2(!sidebar.isEmpty(), "qml/Sidebar.qml must exist");
 
         // (1) Ribbon bulk detect-speakers button — over the transcribed set
@@ -4450,7 +4599,9 @@ private slots:
     {
         const QString sidebar = sidebarTreeSrc();
         QVERIFY2(!sidebar.isEmpty(), "qml/Sidebar.qml must exist");
-        const QString mainPanel = readAll(QStringLiteral(SUOP_QML_DIR "/MainPanel.qml"));
+        // mainPanelSrc(), not the raw file: the chapter TOC lives in
+        // ChapterTocList.qml since its extraction (the shim appends it).
+        const QString mainPanel = mainPanelSrc();
         QVERIFY2(!mainPanel.isEmpty(), "qml/MainPanel.qml must exist");
 
         // treeDelegate's own chaptersEligible must be a strict superset of
@@ -4508,6 +4659,49 @@ private slots:
         const QString listBlock = mainPanel.mid(listIdx, 200);
         QVERIFY2(!listBlock.contains(QStringLiteral("mainPanel.orphanedMdPath ===")),
                  "chapterListColumn must not be gated shut for orphaned .md files");
+    }
+
+    // Regression: regenerateLabelButton/generateChaptersButton/detectSpeakersButton
+    // used to be gated on hasTranscript/hasMetadata alone, so they stayed hidden
+    // (or greyed via the coarse per-file busyOrQueuedUrls) for the entire span of
+    // an in-flight transcription — a derived pass queued during that window was
+    // either invisible or blocked by the transcribe itself occupying the same
+    // audio url. transcribeInFlight + the per-kind busyOrQueuedKeys fix both: the
+    // buttons must appear (and gate only on THEIR OWN kind) the instant a
+    // transcribe starts. No QQuickView here, so this is a source-scan guard.
+    void mainPanel_derivedButtonsAvailableDuringTranscription()
+    {
+        const QString mainPanel = stripComments(mainPanelSrc());
+        QVERIFY2(!mainPanel.isEmpty(), "qml/MainPanel.qml must exist");
+
+        const int keysIdx = mainPanel.indexOf(QStringLiteral("property var busyOrQueuedKeys"));
+        QVERIFY2(keysIdx >= 0, "MainPanel must expose a busyOrQueuedKeys property");
+        const QString keysBlock = mainPanel.mid(keysIdx, 400);
+        QVERIFY2(keysBlock.contains(QStringLiteral("c.jobs")),
+                 "busyOrQueuedKeys must be derived from c.jobs (the per-kind data source)");
+
+        const int inFlightIdx = mainPanel.indexOf(QStringLiteral("property bool transcribeInFlight"));
+        QVERIFY2(inFlightIdx >= 0, "MainPanel must expose a transcribeInFlight property");
+        const QString inFlightBlock = mainPanel.mid(inFlightIdx, 300);
+        QVERIFY2(inFlightBlock.contains(QStringLiteral("\"transcribe\"")),
+                 "transcribeInFlight must key on the \"transcribe\" kind");
+
+        auto checkButton = [&](const QString &id, const QString &kind) {
+            const int idx = mainPanel.indexOf(QStringLiteral("id: %1").arg(id));
+            QVERIFY2(idx >= 0, qPrintable(QStringLiteral("MainPanel must have %1").arg(id)));
+            const QString block = mainPanel.mid(idx, 400);
+            QVERIFY2(block.contains(QStringLiteral("mainPanel.transcribeInFlight")),
+                     qPrintable(QStringLiteral("%1 must be visible while transcribeInFlight, not force-hidden "
+                                                "for the whole span of an in-flight transcription")
+                                    .arg(id)));
+            QVERIFY2(block.contains(QStringLiteral("busyOrQueuedKeys")) && block.contains(QStringLiteral("\"%1\"").arg(kind)),
+                     qPrintable(QStringLiteral("%1 must gate enabled on busyOrQueuedKeys with its own \"%2\" kind, "
+                                                "not the per-file busyOrQueuedUrls")
+                                    .arg(id, kind)));
+        };
+        checkButton(QStringLiteral("regenerateLabelButton"), QStringLiteral("relabel"));
+        checkButton(QStringLiteral("generateChaptersButton"), QStringLiteral("chapters"));
+        checkButton(QStringLiteral("detectSpeakersButton"), QStringLiteral("diarize"));
     }
 
     // The app mounts external volumes itself (KDE's automounter is off by default, so
@@ -4836,7 +5030,8 @@ private slots:
     // Queue item 025.
     void mainPanel_tocChapterTitleIsAlwaysEditable()
     {
-        const QString src = stripComments(readAll(QStringLiteral(SUOP_QML_DIR "/MainPanel.qml")));
+        // mainPanelSrc(): tocChapterTitle lives in ChapterTocList.qml now.
+        const QString src = stripComments(mainPanelSrc());
         QVERIFY2(!src.isEmpty(), "qml/MainPanel.qml must exist");
         const QString block = enclosingBlock(src, QStringLiteral("id: tocChapterTitle"));
         QVERIFY2(!block.isEmpty(), "id: tocChapterTitle must exist in MainPanel.qml");
@@ -5011,7 +5206,12 @@ private slots:
             QStringLiteral("double PhaseTimer::phaseRelativeSyntheticProgress(const QString &phase"));
         QVERIFY2(synth.contains(QStringLiteral("isSyntheticProgressPhase")),
                  "phaseRelativeSyntheticProgress() must gate on isSyntheticProgressPhase, not a literal phase list");
-        QVERIFY2(src.contains(QStringLiteral("if (PhaseTimer::isSyntheticProgressPhase(phase))")),
+        // The gate may OR-in the SelfCumulative frozen-bar fallback
+        // (selfCumulativeNeedsSynthetic), so match the predicate call itself
+        // rather than the exact `if (...)` wrapper — the invariant is that the
+        // WeightedPhases half of the gate still routes through the one predicate,
+        // never a hand-rolled literal phase list.
+        QVERIFY2(src.contains(QStringLiteral("PhaseTimer::isSyntheticProgressPhase(phase)")),
                  "the m_indeterminatePhaseTimer start gate must use isSyntheticProgressPhase, not a literal phase list");
     }
 

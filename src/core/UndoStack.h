@@ -6,7 +6,7 @@
 #include <qqml.h>
 
 // The undo/redo STORAGE half lifted out of MainPanel.qml's pushUndo/undoLast/
-// redoLast (2026-07-20). It owns the two flat stacks of {type, ...} history
+// redoLast. It owns the two flat stacks of {type, ...} history
 // entries and the push/pop/redo-invalidation semantics — nothing more. The
 // APPLY step (MainPanel.applyHistoryEntry) is deliberately LEFT in QML: it is
 // view-entangled (label/prelude/tags re-read frontmatter through the panel's

@@ -49,7 +49,7 @@ public:
     // the default is true.
     virtual bool isValid() const { return true; }
 
-    // Item O35: which compute backend this engine's last model load actually
+    // Which compute backend this engine's last model load actually
     // picked (e.g. "CUDA", "Vulkan", "CPU") — empty until a model has been
     // loaded, and empty forever for an engine with no such concept (e.g. an
     // out-of-process SubprocessEngine driving a JSONL manifest). Only

@@ -28,6 +28,32 @@ ModelPrerequisites DetectSilenceTask::prerequisites() const
     return {{ModelDownloadTarget::VadModel, QString()}};
 }
 
+std::vector<std::pair<double, double>> DetectSilenceTask::selectSilences(
+    const QString &chunkingError, const std::vector<std::pair<double, double>> &speechSpans,
+    const QList<ParsedSegment> &segments, double totalSeconds)
+{
+    // See the doc comment on the declaration for the empty-speechSpans
+    // rationale (item 010).
+    if (chunkingError.isEmpty() && !speechSpans.empty())
+        return VadChunker::complementSpans(speechSpans, totalSeconds);
+
+    // VAD unavailable/failed/empty despite the prerequisite — fall back to
+    // the SAME transcript-gap heuristic TranscribeTask's inline capture uses
+    // when VAD didn't run: treat consecutive segments as touching spans (the
+    // file format stores no per-segment end time — CLAUDE.md's vault-
+    // layout note — so an already-written .md can only ever recover a
+    // LEADING silence gap before the first segment this way, never an
+    // internal one; still better than leaving the key absent, matching
+    // TranscribeTask's "so the key is always present" contract).
+    std::vector<std::pair<double, double>> fallbackSpans;
+    fallbackSpans.reserve(segments.size());
+    for (int i = 0; i < segments.size(); ++i) {
+        const double spanEnd = (i + 1 < segments.size()) ? segments.at(i + 1).t0 : totalSeconds;
+        fallbackSpans.emplace_back(segments.at(i).t0, spanEnd);
+    }
+    return VadChunker::complementSpans(fallbackSpans, totalSeconds);
+}
+
 void DetectSilenceTask::run(TaskContext &ctx)
 {
     // Needs no resident heavy model of its own (VAD loads/frees inline per
@@ -92,36 +118,13 @@ void DetectSilenceTask::run(TaskContext &ctx)
     QString ensureError;
     const QString vadModelPath = ModelManager::ensureVadModel(&ensureError);
 
-    std::vector<std::pair<double, double>> silences;
-    bool vadOk = false;
-    if (!vadModelPath.isEmpty()) {
-        QString chunkingError;
-        std::vector<std::pair<double, double>> speechSpans;
+    QString chunkingError;
+    std::vector<std::pair<double, double>> speechSpans;
+    if (!vadModelPath.isEmpty())
         VadChunker::computeWindows(*pcm, vadModelPath, &chunkingError, &speechSpans);
-        if (chunkingError.isEmpty()) {
-            silences = VadChunker::complementSpans(speechSpans, totalSeconds);
-            vadOk = true;
-        }
-    }
-    if (!vadOk) {
-        // VAD unavailable/failed despite the prerequisite (a corrupt/
-        // unloadable model file, the rare case) — fall back to the SAME
-        // transcript-gap heuristic TranscribeTask's inline capture uses when
-        // VAD didn't run: treat consecutive segments as touching spans (the
-        // file format stores no per-segment end time — CLAUDE.md's vault-
-        // layout note — so an already-written .md can only ever recover a
-        // LEADING silence gap before the first segment this way, never an
-        // internal one; still better than leaving the key absent, matching
-        // TranscribeTask's "so the key is always present" contract).
-        const QList<ParsedSegment> segments = parsedSegmentsFromTranscriptBody(body, knownSpeakers);
-        std::vector<std::pair<double, double>> fallbackSpans;
-        fallbackSpans.reserve(segments.size());
-        for (int i = 0; i < segments.size(); ++i) {
-            const double spanEnd = (i + 1 < segments.size()) ? segments.at(i + 1).t0 : totalSeconds;
-            fallbackSpans.emplace_back(segments.at(i).t0, spanEnd);
-        }
-        silences = VadChunker::complementSpans(fallbackSpans, totalSeconds);
-    }
+    const QList<ParsedSegment> segments = parsedSegmentsFromTranscriptBody(body, knownSpeakers);
+    const std::vector<std::pair<double, double>> silences =
+        selectSilences(chunkingError, speechSpans, segments, totalSeconds);
 
     if (ctx.checkpoint())
         throw TaskError(QStringLiteral("Cancelled"));

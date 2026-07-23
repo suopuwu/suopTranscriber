@@ -13,7 +13,7 @@
 class Task;
 
 // The task-list QUERY/SERIALIZATION collaborator split out of
-// TranscriptionController (2026-07-20). Everything here is a pure function of
+// TranscriptionController. Everything here is a pure function of
 // the queue's contents — `const std::vector<std::unique_ptr<Task>> &tasks`,
 // plus `activeIndex` where the answer depends on what's currently running.
 //
@@ -61,7 +61,7 @@ public:
     // cleanup.
     static bool batchHasMembers(const TaskList &tasks, int batchId);
 
-    // Item O15: where a freshly requested job should land in `tasks` so it
+    // Where a freshly requested job should land in `tasks` so it
     // runs NEXT once whatever's currently running finishes, ahead of
     // anything already Queued — right after the Active job if one exists
     // (never ahead of it: this must not preempt work already in flight), or
@@ -86,6 +86,21 @@ public:
     // actually occupies the file (a benchmark/sweep on it doesn't block a
     // real op — see Task::occupiesFile()).
     static bool isQueued(const TaskList &tasks, const QUrl &fileUrl);
+
+    // True if a Queued/Active/Paused task of exactly `kind` already occupies
+    // fileUrl — the per-KIND dedup a derived pass wants: a transcribe in
+    // flight must NOT block queueing a label/chapters/diarize behind it, but a
+    // second identical pass must. (isQueued() above is the coarser per-FILE
+    // dedup transcribe() still uses.)
+    static bool isKindQueued(const TaskList &tasks, const QUrl &fileUrl, const QString &kind);
+
+    // One past the LAST Queued/Active/Paused task that occupies fileUrl, or -1
+    // if none. A derived pass enqueued while a transcribe for the same file is
+    // still in flight uses this so it lands AFTER the transcribe (and after any
+    // earlier-queued pass for the file), keeping a file's tasks contiguous and
+    // ordered. -1 ⇒ caller falls back to frontOfQueueInsertIndex() (the old
+    // behavior for an already-transcribed file with no pending task).
+    static int insertIndexAfterFileTasks(const TaskList &tasks, const QUrl &fileUrl);
 
     // True if a "combine" task producing exactly this outputPath is already
     // Queued/Active — runCombineScan()'s dedup check, mirrors

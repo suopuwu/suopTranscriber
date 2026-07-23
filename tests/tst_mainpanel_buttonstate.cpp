@@ -264,7 +264,15 @@ private slots:
                 QFAIL(qPrintable(QStringLiteral("a per-file button gates enabled on the non-reactive "
                                                 "isQueued(url) invokable — it goes stale and stays greyed: ")
                                  + trimmed));
-            if (trimmed.contains(QStringLiteral("enabled:")) && trimmed.contains(QStringLiteral("busyOrQueuedUrls"))) {
+            // Either reactive key set counts: the delete trio gates on the
+            // per-FILE busyOrQueuedUrls; the derived-pass trio (label/chapters/
+            // detect-speakers) gates on the per-KIND busyOrQueuedKeys so a
+            // transcribe in flight doesn't grey them (see busyOrQueuedKeys). Both
+            // are reactive — the invariant this guards is "not the stale
+            // isQueued() invokable", which the check above enforces.
+            if (trimmed.contains(QStringLiteral("enabled:"))
+                && (trimmed.contains(QStringLiteral("busyOrQueuedUrls"))
+                    || trimmed.contains(QStringLiteral("busyOrQueuedKeys")))) {
                 for (const QString &id : buttonIds)
                     if (trimmed.contains(id + QStringLiteral(".targetUrl")))
                         gated.append(id);
@@ -297,8 +305,10 @@ private slots:
         QVERIFY2(body.contains(QStringLiteral("refreshTranscriptSync()")),
                  "onFinished must reload the transcript body — otherwise a burst-emitting engine's "
                  "tail (Parakeet) never appears until the file is reopened");
-        QVERIFY2(body.contains(QStringLiteral("mainPanel.player.source.toString()")),
-                 "onFinished's body reload must be guarded on the finished file still being open");
+        QVERIFY2(body.contains(QStringLiteral("isSameFile(fileUrl, mainPanel.player.source)")),
+                 "onFinished's body reload must be guarded on the finished file still being open — "
+                 "via isSameFile (local-path compare), so a spaced filename isn't misread as a "
+                 "different file and the reload silently skipped");
     }
 };
 

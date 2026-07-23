@@ -6,7 +6,18 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_AUTOMOC ON)
 
 option(SUOP_ENABLE_VULKAN "Build whisper.cpp with Vulkan backend (cross-vendor GPU baseline)" ON)
-option(SUOP_ENABLE_CUDA "Build whisper.cpp with CUDA backend (NVIDIA fast path)" OFF)
+# Default ON only when a CUDA compiler is actually available, so an NVIDIA box
+# with the toolkit installed doesn't silently build a CPU-only whisper (the
+# failure mode this guards). No toolkit -> stays OFF and the Vulkan floor
+# carries the GPU path. Override explicitly with -DSUOP_ENABLE_CUDA=OFF to
+# force the Vulkan path on a CUDA-capable machine.
+include(CheckLanguage)
+check_language(CUDA)
+if(CMAKE_CUDA_COMPILER)
+    option(SUOP_ENABLE_CUDA "Build whisper.cpp with CUDA backend (NVIDIA fast path)" ON)
+else()
+    option(SUOP_ENABLE_CUDA "Build whisper.cpp with CUDA backend (NVIDIA fast path)" OFF)
+endif()
 option(SUOP_ENABLE_LABELING "Build with llama.cpp for AI auto-labeling" ON)
 
 find_package(Qt6 6.7 REQUIRED COMPONENTS Core Gui Qml Quick QuickControls2 Multimedia Core5Compat DBus Svg)
@@ -228,9 +239,15 @@ qt_add_qml_module(suopTranscriber
         qml/TitleBar.qml
         qml/Sidebar.qml
         qml/TreeRowDelegate.qml
+        qml/SearchResultDelegate.qml
+        qml/SidebarRibbon.qml
         qml/MainPanel.qml
         qml/SeekBar.qml
         qml/ChapterHeadingRow.qml
+        qml/PreludeEditor.qml
+        qml/ChapterTocList.qml
+        qml/SearchReplaceBar.qml
+        qml/ReplaceRow.qml
         qml/BottomBar.qml
         qml/SettingsPopup.qml
         qml/BenchmarkPage.qml

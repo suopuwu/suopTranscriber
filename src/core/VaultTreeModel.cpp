@@ -299,7 +299,7 @@ std::unique_ptr<VaultTreeModel::Node> VaultTreeModel::scanDirectory(const QStrin
     const QFileInfoList entries = dir.entryInfoList(QDir::AllEntries | QDir::NoDotAndDotDot, QDir::DirsFirst | QDir::Name);
 
     // First pass: collect audio FULL filenames (extension included) — see
-    // rebuild()'s identical first pass for why (Item P7: sidecar convention
+    // rebuild()'s identical first pass for why (sidecar convention
     // is <fileName>.md, not <completeBaseName>.md).
     QSet<QString> audioBaseNames;
     for (const QFileInfo &entry : entries) {
@@ -346,7 +346,7 @@ QString VaultTreeModel::sidecarMdPath(const Node *node)
     if (node->isOrphanedMd)
         return node->path;
     if (node->isAudio) {
-        // Item P7: derived from the FULL filename (extension included), not
+        // Derived from the FULL filename (extension included), not
         // just the stripped stem — otherwise two audio files sharing a stem
         // with different extensions would collide on one sidecar .md.
         const QFileInfo info(node->path);
@@ -403,7 +403,7 @@ VaultTreeModel::Status VaultTreeModel::effectiveStatus(const Node *node) const
     return TranscribedStatus;
 }
 
-// Mirrors TranscriptionController::readTranscriptBody(). Item P12: cached
+// Mirrors TranscriptionController::readTranscriptBody(). Cached
 // per mdPath, invalidated purely by mtime+size (see m_transcriptBodyCache's
 // doc comment) rather than by any file-change signal.
 QString VaultTreeModel::transcriptBody(const QString &mdPath) const
@@ -685,7 +685,7 @@ bool VaultTreeModel::moveFolder(const QUrl &folderUrl, const QUrl &destParentUrl
 }
 
 // The transcript set for `path`: its .md sidecar and .partial.jsonl resume
-// state. Same full-filename convention as sidecarMdPath()/moveFile() (item P7).
+// state. Same full-filename convention as sidecarMdPath()/moveFile().
 // Returns false if path isn't a thing that HAS a transcript.
 static bool transcriptPathsFor(const QFileInfo &info, QString *mdOut, QString *partialOut)
 {

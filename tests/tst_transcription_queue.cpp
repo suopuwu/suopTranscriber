@@ -180,6 +180,33 @@ public:
     std::atomic<bool> m_ran{false};
 };
 
+// A SelfCumulative Serial task that emits phase() ONCE and then blocks, never
+// emitting progress() — the exact shape (RelabelTask's single blocking label()
+// call) that used to freeze the bar at 0% until it snapped to 100%. Holding the
+// phase open guarantees the indeterminate timer's ticks fire, which is what
+// makes the synthetic-fallback integration path deterministic: a real task's
+// phase can complete before a tick (see PhaseTimer.h's defaultPhaseDurationMs
+// doc comment), the fake's block cannot. Released via m_release; honors cancel
+// so controller teardown can't hang. progressModel() is the Task default
+// (SelfCumulative), so this doesn't override it.
+class FakePhaseNoProgressTask : public Task {
+public:
+    explicit FakePhaseNoProgressTask(const QUrl &file = {}) { fileUrl = file; }
+    QString kind() const override { return QStringLiteral("fakePhaseNoProgress"); }
+    QString displayName() const override { return QStringLiteral("Fake phase, no progress"); }
+    Capabilities capabilities() const override { return {/*pausable*/ false, /*cancellableMidRun*/ true}; }
+    void run(TaskContext &ctx) override
+    {
+        emit phase(QStringLiteral("labeling"));
+        while (!m_release.load()) {
+            if (ctx.checkpoint())
+                return; // honor cancel so teardown can't hang
+            QThread::msleep(5);
+        }
+    }
+    std::atomic<bool> m_release{false};
+};
+
 // Combine-rule map shape (mirrors tst_filecombine's rule()) for the
 // maybeRedirectForCombine characterization test.
 inline QVariantMap combineRule(const QString &name, const QString &pattern)
@@ -1730,6 +1757,74 @@ private slots:
         QCOMPARE(controller.queuedFileUrls(), (QVariantList{secondQueued, firstQueued}));
     }
 
+    // Queue derived work (label/chapters) behind an in-flight transcription:
+    // generateChapters()/relabel() dedup per-KIND (TaskQuery::isKindQueued), not
+    // per-file (TaskQuery::isQueued), so a transcribe already occupying fileUrl A
+    // does NOT block queueing a derived pass behind it — and
+    // TaskQuery::insertIndexAfterFileTasks lands the derived task right after A's
+    // existing tasks (contiguous, ordered), never at the front of the whole queue
+    // (which frontOfQueueInsertIndex() would do for a plain, file-free enqueue).
+    void derivedPass_dedupsPerKind_andInsertsAfterExistingFileTasks()
+    {
+        VaultFixture vault;
+        // Plant a zero-byte label model too, so generateChapters()/relabel()
+        // below don't each insert an extra download-prerequisite job ahead of
+        // themselves (enqueueTask() does that via maybeQueueDownloadTask()) —
+        // this test is about ordering/dedup, not the download path.
+        QFile labelModel(vault.dir.path() + "/.transcriber/models/Qwen3-4B-Instruct-2507-Q4_K_M.gguf");
+        QVERIFY(labelModel.open(QIODevice::WriteOnly));
+        labelModel.close();
+
+        TranscriptionController controller;
+        const QUrl fileA = vault.audioUrl("a.wav");
+        const QUrl vaultUrl = vault.vaultUrl;
+
+        // Stand in for "a transcribe is in flight on A, plus one more A task
+        // already queued behind it": FakeBlockingSerialTask's own kind is
+        // irrelevant to insertIndexAfterFileTasks (it keys on fileUrl only), so
+        // two of them model [Active, Queued] on A without needing a real
+        // TranscribeTask/model.
+        auto active = std::make_unique<FakeBlockingSerialTask>(fileA);
+        FakeBlockingSerialTask *activeRaw = active.get();
+        controller.enqueueTask(std::move(active));
+        QTRY_COMPARE(activeRaw->status, Task::Status::Active);
+
+        auto queued = std::make_unique<FakeBlockingSerialTask>(fileA);
+        FakeBlockingSerialTask *queuedRaw = queued.get();
+        controller.enqueueTask(std::move(queued));
+        QCOMPARE(queuedRaw->status, Task::Status::Queued);
+
+        // generateChapters() isn't blocked by A's in-flight tasks (neither is a
+        // "chapters" kind) and lands right AFTER both of them, not at the front.
+        controller.generateChapters(fileA, vaultUrl, 0.5);
+        QVariantList jobs = controller.jobs();
+        QCOMPARE(jobs.size(), 3);
+        QCOMPARE(jobs.at(2).toMap().value("kind").toString(), QStringLiteral("chapters"));
+        QCOMPARE(jobs.at(2).toMap().value("fileUrl").toUrl(), fileA);
+
+        // Per-kind dedup: a second generateChapters() while the first "chapters"
+        // task is still Queued is a no-op.
+        controller.generateChapters(fileA, vaultUrl, 0.5);
+        QCOMPARE(controller.jobs().size(), 3);
+
+        // relabel() also isn't blocked by the transcribe-in-flight, and lands
+        // after ALL of A's existing tasks (contiguous with the chapters task
+        // just queued, not ahead of it).
+        controller.relabel(fileA, vaultUrl);
+        jobs = controller.jobs();
+        QCOMPARE(jobs.size(), 4);
+        QCOMPARE(jobs.at(3).toMap().value("kind").toString(), QStringLiteral("relabel"));
+        QCOMPARE(jobs.at(3).toMap().value("fileUrl").toUrl(), fileA);
+
+        // Let the fakes drain (chapters/relabel then run for real against a
+        // nonexistent vault and fail fast — "has not been transcribed yet" —
+        // which is fine; this test only asserts enqueue order/dedup) so
+        // teardown is clean.
+        activeRaw->m_release.store(true);
+        queuedRaw->m_release.store(true);
+        QTRY_COMPARE(controller.tasksCompleted(), 4);
+    }
+
     // Item 1: a Queued job persists to <vault>/.transcriber/tasks.json and
     // loadPersistedQueue() re-enqueues it on a FRESH controller — same
     // contract a new app launch relies on.
@@ -1984,6 +2079,106 @@ private slots:
         // average feature replaced.
         QCOMPARE(TranscriptionController::defaultPhaseDurationMs(QStringLiteral("detecting-speakers")),
                   TranscriptionController::defaultPhaseDurationMs(QStringLiteral("transcribing")));
+    }
+
+    // 004: the SelfCumulative frozen-bar safety net. A SelfCumulative task
+    // (RelabelTask, …) that emits phase() but never progress() used to leave the
+    // bar at 0% for the whole pass and snap it to 100% at completion. PhaseTimer::
+    // selfCumulativeSyntheticProgress() synthesizes an elapsed-vs-average ramp for
+    // that case. Tested directly (not through the live 200ms timer) for the same
+    // reason the other synthetic-progress asserts are — a wall-clock integration
+    // test is unreliable on fast hardware (see PhaseTimer.h's doc comment).
+    void selfCumulativeSyntheticProgress_rampsFromZero_clamped_andLearnsPerKind()
+    {
+        // Pristine QSettings identity so a persisted sample from another test
+        // can't seed these keys — see the rolling-average test.
+        QCoreApplication::setOrganizationName(QStringLiteral("suopTranscriber-tests"));
+        QCoreApplication::setApplicationName(
+            QStringLiteral("tst_transcription_queue-selfCumulativeRamp"));
+        // recordSelfCumulativePhaseDuration() below PERSISTS, and PhaseTimer's
+        // constructor loads persisted samples — so wipe the group first or a
+        // prior run of this same test would seed "labeling|relabel" and the
+        // default-vs-learned assertions would read a stale average, not the
+        // default. Must happen before the PhaseTimer is constructed.
+        {
+            QSettings settings;
+            settings.beginGroup(QStringLiteral("phaseTimings"));
+            settings.remove(QString()); // clear every key in the group
+            settings.endGroup();
+        }
+
+        PhaseTimer pt;
+        const QString phase = QStringLiteral("labeling");
+        const QString kind = QStringLiteral("relabel");
+        const QString model; // SelfCumulative kinds carry no modelId
+
+        // No samples yet: rises from 0 with elapsed, strictly, and clamps below
+        // 1.0 so it never LOOKS finished before the real completion snaps it there.
+        QCOMPARE(pt.selfCumulativeSyntheticProgress(phase, kind, model, 0), 0.0);
+        const double early = pt.selfCumulativeSyntheticProgress(phase, kind, model, 2000);
+        const double atDefault4s = pt.selfCumulativeSyntheticProgress(phase, kind, model, 4000);
+        QVERIFY2(early > 0.0, "a non-zero elapsed must move the bar off 0% (the frozen-bar bug)");
+        QVERIFY2(atDefault4s > early, "more elapsed must advance the ramp");
+        QVERIFY2(pt.selfCumulativeSyntheticProgress(phase, kind, model, 1'000'000) <= 0.95,
+                 "the ramp must clamp below 1.0 — it must never claim completion on its own");
+
+        // A recorded real duration becomes the ramp's average: a much longer
+        // measured pass makes the SAME elapsed read as a smaller fraction.
+        pt.recordSelfCumulativePhaseDuration(phase, kind, model, 40000); // 40s pass
+        QVERIFY2(pt.selfCumulativeSyntheticProgress(phase, kind, model, 4000) < atDefault4s,
+                 "recording a longer real duration must slow the ramp (elapsed-vs-real-average)");
+
+        // Per-kind keying: the sample recorded for "relabel" must not bleed into
+        // another kind's ramp — which therefore still reads the default.
+        QVERIFY2(qFuzzyCompare(pt.selfCumulativeSyntheticProgress(phase, QStringLiteral("chapters"), model, 4000),
+                               atDefault4s),
+                 "a duration learned for one kind must not affect another kind's ramp");
+    }
+
+    // 004 (integration): the controller must actually drive the ramp above — a
+    // SelfCumulative Active task that emits phase() but no progress() has its bar
+    // advanced off 0 by the indeterminate timer. Deterministic here because the
+    // fake BLOCKS in its phase (guaranteeing timer ticks), unlike a real model.
+    void selfCumulativeTask_barLeavesZeroDuringABlockingPhase_withoutRealProgress()
+    {
+        TranscriptionController controller;
+        auto task = std::make_unique<FakePhaseNoProgressTask>();
+        FakePhaseNoProgressTask *raw = task.get();
+        controller.enqueueTask(std::move(task)); // friend seam -> auto-starts, becomes Active
+
+        // Before the fix the bar sat at 0.0 for the whole blocking pass; now the
+        // synthetic fallback must move it off 0 and keep it honestly below 1.0.
+        QTRY_VERIFY_WITH_TIMEOUT(controller.overallProgress() > 0.0, 3000);
+        QVERIFY2(controller.overallProgress() < 1.0,
+                 "the synthetic ramp must never claim completion on its own");
+
+        raw->m_release.store(true);
+        QTRY_VERIFY_WITH_TIMEOUT(!controller.isBusy(), 3000); // settle for clean teardown
+    }
+
+    // 005 hardening: isSameFile() compares decoded local paths, so a filename
+    // with spaces — which fromLocalFile vs a QUrl(string) can stringify
+    // differently (a literal ' ' vs "%20") — is still recognized as the same
+    // file. MainPanel's onFinished live-reload gate relies on this so a
+    // detect-speakers run on such a file refreshes the panel instead of the old
+    // toString()-compare silently reading it as a different file and skipping.
+    void isSameFile_matchesSpacedFilename_acrossUrlEncodings()
+    {
+        TranscriptionController controller;
+        const QUrl fromLocal =
+            QUrl::fromLocalFile(QStringLiteral("/tmp/acme mic 3 - 20260721 orig.combined.wav"));
+        const QUrl fromEncoded = QUrl(
+            QStringLiteral("file:///tmp/acme%20mic%203%20-%2020260721%20orig.combined.wav"));
+
+        QVERIFY2(controller.isSameFile(fromLocal, fromEncoded),
+                 "a spaced filename built two different ways must compare equal by local path");
+        QVERIFY(controller.isSameFile(fromLocal, fromLocal));
+
+        const QUrl other = QUrl::fromLocalFile(QStringLiteral("/tmp/other file.wav"));
+        QVERIFY(!controller.isSameFile(fromLocal, other));
+        // Two non-local URLs are not "the same file", even byte-identical.
+        QVERIFY(!controller.isSameFile(QUrl(QStringLiteral("about:blank")),
+                                       QUrl(QStringLiteral("about:blank"))));
     }
 
     // 2026-07-10: rolling-average phase weighting (RollingAverage,

@@ -5,6 +5,7 @@
 #include "TranscriptionEngine.h"
 
 struct whisper_context;
+struct whisper_context_params;
 struct whisper_full_params;
 
 // In-process, warm-model engine (see DESIGN.md "whisper.cpp — first-class,
@@ -32,7 +33,15 @@ public:
     // (callbacks, VAD) on top of this.
     static whisper_full_params decodeParams();
 
-    // Item O35: "CUDA"/"Vulkan"/"CPU", parsed out of whisper.cpp's own
+    // The context parameters the constructor builds the model with —
+    // whisper defaults plus flash attention (a faster encoder-attention
+    // kernel; a free speedup, most on the CUDA/Blackwell path, no quality
+    // change). Split out static + public, like decodeParams() above, purely
+    // so tst_engine_contract can assert flash_attn is on without loading a
+    // model.
+    static whisper_context_params contextParams();
+
+    // "CUDA"/"Vulkan"/"CPU", parsed out of whisper.cpp's own
     // "using %s backend" log line (see the .cpp's whisper_log_set()
     // capture) — empty until the first model load. Backed by process-wide
     // storage rather than a plain instance member: whisper_log_set()

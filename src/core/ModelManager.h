@@ -83,7 +83,7 @@ struct ParakeetModelPaths {
 // of the returned paths are present on disk.
 ParakeetModelPaths parakeetModelPaths();
 
-// Wave N (task system, item 5): resolves modelId to its ggml file name
+// Task system: resolves modelId to its ggml file name
 // without touching disk/network — lets a caller check "is this already
 // downloaded" (see isModelDownloaded()) before deciding whether a separate
 // download job is needed. Empty if modelId isn't recognized (mirrors
@@ -152,7 +152,7 @@ QString ensureLabelModel(QString *errorOut = nullptr,
 // transcription — caller degrades gracefully (ASR without VAD gating/
 // windowing, single whole-file chunk, recorded honestly in frontmatter),
 // same contract as ensureDiarizationModels().
-constexpr auto kVadModelFileName = "ggml-silero-v5.1.2.bin";
+constexpr auto kVadModelFileName = "ggml-silero-v6.2.0.bin";
 
 // Whether an out-of-process engine's model is present (app-global) (see
 // DESIGN.md "Pluggable engines" capability detection). True when the engine

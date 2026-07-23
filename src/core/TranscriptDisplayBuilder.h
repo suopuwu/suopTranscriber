@@ -7,7 +7,7 @@
 #include <qqml.h>
 
 // The transcript DISPLAY-MODEL collaborator lifted out of MainPanel.qml's
-// `displayData` binding (2026-07-20). It owns the one pure transform that
+// `displayData` binding. It owns the one pure transform that
 // turns the raw on-disk data — parseSentences() segments, readChapters()
 // markers, the collapse map, the optimistic speaker-rename overlay and
 // parseSilences() spans — into the two things the transcript view renders:

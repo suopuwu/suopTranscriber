@@ -7,7 +7,7 @@
 
 #include "SortKey.h"
 
-// Item 9: sidebar search sort + match highlighting/snippet support. Wraps a
+// Sidebar search sort + match highlighting/snippet support. Wraps a
 // VaultTreeModel (a tree, not a flat list) so matches sort to the top of
 // their sibling list without ever hiding non-matches — the sidebar already
 // dims non-matches visually rather than removing them, so filterAcceptsRow()

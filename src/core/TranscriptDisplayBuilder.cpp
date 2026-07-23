@@ -209,7 +209,7 @@ QVariantMap TranscriptDisplayBuilder::build(const QVariantList &sentences,
             pushHeading(chapter, std::min(chapterT0, sT0));
             chapterIdx++;
         }
-        // Item 33: a collapsed chapter hides its body entirely — the sentence
+        // A collapsed chapter hides its body entirely — the sentence
         // is dropped from BOTH `text` and `list` (its heading was already
         // pushed above and stays visible), keeping every downstream offset
         // consumer (transcriptArea's string, the overlay Repeaters,

@@ -220,6 +220,13 @@ suop_add_test(tst_mainpanel_livescroll LINK_QUICK LINK_SVG ICON_ASSETS LINK_GUI
             EngineManifest.cpp GpuProbe.cpp SubprocessEngine.cpp EngineRegistry.cpp ParakeetEngine.cpp
             UsbGrabJob.cpp UsbRuleStore.cpp VaultTreeModel.cpp
             ${SUOP_TASK_SOURCES})
+suop_add_test(tst_mainpanel_spacedload LINK_QUICK LINK_SVG ICON_ASSETS LINK_GUI
+    LINK_WHISPER LINK_LLAMA LINK_SHERPA_ONNX
+    SOURCES IconTheme.cpp Clipboard.cpp TranscriptDisplayBuilder.cpp UndoStack.cpp TranscriptionController.cpp WhisperCppEngine.cpp VadChunker.cpp
+            ModelManager.cpp AudioDecoder.cpp LabelingEngine.cpp DiarizationEngine.cpp
+            EngineManifest.cpp GpuProbe.cpp SubprocessEngine.cpp EngineRegistry.cpp ParakeetEngine.cpp
+            UsbGrabJob.cpp UsbRuleStore.cpp VaultTreeModel.cpp
+            ${SUOP_TASK_SOURCES})
 suop_add_test(tst_mainpanel_deleteundo LINK_QUICK LINK_SVG ICON_ASSETS LINK_GUI
     LINK_WHISPER LINK_LLAMA LINK_SHERPA_ONNX
     SOURCES IconTheme.cpp Clipboard.cpp TranscriptDisplayBuilder.cpp UndoStack.cpp VaultTreeModel.cpp TranscriptionController.cpp

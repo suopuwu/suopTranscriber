@@ -40,7 +40,7 @@ static QString phaseBucket(const QString &phase)
     return phase;
 }
 
-// 2026-07-10 (item P3): m_phaseTimings' actual storage key — folds modelId
+// 2026-07-10: m_phaseTimings' actual storage key — folds modelId
 // (and, only when relevant, an explicit "diar" marker for speakerDetection)
 // onto the phase bucket name. A large model's "loading"/"transcribing" takes
 // materially longer than a tiny one, and diarization adds real per-job
@@ -49,17 +49,30 @@ static QString phaseBucket(const QString &phase)
 // modelId is deliberately part of the key for EVERY phase (not just
 // "loading"/"transcribing" where it obviously matters) — keeping one
 // consistent key shape is simpler than special-casing which phases care.
-static QString canonicalPhaseKey(const QString &phase, const QString &modelId, bool speakerDetection)
+static QString canonicalPhaseKey(const QString &phase, const QString &modelId, bool speakerDetection,
+                                 const QString &kind = {})
 {
     QString key = phaseBucket(phase) + QLatin1Char('|') + modelId;
     if (speakerDetection)
         key += QStringLiteral("|diar");
+    // Only the SelfCumulative synthetic-ramp path passes a kind; folding it in
+    // keeps a RelabelTask "labeling" timing from ever sharing a bucket with a
+    // WeightedPhases key (those never carry a kind, so their shape is unchanged).
+    if (!kind.isEmpty())
+        key += QLatin1Char('|') + kind;
     return key;
 }
 
+// Fixed plausible duration selfCumulativeSyntheticProgress() ramps against
+// before any real sample exists — a single LLM-ish pass (label / chapters
+// generation) is the common case. Same role defaultPhaseDurationMs() plays for
+// the WeightedPhases phases: too small and the bar saturates within a tick;
+// this just sets ramp SHAPE, never correctness (the 0.95 clamp guards the top).
+static constexpr double kSelfCumulativeDefaultDurationMs = 8000.0;
+
 void PhaseTimer::loadPhaseTimings()
 {
-    // 2026-07-10 (item P3): keys are now composite (phase|modelId[|diar]),
+    // 2026-07-10: keys are now composite (phase|modelId[|diar]),
     // so there's no fixed upfront list to load by name — enumerate whatever
     // keys are actually persisted instead. childKeys() naturally covers every
     // model/config combination ever recorded on this machine.
@@ -140,6 +153,24 @@ double PhaseTimer::phaseRelativeSyntheticProgress(const QString &phase, const QS
     if (avg <= 0.0)
         return 0.0;
     return qMin(0.95, static_cast<double>(elapsedInPhaseMs) / avg);
+}
+
+double PhaseTimer::selfCumulativeSyntheticProgress(const QString &phase, const QString &kind,
+                                                   const QString &modelId, qint64 elapsedMs) const
+{
+    const QString key = canonicalPhaseKey(phase, modelId, false, kind);
+    const double avg = m_phaseTimings.value(key).average(kSelfCumulativeDefaultDurationMs);
+    if (avg <= 0.0)
+        return 0.0;
+    return qMin(0.95, static_cast<double>(qMax<qint64>(0, elapsedMs)) / avg);
+}
+
+void PhaseTimer::recordSelfCumulativePhaseDuration(const QString &phase, const QString &kind,
+                                                   const QString &modelId, qint64 durationMs)
+{
+    const QString key = canonicalPhaseKey(phase, modelId, false, kind);
+    m_phaseTimings[key].addSample(static_cast<double>(durationMs));
+    savePhaseTiming(key);
 }
 
 void PhaseTimer::recomputeOverallProgress(const QStringList &activePhases, bool weightedPhases,

@@ -8,7 +8,7 @@
 #include <qqml.h>
 
 // The file-tree ORDERING collaborator lifted out of Sidebar.qml's
-// refreshTreeOrdering() (2026-07-20). It owns the one pure transform that
+// refreshTreeOrdering(). It owns the one pure transform that
 // turns the vault's raw data — allAudioPaths(), audioLastModified(),
 // detectCombineGroups()'s output, the pending-combine placeholders and the
 // active AppSettings.sortMode — into the five plain data maps that decide

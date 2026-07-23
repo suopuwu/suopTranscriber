@@ -62,7 +62,7 @@ public:
     // tuned against real multi-hour transcripts yet (see DESIGN.md notes on
     // this feature).
     //
-    // existingTags (item 14 "auto-categorize" mode): when non-empty AND
+    // existingTags ("auto-categorize" mode): when non-empty AND
     // restrictToExisting is true, the model is instructed to pick tags ONLY
     // from this vocabulary (or leave tags empty if none fit) instead of
     // freely inventing new ones. This is a PROMPT instruction, not a grammar
@@ -71,7 +71,7 @@ public:
     // isn't practical; the grammar still only constrains the overall JSON
     // shape, same as the unrestricted mode.
     //
-    // tagReuseBias (Item 15, Wave E): when existingTags is non-empty but
+    // tagReuseBias: when existingTags is non-empty but
     // restrictToExisting is false, this 0.0-1.0 slider softly nudges the
     // model's choice between inventing a new/precise tag (near 0.0) and
     // reusing one of the existing tags even if the fit is only approximate
@@ -85,9 +85,14 @@ public:
     // prelude sentence. Mid (default, 0.34-0.67): a short label (a few
     // words), a one-paragraph prelude. High (>=0.67): a descriptive label
     // (up to a short phrase), a detailed multi-sentence prelude.
+    // onTokens (optional) reports output tokens decoded so far, so a caller
+    // driving a progress bar can move DURING this single long call instead of
+    // only between calls — same signal generateChapters() exposes. Never a
+    // total; a grammar-constrained generation stops when the grammar completes.
     std::optional<LabelResult> label(const QString &transcriptText, const QStringList &existingTags = {},
                                       bool restrictToExisting = false, double tagReuseBias = 0.5,
-                                      double wordiness = 0.5, QString *errorOut = nullptr);
+                                      double wordiness = 0.5, QString *errorOut = nullptr,
+                                      const std::function<void(int)> &onTokens = {});
 
     // Feature 3a ("generate chapters"): a SEPARATE grammar-constrained pass
     // sharing this SAME resident model/context as label() above — never a
@@ -132,7 +137,7 @@ public:
                                                     QString *errorOut = nullptr,
                                                     const std::function<void(int)> &onTokens = {});
 
-    // Item 27: the density-parameterized chapter system prompt generateChapters()
+    // The density-parameterized chapter system prompt generateChapters()
     // uses internally — exposed static so it's unit-testable directly (a low
     // vs high density must produce materially different instruction text)
     // without loading a ~2.5GB GGUF.
@@ -173,7 +178,7 @@ public:
     // than fail the whole job on a transient generation error should treat
     // that as non-fatal and fall back to the input list.
     //
-    // Item 27: density (0.0-1.0, same slider generateChapters() takes) tunes
+    // Density (0.0-1.0, same slider generateChapters() takes) tunes
     // this pass's aggressiveness in the opposite direction — a HIGH density
     // (the user wants MORE chapters) makes the per-pair prompt err toward
     // KEEPING adjacent chapters separate, a LOW density errs strongly toward
@@ -210,7 +215,7 @@ public:
     // ChaptersTask::run().
     std::optional<QString> openingChapterTitle(const QStringList &segmentTexts, QString *errorOut = nullptr);
 
-    // Item P34: the same limit generateChapters() truncates to internally
+    // The same limit generateChapters() truncates to internally
     // (see its doc comment above and the .cpp definition site), exposed so
     // TranscriptionController::generateChaptersJob() can split a long
     // transcript into multiple windows — each within this budget — and call

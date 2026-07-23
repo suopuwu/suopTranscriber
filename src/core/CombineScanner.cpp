@@ -13,11 +13,8 @@
 #include <optional>
 #include <tuple>
 
-// findCombineGroups()'s "pending" status: a group is otherwise "ready" but
-// its newest member was modified more recently than this many seconds ago —
-// the recorder may still be actively writing that file, and concatenating a
-// growing/not-yet-closed file risks truncation or a corrupt merge.
-constexpr qint64 kCombineStabilityWindowSecs = 5;
+// kCombineStabilityWindowSecs (the "pending" status window) now lives in
+// CombineScanner.h so the sidebar re-scan timer can read the same value.
 
 // See this method's header doc comment for the full matching/grouping/status
 // semantics.

@@ -8,7 +8,7 @@
 #include "RollingAverage.h"
 
 // The phase-timing / progress-estimation collaborator split out of
-// TranscriptionController (2026-07-20). It owns exactly three things:
+// TranscriptionController. It owns exactly three things:
 //
 //   1. the per-configuration rolling averages of how long each phase has
 //      actually taken (m_phaseTimings) and their QSettings persistence,
@@ -97,7 +97,7 @@ public:
     // it. The caller recomputes the overall bar right after, so the CURRENT
     // phase's own slice reflects the freshly-updated average right away rather
     // than waiting for the next tick.
-    // Item P3: m_phaseTimings is keyed per-CONFIGURATION (phase + modelId
+    // m_phaseTimings is keyed per-CONFIGURATION (phase + modelId
     // + speakerDetection, see canonicalPhaseKey() in the .cpp), not just
     // phase name — modelId/speakerDetection describe the Active job and are
     // read off the controller at the call site (activeModelIdForTiming()/
@@ -116,6 +116,29 @@ public:
     double phaseRelativeSyntheticProgress(const QString &phase, const QString &modelId,
                                           bool speakerDetection, double realProgress,
                                           qint64 elapsedInPhaseMs) const;
+
+    // The frozen-bar safety net for SelfCumulative tasks. A SelfCumulative kind
+    // (RelabelTask, ChaptersTask, …) drives the whole-job bar straight from its
+    // progress() fraction; when its run() is one long blocking call that emits
+    // phase() but never progress(), the bar sits at 0 for the whole pass and
+    // snaps to 1.0 at the end — the recurring "0% then 100%" report. This
+    // synthesizes a within-job fraction from elapsed-vs-rolling-average for that
+    // case, clamped to 0.95 so a slow run never LOOKS finished before it is. The
+    // controller only ever RAISES the bar with this and abandons it the instant a
+    // real progress() tick arrives (that real value wins). Keyed per
+    // (phase|kind|modelId) so each kind's phase learns its own duration
+    // (recordSelfCumulativePhaseDuration); no samples yet ⇒ a fixed plausible
+    // default — same elapsed÷average shape as phaseRelativeSyntheticProgress()
+    // above, but for a single cumulative bar with no per-phase share weighting.
+    double selfCumulativeSyntheticProgress(const QString &phase, const QString &kind,
+                                           const QString &modelId, qint64 elapsedMs) const;
+    // Records how long a never-reported SelfCumulative phase actually took, so the
+    // ramp above becomes elapsed-vs-real-average over runs. Same rolling store and
+    // QSettings persistence as recordPhaseDuration(); the extra `kind` axis keeps
+    // each SelfCumulative kind's phase timings separate (and clear of the
+    // WeightedPhases keys, which never carry a kind).
+    void recordSelfCumulativePhaseDuration(const QString &phase, const QString &kind,
+                                           const QString &modelId, qint64 durationMs);
 
     // Rebuilds overallProgress from scratch: `activePhases` (the ordered phase
     // set the Active task authors — TranscribeTask: load/decode/detect-speech/
@@ -152,7 +175,7 @@ private:
     // per (phase, modelId, speakerDetection) combination ever recorded (see
     // canonicalPhaseKey() in the .cpp), each a QVariantList of up to
     // RollingAverage::kCapacity raw millisecond samples — called once from
-    // the constructor. Item P3: since the composite key embeds an
+    // the constructor. Since the composite key embeds an
     // open-ended modelId, this enumerates whatever keys are actually
     // persisted (QSettings::childKeys()) rather than a fixed list. App-scoped
     // (not per-vault): how long a phase takes is a property of this machine
@@ -164,7 +187,7 @@ private:
     // typically complete one phase at a time, not all four at once.
     void savePhaseTiming(const QString &key);
 
-    // Wave N (task system, item 6): the SAME 0..1 fraction run() used to
+    // Task system: the SAME 0..1 fraction run() used to
     // blend across diarization+transcription phases (see currentPhase's doc
     // comment for why that blending moved OUT of the displayed m_progress) —
     // also feeds estimatedRemainingMs()'s ETA math. Computed by
@@ -175,7 +198,7 @@ private:
     // each named phase, keyed by a COMPOSITE string — phase bucket + modelId
     // + speakerDetection (see canonicalPhaseKey() in the .cpp), not just the
     // phase name Task::phase emits
-    // ("loading"/"decoding"/"detecting-speakers"/"transcribing"). Item P3: a
+    // ("loading"/"decoding"/"detecting-speakers"/"transcribing"). A
     // large model's phases take materially longer than a tiny one's, and
     // diarization adds real overhead, so different configurations must not
     // share one rolling average — see recomputeOverallProgress()'s doc

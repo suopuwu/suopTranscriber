@@ -5,9 +5,21 @@
 #include <QRegularExpression>
 #include <QTextStream>
 
+#include <cmath>
+
 #include "../LabelingEngine.h"
 #include "../TranscriptionController.h"
 #include "EngineCache.h"
+
+// See labelGenerateProgress()'s doc comment in RelabelTask.h. ~180 output
+// tokens is a typical label+prelude+tags generation; only the ramp's shape
+// depends on this, not correctness.
+static constexpr double kTypicalLabelOutputTokens = 180.0;
+
+double labelGenerateProgress(int tokens)
+{
+    return qMin(0.97, 1.0 - std::exp(-static_cast<double>(qMax(0, tokens)) / kTypicalLabelOutputTokens));
+}
 
 RelabelTask::RelabelTask(QUrl file, QUrl vault, bool restrictTagsToExisting, double tagReuseBias, double wordiness,
                          bool skipIfAlreadyLabeled, QObject *parent)
@@ -99,6 +111,7 @@ void RelabelTask::run(TaskContext &ctx)
         throw TaskError(QStringLiteral("%1 has no transcript text to label").arg(mdPath));
 
     emit phase(QStringLiteral("labeling"));
+    emit progress(0.0);
 
     QString error;
     LabelingEngine *labelingEngine = ctx.engines.ensureLabel(&error);
@@ -117,10 +130,13 @@ void RelabelTask::run(TaskContext &ctx)
     const double effectiveWordiness = TranscriptionController::effectiveWordinessForLength(m_wordiness, wordCount);
 
     QString genError;
-    const auto result = labelingEngine->label(transcriptText, existingTagsVocab, m_restrictTagsToExisting,
-                                               m_tagReuseBias, effectiveWordiness, &genError);
+    const auto result = labelingEngine->label(
+        transcriptText, existingTagsVocab, m_restrictTagsToExisting, m_tagReuseBias, effectiveWordiness, &genError, [this](int tokens) {
+            emit progress(labelGenerateProgress(tokens));
+        });
     if (!result)
         throw TaskError(QStringLiteral("auto-label generation failed: %1").arg(genError));
 
+    emit progress(1.0);
     writeLabelingFields(mdPath, *result);
 }

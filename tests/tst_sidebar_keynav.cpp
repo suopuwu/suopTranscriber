@@ -175,6 +175,7 @@ private slots:
         const QString driverQml = QStringLiteral(
             "import QtQuick\n"
             "import QtQuick.Controls\n"
+            "import QtQuick.Window\n"
             "import SuopTranscriber\n"
             "Item {\n"
             "    id: root\n"
@@ -183,6 +184,31 @@ private slots:
             "    property string openPath: \"\"\n"
             "    VaultTreeModel { id: vaultModel; vaultPath: Qt.resolvedUrl(vaultUrl) }\n"
             "    TextField { objectName: \"decoy\"; width: 1; height: 1 }\n"
+            // MIRRORS qml/Main.qml's rootContent empty-space blur TapHandler —
+            // the real-app ANCESTOR of the Sidebar that this driver previously
+            // lacked. Its absence is exactly why Up/Down note-nav regressed in
+            // the app while this harness stayed green: an unconditional
+            // forceActiveFocus() on this ancestor fires on the SAME tap as a
+            // clicked tree row (both are passive TapHandlers) and steals the
+            // row's focus grab, leaving tree.activeFocus false. It MUST stay
+            // gated on a focused text field (duck-typed on cursorPosition) so
+            // it only blurs a real editor and never a deliberate row/tree
+            // focus. Drop the gate and arrowKeysNavigateAndScrollIntoView's
+            // activeFocus assertion goes red — that is this mirror's whole job.
+            "    TapHandler {\n"
+            "        acceptedButtons: Qt.LeftButton\n"
+            "        onTapped: {\n"
+            // root.Window.window resolves the attached Window on root (an Item),
+            // not on this TapHandler (where the attached type doesn't resolve) —
+            // same object-qualified idiom as qml/TextRedoShortcut.qml. Main.qml
+            // reads window.activeFocusItem directly off its ApplicationWindow;
+            // the driver has no window id, so it goes through the attached type.
+            "            const w = root.Window.window\n"
+            "            const fi = w ? w.activeFocusItem : null\n"
+            "            if (fi && fi.cursorPosition !== undefined)\n"
+            "                root.forceActiveFocus()\n"
+            "        }\n"
+            "    }\n"
             "    Sidebar {\n"
             "        id: sidebar\n"
             "        objectName: \"sidebar\"\n"

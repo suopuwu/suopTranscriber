@@ -287,6 +287,11 @@ Rectangle {
     // TapHandlers aren't mutually exclusive in Qt Quick (see the treeRowTap /
     // StyleGuide "Always-editable text" notes), so this is added only on the
     // genuinely-empty surfaces, never as a blanket catcher over the ribbon.
+    // The ribbon's search toggle lives in SidebarRibbon.qml, which can't reach
+    // searchField (a sibling inside expandedColumn) by id across the component
+    // boundary — it calls this instead.
+    function focusSearchField() { searchField.forceActiveFocus() }
+
     function deselectExceptCurrent() {
         if (sidebar.currentPath !== ""
                 && sidebar.visibleNotePaths().indexOf(sidebar.currentPath) >= 0) {
@@ -1021,6 +1026,20 @@ Rectangle {
         sidebar.combineTopMergedPaths = ordering.topMerged
         sidebar.combineBottomMergedPaths = ordering.bottomMerged
         searchProxy.fileSortKeys = ordering.sortKeys
+
+        // A group whose newest member is still inside the combine stability
+        // window reads as "pending", not "ready", so it's absent from
+        // combineReadyPaths and shows no candidate outline. "pending" is the
+        // only status that resolves by the passage of time alone, and nothing
+        // else re-runs this scan once the file stops changing — so without
+        // this, a just-arrived group stays a non-candidate until some
+        // unrelated event (a job finishing, a rule edit, a restart) happens to
+        // recompute ordering, i.e. the outline lags one filesystem event
+        // behind. Re-run ourselves once the window elapses so it settles on
+        // its own; the timer self-cancels once no group is pending.
+        const anyPending = groups.some((g) => g.status === "pending")
+        if (anyPending)
+            combinePendingRescanTimer.restart()
     }
     // pushPendingCombines() too, not just on the queueChanged above: a combine
     // job survives a restart (the queue is persisted), so the tree can open
@@ -1033,6 +1052,19 @@ Rectangle {
         target: AppSettings
         function onCombineRulesChanged() { sidebar.refreshTreeOrdering() }
         function onSortModeChanged() { sidebar.refreshTreeOrdering() }
+    }
+
+    // Passive combine re-scan: fires once, ~just past the stability window, to
+    // re-evaluate a group that refreshTreeOrdering() last saw as "pending"
+    // (newest member too freshly written). Interval is the C++ scan's own
+    // window plus a 1s margin so the file's mtime is safely past it when we
+    // re-scan. See refreshTreeOrdering()'s pending check.
+    Timer {
+        id: combinePendingRescanTimer
+        repeat: false
+        interval: (sidebar.transcriptionController
+                   ? sidebar.transcriptionController.combineStabilityWindowSecs() : 5) * 1000 + 1000
+        onTriggered: sidebar.refreshTreeOrdering()
     }
 
     // Item 51 refinement: the per-group color (combineGroupColor) moved to
@@ -1305,6 +1337,12 @@ Rectangle {
     property bool renamingIsDir: false
     property string renamingLabel: "" // the label the row displays, "" if none
     property string renamingText: ""  // the editor's current text
+    // The scene-coordinate point the rename was launched from, when it began
+    // with a click ON the name (treeRowTap) — the editor maps this to a caret
+    // position so the cursor lands where the user clicked. null when the rename
+    // came from a non-positional entry (context-menu "Rename"), in which case
+    // the editor selects the whole name instead (the menu-rename convention).
+    property var renamingCaretScenePos: null
 
     // Item: anti-flash for the inline rename. commitActiveRename() leaves edit
     // mode (clears renamingPath) SYNCHRONOUSLY but defers the actual write to
@@ -1332,6 +1370,12 @@ Rectangle {
         // matching the blur convention.
         if (sidebar.renamingPath !== "" && sidebar.renamingPath !== path)
             sidebar.commitActiveRename()
+        // Default to no click point (a menu/programmatic rename selects the whole
+        // name). A name-CLICK entry overrides this right after, with the click's
+        // scene position, so the caret lands where the pointer did — see
+        // treeRowTap. Kept OFF beginRename's parameter list so the C++
+        // QMetaObject::invokeMethod call sites stay 3-arg.
+        sidebar.renamingCaretScenePos = null
         sidebar.renamingIsDir = isDir === true
         sidebar.renamingLabel = label ? label : ""
         sidebar.renamingText = TextFormat.renameInitialText(path, sidebar.renamingIsDir, sidebar.renamingLabel,
@@ -2051,449 +2095,16 @@ Rectangle {
         // ignores Layout attached properties entirely (it positions by plain
         // width/height), which is why every child below sets width/height
         // directly rather than Layout.preferredWidth/Height.
-        Flow {
+        SidebarRibbon {
             id: ribbonFlow
+            sidebarRoot: sidebar
             anchors.top: parent.top
             anchors.left: parent.left
             anchors.right: parent.right
             anchors.topMargin: 5
             anchors.leftMargin: 6
             anchors.rightMargin: 6
-            spacing: 4
             visible: !sidebar.searchExpanded
-
-            // A left-click on empty ribbon space — the gap to the right of the
-            // "N selected" indicator, or between wrapped buttons — clears the
-            // multi-selection, matching the empty-tree-space behavior
-            // (treeEmptyLeftTap). childAt() is the ribbon's analogue of the
-            // tree's cellAtPosition bail: it returns the direct Flow child under
-            // the tap (a button/label/divider) or null for genuinely empty
-            // space, so this only fires on empty space. That bail is
-            // load-bearing, not defensive — overlapping TapHandlers aren't
-            // mutually exclusive in Qt Quick, so this ALSO fires when a bulk
-            // action button is tapped, and a file-action button must keep the
-            // selection it's about to act on.
-            TapHandler {
-                id: ribbonEmptyLeftTap
-                acceptedButtons: Qt.LeftButton
-                onTapped: {
-                    const p = ribbonEmptyLeftTap.point.position
-                    if (ribbonFlow.childAt(p.x, p.y))
-                        return // a real control owns this tap
-                    sidebar.deselectExceptCurrent()
-                }
-            }
-
-            // Prepended select-all: mirrors the Ctrl+A shortcut above, and
-            // is what makes the bulk buttons to its right ("apply to the
-            // current selection", see refreshSelectionEligibility()) able to reach
-            // "everything" again without requiring a manual Shift-click
-            // drag across the whole tree.
-            AppIconButton {
-                id: selectAllButton
-                objectName: "selectAllButton"
-                iconName: "select-all"
-                tooltip: qsTr("Select all (Ctrl+A)")
-                enabled: sidebar.visibleNotePaths().length > 0
-                onTapped: sidebar.selectAllVisible()
-            }
-
-            // Separates select-all from the bulk action buttons it feeds —
-            // same border color as the rest of the app's thin-line dividers
-            // (e.g. sortModeMenu's Popup border below).
-            //
-            // A full-height Item wrapping a shorter line, rather than a bare
-            // 18px Rectangle with Layout.alignment: Qt.AlignVCenter — a Flow
-            // has no per-item alignment, so a short child would hang off the
-            // top of its row instead of centering against the 22px buttons.
-            // Same shape as ribbonDeleteDivider below.
-            Item {
-                id: ribbonDivider
-                objectName: "ribbonDivider"
-                width: 1
-                height: 22
-
-                Rectangle {
-                    anchors.centerIn: parent
-                    width: 1
-                    height: 18
-                    color: Theme.border
-                }
-            }
-
-            AppIconButton {
-                id: transcribeAllButton
-                objectName: "transcribeAllButton"
-                iconName: "transcribe"
-                tooltip: qsTr("Transcribe selected untranscribed audio")
-                // Item 3 (reworked): the ribbon always narrows to the
-                // current selection now (see refreshSelectionEligibility()) —
-                // an empty selection means nothing to transcribe, so dim
-                // like the other bulk buttons rather than silently no-op.
-                enabled: sidebar.transcriptionController && sidebar.selectionTranscribePaths.length > 0
-                onTapped: {
-                    const paths = sidebar.selectionTranscribePaths
-                    // Model paths are raw local paths, not file:// URLs
-                    // (see VaultTreeModel's PathRole) — Q_INVOKABLE
-                    // QUrl params need the scheme or QUrl::toLocalFile()
-                    // silently returns empty.
-                    const urls = paths.map((p) => "file://" + p)
-                    sidebar.transcriptionController.transcribeAll(urls, sidebar.vaultPath, AppSettings.defaultModel,
-                                                                    AppSettings.autoLabelEnabled,
-                                                                    AppSettings.restrictTagsToExisting,
-                                                                    AppSettings.tagReuseBias, AppSettings.wordiness)
-                }
-            }
-
-            // Wave D item 7: bulk "regenerate auto-title" mirroring
-            // transcribeAllButton above, over already-transcribed files
-            // instead of untranscribed ones.
-            AppIconButton {
-                id: relabelAllButton
-                iconName: "relabel"
-                tooltip: qsTr("Regenerate titles for selected files")
-                // Item 3 (reworked): same selection-narrowing as
-                // transcribeAllButton above.
-                enabled: sidebar.transcriptionController && sidebar.selectionRelabelPaths.length > 0
-                onTapped: {
-                    const paths = sidebar.selectionRelabelPaths
-                    const urls = paths.map((p) => "file://" + p)
-                    sidebar.transcriptionController.relabelAll(urls, sidebar.vaultPath,
-                                                                 AppSettings.restrictTagsToExisting,
-                                                                 AppSettings.tagReuseBias, AppSettings.wordiness)
-                }
-            }
-
-            // Bulk "regenerate chapters", same shape as relabelAllButton
-            // above but over chaptersPaths (a superset of transcribedPaths —
-            // see treeDelegate.chaptersEligible for why orphaned .md rows
-            // qualify too) and calls the chapters-only bulk entry point,
-            // generateChaptersAll().
-            AppIconButton {
-                id: chaptersAllButton
-                iconName: "chapters"
-                tooltip: qsTr("Regenerate chapters for selected files")
-                // Item 3 (reworked): same selection-narrowing as
-                // transcribeAllButton above.
-                enabled: sidebar.transcriptionController && sidebar.selectionChaptersPaths.length > 0
-                onTapped: {
-                    const paths = sidebar.selectionChaptersPaths
-                    const urls = paths.map((p) => "file://" + p)
-                    sidebar.transcriptionController.generateChaptersAll(urls, sidebar.vaultPath,
-                                                                          AppSettings.chapterDensity)
-                }
-            }
-
-            // Item 52 (CLAUDE.md per-file-action parity): bulk "detect speakers"
-            // — runs standalone diarization over the transcribed audio files
-            // (same transcribedPaths eligibility relabelAllButton uses, since
-            // diarization needs an existing transcript), calling
-            // diarizeFilesForPaths(). Mirrors MainPanel's detectSpeakersButton.
-            AppIconButton {
-                id: detectSpeakersAllButton
-                iconName: "speakers"
-                iconSize: 14
-                tooltip: qsTr("Detect speakers for selected files")
-                // Same selection-narrowing as the other ribbon buttons.
-                enabled: sidebar.transcriptionController && sidebar.selectionRelabelPaths.length > 0
-                onTapped: {
-                    const paths = sidebar.selectionRelabelPaths
-                    const urls = paths.map((p) => "file://" + p)
-                    sidebar.transcriptionController.diarizeFilesForPaths(urls, sidebar.vaultPath,
-                                                                        AppSettings.diarizationSegmentationModel,
-                                                                        AppSettings.diarizationEmbeddingModel,
-                                                                        AppSettings.diarizationSensitivity)
-                }
-            }
-
-            // Items 24/53: bulk "run all jobs" — the full transcribe->label->
-            // chapters pipeline for every untranscribed file (same eligibility
-            // as transcribeAllButton above: an already-transcribed file's
-            // label/chapters are the relabelAll/chaptersAll buttons' job).
-            // runAllJobs() itself skips the transcribe step for anything that
-            // slips through already-transcribed, so it's safe regardless.
-            AppIconButton {
-                id: runAllButton
-                iconName: "run-all"
-                tooltip: qsTr("Run all jobs on selected files (transcribe, label, chapters)")
-                enabled: sidebar.transcriptionController
-                         && sidebar.selectionTranscribePaths.length > 0
-                onTapped: {
-                    const paths = sidebar.selectionTranscribePaths
-                    if (paths.length === 0)
-                        return
-                    const urls = paths.map((p) => "file://" + p)
-                    sidebar.transcriptionController.runAllJobsForPaths(urls, sidebar.vaultPath,
-                                                                        AppSettings.defaultModel,
-                                                                        AppSettings.restrictTagsToExisting,
-                                                                        AppSettings.tagReuseBias,
-                                                                        AppSettings.wordiness,
-                                                                        AppSettings.chapterDensity,
-                                                                        AppSettings.diarizationSegmentationModel,
-                                                                        AppSettings.diarizationEmbeddingModel,
-                                                                        AppSettings.diarizationSensitivity)
-                }
-            }
-
-            // Separates the per-file bulk pipeline (transcribe/label/chapters/
-            // speakers/run-all, all narrowed to the current selection via the
-            // selection*Paths) from combine, which is a different kind of
-            // action: a vault-wide scan over allAudioPaths() that ignores the
-            // selection entirely. Same shape/reasoning as ribbonDivider above.
-            Item {
-                id: ribbonCombineDivider
-                objectName: "ribbonCombineDivider"
-                width: 1
-                height: 22
-
-                Rectangle {
-                    anchors.centerIn: parent
-                    width: 1
-                    height: 18
-                    color: Theme.border
-                }
-            }
-
-            // Split-recording combine, run on demand rather than
-            // automatically: it used to fire on every vault-tree rebuild
-            // (open + every filesystem change, via VaultTreeModel's
-            // modelReset), silently merging files the moment a recorder
-            // dropped in a new part. That surprised users watching a vault
-            // fill up mid-recording, so it's now an explicit action here —
-            // see TranscriptionController::runCombineScan()'s doc comment.
-            AppIconButton {
-                id: combineButton
-                iconName: "combine"
-                tooltip: qsTr("Combine split recordings")
-                enabled: sidebar.transcriptionController && AppSettings.combineRules.length > 0
-                onTapped: {
-                    sidebar.transcriptionController.runCombineScan(
-                                AppSettings.combineRules, sidebar.model.allAudioPaths(),
-                                sidebar.vaultPath, AppSettings.deleteOriginalsAfterCombine)
-                }
-            }
-
-            // File-tree sort mode (Name / Date Modified newest-first /
-            // Date Modified oldest-first) — see AppSettings.sortMode's doc
-            // comment. Combine-candidate clustering (refreshTreeOrdering())
-            // is automatic whenever combine rules exist and composes with
-            // whichever of these is active, so there's no separate toggle
-            // for it here.
-            Item {
-                id: sortModeButton
-                width: 22
-                height: 22
-
-                HoverHandler {
-                    id: sortModeHover
-                    cursorShape: Qt.PointingHandCursor
-                }
-                TapHandler {
-                    onTapped: sortModeMenu.visible ? sortModeMenu.close() : sortModeMenu.open()
-                }
-                HoverBorder {
-                    anchors.fill: parent
-                    active: sortModeHover.hovered
-                }
-                AppIcon {
-                    anchors.centerIn: parent
-                    name: "sort"
-                    color: Theme.textPrimary
-                    iconSize: 15
-                }
-
-                ToolTip.visible: sortModeHover.hovered
-                ToolTip.text: qsTr("Sort files")
-                ToolTip.delay: 500
-
-                // Same custom-Popup shape as TitleBar.qml's "⋯" overflow
-                // menu (moreActionsMenu) — this codebase has no QQC2
-                // Menu/MenuItem usage anywhere, just a Popup anchored off its
-                // trigger button with plain Item rows inside.
-                Popup {
-                    id: sortModeMenu
-                    x: 0
-                    y: sortModeButton.height + 4
-                    width: 220
-                    padding: 4
-                    modal: true
-                    dim: true
-                    focus: false
-                    closePolicy: Popup.CloseOnPressOutside | Popup.CloseOnEscape
-
-                    background: Rectangle {
-                        color: Theme.surfaceDialog
-                        radius: AppSettings.borderRadius
-                        border.width: 1
-                        border.color: Theme.border
-                    }
-
-                    Column {
-                        width: sortModeMenu.width - sortModeMenu.padding * 2
-                        spacing: 2
-
-                        Repeater {
-                            model: [
-                                { value: "name", label: qsTr("Name") },
-                                { value: "dateDesc", label: qsTr("Date modified (newest first)") },
-                                { value: "dateAsc", label: qsTr("Date modified (oldest first)") }
-                            ]
-                            delegate: Item {
-                                id: sortOptionRow
-                                required property var modelData
-                                width: parent.width
-                                height: 28
-
-                                HoverHandler {
-                                    id: sortOptionHover
-                                    cursorShape: Qt.PointingHandCursor
-                                }
-                                TapHandler {
-                                    onTapped: {
-                                        AppSettings.sortMode = sortOptionRow.modelData.value
-                                        sortModeMenu.close()
-                                    }
-                                }
-                                Rectangle {
-                                    anchors.fill: parent
-                                    radius: AppSettings.borderRadius
-                                    color: sortOptionHover.hovered ? Theme.surfaceHover : "transparent"
-                                }
-                                Text {
-                                    anchors.left: parent.left
-                                    anchors.leftMargin: 8
-                                    anchors.verticalCenter: parent.verticalCenter
-                                    text: (AppSettings.sortMode === sortOptionRow.modelData.value ? "✓ " : "")
-                                          + sortOptionRow.modelData.label
-                                    color: "white"
-                                    font.pixelSize: 12
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-
-            AppIconButton {
-                id: searchToggleButton
-                iconName: "search"
-                onTapped: {
-                    sidebar.searchExpanded = true
-                    searchField.forceActiveFocus()
-                }
-            }
-
-            // Separates the constructive actions from the destructive trio
-            // below — same shape/reasoning as ribbonDivider above.
-            Item {
-                id: ribbonDeleteDivider
-                objectName: "ribbonDeleteDivider"
-                width: 1
-                height: 22
-
-                Rectangle {
-                    anchors.centerIn: parent
-                    width: 1
-                    height: 18
-                    color: Theme.border
-                }
-            }
-
-            // The destructive trio — CLAUDE.md per-file-action parity with
-            // MainPanel's deleteTranscriptButton/deleteAudioOnlyButton/
-            // deleteFileButton, which had no bulk counterpart here.
-            //
-            // A bulk ribbon delete was deliberately left out once before, as
-            // "too dangerous" (see tst_styleguide's
-            // delete_transcriptAndFile_wiredInSidebarAndMainPanel). That call
-            // was made while every delete was a confirm-then-maybe-permanent
-            // one. It isn't anymore: these are the same trash-first calls the
-            // context menu uses, so the recoverable case (all but a filesystem
-            // refusal) costs an Undo click from the snackbar rather than the
-            // file — and the Delete key needs a visible affordance to advertise
-            // anyway. Destructive-red icons (#e07a7a), matching MainPanel's.
-            //
-            // Eligibility mirrors MainPanel's gating exactly: the transcript/
-            // audio-only pair need a transcribed AUDIO row (transcribedPaths —
-            // the same map relabelAll/detectSpeakersAll use), since "keep the
-            // other half" is meaningless without both halves. "Delete file"
-            // takes any selected note.
-            AppIconButton {
-                id: deleteTranscriptAllButton
-                objectName: "deleteTranscriptAllButton"
-                iconName: "delete-transcript"
-                iconSize: 14
-                iconColor: deleteTranscriptAllButton.enabled ? Theme.danger : Theme.textDisabled
-                tooltip: qsTr("Delete transcripts for selected files (keep audio)")
-                enabled: sidebar.model && sidebar.selectionRelabelPaths.length > 0
-                onTapped: sidebar.beginDeleteTranscript(
-                              sidebar.selectionRelabelPaths)
-            }
-
-            AppIconButton {
-                id: deleteAudioOnlyAllButton
-                objectName: "deleteAudioOnlyAllButton"
-                iconName: "delete-audio"
-                iconSize: 14
-                iconColor: deleteAudioOnlyAllButton.enabled ? Theme.danger : Theme.textDisabled
-                tooltip: qsTr("Delete audio for selected files (keep transcripts)")
-                enabled: sidebar.model && sidebar.selectionRelabelPaths.length > 0
-                onTapped: sidebar.beginDeleteAudioOnly(
-                              sidebar.selectionRelabelPaths)
-            }
-
-            // The Delete key's visible affordance — see the Delete Shortcut
-            // above, which runs this same beginDeleteFile(selection).
-            AppIconButton {
-                id: deleteFileAllButton
-                objectName: "deleteFileAllButton"
-                iconName: "delete-file"
-                iconSize: 14
-                iconColor: deleteFileAllButton.enabled ? Theme.danger : Theme.textDisabled
-                tooltip: qsTr("Delete selected files (Delete)")
-                enabled: sidebar.model && sidebar.selectedPaths.length > 0
-                onTapped: sidebar.beginDeleteFile(sidebar.selectedPaths.slice())
-            }
-
-            // Item 3: "N selected" indicator, only shown once a genuine
-            // multi-selection exists (2+ rows) — a single selected row is
-            // already communicated by the existing O7 "currently open"
-            // outline in the tree below, so showing "1 selected" here too
-            // would be redundant. Same typography as BottomBar.qml's
-            // tasksLabel (the closest existing "small status readout next
-            // to a toolbar" precedent in this codebase).
-            //
-            // Flows along with the buttons rather than being pushed to the far
-            // right by a Layout.fillWidth spacer, as it was under the old
-            // RowLayout: a Flow gives its items no alignment and a
-            // fillWidth spacer nothing to fill, so a spacer would just wrap the
-            // label onto a line of its own. The explicit height centers it
-            // against the 22px buttons.
-            Label {
-                id: multiSelectCountLabel
-                visible: sidebar.selectedPaths.length > 1
-                text: qsTr("%1 selected").arg(sidebar.selectedPaths.length)
-                color: Theme.textMuted
-                font.pixelSize: 11
-                height: 22
-                verticalAlignment: Text.AlignVCenter
-            }
-
-            // Explicit deselect: clears the multi-selection back to just the
-            // open file (deselectExceptCurrent), the same thing Escape and a
-            // click on empty sidebar space do. Shown only alongside the "N
-            // selected" indicator (2+ rows) — with nothing multi-selected
-            // there's nothing to clear. Standard icon-button convention
-            // (AppIconButton).
-            AppIconButton {
-                id: deselectButton
-                objectName: "deselectButton"
-                iconName: "close"
-                tooltip: qsTr("Clear selection (Esc)")
-                visible: sidebar.selectedPaths.length > 1
-                onTapped: sidebar.deselectExceptCurrent()
-            }
-
         }
 
         Column {
@@ -3484,173 +3095,14 @@ Rectangle {
             }
         }
 
-        delegate: Item {
-            id: resultDelegate
-            required property var modelData
-            // Same unified right-side gap as tree.columnWidthProvider above
-            // (see that property's doc comment) — but this is a plain
-            // ListView delegate, not a TableView column, so this ordinary
-            // width binding stays live-reactive on its own; no
-            // columnWidthProvider/forceLayout() equivalent needed here.
-            width: searchResultsView.width - AppSettings.sidebarRightMargin
-
-            readonly property string resultPath: resultDelegate.modelData.path
-            readonly property string resultName: resultDelegate.modelData.name
-            readonly property string resultLabel: resultDelegate.modelData.label
-            readonly property int resultStatus: resultDelegate.modelData.status
-            readonly property bool resultIsAudio: resultDelegate.modelData.isAudio
-            readonly property bool resultIsOrphanedMd: resultDelegate.modelData.isOrphanedMd
-            readonly property string resultTranscriptBody: resultDelegate.modelData.transcriptBody
-
-            // Same snippet-building idiom as treeDelegate above (item 9),
-            // just fed from this result's own transcriptBody instead of a
-            // tree row's TranscriptBodyRole — reuses the exact same
-            // TextFormat.cleanTranscript()/transcriptSnippet() helpers so the
-            // two never drift.
-            readonly property string cleanedBody: (sidebar.searchIncludeTranscriptions
-                                                     && resultDelegate.resultTranscriptBody)
-                ? TextFormat.cleanTranscript(resultDelegate.resultTranscriptBody) : ""
-            readonly property string snippetText: (sidebar.searchQuery !== "" && resultDelegate.cleanedBody !== "")
-                ? TextFormat.transcriptSnippet(resultDelegate.cleanedBody, sidebar.searchQuery, 40,
-                                               AppSettings.highlightColor) : ""
-            readonly property bool showSnippet: resultDelegate.snippetText !== ""
-
-            readonly property string displayName: {
-                if (AppSettings.useLabelsSidebar && resultDelegate.resultLabel)
-                    return resultDelegate.resultLabel
-                if (!AppSettings.hideExtensionsSidebar)
-                    return resultDelegate.resultName
-                return TextFormat.stripExtension(resultDelegate.resultName)
-            }
-
-            implicitHeight: resultDelegate.showSnippet ? (28 + resultSnippetText.implicitHeight + 4) : 28
-
-            HoverHandler {
-                id: resultHover
-                cursorShape: Qt.PointingHandCursor
-            }
-            TapHandler {
-                id: resultRowTap
-                onTapped: {
-                    // Mirrors treeDelegate's TapHandler exactly (minus the
-                    // isDir/toggleExpanded branch — results are always
-                    // leaves, never directories), including the
-                    // forceActiveFocus() so Up/Down works here too, and
-                    // (item 3) routing through the same handleNoteClick for
-                    // Shift/Ctrl multi-select.
-                    searchResultsView.forceActiveFocus()
-                    if (resultDelegate.resultIsAudio || resultDelegate.resultIsOrphanedMd)
-                        sidebar.handleNoteClick(resultDelegate.resultPath, resultDelegate.resultIsOrphanedMd,
-                                                 resultRowTap.point.modifiers)
-                }
-            }
-            // Note: no anchors.rightMargin — resultDelegate.width above
-            // already subtracts the full AppSettings.sidebarRightMargin.
-            HoverBorder {
-                anchors.fill: parent
-                anchors.topMargin: 1
-                anchors.bottomMargin: 1
-                anchors.leftMargin: AppSettings.sidebarEdgeLeftMargin
-                active: resultHover.hovered
-            }
-
-            // O7: same persistent "currently open" highlight as treeDelegate.
-            Rectangle {
-                anchors.fill: parent
-                anchors.topMargin: 1
-                anchors.bottomMargin: 1
-                anchors.leftMargin: AppSettings.sidebarEdgeLeftMargin
-                visible: resultDelegate.resultPath === sidebar.currentPath
-                color: AppSettings.sidebarSelectionColor
-                radius: AppSettings.borderRadius
-                border.width: 1
-                border.color: AppSettings.sidebarSelectionBorderColor
-            }
-
-            // Item 3: same multi-select highlight as treeDelegate's above.
-            Rectangle {
-                anchors.fill: parent
-                anchors.topMargin: 1
-                anchors.bottomMargin: 1
-                anchors.leftMargin: AppSettings.sidebarEdgeLeftMargin
-                visible: sidebar.selectedPaths.length > 1
-                         && sidebar.selectedPaths.indexOf(resultDelegate.resultPath) >= 0
-                color: "transparent"
-                radius: AppSettings.borderRadius
-                border.width: 1
-                border.color: AppSettings.highlightColor
-            }
-
-            Column {
-                id: resultColumn
-                // Same shape as treeDelegate.treeColumn's x above.
-                x: AppSettings.sidebarEdgeLeftMargin + AppSettings.sidebarContentLeftMargin
-                // Bug fix: conditionally toggling BETWEEN anchors.top and
-                // anchors.verticalCenter via ternary+undefined is fragile —
-                // Qt Quick's anchoring engine doesn't reliably clear/re-apply
-                // anchor lines when both are driven by the same changing
-                // condition (observed live: refining a search from a
-                // body-match to a title-only match, which flips showSnippet
-                // true->false, left this Column visually stuck at its old
-                // top-anchored position instead of re-centering, overlapping
-                // the row's top border). A plain "y" binding sidesteps the
-                // anchor system entirely — this is an ordinary property
-                // re-evaluation, not an anchor reconfiguration, so there's no
-                // conflicting-anchor-lines class of bug possible.
-                y: resultDelegate.showSnippet ? 4 : (resultDelegate.height - resultColumn.implicitHeight) / 2
-                spacing: 2
-
-                Row {
-                    spacing: 6
-
-                    Rectangle {
-                        anchors.verticalCenter: parent.verticalCenter
-                        width: 8
-                        height: 8
-                        radius: 4
-                        // Same color logic as treeDelegate's status dot
-                        // (TranscribedStatus green, orphaned-.md blue,
-                        // otherwise untranscribed yellow).
-                        color: resultDelegate.resultStatus === 2 ? Theme.success
-                               : (resultDelegate.resultIsOrphanedMd ? "#3498db" : "#f1c40f")
-                    }
-
-                    Text {
-                        anchors.verticalCenter: parent.verticalCenter
-                        textFormat: Text.StyledText
-                        text: TextFormat.highlightMatch(resultDelegate.displayName, sidebar.searchQuery,
-                                                        AppSettings.highlightColor)
-                        color: "white"
-                    }
-                }
-
-                Text {
-                    id: resultSnippetText
-                    visible: resultDelegate.showSnippet
-                    x: 14
-                    width: Math.max(10, resultDelegate.width - x - 16)
-                    textFormat: Text.StyledText
-                    text: resultDelegate.snippetText
-                    color: "#999999"
-                    font.pixelSize: 11
-                    wrapMode: Text.WordWrap
-
-                    HoverHandler {
-                        id: resultSnippetHover
-                        cursorShape: Qt.PointingHandCursor
-                    }
-                    TapHandler {
-                        onTapped: sidebar.transcriptMatchActivated(resultDelegate.resultPath,
-                                                                    resultDelegate.resultIsOrphanedMd,
-                                                                    sidebar.searchQuery)
-                    }
-                    HoverBorder {
-                        anchors.fill: parent
-                        anchors.margins: -2
-                        active: resultSnippetHover.hovered
-                    }
-                }
-            }
+        delegate: SearchResultDelegate {
+            // Pure relocation to SearchResultDelegate.qml — sidebarRoot and the
+            // ListView are threaded in so the body's sidebarRoot.* / listView.*
+            // references resolve unchanged (model roles auto-injected). LHS
+            // names differ from the outer ids to dodge the self-bind trap; see
+            // TreeRowDelegate above.
+            sidebarRoot: sidebar
+            listView: searchResultsView
         }
     }
 

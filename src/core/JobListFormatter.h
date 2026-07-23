@@ -5,7 +5,7 @@
 #include <QVariantList>
 
 // The job-list PRESENTATION collaborator split out of TranscriptionController
-// (2026-07-20). It owns exactly two things:
+//. It owns exactly two things:
 //
 //   1. the ONE authoritative phase vocabulary — the slug -> (bottom-bar label,
 //      main-panel overlay title) registry behind phaseLabel()/

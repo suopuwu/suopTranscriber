@@ -90,7 +90,7 @@ QString trashInfoPathFor(const QString &trashedFilePath)
 }
 
 // The transcript set for `path`: its .md sidecar and .partial.jsonl resume
-// state. Same full-filename convention as sidecarMdPath()/moveFile() (item P7).
+// state. Same full-filename convention as sidecarMdPath()/moveFile().
 // Returns false if path isn't a thing that HAS a transcript.
 bool transcriptPathsFor(const QFileInfo &info, QString *mdOut, QString *partialOut)
 {

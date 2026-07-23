@@ -13,6 +13,28 @@ Rectangle {
     property AudioPlayer player
     property AudioRecorder audioRecorder
     property TranscriptionController transcriptionController
+
+    // availableModels()/availableSegmentationModels()/availableEmbeddingModels()
+    // are untracked Q_INVOKABLEs (the trap BenchmarkPage.qml documents): a
+    // declarative model: binding evaluates once and never again, so a download
+    // triggered by transcribing an undownloaded model would never flip the
+    // picker's status dot green. Fetch imperatively, re-fetch on modelsChanged()
+    // — the same fix ModelsPage/BenchmarkPage already use.
+    property var transcriptionModelList: []
+    property var segmentationModelList: []
+    property var embeddingModelList: []
+    function refreshModelLists() {
+        const c = mainPanel.transcriptionController
+        mainPanel.transcriptionModelList = c ? c.availableModels() : []
+        mainPanel.segmentationModelList = c ? c.availableSegmentationModels() : []
+        mainPanel.embeddingModelList = c ? c.availableEmbeddingModels() : []
+    }
+    Component.onCompleted: mainPanel.refreshModelLists()
+    Connections {
+        target: mainPanel.transcriptionController
+        enabled: mainPanel.transcriptionController !== null
+        function onModelsChanged() { mainPanel.refreshModelLists() }
+    }
     property VaultTreeModel vaultTreeModel
     property UsbGrabberController usbGrabberController
     // Set true/false only via setTopLevelScreen() below — gates the recorder
@@ -197,6 +219,27 @@ Rectangle {
         return urls
     }
 
+    // Per-KIND twin of busyOrQueuedUrls: "<fileUrl> <kind>" for every
+    // Queued/Active/Paused task, so a derived-pass button can gate on ITS OWN
+    // kind (a transcribe in flight leaves label/chapters/diarize enabled). Reads
+    // c.jobs (NOTIFY queueChanged) for the data, and also touches c.busy /
+    // c.currentFile so the binding re-evaluates on the Queued->Active flip that
+    // queueChanged alone can miss — the same reactivity fix busyOrQueuedUrls uses.
+    readonly property var busyOrQueuedKeys: {
+        const c = mainPanel.transcriptionController
+        if (!c)
+            return []
+        void c.busy; void c.currentFile
+        return c.jobs
+            .filter(j => j.status === "Queued" || j.status === "Active" || j.status === "Paused")
+            .map(j => j.fileUrl.toString() + " " + j.kind)
+    }
+    // "A transcribe for the open audio file is Queued/Active/Paused" — the gate
+    // that makes the derived-pass buttons appear DURING transcription, before a
+    // transcript exists. See busyOrQueuedKeys.
+    readonly property bool transcribeInFlight: mainPanel.hasAudio
+        && mainPanel.busyOrQueuedKeys.indexOf(mainPanel.player.source.toString() + " " + "transcribe") !== -1
+
     signal openVaultRequested()
     // Item 16 (Wave E): a tag pill was clicked — Main.qml routes this to
     // sidebar.applyTagFilter(tag).
@@ -371,10 +414,10 @@ Rectangle {
             ? transcriptionController.readPrelude(mainPanel.currentMdUrl) : ""
         mainPanel.chapters = (mainPanel.currentMdUrl !== "" && transcriptionController)
             ? transcriptionController.readChapters(mainPanel.currentMdUrl) : []
-        // preludeArea is always-editable (see its doc comment) — same
-        // one-shot-binding caveat as titleField, resynced here.
-        if (!preludeArea.activeFocus)
-            preludeArea.text = mainPanel.prelude
+        // The prelude field is always-editable — same one-shot-binding caveat
+        // as titleField, resynced here when it isn't focused.
+        if (!preludeEditor.fieldFocused)
+            preludeEditor.fieldText = mainPanel.prelude
     }
 
     // Item 17: insert a MANUAL chapter marker at the current playback
@@ -1155,7 +1198,7 @@ Rectangle {
     // lands on a non-interactive region.
     function deselectTextSelections() {
         transcriptArea.deselect()
-        preludeArea.deselect()
+        preludeEditor.deselect()
         // Clicking empty background also blurs the identity fields, committing
         // any pending rename/label edit through their onActiveFocusChanged
         // (a TapHandler on a sibling does NOT move focus off a TextField on its
@@ -1306,7 +1349,7 @@ Rectangle {
     // here for consistency.
     function commitPrelude(newValue) {
         if (!mainPanel.transcriptionController || mainPanel.currentMdUrl === "") {
-            preludeArea.text = mainPanel.prelude
+            preludeEditor.fieldText = mainPanel.prelude
             return
         }
         if (newValue === mainPanel.prelude)
@@ -1484,8 +1527,8 @@ Rectangle {
         // load.
         mainPanel.prelude = ""
         mainPanel.chapters = []
-        if (!preludeArea.activeFocus)
-            preludeArea.text = ""
+        if (!preludeEditor.fieldFocused)
+            preludeEditor.fieldText = ""
         if (!mainPanel.transcriptionController)
             return
         const key = mainPanel.transcriptLoadKey()
@@ -1520,7 +1563,14 @@ Rectangle {
     Connections {
         target: mainPanel.transcriptionController
         function onTranscriptLoaded(fileUrl, body, loadedSentences) {
-            if (fileUrl.toString() !== mainPanel.transcriptLoadingFor)
+            // isSameFile compares decoded local paths, not toString(): the
+            // orphaned-md load key is a raw "file://"+path string (literal ' '),
+            // but the emitted fileUrl round-trips through QUrl and stringifies a
+            // space as "%20" — a toString() compare read them as different files
+            // and discarded EVERY load for any file whose path has a space, so it
+            // rendered permanently blank. Same seam as the live-reload guard
+            // below; see isSameFile()'s doc comment.
+            if (!mainPanel.transcriptionController.isSameFile(fileUrl, mainPanel.transcriptLoadingFor))
                 return // superseded by a later file switch — discard
             mainPanel.transcriptBody = body
             mainPanel.sentences = loadedSentences
@@ -2330,8 +2380,14 @@ Rectangle {
             // growth drives the transcriptScrollView follow above, which is
             // still armed (followingTail stays set until the next file open), so
             // the final segments scroll into view through the one code path.
+            // isSameFile compares decoded local paths, not toString(): a
+            // detect-speakers run on a file whose name has spaces emits a
+            // fileUrl that can stringify differently from player.source (literal
+            // ' ' vs "%20"), which a toString() compare would read as "a
+            // different file" and silently skip this reload — so the just-added
+            // speaker tags never appear live. See isSameFile()'s doc comment.
             if (ok && mainPanel.player
-                    && fileUrl.toString() === mainPanel.player.source.toString())
+                    && mainPanel.transcriptionController.isSameFile(fileUrl, mainPanel.player.source))
                 mainPanel.refreshTranscriptSync()
         }
         // Item 10: frontmatter is written at job START (durability, see
@@ -2520,7 +2576,7 @@ Rectangle {
         enabled: mainPanel.activeFocus && mainPanel.currentMdUrl !== ""
         onActivated: {
             mainPanel.searchExpanded = true
-            searchField.forceActiveFocus()
+            searchReplaceBar.forceSearchFocus()
         }
     }
 
@@ -2553,7 +2609,7 @@ Rectangle {
         onActivated: {
             mainPanel.searchExpanded = true
             mainPanel.replaceEnabled = true
-            searchField.forceActiveFocus()
+            searchReplaceBar.forceSearchFocus()
         }
     }
 
@@ -2884,9 +2940,9 @@ Rectangle {
             // regeneration).
             AppIconButton {
                 id: regenerateLabelButton
-                visible: mainPanel.transcriptionController && mainPanel.hasTranscript
+                visible: mainPanel.transcriptionController && (mainPanel.hasTranscript || mainPanel.transcribeInFlight)
                 readonly property url targetUrl: mainPanel.currentMdUrl
-                enabled: visible && mainPanel.busyOrQueuedUrls.indexOf(regenerateLabelButton.targetUrl.toString()) === -1
+                enabled: visible && mainPanel.busyOrQueuedKeys.indexOf(regenerateLabelButton.targetUrl.toString() + " " + "relabel") === -1
 
                 iconName: "relabel"
                 iconSize: 14
@@ -2911,9 +2967,9 @@ Rectangle {
             // itself only renders once chapters.length > 0).
             AppIconButton {
                 id: generateChaptersButton
-                visible: mainPanel.transcriptionController && mainPanel.hasTranscript
+                visible: mainPanel.transcriptionController && (mainPanel.hasTranscript || mainPanel.transcribeInFlight)
                 readonly property url targetUrl: mainPanel.currentMdUrl
-                enabled: visible && mainPanel.busyOrQueuedUrls.indexOf(generateChaptersButton.targetUrl.toString()) === -1
+                enabled: visible && mainPanel.busyOrQueuedKeys.indexOf(generateChaptersButton.targetUrl.toString() + " " + "chapters") === -1
 
                 iconName: "chapters"
                 tooltip: qsTr("Generate chapters")
@@ -2937,9 +2993,9 @@ Rectangle {
             // sidebar_detectSpeakersActionParityAcrossAllSites.
             AppIconButton {
                 id: detectSpeakersButton
-                visible: mainPanel.transcriptionController && mainPanel.hasAudio && mainPanel.hasMetadata
+                visible: mainPanel.transcriptionController && mainPanel.hasAudio && (mainPanel.hasMetadata || mainPanel.transcribeInFlight)
                 readonly property url targetUrl: mainPanel.player.source
-                enabled: visible && mainPanel.busyOrQueuedUrls.indexOf(detectSpeakersButton.targetUrl.toString()) === -1
+                enabled: visible && mainPanel.busyOrQueuedKeys.indexOf(detectSpeakersButton.targetUrl.toString() + " " + "diarize") === -1
 
                 iconName: "speakers"
                 iconSize: 14
@@ -3028,157 +3084,14 @@ Rectangle {
             // Item 7: this field is ALSO the find pattern for replace — the
             // .*/Aa toggles and the Replace checkbox sit right after it, and
             // the replace row unfolds below the whole title row.
-            AppIconButton {
-                id: searchToggleButton
-                visible: !mainPanel.searchExpanded
-
-                iconName: "search"
-
-                onTapped: {
-                    mainPanel.searchExpanded = true
-                    searchField.forceActiveFocus()
-                }
-            }
-
-            TextField {
-                id: searchField
-                visible: mainPanel.searchExpanded
-                // Item 048: was a bare fixed Layout.preferredWidth: 200 —
-                // on a narrow panel that, plus the rest of the fixed-width
-                // search/replace cluster, couldn't fit beside titleContainer
-                // and forced the title to overflow/clip. Shrinkable instead,
-                // so it gives width back under pressure.
-                Layout.fillWidth: true
-                Layout.minimumWidth: 90
-                Layout.maximumWidth: 200
-                // Item 7: the placeholder tracks the mode, since the same
-                // field means a literal string or a regex depending on ".*".
-                placeholderText: mainPanel.findRegexEnabled
-                                 ? qsTr("Pattern in transcript, title, tags…")
-                                 : qsTr("Search transcript, title, tags…")
-                text: mainPanel.searchQuery
-                onTextChanged: mainPanel.searchQuery = text
-                onAccepted: mainPanel.jumpToNextMatch()
-                // Item 7: an invalid regex reddens the text it's invalid in
-                // (the banner below spells out why).
-                color: mainPanel.findReplaceError !== "" ? Theme.danger : Theme.textPrimary
-
-                background: UnderlineField { focused: searchField.activeFocus }
-
-                HoverHandler {
-                    cursorShape: Qt.IBeamCursor
-                }
-            }
-
-            // Item 7: regex mode toggle (.*) — active state uses the app
-            // accent so it reads as a mode, not a one-shot button. Governs
-            // the live search as well as replace (see findRegexEnabled).
-            Item {
-                id: regexToggle
-                visible: mainPanel.searchExpanded
-                Layout.preferredWidth: 26
-                Layout.preferredHeight: 22
-                ToolTip.visible: regexToggleHover.hovered
-                ToolTip.text: qsTr("Regular expression")
-                ToolTip.delay: 500
-                HoverHandler { id: regexToggleHover; cursorShape: Qt.PointingHandCursor }
-                TapHandler { onTapped: mainPanel.findRegexEnabled = !mainPanel.findRegexEnabled }
-                HoverBorder { anchors.fill: parent; active: regexToggleHover.hovered }
-                Text {
-                    anchors.centerIn: parent
-                    text: ".*"
-                    color: mainPanel.findRegexEnabled ? AppSettings.accentColor : Theme.textSecondary
-                    font.pixelSize: 13
-                    font.bold: mainPanel.findRegexEnabled
-                }
-            }
-
-            // Item 7: case-sensitivity toggle (Aa) — on means case-INsensitive.
-            Item {
-                id: caseToggle
-                visible: mainPanel.searchExpanded
-                Layout.preferredWidth: 26
-                Layout.preferredHeight: 22
-                ToolTip.visible: caseToggleHover.hovered
-                ToolTip.text: qsTr("Ignore case")
-                ToolTip.delay: 500
-                HoverHandler { id: caseToggleHover; cursorShape: Qt.PointingHandCursor }
-                TapHandler { onTapped: mainPanel.findCaseInsensitive = !mainPanel.findCaseInsensitive }
-                HoverBorder { anchors.fill: parent; active: caseToggleHover.hovered }
-                Text {
-                    anchors.centerIn: parent
-                    text: "Aa"
-                    color: mainPanel.findCaseInsensitive ? AppSettings.accentColor : Theme.textSecondary
-                    font.pixelSize: 12
-                    font.bold: mainPanel.findCaseInsensitive
-                }
-            }
-
-            // Item 13: "a/b" match position, updating as Enter cycles
-            // through matches (and wraps back to 1 after the last one).
-            Label {
-                visible: mainPanel.searchExpanded && mainPanel.searchQuery !== ""
-                text: mainPanel.searchMatchCount > 0
-                      ? qsTr("%1/%2").arg(mainPanel.searchMatchOrdinal).arg(mainPanel.searchMatchCount)
-                      : qsTr("0/0")
-                color: Theme.textSecondary
-                font.pixelSize: 11
-            }
-
-            // Item 7: the checkbox that arms replace. Minimal pill toggle
-            // (same idiom as Sidebar.qml's search-scope toggle) rather than a
-            // QQC2 CheckBox — which would
-            // also steal focus from searchField on press, per the
-            // focusable-control-beside-a-TextField hazard this file already
-            // avoids everywhere else.
-            Item {
-                id: replaceToggle
-                visible: mainPanel.searchExpanded
-                Layout.preferredWidth: replaceToggleLabel.implicitWidth + 16
-                Layout.preferredHeight: 22
-
-                HoverHandler { id: replaceToggleHover; cursorShape: Qt.PointingHandCursor }
-                TapHandler { onTapped: mainPanel.replaceEnabled = !mainPanel.replaceEnabled }
-                Rectangle {
-                    anchors.fill: parent
-                    radius: AppSettings.borderRadius
-                    color: mainPanel.replaceEnabled
-                           ? (replaceToggleHover.hovered ? Theme.success : Theme.successDim)
-                           : (replaceToggleHover.hovered ? Theme.surfaceHover : Theme.surface)
-                    border.width: 1
-                    border.color: mainPanel.replaceEnabled ? Theme.success : Theme.borderStrong
-
-                    Behavior on color { ColorAnimation { duration: AppSettings.animationsEnabled ? 100 : 0 } }
-                }
-                Label {
-                    id: replaceToggleLabel
-                    anchors.centerIn: parent
-                    text: qsTr("Replace")
-                    color: mainPanel.replaceEnabled ? "white" : Theme.textMuted
-                    font.pixelSize: 11
-                }
-            }
-
-            AppIconButton {
-                id: searchCloseButton
-                visible: mainPanel.searchExpanded
-                // A 20x20 box, not the component's implicit 22 — this "×" is
-                // deliberately smaller than the action-cluster icons.
-                Layout.preferredWidth: 20
-                Layout.preferredHeight: 20
-
-                iconName: "close"
-
-                onTapped: {
-                    searchField.text = ""
-                    mainPanel.searchQuery = ""
-                    mainPanel.searchExpanded = false
-                    // Item 7: closing disarms replace and drops the
-                    // banner, so the bar can't reopen mid-edit already
-                    // armed with a stale pattern.
-                    mainPanel.replaceEnabled = false
-                    mainPanel.findReplaceError = ""
-                }
+            // Extracted to SearchReplaceBar.qml. Layout.fillWidth is gated on
+            // searchExpanded so the collapsed bar (just the search icon) claims
+            // no row space — expanded, it competes with titleContainer for
+            // width exactly as the individual controls used to.
+            SearchReplaceBar {
+                id: searchReplaceBar
+                panel: mainPanel
+                Layout.fillWidth: mainPanel.searchExpanded
             }
         },
 
@@ -3193,111 +3106,8 @@ Rectangle {
         // routes through commitTranscriptEdits() via replaceNext()/
         // replaceAll(), so it inherits that path's per-sentence line-count
         // safety check.
-        ColumnLayout {
-            Layout.fillWidth: true
-            visible: mainPanel.searchExpanded
-            spacing: 4
-
-            RowLayout {
-                Layout.fillWidth: true
-                visible: mainPanel.replaceEnabled
-                spacing: 8
-
-                Label {
-                    text: qsTr("Replace with")
-                    color: Theme.textSecondary
-                    font.pixelSize: 11
-                }
-
-                TextField {
-                    id: replaceField
-                    Layout.preferredWidth: 180
-                    placeholderText: qsTr("replacement…")
-                    text: mainPanel.replaceText
-                    onTextChanged: mainPanel.replaceText = text
-                    color: Theme.textPrimary
-                    background: UnderlineField { focused: replaceField.activeFocus }
-                    HoverHandler { cursorShape: Qt.IBeamCursor }
-                }
-
-                // Replace / Replace-all: Item+TapHandler buttons (NOT
-                // focusable QQC2 Buttons) so they never steal focus from the
-                // find/replace fields on press — project memory: a focusable
-                // button next to a focused TextField grabs focus on press.
-                Item {
-                    id: replaceNextButton
-                    Layout.preferredHeight: 22
-                    Layout.preferredWidth: replaceNextText.implicitWidth + 16
-                    HoverHandler { id: replaceNextHover; cursorShape: Qt.PointingHandCursor }
-                    TapHandler { onTapped: mainPanel.replaceNext() }
-                    Rectangle {
-                        anchors.fill: parent
-                        radius: AppSettings.borderRadius
-                        color: "transparent"
-                        border.width: 1
-                        border.color: Theme.border
-                    }
-                    HoverBorder { anchors.fill: parent; active: replaceNextHover.hovered }
-                    Text {
-                        id: replaceNextText
-                        anchors.centerIn: parent
-                        text: qsTr("Replace")
-                        color: Theme.textPrimary
-                        font.pixelSize: 11
-                    }
-                }
-
-                Item {
-                    id: replaceAllButton
-                    Layout.preferredHeight: 22
-                    Layout.preferredWidth: replaceAllText.implicitWidth + 16
-                    HoverHandler { id: replaceAllHover; cursorShape: Qt.PointingHandCursor }
-                    TapHandler { onTapped: mainPanel.replaceAll() }
-                    Rectangle {
-                        anchors.fill: parent
-                        radius: AppSettings.borderRadius
-                        color: "transparent"
-                        border.width: 1
-                        border.color: Theme.border
-                    }
-                    HoverBorder { anchors.fill: parent; active: replaceAllHover.hovered }
-                    Text {
-                        id: replaceAllText
-                        anchors.centerIn: parent
-                        text: qsTr("Replace all")
-                        color: Theme.textPrimary
-                        font.pixelSize: 11
-                    }
-                }
-
-                Item { Layout.fillWidth: true }
-
-                // Item 7: disarms replace, folding this row away and leaving
-                // the find bar (and your pattern) intact — the "×" on the
-                // search row above is what closes the whole thing.
-                AppIconButton {
-                    id: replaceCollapseButton
-                    // 20x20 to match searchCloseButton's "×" above, not the
-                    // component's implicit 22.
-                    Layout.preferredWidth: 20
-                    Layout.preferredHeight: 20
-                    iconName: "close"
-                    tooltip: qsTr("Hide replace")
-                    onTapped: mainPanel.replaceEnabled = false
-                }
-            }
-
-            // Invalid-regex inline error (StyleGuide.md warning-banner
-            // convention: backing string, #e07a7a, 11px, wrapping — no
-            // separate visible flag beyond the string being non-empty).
-            Label {
-                Layout.fillWidth: true
-                visible: mainPanel.findReplaceError !== ""
-                text: mainPanel.findReplaceError
-                color: Theme.danger
-                font.pixelSize: 11
-                wrapMode: Text.WordWrap
-            }
+        ReplaceRow {
+            panel: mainPanel
         }
         ] // end header slot
 
@@ -3803,46 +3613,11 @@ Rectangle {
                 // Shown whenever the open file has a transcript to describe,
                 // orphaned .md and audio-backed alike (the prelude lives in the
                 // .md body and reads/writes through currentMdUrl either way).
-                Item {
-                    id: preludeContainer
+                PreludeEditor {
+                    id: preludeEditor
+                    panel: mainPanel
                     Layout.fillWidth: true
                     visible: mainPanel.hasMetadata
-                    implicitHeight: preludeArea.implicitHeight
-
-                    // Always-editable: a single TextArea is present at all
-                    // times (no display-TextEdit/edit-TextArea swap, mirrors
-                    // titleField's pattern above) — clicking directly into
-                    // the text starts editing, no separate pencil-icon
-                    // trigger needed any more. Autosaves via commitPrelude()
-                    // the moment focus leaves the field (see
-                    // onActiveFocusChanged below), no Save/Cancel chrome.
-                    TextArea {
-                        id: preludeArea
-                        anchors.left: parent.left
-                        anchors.right: parent.right
-                        wrapMode: TextArea.Wrap
-                        color: Theme.textPrimary
-                        font.pixelSize: 12
-                        selectByMouse: true
-                        selectByKeyboard: true
-                        text: mainPanel.prelude
-                        placeholderText: qsTr("Click to add a prelude…")
-                        // See titleField's doc comment — zeroed to match
-                        // the old read-only TextEdit's tight sizing.
-                        padding: 0
-                        leftPadding: 0
-                        rightPadding: 0
-                        topPadding: 0
-                        bottomPadding: 0
-                        background: UnderlineField { implicitHeight: 0; plainUntilHovered: true; focused: preludeArea.activeFocus }
-                        Keys.onEscapePressed: preludeArea.text = mainPanel.prelude
-                        onActiveFocusChanged: if (!activeFocus) mainPanel.commitPrelude(text)
-
-                        // Item 13: this LOST its I-beam when b72b365 turned the
-                        // old read-only TextEdit into an editable TextArea —
-                        // QQC2 TextArea has no built-in one, restore it here.
-                        HoverHandler { cursorShape: Qt.IBeamCursor }
-                    }
                 }
 
                 // Feature 3c: collapsible chapter list — same tap-to-seek
@@ -3861,195 +3636,11 @@ Rectangle {
                 // default would be the wrong default — the toggle exists as
                 // an escape hatch for the rare long list, not a resting
                 // state.
-                ColumnLayout {
-                    id: chapterListColumn
+                ChapterTocList {
+                    id: chapterTocList
+                    panel: mainPanel
                     Layout.fillWidth: true
                     visible: mainPanel.chapters.length > 0
-                    spacing: 4
-
-                    RowLayout {
-                        Layout.fillWidth: true
-                        spacing: 6
-
-                        AppIcon {
-                            name: mainPanel.chaptersExpanded ? "collapse" : "expand"
-                            iconSize: 11
-                            color: Theme.textMuted
-
-                            HoverHandler { cursorShape: Qt.PointingHandCursor }
-                            TapHandler { onTapped: mainPanel.chaptersExpanded = !mainPanel.chaptersExpanded }
-                        }
-
-                        Label {
-                            Layout.fillWidth: true
-                            text: qsTr("Chapters (%1)").arg(mainPanel.chapters.length)
-                            color: Theme.textMuted
-                            font.pixelSize: 11
-                            font.bold: true
-
-                            HoverHandler { cursorShape: Qt.PointingHandCursor }
-                            TapHandler { onTapped: mainPanel.chaptersExpanded = !mainPanel.chaptersExpanded }
-                        }
-
-                        // Item 17: add a MANUAL chapter at the current
-                        // playhead. Player-backed only (an orphaned .md has no
-                        // audio to position against). Item+TapHandler rather
-                        // than a focusable QQC2 Button so tapping it can't
-                        // steal focus from a chapter title being renamed
-                        // (project-memory focus-grab warning) — it just adds +
-                        // drops into editing the new one.
-                        Item {
-                            id: addChapterButton
-                            Layout.preferredWidth: 18
-                            Layout.preferredHeight: 18
-                            // Audio-only: "at playhead" is meaningless without a
-                            // player. Orphaned .md chapters are managed via the
-                            // TOC's own add/edit affordances, not the playhead.
-                            visible: mainPanel.hasAudio
-
-                            ToolTip.visible: addChapterHover.hovered
-                            ToolTip.text: qsTr("Add chapter at playhead")
-                            ToolTip.delay: 500
-
-                            HoverHandler {
-                                id: addChapterHover
-                                cursorShape: Qt.PointingHandCursor
-                            }
-                            TapHandler { onTapped: mainPanel.addChapterAtPlayhead() }
-                            HoverBorder {
-                                anchors.fill: parent
-                                active: addChapterHover.hovered
-                            }
-                            AppIcon {
-                                anchors.centerIn: parent
-                                name: "add"
-                                iconSize: 14
-                                color: "#8fdf9f"
-                            }
-                        }
-                    }
-
-                    ColumnLayout {
-                        Layout.fillWidth: true
-                        Layout.leftMargin: 20
-                        spacing: 2
-                        visible: mainPanel.chaptersExpanded
-
-                        Repeater {
-                            model: mainPanel.chapters
-
-                            RowLayout {
-                                id: chapterRow
-                                required property var modelData
-                                Layout.fillWidth: true
-                                spacing: 8
-
-                                // Item P33: pointer cursor + click-to-seek
-                                // scoped to JUST the timestamp now (used to
-                                // span the whole row, covering the title
-                                // too) — the title below gets its own
-                                // independent I-beam/selectable treatment
-                                // instead of inheriting this one.
-                                Label {
-                                    id: chapterTimestampLabel
-                                    text: mainPanel.formatGutterTimestamp(chapterRow.modelData.t0)
-                                    color: "#777777"
-                                    font.pixelSize: 10
-
-                                    HoverHandler { cursorShape: Qt.PointingHandCursor }
-                                    TapHandler { onTapped: mainPanel.player.position = chapterRow.modelData.t0 * 1000 }
-                                }
-
-                                // Item 17: manual chapters (user-created or
-                                // -edited) get a subtle pencil marker,
-                                // distinguishing them from auto-generated ones
-                                // via readChapters()' `manual` bool.
-                                AppIcon {
-                                    visible: !!chapterRow.modelData.manual
-                                    name: "edit"
-                                    iconSize: 10
-                                    color: "#8fdf9f"
-                                }
-
-                                // Always-editable (StyleGuide.md "Always-editable
-                                // text"): one TextField present at all times,
-                                // styled like plain text via UnderlineField until
-                                // hovered/focused — same idiom as the main-panel
-                                // titleField. Selection works from a fresh drag in
-                                // any chapter (no arm-on-tap / editingChapterTs
-                                // gate, no manual positionAt). Commits on blur/
-                                // Return through commitChapterTitle → setChapterTitle.
-                                //
-                                // The transcript chapter HEADING deliberately keeps
-                                // the read-only-until-armed TextEdit idiom: it is an
-                                // overlay on transcriptArea whose title is swept
-                                // into the body selection and spliced into the
-                                // clipboard by copySelectionWithChapters(), which an
-                                // always-editable field would swallow. See
-                                // StyleGuide's carve-out.
-                                TextField {
-                                    id: tocChapterTitle
-                                    objectName: "tocChapterTitle"
-                                    Layout.fillWidth: true
-                                    color: "#cccccc"
-                                    font.pixelSize: 11
-                                    padding: 0
-                                    leftPadding: 0
-                                    rightPadding: 0
-                                    topPadding: 0
-                                    bottomPadding: 0
-                                    text: chapterRow.modelData.title
-
-                                    background: UnderlineField { implicitHeight: 0; plainUntilHovered: true; focused: tocChapterTitle.activeFocus }
-
-                                    onAccepted: mainPanel.commitChapterTitle(chapterRow.modelData.t0,
-                                                                             chapterRow.modelData.title,
-                                                                             tocChapterTitle.text)
-                                    onActiveFocusChanged: if (!tocChapterTitle.activeFocus)
-                                        mainPanel.commitChapterTitle(chapterRow.modelData.t0,
-                                                                     chapterRow.modelData.title,
-                                                                     tocChapterTitle.text)
-
-                                    Keys.onEscapePressed: tocChapterTitle.text = chapterRow.modelData.title
-
-                                    HoverHandler { cursorShape: Qt.IBeamCursor }
-                                }
-
-                                // Item 17: delete this chapter marker.
-                                // Item+TapHandler (not a focusable Button) for
-                                // the same focus-grab reason as addChapterButton.
-                                Item {
-                                    id: deleteChapterButton
-                                    Layout.preferredWidth: 16
-                                    Layout.preferredHeight: 16
-
-                                    ToolTip.visible: deleteChapterHover.hovered
-                                    ToolTip.text: qsTr("Delete chapter")
-                                    ToolTip.delay: 500
-
-                                    HoverHandler {
-                                        id: deleteChapterHover
-                                        cursorShape: Qt.PointingHandCursor
-                                    }
-                                    TapHandler {
-                                        onTapped: mainPanel.deleteChapterAt(chapterRow.modelData.t0,
-                                                                            chapterRow.modelData.title,
-                                                                            !!chapterRow.modelData.manual)
-                                    }
-                                    HoverBorder {
-                                        anchors.fill: parent
-                                        active: deleteChapterHover.hovered
-                                    }
-                                    AppIcon {
-                                        anchors.centerIn: parent
-                                        name: "close"
-                                        iconSize: 13
-                                        color: "#c07a7a"
-                                    }
-                                }
-                            }
-                        }
-                    }
                 }
 
                 // Speaker detection was requested but couldn't actually run (models
@@ -4119,9 +3710,66 @@ Rectangle {
                         id: modelCombo
                         Layout.fillWidth: true
                         Layout.preferredWidth: 1
-                        model: mainPanel.transcriptionController ? mainPanel.transcriptionController.availableModels() : []
+                        model: mainPanel.transcriptionModelList
                         selectedId: AppSettings.defaultModel
                         onPicked: (id) => AppSettings.defaultModel = id
+                    }
+
+                    // VAD status dot. Green when the selected model runs through
+                    // the app's Silero VAD path (silence-gated windows — fewer
+                    // repetition hallucinations); red in two cases: the engine
+                    // self-segments and bypasses VAD, OR the open file's stored
+                    // transcript recorded a VAD failure (`vadError` — the same
+                    // signal the fallback banner above reads), i.e. VAD was
+                    // expected but the ~2 MB model / detection didn't run for
+                    // THAT file. A status dot (Rectangle circle), not an icon —
+                    // StyleGuide "Not every symbol is an icon". Hover-for-info
+                    // only, so no pointing-hand cursor / HoverBorder.
+                    Rectangle {
+                        id: vadIndicator
+                        readonly property bool usesVad: mainPanel.transcriptionController
+                            ? mainPanel.transcriptionController.modelUsesVad(modelCombo.currentValue) : false
+                        // Whisper-only per-window silence GATING (a subset of
+                        // usesVad — parakeet gets windowing but not this), so
+                        // the green tooltip can scope its silence-skipping claim.
+                        readonly property bool usesGating: mainPanel.transcriptionController
+                            ? mainPanel.transcriptionController.modelUsesVadGating(modelCombo.currentValue) : false
+                        // Ground truth from the OPEN file's stored transcript:
+                        // VAD was attempted but failed (guarded exactly like the
+                        // banner above — metadata is a valid map once hasMetadata).
+                        readonly property bool runtimeVadFailed: mainPanel.hasMetadata
+                            && !!mainPanel.metadata.vadError
+                        readonly property bool vadOk: usesVad && !runtimeVadFailed
+                        implicitWidth: 10
+                        implicitHeight: 10
+                        radius: 5
+                        color: vadOk ? Theme.success : Theme.danger
+                        Layout.alignment: Qt.AlignVCenter
+
+                        HoverHandler {
+                            id: vadHover
+                        }
+                        ToolTip {
+                            visible: vadHover.hovered
+                            delay: 400
+                            // Width-capped so the explanation wraps instead of
+                            // stretching into one long line off the window.
+                            width: 320
+                            // Four states: engine bypasses VAD → OFF; VAD
+                            // expected but failed on the open file → FAILED
+                            // (with the recorded reason); ON with whisper's
+                            // per-window silence gating → full; ON via windowing
+                            // only (parakeet) → pause-splitting, gating scoped
+                            // out honestly.
+                            text: !vadIndicator.usesVad
+                                ? qsTr("Voice activity detection is OFF for this engine.\n\nThis engine segments audio itself, so the whole file is sent without VAD silence-gating — repetition hallucinations over silence are more likely.")
+                                : vadIndicator.runtimeVadFailed
+                                    ? qsTr("Voice activity detection FAILED on the open file: %1\n\nSilence detection didn't run for this transcript, so repetition artifacts are more likely. Re-transcribe once the VAD model is available.")
+                                        .arg(mainPanel.metadata.vadError || "")
+                                    : vadIndicator.usesGating
+                                        ? qsTr("Voice activity detection is ON.\n\nSilero VAD finds the spoken regions and skips silent / non-speech audio, so the model is never fed empty stretches. This suppresses repetition hallucinations and splits long files at natural pauses.")
+                                        : qsTr("Voice activity detection is ON (windowing only).\n\nSilero VAD splits this long audio into chunks at natural pauses, which reduces drift. Per-window silence gating — dropping silent frames so the model isn't fed empty stretches — is a whisper-only feature this engine doesn't get.")
+                        }
                     }
 
                     // The two speaker-diarization models (segmentation +
@@ -4140,7 +3788,7 @@ Rectangle {
                         id: segmentationCombo
                         Layout.fillWidth: true
                         Layout.preferredWidth: 1
-                        model: mainPanel.transcriptionController ? mainPanel.transcriptionController.availableSegmentationModels() : []
+                        model: mainPanel.segmentationModelList
                         selectedId: AppSettings.diarizationSegmentationModel
                         onPicked: (id) => AppSettings.diarizationSegmentationModel = id
                     }
@@ -4149,7 +3797,7 @@ Rectangle {
                         id: embeddingCombo
                         Layout.fillWidth: true
                         Layout.preferredWidth: 1
-                        model: mainPanel.transcriptionController ? mainPanel.transcriptionController.availableEmbeddingModels() : []
+                        model: mainPanel.embeddingModelList
                         selectedId: AppSettings.diarizationEmbeddingModel
                         onPicked: (id) => AppSettings.diarizationEmbeddingModel = id
                     }

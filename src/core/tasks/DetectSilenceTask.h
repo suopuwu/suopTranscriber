@@ -1,9 +1,14 @@
 #pragma once
 
+#include <QList>
 #include <QString>
 #include <QUrl>
 
+#include <utility>
+#include <vector>
+
 #include "Task.h"
+#include "../TranscriptFormat.h" // ParsedSegment
 
 // Silence phase 1 (backfill): standalone "detect silences" on an
 // ALREADY-transcribed file — the Tasks-list job for the files auto-capture
@@ -47,6 +52,22 @@ public:
     // a single fixed file (ModelManager::kVadModelFileName), same as
     // LabelModel's ModelPrerequisite.
     ModelPrerequisites prerequisites() const override;
+
+    // Pure VAD-vs-fallback selection, extracted out of run() so it's
+    // unit-testable without a real decode/VAD pass (see tst_task_silence.cpp).
+    // Trusts the VAD result only when it ran clean AND found at least one
+    // speech span — an empty speechSpans with no error is indistinguishable
+    // from "VAD found nothing", and complementSpans() on an empty list always
+    // returns a single whole-file span, which is wrong on a file that HAS
+    // transcript segments (item 010: 3469-segment file wrongly got a single
+    // 0-3:17:14 silence). Falls through to the SAME transcript-gap heuristic
+    // TranscribeTask's inline capture uses otherwise; on a genuinely silent
+    // file segments is empty too, so the fallback still yields the correct
+    // whole-file span — no regression.
+    static std::vector<std::pair<double, double>> selectSilences(const QString &chunkingError,
+                                                                   const std::vector<std::pair<double, double>> &speechSpans,
+                                                                   const QList<ParsedSegment> &segments,
+                                                                   double totalSeconds);
 
     void run(TaskContext &ctx) override;
 };

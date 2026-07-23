@@ -5,6 +5,14 @@
 
 #include "Task.h"
 
+// Single-pass token→progress ramp for RelabelTask's one label() call: an
+// exponential approach so the bar moves smoothly during the generation and
+// never reaches 1.0 on its own (run() snaps to 1.0 on success). Pure and
+// header-declared so it's unit-testable without a real GGUF — same pattern as
+// ChaptersTask's chaptersGenerateProgress(). ~180 output tokens is a typical
+// label+prelude+tags generation; used only as the ramp's time constant.
+double labelGenerateProgress(int tokens);
+
 // "Regenerate auto-title": re-runs JUST the labeling pass on an
 // already-transcribed file — no audio decode, no whisper, no frontmatter
 // reset. Both a manual "Regenerate label and prelude" request and the

@@ -110,6 +110,26 @@ private slots:
         NullContextFixture fixture;
         task.run(fixture.ctx); // must not throw
     }
+
+    // The progress bar is SelfCumulative — the fraction RelabelTask emits IS
+    // the bar, so this ramp is the whole smoothness fix. Pure, no model.
+    // Mirrors tst_task_chapters.cpp's chaptersGenerateProgress_* tests.
+
+    void labelGenerateProgress_rampsMonotonicallyWithTokens()
+    {
+        double previous = -1.0;
+        for (int tokens : {0, 8, 40, 120, 400, 2000}) {
+            const double p = labelGenerateProgress(tokens);
+            QVERIFY2(p > previous, qPrintable(QStringLiteral("not monotone at tokens=%1").arg(tokens)));
+            previous = p;
+        }
+    }
+
+    void labelGenerateProgress_zeroTokensIsZero() { QCOMPARE(labelGenerateProgress(0), 0.0); }
+
+    void labelGenerateProgress_neverReachesOne() { QVERIFY(labelGenerateProgress(1000000) <= 0.97); }
+
+    void labelGenerateProgress_negativeTokensClampToZero() { QCOMPARE(labelGenerateProgress(-5), 0.0); }
 };
 
 QTEST_GUILESS_MAIN(TestTaskRelabel)

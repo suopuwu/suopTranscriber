@@ -29,7 +29,7 @@ struct CombineGroup {
 };
 
 // The split-recording combine DETECTION collaborator split out of
-// TranscriptionController (2026-07-20). It owns exactly one thing: turning
+// TranscriptionController. It owns exactly one thing: turning
 // (combine rules, audio paths) into the set of groups those rules describe,
 // plus the two pattern-authoring helpers the Settings combine page needs to
 // validate a rule against the SAME engine this detection actually uses.
@@ -52,6 +52,14 @@ class CombineScanner
 {
 public:
     CombineScanner() = delete;
+
+    // A group otherwise "ready" whose newest member was modified within this
+    // many seconds of now reads as "pending" instead — the recorder may still
+    // be writing that file, and concatenating a not-yet-closed file risks a
+    // truncated/corrupt merge. Public so the sidebar's passive re-scan timer
+    // (Sidebar.qml refreshTreeOrdering) can wait exactly this long for a
+    // freshly-arrived group to settle, instead of hardcoding a parallel value.
+    static constexpr qint64 kCombineStabilityWindowSecs = 5;
 
     // Matches every path in audioPaths against every enabled rule in `rules`
     // ({name, pattern, enabled, sortGroupIndex} maps) using QRegularExpression

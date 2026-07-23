@@ -52,7 +52,7 @@ QString formatTimestamp(double seconds)
     return QStringLiteral("%1%2").arg(s).arg(msPart);
 }
 
-// Item P7: derived from the audio file's FULL name (fi.fileName(), extension
+// Derived from the audio file's FULL name (fi.fileName(), extension
 // included), not just its stripped stem (fi.completeBaseName()) — two audio
 // files sharing a stem with different extensions (e.g. "meeting.wav" +
 // "meeting.mp3") must get distinct sidecars ("meeting.wav.md" /
@@ -143,7 +143,7 @@ double parseCompactTimestamp(const QString &raw)
     } else {
         result = parts[0].toDouble(&ok);
     }
-    // Item O32: a malformed/non-numeric timestamp used to silently fall back
+    // A malformed/non-numeric timestamp used to silently fall back
     // to 0.0 with no diagnostic — a corrupted .md file's mis-sorted/
     // mis-highlighted segment was otherwise undiagnosable. The 0.0 fallback
     // itself is unchanged (graceful degradation is still correct here), this
@@ -511,7 +511,7 @@ QRegularExpression chapterMarkerPattern()
     return QRegularExpression(QStringLiteral("^## \\[([\\d:.]+)\\] (.*)$"), QRegularExpression::MultilineOption);
 }
 
-// Item 17: a MANUAL chapter marker carries this trailing HTML-comment sentinel
+// A MANUAL chapter marker carries this trailing HTML-comment sentinel
 // ("## [t] Title <!-- manual -->"). An HTML comment round-trips cleanly through
 // the chapterMarkerPattern (it's captured as part of group 2's title text, then
 // stripped for display by chapterDisplayTitle() below) and never renders as
@@ -1045,7 +1045,7 @@ QString spliceBodyChapters(const QString &body, const QList<ResolvedChapter> &ch
 {
     QString result = body;
 
-    // Item 17: strip only AUTO markers; PRESERVE manual ones (they carry the
+    // Strip only AUTO markers; PRESERVE manual ones (they carry the
     // sentinel — chapterTitleCaptureIsManual()). A user's hand-added/edited
     // chapter survives regeneration; only the previous LLM-generated auto set
     // is replaced. Offsets computed below are against this partially-stripped

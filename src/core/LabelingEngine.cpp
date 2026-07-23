@@ -111,7 +111,7 @@ const char *kChapterSystemPromptSuffix =
     "a short (a few words) descriptive title for the chapter that STARTS there. Respond with "
     "ONLY a JSON array of these objects, ordered by afterSegment ascending, nothing else.";
 
-// Item 27: density (0.0-1.0) -> how many chapters to propose. 3-tier
+// Density (0.0-1.0) -> how many chapters to propose. 3-tier
 // qualitative phrasing (same style as labelPreludePhrasing/tagReuseBias) — a
 // small model follows a clear instruction far more reliably than it calibrates
 // against a bare number. Mid tier is the exact "up to ~20" wording this prompt
@@ -166,7 +166,7 @@ const char *kOpeningTitleSystemPrompt =
 // narrower pass afterward — a single bounded yes/no per adjacent pair — to
 // collapse over-eager chapters back down. See
 // LabelingEngine::mergeSimilarChapters()'s doc comment for the scan shape.
-// Item 27: density tunes the merge bias INVERSELY to generateChapters() — a
+// Density tunes the merge bias INVERSELY to generateChapters() — a
 // high density (user wants more chapters) keeps adjacent chapters separate
 // unless near-duplicate; a low density merges aggressively.
 QString chapterMergeSystemPrompt(double density)
@@ -195,7 +195,7 @@ QString chapterMergeSystemPrompt(double density)
 // the wording this prompt always used before wordiness/prelude existed.
 QString labelPreludePhrasing(double wordiness)
 {
-    // Item 58: a very-long transcript should be allowed a fuller prelude than
+    // A very-long transcript should be allowed a fuller prelude than
     // the old top tier's "detailed multi-sentence" — relabelJob() raises the
     // EFFECTIVE wordiness into this >=0.9 tier for multi-hour transcripts (see
     // TranscriptionController::effectiveWordinessForLength()), so a 2-3 hour
@@ -210,7 +210,7 @@ QString labelPreludePhrasing(double wordiness)
     return QStringLiteral("a very short label (1-3 words), a single concise prelude sentence");
 }
 
-// Item 14 "auto-categorize" mode: restrict tags to an existing vault-wide
+// "auto-categorize" mode: restrict tags to an existing vault-wide
 // vocabulary instead of freely inventing new ones. This is a prompt
 // instruction, not a grammar constraint (see LabelingEngine.h) — the
 // vocabulary is open-ended, so it's appended to the base system prompt
@@ -433,11 +433,11 @@ std::optional<QString> LabelingEngine::runGrammarConstrained(const QString &syst
 
 std::optional<LabelResult> LabelingEngine::label(const QString &transcriptText, const QStringList &existingTags,
                                                   bool restrictToExisting, double tagReuseBias, double wordiness,
-                                                  QString *errorOut)
+                                                  QString *errorOut, const std::function<void(int)> &onTokens)
 {
     const QString systemPrompt = buildSystemPrompt(existingTags, restrictToExisting, tagReuseBias, wordiness);
-    const auto response =
-        runGrammarConstrained(systemPrompt, transcriptText.left(kMaxInputChars), kGrammar, kMaxOutputTokens, errorOut);
+    const auto response = runGrammarConstrained(systemPrompt, transcriptText.left(kMaxInputChars), kGrammar,
+                                                 kMaxOutputTokens, errorOut, onTokens);
     if (!response)
         return std::nullopt;
 
@@ -598,7 +598,7 @@ LabelingEngine::LabelingEngine(const QString &) {}
 LabelingEngine::~LabelingEngine() = default;
 
 std::optional<LabelResult> LabelingEngine::label(const QString &, const QStringList &, bool, double, double,
-                                                 QString *errorOut)
+                                                 QString *errorOut, const std::function<void(int)> &)
 {
     if (errorOut)
         *errorOut = QStringLiteral("auto-labeling was disabled at build time (SUOP_ENABLE_LABELING=OFF)");

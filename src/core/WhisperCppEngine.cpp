@@ -96,7 +96,7 @@ WhisperCppEngine::WhisperCppEngine(const QString &modelPath)
     // one call that logs the "using X backend" line this engine parses (see
     // onWhisperLog's doc comment).
     whisper_log_set(onWhisperLog, nullptr);
-    whisper_context_params cparams = whisper_context_default_params();
+    whisper_context_params cparams = contextParams();
     m_ctx = whisper_init_from_file_with_params(modelPath.toUtf8().constData(), cparams);
 }
 
@@ -143,6 +143,13 @@ WhisperCppEngine::~WhisperCppEngine()
 // - suppress_nst true (default false): suppresses non-speech tokens (music
 //   notation, bracketed sound-effect markers) that seed a different,
 //   smaller class of noise-driven hallucination.
+whisper_context_params WhisperCppEngine::contextParams()
+{
+    whisper_context_params cparams = whisper_context_default_params();
+    cparams.flash_attn = true;
+    return cparams;
+}
+
 whisper_full_params WhisperCppEngine::decodeParams()
 {
     whisper_full_params wparams = whisper_full_default_params(WHISPER_SAMPLING_BEAM_SEARCH);

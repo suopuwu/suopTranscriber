@@ -106,6 +106,56 @@ private slots:
         QVERIFY(threw);
     }
 
+    // Item 010 regression: an empty-but-error-free VAD result (chunkingError
+    // empty, speechSpans empty) must NOT be trusted when the transcript has
+    // real segments — trusting it would complement an empty list into a
+    // single whole-file silence span, which is what the observed bug wrote
+    // (0-3:17:14.04 on a 3469-segment file). This calls selectSilences()
+    // directly, so it fails if the `!speechSpans.empty()` guard is reverted
+    // (the un-guarded code would take the VAD branch and return {0,total}
+    // instead of the leading-only gap asserted below).
+    void selectSilences_emptySpeechSpansWithSegments_usesTranscriptGapFallback()
+    {
+        const QList<ParsedSegment> segments = {
+            {423.0, QStringLiteral("first")},
+            {500.0, QStringLiteral("second")},
+            {11800.0, QStringLiteral("last")},
+        };
+        const auto silences = DetectSilenceTask::selectSilences(QString(), {}, segments, 12000.0);
+
+        // Touching fallback spans leave only the leading gap before the
+        // first segment — never the whole-file span the bug produced.
+        QCOMPARE(silences.size(), std::size_t(1));
+        QCOMPARE(silences.front().first, 0.0);
+        QCOMPARE(silences.front().second, 423.0);
+    }
+
+    // Non-empty speechSpans is the ordinary, working case: the VAD result is
+    // trusted and complemented directly, ignoring segments entirely.
+    void selectSilences_nonEmptySpeechSpans_usesVadResult()
+    {
+        const std::vector<std::pair<double, double>> speechSpans = {{10.0, 20.0}};
+        const QList<ParsedSegment> segments = {{10.0, QStringLiteral("only")}};
+        const auto silences = DetectSilenceTask::selectSilences(QString(), speechSpans, segments, 30.0);
+
+        QCOMPARE(silences.size(), std::size_t(2));
+        QCOMPARE(silences[0].first, 0.0);
+        QCOMPARE(silences[0].second, 10.0);
+        QCOMPARE(silences[1].first, 20.0);
+        QCOMPARE(silences[1].second, 30.0);
+    }
+
+    // Genuinely silent file: empty speechSpans AND no transcript segments —
+    // the fallback's empty span list still complements to the correct
+    // whole-file silence, so the item 010 guard doesn't regress this case.
+    void selectSilences_emptySpeechSpansNoSegments_yieldsWholeFileSilence()
+    {
+        const auto silences = DetectSilenceTask::selectSilences(QString(), {}, {}, 42.0);
+        QCOMPARE(silences.size(), std::size_t(1));
+        QCOMPARE(silences.front().first, 0.0);
+        QCOMPARE(silences.front().second, 42.0);
+    }
+
     // Real end-to-end run through the queue: on a fixture .md that already
     // carries segments/speakers/chapters, DetectSilenceTask must add
     // "silences:" WITHOUT disturbing any of that — draining via finished()

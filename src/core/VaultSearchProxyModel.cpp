@@ -136,7 +136,7 @@ void VaultSearchProxyModel::setFileSortKeys(const SortKeyMap &keys)
 
 bool VaultSearchProxyModel::filterAcceptsRow(int sourceRow, const QModelIndex &sourceParent) const
 {
-    // Free-text searchQuery never hides rows (item 9: matches sort to the
+    // Free-text searchQuery never hides rows (matches sort to the
     // top, non-matches just dim). tagFilter/speakerFilter are genuinely
     // harder filters: a row failing either IS hidden. Both must pass when
     // both are set (independent AND, same as tagFilter's own multi-tag AND).

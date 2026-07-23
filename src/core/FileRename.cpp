@@ -46,7 +46,7 @@ bool renameRecordingFile(const QUrl &fileUrl, const QString &newBaseName, QUrl *
     if (isAudioFile(info)) {
         audioOldPath = info.absoluteFilePath();
         audioExt = info.suffix();
-        // Item P7: the sidecar's name is the FULL audio filename + ".md",
+        // The sidecar's name is the FULL audio filename + ".md",
         // not just the stripped stem — see sidecarMdPath()'s doc comment.
         const QString candidateMd = dirPath + '/' + info.fileName() + ".md";
         if (QFileInfo::exists(candidateMd))
@@ -182,7 +182,7 @@ bool moveRecordingFile(const QUrl &fileUrl, const QUrl &destDirUrl, const QStrin
     // The set of files that move together: the file itself, plus — when it's
     // an audio file — its <fileName>.md sidecar and, if present, its
     // .<fileName>.partial.jsonl resume state (same full-filename convention as
-    // sidecarMdPath(); see item P7). A standalone .md moves alone.
+    // sidecarMdPath()). A standalone .md moves alone.
     std::vector<std::pair<QString, QString>> moves;
     moves.emplace_back(srcPath, destDir + '/' + srcInfo.fileName());
 

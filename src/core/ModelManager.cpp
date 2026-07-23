@@ -299,7 +299,7 @@ qint64 probeContentLength(const QString &url)
 // rename into place. Returns the final path, or empty on failure (errorOut
 // set if given). Assumes modelsDir already exists.
 //
-// Wave N (task system): event-driven rather than one blocking
+// Task system: event-driven rather than one blocking
 // waitForFinished(-1) — polls every 100ms instead, which both reports real
 // byte progress (against an upfront HEAD probe of Content-Length) and gives
 // a cooperative checkpoint for pause (SIGSTOP the curl process, SIGCONT to
