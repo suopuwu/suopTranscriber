@@ -254,7 +254,8 @@ qt_add_qml_module(suopTranscriber
         qml/UsbGrabberPage.qml
         qml/RecorderPage.qml
         qml/ModelsPage.qml
-        qml/ModelComboBox.qml
+        qml/AppComboBox.qml
+        qml/GainSlider.qml
         qml/MiddleDragScroll.qml
         qml/ScrollPage.qml
         qml/CombineRuleRegex.js

@@ -53,6 +53,41 @@ private slots:
         QVERIFY(threw);
     }
 
+    // Item 021: the onnxruntime CUDA arena backing the diar engine grows
+    // unbounded within a pass — reusing one warm engine across a batch let
+    // that growth compound across files, contradicting EngineCache.h's own
+    // doc comment. DiarizeTask::run() now evicts the diar engine
+    // unconditionally at the very top of every run (alongside evictAsr()/
+    // evictLabel() just above it), so a second task sharing the same
+    // EngineCache never inherits a resident engine from the first — even
+    // when both tasks fail before ever reaching ensureDiar(), like the
+    // not-yet-transcribed early exit here. diarEvictionCount() is a
+    // test-only counter (see EngineCache.h) — there's no cheap way to
+    // observe engine IDENTITY without a real downloaded sherpa-onnx model
+    // (see this file's header comment), so this asserts the mechanism that
+    // forces the rebuild instead.
+    void diarizeTask_evictsDiarEngineOnEveryRun()
+    {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        NullContextFixture fixture;
+        QCOMPARE(fixture.engines.diarEvictionCount(), 0);
+
+        for (int i = 0; i < 2; ++i) {
+            DiarizeTask task(QUrl::fromLocalFile(dir.path() + QStringLiteral("/never-transcribed-%1.wav").arg(i)),
+                              QUrl::fromLocalFile(dir.path()), QString(), QString(), 0.5);
+            bool threw = false;
+            try {
+                task.run(fixture.ctx);
+            } catch (const TaskError &e) {
+                threw = true;
+                QVERIFY(e.message().contains(QStringLiteral("has not been transcribed")));
+            }
+            QVERIFY(threw);
+            QCOMPARE(fixture.engines.diarEvictionCount(), i + 1);
+        }
+    }
+
     void diarizeTask_toVariantMap_carriesTuning()
     {
         DiarizeTask task(QUrl::fromLocalFile("/vault/a.wav"), QUrl::fromLocalFile("/vault"), QStringLiteral("seg-x"),

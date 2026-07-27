@@ -50,6 +50,13 @@ public:
 
     QString activeBackendName() const override { return m_backendName; }
 
+    int takeInferenceFailureCount() override
+    {
+        const int count = m_decodeFailures;
+        m_decodeFailures = 0;
+        return count;
+    }
+
     // Turns sherpa-onnx's per-token output into sentence-level Segments:
     // reassembles words from BPE subword tokens (the "▁" word-boundary marker),
     // then splits into sentences on .!? (Parakeet v2 emits punctuation +
@@ -77,4 +84,7 @@ public:
 private:
     std::unique_ptr<sherpa_onnx::cxx::OfflineRecognizer> m_recognizer;
     QString m_backendName;
+    // Sub-windows whose Decode() threw during the CURRENT transcribe() call
+    // (reset at its top) — see takeInferenceFailureCount().
+    int m_decodeFailures = 0;
 };

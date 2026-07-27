@@ -55,6 +55,15 @@ public:
     // phase registry as phaseLabel(); this is its overlay column.
     static QString phaseOverlayLabel(const QString &phase);
 
+    // Catalog id -> the SHORT display label the Tasks list shows ("base.en" ->
+    // "Base (English)"): the catalog label truncated at its " — " size/detail
+    // suffix, which is noise in a 560px-wide row. Searches the transcription,
+    // segmentation and embedding catalogs, so one call serves every model key a
+    // task row can carry. Falls back to the raw id — an `engine:<id>`
+    // out-of-process engine and a stale/removed id must still render as
+    // something, never as blank.
+    static QString modelShortLabel(const QString &modelId);
+
     // Collapse the rows of a multi-select batch (each carrying the same
     // non-zero "batchId", stamped by enqueueBatch()) into ONE aggregate row so
     // a bulk op appears as a single Tasks entry — "at least visually" one task,

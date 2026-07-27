@@ -402,6 +402,20 @@ TranscriptionController::TranscriptionController(QObject *parent)
     // it did when the value lived here.
     connect(m_phaseTimer, &PhaseTimer::overallProgressChanged, this,
             &TranscriptionController::overallProgressChanged);
+    // estimatedRemainingMs()'s stall check: record the LAST time the bar
+    // actually moved forward, not just the last time this signal fired (a
+    // redundant re-notify at the same value — e.g. the reset to 0.0 in
+    // onSerialTaskStarting() — must not look like fresh progress). A
+    // genuinely wedged transcription (2026-07-24 batch-wedge report) leaves
+    // overallProgress frozen for the rest of the job, so this timestamp stops
+    // advancing right along with it.
+    connect(m_phaseTimer, &PhaseTimer::overallProgressChanged, this, [this] {
+        const double current = m_phaseTimer->overallProgress();
+        if (current > m_lastProgressTrackedValue) {
+            m_lastProgressTrackedValue = current;
+            m_lastProgressAdvanceMs = activeElapsedMs();
+        }
+    });
     // See recomputeOverallProgress()'s doc comment — the only way
     // "loading"/"decoding" (no real progress callback) ever advance
     // overallProgress mid-phase. Only ever running while m_phase is one of
@@ -990,6 +1004,50 @@ void TranscriptionController::generateChaptersAll(const QVariantList &fileUrls, 
     });
 }
 
+QStringList TranscriptionController::pendingJobKinds(const QUrl &fileUrl) const
+{
+    // No .md at all ⇒ nothing has run.
+    const QString mdPath = sidecarPath(fileUrl.toLocalFile());
+    if (!QFileInfo::exists(mdPath))
+        return {QStringLiteral("transcribe"), QStringLiteral("diarize"), QStringLiteral("relabel"),
+                QStringLiteral("chapters")};
+
+    QStringList frontmatterLines;
+    QString body;
+    // A malformed/unreadable .md still counts as transcribed (the file exists —
+    // re-transcribing would clobber it); everything derived from it is unknown,
+    // so offer the derived passes.
+    if (!MdFrontmatter::read(mdPath, &frontmatterLines, &body, nullptr))
+        return {QStringLiteral("diarize"), QStringLiteral("relabel"), QStringLiteral("chapters")};
+
+    QString speakerDetection, label, tags;
+    for (const QString &line : std::as_const(frontmatterLines)) {
+        const int colon = line.indexOf(QLatin1Char(':'));
+        if (colon < 0)
+            continue;
+        const QString key = line.left(colon).trimmed();
+        const QString value = line.mid(colon + 1).trimmed();
+        if (key == QStringLiteral("speakerDetection"))
+            speakerDetection = value;
+        else if (key == QStringLiteral("label"))
+            label = value;
+        else if (key == QStringLiteral("tags"))
+            tags = value;
+    }
+
+    QStringList pending;
+    if (!MdFrontmatter::isTrue(speakerDetection))
+        pending << QStringLiteral("diarize");
+    if (!transcriptIsLabeled(label, tags, body))
+        pending << QStringLiteral("relabel");
+    // Same scan readChapters() uses, so "has chapters" means exactly what the
+    // TOC shows (manual markers included — a hand-added chapter is still a
+    // reason not to re-run the generator).
+    if (!chapterMarkerPattern().match(stripPreludeIfPresent(body)).hasMatch())
+        pending << QStringLiteral("chapters");
+    return pending;
+}
+
 void TranscriptionController::runAllJobs(const QUrl &fileUrl, const QUrl &vaultUrl, const QString &modelId,
                                           bool restrictTagsToExisting, double tagReuseBias,
                                           double wordiness, double chapterDensity, const QString &segmentationModelId,
@@ -1010,11 +1068,12 @@ void TranscriptionController::runAllJobs(const QUrl &fileUrl, const QUrl &vaultU
                                 ? QString::fromLatin1(ModelManager::kDefaultEmbeddingModelId)
                                 : embeddingModelId;
 
-    // Skip the transcribe step for a file that already has a sibling .md (the
-    // friendly, least-surprising "run all" on an already-done file — just
-    // re-detect speakers and refresh its label+chapters). An orphaned .md's
-    // sidecarPath() is itself, so this is true for those too.
-    const bool alreadyTranscribed = QFileInfo::exists(sidecarPath(fileUrl.toLocalFile()));
+    // Only the steps that haven't run yet (see pendingJobKinds()). Nothing left
+    // ⇒ enqueue nothing at all, so the button is a visible no-op on a fully
+    // processed file rather than a surprise re-run.
+    const QStringList pending = pendingJobKinds(fileUrl);
+    if (pending.isEmpty())
+        return;
 
     // Jump ahead of whatever's already Queued, but keep this file's
     // tasks CONTIGUOUS and IN ORDER by walking insertAt forward as each is
@@ -1035,17 +1094,20 @@ void TranscriptionController::runAllJobs(const QUrl &fileUrl, const QUrl &vaultU
         insertAt += static_cast<int>(m_scheduler->tasks().size()) - before;
     };
 
-    // (1) transcribe (pure ASR) — skipped if already transcribed.
-    if (!alreadyTranscribed)
+    // (1) transcribe (pure ASR).
+    if (pending.contains(QStringLiteral("transcribe")))
         step(std::make_unique<TranscribeTask>(fileUrl, vaultUrl, modelId));
     // (2) detect speakers — reads the .md the transcribe step (if any) just
     // wrote and splices "[Speaker N]" tags in.
-    step(std::make_unique<DiarizeTask>(fileUrl, vaultUrl, segId, embedId, sensitivity));
+    if (pending.contains(QStringLiteral("diarize")))
+        step(std::make_unique<DiarizeTask>(fileUrl, vaultUrl, segId, embedId, sensitivity));
     // (3) label — reads the .md the diarize step just updated.
-    step(std::make_unique<RelabelTask>(fileUrl, vaultUrl, restrictTagsToExisting, tagReuseBias, wordiness,
-                                        /*skipIfAlreadyLabeled=*/false));
+    if (pending.contains(QStringLiteral("relabel")))
+        step(std::make_unique<RelabelTask>(fileUrl, vaultUrl, restrictTagsToExisting, tagReuseBias, wordiness,
+                                            /*skipIfAlreadyLabeled=*/false));
     // (4) chapters — reads the labeled .md.
-    step(std::make_unique<ChaptersTask>(fileUrl, vaultUrl, chapterDensity));
+    if (pending.contains(QStringLiteral("chapters")))
+        step(std::make_unique<ChaptersTask>(fileUrl, vaultUrl, chapterDensity));
 
     // No trailing startTask(): the FIRST step()'s enqueueTask() already
     // auto-started the queue if it was idle (and startIndex just marks where
@@ -1087,6 +1149,12 @@ void TranscriptionController::onSerialTaskStarting(Task *task, bool wasCancellin
     m_activeAccumulatedMs = 0;
     m_activeSegmentTimer.start();
     m_phaseTimer->setOverallProgress(0.0);
+    // A fresh job must never inherit the previous job's stall clock — see
+    // estimatedRemainingMs()'s doc comment. The setOverallProgress(0.0) just
+    // above won't naturally reset these (0.0 isn't > a stale tracked value
+    // left over from a job that finished near 1.0).
+    m_lastProgressAdvanceMs = 0;
+    m_lastProgressTrackedValue = 0.0;
     // See recomputeOverallProgress()'s doc comment — true ONLY for a "diarize"
     // task, whose progress bar is weighted around the detecting-speakers phase.
     m_activeSpeakerDetection = task->kind() == QStringLiteral("diarize");
@@ -1254,13 +1322,42 @@ qint64 TranscriptionController::activeElapsedMs() const
     return m_activeAccumulatedMs + (m_activePaused ? 0 : m_activeSegmentTimer.elapsed());
 }
 
+// See estimatedRemainingMs()'s doc comment and the kStalledEtaMs/
+// etaStallThresholdMs doc comments on the header. Constants deliberately
+// generous in both directions: the floor keeps an ordinary brief gap between
+// progress ticks (even a slow one) from misreading as "stalled", and the
+// multiplier scales that tolerance UP for a phase whose own historical pace
+// is already slow (a big model's "transcribing" phase legitimately goes
+// longer between ticks than a tiny model's does) — this is a DISPLAY-only
+// judgment call (unlike TranscribeTask's stall watchdog, which actually
+// aborts real work and so must be far more conservative), so erring toward
+// "still shows a number a bit too long" over "flips to stalled too eagerly"
+// is the safer direction here too.
+qint64 TranscriptionController::etaStallThresholdMs(double phaseAverageDurationMs)
+{
+    constexpr qint64 kFloorMs = 60'000; // 1 minute, regardless of phase pace
+    constexpr double kMultiplier = 10.0;
+    return qMax<qint64>(kFloorMs, static_cast<qint64>(kMultiplier * phaseAverageDurationMs));
+}
+
 qint64 TranscriptionController::estimatedRemainingMs() const
 {
     const double overall = m_phaseTimer->overallProgress();
     if (m_scheduler->activeIndex() < 0 || overall <= 0.0)
         return -1;
+    const qint64 sinceLastAdvance = activeElapsedMs() - m_lastProgressAdvanceMs;
+    const qint64 stallThreshold = etaStallThresholdMs(
+        m_phaseTimer->phaseAverageDurationMs(m_phase, activeModelIdForTiming(), m_activeSpeakerDetection));
+    if (sinceLastAdvance > stallThreshold)
+        return kStalledEtaMs;
     const double remainingFraction = (1.0 - overall) / overall;
-    return static_cast<qint64>(activeElapsedMs() * remainingFraction);
+    const qint64 remaining = static_cast<qint64>(activeElapsedMs() * remainingFraction);
+    // Belt-and-suspenders ceiling: the stall check above is the real fix, but
+    // this catches any extrapolation the stall check doesn't (e.g. a job that
+    // IS still ticking, just at a near-zero rate) before it reaches the
+    // "~114 hours left" territory that prompted this whole change.
+    constexpr qint64 kEtaCeilingMs = 48LL * 60 * 60 * 1000; // 48h
+    return qMin(remaining, kEtaCeilingMs);
 }
 
 void TranscriptionController::pauseActive()
@@ -2300,6 +2397,11 @@ QString TranscriptionController::phaseLabel(const QString &phase) const
 QString TranscriptionController::phaseOverlayLabel(const QString &phase) const
 {
     return JobListFormatter::phaseOverlayLabel(phase);
+}
+
+QString TranscriptionController::modelShortLabel(const QString &modelId) const
+{
+    return JobListFormatter::modelShortLabel(modelId);
 }
 
 bool TranscriptionController::activeCanPause() const

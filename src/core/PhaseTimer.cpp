@@ -138,6 +138,12 @@ bool PhaseTimer::isSyntheticProgressPhase(const QString &phase)
         || phase == QStringLiteral("detecting-speech");
 }
 
+double PhaseTimer::phaseAverageDurationMs(const QString &phase, const QString &modelId, bool speakerDetection) const
+{
+    const QString key = canonicalPhaseKey(phase, modelId, speakerDetection);
+    return m_phaseTimings.value(key).average(defaultPhaseDurationMs(phase));
+}
+
 double PhaseTimer::phaseRelativeSyntheticProgress(const QString &phase, const QString &modelId,
                                                   bool speakerDetection, double realProgress,
                                                   qint64 elapsedInPhaseMs) const

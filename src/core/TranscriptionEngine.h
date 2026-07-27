@@ -55,4 +55,11 @@ public:
     // out-of-process SubprocessEngine driving a JSONL manifest). Only
     // WhisperCppEngine overrides this today.
     virtual QString activeBackendName() const { return QString(); }
+
+    // Number of inference failures (e.g. onnxruntime OOM) since the last
+    // call, then reset to 0 — a non-zero count means the segments just
+    // returned by transcribe() are incomplete, not a genuine end of speech.
+    // Defaulted to 0 so WhisperCppEngine/SubprocessEngine need no change;
+    // only engines with a known silent-failure path override this.
+    virtual int takeInferenceFailureCount() { return 0; }
 };

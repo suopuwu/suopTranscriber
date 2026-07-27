@@ -62,10 +62,25 @@ public:
     // whisper.cpp's transcription this had no progress reporting at all
     // until now (see TranscriptionController's "loading/detecting/
     // transcribing" phase reporting).
+    // inferenceFailed (optional out-param): set true when the underlying
+    // sherpa-onnx Process() call threw — distinguishes a real inference
+    // failure (OOM, decode error) from a genuinely speaker-less file, which
+    // also returns empty turns but is NOT a failure.
     std::vector<DiarizedTurn> diarize(const std::vector<float> &pcm16kMono,
-                                       const DiarizationProgressCallback &onProgress = {}) const;
+                                       const DiarizationProgressCallback &onProgress = {},
+                                       bool *inferenceFailed = nullptr) const;
 
 private:
+    // Retained so diarize() can rebuild a CPU session on a CUDA inference OOM
+    // (see diarize()'s catch — the load-time CUDA→CPU fallback in the .cpp only
+    // covers a failed CUDA *init*, not an out-of-memory at Process() time).
+    QString m_segmentationModelPath;
+    QString m_embeddingModelPath;
+    float m_threshold = 0.5f;
+    // True while diarizing on CUDA; flipped false permanently the first time a
+    // CUDA inference OOM forces the CPU fallback, so a batch of long files
+    // doesn't re-attempt (and re-OOM) CUDA on every file.
+    mutable bool m_usingCuda = false;
     sherpa_onnx::cxx::OfflineSpeakerDiarization m_sd;
 };
 

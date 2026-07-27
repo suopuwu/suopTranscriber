@@ -30,7 +30,8 @@ constexpr qint64 kLiveUpdateThrottleMs = 200;
 // decode loop, same mechanism a real transcribe uses.
 QVariantMap runOneBenchmarkModel(const QString &modelId, const QString &vaultPath, const AudioChunk &chunk,
                                   double audioSeconds, const AbortCallback &onAbort,
-                                  const SegmentCallback &onSegment = {})
+                                  const SegmentCallback &onSegment = {},
+                                  const ProgressCallback &onProgress = {})
 {
     QVariantMap row;
     row["modelId"] = modelId;
@@ -93,7 +94,7 @@ QVariantMap runOneBenchmarkModel(const QString &modelId, const QString &vaultPat
     QElapsedTimer timer;
     timer.start();
     const std::vector<Segment> segments =
-        TranscribePipeline::runWindows(*engine, chunk.pcm16kMono, win.windows, {}, onSegment, onAbort);
+        TranscribePipeline::runWindows(*engine, chunk.pcm16kMono, win.windows, onProgress, onSegment, onAbort);
     const qint64 runtimeMs = timer.elapsed();
 
     QString text;
@@ -121,6 +122,14 @@ QVariantMap runOneBenchmarkModel(const QString &modelId, const QString &vaultPat
 }
 
 } // namespace
+
+double benchmarkOverallProgress(int modelIndex, int modelCount, double secondsDone, double secondsTotal)
+{
+    if (modelCount <= 0)
+        return 0.0;
+    const double within = secondsTotal > 0.0 ? qBound(0.0, secondsDone / secondsTotal, 1.0) : 0.0;
+    return (static_cast<double>(qMax(0, modelIndex)) + within) / modelCount;
+}
 
 BenchmarkTask::BenchmarkTask(QUrl file, QUrl vault, QStringList modelIds, QObject *parent)
     : Task(parent)
@@ -180,6 +189,7 @@ void BenchmarkTask::run(TaskContext &ctx)
         liveTimer.start();
         qint64 lastLiveTickMs = -kLiveUpdateThrottleMs;
         const int modelIndex = i;
+        const int modelCount = m_modelIds.size();
         const SegmentCallback onSegment = [&, this](const Segment &seg) {
             const QString t = QString::fromStdString(seg.text).trimmed();
             if (t.isEmpty())
@@ -193,8 +203,14 @@ void BenchmarkTask::run(TaskContext &ctx)
                 emit benchmarkModelProgressText(modelIndex, liveText);
             }
         };
+        // Advance the bar DURING each model's transcription (runWindows reports
+        // cumulative seconds vs the whole file), not just at model boundaries —
+        // otherwise the SelfCumulative bar is frozen for the whole of each run.
+        const ProgressCallback onProgress = [this, modelIndex, modelCount](double secondsDone, double secondsTotal) {
+            emit progress(benchmarkOverallProgress(modelIndex, modelCount, secondsDone, secondsTotal));
+        };
         QVariantMap result =
-            runOneBenchmarkModel(modelId, vaultPath, chunk, audioSeconds, onAbort, onSegment);
+            runOneBenchmarkModel(modelId, vaultPath, chunk, audioSeconds, onAbort, onSegment, onProgress);
         results.append(result);
         emit benchmarkModelDone(result);
         if (!m_modelIds.isEmpty())

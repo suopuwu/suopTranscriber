@@ -49,6 +49,7 @@
 #include "tasks/BenchmarkTask.h"
 #include "tasks/ChaptersTask.h"
 #include "tasks/CombineTask.h"
+#include "tasks/DetectSilenceTask.h"
 #include "tasks/DiarizationSweepTask.h"
 #include "tasks/DiarizeTask.h"
 #include "tasks/DownloadTask.h"
@@ -198,6 +199,34 @@ public:
     void run(TaskContext &ctx) override
     {
         emit phase(QStringLiteral("labeling"));
+        while (!m_release.load()) {
+            if (ctx.checkpoint())
+                return; // honor cancel so teardown can't hang
+            QThread::msleep(5);
+        }
+    }
+    std::atomic<bool> m_release{false};
+};
+
+// A WeightedPhases fake (TranscribeTask/DiarizeTask's progress shape) that
+// reports ONE real progress() tick on a single named phase, then blocks — for
+// item 024's ETA-stall test. Real (not synthetic-ramp) progress is needed
+// because estimatedRemainingMs()'s stall check tracks overallProgress
+// actually advancing, and "transcribing" is not one of PhaseTimer's
+// no-callback synthetic phases (see PhaseTimer::isSyntheticProgressPhase()) —
+// so once this fake stops ticking, overallProgress genuinely freezes, exactly
+// like the wedged whisper_full() call in the 2026-07-24 batch-wedge report.
+class FakeWeightedProgressTask : public Task {
+public:
+    QString kind() const override { return QStringLiteral("fakeWeightedProgress"); }
+    QString displayName() const override { return QStringLiteral("Fake weighted progress"); }
+    Capabilities capabilities() const override { return {/*pausable*/ false, /*cancellableMidRun*/ true}; }
+    ProgressModel progressModel() const override { return ProgressModel::WeightedPhases; }
+    QStringList progressPhases() const override { return {QStringLiteral("transcribing")}; }
+    void run(TaskContext &ctx) override
+    {
+        emit phase(QStringLiteral("transcribing"));
+        emit progress(0.1); // one real tick, then silence until released
         while (!m_release.load()) {
             if (ctx.checkpoint())
                 return; // honor cancel so teardown can't hang
@@ -1179,10 +1208,11 @@ private slots:
         QTRY_COMPARE(controller.tasksCompleted(), 4);
     }
 
-    // Items 24/53 already-transcribed decision: runAllJobs() on a file that
-    // already has a sibling .md SKIPS the transcribe step and enqueues only
-    // detect speakers -> label -> chapters (the friendly "just re-detect
-    // speakers + refresh the derived passes" behavior documented on the method).
+    // "Run all available jobs": runAllJobs() on a file that already has a
+    // sibling .md (but no other step's marker) SKIPS the transcribe step and
+    // enqueues only detect speakers -> label -> chapters — the general
+    // per-step "has this already run?" rule (pendingJobKinds()), not a
+    // one-off already-transcribed special case.
     void runAllJobs_alreadyTranscribed_skipsTranscribe_diarizeLabelThenChapters()
     {
         VaultFixture vault;
@@ -1211,6 +1241,104 @@ private slots:
         QCOMPARE(controller.jobs().at(2).toMap().value("kind").toString(), QStringLiteral("chapters"));
 
         QTRY_COMPARE(controller.tasksCompleted(), 3);
+    }
+
+    // "Run all available jobs": a .md that already has speakerDetection: true
+    // and a non-empty label: (transcribe+diarize+relabel all done) enqueues
+    // ONLY the chapters step.
+    void runAllJobs_skipsStepsAlreadyDone()
+    {
+        VaultFixture vault;
+        // Chapters still needs the label engine (ChaptersTask::prerequisites()),
+        // so plant it — same "no download job masks the ordering" idiom as the
+        // tests above.
+        QFile labelModel(vault.dir.path() + "/.transcriber/models/Qwen3-4B-Instruct-2507-Q4_K_M.gguf");
+        QVERIFY(labelModel.open(QIODevice::WriteOnly));
+        labelModel.close();
+
+        const QUrl file = vault.audioUrl("a.wav");
+        QFile md(vault.dir.path() + "/a.wav.md");
+        QVERIFY(md.open(QIODevice::WriteOnly));
+        md.write("---\nmodel: ggml-base.en.bin\nspeakerDetection: true\nlabel: Interview\n---\n\n[0] hello\n");
+        md.close();
+
+        TranscriptionController controller;
+        controller.runAllJobs(file, vault.vaultUrl, kModelId);
+
+        QCOMPARE(controller.tasksTotal(), 1);
+        QCOMPARE(controller.jobs().at(0).toMap().value("kind").toString(), QStringLiteral("chapters"));
+
+        QTRY_COMPARE(controller.tasksCompleted(), 1);
+    }
+
+    // Requirement 4: a fully-processed file (transcribe+diarize+relabel+
+    // chapters all already on disk) enqueues NOTHING at all — runAllJobs()
+    // is a silent no-op rather than re-running a finished pass.
+    void runAllJobs_allJobsDone_enqueuesNothing()
+    {
+        VaultFixture vault;
+        const QUrl file = vault.audioUrl("a.wav");
+        QFile md(vault.dir.path() + "/a.wav.md");
+        QVERIFY(md.open(QIODevice::WriteOnly));
+        md.write("---\nmodel: ggml-base.en.bin\nspeakerDetection: true\nlabel: Interview\ntags: a, b\n---\n\n"
+                  "## [0] Intro\n[0] hello\n");
+        md.close();
+
+        TranscriptionController controller;
+        controller.runAllJobs(file, vault.vaultUrl, kModelId);
+
+        QCOMPARE(controller.tasksTotal(), 0);
+        QVERIFY(controller.jobs().isEmpty());
+        QVERIFY(!controller.isBusy());
+    }
+
+    // pendingJobKinds() derives "still needs to run" purely from the .md,
+    // one marker at a time, in pipeline order — the same rule runAllJobs()
+    // gates on above.
+    void pendingJobKinds_reportsEachStepFromTheMdAlone()
+    {
+        VaultFixture vault;
+        const QUrl file = vault.audioUrl("a.wav");
+        const QString mdPath = vault.dir.path() + "/a.wav.md";
+        TranscriptionController controller;
+
+        // No .md at all -> every step, in pipeline order.
+        QCOMPARE(controller.pendingJobKinds(file),
+                 QStringList({QStringLiteral("transcribe"), QStringLiteral("diarize"),
+                              QStringLiteral("relabel"), QStringLiteral("chapters")}));
+
+        // Bare .md (sibling exists, nothing else done yet).
+        auto writeMd = [&](const QString &contents) {
+            QFile md(mdPath);
+            QVERIFY(md.open(QIODevice::WriteOnly | QIODevice::Truncate));
+            md.write(contents.toUtf8());
+            md.close();
+        };
+        writeMd(QStringLiteral("---\nmodel: ggml-base.en.bin\n---\n\n[0] hello\n"));
+        QCOMPARE(controller.pendingJobKinds(file),
+                 QStringList({QStringLiteral("diarize"), QStringLiteral("relabel"), QStringLiteral("chapters")}));
+
+        // + speakerDetection: true.
+        writeMd(QStringLiteral("---\nmodel: ggml-base.en.bin\nspeakerDetection: true\n---\n\n[0] hello\n"));
+        QCOMPARE(controller.pendingJobKinds(file),
+                 QStringList({QStringLiteral("relabel"), QStringLiteral("chapters")}));
+
+        // + label:.
+        writeMd(QStringLiteral(
+            "---\nmodel: ggml-base.en.bin\nspeakerDetection: true\nlabel: Interview\n---\n\n[0] hello\n"));
+        QCOMPARE(controller.pendingJobKinds(file), QStringList({QStringLiteral("chapters")}));
+
+        // + a chapter marker -> nothing left.
+        writeMd(QStringLiteral("---\nmodel: ggml-base.en.bin\nspeakerDetection: true\nlabel: Interview\n---\n\n"
+                                "## [0] Intro\n[0] hello\n"));
+        QVERIFY(controller.pendingJobKinds(file).isEmpty());
+
+        // A prelude-only body (kPreludeEndMarker, no label/tags) counts as
+        // labeled via the shared transcriptIsLabeled() rule -> "relabel" must
+        // NOT be listed, even though no label:/tags: line is present.
+        writeMd(QStringLiteral("---\nmodel: ggml-base.en.bin\n---\n\n") + kPreludeEndMarker
+                + QStringLiteral("\n\n[0] hello\n"));
+        QVERIFY(!controller.pendingJobKinds(file).contains(QStringLiteral("relabel")));
     }
 
     // Wave N (task system, item 5): transcribe() queues a "download" job
@@ -1998,6 +2126,10 @@ private slots:
         reps.push_back(std::make_unique<ChaptersTask>(file, vaultUrl, /*density=*/0.5));
         reps.push_back(std::make_unique<DiarizeTask>(file, vaultUrl, QStringLiteral("seg"), QStringLiteral("emb"),
                                                      /*threshold=*/0.5));
+        // No constructor fields beyond fileUrl/vaultUrl — its default
+        // toJson() is empty, so this rep also pins that a kind carrying NO
+        // extra state still needs its factory branch to survive a restart.
+        reps.push_back(std::make_unique<DetectSilenceTask>(file, vaultUrl));
         reps.push_back(std::make_unique<RenameSpeakerTask>(file, QStringLiteral("A"), QStringLiteral("B")));
         reps.push_back(std::make_unique<MergeSpeakersTask>(file, QStringLiteral("A"), QStringLiteral("B")));
         reps.push_back(std::make_unique<CombineTask>(QStringList{QStringLiteral("/vault/a.wav"),
@@ -2027,7 +2159,7 @@ private slots:
         // (grepped from the task headers) must equal the number round-tripped
         // above. A NEW persistable kind trips this until it's added here AND
         // shown to survive the factory — closing the "forgot the branch" gap
-        // for future kinds, not just today's eight.
+        // for future kinds, not just today's list.
         int persistableInSource = 0;
         QDirIterator it(QStringLiteral(SUOP_SRC_DIR "/core/tasks"), {QStringLiteral("*.h")}, QDir::Files);
         const QRegularExpression optIn(QStringLiteral("bool isPersistable\\(\\) const override \\{ return true"));
@@ -2709,6 +2841,169 @@ private slots:
         // Let both tasks settle (they fail fast — no real audio to merge/decode)
         // so teardown is clean.
         QTRY_COMPARE(controller.tasksCompleted(), 2);
+    }
+
+    // Perf regression (UI freeze): a BULK enqueue emits queueChanged exactly
+    // ONCE, not once per inserted task.
+    //
+    // queueChanged is the app's most expensive signal — every emission
+    // re-serializes tasks.json to disk (persistQueue) and rebuilds the whole
+    // `jobs` QVariantList from scratch for each of its several QML consumers
+    // (MainPanel's busyOrQueuedKeys, BottomBar's frontQueuedJob, Sidebar's
+    // pendingCombines, the Tasks list). Raising it per inserted task made
+    // "Run all" quadratic: 60 files (243 tasks, since each file contributes a
+    // transcribe/diarize/relabel/chapters step) fired 241 emissions and froze
+    // the GUI thread for seconds. See TaskScheduler::QueueChangedHold.
+    void bulkEnqueue_emitsQueueChangedOnce()
+    {
+        VaultFixture vault;
+        TranscriptionController controller;
+        controller.loadPersistedQueue(vault.vaultUrl); // so persistQueue() is live, as in the app
+        QVariantList urls;
+        for (int i = 0; i < 20; ++i)
+            urls << QVariant(vault.audioUrl(QStringLiteral("bulk-%1.wav").arg(i)));
+
+        QSignalSpy queueSpy(&controller, &TranscriptionController::queueChanged);
+        controller.runAllJobsForPaths(urls, vault.vaultUrl, kModelId, false, 0.5, 0.5, 0.5, QString(), QString(),
+                                      0.5);
+
+        // Four steps per file, all inserted synchronously inside the one batch
+        // (plus the handful of one-off model DownloadTasks the first file's
+        // steps queue as prerequisites — deduped, so they don't scale with N).
+        QVERIFY(controller.tasksTotal() >= 4 * urls.size());
+        QCOMPARE(queueSpy.count(), 1);
+        // The single emission lands AFTER the batch is complete — a consumer
+        // that recomputes from it sees the finished queue, not a partial one.
+        QCOMPARE(controller.jobs().size(), controller.tasksTotal());
+
+        controller.cancelAll();
+        QTRY_VERIFY(!controller.isBusy()); // let the one Active task settle before teardown
+    }
+
+    // The removal twin of bulkEnqueue_emitsQueueChangedOnce: clearing a long
+    // queue removes every Queued task in one synchronous burst, and emitted one
+    // queueChanged per removal — the same freeze in reverse.
+    void bulkCancel_emitsQueueChangedOnce()
+    {
+        VaultFixture vault;
+        TranscriptionController controller;
+        controller.loadPersistedQueue(vault.vaultUrl);
+        QVariantList urls;
+        for (int i = 0; i < 20; ++i)
+            urls << QVariant(vault.audioUrl(QStringLiteral("bulk-%1.wav").arg(i)));
+        controller.runAllJobsForPaths(urls, vault.vaultUrl, kModelId, false, 0.5, 0.5, 0.5, QString(), QString(),
+                                      0.5);
+        const int queued = controller.tasksTotal();
+        QVERIFY(queued >= 4 * urls.size());
+
+        QSignalSpy queueSpy(&controller, &TranscriptionController::queueChanged);
+        QSignalSpy finishedSpy(&controller, &TranscriptionController::finished);
+        controller.cancelAll();
+
+        QCOMPARE(queueSpy.count(), 1);
+        // The one-terminal-report invariant is untouched by the coalescing —
+        // every task cancelled before it ran still reports individually.
+        QCOMPARE(finishedSpy.count(), queued - 1); // minus the one that went Active
+        QTRY_VERIFY(!controller.isBusy());
+    }
+
+    // Item 024 (batch-wedge report), ETA half. Pure boundary check on the
+    // predicate estimatedRemainingMs() consults — floor wins for a phase
+    // with no/small recorded average, the multiplier wins once that average
+    // is itself slow. Static + pure so this needs no controller, no task, no
+    // wall-clock waiting.
+    void etaStallThresholdMs_isFloorOrScaledAverageWhicheverIsLarger()
+    {
+        QCOMPARE(TranscriptionController::etaStallThresholdMs(0.0), qint64(60'000));
+        QCOMPARE(TranscriptionController::etaStallThresholdMs(1000.0), qint64(60'000));
+        // Past the crossover (average * 10 > the 60s floor), the multiplier
+        // wins — a slower-paced phase earns proportionally more silent runway
+        // before its ETA reads as stalled.
+        QCOMPARE(TranscriptionController::etaStallThresholdMs(10'000.0), qint64(100'000));
+        QVERIFY2(TranscriptionController::etaStallThresholdMs(50'000.0)
+                     > TranscriptionController::etaStallThresholdMs(10'000.0),
+                 "a slower historical phase pace must widen the stall window, not shrink it");
+    }
+
+    // Item 024, ETA half (integration): a WeightedPhases Active task that
+    // ticks real progress once and then goes silent must have
+    // estimatedRemainingMs() read as "stalled" once that silence outlasts
+    // etaStallThresholdMs() — never a runaway extrapolation like the
+    // reported "~114 hours left" on a 3-minute file. The silent stretch is
+    // simulated via the m_activeAccumulatedMs friend seam (same technique
+    // the combine-redirect test above uses for m_scheduler's cached state)
+    // rather than an actual multi-minute sleep — etaStallThresholdMs()'s
+    // floor alone is 60 real seconds, which the boundary test above already
+    // covers directly.
+    void estimatedRemainingMs_frozenProgress_readsStalled_notRunawayEta()
+    {
+        TranscriptionController controller;
+        auto task = std::make_unique<FakeWeightedProgressTask>();
+        FakeWeightedProgressTask *raw = task.get();
+        controller.enqueueTask(std::move(task)); // friend seam -> auto-starts, becomes Active
+
+        // The one real progress() tick lands asynchronously (queued
+        // cross-thread connection) — wait for the bar to actually move
+        // before trusting m_lastProgressAdvanceMs is set from it.
+        QTRY_VERIFY_WITH_TIMEOUT(controller.overallProgress() > 0.0, 3000);
+        QVERIFY2(controller.estimatedRemainingMs() != TranscriptionController::kStalledEtaMs,
+                 "fresh progress must not immediately read as stalled");
+
+        // Fast-forward activeElapsedMs() WITHOUT any further progress() tick —
+        // exactly the wedged-whisper_full() shape (elapsed climbs, overall
+        // frozen). Comfortably past even the largest plausible threshold
+        // (a many-minutes-average phase multiplied by 10) without waiting
+        // real wall-clock time for it.
+        controller.m_activeAccumulatedMs += 6LL * 60 * 60 * 1000; // +6 real hours, no new tick
+
+        QCOMPARE(controller.estimatedRemainingMs(), TranscriptionController::kStalledEtaMs);
+
+        raw->m_release.store(true);
+        QTRY_VERIFY_WITH_TIMEOUT(!controller.isBusy(), 3000); // settle for clean teardown
+    }
+
+    // Item 024, stall-watchdog half. Pure predicate boundary check
+    // (TranscribeTask::isStalled) — the real whisper.cpp stall from the
+    // 2026-07-24 report isn't reproducible read-only (root cause unconfirmed,
+    // per the work order), so this pins the threshold shape directly instead.
+    void transcribeTask_isStalled_isAudioLengthRelative_notFlatWallClockCap()
+    {
+        // A brief gap never trips it, even on a tiny file.
+        QVERIFY2(!TranscribeTask::isStalled(500, /*fileSeconds=*/0.5),
+                 "a sub-second gap on a fraction-of-a-second file must not trip the watchdog");
+
+        // The load-bearing case (CLAUDE.md / the 2026-07-25 decision): the
+        // SAME no-progress duration must trip a near-zero-length file but
+        // NOT a genuinely long one — the bound is audio-length-relative, not
+        // a flat wall-clock cap. A false trip destroys real, in-progress
+        // work; that's strictly worse than a late trip on a file that really
+        // is wedged.
+        constexpr qint64 kTenMinutesMs = 10 * 60 * 1000;
+        QVERIFY2(TranscribeTask::isStalled(kTenMinutesMs, /*fileSeconds=*/1.0),
+                 "a near-zero-length file stalled for 10 real minutes must trip");
+        QVERIFY2(!TranscribeTask::isStalled(kTenMinutesMs, /*fileSeconds=*/3600.0),
+                 "the SAME 10-minute silence on a genuinely long (1h) file must NOT trip — "
+                 "never falsely kill a legitimately long recording");
+
+        // The negative case that matters most in practice: a long file that
+        // is genuinely still working (progress resets the caller's clock
+        // before each isStalled() check — see TranscribeTask::run()'s
+        // onAbort) never trips no matter how long the file's OWN duration
+        // is, as long as ticks keep arriving. Modeled here as a small,
+        // realistic per-tick gap on a long file.
+        QVERIFY2(!TranscribeTask::isStalled(/*noProgressElapsedMs=*/2000, /*fileSeconds=*/7200.0),
+                 "a normal few-second gap between ticks on a 2-hour file must never trip");
+
+        // But even a long file trips EVENTUALLY once truly wedged for many
+        // times its own length — this is a bounded backstop, not "never".
+        QVERIFY2(TranscribeTask::isStalled(30LL * 3600 * 1000, /*fileSeconds=*/3600.0),
+                 "a 1-hour file silent for 30 real hours must eventually trip");
+
+        // Reproduces the reported incident's own numbers: 1:46:36 elapsed
+        // with near-zero progress on a 3-minute file must trip.
+        constexpr qint64 kIncidentElapsedMs = ((1 * 60 + 46) * 60 + 36) * 1000LL;
+        QVERIFY2(TranscribeTask::isStalled(kIncidentElapsedMs, /*fileSeconds=*/180.0),
+                 "the 2026-07-24 batch-wedge report's own numbers must trip the watchdog");
     }
 };
 

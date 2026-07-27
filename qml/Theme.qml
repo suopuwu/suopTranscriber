@@ -64,6 +64,10 @@ Item {
 
     // Enabled/available/on. `successDim` is its at-rest partner, mirroring the
     // surface/surfaceHover pair: `checked ? (hovered ? success : successDim)`.
+    // The recorder's "too quiet to equalise" band (see
+    // AudioRecorderIO::levelBand) — a caution, not an error, so it sits
+    // between textMuted and danger rather than reusing either.
+    readonly property color warning: "#d8b45a"
     readonly property color success: "#2ecc71"
     readonly property color successDim: "#25a25a"
 }

@@ -103,8 +103,7 @@ void RelabelTask::run(TaskContext &ctx)
     // This is the automatic post-transcribe follow-up, not an explicit user
     // request — don't clobber label/tags/prelude a previous run (or a manual
     // edit) already produced.
-    if (m_skipIfAlreadyLabeled
-        && (!existingLabel.isEmpty() || !existingTags.isEmpty() || rawBody.contains(kPreludeEndMarker)))
+    if (m_skipIfAlreadyLabeled && transcriptIsLabeled(existingLabel, existingTags, rawBody))
         return; // success, nothing to do
 
     if (transcriptText.trimmed().isEmpty())

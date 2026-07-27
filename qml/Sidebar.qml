@@ -165,6 +165,22 @@ Rectangle {
             ? sidebar.model.searchResults(sidebar.searchQuery, sidebar.searchIncludeTranscriptions)
             : []
     }
+    // Burst-collapsing twin, for callers driven by a PER-TASK signal (onFinished)
+    // rather than a user gesture — same idiom as refreshSelectionEligibility().
+    // Direct callers (a query edit, a toggle) keep the synchronous function:
+    // there is exactly one of them per gesture, and the result must be on screen
+    // for the same frame.
+    property bool searchResultsRefreshPending: false
+    function refreshSearchResultsCoalesced() {
+        if (sidebar.searchResultsRefreshPending)
+            return
+        sidebar.searchResultsRefreshPending = true
+        Qt.callLater(sidebar.doRefreshSearchResultsCoalesced)
+    }
+    function doRefreshSearchResultsCoalesced() {
+        sidebar.searchResultsRefreshPending = false
+        sidebar.refreshSearchResults()
+    }
 
     // Reuses the exact fileActivated/orphanedMdActivated signal path a
     // click emits — currentPath's persistent outline (Main.qml) and
@@ -435,18 +451,14 @@ Rectangle {
             .filter((n) => n.isAudio && n.status === 2)
             .map((n) => n.path)
     }
-    // Items 24/53: search-scoped "run all jobs" — same eligibility as
-    // searchTranscribePaths() (untranscribed audio in the filtered set), since
-    // run-all's whole point is the full pipeline on files that need it; an
-    // already-transcribed result's label/chapters are the other two search
-    // buttons' job (runAllJobs() itself skips a redundant re-transcribe anyway).
+    // Search-scoped "run all available jobs" — EVERY audio result, transcribed
+    // or not: runAllJobs() queues only the steps a given file still needs and
+    // no-ops when it needs none, so narrowing to untranscribed files here would
+    // just hide the action from the files it now has work for. Audio only (no
+    // orphaned .md — the diarize step needs audio to decode).
     function searchRunAllPaths() {
-        if (!sidebar.transcriptionController)
-            return []
         return sidebar.searchResultNotes()
-            .filter((n) => n.isAudio
-                    && !sidebar.transcriptionController.matchesExistingTranscription(
-                           "file://" + n.path, AppSettings.defaultModel))
+            .filter((n) => n.isAudio)
             .map((n) => n.path)
     }
 
@@ -858,11 +870,17 @@ Rectangle {
             // reset own it. In-place edits (label/tags/chapters/speaker) never
             // produce a reset, so for them this stays their only reflow trigger.
             if (!structural) {
-                sidebar.refreshTreeOrdering()
+                // COALESCED, not called directly: finished() arrives one per
+                // task, and a bulk queue operation emits a whole burst of them
+                // in a single synchronous pass (cancelling a 240-task queue
+                // synthesizes 240 terminal reports). Reflowing per report ran
+                // the vault walk + proxy re-sort 240 times for one user action
+                // and froze the GUI thread. The burst collapses to one reflow.
+                sidebar.refreshTreeOrderingCoalesced()
                 // A label/tag/transcript change can change what the active search
                 // matches, so re-run it (was previously driven by metadataRevision).
-                sidebar.refreshSearchResults()
-                sidebar.refreshSelectionEligibility()
+                sidebar.refreshSearchResultsCoalesced()
+                sidebar.refreshSelectionEligibility() // already coalesced
             }
             // Item 6: labels/tags/chapters are written in-place into an
             // already-existing .md, which QFileSystemWatcher::directoryChanged
@@ -988,6 +1006,25 @@ Rectangle {
     // own intra-group display order, which also needs an order for
     // non-ready groups to sort consistently).
     property var combineOrderPaths: ({})
+
+    // Burst-collapsing twin of refreshTreeOrdering() below, for callers driven
+    // by a PER-TASK signal (onFinished) rather than a user gesture or a model
+    // reset — same idiom as refreshSelectionEligibility(). refreshTreeOrdering()
+    // is the most expensive routine in the panel (vault walk + a stat sweep + a
+    // JS sort + a fileSortKeys write that re-runs the proxy's whole O(n log n)
+    // sort), so running it once per finished task is what turns a bulk queue
+    // operation into a multi-second freeze.
+    property bool treeOrderingRefreshPending: false
+    function refreshTreeOrderingCoalesced() {
+        if (sidebar.treeOrderingRefreshPending)
+            return
+        sidebar.treeOrderingRefreshPending = true
+        Qt.callLater(sidebar.doRefreshTreeOrderingCoalesced)
+    }
+    function doRefreshTreeOrderingCoalesced() {
+        sidebar.treeOrderingRefreshPending = false
+        sidebar.refreshTreeOrdering()
+    }
 
     // Sort mode / combine-candidate clustering (see AppSettings.sortMode's
     // doc comment and CombineGroupOutline usage below): computed once here,
@@ -1177,6 +1214,7 @@ Rectangle {
     property var selectionTranscribePaths: []
     property var selectionRelabelPaths: []
     property var selectionChaptersPaths: []
+    property var selectionRunAllPaths: []
     property bool selectionEligibilityRefreshPending: false
     // DEFERRED + coalesced, deliberately: the search*Paths() helpers walk
     // searchProxy.data(...) over every proxy row, and several callers fire
@@ -1202,12 +1240,14 @@ Rectangle {
             sidebar.selectionTranscribePaths = []
             sidebar.selectionRelabelPaths = []
             sidebar.selectionChaptersPaths = []
+            sidebar.selectionRunAllPaths = []
             return
         }
         const narrow = (paths) => paths.filter((p) => selected.indexOf(p) >= 0)
         sidebar.selectionTranscribePaths = narrow(sidebar.searchTranscribePaths())
         sidebar.selectionRelabelPaths = narrow(sidebar.searchRelabelPaths())
         sidebar.selectionChaptersPaths = narrow(sidebar.searchChaptersPaths())
+        sidebar.selectionRunAllPaths = narrow(sidebar.searchRunAllPaths())
     }
     onSelectedPathsChanged: sidebar.refreshSelectionEligibility()
 
@@ -2596,13 +2636,13 @@ Rectangle {
                 }
             }
 
-            // Items 24/53: search-scoped "run all jobs", parity with the
-            // ribbon's runAllButton — over the untranscribed audio in the
-            // filtered result set.
+            // Search-scoped "run all available jobs", parity with the
+            // ribbon's runAllButton — over every audio file in the filtered
+            // result set (see searchRunAllPaths()).
             AppIconButton {
                 id: searchRunAllButton
                 iconName: "run-all"
-                tooltip: qsTr("Run all jobs for results")
+                tooltip: qsTr("Run all available jobs for results")
                 Layout.preferredWidth: 22
                 Layout.preferredHeight: 22
                 enabled: sidebar.transcriptionController && sidebar.searchFilterActive

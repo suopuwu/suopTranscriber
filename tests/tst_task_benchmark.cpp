@@ -69,6 +69,47 @@ private slots:
         NullContextFixture fixture;
         QVERIFY_EXCEPTION_THROWN(task.run(fixture.ctx), TaskError);
     }
+
+    // The progress bar is SelfCumulative — the fraction BenchmarkTask emits
+    // IS the bar, so this pure helper's math is the whole smoothness fix.
+    // Pure, no engine/model needed.
+
+    void benchmarkOverallProgress_endOfModelEqualsPerModelStep()
+    {
+        for (int n : {1, 3, 5}) {
+            for (int i = 0; i < n; ++i)
+                QCOMPARE(benchmarkOverallProgress(i, n, 10.0, 10.0), double(i + 1) / n);
+        }
+    }
+
+    void benchmarkOverallProgress_rampsWithinAModel()
+    {
+        const int i = 1;
+        const int n = 4;
+        double previous = -1.0;
+        for (double secondsDone : {0.0, 2.5, 5.0, 7.5, 10.0}) {
+            const double p = benchmarkOverallProgress(i, n, secondsDone, 10.0);
+            QVERIFY2(p > previous, qPrintable(QStringLiteral("not monotone at secondsDone=%1").arg(secondsDone)));
+            QVERIFY(p >= double(i) / n);
+            QVERIFY(p <= double(i + 1) / n);
+            previous = p;
+        }
+    }
+
+    void benchmarkOverallProgress_zeroModelsIsZero()
+    {
+        QCOMPARE(benchmarkOverallProgress(0, 0, 5.0, 10.0), 0.0);
+    }
+
+    void benchmarkOverallProgress_zeroTotalSecondsIsModelLowerEdge()
+    {
+        QCOMPARE(benchmarkOverallProgress(2, 5, 3.0, 0.0), 2.0 / 5.0);
+    }
+
+    void benchmarkOverallProgress_clampsOvershoot()
+    {
+        QCOMPARE(benchmarkOverallProgress(0, 4, 20.0, 10.0), 1.0 / 4.0);
+    }
 };
 
 QTEST_GUILESS_MAIN(TestTaskBenchmark)

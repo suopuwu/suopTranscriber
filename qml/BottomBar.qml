@@ -126,6 +126,17 @@ Item {
         }
         return ""
     }
+    // The URL of whatever job the task label currently names (busy → the
+    // active job's file; idle → the front queued job's). Empty for a
+    // display job with no file (a download/benchmark) — the label is then
+    // not clickable. Mirrors displayJobFileName's busy/queued branching.
+    readonly property url displayJobFileUrl: {
+        if (bottomBar.busy)
+            return bottomBar.transcriptionController ? bottomBar.transcriptionController.currentFile : ""
+        if (bottomBar.frontQueuedJob && bottomBar.frontQueuedJob.fileUrl)
+            return bottomBar.frontQueuedJob.fileUrl
+        return ""
+    }
     // See TranscriptionController::currentPhase's doc comment — "loading"
     // and "decoding" have no real progress number behind them (whisper.cpp/
     // ffmpeg have no hook for model-load/decode time), so taskProgress is a
@@ -245,6 +256,14 @@ Item {
         // entirely and say so instead of showing a stale "~Y left".
         if (bottomBar.activePaused)
             return qsTr("paused at %1").arg(elapsed)
+        // -2 is TranscriptionController::kStalledEtaMs: overallProgress hasn't
+        // actually moved in a generous while (see estimatedRemainingMs()'s doc
+        // comment) — a runaway extrapolation ("~114:00:00 left" on a 3-minute
+        // file, 2026-07-24 batch-wedge report) is worse than useless, so say so
+        // honestly instead of a fake number. Distinct from -1 (unknown/too
+        // early), which still just shows bare elapsed.
+        if (bottomBar.estimatedRemainingMs === -2)
+            return qsTr("stalled at %1").arg(elapsed)
         return bottomBar.estimatedRemainingMs >= 0
             ? (elapsed + " / ~" + bottomBar.formatDuration(bottomBar.estimatedRemainingMs) + " left")
             : elapsed
@@ -414,7 +433,14 @@ Item {
         // it. The fillWidth segment is also the one that elides, and eliding
         // belongs at the far end of the string, never mid-path.
         RowLayout {
-            Layout.fillWidth: true
+            // When bottomBarPathShrinkToContent is on, the path sizes to its
+            // content and hands the row's slack to the task label instead of
+            // eating it; capped at half the bar so a deep vault still elides
+            // (the last segment's Layout.fillWidth handles that) rather than
+            // shoving the task label off-screen. Off → the original greedy
+            // fillWidth behavior.
+            Layout.fillWidth: !AppSettings.bottomBarPathShrinkToContent
+            Layout.maximumWidth: AppSettings.bottomBarPathShrinkToContent ? bottomBar.width * 0.5 : -1
             spacing: 0
 
             Label {
@@ -475,12 +501,48 @@ Item {
         }
 
         Label {
-            Layout.preferredWidth: 160
+            id: taskLabel
+            objectName: "bottomBarTaskLabel"
+            // When the path yields its slack (bottomBarPathShrinkToContent),
+            // this label claims it and truncates less; otherwise the original
+            // fixed 160 box.
+            Layout.fillWidth: AppSettings.bottomBarPathShrinkToContent
+            Layout.preferredWidth: AppSettings.bottomBarPathShrinkToContent ? -1 : 160
             elide: Text.ElideMiddle
+            // bottomBarTaskTextFit: shrink the font (down to 8px) to fit,
+            // wrapping to a second line, before falling back to elide. Bounded
+            // by the row height so the bar height never changes.
+            fontSizeMode: AppSettings.bottomBarTaskTextFit ? Text.Fit : Text.FixedSize
+            minimumPixelSize: 8
+            wrapMode: AppSettings.bottomBarTaskTextFit ? Text.WordWrap : Text.NoWrap
+            maximumLineCount: 2
             visible: bottomBar.hasDisplayJob
             text: bottomBar.displayJobKindLabel + ": " + bottomBar.displayJobFileName
             color: Theme.textMuted
             font.pixelSize: 11
+
+            readonly property bool clickable: AppSettings.bottomBarTaskClickOpensFile
+                && bottomBar.displayJobFileUrl.toString() !== ""
+
+            HoverHandler {
+                id: taskLabelHover
+                cursorShape: taskLabel.clickable ? Qt.PointingHandCursor : Qt.ArrowCursor
+            }
+            TapHandler {
+                enabled: taskLabel.clickable
+                // Small target beside other controls — see the pauseButton
+                // TapHandler for why ReleaseWithinBounds.
+                gesturePolicy: TapHandler.ReleaseWithinBounds
+                // Same file://-stripping convention as the Tasks-popup rows
+                // (see the jobRow TapHandler ~line 1115) and Sidebar's
+                // fileActivated — Main.qml's onTaskActivated opens it.
+                onTapped: bottomBar.taskActivated(
+                    bottomBar.displayJobFileUrl.toString().replace("file://", ""))
+            }
+            ToolTip.visible: AppSettings.bottomBarTaskTooltip && taskLabelHover.hovered
+                && taskLabel.text !== ""
+            ToolTip.text: taskLabel.text
+            ToolTip.delay: 400
         }
 
         // Deliberately a SEPARATE, non-eliding Label — this is the one
@@ -643,6 +705,7 @@ Item {
     // vanishing the instant they finish.
     Popup {
         id: jobListPopup
+        objectName: "tasksPopup"
         y: -height - 4
         // tasksButton.x is relative to the RowLayout it's nested in, not to
         // bottomBar (this popup's actual positioning parent) — using it
@@ -666,6 +729,15 @@ Item {
         // cap (below) keeps rows scrollable well before this outer cap is hit
         // in practice, but the cap is still a needed hard backstop.
         readonly property int innerPadding: 14
+        // The Basic style's vertical ScrollBar is an OVERLAY — `parent: control;
+        // x: control.width - width`, 10px wide, and `visible` whenever policy
+        // isn't AlwaysOff (only its contentItem's OPACITY fades), so it is
+        // permanently hit-testable even when no bar is drawn. Full-width task
+        // rows put the per-row × straight under it and it swallowed the press.
+        // Same fix as ScrollPage.scrollBarGutter / SettingsPopup: the ScrollView
+        // bleeds into the right padding and the rows give the lane back, so the
+        // bar floats in the gutter and content lands exactly where it did before.
+        readonly property int scrollBarGutter: 12
         height: Math.min(jobColumn.implicitHeight + 2 * innerPadding, 600)
         // Item: the height calc above assumes jobColumn (anchors.fill parent +
         // margins:innerPadding) spans the WHOLE popup, so the popup's own
@@ -710,11 +782,17 @@ Item {
             // Item 21: symmetric with the popup height's 2*innerPadding, so
             // the padding below the list equals the padding above the header.
             anchors.margins: jobListPopup.innerPadding
+            // Right edge only: reach into the padding so the overlay bar lands
+            // in the gutter (see scrollBarGutter); children hand the lane back.
+            anchors.rightMargin: jobListPopup.innerPadding - jobListPopup.scrollBarGutter
             spacing: 8
 
             RowLayout {
                 id: taskHeaderRow
                 Layout.fillWidth: true
+                // Not scrolled, so it cedes no lane — give back what the
+                // ColumnLayout bled off above (Clear stays put).
+                Layout.rightMargin: jobListPopup.scrollBarGutter
 
                 Label {
                     Layout.fillWidth: true
@@ -817,304 +895,372 @@ Item {
                 }
             }
 
-            ScrollView {
+            ListView {
+                id: jobListView
                 Layout.fillWidth: true
-                // Explicit preferredHeight (not Layout.fillHeight) — a
-                // fillHeight ScrollView inside a Popup whose own height is
-                // in turn derived from this ColumnLayout's implicitHeight
-                // is a circular/ill-defined size request: the ScrollView
-                // contributes ~0 to implicitHeight since "fill" isn't an
-                // intrinsic size, which collapsed the whole popup down to
-                // just the header row. Deriving from the ListView's real
-                // contentHeight (capped) breaks that cycle.
+                // Explicit preferredHeight (not Layout.fillHeight) — this
+                // ListView sits directly in a Popup whose own height is in
+                // turn derived from this ColumnLayout's implicitHeight, a
+                // circular/ill-defined size request otherwise (a "fill"
+                // contributes ~0 to implicitHeight, which collapsed the whole
+                // popup down to just the header row). Deriving from the
+                // ListView's own contentHeight (capped) breaks that cycle.
                 Layout.preferredHeight: Math.min(jobListView.contentHeight, 320)
                 clip: true
-                ScrollBar.horizontal.policy: ScrollBar.AlwaysOff
+                // Item 023: this ListView used to sit inside a ScrollView — a
+                // Flickable nested in a Flickable, the standard anti-pattern —
+                // which combined with the non-flattened model below to defeat
+                // virtualization outright for an expanded large batch.
+                // ListView is now the sole scroller, with its own overlay
+                // ScrollBar standing in for the ScrollView's.
+                ScrollBar.vertical: ScrollBar {}
+                // Realize rows a little beyond the viewport so a fast flick
+                // doesn't show blank gaps while new delegates spin up — safe
+                // now that flatRows (below) bounds delegate count to a small
+                // multiple of what's visible, instead of one mega-delegate
+                // fanning out an entire batch via a nested Repeater.
+                cacheBuffer: 240
+                // Items 10/11: bind to the pre-partitioned sortedJobs view
+                // (see TranscriptionController::sortedJobs) — the
+                // currently-running/next-to-run jobs sit at the TOP in
+                // real run order, with finished (done/failed/cancelled)
+                // history demoted to the bottom. The old blind reversal of
+                // raw jobs() inverted run order (soonest-to-run at the
+                // BOTTOM) and never separated finished from pending.
+                // Nothing else (queuedPositionOf(), the move-up/down
+                // handlers, etc.) touches this binding — they all recompute
+                // position by walking transcriptionController.jobs (raw
+                // append order) from scratch, so they're unaffected.
+                model: jobListView.flatRows
+                spacing: 2
 
-                ListView {
-                    id: jobListView
-                    // Items 10/11: bind to the pre-partitioned sortedJobs view
-                    // (see TranscriptionController::sortedJobs) — the
-                    // currently-running/next-to-run jobs sit at the TOP in
-                    // real run order, with finished (done/failed/cancelled)
-                    // history demoted to the bottom. The old blind reversal of
-                    // raw jobs() inverted run order (soonest-to-run at the
-                    // BOTTOM) and never separated finished from pending.
-                    // Nothing else (queuedPositionOf(), the move-up/down
-                    // handlers, etc.) touches this binding — they all recompute
-                    // position by walking transcriptionController.jobs (raw
-                    // append order) from scratch, so they're unaffected.
-                    model: bottomBar.transcriptionController ? bottomBar.transcriptionController.sortedJobs : []
-                    spacing: 2
+                // Which batches are expanded, keyed by batchId. Held HERE,
+                // not on the delegate: sortedJobs returns a fresh array on
+                // every queueChanged (a member finishing, say), so the
+                // ListView recreates its delegates and any per-delegate
+                // state would reset — re-collapsing a batch the user just
+                // opened, repeatedly, mid-processing. Keyed by the stable
+                // batchId, expansion survives those rebuilds. (Reassigned,
+                // not mutated, so the delegates' bindings re-evaluate.)
+                property var expandedBatches: ({})
+                function toggleBatchExpanded(batchId) {
+                    const next = {}
+                    for (const k in jobListView.expandedBatches)
+                        next[k] = jobListView.expandedBatches[k]
+                    next[batchId] = !next[batchId]
+                    jobListView.expandedBatches = next
+                }
 
-                    // Which batches are expanded, keyed by batchId. Held HERE,
-                    // not on the delegate: sortedJobs returns a fresh array on
-                    // every queueChanged (a member finishing, say), so the
-                    // ListView recreates its delegates and any per-delegate
-                    // state would reset — re-collapsing a batch the user just
-                    // opened, repeatedly, mid-processing. Keyed by the stable
-                    // batchId, expansion survives those rebuilds. (Reassigned,
-                    // not mutated, so the delegates' bindings re-evaluate.)
-                    property var expandedBatches: ({})
-                    function toggleBatchExpanded(batchId) {
-                        const next = {}
-                        for (const k in jobListView.expandedBatches)
-                            next[k] = jobListView.expandedBatches[k]
-                        next[batchId] = !next[batchId]
-                        jobListView.expandedBatches = next
+                // Item 023: flattens sortedJobs (each batch header carrying a
+                // `members` array — see TranscriptionController::
+                // collapseBatches()) into ONE row per rendered list item, so
+                // every visible row — batch header, standalone task, and each
+                // member of an EXPANDED batch — is a real top-level ListView
+                // entry. The old scheme collapsed a batch into a single
+                // ListView delegate that fanned its members out through a
+                // NESTED Repeater, which instantiated every member Item at
+                // once regardless of what was on screen (all 250 of them for
+                // a large batch) — exactly what ListView's own virtualization
+                // exists to avoid. Flattening trades that for one delegate
+                // per row, so ListView only ever realizes what's near the
+                // viewport. Each row is a shallow copy of the original entry/
+                // member object (its own fields untouched) plus rowIsHeader/
+                // rowIsMember/rowEntryIsBatch/rowExpanded tags standing in for
+                // what the old delegate derived from entryColumn+index.
+                readonly property var flatRows: {
+                    if (!bottomBar.transcriptionController)
+                        return []
+                    const entries = bottomBar.transcriptionController.sortedJobs
+                    const rows = []
+                    for (let i = 0; i < entries.length; ++i) {
+                        const entry = entries[i]
+                        if (!entry.isBatch) {
+                            rows.push(Object.assign({}, entry, {
+                                rowIsHeader: false, rowIsMember: false,
+                                rowEntryIsBatch: false, rowExpanded: false
+                            }))
+                            continue
+                        }
+                        const expanded = jobListView.expandedBatches[entry.batchId] === true
+                        rows.push(Object.assign({}, entry, {
+                            rowIsHeader: true, rowIsMember: false,
+                            rowEntryIsBatch: true, rowExpanded: expanded
+                        }))
+                        if (expanded) {
+                            const members = entry.members
+                            for (let j = 0; j < members.length; ++j) {
+                                rows.push(Object.assign({}, members[j], {
+                                    rowIsHeader: false, rowIsMember: true,
+                                    rowEntryIsBatch: true, rowExpanded: expanded
+                                }))
+                            }
+                        }
+                    }
+                    return rows
+                }
+
+                // A multi-select bulk op (transcribe/relabel/chapters/
+                // detect-speakers/run-all/move over N files) collapses into
+                // ONE row via TranscriptionController::collapseBatches() —
+                // modelData.isBatch, with modelData.members holding the
+                // per-file task rows; flatRows above fans those members back
+                // out into their own rows when the batch is expanded. This
+                // delegate renders all three row roles (standalone / header /
+                // member) off the row's own rowIsHeader/rowIsMember tags, so
+                // the row layout still lives in one place.
+                delegate: Item {
+                    id: jobRow
+                    required property var modelData
+                    // Minus the gutter: the ScrollBar overlay floats there,
+                    // and a full-width row buries its own × under it.
+                    width: jobListView.width - jobListPopup.scrollBarGutter
+                    // Grow to fit a wrapped kind badge (kindLabel wraps to
+                    // at most 2 lines) OR the model sub-line under the
+                    // filename; single-line rows stay at 24.
+                    height: Math.max(24, kindLabel.implicitHeight + 6, nameColumn.implicitHeight + 6)
+
+                    // Role of this row — tagged directly onto it by
+                    // jobListView.flatRows rather than derived from an
+                    // enclosing batch Column + index (see flatRows' doc
+                    // comment for why that scheme had to go).
+                    readonly property bool isHeader: modelData.rowIsHeader === true
+                    readonly property bool isMember: modelData.rowIsMember === true
+                    readonly property bool entryIsBatch: modelData.rowEntryIsBatch === true
+                    readonly property bool rowExpanded: modelData.rowExpanded === true
+
+                    readonly property bool isDownload: modelData.kind === "download"
+                    readonly property string fileName: {
+                        if (jobRow.isHeader) {
+                            // The batch header names the whole set by its
+                            // distinct-file count (a run-all batch has
+                            // several tasks per file, so this is files, not
+                            // tasks — see collapseBatches()).
+                            const n = modelData.batchCount
+                            return n === 1 ? qsTr("1 file") : qsTr("%1 files").arg(n)
+                        }
+                        if (jobRow.isDownload) {
+                            // Downloads have no fileUrl (nothing to
+                            // open) — name the row after WHAT is being
+                            // downloaded instead.
+                            switch (modelData.downloadTarget) {
+                            case "model": return modelData.modelId
+                            case "label": return qsTr("auto-label model")
+                            case "vad": return qsTr("voice-activity model")
+                            case "segmentation": return qsTr("speaker segmentation model")
+                            case "embedding": return qsTr("speaker embedding model")
+                            default: return ""
+                            }
+                        }
+                        if (modelData.kind === "usbGrab") {
+                            // Name the row after the DRIVE, not the vault-
+                            // root destination folder (which every grab
+                            // shares — "USB grab recordings" told you
+                            // nothing). fileCount is -1 until the run's
+                            // pre-count pass reports it, so show the drive
+                            // alone until then.
+                            const drive = modelData.ruleName || qsTr("USB device")
+                            const n = modelData.fileCount
+                            return (n >= 0) ? qsTr("%1 — %2 files").arg(drive).arg(n) : drive
+                        }
+                        const s = modelData.fileUrl ? modelData.fileUrl.toString() : ""
+                        return s.substring(s.lastIndexOf("/") + 1)
+                    }
+                    // O16: same root cause as bottomBar.elapsedEtaText —
+                    // a real cooperative pause never changes
+                    // modelData.status away from "active" (only
+                    // JobStatus::Paused's narrow loading-restart edge
+                    // case does that), so this row has to check
+                    // bottomBar.activePaused directly too, not just the
+                    // status string, since this IS unambiguously the
+                    // Active row whenever modelData.status === "active"
+                    // (there's only ever one).
+                    readonly property bool isActivePaused: modelData.status === "active" && bottomBar.activePaused
+                    // O20: a cancelled job is reported as
+                    // status: Failed, error: "Cancelled" by the backend
+                    // (see TranscriptionController::jobs()'s doc
+                    // comment) — same as any other failure otherwise, so
+                    // without this check a user-initiated cancel and a
+                    // genuine transcription failure render identically.
+                    readonly property bool isCancelled: modelData.status === "failed" && modelData.error === "Cancelled"
+                    readonly property string statusText: {
+                        if (jobRow.isActivePaused)
+                            return qsTr("paused")
+                        if (jobRow.isCancelled)
+                            return qsTr("cancelled")
+                        return modelData.status
+                    }
+                    readonly property color statusColor: {
+                        if (jobRow.isActivePaused)
+                            return "#e67e22"
+                        if (jobRow.isCancelled)
+                            return "#888888"
+                        switch (modelData.status) {
+                        case "done": return "#2ecc71"
+                        case "failed": return "#e74c3c"
+                        case "active": return "#3498db"
+                        case "paused": return "#e67e22"
+                        default: return "#f1c40f"
+                        }
+                    }
+                    // Distinguishes what kind of work this job actually
+                    // is — the same queue/worker thread runs full
+                    // transcriptions, "regenerate label" jobs, speaker
+                    // renames, and (Wave N) model downloads, which
+                    // otherwise look identical in this list (same
+                    // status colors).
+                    readonly property string kindLabel: modelData.kindLabel
+                    // Which model this task will actually run — frozen at
+                    // enqueue time (each Task stores its own ids; changing
+                    // the picker afterwards never retargets a queued task),
+                    // so with several tasks queued this line is the only way
+                    // to tell them apart. Empty for kinds that don't name a
+                    // model, and for the rows already NAMED after one (a
+                    // download/import row's title IS the model — repeating
+                    // it under itself reads as a bug).
+                    readonly property string modelDetail: {
+                        if (jobRow.isHeader || jobRow.isDownload || modelData.kind === "modelIo")
+                            return ""
+                        const c = bottomBar.transcriptionController
+                        if (!c)
+                            return ""
+                        if (modelData.kind === "transcribe")
+                            return c.modelShortLabel(modelData.modelId)
+                        if (modelData.kind === "diarize")
+                            return c.modelShortLabel(modelData.segmentationModelId)
+                                + " · " + c.modelShortLabel(modelData.embeddingModelId)
+                        return ""
+                    }
+                    // The un-elided form, plus the tuning the short line has
+                    // no room for — the line above is width-capped, so the
+                    // raw ids only exist on hover.
+                    readonly property string modelDetailFull: {
+                        if (modelData.kind === "transcribe")
+                            return qsTr("Model: %1").arg(modelData.modelId || "")
+                        if (modelData.kind === "diarize")
+                            return qsTr("Segmentation: %1\nEmbedding: %2\nSensitivity: %3")
+                                .arg(modelData.segmentationModelId || "")
+                                .arg(modelData.embeddingModelId || "")
+                                .arg(Number(modelData.diarizationThreshold).toFixed(2))
+                        return ""
+                    }
+                    // Item 4/7: elapsed/ETA while this IS the active
+                    // row (there's only ever one, so bottomBar's own
+                    // elapsedEtaText is unambiguously about THIS row
+                    // whenever status is "active"); final duration once
+                    // Done/Failed; nothing yet while Queued.
+                    readonly property string detailText: {
+                        // Batch header: show file-completion progress
+                        // ("2/5 done") while anything's pending; the summed
+                        // wall-clock once the whole batch is terminal.
+                        if (jobRow.isHeader) {
+                            if (modelData.status === "done" || modelData.status === "failed")
+                                return modelData.durationMs >= 0
+                                    ? bottomBar.formatDuration(modelData.durationMs) : ""
+                            return qsTr("%1/%2 done").arg(modelData.batchDoneCount).arg(modelData.batchCount)
+                        }
+                        if (modelData.status === "active") {
+                            // Avoid "paused (paused at 45s)" — statusText
+                            // above already says "paused"; just the bare
+                            // elapsed time is needed here.
+                            return jobRow.isActivePaused
+                                ? bottomBar.formatDuration(bottomBar.activeElapsedMs)
+                                : bottomBar.elapsedEtaText
+                        }
+                        if (modelData.status === "done" || modelData.status === "failed")
+                            return bottomBar.formatDuration(modelData.durationMs)
+                        return ""
+                    }
+                    // Item 3: up/down only make sense among Queued rows
+                    // — see queuedPositionOf()'s doc comment. Never for a
+                    // batch header or a member (a batch keeps its enqueue
+                    // order; reorder stays a standalone-row affordance).
+                    readonly property bool reorderable: !jobRow.entryIsBatch
+                    readonly property int queuedPosition: bottomBar.queuedPositionOf(modelData.id)
+
+                    // A batch header's own row-tap toggles expand rather
+                    // than opening a file (it has none); a member/standalone
+                    // opens its note. Downloads open nothing.
+                    readonly property bool rowClickable: jobRow.isHeader || !jobRow.isDownload
+
+                    HoverHandler {
+                        id: jobRowHover
+                        cursorShape: Qt.PointingHandCursor
+                        enabled: jobRow.rowClickable
+                    }
+                    // Clicking a task jumps straight to its note — same
+                    // "row itself is clickable, inner buttons still work
+                    // independently" pattern as Sidebar.qml's file rows;
+                    // the buttons' own TapHandlers below (child Items)
+                    // take priority over this one within their bounds.
+                    // A batch header toggles its expansion instead.
+                    TapHandler {
+                        enabled: jobRow.rowClickable
+                        onTapped: {
+                            if (jobRow.isHeader) {
+                                jobListView.toggleBatchExpanded(modelData.batchId)
+                                return
+                            }
+                            bottomBar.taskActivated(jobRow.modelData.fileUrl.toString().replace("file://", ""))
+                            jobListPopup.close()
+                        }
+                    }
+                    HoverBorder {
+                        anchors.fill: parent
+                        active: jobRowHover.hovered && jobRow.rowClickable
                     }
 
-                    // A multi-select bulk op (transcribe/relabel/chapters/
-                    // detect-speakers/run-all/move over N files) collapses into
-                    // ONE row via TranscriptionController::collapseBatches() —
-                    // modelData.isBatch, with modelData.members holding the
-                    // per-file task rows. This delegate is a Column: the batch
-                    // header (or a standalone task) on top, and — for an
-                    // EXPANDED batch — its member rows beneath. taskRowComponent
-                    // renders all three cases (standalone / header / member) so
-                    // the row layout lives in one place; index 0 is the header,
-                    // index > 0 a member (see its isHeader/isMember).
-                    delegate: Column {
-                        id: entryColumn
-                        required property var modelData
-                        width: jobListView.width
-                        spacing: 2
-
-                        readonly property bool entryIsBatch: modelData.isBatch === true
-                        // Read from jobListView.expandedBatches so it survives
-                        // the model rebuilds sortedJobs triggers — see that
-                        // property's comment.
-                        readonly property bool expanded: entryColumn.entryIsBatch
-                            && jobListView.expandedBatches[modelData.batchId] === true
-
-                        readonly property var visibleRows: {
-                            if (!entryColumn.entryIsBatch)
-                                return [modelData]
-                            const rows = [modelData] // header first
-                            if (entryColumn.expanded) {
-                                const ms = modelData.members
-                                for (let i = 0; i < ms.length; ++i)
-                                    rows.push(ms[i])
-                            }
-                            return rows
-                        }
-
-                        Repeater {
-                            model: entryColumn.visibleRows
-                            delegate: taskRowComponent
-                        }
-
-                        Component {
-                            id: taskRowComponent
-                            Item {
-                        id: jobRow
-                        required property var modelData
-                        required property int index
-                        width: entryColumn.width
-                        // Grow to fit a wrapped kind badge (kindLabel wraps to
-                        // at most 2 lines); single-line rows stay at 24.
-                        height: Math.max(24, kindLabel.implicitHeight + 6)
-
-                        // Role within entryColumn: a batch's header is index 0
-                        // (aggregate row), its members index > 0; a standalone
-                        // task is a lone non-batch row.
-                        readonly property bool isHeader: entryColumn.entryIsBatch && index === 0
-                        readonly property bool isMember: entryColumn.entryIsBatch && index > 0
-
-                        readonly property bool isDownload: modelData.kind === "download"
-                        readonly property string fileName: {
-                            if (jobRow.isHeader) {
-                                // The batch header names the whole set by its
-                                // distinct-file count (a run-all batch has
-                                // several tasks per file, so this is files, not
-                                // tasks — see collapseBatches()).
-                                const n = modelData.batchCount
-                                return n === 1 ? qsTr("1 file") : qsTr("%1 files").arg(n)
-                            }
-                            if (jobRow.isDownload) {
-                                // Downloads have no fileUrl (nothing to
-                                // open) — name the row after WHAT is being
-                                // downloaded instead.
-                                switch (modelData.downloadTarget) {
-                                case "model": return modelData.modelId
-                                case "label": return qsTr("auto-label model")
-                                case "vad": return qsTr("voice-activity model")
-                                case "segmentation": return qsTr("speaker segmentation model")
-                                case "embedding": return qsTr("speaker embedding model")
-                                default: return ""
-                                }
-                            }
-                            if (modelData.kind === "usbGrab") {
-                                // Name the row after the DRIVE, not the vault-
-                                // root destination folder (which every grab
-                                // shares — "USB grab recordings" told you
-                                // nothing). fileCount is -1 until the run's
-                                // pre-count pass reports it, so show the drive
-                                // alone until then.
-                                const drive = modelData.ruleName || qsTr("USB device")
-                                const n = modelData.fileCount
-                                return (n >= 0) ? qsTr("%1 — %2 files").arg(drive).arg(n) : drive
-                            }
-                            const s = modelData.fileUrl ? modelData.fileUrl.toString() : ""
-                            return s.substring(s.lastIndexOf("/") + 1)
-                        }
-                        // O16: same root cause as bottomBar.elapsedEtaText —
-                        // a real cooperative pause never changes
-                        // modelData.status away from "active" (only
-                        // JobStatus::Paused's narrow loading-restart edge
-                        // case does that), so this row has to check
-                        // bottomBar.activePaused directly too, not just the
-                        // status string, since this IS unambiguously the
-                        // Active row whenever modelData.status === "active"
-                        // (there's only ever one).
-                        readonly property bool isActivePaused: modelData.status === "active" && bottomBar.activePaused
-                        // O20: a cancelled job is reported as
-                        // status: Failed, error: "Cancelled" by the backend
-                        // (see TranscriptionController::jobs()'s doc
-                        // comment) — same as any other failure otherwise, so
-                        // without this check a user-initiated cancel and a
-                        // genuine transcription failure render identically.
-                        readonly property bool isCancelled: modelData.status === "failed" && modelData.error === "Cancelled"
-                        readonly property string statusText: {
-                            if (jobRow.isActivePaused)
-                                return qsTr("paused")
-                            if (jobRow.isCancelled)
-                                return qsTr("cancelled")
-                            return modelData.status
-                        }
-                        readonly property color statusColor: {
-                            if (jobRow.isActivePaused)
-                                return "#e67e22"
-                            if (jobRow.isCancelled)
-                                return "#888888"
-                            switch (modelData.status) {
-                            case "done": return "#2ecc71"
-                            case "failed": return "#e74c3c"
-                            case "active": return "#3498db"
-                            case "paused": return "#e67e22"
-                            default: return "#f1c40f"
-                            }
-                        }
-                        // Distinguishes what kind of work this job actually
-                        // is — the same queue/worker thread runs full
-                        // transcriptions, "regenerate label" jobs, speaker
-                        // renames, and (Wave N) model downloads, which
-                        // otherwise look identical in this list (same
-                        // status colors).
-                        readonly property string kindLabel: modelData.kindLabel
-                        // Item 4/7: elapsed/ETA while this IS the active
-                        // row (there's only ever one, so bottomBar's own
-                        // elapsedEtaText is unambiguously about THIS row
-                        // whenever status is "active"); final duration once
-                        // Done/Failed; nothing yet while Queued.
-                        readonly property string detailText: {
-                            // Batch header: show file-completion progress
-                            // ("2/5 done") while anything's pending; the summed
-                            // wall-clock once the whole batch is terminal.
-                            if (jobRow.isHeader) {
-                                if (modelData.status === "done" || modelData.status === "failed")
-                                    return modelData.durationMs >= 0
-                                        ? bottomBar.formatDuration(modelData.durationMs) : ""
-                                return qsTr("%1/%2 done").arg(modelData.batchDoneCount).arg(modelData.batchCount)
-                            }
-                            if (modelData.status === "active") {
-                                // Avoid "paused (paused at 45s)" — statusText
-                                // above already says "paused"; just the bare
-                                // elapsed time is needed here.
-                                return jobRow.isActivePaused
-                                    ? bottomBar.formatDuration(bottomBar.activeElapsedMs)
-                                    : bottomBar.elapsedEtaText
-                            }
-                            if (modelData.status === "done" || modelData.status === "failed")
-                                return bottomBar.formatDuration(modelData.durationMs)
-                            return ""
-                        }
-                        // Item 3: up/down only make sense among Queued rows
-                        // — see queuedPositionOf()'s doc comment. Never for a
-                        // batch header or a member (a batch keeps its enqueue
-                        // order; reorder stays a standalone-row affordance).
-                        readonly property bool reorderable: !entryColumn.entryIsBatch
-                        readonly property int queuedPosition: bottomBar.queuedPositionOf(modelData.id)
-
-                        // A batch header's own row-tap toggles expand rather
-                        // than opening a file (it has none); a member/standalone
-                        // opens its note. Downloads open nothing.
-                        readonly property bool rowClickable: jobRow.isHeader || !jobRow.isDownload
-
-                        HoverHandler {
-                            id: jobRowHover
-                            cursorShape: Qt.PointingHandCursor
-                            enabled: jobRow.rowClickable
-                        }
-                        // Clicking a task jumps straight to its note — same
-                        // "row itself is clickable, inner buttons still work
-                        // independently" pattern as Sidebar.qml's file rows;
-                        // the buttons' own TapHandlers below (child Items)
-                        // take priority over this one within their bounds.
-                        // A batch header toggles its expansion instead.
-                        TapHandler {
-                            enabled: jobRow.rowClickable
-                            onTapped: {
-                                if (jobRow.isHeader) {
-                                    jobListView.toggleBatchExpanded(modelData.batchId)
-                                    return
-                                }
-                                bottomBar.taskActivated(jobRow.modelData.fileUrl.toString().replace("file://", ""))
-                                jobListPopup.close()
-                            }
-                        }
-                        HoverBorder {
+                        RowLayout {
                             anchors.fill: parent
-                            active: jobRowHover.hovered && jobRow.rowClickable
-                        }
+                            // Indent member rows so they read as children of
+                            // the batch header above them.
+                            anchors.leftMargin: jobRow.isMember ? 14 : 0
+                            spacing: 6
 
-                            RowLayout {
-                                anchors.fill: parent
-                                // Indent member rows so they read as children of
-                                // the batch header above them.
-                                anchors.leftMargin: jobRow.isMember ? 14 : 0
-                                spacing: 6
-
-                                // Batch header disclosure chevron (expanded vs
-                                // collapsed) — a header reads as a disclosure
-                                // row. Only headers show it (an invisible
-                                // Layout child collapses, so standalone/member
-                                // rows keep their status dot at the left edge).
-                                Item {
-                                    Layout.preferredWidth: 9
-                                    Layout.preferredHeight: 9
-                                    visible: jobRow.isHeader
-                                    AppIcon {
-                                        anchors.centerIn: parent
-                                        name: entryColumn.expanded ? "collapse" : "expand"
-                                        iconSize: 9
-                                        color: "#8fa8bf"
-                                    }
-                                }
-                                Rectangle {
-                                    width: 8
-                                    height: 8
-                                    radius: 4
-                                    color: jobRow.statusColor
-                                }
-                                Label {
-                                    id: kindLabel
-                                    Layout.preferredWidth: 80
-                                    Layout.alignment: Qt.AlignVCenter
-                                    // Longest kinds ("Generate chapters",
-                                    // "Diarization sweep") no longer truncate:
-                                    // wrap to a second line, capped at 2 so a
-                                    // pathological label can't balloon the row
-                                    // (elide is the >2-line backstop). jobRow's
-                                    // height binding grows the row to fit.
-                                    wrapMode: Text.WordWrap
-                                    maximumLineCount: 2
-                                    elide: Text.ElideRight
-                                    text: jobRow.kindLabel
+                            // Batch header disclosure chevron (expanded vs
+                            // collapsed) — a header reads as a disclosure
+                            // row. Only headers show it (an invisible
+                            // Layout child collapses, so standalone/member
+                            // rows keep their status dot at the left edge).
+                            Item {
+                                Layout.preferredWidth: 9
+                                Layout.preferredHeight: 9
+                                visible: jobRow.isHeader
+                                AppIcon {
+                                    anchors.centerIn: parent
+                                    name: jobRow.rowExpanded ? "collapse" : "expand"
+                                    iconSize: 9
                                     color: "#8fa8bf"
-                                    font.pixelSize: 10
-                                    font.bold: true
                                 }
+                            }
+                            Rectangle {
+                                width: 8
+                                height: 8
+                                radius: 4
+                                color: jobRow.statusColor
+                            }
+                            Label {
+                                id: kindLabel
+                                Layout.preferredWidth: 80
+                                Layout.alignment: Qt.AlignVCenter
+                                // Longest kinds ("Generate chapters",
+                                // "Diarization sweep") no longer truncate:
+                                // wrap to a second line, capped at 2 so a
+                                // pathological label can't balloon the row
+                                // (elide is the >2-line backstop). jobRow's
+                                // height binding grows the row to fit.
+                                wrapMode: Text.WordWrap
+                                maximumLineCount: 2
+                                elide: Text.ElideRight
+                                text: jobRow.kindLabel
+                                color: "#8fa8bf"
+                                font.pixelSize: 10
+                                font.bold: true
+                            }
+                            ColumnLayout {
+                                id: nameColumn
+                                Layout.fillWidth: true
+                                spacing: 0
+
                                 Label {
                                     Layout.fillWidth: true
                                     elide: Text.ElideMiddle
@@ -1123,197 +1269,212 @@ Item {
                                     font.pixelSize: 11
                                 }
                                 Label {
-                                    id: statusLabel
-                                    Layout.preferredWidth: 96
-                                    elide: Text.ElideRight
-                                    horizontalAlignment: Text.AlignRight
-                                    text: jobRow.statusText + (jobRow.detailText !== "" ? " (" + jobRow.detailText + ")" : "")
-                                    color: Theme.textSecondary
+                                    id: modelDetailLabel
+                                    objectName: "taskModelDetail"
+                                    Layout.fillWidth: true
+                                    visible: jobRow.modelDetail !== ""
+                                    elide: Text.ElideMiddle
+                                    text: jobRow.modelDetail
+                                    color: Theme.textMuted
                                     font.pixelSize: 9
 
-                                    // O20: surface the real error message on
-                                    // hover for a genuine failure (not a
-                                    // cancel) — the row itself has no room
-                                    // to show it inline without blowing past
-                                    // the popup's fixed width.
-                                    HoverHandler { id: statusHover }
-                                    ToolTip.visible: statusHover.hovered
-                                        && modelData.status === "failed" && !jobRow.isCancelled
-                                        && modelData.error !== ""
-                                    ToolTip.text: modelData.error
+                                    HoverHandler { id: modelDetailHover }
+                                    ToolTip.visible: modelDetailHover.hovered
+                                                     && jobRow.modelDetailFull !== ""
+                                    ToolTip.text: jobRow.modelDetailFull
+                                    ToolTip.delay: 400
                                 }
+                            }
+                            Label {
+                                id: statusLabel
+                                Layout.preferredWidth: 96
+                                elide: Text.ElideRight
+                                horizontalAlignment: Text.AlignRight
+                                text: jobRow.statusText + (jobRow.detailText !== "" ? " (" + jobRow.detailText + ")" : "")
+                                color: Theme.textSecondary
+                                font.pixelSize: 9
+
+                                // O20: surface the real error message on
+                                // hover for a genuine failure (not a
+                                // cancel) — the row itself has no room
+                                // to show it inline without blowing past
+                                // the popup's fixed width.
+                                HoverHandler { id: statusHover }
+                                ToolTip.visible: statusHover.hovered
+                                    && modelData.status === "failed" && !jobRow.isCancelled
+                                    && modelData.error !== ""
+                                ToolTip.text: modelData.error
+                            }
 
 
-                                // Item 3: reorder — Queued standalone rows only
-                                // (a batch reorders as a unit it doesn't expose).
-                                Item {
-                                    id: moveUpButton
-                                    visible: jobRow.reorderable && modelData.status === "queued"
-                                        && jobRow.queuedPosition > 0
-                                    Layout.preferredWidth: 14
-                                    Layout.preferredHeight: 14
+                            // Item 3: reorder — Queued standalone rows only
+                            // (a batch reorders as a unit it doesn't expose).
+                            Item {
+                                id: moveUpButton
+                                visible: jobRow.reorderable && modelData.status === "queued"
+                                    && jobRow.queuedPosition > 0
+                                Layout.preferredWidth: 14
+                                Layout.preferredHeight: 14
 
-                                    HoverHandler {
-                                        id: moveUpHover
-                                        cursorShape: Qt.PointingHandCursor
-                                    }
-                                    TapHandler {
-                                        // See BottomBar.qml's main pauseButton
-                                        // TapHandler for why this is needed on
-                                        // a small icon target.
-                                        gesturePolicy: TapHandler.ReleaseWithinBounds
-                                        onTapped: bottomBar.transcriptionController.moveQueuedJob(
-                                            modelData.id, jobRow.queuedPosition - 1)
-                                    }
-                                    HoverBorder {
-                                        anchors.fill: parent
-                                        active: moveUpHover.hovered
-                                    }
-                                    AppIcon {
-                                        anchors.centerIn: parent
-                                        name: "move-up"
-                                        iconSize: 9
-                                        color: Theme.textPrimary
-                                    }
+                                HoverHandler {
+                                    id: moveUpHover
+                                    cursorShape: Qt.PointingHandCursor
                                 }
-                                Item {
-                                    id: moveDownButton
-                                    visible: jobRow.reorderable && modelData.status === "queued"
-                                        && jobRow.queuedPosition >= 0 && jobRow.queuedPosition < bottomBar.queuedCount() - 1
-                                    Layout.preferredWidth: 14
-                                    Layout.preferredHeight: 14
-
-                                    HoverHandler {
-                                        id: moveDownHover
-                                        cursorShape: Qt.PointingHandCursor
-                                    }
-                                    TapHandler {
-                                        gesturePolicy: TapHandler.ReleaseWithinBounds
-                                        onTapped: bottomBar.transcriptionController.moveQueuedJob(
-                                            modelData.id, jobRow.queuedPosition + 1)
-                                    }
-                                    HoverBorder {
-                                        anchors.fill: parent
-                                        active: moveDownHover.hovered
-                                    }
-                                    AppIcon {
-                                        anchors.centerIn: parent
-                                        name: "move-down"
-                                        iconSize: 9
-                                        color: Theme.textPrimary
-                                    }
+                                TapHandler {
+                                    // See BottomBar.qml's main pauseButton
+                                    // TapHandler for why this is needed on
+                                    // a small icon target.
+                                    gesturePolicy: TapHandler.ReleaseWithinBounds
+                                    onTapped: bottomBar.transcriptionController.moveQueuedJob(
+                                        modelData.id, jobRow.queuedPosition - 1)
                                 }
-
-                                // Per-row Undo — the persistent twin of the
-                                // auto undo snackbar (Main.qml's onUndoAvailable):
-                                // a finished task that advertises an undo
-                                // (modelData.undoable, set by jobs()) offers to
-                                // enqueue its inverse right from the Tasks list,
-                                // so undo stays reachable after the snackbar has
-                                // expired. A batch header undoes every Done
-                                // member at once via its batchId; a standalone/
-                                // member undoes just itself via its own id —
-                                // exactly the token undoTask() expects (it reads
-                                // a non-zero token as either, unambiguously). The
-                                // terminal gate keeps it hidden on a header still
-                                // running (some members Done, batch not finished).
-                                Item {
-                                    id: undoButton
-                                    visible: modelData.undoable === true
-                                        && (modelData.status === "done" || modelData.status === "failed")
-                                    Layout.preferredWidth: 16
-                                    Layout.preferredHeight: 16
-
-                                    // The undo is still offered but no longer
-                                    // applicable — the file has moved/been renamed
-                                    // since, so the inverse would fail. Grey it
-                                    // (visible but non-clickable) rather than
-                                    // letting the user click-then-fail. See
-                                    // Task::undoStillApplicable() / jobs()' undoStale.
-                                    readonly property bool stale: modelData.undoStale === true
-                                    opacity: undoButton.stale ? 0.4 : 1
-
-                                    HoverHandler {
-                                        id: undoHover
-                                        cursorShape: undoButton.stale ? Qt.ArrowCursor : Qt.PointingHandCursor
-                                    }
-                                    TapHandler {
-                                        // See the main pauseButton TapHandler for
-                                        // why ReleaseWithinBounds on a small icon.
-                                        enabled: !undoButton.stale
-                                        gesturePolicy: TapHandler.ReleaseWithinBounds
-                                        onTapped: bottomBar.transcriptionController.undoTask(
-                                            jobRow.isHeader ? modelData.batchId : modelData.id)
-                                    }
-                                    HoverBorder {
-                                        anchors.fill: parent
-                                        active: undoHover.hovered
-                                    }
-                                    AppIcon {
-                                        anchors.centerIn: parent
-                                        name: "undo"
-                                        iconSize: 13
-                                        color: Theme.textPrimary
-                                    }
-                                    ToolTip.visible: undoHover.hovered
-                                    ToolTip.text: undoButton.stale
-                                        ? qsTr("Can't undo — the file has moved or been renamed since")
-                                        : qsTr("Undo")
+                                HoverBorder {
+                                    anchors.fill: parent
+                                    active: moveUpHover.hovered
                                 }
+                                AppIcon {
+                                    anchors.centerIn: parent
+                                    name: "move-up"
+                                    iconSize: 9
+                                    color: Theme.textPrimary
+                                }
+                            }
+                            Item {
+                                id: moveDownButton
+                                visible: jobRow.reorderable && modelData.status === "queued"
+                                    && jobRow.queuedPosition >= 0 && jobRow.queuedPosition < bottomBar.queuedCount() - 1
+                                Layout.preferredWidth: 14
+                                Layout.preferredHeight: 14
 
-                                // Item 3: one button for both "cancel"
-                                // (Queued/Active — stops it, see
-                                // TranscriptionController::cancelJob()'s doc
-                                // comment for the immediate-vs-next-
-                                // checkpoint caveat) and "dismiss"
-                                // (Done/Failed — just removes the row);
-                                // never both at once since they're keyed off
-                                // mutually exclusive status values.
-                                Item {
-                                    id: closeButton
-                                    Layout.preferredWidth: 16
-                                    Layout.preferredHeight: 16
+                                HoverHandler {
+                                    id: moveDownHover
+                                    cursorShape: Qt.PointingHandCursor
+                                }
+                                TapHandler {
+                                    gesturePolicy: TapHandler.ReleaseWithinBounds
+                                    onTapped: bottomBar.transcriptionController.moveQueuedJob(
+                                        modelData.id, jobRow.queuedPosition + 1)
+                                }
+                                HoverBorder {
+                                    anchors.fill: parent
+                                    active: moveDownHover.hovered
+                                }
+                                AppIcon {
+                                    anchors.centerIn: parent
+                                    name: "move-down"
+                                    iconSize: 9
+                                    color: Theme.textPrimary
+                                }
+                            }
 
-                                    HoverHandler {
-                                        id: closeHover
-                                        cursorShape: Qt.PointingHandCursor
-                                    }
-                                    TapHandler {
-                                        gesturePolicy: TapHandler.ReleaseWithinBounds
-                                        onTapped: {
-                                            const terminal = modelData.status === "done"
-                                                || modelData.status === "failed"
-                                            // A batch header's one button acts on
-                                            // the WHOLE batch (dismiss/cancel all
-                                            // members); a member/standalone acts
-                                            // on just itself.
-                                            if (jobRow.isHeader) {
-                                                if (terminal)
-                                                    bottomBar.transcriptionController.dismissBatch(modelData.batchId)
-                                                else
-                                                    bottomBar.transcriptionController.cancelBatch(modelData.batchId)
-                                            } else if (terminal) {
-                                                bottomBar.transcriptionController.dismiss(modelData.fileUrl)
-                                            } else {
-                                                bottomBar.transcriptionController.cancelJob(modelData.id)
-                                            }
+                            // Per-row Undo — the persistent twin of the
+                            // auto undo snackbar (Main.qml's onUndoAvailable):
+                            // a finished task that advertises an undo
+                            // (modelData.undoable, set by jobs()) offers to
+                            // enqueue its inverse right from the Tasks list,
+                            // so undo stays reachable after the snackbar has
+                            // expired. A batch header undoes every Done
+                            // member at once via its batchId; a standalone/
+                            // member undoes just itself via its own id —
+                            // exactly the token undoTask() expects (it reads
+                            // a non-zero token as either, unambiguously). The
+                            // terminal gate keeps it hidden on a header still
+                            // running (some members Done, batch not finished).
+                            Item {
+                                id: undoButton
+                                visible: modelData.undoable === true
+                                    && (modelData.status === "done" || modelData.status === "failed")
+                                Layout.preferredWidth: 16
+                                Layout.preferredHeight: 16
+
+                                // The undo is still offered but no longer
+                                // applicable — the file has moved/been renamed
+                                // since, so the inverse would fail. Grey it
+                                // (visible but non-clickable) rather than
+                                // letting the user click-then-fail. See
+                                // Task::undoStillApplicable() / jobs()' undoStale.
+                                readonly property bool stale: modelData.undoStale === true
+                                opacity: undoButton.stale ? 0.4 : 1
+
+                                HoverHandler {
+                                    id: undoHover
+                                    cursorShape: undoButton.stale ? Qt.ArrowCursor : Qt.PointingHandCursor
+                                }
+                                TapHandler {
+                                    // See the main pauseButton TapHandler for
+                                    // why ReleaseWithinBounds on a small icon.
+                                    enabled: !undoButton.stale
+                                    gesturePolicy: TapHandler.ReleaseWithinBounds
+                                    onTapped: bottomBar.transcriptionController.undoTask(
+                                        jobRow.isHeader ? modelData.batchId : modelData.id)
+                                }
+                                HoverBorder {
+                                    anchors.fill: parent
+                                    active: undoHover.hovered
+                                }
+                                AppIcon {
+                                    anchors.centerIn: parent
+                                    name: "undo"
+                                    iconSize: 13
+                                    color: Theme.textPrimary
+                                }
+                                ToolTip.visible: undoHover.hovered
+                                ToolTip.text: undoButton.stale
+                                    ? qsTr("Can't undo — the file has moved or been renamed since")
+                                    : qsTr("Undo")
+                            }
+
+                            // Item 3: one button for both "cancel"
+                            // (Queued/Active — stops it, see
+                            // TranscriptionController::cancelJob()'s doc
+                            // comment for the immediate-vs-next-
+                            // checkpoint caveat) and "dismiss"
+                            // (Done/Failed — just removes the row);
+                            // never both at once since they're keyed off
+                            // mutually exclusive status values.
+                            Item {
+                                id: closeButton
+                                objectName: "taskCloseButton"
+                                Layout.preferredWidth: 16
+                                Layout.preferredHeight: 16
+
+                                HoverHandler {
+                                    id: closeHover
+                                    cursorShape: Qt.PointingHandCursor
+                                }
+                                TapHandler {
+                                    gesturePolicy: TapHandler.ReleaseWithinBounds
+                                    onTapped: {
+                                        const terminal = modelData.status === "done"
+                                            || modelData.status === "failed"
+                                        // A batch header's one button acts on
+                                        // the WHOLE batch (dismiss/cancel all
+                                        // members); a member/standalone acts
+                                        // on just itself.
+                                        if (jobRow.isHeader) {
+                                            if (terminal)
+                                                bottomBar.transcriptionController.dismissBatch(modelData.batchId)
+                                            else
+                                                bottomBar.transcriptionController.cancelBatch(modelData.batchId)
+                                        } else if (terminal) {
+                                            bottomBar.transcriptionController.dismiss(modelData.fileUrl)
+                                        } else {
+                                            bottomBar.transcriptionController.cancelJob(modelData.id)
                                         }
                                     }
-                                    HoverBorder {
-                                        anchors.fill: parent
-                                        active: closeHover.hovered
-                                    }
-                                    AppIcon {
-                                        anchors.centerIn: parent
-                                        name: "close"
-                                        iconSize: 13
-                                        color: Theme.textPrimary
-                                    }
+                                }
+                                HoverBorder {
+                                    anchors.fill: parent
+                                    active: closeHover.hovered
+                                }
+                                AppIcon {
+                                    anchors.centerIn: parent
+                                    name: "close"
+                                    iconSize: 13
+                                    color: Theme.textPrimary
                                 }
                             }
-                            }
                         }
-                    }
                 }
             }
         }

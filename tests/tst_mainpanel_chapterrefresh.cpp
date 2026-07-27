@@ -255,8 +255,11 @@ private slots:
         qmlRegisterType<UndoStack>("SuopTranscriber", 1, 0, "UndoStack");
         // The real thing — see this file's top comment.
         qmlRegisterType<TranscriptionController>("SuopTranscriber", 1, 0, "TranscriptionController");
-        qmlRegisterUncreatableType<AudioPlayerStub>(
-            "SuopTranscriber", 1, 0, "AudioPlayer", QStringLiteral("stub — this harness leaves it null"));
+        // RecorderPage now owns an instantiable `AudioPlayer { id: recorderPlayer }`
+        // (its own playback for the last recording, separate from MainPanel's
+        // `player`), so the type must be creatable — the same reason UndoStack
+        // is qmlRegisterType above, not uncreatable.
+        qmlRegisterType<AudioPlayerStub>("SuopTranscriber", 1, 0, "AudioPlayer");
         qmlRegisterUncreatableType<AudioRecorderStub>(
             "SuopTranscriber", 1, 0, "AudioRecorder", QStringLiteral("stub — this harness leaves it null"));
         qmlRegisterUncreatableType<VaultTreeModelStub>(

@@ -18,6 +18,15 @@
 // go through EngineCache's ASR slot: cycling through many models would
 // otherwise thrash the one resident transcribe engine, so each model here
 // builds and discards its own short-lived engine instance.
+// Cumulative 0..1 bar position for a benchmark sweep: models fully done plus
+// the fraction of the current model's audio processed, over the model count.
+// Pure and header-declared so it's unit-testable without a real engine — same
+// pattern as ChaptersTask's chaptersGenerateProgress(). `secondsDone`/
+// `secondsTotal` come from runWindows' onProgress (cumulative seconds vs the
+// whole file); modelIndex is 0-based, so the end of model i (within == 1)
+// yields exactly (i+1)/modelCount — matching the per-model step emit.
+double benchmarkOverallProgress(int modelIndex, int modelCount, double secondsDone, double secondsTotal);
+
 class BenchmarkTask : public Task {
     Q_OBJECT
 public:

@@ -223,6 +223,18 @@ Item {
     // user can turn this off to show both at once.
     property bool progressGlowHidesBar: true
 
+    // Bottom info bar's "Kind: filename" task label (see BottomBar.qml).
+    // Clicking it opens that file in the main panel (same as a Tasks-popup row).
+    property bool bottomBarTaskClickOpensFile: true
+    // Hover tooltip showing the full, un-elided task text when it truncates.
+    property bool bottomBarTaskTooltip: true
+    // The bottom-left vault path sizes to its content instead of claiming the
+    // whole row, freeing width for the task label so it truncates less.
+    property bool bottomBarPathShrinkToContent: true
+    // When the task label would still overflow, shrink its font (and wrap to a
+    // second line) to fit instead of eliding.
+    property bool bottomBarTaskTextFit: true
+
     // Split-recording combine (see TranscriptionController::
     // findCombineGroups()'s doc comment): what happens to a group's original
     // files once ffmpeg has merged them. false (default) moves them into a
@@ -261,6 +273,29 @@ Item {
     // quiet mic while leaving system audio untouched, or vice versa.
     property real recordingMicGain: 1.0
     property real recordingSystemGain: 1.0
+
+    // Per-application capture state for the recorder's per-app rows, keyed by
+    // the ancestry-resolved application display name ("Discord", not
+    // "Chromium") — the same key the rows themselves use, and the only handle
+    // stable enough to outlive both an app going quiet and this app
+    // restarting. A "stream:<object.serial>" id is neither.
+    //
+    // A key is written ONLY when the user actually adjusts that app's gain or
+    // toggles its row, never merely on seeing the app play. That keeps the map
+    // to the handful of apps someone has deliberately set up, and makes its
+    // key set double as "which rows to show before anything has played this
+    // session".
+    //
+    // Deliberately NOT part of `defaults`/isDefault()/resetProperty() below,
+    // for the same reason iconOverrides isn't (see its comment): that
+    // machinery is single-value reset-to-default semantics compared with
+    // `===`, which can't compare a map. Loaded/saved explicitly in
+    // loadFromVault()/saveToVault() instead.
+    property var recordingAppGains: ({})
+    // Which of those apps are armed for capture. Separate from the gains map
+    // rather than a nested {gain, enabled} object: the two are written from
+    // different controls and JSON round-trips a flat map with no surprises.
+    property var recordingAppCaptureEnabled: ({})
 
     // Which icon pack supplies icons by default — a pack id from
     // IconTheme::packIds() (packs are directories under assets/icons/, see
@@ -356,6 +391,10 @@ Item {
         progressGlowRadius: 8,
         progressGlowLayerCount: 2,
         progressGlowHidesBar: true,
+        bottomBarTaskClickOpensFile: true,
+        bottomBarTaskTooltip: true,
+        bottomBarPathShrinkToContent: true,
+        bottomBarTaskTextFit: true,
         deleteOriginalsAfterCombine: false,
         autoCombineAfterGrab: false,
         recordingOutputFolder: "",
@@ -405,6 +444,8 @@ Item {
         // own doc comments above) — loaded explicitly here instead.
         appSettings.combineRules = loaded.combineRules || []
         appSettings.iconOverrides = loaded.iconOverrides || ({})
+        appSettings.recordingAppGains = loaded.recordingAppGains || ({})
+        appSettings.recordingAppCaptureEnabled = loaded.recordingAppCaptureEnabled || ({})
         appSettings.suppressSave = false
     }
 
@@ -418,6 +459,8 @@ Item {
         }
         data.combineRules = appSettings.combineRules
         data.iconOverrides = appSettings.iconOverrides
+        data.recordingAppGains = appSettings.recordingAppGains
+        data.recordingAppCaptureEnabled = appSettings.recordingAppCaptureEnabled
         appSettings.activeVaultModel.writeVaultSettings(data)
     }
 
@@ -463,6 +506,7 @@ Item {
         function onRimEnabledChanged() { appSettings.scheduleSave() }
         function onRimWidthChanged() { appSettings.scheduleSave() }
         function onRimColorChanged() { appSettings.scheduleSave() }
+        function onRecordingActiveColorChanged() { appSettings.scheduleSave() }
         function onUseLabelsMainPanelChanged() { appSettings.scheduleSave() }
         function onUseLabelsSidebarChanged() { appSettings.scheduleSave() }
         function onHideExtensionsSidebarChanged() { appSettings.scheduleSave() }
@@ -495,7 +539,12 @@ Item {
         function onProgressGlowRadiusChanged() { appSettings.scheduleSave() }
         function onProgressGlowLayerCountChanged() { appSettings.scheduleSave() }
         function onProgressGlowHidesBarChanged() { appSettings.scheduleSave() }
+        function onBottomBarTaskClickOpensFileChanged() { appSettings.scheduleSave() }
+        function onBottomBarTaskTooltipChanged() { appSettings.scheduleSave() }
+        function onBottomBarPathShrinkToContentChanged() { appSettings.scheduleSave() }
+        function onBottomBarTaskTextFitChanged() { appSettings.scheduleSave() }
         function onDeleteOriginalsAfterCombineChanged() { appSettings.scheduleSave() }
+        function onAutoCombineAfterGrabChanged() { appSettings.scheduleSave() }
         function onRecordingOutputFolderChanged() { appSettings.scheduleSave() }
         function onRecordingMicGainChanged() { appSettings.scheduleSave() }
         function onRecordingSystemGainChanged() { appSettings.scheduleSave() }
@@ -504,5 +553,7 @@ Item {
         // as every other persisted key.
         function onCombineRulesChanged() { appSettings.scheduleSave() }
         function onIconOverridesChanged() { appSettings.scheduleSave() }
+        function onRecordingAppGainsChanged() { appSettings.scheduleSave() }
+        function onRecordingAppCaptureEnabledChanged() { appSettings.scheduleSave() }
     }
 }

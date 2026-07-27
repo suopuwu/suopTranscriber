@@ -185,6 +185,13 @@ QString sidecarPath(const QString &audioFilePath);
 // this to tell "already labeled" from "never labeled".
 extern const QString kPreludeEndMarker;
 
+// "This transcript already went through a labeling pass" — a non-empty label
+// or tags, or a prelude in the body. ONE rule, shared by RelabelTask's
+// skipIfAlreadyLabeled short-circuit and TranscriptionController::
+// pendingJobKinds(), so the automatic skip and the run-all-available gating
+// can never disagree about what "labeled" means.
+bool transcriptIsLabeled(const QString &label, const QString &tags, const QString &body);
+
 // Written immediately when a transcribe task starts, before any decoding
 // happens, so a killed/stopped run still leaves a file recording what it was
 // run with. See the definition site for the full field-by-field contract

@@ -1,5 +1,7 @@
 #include "JobListFormatter.h"
 
+#include "ModelManager.h"
+
 #include <QHash>
 #include <QList>
 #include <QStringList>
@@ -92,6 +94,26 @@ QString JobListFormatter::phaseOverlayLabel(const QString &phase)
     // generic fallback ("Transcribing…").
     const PhaseInfo *info = phaseInfoFor(phase);
     return info ? info->overlayLabel : QString();
+}
+
+QString JobListFormatter::modelShortLabel(const QString &modelId)
+{
+    auto headOf = [](const QString &label) {
+        return label.section(QStringLiteral(" — "), 0, 0).trimmed();
+    };
+    for (const auto &info : ModelManager::availableModels()) {
+        if (info.id == modelId)
+            return headOf(info.label).isEmpty() ? modelId : headOf(info.label);
+    }
+    for (const auto &info : ModelManager::availableSegmentationModels()) {
+        if (info.id == modelId)
+            return headOf(info.label).isEmpty() ? modelId : headOf(info.label);
+    }
+    for (const auto &info : ModelManager::availableEmbeddingModels()) {
+        if (info.id == modelId)
+            return headOf(info.label).isEmpty() ? modelId : headOf(info.label);
+    }
+    return modelId;
 }
 
 QVariantList JobListFormatter::collapseBatches(const QVariantList &jobEntries)

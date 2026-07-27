@@ -51,6 +51,17 @@ public:
 
     const QString &modelId() const { return m_modelId; }
 
+    // Stall-watchdog predicate — pure function so it's unit-testable
+    // (tst_transcription_queue.cpp) without a live/wedged whisper.cpp process,
+    // which isn't reproducible read-only. `noProgressElapsedMs` is wall-clock
+    // since the last onProgress/onSegment tick, EXCLUDING any stretch spent
+    // legitimately paused (see run()'s onAbort doc comment); `fileSeconds` is
+    // the audio's own duration. Audio-length-relative by design — never a
+    // flat wall-clock cap — so a genuinely long recording (which legitimately
+    // goes quiet between ticks for longer) is never falsely killed; see the
+    // .cpp for the chosen constants and why they're conservative.
+    static bool isStalled(qint64 noProgressElapsedMs, double fileSeconds);
+
 signals:
     // Which compute backend the model load actually picked ("CUDA"/
     // "Vulkan"/"CPU") — fired once, right after "loading" resolves.

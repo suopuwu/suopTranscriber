@@ -83,6 +83,17 @@ public:
     // frozen).
     static bool isSyntheticProgressPhase(const QString &phase);
 
+    // The SAME rolling-average duration (ms) recomputeOverallProgress() and
+    // phaseRelativeSyntheticProgress() weight/ramp against, exposed read-only
+    // for a caller that needs the raw number rather than a fraction —
+    // TranscriptionController::estimatedRemainingMs() scales its "progress
+    // hasn't moved in a while ⇒ stalled" window to this phase's own historical
+    // pace (a huge model's "transcribing" phase legitimately goes longer
+    // between ticks than a tiny one's) instead of one fixed constant that
+    // would be wrong for both ends of that range. No samples yet ⇒
+    // defaultPhaseDurationMs(phase), same fallback every other caller here uses.
+    double phaseAverageDurationMs(const QString &phase, const QString &modelId, bool speakerDetection) const;
+
     // The blended 0..1 whole-job fraction QML's progress bar binds to (via
     // TranscriptionController::overallProgress, which just reads this).
     double overallProgress() const { return m_overallProgress; }

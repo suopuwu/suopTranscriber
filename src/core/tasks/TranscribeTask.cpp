@@ -26,7 +26,41 @@ namespace {
 // bursts are coalesced down to this rate. Same value as the old worker's
 // kLiveUpdateThrottleMs.
 constexpr qint64 kLiveUpdateThrottleMs = 200;
+
+// Stall-watchdog thresholds (TranscribeTask::isStalled()). whisper.cpp has no
+// other cooperative interruption point inside a single decode call besides
+// onAbort — which it polls "many times per second" deep in its own loop (see
+// WhisperCppEngine::onAbortCheck) — so THAT is the one hook that can reach
+// into a genuinely wedged whisper_full() and bound the damage. Deliberately
+// conservative in both directions, per the 2026-07-25 decision: a FALSE trip
+// destroys a real, in-progress transcription (unrecoverable), while a LATE
+// trip on a genuinely stalled file only costs wall-clock time (recoverable —
+// the task just fails retryably and the batch moves on). The 2026-07-24
+// batch-wedge report is the motivating case: one 3-minute file stalled with
+// near-zero progress for 1h46m (user-observed, before manual pause), silently
+// blocking ~88 queued files behind it with no backstop at all — ANY bounded
+// watchdog is a strict improvement over that.
+//
+// Bound to the FILE's own total duration, not the current window's — runWindows()
+// (TranscribePipeline.cpp) owns per-window boundaries, which would give a
+// tighter bound, but that file is out of scope for this change. Using the
+// coarser whole-file bound is still exactly what CLAUDE.md's non-negotiable
+// requires ("audio-length-relative, NOT a flat wall-clock cap"): a longer
+// recording earns proportionally more silent runway before it's ever
+// considered wedged, so a genuinely long file is never falsely killed —
+// at the cost of a proportionally later trip on a huge file that really is
+// stalled, which is the accepted, explicitly-chosen tradeoff.
+constexpr qint64 kStallFloorMs = 120'000; // 2 minutes, regardless of file length
+constexpr double kStallRealtimeMultiplier = 20.0; // x the file's own duration
 } // namespace
+
+bool TranscribeTask::isStalled(qint64 noProgressElapsedMs, double fileSeconds)
+{
+    const qint64 scaledMs =
+        static_cast<qint64>(kStallRealtimeMultiplier * std::max(0.0, fileSeconds) * 1000.0);
+    const qint64 threshold = std::max(kStallFloorMs, scaledMs);
+    return noProgressElapsedMs > threshold;
+}
 
 TranscribeTask::TranscribeTask(QUrl file, QUrl vault, QString modelId, QObject *parent)
     : Task(parent)
@@ -183,13 +217,46 @@ void TranscribeTask::run(TaskContext &ctx)
     liveTimer.start();
     qint64 lastLiveTickMs = -kLiveUpdateThrottleMs;
 
+    // Stall watchdog (see kStallFloorMs/kStallRealtimeMultiplier's doc
+    // comment above): resets on every real tick (onProgress/onSegment below)
+    // and elapsed() is checked from onAbort, the one hook whisper.cpp polls
+    // frequently enough to actually interrupt a wedged decode. `stalled`
+    // records WHY onAbort returned true so the code after runWindows() can
+    // tell a real stall apart from an ordinary cancel.
+    QElapsedTimer stallClock;
+    stallClock.start();
+    bool stalled = false;
+
     // The engine checks this deep inside its own encode/decode loops
     // (WhisperCppEngine's onAbortCheck) — frequent enough that blocking here
     // for a pause is near-instant, and returning true stops the engine
     // mid-file rather than only at its next natural boundary.
-    const AbortCallback onAbort = [&ctx] { return ctx.checkpoint(); };
+    const AbortCallback onAbort = [&ctx, &stallClock, &stalled, totalFileSeconds] {
+        // Time this call itself spends blocked inside checkpoint() (its
+        // pause loop wakes every 100ms — see TaskContext::checkpoint()) so a
+        // real pause-then-resume can be told apart from a stall without
+        // racing ctx.pauseRequested() against checkpoint() actually entering
+        // its wait loop. A cheap sanity margin above one wake interval.
+        QElapsedTimer checkpointTimer;
+        checkpointTimer.start();
+        if (ctx.checkpoint())
+            return true; // real cancel, or checkpoint() blocked then cancelled
+        if (checkpointTimer.elapsed() > 200) {
+            // Blocked for a real stretch — a pause resumed. That silence is
+            // intentional, not a stall: exempt it and don't let the paused
+            // time count against the watchdog.
+            stallClock.restart();
+            return false;
+        }
+        if (TranscribeTask::isStalled(stallClock.elapsed(), totalFileSeconds)) {
+            stalled = true;
+            return true;
+        }
+        return false;
+    };
 
-    ProgressCallback onProgress = [this, totalFileSeconds](double done, double) {
+    ProgressCallback onProgress = [this, totalFileSeconds, &stallClock](double done, double) {
+        stallClock.restart();
         emit progress(totalFileSeconds > 0 ? done / totalFileSeconds : 0.0);
     };
     // Only accumulated when VAD didn't run — feeds the transcript-gap
@@ -197,8 +264,9 @@ void TranscribeTask::run(TaskContext &ctx)
     // in for "speech spans" when there's no VAD data to complement instead
     // (see the fallback's doc comment below).
     std::vector<std::pair<double, double>> fallbackSpeechSpans;
-    SegmentCallback onSegment = [&lineWriter, &liveTimer, &lastLiveTickMs, &fallbackSpeechSpans, vadActive,
-                                  this](const Segment &segment) {
+    SegmentCallback onSegment = [&lineWriter, &liveTimer, &lastLiveTickMs, &fallbackSpeechSpans, &stallClock,
+                                  vadActive, this](const Segment &segment) {
+        stallClock.restart();
         // Segment is already absolute (offset merge is the pipeline's job
         // now). Pure ASR — no speaker label written at transcribe time.
         lineWriter.append(segment, QString());
@@ -211,8 +279,20 @@ void TranscribeTask::run(TaskContext &ctx)
             emit segmentWritten();
         }
     };
-    TranscribePipeline::runWindows(*asr.engine, *pcm, windows, onProgress, onSegment, onAbort);
+    int failureCount = 0;
+    TranscribePipeline::runWindows(*asr.engine, *pcm, windows, onProgress, onSegment, onAbort, &failureCount);
     mdFile.close();
+
+    // The watchdog tripped: fail retryably (per CLAUDE.md — a Task-system
+    // failure, not a silent hang) so the Tasks list shows it and the queue
+    // advances to the next file rather than wedging the rest of an overnight
+    // batch behind it, same as any other TaskError. Checked BEFORE the plain
+    // cancel below since onAbort returning true for a stall is not a cancel.
+    if (stalled) {
+        throw TaskError(QStringLiteral("transcription stalled — no progress for over %1 min on a %2s file")
+                             .arg(QString::number(stallClock.elapsed() / 60000.0, 'f', 1),
+                                  QString::number(totalFileSeconds, 'f', 0)));
+    }
 
     // A cancel mid-decode stops the engine early (see onAbort above) but
     // everything transcribed up to that point is still flushed and valid
@@ -221,6 +301,17 @@ void TranscribeTask::run(TaskContext &ctx)
     // honesty contract. Its .md keeps the `partial: true` marker written above.
     if (ctx.cancelRequested())
         throw TaskError(QStringLiteral("Cancelled"));
+
+    // An inference failure (e.g. onnxruntime OOM) dropped one or more
+    // sub-windows silently at the engine level — the transcript that was
+    // written is real but incomplete. Fail the task (see item 019's
+    // decision) BEFORE the `partial: true` marker is dropped below, so the
+    // vault keeps showing this file as not-done/retryable rather than a
+    // green Done hiding missing audio.
+    if (failureCount > 0)
+        throw TaskError(QStringLiteral("transcription failed for %1 audio segment(s) (out of memory or decode "
+                                       "error) — transcript is incomplete")
+                            .arg(failureCount));
 
     // Fully completed: drop the `partial: true` marker so the finished .md is
     // no longer flagged incomplete. Only a completed run reaches here — a

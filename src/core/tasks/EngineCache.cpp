@@ -140,15 +140,12 @@ void EngineCache::evictDiar()
     m_diar.reset();
     m_diarSegPath.clear();
     m_diarEmbedPath.clear();
+    ++m_diarEvictionCount;
 }
 
 void EngineCache::evictAll()
 {
-    m_asr.reset();
-    m_asrModelPath.clear();
-    m_label.reset();
-    m_labelModelPath.clear();
-    m_diar.reset();
-    m_diarSegPath.clear();
-    m_diarEmbedPath.clear();
+    evictAsr();
+    evictLabel();
+    evictDiar();
 }

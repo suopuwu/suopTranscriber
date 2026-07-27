@@ -22,8 +22,13 @@ class DiarizationEngine;
 // model (ASR or labeling) is kept resident, so a transcribe evicts the label
 // engine and vice versa; evictAll() drops everything once the queue drains
 // (see TaskRunner's idle eviction, formerly evictIdle()). A DiarizationEngine
-// is built fresh per diarize task (threshold is baked in at construction), so
-// it is not reused across tasks — only tracked here so evictAll() releases it.
+// is built fresh for every diarize task — DiarizeTask::run() calls
+// evictDiar() before ensureDiar(), so the reuse guard in ensureDiar() never
+// actually reuses one across tasks — because letting the onnxruntime CUDA
+// arena carry over between files let it grow unbounded across a batch
+// (measured ~29 GB on one real recording; see
+// patches/sherpa-onnx-batch-segmentation.patch and item 021). Only tracked
+// here so evictAll() can still release it.
 class EngineCache {
 public:
     EngineCache();
@@ -59,9 +64,11 @@ public:
     // failure.
     LabelingEngine *ensureLabel(QString *error);
 
-    // Resolve+load a DiarizationEngine for a diarize task, rebuilding only
-    // when the resolved model paths OR threshold change (threshold is baked
-    // into the sherpa config at construction). The caller drives
+    // Resolve+load a DiarizationEngine, rebuilding when the resolved model
+    // paths OR threshold change (threshold is baked into the sherpa config
+    // at construction) — in practice DiarizeTask::run() calls evictDiar()
+    // right before this, so every diarize task gets a fresh engine
+    // regardless (see class doc comment for why). The caller drives
     // engine->diarize(pcm, onProgress) itself — the progress callback needs
     // to emit the Task's own phase()/progress() signals and call
     // TaskContext::checkpoint(), neither of which EngineCache has access to.
@@ -78,11 +85,18 @@ public:
     // calls this alongside evictAsr() (mirrors the old relabelJob()'s
     // opening m_engine.reset()/m_diarizationEngine.reset() pair; diarization
     // is never actually resident there today, reset defensively anyway in
-    // case that ever changes).
+    // case that ever changes), and DiarizeTask::run() calls it at the start
+    // of every run (see class doc comment).
     void evictDiar();
     // Release every resident engine — called when the queue drains so a warm
     // model doesn't sit on VRAM indefinitely (old evictIdle()).
     void evictAll();
+
+    // How many times evictDiar() has run (directly or via evictAll()) —
+    // exposed purely so tst_task_diarize.cpp can assert DiarizeTask evicts
+    // the diar engine on every run() (item 021) without needing a real
+    // downloaded sherpa-onnx model to observe engine identity directly.
+    int diarEvictionCount() const { return m_diarEvictionCount; }
 
 private:
     std::unique_ptr<TranscriptionEngine> m_asr;
@@ -93,4 +107,5 @@ private:
     QString m_diarSegPath;
     QString m_diarEmbedPath;
     float m_diarThreshold = 0.5f; // part of the reuse key alongside the two paths
+    int m_diarEvictionCount = 0;
 };

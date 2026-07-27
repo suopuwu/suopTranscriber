@@ -3,26 +3,35 @@ import QtQuick.Controls
 import QtQuick.Layouts
 import SuopTranscriber
 
-// Reusable eliding model picker for the MainPanel note-page controls (the
-// transcription model plus the diarization segmentation/embedding models).
+// Reusable eliding combo box shared by the MainPanel model pickers (the
+// transcription model plus the diarization segmentation/embedding models)
+// and the Recorder page's mic/system-source device pickers.
 //
 // - The closed box shows a TRUNCATED label for the current selection (full
 //   text stays in the hover tooltip and in the wider dropdown popup), so a
-//   long model name never overflows a width-capped row.
+//   long label never overflows a width-capped row.
 // - Both the closed box and the popup round their corners with
 //   AppSettings.borderRadius (QQC2's default ComboBox box/popup are
 //   square-cornered) — StyleGuide.md border-radius convention.
-// - Each entry carries a small status dot: green if that model's weights are
-//   already on disk, gray if picking it will first queue a download job.
+// - Each entry carries a small status dot, but only when it has one: green if
+//   that model's weights are already on disk, gray if picking it will first
+//   queue a download job. Device entries have no `downloaded` field, so the
+//   dot is simply absent for them.
 //
 // Every model list this drives (availableModels() / availableSegmentationModels()
-// / availableEmbeddingModels()) exposes the same {id, label, downloaded} fields.
+// / availableEmbeddingModels()) exposes {id, label, downloaded}; the device
+// lists (availableMicDevices() / systemSources) expose {id, name} instead —
+// labelRole below picks which field is the display text.
 ComboBox {
     id: control
 
-    // The currently-selected model id (valueRole). Kept in sync with the
+    // The currently-selected entry id (valueRole). Kept in sync with the
     // dropdown's currentIndex; assigning it externally moves the selection.
     property string selectedId: ""
+
+    // Which field of an entry is its display text. Defaults to the model
+    // lists' `label`; the recorder's device lists spell the same thing `name`.
+    property string labelRole: "label"
 
     // Emitted only when the USER picks an entry (not on programmatic
     // selectedId changes) — the parent persists this to the relevant
@@ -34,7 +43,7 @@ ComboBox {
     // stays capped and elides).
     property real cachedMaxLabelWidth: 0
 
-    textRole: "label"
+    textRole: control.labelRole
     valueRole: "id"
     hoverEnabled: true
     // Reading `count` is load-bearing, not cosmetic: indexOfValue() reads the
@@ -45,11 +54,12 @@ ComboBox {
     // Touching `count` ties this binding to the list changing so it recomputes.
     // And when selectedId isn't in the list (nothing chosen yet, or a stale/
     // removed id) fall back to the FIRST entry rather than showing nothing.
-    currentIndex: {
+    function resolveIndex() {
         const n = count
         const i = indexOfValue(selectedId)
         return i >= 0 ? i : (n > 0 ? 0 : -1)
     }
+    currentIndex: control.resolveIndex()
 
     onActivated: control.picked(currentValue)
 
@@ -59,7 +69,18 @@ ComboBox {
             maxWidth = Math.max(maxWidth, modelLabelFontMetrics.advanceWidth(textAt(i)))
         control.cachedMaxLabelWidth = maxWidth
     }
-    onModelChanged: recomputeMaxLabelWidth()
+    // QQuickComboBox::setModel() force-resets currentIndex ("0 whenever
+    // count > 0") when the list is assigned after the combo is complete —
+    // exactly how MainPanel drives these (empty array at build time, real list
+    // in Component.onCompleted and again on modelsChanged). That C++ write
+    // lands after the binding above last ran, and a same-length replacement
+    // never changes `count`, so without re-asserting here the box silently
+    // shows the FIRST model while selectedId still holds the saved one.
+    // modelChanged is emitted last, so this runs after the reset.
+    onModelChanged: {
+        recomputeMaxLabelWidth()
+        currentIndex = Qt.binding(control.resolveIndex)
+    }
     Component.onCompleted: recomputeMaxLabelWidth()
 
     // A single throwaway FontMetrics reused across the whole list (not one
@@ -74,10 +95,11 @@ ComboBox {
 
     HoverHandler {
         cursorShape: Qt.PointingHandCursor
+        enabled: control.enabled
     }
     HoverBorder {
         anchors.fill: parent
-        active: control.hovered
+        active: control.enabled && control.hovered
     }
 
     // Custom eliding content: the default QQC2 ComboBox contentItem clips (no
@@ -113,7 +135,7 @@ ComboBox {
         contentItem: RowLayout {
             spacing: 6
             Label {
-                text: modelDelegate.modelData.label
+                text: modelDelegate.modelData[control.labelRole]
                 color: "white"
                 Layout.fillWidth: true
                 // Wrap instead of eliding: when the popup is clamped by the
@@ -121,7 +143,11 @@ ComboBox {
                 // being cut.
                 wrapMode: Text.Wrap
             }
+            // Download-state dot — only for lists that HAVE a download state.
+            // An audio device is never "not downloaded", and a dot that is
+            // always the same color is noise.
             Rectangle {
+                visible: modelDelegate.modelData.downloaded !== undefined
                 width: 8
                 height: 8
                 radius: 4

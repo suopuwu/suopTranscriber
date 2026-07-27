@@ -163,20 +163,19 @@ Flow {
         }
     }
 
-    // Items 24/53: bulk "run all jobs" — the full transcribe->label->
-    // chapters pipeline for every untranscribed file (same eligibility
-    // as transcribeAllButton above: an already-transcribed file's
-    // label/chapters are the relabelAll/chaptersAll buttons' job).
-    // runAllJobs() itself skips the transcribe step for anything that
-    // slips through already-transcribed, so it's safe regardless.
+    // Bulk "run all available jobs" — for every selected AUDIO file
+    // (transcribed or not, see selectionRunAllPaths), runAllJobs()
+    // queues only the pipeline steps that file still needs and no-ops
+    // when it needs none. Deliberately NOT selectionTranscribePaths:
+    // a transcribed file usually still has derived passes owing.
     AppIconButton {
         id: runAllButton
         iconName: "run-all"
-        tooltip: qsTr("Run all jobs on selected files (transcribe, label, chapters)")
+        tooltip: qsTr("Run all available jobs on selected files (transcribe, detect speakers, label, chapters)")
         enabled: sidebarRoot.transcriptionController
-                 && sidebarRoot.selectionTranscribePaths.length > 0
+                 && sidebarRoot.selectionRunAllPaths.length > 0
         onTapped: {
-            const paths = sidebarRoot.selectionTranscribePaths
+            const paths = sidebarRoot.selectionRunAllPaths
             if (paths.length === 0)
                 return
             const urls = paths.map((p) => "file://" + p)

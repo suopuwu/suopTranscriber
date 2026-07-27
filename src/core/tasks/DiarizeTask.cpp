@@ -70,9 +70,14 @@ void applyDiarizationModelFrontmatter(QStringList *frontmatterLines,
 void DiarizeTask::run(TaskContext &ctx)
 {
     // Needs neither the whisper nor the label model — free them now (GPU
-    // hygiene, mirrors RelabelTask's eviction).
+    // hygiene, mirrors RelabelTask's eviction). The diar engine is also
+    // evicted unconditionally, every run — NOT reused even when the resolved
+    // models/threshold match the previous task's, so its onnxruntime CUDA
+    // arena tears down between files instead of accumulating VRAM across a
+    // batch (item 021; see EngineCache.h's class doc comment).
     ctx.engines.evictAsr();
     ctx.engines.evictLabel();
+    ctx.engines.evictDiar();
 
     const QString filePath = fileUrl.toLocalFile();
     const QString mdPath = sidecarPath(filePath);
@@ -125,8 +130,10 @@ void DiarizeTask::run(TaskContext &ctx)
     QElapsedTimer progressThrottle;
     progressThrottle.start();
     qint64 lastProgressTickMs = -kProgressThrottleMs;
+    bool inferenceFailed = false;
     const std::vector<DiarizedTurn> turns = diarizationEngine->diarize(
-        *pcm, [this, &ctx, &detectingSubPhase, &progressThrottle, &lastProgressTickMs](double fraction) {
+        *pcm,
+        [this, &ctx, &detectingSubPhase, &progressThrottle, &lastProgressTickMs](double fraction) {
             ctx.checkpoint(); // blocks on pause; cancel not actionable mid-pass (see class doc comment)
             const QString subPhase = fraction < 0.30 ? QStringLiteral("detecting-speakers-segmenting")
                                                        : QStringLiteral("detecting-speakers-identifying");
@@ -139,12 +146,22 @@ void DiarizeTask::run(TaskContext &ctx)
                 lastProgressTickMs = nowMs;
                 emit progress(fraction);
             }
-        });
+        },
+        &inferenceFailed);
 
     // A cancel requested DURING diarization (no mid-pass abort hook) takes
     // effect here, before any file I/O.
     if (ctx.checkpoint())
         throw TaskError(QStringLiteral("Cancelled"));
+
+    // An onnxruntime (or other) inference-time failure inside diarize() is
+    // indistinguishable from "no speakers found" by the turns vector alone —
+    // the out-param is the only signal. Detecting speakers IS this task's
+    // whole purpose, so a failure here fails the task (see item 019's
+    // decision) rather than silently stamping speakerDetection: true with
+    // zero speakers.
+    if (inferenceFailed)
+        throw TaskError(QStringLiteral("speaker detection failed (out of memory or model error) — see log"));
 
     const double totalSeconds = static_cast<double>(pcm->size()) / 16000.0;
     QStringList appliedSpeakers;

@@ -97,14 +97,19 @@ constexpr bool kTryCuda = true;
 // nothing in that case — it just repeats the same (fast, local) failure
 // once more before giving up for real.
 sc::OfflineSpeakerDiarization createSafely(const QString &segmentationModelPath, const QString &embeddingModelPath,
-                                            float threshold)
+                                            float threshold, bool *usedCuda = nullptr)
 {
+    if (usedCuda)
+        *usedCuda = false;
     if constexpr (kTryCuda) {
         try {
             sc::OfflineSpeakerDiarization sd = sc::OfflineSpeakerDiarization::Create(
                 buildConfig(segmentationModelPath, embeddingModelPath, threshold, "cuda"));
-            if (sd.Get() != nullptr)
+            if (sd.Get() != nullptr) {
+                if (usedCuda)
+                    *usedCuda = true;
                 return sd;
+            }
             qWarning() << "DiarizationEngine: CUDA init returned no handle — falling back to CPU";
         } catch (const std::exception &e) {
             qWarning() << "DiarizationEngine: CUDA init failed (" << e.what() << ") — falling back to CPU";
@@ -213,35 +218,74 @@ void mergeMinorSpeakersIntoNearestMajor(std::vector<sc::OfflineSpeakerDiarizatio
 
 DiarizationEngine::DiarizationEngine(const QString &segmentationModelPath, const QString &embeddingModelPath,
                                      float threshold)
-    : m_sd(createSafely(segmentationModelPath, embeddingModelPath, threshold))
+    : m_segmentationModelPath(segmentationModelPath)
+    , m_embeddingModelPath(embeddingModelPath)
+    , m_threshold(threshold)
+    , m_sd(createSafely(segmentationModelPath, embeddingModelPath, threshold, &m_usingCuda))
 {
 }
 
 std::vector<DiarizedTurn> DiarizationEngine::diarize(const std::vector<float> &pcm16kMono,
-                                                      const DiarizationProgressCallback &onProgress) const
+                                                      const DiarizationProgressCallback &onProgress,
+                                                      bool *inferenceFailed) const
 {
     std::vector<DiarizedTurn> turns;
+    if (inferenceFailed)
+        *inferenceFailed = false;
     if (!isValid() || pcm16kMono.empty())
         return turns;
 
     std::vector<sc::OfflineSpeakerDiarizationSegment> segments;
-    try {
+    const auto runProcess = [&](const sc::OfflineSpeakerDiarization &sd) {
         if (onProgress) {
-            segments = m_sd.Process(pcm16kMono.data(), static_cast<int32_t>(pcm16kMono.size()),
-                                     [&onProgress](int32_t numProcessedChunks, int32_t numTotalChunks) {
-                                         onProgress(numTotalChunks > 0
-                                                        ? static_cast<double>(numProcessedChunks) / numTotalChunks
-                                                        : 0.0);
-                                     });
+            segments = sd.Process(pcm16kMono.data(), static_cast<int32_t>(pcm16kMono.size()),
+                                   [&onProgress](int32_t numProcessedChunks, int32_t numTotalChunks) {
+                                       onProgress(numTotalChunks > 0
+                                                      ? static_cast<double>(numProcessedChunks) / numTotalChunks
+                                                      : 0.0);
+                                   });
         } else {
-            segments = m_sd.Process(pcm16kMono.data(), static_cast<int32_t>(pcm16kMono.size()));
+            segments = sd.Process(pcm16kMono.data(), static_cast<int32_t>(pcm16kMono.size()));
         }
+    };
+
+    try {
+        runProcess(m_sd);
     } catch (const std::exception &e) {
-        // Same "never crash the app" principle as createSafely() above —
-        // an inference-time failure degrades to "no turns found", not a
-        // process crash.
         qWarning() << "DiarizationEngine: diarize() failed:" << e.what();
-        return turns;
+        // A CUDA inference failure on a long recording is almost always the
+        // onnxruntime CUDA arena exhausting VRAM (it caches and grows
+        // monotonically — measured ~29 GB on a multi-hour file; see
+        // patches/sherpa-onnx-batch-segmentation.patch). The load-time CUDA→CPU
+        // fallback in createSafely() only covers a failed CUDA *init*, so retry
+        // here on a freshly-built CPU session (its arena lives in system RAM),
+        // and latch to CPU so the rest of a batch skips the doomed CUDA attempt.
+        if (m_usingCuda && !m_segmentationModelPath.isEmpty()) {
+            try {
+                sc::OfflineSpeakerDiarization cpuSd = sc::OfflineSpeakerDiarization::Create(
+                    buildConfig(m_segmentationModelPath, m_embeddingModelPath, m_threshold, "cpu"));
+                if (cpuSd.Get() != nullptr) {
+                    qWarning() << "DiarizationEngine: retrying diarization on CPU (GPU out of memory)";
+                    runProcess(cpuSd);
+                    m_usingCuda = false;
+                } else {
+                    if (inferenceFailed)
+                        *inferenceFailed = true;
+                    return turns;
+                }
+            } catch (const std::exception &e2) {
+                qWarning() << "DiarizationEngine: CPU fallback also failed:" << e2.what();
+                if (inferenceFailed)
+                    *inferenceFailed = true;
+                return turns;
+            }
+        } else {
+            // Already on CPU (or no model paths) — no lower-memory tier left;
+            // this is a real failure (item 019's signal → DiarizeTask throws).
+            if (inferenceFailed)
+                *inferenceFailed = true;
+            return turns;
+        }
     }
 
     // See mergeMinorSpeakersIntoNearestMajor()'s doc comment — collapses

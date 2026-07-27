@@ -291,6 +291,7 @@ std::vector<Segment> ParakeetEngine::transcribe(const AudioChunk &chunk, const P
                                                  const SegmentCallback &onSegment, const AbortCallback &onAbort)
 {
     std::vector<Segment> segments;
+    m_decodeFailures = 0;
     if (!isValid() || chunk.pcm16kMono.empty())
         return segments;
     // No mid-decode abort hook (Decode() is one blocking call) — honor a cancel
@@ -333,7 +334,11 @@ std::vector<Segment> ParakeetEngine::transcribe(const AudioChunk &chunk, const P
         } catch (const std::exception &e) {
             // Same never-crash-the-app degradation as DiarizationEngine: a decode
             // failure drops this sub-window (not the whole file, not the process).
+            // Counted (not just logged) so the caller can tell an incomplete
+            // result from a genuinely short/silent file — see
+            // takeInferenceFailureCount().
             qWarning() << "ParakeetEngine: decode failed:" << e.what();
+            ++m_decodeFailures;
             continue;
         }
 

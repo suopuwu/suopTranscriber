@@ -2891,24 +2891,29 @@ Rectangle {
                             ? qsTr("Add to queue")
                             : (mainPanel.hasMetadata ? qsTr("Re-transcribe") : qsTr("Transcribe")))
 
+                // AppSettings.defaultModel, not modelCombo.currentValue: the picker is a
+                // VIEW of the setting (it writes back via onPicked), so reading the
+                // setting here keeps this button and the sidebar/ribbon transcribe
+                // entry points (which already read AppSettings.defaultModel) from
+                // ever queuing a different model than what's displayed.
                 onTapped: mainPanel.transcriptionController.transcribe(mainPanel.player.source, mainPanel.vaultPath,
-                                                                         modelCombo.currentValue,
+                                                                         AppSettings.defaultModel,
                                                                          AppSettings.autoLabelEnabled,
                                                                          AppSettings.restrictTagsToExisting,
                                                                          AppSettings.tagReuseBias,
                                                                          AppSettings.wordiness)
             }
 
-            // Items 24/53: "Run all jobs" — queues the full transcribe->label
-            // ->chapters pipeline for the open file. Per the user's spec, shown
-            // ONLY when there's no transcription yet (an untranscribed audio
-            // file): once transcribed, the individual regenerate-label /
-            // generate-chapters icons beside it cover the derived passes. Not
-            // shown for an orphaned .md (nothing to transcribe — the
-            // relabel/chapters icons already handle that case).
+            // "Run all available jobs" — queues every pipeline step the open
+            // file hasn't had yet (transcribe / detect speakers / label /
+            // chapters, see runAllJobs()). Available for ANY audio file,
+            // transcribed or not: the skipping happens in runAllJobs(), and on
+            // a fully processed file the tap is a deliberate no-op. Still not
+            // shown for an orphaned .md (no audio — the relabel/chapters icons
+            // handle that case).
             AppIconButton {
                 id: runAllIconButton
-                visible: mainPanel.transcriptionController && mainPanel.hasAudio && !mainPanel.hasMetadata
+                visible: mainPanel.transcriptionController && mainPanel.hasAudio
                 readonly property bool isQueued: mainPanel.transcriptionController && mainPanel.player
                     && mainPanel.transcriptionController.queuedFileUrls.some(
                            u => u.toString() === mainPanel.player.source.toString())
@@ -2919,10 +2924,10 @@ Rectangle {
                                  === mainPanel.player.source.toString())
 
                 iconName: "run-all"
-                tooltip: qsTr("Run all jobs (transcribe, label, chapters)")
+                tooltip: qsTr("Run all available jobs (transcribe, detect speakers, label, chapters)")
 
                 onTapped: mainPanel.transcriptionController.runAllJobs(mainPanel.player.source, mainPanel.vaultPath,
-                                                                        modelCombo.currentValue,
+                                                                        AppSettings.defaultModel,
                                                                         AppSettings.restrictTagsToExisting,
                                                                         AppSettings.tagReuseBias,
                                                                         AppSettings.wordiness,
@@ -3704,9 +3709,9 @@ Rectangle {
 
                     // Transcription model. Shares the row evenly with the two
                     // diarization pickers below via matching Layout.fillWidth
-                    // + preferredWidth; ModelComboBox elides the closed label
+                    // + preferredWidth; AppComboBox elides the closed label
                     // (full text in tooltip/popup) so nothing overflows.
-                    ModelComboBox {
+                    AppComboBox {
                         id: modelCombo
                         Layout.fillWidth: true
                         Layout.preferredWidth: 1
@@ -3728,12 +3733,12 @@ Rectangle {
                     Rectangle {
                         id: vadIndicator
                         readonly property bool usesVad: mainPanel.transcriptionController
-                            ? mainPanel.transcriptionController.modelUsesVad(modelCombo.currentValue) : false
+                            ? mainPanel.transcriptionController.modelUsesVad(AppSettings.defaultModel) : false
                         // Whisper-only per-window silence GATING (a subset of
                         // usesVad — parakeet gets windowing but not this), so
                         // the green tooltip can scope its silence-skipping claim.
                         readonly property bool usesGating: mainPanel.transcriptionController
-                            ? mainPanel.transcriptionController.modelUsesVadGating(modelCombo.currentValue) : false
+                            ? mainPanel.transcriptionController.modelUsesVadGating(AppSettings.defaultModel) : false
                         // Ground truth from the OPEN file's stored transcript:
                         // VAD was attempted but failed (guarded exactly like the
                         // banner above — metadata is a valid map once hasMetadata).
@@ -3784,7 +3789,7 @@ Rectangle {
                         color: Theme.textMuted
                     }
 
-                    ModelComboBox {
+                    AppComboBox {
                         id: segmentationCombo
                         Layout.fillWidth: true
                         Layout.preferredWidth: 1
@@ -3793,7 +3798,7 @@ Rectangle {
                         onPicked: (id) => AppSettings.diarizationSegmentationModel = id
                     }
 
-                    ModelComboBox {
+                    AppComboBox {
                         id: embeddingCombo
                         Layout.fillWidth: true
                         Layout.preferredWidth: 1

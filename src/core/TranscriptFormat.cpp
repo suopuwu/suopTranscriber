@@ -336,6 +336,11 @@ QString formatSegmentLine(double t0, const QString &speakerLabel, const QString 
 // real segment.
 extern const QString kPreludeEndMarker = QStringLiteral("<!-- prelude end -->");
 
+bool transcriptIsLabeled(const QString &label, const QString &tags, const QString &body)
+{
+    return !label.isEmpty() || !tags.isEmpty() || body.contains(kPreludeEndMarker);
+}
+
 // Everything from `body`'s start through kPreludeEndMarker (and its
 // immediately-following blank line, if present) is the prelude region —
 // strip it, leaving just the segment-line content. `body` unchanged if the

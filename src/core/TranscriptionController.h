@@ -266,6 +266,9 @@ public:
     // MainPanel's transcribingOverlayLabel); both are pure forwarders.
     Q_INVOKABLE QString phaseLabel(const QString &phase) const;
     Q_INVOKABLE QString phaseOverlayLabel(const QString &phase) const;
+    // Thin forwarder to JobListFormatter::modelShortLabel — the Tasks list is
+    // the only caller (see BottomBar's modelDetail line).
+    Q_INVOKABLE QString modelShortLabel(const QString &modelId) const;
     QUrl currentFile() const { return m_currentFile; }
     // See the liveUpdateTick Q_PROPERTY doc comment above.
     int liveUpdateTick() const { return m_liveUpdateTick; }
@@ -316,7 +319,34 @@ public:
     // during "loading"/"decoding" (their synthetic progress still advances
     // m_overallProgress — see phaseRelativeSyntheticProgress()), unlike
     // before those phases had rolling-average timing data to synthesize from.
+    //
+    // 2026-07-25 (batch-wedge report): a stuck Active job — overallProgress
+    // frozen near 0 while elapsed keeps climbing — used to extrapolate to an
+    // absurd, alarming number ("~114 hours left" on a 3-minute file, back-
+    // solved from overall stuck at ~0.015). Returns kStalledEtaMs instead
+    // once overallProgress hasn't ACTUALLY increased (tracked in
+    // m_lastProgressAdvanceMs, updated wherever it lands — see the
+    // overallProgressChanged connection in the constructor) for longer than
+    // etaStallThresholdMs() allows; BottomBar renders that as "stalled at …"
+    // rather than a fake ETA. Also clamps the raw extrapolation to
+    // kEtaCeilingMs as a cheap belt-and-suspenders — a display-only backstop,
+    // not a substitute for the stall check above.
     Q_INVOKABLE qint64 estimatedRemainingMs() const;
+    // The sentinel estimatedRemainingMs() returns for "stalled" — distinct
+    // from the existing -1 ("unknown: nothing Active, or too early for
+    // overallProgress to be above 0"). QML compares against this literal
+    // (see BottomBar.qml's elapsedEtaText), same convention as -1 already
+    // being spelled directly there.
+    static constexpr qint64 kStalledEtaMs = -2;
+    // Pure predicate behind the stall check above, given this phase's own
+    // rolling-average duration (PhaseTimer::phaseAverageDurationMs()):
+    // generous window = at least a floor, or a multiple of that average,
+    // whichever is larger — so a phase that's merely slower than usual (a
+    // big model's own pace) doesn't misread as stalled. Static + pure so
+    // tst_transcription_queue.cpp can assert the boundary directly without
+    // waiting out real wall-clock minutes. See the .cpp for the chosen
+    // constants and why they're conservative.
+    static qint64 etaStallThresholdMs(double phaseAverageDurationMs);
     // Derived from m_jobs: total entry count / Done+Failed count. Both only
     // grow until dismiss()/clearFinished() shrink the list (see class doc).
     // Thin forwarders to TaskQuery — pure over the task list; they stay here
@@ -571,20 +601,29 @@ public:
     // ASR (see transcribe()), and speaker detection is only ever a separate
     // job (diarizeFile() standalone, or this pipeline's diarize step).
     //
-    // Already-transcribed decision (documented per items 24/53): if fileUrl
-    // already has a sibling .md, the transcribe step is SKIPPED and only
-    // diarize+label+chapters are queued — re-transcribing a file that's already
-    // done is the surprising choice; "run all" on a done file just re-detects
-    // speakers and refreshes its derived label+chapters. An UNtranscribed file
-    // gets all four. (An orphaned .md — passed as its own path — is "already
-    // transcribed" by this rule; it too skips transcribe, and its diarize step
-    // is a no-op result since there's no audio to decode.)
+    // "Run all AVAILABLE jobs": every step whose output is already on disk is
+    // skipped — see pendingJobKinds() for the per-step markers. So a fresh file
+    // gets all four, a transcribed-but-unlabeled one gets label+chapters, and a
+    // fully-processed one queues NOTHING (silent no-op, by request: re-running a
+    // finished pass is never what the button means). Re-running an individual
+    // pass is what the individual actions are for. (An orphaned .md — passed as
+    // its own path — reads as already transcribed, so it never re-transcribes.)
     //
     // Params mirror the union of transcribe()'s + generateChapters()' inputs
     // (the QML call sites read them from AppSettings / the model combo, same as
     // the individual actions do). No-op if fileUrl already has a Queued/Active
     // entry, same dedup gate as the individual actions (checked once, up front,
     // before any of the jobs is inserted).
+    //
+    // The run-all pipeline steps fileUrl still NEEDS, in pipeline order:
+    // "transcribe", "diarize", "relabel", "chapters". A step is absent once its
+    // own output is on disk — sibling .md for transcribe, `speakerDetection:
+    // true` for diarize, transcriptIsLabeled() for relabel, a chapter marker in
+    // the body for chapters. Purely a disk read: it says nothing about what's
+    // queued (runAllJobs()'s isQueued() gate covers that). Empty ⇒ everything
+    // has already run, and runAllJobs() is a no-op.
+    Q_INVOKABLE QStringList pendingJobKinds(const QUrl &fileUrl) const;
+
     Q_INVOKABLE void runAllJobs(const QUrl &fileUrl, const QUrl &vaultUrl, const QString &modelId,
                                  bool restrictTagsToExisting = false,
                                  double tagReuseBias = 0.5, double wordiness = 0.5, double chapterDensity = 0.5,
@@ -1620,6 +1659,18 @@ private:
     // activeElapsedMs() at the moment m_phase last changed — see
     // phaseRelativeSyntheticProgress()'s doc comment.
     qint64 m_phaseStartMs = 0;
+    // activeElapsedMs() at the last moment m_phaseTimer->overallProgress()
+    // actually INCREASED (not merely re-notified at the same value) — see
+    // estimatedRemainingMs()'s doc comment. Updated from the
+    // overallProgressChanged connection in the constructor; reset to 0
+    // alongside m_lastProgressTrackedValue in onSerialTaskStarting() so a
+    // fresh job never inherits the previous one's stall clock.
+    qint64 m_lastProgressAdvanceMs = 0;
+    // The overallProgress value as of m_lastProgressAdvanceMs — compared
+    // against the current value on every overallProgressChanged to detect a
+    // genuine increase (a re-notify at the same value, e.g. a redundant
+    // setOverallProgress(0.0), must not look like fresh progress).
+    double m_lastProgressTrackedValue = 0.0;
     // Ticks only during "loading"/"decoding" (see recomputeOverallProgress()'s
     // doc comment) — those two have no real progress callback of their own,
     // so without this m_overallProgress would sit frozen for however long

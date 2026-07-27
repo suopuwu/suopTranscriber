@@ -119,7 +119,7 @@ int TaskScheduler::enqueueTask(std::unique_ptr<Task> task, int insertIndex)
     if (m_activeIndex >= insertAt)
         ++m_activeIndex;
 
-    emit queueChanged();
+    emitQueueChanged();
 
     pumpQueues();
     return id;
@@ -171,7 +171,7 @@ void TaskScheduler::startTask(int index)
     // golden emission order.
     m_observer->onSerialTaskStarting(task, wasCancelling);
 
-    emit queueChanged();
+    emitQueueChanged();
 
     // The ENTIRE dispatch, for every kind.
     QMetaObject::invokeMethod(m_runner, "execute", Qt::QueuedConnection, Q_ARG(Task *, task));
@@ -233,7 +233,7 @@ void TaskScheduler::startInstantTask(int index)
     // controller no-ops the serial-only progress/phase/paused wiring for an
     // Instant task.
     m_observer->onInstantTaskStarting(task);
-    emit queueChanged(); // status -> active shows in the Tasks list
+    emitQueueChanged(); // status -> active shows in the Tasks list
 
     m_instantRunner->resetControl();
     QMetaObject::invokeMethod(m_instantRunner, "execute", Qt::QueuedConnection, Q_ARG(Task *, task));
@@ -252,7 +252,7 @@ void TaskScheduler::onTaskFinished(Task *task, bool ok, const QString &error)
             task->error = error;
             task->durationMs = 0; // instant by construction — no elapsed tracking
         }
-        emit queueChanged();
+        emitQueueChanged();
         m_observer->reportInstantFinished(task, finishedFile, ok, error);
         if (indexOfTask(task) >= 0)
             maybeEmitUndoAvailable(task, ok); // fires per terminal; batch-aware
@@ -295,7 +295,7 @@ void TaskScheduler::onTaskFinished(Task *task, bool ok, const QString &error)
         // Deliberately do NOT advance to the next Queued task — the Paused task
         // sits at the front until the user explicitly resumes it.
         m_observer->onQueueDrained();
-        emit queueChanged();
+        emitQueueChanged();
         QMetaObject::invokeMethod(m_runner, "evictIdle", Qt::QueuedConnection);
         m_observer->reportSerialFinished(ok, error, /*structural*/ false, /*threeArg*/ true);
         return;
@@ -308,7 +308,7 @@ void TaskScheduler::onTaskFinished(Task *task, bool ok, const QString &error)
         // Serial queue drained — clear the "what's running" UI and release the
         // warm engine the finished task was using.
         m_observer->onQueueDrained();
-        emit queueChanged();
+        emitQueueChanged();
         QMetaObject::invokeMethod(m_runner, "evictIdle", Qt::QueuedConnection);
     }
 
@@ -404,11 +404,37 @@ void TaskScheduler::withBatch(const QString &displayLabel, const std::function<v
     m_currentBatchId = batchId;
     if (!displayLabel.isEmpty())
         m_batchLabels.insert(batchId, displayLabel);
-    fn();
-    m_currentBatchId = 0;
-    // Nothing landed under this batchId — drop the speculatively-recorded label.
-    if (!batchHasMembers(batchId))
-        m_batchLabels.remove(batchId);
+    {
+        // One queueChanged for the whole batch, not one per member. The hold is
+        // released (and the single emission raised) at the closing brace —
+        // AFTER the batch-label cleanup below, so the one notification consumers
+        // get already sees the finalized batch.
+        QueueChangedHold hold(this);
+        fn();
+        m_currentBatchId = 0;
+        // Nothing landed under this batchId — drop the speculatively-recorded label.
+        if (!batchHasMembers(batchId))
+            m_batchLabels.remove(batchId);
+    }
+}
+
+void TaskScheduler::emitQueueChanged()
+{
+    if (m_queueChangedHold > 0) {
+        m_queueChangedPending = true;
+        return;
+    }
+    emit queueChanged();
+}
+
+void TaskScheduler::releaseQueueChangedHold()
+{
+    if (--m_queueChangedHold > 0)
+        return;
+    if (m_queueChangedPending) {
+        m_queueChangedPending = false;
+        emit queueChanged();
+    }
 }
 
 void TaskScheduler::removeTaskAt(int index)
@@ -435,7 +461,7 @@ void TaskScheduler::cancelTaskAt(int index)
     // synthesizes its terminal report itself.
     const QUrl url = m_tasks[index]->fileUrl;
     removeTaskAt(index);
-    emit queueChanged();
+    emitQueueChanged();
     m_observer->reportCancelledBeforeRun(url);
 }
 
@@ -446,7 +472,7 @@ void TaskScheduler::dismiss(const QUrl &fileUrl)
         if (task->fileUrl == fileUrl
             && (task->status == Task::Status::Done || task->status == Task::Status::Failed)) {
             removeTaskAt(i);
-            emit queueChanged();
+            emitQueueChanged();
             return;
         }
     }
@@ -462,7 +488,7 @@ void TaskScheduler::clearFinished()
         }
     }
     if (changed)
-        emit queueChanged();
+        emitQueueChanged();
 }
 
 void TaskScheduler::cancelActive()
@@ -504,6 +530,9 @@ void TaskScheduler::cancelBatch(int batchId)
 {
     if (batchId == 0)
         return;
+    // Cancelling a batch removes N tasks in one synchronous burst — one
+    // queueChanged for the whole burst, not N. See QueueChangedHold.
+    QueueChangedHold hold(this);
     QList<int> ids;
     for (const auto &task : m_tasks) {
         if (task->batchId == batchId
@@ -529,11 +558,14 @@ void TaskScheduler::dismissBatch(int batchId)
         }
     }
     if (changed)
-        emit queueChanged();
+        emitQueueChanged();
 }
 
 void TaskScheduler::cancelAll()
 {
+    // Same burst collapse as cancelBatch() — clearing a long queue removes every
+    // Queued/Paused task at once. See QueueChangedHold.
+    QueueChangedHold hold(this);
     QList<int> queuedIds;
     for (const auto &task : m_tasks) {
         if (task->status == Task::Status::Queued || task->status == Task::Status::Paused)
@@ -573,7 +605,7 @@ void TaskScheduler::moveQueuedJob(int id, int newIndex)
     m_tasks.insert(m_tasks.begin() + move.insertIndex, std::move(moved));
     if (m_activeIndex >= move.insertIndex)
         ++m_activeIndex;
-    emit queueChanged();
+    emitQueueChanged();
 }
 
 void TaskScheduler::enqueueCombineJob(const CombineGroup &group, const QUrl &vaultUrl, bool deleteOriginals,
@@ -625,7 +657,7 @@ bool TaskScheduler::maybeRedirectForCombine(int index)
         transcribe->fileUrl = QUrl::fromLocalFile(group.outputPath);
         if (!isCombineQueued(group.outputPath))
             enqueueCombineJob(group, transcribe->vaultUrl, m_combineDeleteOriginals, index);
-        emit queueChanged();
+        emitQueueChanged();
         startTask(index);
         return true;
     }
@@ -655,7 +687,7 @@ int TaskScheduler::enqueueReadyCombineGroups(const QVariantList &rules, const QS
     }
     if (enqueued == 0)
         return 0;
-    emit queueChanged();
+    emitQueueChanged();
     if (m_activeIndex < 0)
         startNext();
     return enqueued;
@@ -686,6 +718,12 @@ void TaskScheduler::loadPersistedQueue(const QUrl &vaultUrl)
     // NOT auto-start anything: every restored entry just sits Queued until the
     // user resumes via startNext(). So this appends at the tail (explicit
     // insertIndex == size) and reproduces the exact saved order.
+    //
+    // One queueChanged for the whole replay, not one per restored task: the
+    // saved queue can be hundreds of entries, and each emission re-writes
+    // tasks.json (the very file being read) and rebuilds `jobs` app-wide. See
+    // QueueChangedHold.
+    QueueChangedHold hold(this);
     for (const QJsonValue &v : doc.array()) {
         const QJsonObject obj = v.toObject();
         const QString kind = obj.value("kind").toString();
@@ -700,7 +738,7 @@ void TaskScheduler::loadPersistedQueue(const QUrl &vaultUrl)
         task->id = m_nextJobId++;
         task->status = Task::Status::Queued;
         m_tasks.insert(m_tasks.begin() + std::clamp(insertAt, 0, static_cast<int>(m_tasks.size())), std::move(task));
-        emit queueChanged();
+        emitQueueChanged();
     }
 }
 

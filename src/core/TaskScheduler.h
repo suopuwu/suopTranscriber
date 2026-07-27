@@ -184,6 +184,27 @@ signals:
     void queueChanged();
 
 private:
+    // The ONE place queueChanged is raised. Inside a QueueChangedHold scope the
+    // emission is held and collapsed to a single one at scope exit: queueChanged
+    // is a very expensive signal (each one re-serializes tasks.json to disk and
+    // rebuilds the whole QVariantList `jobs` for every QML consumer), so raising
+    // it once per touched task made any bulk operation quadratic — "Run all"
+    // over 60 files fired 241 of them and froze the GUI thread.
+    void emitQueueChanged();
+    void releaseQueueChangedHold();
+
+    // RAII: collapse every queueChanged raised in this scope into one at the
+    // end. Only ever entered on the GUI thread, around a SYNCHRONOUS burst — a
+    // hold that outlived the burst would stall the Tasks list indefinitely.
+    class QueueChangedHold {
+    public:
+        explicit QueueChangedHold(TaskScheduler *s) : m_s(s) { ++m_s->m_queueChangedHold; }
+        ~QueueChangedHold() { m_s->releaseQueueChangedHold(); }
+        Q_DISABLE_COPY_MOVE(QueueChangedHold)
+    private:
+        TaskScheduler *m_s;
+    };
+
     void pumpQueues();
     void startTask(int index);
     void startInstantTask(int index);
@@ -218,6 +239,10 @@ private:
     int m_nextJobId = 1;
     int m_currentBatchId = 0;
     QHash<int, QString> m_batchLabels;
+
+    // queueChanged coalescing — see emitQueueChanged()/QueueChangedHold.
+    int m_queueChangedHold = 0;
+    bool m_queueChangedPending = false;
 
     // Pause/cancel INTENT (Q1: m_pausingActiveAsRestart is INTENTIONAL dormant
     // scaffolding, carried verbatim, NOT deleted).

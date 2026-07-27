@@ -23,6 +23,20 @@ private slots:
     // checkpoint half of this same DESIGN.md milestone (below) is still not
     // built.
 
+    void audioRecorder_monitorTeardownIsNotAFinishedTake()
+    {
+        QSKIP("AudioRecorder's own signal routing has no automated coverage. The worker's "
+              "monitor teardown must emit monitorStopped(), NOT stopped(): startRecording() stops "
+              "monitoring and starts a take in the same breath, so a monitor teardown reported as "
+              "a finished take clears `recording` right after it was set optimistically, leaving "
+              "the UI idle while capture really is running and the next Record press rejected as "
+              "'already recording'. Shipped as a fix and verified by hand; NOT TESTED, because "
+              "AudioRecorder owns a real capture thread (QAudioSource + parec/pw-record "
+              "subprocesses) and tst_recorderpage_sources replaces it with a stub — reverting the "
+              "fix leaves that harness green. Owed: a test double for AudioRecorderWorker, or a "
+              "seam that lets the GUI-side signal handlers be driven without opening a device.");
+    }
+
     void partialJsonl_checkpointAppend()
     {
         QSKIP("DESIGN.md / CLAUDE.md: after each window, append committed segments to "
@@ -135,16 +149,17 @@ private slots:
 
     void perAppAudioCapture_singleApplicationIsolation()
     {
-        QSKIP("Queue item 036: app-stream SELECTION into the one mixed WAV is now built — "
-              "AudioRecorderIO::parseSystemSources() (see tst_audiorecorder) enumerates "
-              "Stream/Output/Audio nodes via `pw-dump`, AudioRecorder::availableSystemSources() "
-              "surfaces them to the RecorderPage.qml dropdown, and AudioRecorderWorker::"
-              "startSystemAudio() taps the chosen one non-invasively via `pw-record --target` "
-              "instead of the whole default-sink monitor. What remains owed (and is NOT wanted per "
-              "the user's 2026-07-20 decision) is SIMULTANEOUS multi-track capture — recording "
-              "several sources at once into separate output tracks rather than one mixed WAV. "
-              "Capture-follows-selection itself has no offline unit path (needs a real PipeWire "
-              "server/pw-record) — see item 036's manual verification steps.");
+        QSKIP("Simultaneous N-source capture, mixed into ONE WAV, is now built: "
+              "AudioRecorderIO::filterAppStreams() surfaces the per-app rows, "
+              "AudioRecorder::startRecording()'s appCaptureSources starts one "
+              "parec/pw-record process per selected app (AudioRecorderIO::captureCommand()), "
+              "each at its own capture gain, and AudioRecorderWorker::mixOnce() mixes all of "
+              "them (plus mic/system audio) via AudioRecorderIO::mixPcm16N — see tst_audiorecorder "
+              "for the mixing/stall-policy coverage (AudioRecorderIO::planMixTick()). What remains "
+              "owed and NOT wanted is separate output TRACKS per source — still one mixed WAV, "
+              "never a multi-track file. Real capture itself has no offline unit path (needs a "
+              "real PipeWire server/pw-record) — see the recorder's per-app capture manual "
+              "verification steps.");
     }
 
     void emptyCapture_isDiscardedNotWrittenAsZeroLengthWav()

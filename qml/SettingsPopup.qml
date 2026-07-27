@@ -210,6 +210,10 @@ Popup {
                 || !AppSettings.isDefault("progressGlowRadius")
                 || !AppSettings.isDefault("progressGlowLayerCount")
                 || !AppSettings.isDefault("progressGlowHidesBar")
+                || !AppSettings.isDefault("bottomBarTaskClickOpensFile")
+                || !AppSettings.isDefault("bottomBarTaskTooltip")
+                || !AppSettings.isDefault("bottomBarPathShrinkToContent")
+                || !AppSettings.isDefault("bottomBarTaskTextFit")
                 || !AppSettings.isDefault("deleteOriginalsAfterCombine")
                 || !AppSettings.isDefault("autoCombineAfterGrab")
                 || !AppSettings.isDefault("sidebarEdgeLeftMargin")
@@ -1310,6 +1314,35 @@ Popup {
                 font.pixelSize: 11
             }
 
+            }
+
+            // Bottom bar section (page 0)
+            ColumnLayout {
+                Layout.fillWidth: true
+                spacing: 10
+                visible: settingsPopup.currentPage === 0
+
+                Label {
+                    text: qsTr("Bottom bar")
+                    color: "white"
+                    font.bold: true
+                }
+                ToggleSetting {
+                    label: qsTr("Click running-task text to open its file")
+                    propertyName: "bottomBarTaskClickOpensFile"
+                }
+                ToggleSetting {
+                    label: qsTr("Show full task text on hover")
+                    propertyName: "bottomBarTaskTooltip"
+                }
+                ToggleSetting {
+                    label: qsTr("Shrink the vault path to fit its content")
+                    propertyName: "bottomBarPathShrinkToContent"
+                }
+                ToggleSetting {
+                    label: qsTr("Shrink/wrap task text instead of truncating")
+                    propertyName: "bottomBarTaskTextFit"
+                }
             }
 
             // ===== Page 1 (cont.): Timestamps section =====

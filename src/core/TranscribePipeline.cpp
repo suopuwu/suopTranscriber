@@ -43,11 +43,13 @@ Windowing planWindows(bool selfSegmenting, const std::vector<float> &pcm, Transc
 std::vector<Segment> runWindows(TranscriptionEngine &engine, const std::vector<float> &pcm,
                                 const std::vector<VadChunker::Window> &windows,
                                 const ProgressCallback &onProgress, const SegmentCallback &onSegment,
-                                const AbortCallback &onAbort)
+                                const AbortCallback &onAbort, int *failureCount)
 {
     std::vector<Segment> merged;
     const double totalFileSeconds = static_cast<double>(pcm.size()) / 16000.0;
     double secondsDoneInPriorWindows = 0.0;
+    if (failureCount)
+        *failureCount = 0;
 
     for (const VadChunker::Window &window : windows) {
         // Between-window abort checkpoint — a mid-window abort is still the
@@ -88,6 +90,8 @@ std::vector<Segment> runWindows(TranscriptionEngine &engine, const std::vector<f
         };
 
         std::vector<Segment> produced = engine.transcribe(chunk, windowProgress, windowSegment, onAbort);
+        if (failureCount)
+            *failureCount += engine.takeInferenceFailureCount();
         // The returned vector gets the same offset merge as the streamed
         // segments (return value and callback are separate channels).
         for (Segment &segment : produced) {

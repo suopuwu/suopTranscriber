@@ -166,6 +166,23 @@ suop_add_test(tst_clipboard LINK_GUI SOURCES Clipboard.cpp)
 # clicked path segment never launches a real file manager (see the test's
 # top-of-file comment).
 suop_add_test(tst_bottombar_pathsegments LINK_QUICK LINK_SVG ICON_ASSETS SOURCES IconTheme.cpp)
+# Loads the real BottomBar.qml (inside an ApplicationWindow — its Tasks popup
+# needs a real Overlay, same reason tst_snackbar.cpp isn't a bare QQuickView)
+# and proves each Tasks-list row renders which model it will run. Compiles the
+# REAL ModelManager.cpp so JobListFormatter::modelShortLabel()'s catalog
+# mapping is exercised end to end, not re-asserted against itself.
+suop_add_test(tst_bottombar_taskmodel LINK_QUICK LINK_SVG ICON_ASSETS SOURCES IconTheme.cpp JobListFormatter.cpp ModelManager.cpp)
+# Loads the real BottomBar.qml (ApplicationWindow, same Overlay requirement as
+# tst_bottombar_taskmodel above) and proves the Tasks-list per-row × button is
+# actually clickable on its RIGHT edge — the overlay ScrollBar used to float
+# on top of that lane and swallow the press. See its top-of-file comment.
+suop_add_test(tst_bottombar_tasklist LINK_QUICK LINK_SVG ICON_ASSETS SOURCES IconTheme.cpp)
+# Loads the real BottomBar.qml (inside an ApplicationWindow — its Tasks popup
+# needs a real Overlay, same reason tst_snackbar.cpp isn't a bare QQuickView)
+# and proves clicking the "Kind: filename" task label emits taskActivated for
+# the displayed job's file (active + queued paths), and stays inert when
+# there's no file or the setting is off.
+suop_add_test(tst_bottombar_taskopen LINK_QUICK LINK_SVG ICON_ASSETS SOURCES IconTheme.cpp)
 # Loads the real MainPanel.qml in a QQuickView and proves the chapter-title <->
 # transcript cross-selection offset math (which the tst_styleguide source scans
 # structurally cannot check). Compiles the REAL Clipboard.cpp — not a stub —
@@ -426,6 +443,19 @@ suop_add_test(tst_middledragscroll LINK_QUICK)
 # text-editing behavior. No app C++ and no icons — the component imports
 # nothing from the module.
 suop_add_test(tst_textredoshortcut LINK_QUICK)
+# ModelComboBox.qml's own harness: a QQuickView driver assigning its model
+# after completion, the way MainPanel does — proves the real
+# QQuickComboBox::setModel() reset behavior rather than guessing at it. No
+# app C++ and no icons (the component never touches AppIcon/IconTheme).
+suop_add_test(tst_modelpicker LINK_QUICK)
+# RecorderPage.qml's runtime harness — the recorder was the one screen with no
+# QQuickView coverage, guarded only by tst_styleguide source scans. Needs
+# AudioRecorder.cpp (the stub delegates buildAppCaptureRows/decayPeak/… to the
+# REAL AudioRecorderIO helpers, so row logic is under test rather than
+# re-stated), hence LINK_MULTIMEDIA; and IconTheme + icon assets because the
+# page uses AppIcon.
+suop_add_test(tst_recorderpage_sources LINK_QUICK LINK_MULTIMEDIA LINK_SVG ICON_ASSETS
+    SOURCES AudioRecorder.cpp IconTheme.cpp)
 # TitleBar.qml's own harness: loads the real TitleBar (frameless-mode custom
 # titlebar), so like the sidebar harnesses below it needs IconTheme (its
 # singleton + image provider) and the icon-pack resources for AppIcon.

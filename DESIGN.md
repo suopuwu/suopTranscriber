@@ -259,6 +259,10 @@ full description + short category label — the latter replaced a QML
 "Transcribe"), `capabilities()`, `presentation()`, `isPersistable()`, and
 `prerequisites()` all live in one file.
 
+A `toVariantMap()` key IS the Tasks-list display contract: `modelId`
+(`TranscribeTask`) and `segmentationModelId`/`embeddingModelId` (`DiarizeTask`)
+render as the row's model sub-line via `JobListFormatter::modelShortLabel()`.
+
 The same "author it on the kind, not in a disjoint controller site" rule
 governs three more per-kind facts the controller used to hardcode (each in
 *two* places that had already drifted apart):
@@ -437,10 +441,14 @@ through the one task queue and sharing one diarization core
   `.md`'s segments, decodes the audio, diarizes, and splices the speaker tags +
   `speakerDetection: true`/`speakers:` back in (`spliceBodySpeakers`). A
   diarization failure here *is* the job's result.
-- **As a `runAllJobs()` pipeline step** — the one-click "do everything" path
-  queues transcribe → **detect speakers** → label → chapters as separate FIFO
-  jobs (the diarize step reads the `.md` the transcribe job just wrote). This
-  replaced the old inline `speakerDetection` toggle on transcribe.
+- **As a `runAllJobs()` pipeline step** — the one-click "run all available
+  jobs" path queues transcribe → **detect speakers** → label → chapters as
+  separate FIFO jobs (the diarize step reads the `.md` the transcribe job just
+  wrote). This replaced the old inline `speakerDetection` toggle on transcribe.
+  Only the steps that haven't run yet are queued — `pendingJobKinds()` derives
+  that from the `.md` alone (sibling file / `speakerDetection: true` /
+  `transcriptIsLabeled()` / a chapter marker), and a file with nothing owing
+  queues nothing.
 
 A fresh transcript is therefore always written speaker-less
 (`speakerDetection: false`, no `[Speaker N]` tags); the diarize job adds them

@@ -41,9 +41,13 @@ Windowing planWindows(bool selfSegmenting, const std::vector<float> &pcm,
 // reports cumulative seconds across all windows against the whole file. Returns
 // all merged segments. Honors onAbort between windows (mid-window abort is the
 // engine's own onAbort responsibility) and stops early when it fires.
+// failureCount (optional out-param): set to the sum of
+// engine.takeInferenceFailureCount() across all windows — a non-zero value
+// means the returned segments are incomplete (see TranscriptionEngine's doc
+// comment), not that the file genuinely had less speech.
 std::vector<Segment> runWindows(TranscriptionEngine &engine, const std::vector<float> &pcm,
                                 const std::vector<VadChunker::Window> &windows,
                                 const ProgressCallback &onProgress, const SegmentCallback &onSegment,
-                                const AbortCallback &onAbort);
+                                const AbortCallback &onAbort, int *failureCount = nullptr);
 
 } // namespace TranscribePipeline
