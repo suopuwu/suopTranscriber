@@ -33,15 +33,15 @@ std::vector<std::pair<double, double>> DetectSilenceTask::selectSilences(
     const QList<ParsedSegment> &segments, double totalSeconds)
 {
     // See the doc comment on the declaration for the empty-speechSpans
-    // rationale (item 010).
+    // rationale.
     if (chunkingError.isEmpty() && !speechSpans.empty())
         return VadChunker::complementSpans(speechSpans, totalSeconds);
 
     // VAD unavailable/failed/empty despite the prerequisite — fall back to
     // the SAME transcript-gap heuristic TranscribeTask's inline capture uses
     // when VAD didn't run: treat consecutive segments as touching spans (the
-    // file format stores no per-segment end time — CLAUDE.md's vault-
-    // layout note — so an already-written .md can only ever recover a
+    // file format stores no per-segment end time by design, so an
+    // already-written .md can only ever recover a
     // LEADING silence gap before the first segment this way, never an
     // internal one; still better than leaving the key absent, matching
     // TranscribeTask's "so the key is always present" contract).
@@ -57,12 +57,9 @@ std::vector<std::pair<double, double>> DetectSilenceTask::selectSilences(
 void DetectSilenceTask::run(TaskContext &ctx)
 {
     // Needs no resident heavy model of its own (VAD loads/frees inline per
-    // call — see VadChunker::computeWindows()) — free whatever a PREVIOUS
-    // task left resident, same GPU hygiene as DiarizeTask/ChaptersTask.
-    ctx.engines.evictAsr();
-    ctx.engines.evictLabel();
-    ctx.engines.evictDiar();
-
+    // call — see VadChunker::computeWindows()) — the default engineNeeds()
+    // (needs nothing) is correct here, so TaskRunner's dispatch-time
+    // residency policy already freed whatever a previous task left resident.
     const QString filePath = fileUrl.toLocalFile();
     const QString mdPath = sidecarPath(filePath);
     if (!QFileInfo::exists(mdPath))

@@ -9,8 +9,8 @@
 #include "VadChunker.h"
 
 // Shared transcription windowing + streaming, used by BOTH TranscribeTask (the
-// real transcriber) and BenchmarkTask so they segment/stream identically (see
-// CLAUDE.md: no parallel code paths). The app owns the chunk offset merge, not
+// real transcriber) and BenchmarkTask so they segment/stream identically (no
+// parallel code paths). The app owns the chunk offset merge, not
 // the engines (DESIGN.md "Engine architecture").
 namespace TranscribePipeline {
 
@@ -31,7 +31,7 @@ struct Windowing {
 // own internal segmentation) ⇒ ONE whole-file window. Otherwise VAD-window via
 // ModelManager::ensureVadModel + VadChunker::computeWindows, degrading to a
 // single whole-file window when the VAD model is missing/failed (vadError set
-// honestly, per CLAUDE.md). Also sets the VAD model path on a WhisperCppEngine
+// honestly — never a silent degrade). Also sets the VAD model path on a WhisperCppEngine
 // so its own per-window gating matches (a no-op for other engine types).
 Windowing planWindows(bool selfSegmenting, const std::vector<float> &pcm,
                       TranscriptionEngine &engine);

@@ -14,9 +14,8 @@
 // `overwrite` (opt-in, from the drop handler's Overwrite/Skip snackbar) lifts
 // the collision guard in run() and lets the copy truncate the existing
 // destination. It replaces the audio bytes ONLY — a pre-existing sibling
-// `.md` transcript is left untouched (import never owned it; see the 078
-// work order's Open questions for the destructive alternative that was NOT
-// chosen).
+// `.md` transcript is left untouched (import never owned it; the destructive
+// alternative was considered and NOT chosen).
 class ImportTask : public Task {
     Q_OBJECT
 public:

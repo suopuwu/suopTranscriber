@@ -51,8 +51,12 @@ void DiarizationSweepTask::run(TaskContext &ctx)
         throw TaskError(decodeError.isEmpty() ? QStringLiteral("audio decode failed") : decodeError);
     const double audioSeconds = static_cast<double>(pcm->size()) / 16000.0;
 
-    ctx.engines.evictDiar(); // don't reuse a warm engine across a sweep
-
+    // Never reuses ctx.engines' cached diar engine — each combo below builds
+    // its own short-lived local DiarizationEngine instead (same reason
+    // BenchmarkTask doesn't go through EngineCache for its ASR models: a
+    // sweep's whole point is comparing several fresh models sequentially).
+    // The default engineNeeds() (needs nothing) is correct, so TaskRunner's
+    // dispatch-time residency policy already freed whatever was resident.
     QVariantList results;
     QElapsedTimer totalTimer;
     totalTimer.start();
@@ -116,8 +120,6 @@ void DiarizationSweepTask::run(TaskContext &ctx)
         if (!m_combos.isEmpty())
             emit progress(static_cast<double>(i + 1) / m_combos.size());
     }
-    ctx.engines.evictDiar();
-
     const bool cancelled = ctx.cancelRequested();
     QVariantMap run;
     run["file"] = filePath;

@@ -39,6 +39,8 @@ public:
     {
         emit phase(QStringLiteral("working"));
         emit progress(0.5);
+        if (!warningToReport.isEmpty())
+            ctx.reportWarning(warningToReport);
         if (blockOnCheckpoint && ctx.checkpoint())
             throw TaskError(QStringLiteral("Cancelled"));
         if (shouldThrow)
@@ -50,6 +52,10 @@ public:
     bool blockOnCheckpoint = false;
     bool shouldThrow = false;
     QString failureMessage = QStringLiteral("boom");
+    // A non-fatal diagnostic a subclass reports via
+    // TaskContext::reportWarning() during run() — empty means "nothing to
+    // report" (the common case every other FakeTask use leaves it as).
+    QString warningToReport;
 };
 
 } // namespace
@@ -79,6 +85,34 @@ private slots:
         QVERIFY(args.at(2).toString().isEmpty());
         QVERIFY(phaseSpy.count() >= 1);
         QVERIFY(progressSpy.count() >= 1);
+
+        thread.quit();
+        thread.wait();
+    }
+
+    // TaskContext::reportWarning() during a run() that otherwise
+    // succeeds must surface through taskFinished's warning argument WITH
+    // ok=true — a non-fatal diagnostic must never look like a failure at the
+    // one place (TaskRunner) every kind's result funnels through.
+    void runner_reportedWarning_survivesOnSuccessfulRun()
+    {
+        TaskRunner runner;
+        QThread thread;
+        runner.moveToThread(&thread);
+        thread.start();
+
+        FakeTask task;
+        task.warningToReport = QStringLiteral("196249 corrupt samples replaced with silence");
+        QSignalSpy finishedSpy(&runner, &TaskRunner::taskFinished);
+
+        QMetaObject::invokeMethod(&runner, "execute", Qt::QueuedConnection, Q_ARG(Task *, &task));
+        QVERIFY(finishedSpy.wait(2000));
+
+        QCOMPARE(finishedSpy.count(), 1);
+        const QVariantList args = finishedSpy.constFirst();
+        QVERIFY2(args.at(1).toBool(), "a reported warning must not fail the task");
+        QVERIFY(args.at(2).toString().isEmpty());
+        QCOMPARE(args.at(3).toString(), task.warningToReport);
 
         thread.quit();
         thread.wait();

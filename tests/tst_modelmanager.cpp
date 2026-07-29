@@ -11,8 +11,8 @@
 //              ensureDiarizationModels).
 //
 // Isolation: SUOP_MODELS_DIR / SUOP_BUNDLED_MODELS_DIR are redirected to fresh
-// temp dirs in init() so the tests never touch the real store (CLAUDE.md:
-// "never touch the user's real vault or app config").
+// temp dirs in init() so the tests never touch the real store (or the
+// user's real vault or app config).
 //
 // Network policy: these tests NEVER exercise the download path. Every
 // ensure* call pre-creates the expected file so the manager returns early;
@@ -22,6 +22,7 @@
 
 #include <QDir>
 #include <QFile>
+#include <QRegularExpression>
 #include <QTemporaryDir>
 #include <QUrl>
 
@@ -331,7 +332,106 @@ private slots:
     void ensureLabelModel_downloadRequiresNetwork()
     {
         QSKIP("Download path deliberately untested: tests must pass with no network "
-              "(would fetch ~2.5 GB from huggingface.co via curl).");
+              "(would fetch ~2.5 GB from huggingface.co via curl). The download-integrity "
+              "gate (expectedSha256()/verifyFileSha256(), applied to the installed file "
+              "before/after each download route) is covered offline by the "
+              "'Download integrity (pinned SHA-256)' slots below instead.");
+    }
+
+    // --- Download integrity (pinned SHA-256) ---------------------------------
+
+    // Digest of the exact bytes plantFakeModel() writes verbatim (no trailing
+    // newline) — computed with `sha256sum` while scouting. Recompute if the
+    // payload string below changes by so much as a byte.
+    void fileSha256_matchesAKnownDigest()
+    {
+        const QString planted =
+            plantFakeModel("whatever.bin", QByteArrayLiteral("not a real model — planted by the test"));
+        QVERIFY(!planted.isEmpty());
+        QCOMPARE(ModelManager::fileSha256(planted),
+                 QStringLiteral("919d91020d15a3a490b5f1a2e74071ec285b49ff26a1fa30365132df1dabe634"));
+
+        QVERIFY(ModelManager::fileSha256(QStringLiteral("/no/such/path")).isEmpty());
+    }
+
+    void verifyFileSha256_acceptsAMatch_rejectsAMismatch()
+    {
+        const QString planted = plantFakeModel("whatever.bin", "some model bytes");
+        QVERIFY(!planted.isEmpty());
+        const QString digest = ModelManager::fileSha256(planted);
+        QVERIFY(!digest.isEmpty());
+
+        QString error;
+        QVERIFY2(ModelManager::verifyFileSha256(planted, digest, &error), qPrintable(error));
+        QVERIFY(error.isEmpty());
+
+        const QString zeros = QString(64, QLatin1Char('0'));
+        error.clear();
+        QVERIFY(!ModelManager::verifyFileSha256(planted, zeros, &error));
+        // Actionable message: names both the expected and the actual digest.
+        QVERIFY2(error.contains(zeros), qPrintable(error));
+        QVERIFY2(error.contains(digest), qPrintable(error));
+
+        QVERIFY(!ModelManager::verifyFileSha256(QStringLiteral("/no/such/path"), digest));
+    }
+
+    // An empty pin is the documented escape hatch for an artifact nobody has
+    // captured a digest for yet — without this, an unpinned artifact becomes
+    // undownloadable rather than merely unverified.
+    void verifyFileSha256_treatsAnEmptyPinAsUnpinned()
+    {
+        const QString planted = plantFakeModel("whatever.bin", "some model bytes");
+        QVERIFY(!planted.isEmpty());
+        QVERIFY(ModelManager::verifyFileSha256(planted, QString()));
+    }
+
+    // Living-documentation slot: every artifact the catalogs can actually
+    // download must either carry a pinned SHA-256 or be named on the declared
+    // not-yet-pinned exemption list — never silently fall through unpinned AND
+    // unlisted. Also asserts the reverse: a stale exemption (a tier that was
+    // removed from the catalog) can't linger unnoticed.
+    void everyCatalogArtifact_isPinnedOrDeclaredUnpinned()
+    {
+        // Every catalog artifact is pinned as of this writing (see
+        // DEPENDENCIES.md); kept as a real (empty) exemption list rather than
+        // deleting the mechanism, since a future tier can land without a local
+        // copy or a huggingface LFS entry to hash.
+        const QStringList kNotYetPinned = {};
+
+        QStringList names;
+        for (const ModelManager::ModelInfo &info : ModelManager::availableModels()) {
+            if (ModelManager::isParakeetModelId(info.id)) {
+                // fileName is a bundle DIRECTORY, not a store-relative file — the
+                // pin table keys the four extracted members individually instead.
+                names << QStringLiteral("parakeet-tdt-0.6b-v2/encoder.int8.onnx")
+                      << QStringLiteral("parakeet-tdt-0.6b-v2/decoder.int8.onnx")
+                      << QStringLiteral("parakeet-tdt-0.6b-v2/joiner.int8.onnx")
+                      << QStringLiteral("parakeet-tdt-0.6b-v2/tokens.txt");
+                continue;
+            }
+            names << info.fileName;
+        }
+        for (const ModelManager::DiarizationModelInfo &info : ModelManager::availableSegmentationModels())
+            names << info.fileName;
+        for (const ModelManager::DiarizationModelInfo &info : ModelManager::availableEmbeddingModels())
+            names << info.fileName;
+        names << QString(ModelManager::kLabelModelFileName);
+        names << QString(ModelManager::kVadModelFileName);
+
+        static const QRegularExpression kSha256Pattern(QStringLiteral("^[0-9a-f]{64}$"));
+        for (const QString &name : std::as_const(names)) {
+            if (kNotYetPinned.contains(name))
+                continue;
+            const QString pin = ModelManager::expectedSha256(name);
+            QVERIFY2(!pin.isEmpty(), qPrintable(name + " has no pinned SHA-256 and is not on kNotYetPinned"));
+            QVERIFY2(kSha256Pattern.match(pin).hasMatch(),
+                     qPrintable(name + " pin is not 64 lowercase hex chars: " + pin));
+        }
+
+        // A stale exemption (the artifact it names was removed/pinned since)
+        // must not linger unnoticed either.
+        for (const QString &exempt : kNotYetPinned)
+            QVERIFY2(names.contains(exempt), qPrintable(exempt + " is on kNotYetPinned but not in any catalog"));
     }
 
     // --- Bundled-dir fallback (Settings → Models: search-path bundling) ------
@@ -443,6 +543,32 @@ private slots:
         QVERIFY(!error.isEmpty());
     }
 
+    // QFile::copy() returns TRUE on a short read (see ModelManager.cpp's
+    // copyVerified() comment) — a truncated/interrupted source must not land in
+    // the store wearing a clean "Done" result. A symlink to /proc/self/status is
+    // the deterministic way to force that: it stats at size 0 but reads back
+    // ~1.5 KB, so the copy "succeeds" with a landed size that disagrees with the
+    // source's stat, exactly the mismatch copyVerified() rejects. Same recipe as
+    // tst_usbgrabjob.cpp's copyThatDoesNotLandWhole_* tests.
+    void importModel_truncatedCopy_failsAndLeavesNothingInTheStore()
+    {
+#ifndef Q_OS_LINUX
+        QSKIP("truncated-copy recipe needs /proc/self/status (Linux-only)");
+#endif
+        QTemporaryDir src;
+        QVERIFY(src.isValid());
+        const QString srcPath = src.filePath("whatever-the-user-named-it.bin");
+        QVERIFY(QFile::link(QStringLiteral("/proc/self/status"), srcPath));
+        // The premise of the trick, asserted rather than assumed.
+        QCOMPARE(QFileInfo(srcPath).size(), 0);
+
+        QString error;
+        QVERIFY(!ModelManager::importModel("small.en", srcPath, &error));
+        QVERIFY(!error.isEmpty());
+        QVERIFY(!QFileInfo::exists(ModelManager::modelsStoreDir() + "/ggml-small.en.bin"));
+        QVERIFY(!ModelManager::isModelDownloaded("small.en"));
+    }
+
     // The parakeet bundle imports from a FOLDER holding its four files.
     void importModel_parakeetBundle_fromFolder()
     {
@@ -493,6 +619,29 @@ private slots:
         const QString exported = dest.filePath("ggml-base.en.bin");
         QVERIFY(QFileInfo::exists(exported));
         QCOMPARE(readAll(exported), QByteArray("export me"));
+    }
+
+    // Mirror of importModel_truncatedCopy_failsAndLeavesNothingInTheStore on the
+    // export side: the STORE file is the lying symlink this time, so exporting a
+    // model whose store copy is quietly truncated/corrupt must not hand the user
+    // a broken file while reporting success.
+    void exportModel_truncatedCopy_failsAndLeavesNothingAtTheDestination()
+    {
+#ifndef Q_OS_LINUX
+        QSKIP("truncated-copy recipe needs /proc/self/status (Linux-only)");
+#endif
+        const QDir modelsDir(ModelManager::modelsStoreDir());
+        QVERIFY(QDir().mkpath(modelsDir.path()));
+        const QString storePath = modelsDir.filePath("ggml-base.en.bin");
+        QVERIFY(QFile::link(QStringLiteral("/proc/self/status"), storePath));
+        QCOMPARE(QFileInfo(storePath).size(), 0);
+
+        QTemporaryDir dest;
+        QVERIFY(dest.isValid());
+        QString error;
+        QVERIFY(!ModelManager::exportModel("base.en", dest.path(), &error));
+        QVERIFY(!error.isEmpty());
+        QVERIFY(!QFileInfo::exists(dest.filePath("ggml-base.en.bin")));
     }
 
     // Export round-trips: a parakeet bundle exported to a folder re-imports.

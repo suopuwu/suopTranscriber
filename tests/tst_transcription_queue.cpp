@@ -1,5 +1,5 @@
-// Spec under test — TranscriptionController's task queue (Milestone 4/5)
-// and CLAUDE.md's "Never run transcription on the GUI thread."
+// Spec under test — TranscriptionController's task queue and the rule that
+// transcription never runs on the GUI thread (DESIGN.md).
 //
 //   - transcribe() queues; no duplicate entry while a fileUrl is already
 //     Queued/Active. Done/Failed entries deliberately do NOT block
@@ -41,7 +41,7 @@
 
 #include <atomic>
 
-#include "DiarizationEngine.h" // DiarizedTurn for the spliceBodySpeakers test (item 52)
+#include "DiarizationEngine.h" // DiarizedTurn for the spliceBodySpeakers test
 #include "LabelingEngine.h" // kMaxChapterInputChars for the item-28 window test
 #include "TranscriptionController.h"
 // Persistence round-trip guard (everyPersistableKind_roundTripsThroughFactory):
@@ -59,6 +59,7 @@
 #include "tasks/RelabelTask.h"
 #include "tasks/RenameSpeakerTask.h"
 #include "tasks/TaskFactory.h"
+#include "tasks/TaskRunner.h" // TaskRunner::engines() — the real-dispatch residency test
 #include "tasks/TranscribeTask.h"
 
 namespace {
@@ -102,7 +103,7 @@ struct VaultFixture {
 };
 
 // A fake Task mimicking diarization's shape for the cancel-while-paused state
-// machine (item 065): pausable == true, cancellableMidRun == false. Its run()
+// machine: pausable == true, cancellableMidRun == false. Its run()
 // blocks on ctx.checkpoint() to honor pause, but DISCARDS checkpoint()'s cancel
 // return during the "pass" — exactly like DiarizeTask, whose sherpa-onnx
 // progress-callback return is ignored, so a cancel cannot abort the pass
@@ -144,6 +145,20 @@ public:
     QString kind() const override { return QStringLiteral("fakeQuietSerial"); }
     QString displayName() const override { return QStringLiteral("Fake quiet serial"); }
     void run(TaskContext &) override {} // returns at once -> Done, emits nothing
+};
+
+// A Serial task that reports a non-fatal warning via
+// TaskContext::reportWarning() and then succeeds — the general channel
+// TranscribeTask's corrupt-audio note ultimately feeds, exercised here
+// without a real decode. run() returns normally (never throws), so this
+// must still land Status::Done, not Failed.
+class FakeWarningSerialTask : public Task {
+public:
+    explicit FakeWarningSerialTask(const QUrl &file = {}) { fileUrl = file; }
+    QString kind() const override { return QStringLiteral("fakeWarningSerial"); }
+    QString displayName() const override { return QStringLiteral("Fake warning serial"); }
+    void run(TaskContext &ctx) override { ctx.reportWarning(m_warningToReport); }
+    QString m_warningToReport = QStringLiteral("corrupt samples replaced with silence");
 };
 
 // A Serial task that BLOCKS in run() until released (m_release), so a test can
@@ -210,7 +225,7 @@ public:
 
 // A WeightedPhases fake (TranscribeTask/DiarizeTask's progress shape) that
 // reports ONE real progress() tick on a single named phase, then blocks — for
-// item 024's ETA-stall test. Real (not synthetic-ramp) progress is needed
+// the ETA-stall test. Real (not synthetic-ramp) progress is needed
 // because estimatedRemainingMs()'s stall check tracks overallProgress
 // actually advancing, and "transcribing" is not one of PhaseTimer's
 // no-callback synthetic phases (see PhaseTimer::isSyntheticProgressPhase()) —
@@ -303,6 +318,21 @@ QString statusOf(const TranscriptionController &c, const QUrl &fileUrl)
     return {};
 }
 
+// The "warning" field jobs() merges onto every row (see
+// TranscriptionController::jobs()'s doc comment) — empty for the
+// overwhelming majority of tasks, so a missing fileUrl match also reads as
+// "no warning" rather than a distinguishable error.
+QString warningOf(const TranscriptionController &c, const QUrl &fileUrl)
+{
+    const QVariantList jobs = c.jobs();
+    for (const QVariant &v : jobs) {
+        const QVariantMap job = v.toMap();
+        if (job.value("fileUrl").toUrl() == fileUrl)
+            return job.value("warning").toString();
+    }
+    return {};
+}
+
 constexpr auto kModelId = "base.en";
 
 }
@@ -321,7 +351,7 @@ class TstTranscriptionQueue : public QObject
 
 private slots:
     // The model benchmark (BenchmarkTask) is display-only: it must NEVER write
-    // a transcript .md or otherwise mutate the vault. Wave N: the old
+    // a transcript .md or otherwise mutate the vault. The old
     // benchmarkJob worker slot is now BenchmarkTask::run() in its own file, so
     // this source-scan guard (same technique as tst_styleguide's) points there
     // — a future edit that reaches for sidecarPath()/writeFrontmatter()/a
@@ -340,8 +370,8 @@ private slots:
     }
 
     // TranscriptionController persists rolling-average phase timing via a
-    // plain QSettings() (see RollingAverage.h / loadPhaseTimings()) — CLAUDE.md
-    // "Never let testing touch the user's real vault or app config" applies
+    // plain QSettings() (see RollingAverage.h / loadPhaseTimings()) — the
+    // "never let testing touch the user's real vault or app config" rule applies
     // here just as much as to lastVaultPath: setTestModeEnabled() redirects every
     // QSettings/QStandardPaths lookup for the rest of this process into an
     // isolated "qttest" sandbox instead of the real ~/.config/suopTranscriber.
@@ -361,7 +391,7 @@ private slots:
         qputenv("SUOP_BUNDLED_MODELS_DIR", m_emptyBundled->path().toLocal8Bit());
     }
 
-    // Item 11: sortedJobs partitions the raw (append-order) jobs() list for
+    // sortedJobs partitions the raw (append-order) jobs() list for
     // display — Active first, then Queued in run order, then Paused, then
     // finished (done/failed) most-recently-appended first. Pure static
     // helper, tested directly with synthetic entries (no real jobs needed).
@@ -483,7 +513,7 @@ private slots:
         QCOMPARE(agg.value(QStringLiteral("durationMs")).toLongLong(), qint64(180)); // 100+50+30, all terminal
     }
 
-    // Item 25: backendKind maps CUDA/Vulkan/any-non-CPU -> "gpu", CPU -> "cpu"
+    // backendKind maps CUDA/Vulkan/any-non-CPU -> "gpu", CPU -> "cpu"
     // (case-insensitive), empty -> empty (so QML keeps its indicator hidden
     // until a model loads).
     void backendKind_mapsGpuCpuEmpty()
@@ -755,8 +785,8 @@ private slots:
         QCOMPARE(controller.jobs().size(), 0); // whole batch cleared at once
     }
 
-    // Item 37: drag-and-drop import runs its byte-copy on the SAME worker
-    // thread as every other job (CLAUDE.md "never on the GUI thread"), tagged
+    // Drag-and-drop import runs its byte-copy on the SAME worker
+    // thread as every other job (never on the GUI thread), tagged
     // as a distinct "import" kind. Enqueuing an import job copies the source
     // into the vault and the job ends Done. Uses a real source file + a temp
     // dest vault (never the user's real vault).
@@ -780,7 +810,7 @@ private slots:
 
         TranscriptionController controller;
         QSignalSpy finishedSpy(&controller, &TranscriptionController::finished);
-        // Item 040: an import is Presentation::Background, so it must never flip
+        // An import is Presentation::Background, so it must never flip
         // the main-panel overlay gate. m_activeIsForeground starts false and
         // only changes on a Foreground task start, so a Background import
         // produces ZERO notifications regardless of copy timing.
@@ -807,7 +837,7 @@ private slots:
         QCOMPARE(copied.readAll().size(), 64 * 1024); // bytes copied intact
     }
 
-    // Item 37: a copy that can't proceed on the worker (here: the source file
+    // A copy that can't proceed on the worker (here: the source file
     // doesn't exist) surfaces as a Failed job with an error, exactly like any
     // other job's failure — not a crash or a silent drop. (Wrong-type /
     // collision / no-vault are rejected SYNCHRONOUSLY before enqueue, by
@@ -831,7 +861,7 @@ private slots:
         QVERIFY(!QFileInfo::exists(destUrl.toLocalFile())); // no partial file left behind
     }
 
-    // Item 074: the controller-owned pending-rename store. pendingRenameStem()
+    // The controller-owned pending-rename store. pendingRenameStem()
     // returns the new stem between renameFile() and fileRenamed, and "" after;
     // pendingRenamesRevision bumps on BOTH edges (enqueue and completion). This
     // is the single source both panels read so a rename deferred behind a
@@ -873,7 +903,7 @@ private slots:
         QCOMPARE(revSpy.count(), 2);
     }
 
-    // CLAUDE.md: "Never run transcription on the GUI thread." The worker
+    // Transcription never runs on the GUI thread. The worker
     // QThread is a private member (not a QObject child of the controller),
     // so it isn't reachable via findChildren(); the observable contract from
     // the public API is:
@@ -1123,7 +1153,7 @@ private slots:
             QVERIFY(!v.toMap().value("undoable").toBool());
     }
 
-    // Item 23 (behavior change): a transcribe call now ONLY transcribes. It
+    // A transcribe call now ONLY transcribes. It
     // used to chain a SEPARATE "relabel" job alongside the transcribe job
     // whenever autoLabel was true (silent auto-labeling on every "Transcribe"
     // click) — that auto-chaining is removed. The autoLabel parameter is kept
@@ -1158,7 +1188,7 @@ private slots:
             QVERIFY(v.toMap().value("kind").toString() != QStringLiteral("relabel"));
     }
 
-    // Items 24/53 ("run all jobs"): a single runAllJobs() on an UNtranscribed
+    // "Run all jobs": a single runAllJobs() on an UNtranscribed
     // file must enqueue exactly four jobs, IN ORDER — transcribe, then detect
     // speakers (diarize), then label (relabel), then chapters — so the single
     // FIFO worker runs the full pipeline sequentially. The diarize step is what
@@ -1341,7 +1371,7 @@ private slots:
         QVERIFY(!controller.pendingJobKinds(file).contains(QStringLiteral("relabel")));
     }
 
-    // Wave N (task system, item 5): transcribe() queues a "download" job
+    // Task system: transcribe() queues a "download" job
     // ahead of the transcribe job when the whisper model isn't on disk yet
     // — VaultFixture deliberately does NOT plant a model file here (unlike
     // every other test in this file), so this is the one case where that's
@@ -1371,7 +1401,7 @@ private slots:
         controller.cancelJob(controller.jobs().at(0).toMap().value("id").toInt());
     }
 
-    // Item 3: cancelling a Queued job removes it outright (nothing had
+    // Cancelling a Queued job removes it outright (nothing had
     // started, nothing to interrupt); cancelling the Active job lets it run
     // to a Failed/"Cancelled" completion rather than vanishing instantly
     // (see TranscriptionController::cancelJob()'s doc comment).
@@ -1396,7 +1426,7 @@ private slots:
         QTRY_COMPARE(controller.tasksCompleted(), 1); // let the fake (fails-fast) model job settle before teardown
     }
 
-    // Wave N (task system) invariant 1 — "exactly one terminal report per
+    // Task-system invariant — "exactly one terminal report per
     // enqueued task, whether or not run() was ever called." The OLD system
     // silently dropped a cancelled-while-Queued job (removeAt, no signal), so
     // a consumer waiting on finished() (e.g. UsbGrabberController's in-flight
@@ -1432,7 +1462,7 @@ private slots:
         QTRY_COMPARE(controller.tasksCompleted(), 1); // let the active fake job settle before teardown
     }
 
-    // Item 3: cancelling the ACTIVE job takes effect (Failed/"Cancelled")
+    // Cancelling the ACTIVE job takes effect (Failed/"Cancelled")
     // rather than leaving it running to completion. Uses a "download" job
     // as the Active job under test — see maybeQueueDownloadJob()'s doc
     // comment for why VaultFixture's normal fake model would fail on its
@@ -1457,7 +1487,7 @@ private slots:
         QCOMPARE(controller.jobs().at(0).toMap().value("error").toString(), QStringLiteral("Cancelled"));
     }
 
-    // Item 065: cancelling a PAUSED task that can't abort mid-pass (diarization's
+    // Cancelling a PAUSED task that can't abort mid-pass (diarization's
     // shape — pausable && !cancellableMidRun) must show an honest "Cancelling"
     // (activeStopping) state, NOT look like a resume with a dead pause button.
     // Before the fix, the cancel paths fired requestResume() and checkpoint()
@@ -1629,7 +1659,7 @@ private slots:
         QCOMPARE(finishedSpy.at(1).at(1).toBool(), true);
     }
 
-    // Item 9 (2026-07-14, supersedes the earlier "loading pause = restart-as-
+    // 2026-07-14, supersedes the earlier "loading pause = restart-as-
     // Paused" behavior): clicking pause during "loading" must NOT reinterpret
     // the tap as a cancel — that was the "pause broken again" report (a click
     // that looked like it did nothing, and could latch a stray cancel that
@@ -1648,7 +1678,7 @@ private slots:
         controller.transcribe(vault.audioUrl("a.wav"), vault.vaultUrl, kModelId);
         QTRY_COMPARE(controller.currentPhase(), QStringLiteral("loading"));
 
-        controller.togglePauseActive(); // Item 9: safe no-op during "loading".
+        controller.togglePauseActive(); // Safe no-op during "loading".
         QVERIFY(!controller.isActivePaused());
         QVERIFY(!controller.isActiveStopping());
 
@@ -1820,7 +1850,7 @@ private slots:
                  "destructor took too long -- did it wait for the job to finish naturally instead of cancelling it?");
     }
 
-    // Item 3: moveQueuedJob() reorders WITHIN the queued sublist only,
+    // moveQueuedJob() reorders WITHIN the queued sublist only,
     // leaving the Active row's position alone.
     void moveQueuedJob_reordersQueuedEntriesOnly()
     {
@@ -1953,7 +1983,7 @@ private slots:
         QTRY_COMPARE(controller.tasksCompleted(), 4);
     }
 
-    // Item 1: a Queued job persists to <vault>/.transcriber/tasks.json and
+    // A Queued job persists to <vault>/.transcriber/tasks.json and
     // loadPersistedQueue() re-enqueues it on a FRESH controller — same
     // contract a new app launch relies on.
     void persistedQueue_survivesAcrossControllerInstances()
@@ -2028,7 +2058,7 @@ private slots:
     // bypasses that guard for replay (every persisted entry already passed
     // dedup once, when it was first queued live).
     //
-    // Item 23 note: transcribe() no longer auto-chains a relabel job, so this
+    // transcribe() no longer auto-chains a relabel job, so this
     // same-file pair can no longer arise from a single transcribe(autoLabel)
     // call — the persisted tasks.json is written directly here (its exact
     // on-disk shape, see persistQueue()) to still exercise the replay-dedup
@@ -2382,7 +2412,7 @@ private slots:
         settings.endGroup();
     }
 
-    // Item 17: manual chapter add/edit/delete round-trips through the .md.
+    // Manual chapter add/edit/delete round-trips through the .md.
     // addChapter() writes a MANUAL marker (sentinel on disk, stripped from the
     // displayed title, "manual" flag set); setChapterTitle() rewrites it;
     // deleteChapter() removes it. Each emits finished(fileUrl, ok, error).
@@ -2427,7 +2457,7 @@ private slots:
         QVERIFY(!finishedSpy.at(0).at(1).toBool());
     }
 
-    // Item 17 (the key test): regeneration must PRESERVE manual markers while
+    // The key test: regeneration must PRESERVE manual markers while
     // replacing auto ones. Drives spliceBodyChapters() directly (the pure
     // splice helper generateChaptersJob() writes through), no model needed.
     void spliceBodyChapters_preservesManualReplacesAuto()
@@ -2456,7 +2486,7 @@ private slots:
         QCOMPARE(out2.count(QStringLiteral("## [")), 1);
     }
 
-    // Item 28 (concrete bug): a transcript spanning multiple windows must have
+    // Concrete bug: a transcript spanning multiple windows must have
     // EVERY window within kMaxChapterInputChars — otherwise
     // LabelingEngine::generateChapters() silently truncates the oversized
     // window and the folded-in tail gets zero chapters. Also verifies the
@@ -2490,7 +2520,7 @@ private slots:
         QVERIFY2(windows.last() < segs.size(), "the last window must cover the transcript's tail");
     }
 
-    // Item 58: prelude length scales with transcript size — capped DOWN for
+    // Prelude length scales with transcript size — capped DOWN for
     // short transcripts (P29), scaled UP for long ones. Pure static mapping,
     // testable without a model.
     void effectiveWordinessForLength_capsShortScalesLong()
@@ -2514,7 +2544,7 @@ private slots:
         QVERIFY(TranscriptionController::effectiveWordinessForLength(0.95, 3000) >= 0.95);
     }
 
-    // Item 52: diarizeFile() enqueues a standalone "diarize" job on an
+    // diarizeFile() enqueues a standalone "diarize" job on an
     // already-transcribed file — a job of the right kind, keyed on that file,
     // through the same queue/worker as every other action. The two diarization
     // onnx models are pre-created (zero-byte, "downloaded") so no download job
@@ -2552,6 +2582,113 @@ private slots:
         // Let it settle so teardown is clean — the job fails fast (no audio to
         // decode / unloadable models), which is fine; we only assert enqueue.
         QTRY_VERIFY(finishedSpy.count() >= 1);
+    }
+
+    // EngineCache's residency policy (applyResidencyPolicy(),
+    // driven by each Task's engineNeeds()) must actually fire through the
+    // REAL dispatch path — TaskScheduler::startTask() ->
+    // QMetaObject::invokeMethod(..., "execute", Qt::QueuedConnection) ->
+    // TaskRunner::execute() — not merely be reachable in isolation against a
+    // bare Task/EngineCache (see tst_task_transcribe.cpp's
+    // applyResidencyPolicy_* tests and the per-kind engineNeeds() tests,
+    // which cover the RULE itself but never touch execute()). This drives
+    // the original bug's exact shape (diarize file A, then transcribe files
+    // B and C) through one real TranscriptionController/TaskScheduler/
+    // TaskRunner, reading the WORKER thread's own EngineCache via
+    // TaskRunner::engines() (added for this).
+    //
+    // Deliberately does NOT try to catch an exact intermediate task count as
+    // a "clean" checkpoint: onTaskFinished() flips tasksCompleted() AND
+    // synchronously re-pumps the queue (starting the next Queued task, or —
+    // once the queue is actually empty — scheduling evictIdle()) in the SAME
+    // call, so the moment a QTRY_COMPARE(tasksCompleted(), N) first observes
+    // N, the worker thread may already be executing (or have finished) the
+    // NEXT dispatch. A naive read of engines() right after is a genuine
+    // cross-thread race with that. Instead, each phase below is followed by
+    // flushWorkerThread() — a BlockingQueuedConnection round trip, which
+    // only returns once every call already queued to the worker (a next
+    // task's execute(), or evictIdle()) has finished, since Qt processes one
+    // thread's queued calls strictly in FIFO order. That makes each
+    // checkpoint's aggregate state fully deterministic, INCLUDING whichever
+    // idle-drain evictIdle() fired — a real, correct, unrelated hygiene
+    // mechanism (evictAll() once the whole queue empties) that the expected
+    // counts below account for explicitly rather than trying to dodge.
+    //
+    // All tasks fail fast (unloadable/fake models, same "no network in
+    // tests" precedent as the rest of this file) — irrelevant here, since
+    // applyResidencyPolicy() runs unconditionally in execute() BEFORE run()
+    // gets a chance to fail.
+    void residencyPolicy_realDispatch_diarizeThenTranscribes_evictsDiarKeepsAsrWarm()
+    {
+        VaultFixture vault;
+        // Zero-byte, so the presence check that decides whether a
+        // DownloadTask must jump ahead is satisfied and the diarize task
+        // below is the front-most (only) entry — same precedent as
+        // diarizeFile_enqueuesDiarizeJob() above.
+        for (const QString &name :
+             {QStringLiteral("pyannote-segmentation-3.0-int8.onnx"), QStringLiteral("wespeaker-resnet293-lm.onnx")}) {
+            QFile f(vault.dir.path() + QStringLiteral("/.transcriber/models/") + name);
+            QVERIFY(f.open(QIODevice::WriteOnly));
+            f.close();
+        }
+
+        TranscriptionController controller;
+        // Diarize and transcribe are both Serial-lane, so every dispatch
+        // below goes through m_scheduler->m_runner (not m_instantRunner) —
+        // the ONE EngineCache instance this whole test observes.
+        TaskRunner *runner = controller.m_scheduler->m_runner;
+        const EngineCache &engines = runner->engines();
+        auto flushWorkerThread = [runner] {
+            QMetaObject::invokeMethod(runner, [] {}, Qt::BlockingQueuedConnection);
+        };
+        QCOMPARE(engines.asrEvictionCount(), 0);
+        QCOMPARE(engines.labelEvictionCount(), 0);
+        QCOMPARE(engines.diarEvictionCount(), 0);
+
+        // --- Phase 1: a LONE diarize (declares needing ONLY diar). ---
+        controller.diarizeFile(vault.audioUrl("a.wav"), vault.vaultUrl);
+        QTRY_COMPARE(controller.tasksCompleted(), 1);
+        flushWorkerThread(); // let the now-scheduled evictIdle() (queue empty) finish
+        const int asrAfterDiarize = engines.asrEvictionCount();
+        const int labelAfterDiarize = engines.labelEvictionCount();
+        const int diarAfterDiarize = engines.diarEvictionCount();
+        // The dispatch-time policy frees what diarize does NOT need (asr,
+        // label — +1 each); DiarizeTask's own run() additionally
+        // force-evicts diar itself right before ensureDiar() regardless
+        // (see that call's own doc comment, +1); the queue then
+        // drains (nothing else was queued), triggering evictIdle() — a
+        // second full evictAll() pass (+1 each, on top of the above).
+        QCOMPARE(asrAfterDiarize, 2);
+        QCOMPARE(labelAfterDiarize, 2);
+        QCOMPARE(diarAfterDiarize, 2);
+
+        // --- Phase 2: two BACK-TO-BACK transcribes (declare needing ONLY
+        // asr), enqueued together so the queue never idles BETWEEN them —
+        // only once BOTH are done does it drain again. ---
+        controller.transcribe(vault.audioUrl("b.wav"), vault.vaultUrl, kModelId);
+        controller.transcribe(vault.audioUrl("c.wav"), vault.vaultUrl, kModelId);
+        QTRY_COMPARE(controller.tasksCompleted(), 3);
+        flushWorkerThread(); // let the now-scheduled evictIdle() (queue empty again) finish
+
+        // THE ACTUAL BUG: before this fix, TranscribeTask evicted
+        // only the label engine, leaving whatever the diarize above left
+        // resident. diar's counter must have moved past diarAfterDiarize —
+        // no diarization engine survives into (or across) this transcribe
+        // pair.
+        QVERIFY(engines.diarEvictionCount() > diarAfterDiarize);
+
+        // THE WARM-MODEL GUARANTEE: across the two-transcribe run, asr is
+        // evicted EXACTLY ONE more time than after the diarize phase — by
+        // the trailing evictIdle() alone, once the WHOLE queue (not just
+        // one transcribe) drains — never by either transcribe's OWN
+        // dispatch, since both declare needing it. Were the dispatch-time
+        // policy to regress into evicting an engine a task declares
+        // needing, this would catch it as MORE than one extra eviction
+        // across two same-kind dispatches (label/diar's exact +3 — one per
+        // transcribe, plus the trailing evictIdle — confirm the accounting).
+        QCOMPARE(engines.asrEvictionCount(), asrAfterDiarize + 1);
+        QCOMPARE(engines.labelEvictionCount(), labelAfterDiarize + 3);
+        QCOMPARE(engines.diarEvictionCount(), diarAfterDiarize + 3);
     }
 
     // The chosen segmentation/embedding models + sensitivity are carried on the
@@ -2613,7 +2750,7 @@ private slots:
         QVERIFY2(found, "diarize job did not survive the persist/replay round-trip");
     }
 
-    // Item 52: spliceBodySpeakers() is the write-back half of a standalone
+    // spliceBodySpeakers() is the write-back half of a standalone
     // diarize — given synthetic diarized turns (no real engine/models), it
     // adds "[Speaker N]" tags to an already-transcribed body WITHOUT touching
     // the timestamps or spoken text, and reports the applied speaker set. This
@@ -2634,7 +2771,7 @@ private slots:
         QCOMPARE(applied, (QStringList{QStringLiteral("Speaker 1"), QStringLiteral("Speaker 2")}));
     }
 
-    // Item 52: re-diarizing a file that ALREADY has speaker tags replaces them
+    // Re-diarizing a file that ALREADY has speaker tags replaces them
     // in place (per its frontmatter "speakers:" allowlist) rather than
     // doubling them up.
     void spliceBodySpeakers_reDiarize_replacesExistingTags()
@@ -2697,6 +2834,26 @@ private slots:
             QStringLiteral("finished"),
         };
         QCOMPARE(seq, golden);
+    }
+
+    // A task that reports a non-fatal warning during run() (and
+    // otherwise succeeds) must land Status::Done — NOT Failed — with the
+    // warning readable both on the Task itself and through jobs(), which is
+    // what the Tasks-list QML binds to.
+    void warningReportedDuringRun_survivesAsDoneWithNonEmptyWarning()
+    {
+        TranscriptionController controller;
+        const QUrl file = QUrl::fromLocalFile(QStringLiteral("/v/corrupt.wav"));
+
+        auto owned = std::make_unique<FakeWarningSerialTask>(file);
+        FakeWarningSerialTask *task = owned.get();
+        controller.enqueueTask(std::move(owned)); // friend seam -> auto-starts, becomes Active
+        QTRY_COMPARE(controller.tasksCompleted(), 1);
+
+        QCOMPARE(task->status, Task::Status::Done);
+        QCOMPARE(task->warning, task->m_warningToReport);
+        QCOMPARE(statusOf(controller, file), QStringLiteral("done"));
+        QCOMPARE(warningOf(controller, file), task->m_warningToReport);
     }
 
     // Test 2: two serial tasks on DIFFERENT files. When the first finishes and
@@ -2907,7 +3064,7 @@ private slots:
         QTRY_VERIFY(!controller.isBusy());
     }
 
-    // Item 024 (batch-wedge report), ETA half. Pure boundary check on the
+    // The batch-wedge fix's ETA half. Pure boundary check on the
     // predicate estimatedRemainingMs() consults — floor wins for a phase
     // with no/small recorded average, the multiplier wins once that average
     // is itself slow. Static + pure so this needs no controller, no task, no
@@ -2925,7 +3082,7 @@ private slots:
                  "a slower historical phase pace must widen the stall window, not shrink it");
     }
 
-    // Item 024, ETA half (integration): a WeightedPhases Active task that
+    // ETA half (integration): a WeightedPhases Active task that
     // ticks real progress once and then goes silent must have
     // estimatedRemainingMs() read as "stalled" once that silence outlasts
     // etaStallThresholdMs() — never a runaway extrapolation like the
@@ -2962,17 +3119,17 @@ private slots:
         QTRY_VERIFY_WITH_TIMEOUT(!controller.isBusy(), 3000); // settle for clean teardown
     }
 
-    // Item 024, stall-watchdog half. Pure predicate boundary check
+    // Stall-watchdog half. Pure predicate boundary check
     // (TranscribeTask::isStalled) — the real whisper.cpp stall from the
-    // 2026-07-24 report isn't reproducible read-only (root cause unconfirmed,
-    // per the work order), so this pins the threshold shape directly instead.
+    // 2026-07-24 report isn't reproducible read-only (root cause unconfirmed),
+    // so this pins the threshold shape directly instead.
     void transcribeTask_isStalled_isAudioLengthRelative_notFlatWallClockCap()
     {
         // A brief gap never trips it, even on a tiny file.
         QVERIFY2(!TranscribeTask::isStalled(500, /*fileSeconds=*/0.5),
                  "a sub-second gap on a fraction-of-a-second file must not trip the watchdog");
 
-        // The load-bearing case (CLAUDE.md / the 2026-07-25 decision): the
+        // The load-bearing case (the 2026-07-25 decision): the
         // SAME no-progress duration must trip a near-zero-length file but
         // NOT a genuinely long one — the bound is audio-length-relative, not
         // a flat wall-clock cap. A false trip destroys real, in-progress

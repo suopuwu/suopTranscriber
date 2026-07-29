@@ -107,7 +107,7 @@ public:
     }
     Q_INVOKABLE QStringList existingVaultTags(const QUrl &) const { return {}; }
 
-    // Item 074: the pending-rename store the Sidebar's rowNameText now reads.
+    // The pending-rename store the Sidebar's rowNameText now reads.
     QHash<QString, QString> pendingRenames; // "file://"+localpath -> stem
     int pendingRenamesRev = 0;
     Q_PROPERTY(int pendingRenamesRevision READ pendingRenamesRevision NOTIFY pendingRenamesRevisionChanged)
@@ -416,7 +416,7 @@ private slots:
         QQuickItem *field = renameFieldFor(item);
         QVERIFY(field);
         QTRY_VERIFY2(field->hasActiveFocus(), "the rename editor must take focus so the user can just type");
-        // Item 047: the editor now seeds what the ROW shows — the full
+        // The editor now seeds what the ROW shows — the full
         // name+extension when extensions are visible (default) — with the stem
         // pre-selected, and strips the extension back to a stem on commit
         // (renameFile re-appends the real extension). Typing over the selected
@@ -438,7 +438,7 @@ private slots:
         QVERIFY(!QFileInfo::exists(vault.filePath(QStringLiteral("talk.mp3.md"))));
     }
 
-    // Item 082 regression: renaming the OPEN file "took 3-4 clicks". A
+    // Regression: renaming the OPEN file "took 3-4 clicks". A
     // background model rebuild (vault watcher firing after the open, a
     // transcription finishing, …) runs Sidebar's onModelReset, which clears
     // selectedPaths but leaves currentPath. Before the fix, that reset landing
@@ -878,7 +878,7 @@ private slots:
         QVERIFY(QFileInfo::exists(vault.filePath(QStringLiteral("talk.mp3.md"))));
     }
 
-    // Item 074: a file rename in flight (from ANY panel, e.g. MainPanel-
+    // A file rename in flight (from ANY panel, e.g. MainPanel-
     // initiated) is recorded in the controller's pending-rename store and shows
     // in the Sidebar row AT ONCE, before the deferred RenameFileTask completes.
     void pendingRename_updatesRowNameOptimistically()
@@ -910,7 +910,7 @@ private slots:
         QCOMPARE(nameText->property("text").toString(), QStringLiteral("chat.m4a"));
     }
 
-    // Item 074 guard: a LABEL-showing row (labels mode + a label) is LEFT ALONE
+    // Guard: a LABEL-showing row (labels mode + a label) is LEFT ALONE
     // by a pending file rename — the store read sits AFTER the label branch in
     // rowNameText, so a file rename never disturbs a label-shown row.
     void pendingRename_leavesLabelRowUnchanged()
@@ -1645,15 +1645,15 @@ int main(int argc, char *argv[])
 {
     // Offscreen + sandboxed org/app name: AppSettings.qml's Settings{} element
     // is loaded transitively by Sidebar.qml, and must never touch the real
-    // ~/.config/suopTranscriber (CLAUDE.md: never let testing touch the user's
+    // ~/.config/suopTranscriber (tests must never touch the user's
     // real vault or app config). Same setup as tst_sidebar_dragmove.cpp.
     qputenv("QT_QPA_PLATFORM", "offscreen");
     qputenv("QT_QUICK_CONTROLS_STYLE", "Basic");
     QCoreApplication::setOrganizationName(QStringLiteral("suopTranscriberTestHarness"));
     QCoreApplication::setApplicationName(QStringLiteral("tst_sidebar_rename"));
     // These tests delete files, and deleting now TRASHES them — so the trash is
-    // part of what's under test and must not be the developer's own (CLAUDE.md:
-    // never let testing touch real user state). Pointing XDG_DATA_HOME at a temp
+    // part of what's under test and must not be the developer's own (tests must
+    // never touch real user state). Pointing XDG_DATA_HOME at a temp
     // dir makes the home trash <temp>/Trash, thrown away with it. Same reasoning
     // as tst_vaulttreemodel's initTestCase(). Must be set before the app reads
     // it. The QTemporaryDir is static so it outlives every test.

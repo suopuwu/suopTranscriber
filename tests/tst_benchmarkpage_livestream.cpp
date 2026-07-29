@@ -1,10 +1,9 @@
-// Source-scan guard for the Benchmark page's LIVE transcript streaming
-// (queue item 066). There is no QQuickView harness that can drive
-// BenchmarkPage's `Connections` handlers directly — the target
-// transcriptionController is a null stub in the filesync harness, so its
-// signals never fire — so, per CLAUDE.md's "Tests are living documentation"
-// fallback (and tst_styleguide.cpp), this guards the behavior by scanning the
-// real qml/BenchmarkPage.qml source.
+// Source-scan guard for the Benchmark page's LIVE transcript streaming.
+// There is no QQuickView harness that can drive BenchmarkPage's
+// `Connections` handlers directly — the target transcriptionController is a
+// null stub in the filesync harness, so its signals never fire — so this
+// falls back to the source-scan-guard convention (see tst_styleguide.cpp)
+// over the real qml/BenchmarkPage.qml source.
 //
 // It pins that the running card streams in: onBenchmarkModelStarted creates a
 // `running: true` placeholder, a NEW onBenchmarkModelProgressText handler grows
@@ -117,7 +116,7 @@ private slots:
             functionBody(m_src, QStringLiteral("function onBenchmarkModelProgressText("));
         QVERIFY2(!body.isEmpty(),
                  "BenchmarkPage.qml must wire onBenchmarkModelProgressText to grow the "
-                 "running card live (item 066)");
+                 "running card live");
         QVERIFY2(body.contains(QStringLiteral("text")),
                  "onBenchmarkModelProgressText must update the card's text");
     }

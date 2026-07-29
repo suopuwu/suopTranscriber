@@ -350,7 +350,7 @@ Item {
                         background: UnderlineField { focused: catchAllExtensionField.activeFocus }
                         onEditingFinished: usbGrabberPage.commitRuleField("*", "", "extensionFilter",
                             text.split(",").map(s => s.trim()).filter(s => s.length > 0))
-                        // Item 13: editable text needs an I-beam.
+                        // Editable text needs an I-beam.
                         HoverHandler { cursorShape: Qt.IBeamCursor }
                     }
                     Switch {
@@ -378,7 +378,7 @@ Item {
                     text: usbGrabberPage.catchAllRule.startFolder || ""
                     background: UnderlineField { focused: catchAllStartFolderField.activeFocus }
                     onEditingFinished: usbGrabberPage.commitRuleField("*", "", "startFolder", text)
-                    // Item 13: editable text needs an I-beam.
+                    // Editable text needs an I-beam.
                     HoverHandler { cursorShape: Qt.IBeamCursor }
                 }
 
@@ -557,7 +557,7 @@ Item {
                             onEditingFinished: usbGrabberPage.commitRuleField(deviceCard.modelData.serial,
                                 deviceCard.modelData.label, "extensionFilter",
                                 text.split(",").map(s => s.trim()).filter(s => s.length > 0))
-                            // Item 13: editable text needs an I-beam.
+                            // Editable text needs an I-beam.
                             HoverHandler { cursorShape: Qt.IBeamCursor }
                         }
                         Switch {
@@ -589,7 +589,7 @@ Item {
                         background: UnderlineField { focused: deviceStartFolderField.activeFocus }
                         onEditingFinished: usbGrabberPage.commitRuleField(deviceCard.modelData.serial,
                             deviceCard.modelData.label, "startFolder", text)
-                        // Item 13: editable text needs an I-beam.
+                        // Editable text needs an I-beam.
                         HoverHandler { cursorShape: Qt.IBeamCursor }
                     }
 
@@ -736,7 +736,7 @@ Item {
                                     font.pixelSize: 10
                                     textFormat: Text.RichText
                                     text: usbGrabberPage.previewHtml(usbGrabberPage.previewEntries)
-                                    // Item 13: selectable text needs an I-beam.
+                                    // Selectable text needs an I-beam.
                                     HoverHandler { cursorShape: Qt.IBeamCursor }
                                 }
                             }

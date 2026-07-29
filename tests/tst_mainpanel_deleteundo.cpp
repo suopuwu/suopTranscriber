@@ -612,8 +612,8 @@ int main(int argc, char *argv[])
 {
     // Offscreen + sandboxed org/app name: MainPanel.qml loads the AppSettings
     // singleton, whose Settings{} element must NEVER touch the real
-    // ~/.config/suopTranscriber (CLAUDE.md: never let testing touch the user's
-    // real vault or app config). Same setup as tst_mainpanel_chapterrefresh.cpp.
+    // ~/.config/suopTranscriber (tests must never touch the user's real vault
+    // or app config). Same setup as tst_mainpanel_chapterrefresh.cpp.
     qputenv("QT_QPA_PLATFORM", "offscreen");
     qputenv("QT_QUICK_CONTROLS_STYLE", "Basic");
     QCoreApplication::setOrganizationName(QStringLiteral("suopTranscriberTestHarness"));

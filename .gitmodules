@@ -6,4 +6,8 @@
 	url = https://github.com/ggerganov/llama.cpp.git
 [submodule "third_party/sherpa-onnx"]
 	path = third_party/sherpa-onnx
-	url = https://github.com/k2-fsa/sherpa-onnx.git
+	# suopuwu fork, not upstream k2-fsa/sherpa-onnx: the pinned commit sits
+	# above the v1.13.4 tag (see the patch-guard comment in CMakeLists.txt),
+	# and only exists on this fork's history — a plain
+	# `git submodule update --init` against upstream can't resolve it.
+	url = https://github.com/suopuwu/sherpa-onnx.git

@@ -1,5 +1,5 @@
 // Living spec + runtime verification for TextRedoShortcut.qml — the window-wide
-// Ctrl+Y => redo alias for text boxes (item 043).
+// Ctrl+Y => redo alias for text boxes.
 //
 // Same harness shape as tst_middledragscroll.cpp (read its top-of-file comment
 // first): a REAL offscreen QQuickView loading the actual checked-out qml/,

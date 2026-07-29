@@ -1,12 +1,11 @@
-// Living spec: UsbRuleStore — persisted USB grab-rule config (see CLAUDE.md's
-// "USB Grabber" feature, DESIGN.md's "USB import" section).
+// Living spec: UsbRuleStore — persisted USB grab-rule config (see DESIGN.md's
+// "USB import" section).
 //
 // App-scoped via QSettings (NOT vault-scoped .transcriber/settings.json) —
 // the same physical device is used across many vaults by the same user. See
 // tst_transcription_queue.cpp's rollingAveragePhaseWeighting test for the
 // same QStandardPaths::setTestModeEnabled()-based isolation precedent this
-// file follows, per CLAUDE.md's "never touch the user's real vault or app
-// config" rule.
+// file follows — tests must never touch the user's real vault or app config.
 
 #include <QtTest>
 

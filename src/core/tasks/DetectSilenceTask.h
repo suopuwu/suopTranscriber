@@ -59,7 +59,7 @@ public:
     // speech span — an empty speechSpans with no error is indistinguishable
     // from "VAD found nothing", and complementSpans() on an empty list always
     // returns a single whole-file span, which is wrong on a file that HAS
-    // transcript segments (item 010: 3469-segment file wrongly got a single
+    // transcript segments (a 3469-segment file wrongly got a single
     // 0-3:17:14 silence). Falls through to the SAME transcript-gap heuristic
     // TranscribeTask's inline capture uses otherwise; on a genuinely silent
     // file segments is empty too, so the fallback still yields the correct

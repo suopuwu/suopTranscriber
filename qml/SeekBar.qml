@@ -108,7 +108,7 @@ RowLayout {
         }
     }
 
-    // Skip-silence toggle (silence phase 2, queue item 084): mirrors
+    // Skip-silence toggle (silence phase 2): mirrors
     // followPlaybackButton immediately above — same 28x28 box,
     // hover/tap idiom, background/border treatment — just gating a
     // different playback behavior (auto-seek past long stored
@@ -210,7 +210,7 @@ RowLayout {
                 when: !skipSilenceThresholdField.activeFocus
             }
 
-            // Item 13 (StyleGuide "Cursor affordances"): an editable
+            // StyleGuide "Cursor affordances": an editable
             // text control gets the I-beam, not a pointing hand — the
             // rimWidthField sibling in SettingsPopup.qml uses a
             // pointing hand instead, but this file's own guard
@@ -243,7 +243,7 @@ RowLayout {
         font.pixelSize: 11
     }
 
-    // Item 10: the hover highlight rings only the handle/puck, not
+    // The hover highlight rings only the handle/puck, not
     // the whole track — custom `handle:` so we own that geometry
     // instead of the default QQC2 style's whole-control HoverBorder.
     Slider {
@@ -265,11 +265,10 @@ RowLayout {
         value: panel.player ? panel.player.position : 0
         onMoved: panel.player.position = value
 
-        // Item 5 (Wave E): undo Wave D item 4's border-on-hover puck
-        // (reported as not clear enough) — back to a separate
-        // expanding ring around the puck (Wave C item 5's tightened
-        // +2px/1px-gap version), which reads more clearly as a hover
-        // state at a glance.
+        // The border-on-hover puck was reported as not clear
+        // enough — back to a separate expanding ring around the
+        // puck (the tightened +2px/1px-gap version), which reads
+        // more clearly as a hover state at a glance.
         handle: Item {
             x: seekSlider.leftPadding + seekSlider.visualPosition * (seekSlider.availableWidth - width)
             y: seekSlider.topPadding + seekSlider.availableHeight / 2 - height / 2
@@ -298,7 +297,7 @@ RowLayout {
             }
         }
 
-        // Feature 3b: one tick mark per chapter (see
+        // One tick mark per chapter (see
         // panel.chapters/readChapters()), positioned with the
         // EXACT SAME leftPadding/availableWidth math as the handle
         // above (:1071) — visualPosition there is

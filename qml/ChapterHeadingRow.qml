@@ -52,7 +52,7 @@ RowLayout {
             headingTitle.positionAt(clickX, headingTitle.height / 2)
     }
 
-    // Item 33: a dedicated disclosure triangle collapses/
+    // A dedicated disclosure triangle collapses/
     // expands this chapter's body in the transcript
     // (displayData drops the collapsed sentences). Kept
     // SEPARATE from the title (which is click-to-edit, item
@@ -80,7 +80,7 @@ RowLayout {
             onTapped: panel.toggleChapterCollapse(chapterHeadingRow.modelData.chapterT0)
         }
     }
-    // Item 35: the transcript heading is now click-to-edit
+    // The transcript heading is now click-to-edit
     // too, sharing the SAME single-active-edit state
     // (editingChapterTs, keyed by the real chapterT0) as
     // the TOC row, so editing one exits the other. Commits

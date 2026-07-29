@@ -32,6 +32,16 @@ public:
     // into this one.
     void resetControl() { m_control.reset(); }
 
+    // Read-only access to this runner's own engine cache — exposed purely so
+    // a test can verify the residency policy actually fires
+    // through the REAL dispatch path (execute(), below) by reading the
+    // eviction counters after driving real tasks through a TaskScheduler,
+    // rather than only against a bare EngineCache/Task in isolation. Safe to
+    // read cross-thread once the caller has observed the corresponding
+    // task's completion (the queued taskFinished signal happens-after
+    // execute() returns).
+    const EngineCache &engines() const { return m_engines; }
+
 public slots:
     // Release every warm engine — called when the queue drains, so a resident
     // model doesn't sit on VRAM indefinitely. A slot (not a plain method)
@@ -40,14 +50,20 @@ public slots:
     // returns rather than racing it from the GUI thread.
     void evictIdle() { m_engines.evictAll(); }
 
-    // Runs task->run() against a TaskContext wired to this runner's engine
-    // cache and control, then emits EXACTLY ONE taskFinished — whether run()
+    // Applies this task's engine residency policy (EngineCache::
+    // applyResidencyPolicy(), driven by task->engineNeeds()), then runs
+    // task->run() against a TaskContext wired to this runner's engine cache
+    // and control, then emits EXACTLY ONE taskFinished — whether run()
     // returned normally or threw TaskError. Ownership of `task` stays with
     // the caller (the queue); this only borrows the pointer for the call.
     void execute(Task *task);
 
 signals:
-    void taskFinished(Task *task, bool ok, const QString &error);
+    // `warning` is whatever the task reported via TaskContext::reportWarning()
+    // during run() (empty for the overwhelming majority) — carried alongside
+    // ok/error so the scheduler can thread it onto Task::warning the same way
+    // it threads `error` onto Task::error, regardless of whether run() threw.
+    void taskFinished(Task *task, bool ok, const QString &error, const QString &warning);
 
 private:
     EngineCache m_engines;

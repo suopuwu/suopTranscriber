@@ -1,5 +1,5 @@
-// Living spec + runtime verification for Sidebar.qml's drag-to-move gesture
-// (Item 40): drives a REAL QQuickView (offscreen, sandboxed config — see
+// Living spec + runtime verification for Sidebar.qml's drag-to-move gesture:
+// drives a REAL QQuickView (offscreen, sandboxed config — see
 // main() below) loading the actual Sidebar.qml against a real VaultTreeModel,
 // dragging real rows with real QTest::mousePress/mouseMove/mouseRelease
 // events, and then checking the actual filesystem for the result.
@@ -339,15 +339,15 @@ private slots:
                  "dragging talk.mp3 onto the Interviews folder must move it out of the vault root");
         QVERIFY2(QFile::exists(vault.filePath(QStringLiteral("Interviews/talk.mp3"))),
                  "talk.mp3 must land inside Interviews/");
-        // CLAUDE.md vault layout: the transcript is a sibling .md and must never
-        // be left split from its audio.
+        // Vault layout (DESIGN.md "Vault / file layout"): the transcript is a
+        // sibling .md and must never be left split from its audio.
         QVERIFY2(QFile::exists(vault.filePath(QStringLiteral("Interviews/talk.mp3.md"))),
                  "the sibling .md transcript must travel with the audio it belongs to");
         QVERIFY2(!QFile::exists(vault.filePath(QStringLiteral("talk.mp3.md"))),
                  "the .md must not be left behind in the vault root");
     }
 
-    // Regression (work order 050): while a row is being inline-renamed, a
+    // Regression: while a row is being inline-renamed, a
     // press-drag over it must NOT start the file-move drag — rowDragHandler
     // has to be disarmed so the rename TextField's own text-selection gets
     // the grab instead. Drive rename via beginRename() (same entry point
@@ -1124,8 +1124,8 @@ int main(int argc, char *argv[])
 {
     // Offscreen + sandboxed org/app name: AppSettings.qml's Settings{} element
     // is loaded transitively by Sidebar.qml, and must never touch the real
-    // ~/.config/suopTranscriber (CLAUDE.md: never let testing touch the user's
-    // real vault or app config). Same setup as tst_sidebar_keynav.cpp.
+    // ~/.config/suopTranscriber (tests must never touch the user's real
+    // vault or app config). Same setup as tst_sidebar_keynav.cpp.
     qputenv("QT_QPA_PLATFORM", "offscreen");
     qputenv("QT_QUICK_CONTROLS_STYLE", "Basic");
     QCoreApplication::setOrganizationName(QStringLiteral("suopTranscriberTestHarness"));

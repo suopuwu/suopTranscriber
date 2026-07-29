@@ -33,6 +33,11 @@ public:
     // no abort hook, so a cancel requested during it only takes effect at
     // the checkpoint right after.
     Capabilities capabilities() const override { return {/*pausable=*/true, /*cancellableMidRun=*/false}; }
+    // Only diarization — see run()'s ensureDiar() call. Declaring
+    // this keeps the dispatch-time residency policy from evicting it; run()
+    // still force-evicts it itself right before ensureDiar() regardless (see
+    // that call's own doc comment for why).
+    EngineNeeds engineNeeds() const override { return {/*asr=*/false, /*label=*/false, /*diar=*/true}; }
     // No whisper load, no ASR: decode then the diarization pass. The overall
     // bar weights these two phases (see Task::ProgressModel). The finer
     // "detecting-speakers-segmenting"/"-identifying" sub-phases run() emits

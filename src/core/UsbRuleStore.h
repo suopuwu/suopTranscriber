@@ -5,7 +5,7 @@
 #include <QString>
 #include <QStringList>
 
-// One persisted USB "grab rule" — see CLAUDE.md's "USB Grabber" feature.
+// One persisted USB "grab rule" — see DESIGN.md "USB import".
 // Plain struct (not QObject/Q_GADGET), matching Segment.h's precedent for a
 // small, store-internal value type; UsbGrabberController (a later step) is
 // responsible for exposing this to QML (e.g. as a QVariantMap).

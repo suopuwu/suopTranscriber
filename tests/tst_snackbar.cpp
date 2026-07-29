@@ -539,8 +539,8 @@ int main(int argc, char *argv[])
     // Offscreen: no real compositor/display needed. Must be set before
     // QGuiApplication reads it. Sandboxed org/app name so AppSettings.qml's
     // QtCore Settings{} element (loaded transitively) never touches the real
-    // app's ~/.config/suopTranscriber (CLAUDE.md: never let testing touch the
-    // user's real vault or app config).
+    // app's ~/.config/suopTranscriber (tests must never touch the user's
+    // real vault or app config).
     qputenv("QT_QPA_PLATFORM", "offscreen");
     qputenv("QT_QUICK_CONTROLS_STYLE", "Basic");
     QCoreApplication::setOrganizationName(QStringLiteral("suopTranscriberTestHarness"));

@@ -60,6 +60,32 @@ public:
         bool cancellableMidRun = true;
     };
 
+    // Which EngineCache-resident engines this kind's run() calls ensureAsr()/
+    // ensureLabel()/ensureDiar() for. TaskRunner::execute() evicts every OTHER
+    // engine right before run() starts (EngineCache::applyResidencyPolicy) —
+    // one rule replacing N hand-written evictAsr()/evictLabel()/evictDiar()
+    // calls scattered per-kind, which is how a diarization arena survived
+    // into an unrelated transcribe and pressured the GPU into an uncatchable
+    // ggml abort. A kind that needs an engine still calls
+    // ensureXxx() itself in run() as always — this only says what dispatch
+    // must NOT clear out from under it.
+    //
+    // Default: needs nothing. That looks like it risks "silently evicting an
+    // engine a task is using", but the failure mode of forgetting this
+    // override is a redundant reload (ensureXxx() rebuilds unconditionally
+    // once its engine is gone) — a performance regression, never a residency
+    // one. The other default (needs everything) fails in the direction this
+    // item exists to close: a forgotten override would leave that kind's
+    // idle engines resident forever, reproducing today's asymmetric-eviction
+    // bug for the next kind added. Get eviction wrong by omission, not
+    // residency.
+    struct EngineNeeds {
+        bool asr = false;
+        bool label = false;
+        bool diar = false;
+    };
+    virtual EngineNeeds engineNeeds() const { return {}; }
+
     enum class Status { Queued, Active, Paused, Done, Failed };
 
     // Which execution lane this kind runs in.
@@ -258,6 +284,15 @@ public:
     int batchId = 0;
     Status status = Status::Queued;
     QString error;
+    // Non-fatal diagnostic surviving into a Done (never Failed-meaningful)
+    // terminal state — the task fully succeeded but has something worth
+    // showing, e.g. TranscribeTask reporting a corrupt-audio repair. Empty
+    // for the overwhelming majority of tasks. Set from TaskRunner::
+    // taskFinished()'s warning argument, exactly where `error` above is set
+    // from its error argument — a subclass reports one via TaskContext::
+    // reportWarning() during run(), never by writing this field directly
+    // (see the threading doc comment above).
+    QString warning;
     qint64 durationMs = -1; // wall-clock Active time, set when the task ends
 
     // --- Queue-owned identity (GUI thread writes BEFORE dispatch; run() only

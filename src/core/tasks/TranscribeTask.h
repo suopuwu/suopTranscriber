@@ -3,6 +3,7 @@
 #include <QString>
 #include <QUrl>
 
+#include "../AudioDecoder.h"
 #include "Task.h"
 
 // Orchestrates: ffmpeg decode -> ASR engine -> vault sidecar .md. Pure ASR —
@@ -30,6 +31,11 @@ public:
     // layer (not this flag) is responsible for treating a pause click during
     // "loading" as a no-op rather than queuing it.
     Capabilities capabilities() const override { return {/*pausable=*/true, /*cancellableMidRun=*/true}; }
+    // Only the ASR engine — see run()'s ensureAsr() call. Declaring this
+    // (rather than relying on the default) is what makes a batch of
+    // transcribes keep one warm model across files: the dispatch-time
+    // residency policy leaves asr alone between them.
+    EngineNeeds engineNeeds() const override { return {/*asr=*/true, /*label=*/false, /*diar=*/false}; }
     // Multi-stage ASR pipeline — the overall bar blends these four phases by
     // their rolling-average durations (see Task::ProgressModel).
     ProgressModel progressModel() const override { return ProgressModel::WeightedPhases; }
@@ -61,6 +67,16 @@ public:
     // goes quiet between ticks for longer) is never falsely killed; see the
     // .cpp for the chosen constants and why they're conservative.
     static bool isStalled(qint64 noProgressElapsedMs, double fileSeconds);
+
+    // The corrupt-audio repair note (see AudioDecoder::DecodeDiagnostics),
+    // shared verbatim between the transcript's frontmatter `corruptAudioNote`
+    // (a permanent written record) and the Task-level non-fatal
+    // warning reported via TaskContext::reportWarning() (a live Tasks-list
+    // surfacing): one string, not two that could drift apart.
+    // Empty when nothing was scrubbed. Pure + static so it's unit-testable
+    // (tst_task_transcribe.cpp) without a real decode, same reason
+    // isStalled() is.
+    static QString corruptAudioWarning(const AudioDecoder::DecodeDiagnostics &diagnostics);
 
 signals:
     // Which compute backend the model load actually picked ("CUDA"/

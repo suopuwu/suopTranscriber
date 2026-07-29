@@ -430,7 +430,7 @@ private slots:
         QCOMPARE(selectedPaths().size(), 4);
     }
 
-    // Queue item 055: the Delete key deletes the sidebar selection whenever one
+    // The Delete key deletes the sidebar selection whenever one
     // exists and no text field is being edited — NOT gated on tree focus, since
     // the selection stays highlighted after focus drifts to the main panel.
     // Asserted at the property level (deleteShortcutEnabled) rather than driving
@@ -494,7 +494,7 @@ private slots:
                  "Delete must be suppressed while a text field is being edited");
     }
 
-    // Queue item 052: Escape clears a multi-selection (mirroring the cancel
+    // Escape clears a multi-selection (mirroring the cancel
     // button and empty-space taps) even after keyboard focus has left the
     // tree — NOT gated on tree/search focus, since the selection stays
     // highlighted after focus drifts to the main panel. Under the old
@@ -570,8 +570,8 @@ int main(int argc, char *argv[])
     // window would gain nothing). Must be set before QGuiApplication reads
     // it. Sandboxed org/app name so AppSettings.qml's QtCore Settings{}
     // element (loaded transitively by Sidebar.qml) never touches the real
-    // app's ~/.config/suopTranscriber (CLAUDE.md: never let testing touch
-    // the user's real vault or app config).
+    // app's ~/.config/suopTranscriber (tests must never touch the user's
+    // real vault or app config).
     qputenv("QT_QPA_PLATFORM", "offscreen");
     qputenv("QT_QUICK_CONTROLS_STYLE", "Basic");
     QCoreApplication::setOrganizationName(QStringLiteral("suopTranscriberTestHarness"));

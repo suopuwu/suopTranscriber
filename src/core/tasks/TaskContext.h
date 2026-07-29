@@ -1,5 +1,7 @@
 #pragma once
 
+#include <QString>
+
 #include <functional>
 
 #include "TaskControl.h"
@@ -74,6 +76,17 @@ public:
     bool cancelRequested() const { return m_control.cancelRequested(); }
     bool pauseRequested() const { return m_control.pauseRequested(); }
 
+    // A non-fatal diagnostic worth surfacing even though run() is going to
+    // (or already did) succeed — e.g. TranscribeTask reporting a corrupt-
+    // audio repair. This is the ONE way a Task may hand such a thing back:
+    // run() never mutates Task::warning directly (see Task.h's threading
+    // doc comment) — TaskRunner::execute() reads it back here, AFTER run()
+    // returns, and hands it to the scheduler through the same taskFinished
+    // channel Task::error already uses. Last call wins; a kind with nothing
+    // to say never calls this and warning() stays empty.
+    void reportWarning(const QString &message) { m_warning = message; }
+    const QString &warning() const { return m_warning; }
+
     EngineCache &engines;
 
 private:
@@ -84,4 +97,5 @@ private:
     TaskControl &m_control;
     std::function<void(bool)> m_emitPaused;
     bool m_pausedSignaled = false;
+    QString m_warning;
 };

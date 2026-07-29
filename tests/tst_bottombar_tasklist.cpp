@@ -84,7 +84,7 @@ public:
     Q_INVOKABLE qint64 activeElapsedMs() const { return 0; }
     Q_INVOKABLE qint64 estimatedRemainingMs() const { return -1; }
     Q_INVOKABLE QString phaseLabel(const QString &) const { return QString(); }
-    // Item 015's modelDetail binding calls this for a "transcribe"/"diarize"
+    // The modelDetail binding calls this for a "transcribe"/"diarize"
     // row (jobRow.modelDetail in BottomBar.qml) — an unguarded read that
     // throws a QML TypeError without it, which breaks the whole delegate's
     // layout (not just the missing text). This harness doesn't assert on the
@@ -193,7 +193,7 @@ class TstBottomBarTaskList : public QObject
         };
     }
 
-    // Item 023: a member row of a collapsed batch — same shape as
+    // A member row of a collapsed batch — same shape as
     // queuedTranscribeRow's standalone row, but stamped with the shared
     // batchId TranscriptionController::collapseBatches() groups on (see
     // JobListFormatter.cpp), which is what jobListView.flatRows keys
@@ -312,7 +312,7 @@ class TstBottomBarTaskList : public QObject
     // The close button's OWN position settles on the very first layout pass
     // (it's positioned via the delegate Item, independent of its container's
     // reported size) — but the Tasks ListView's own Layout.preferredHeight
-    // (bound to its contentHeight — item 023 dropped the wrapping ScrollView,
+    // (bound to its contentHeight — the flattening dropped the wrapping ScrollView,
     // so the ListView is now directly what has to catch up) needs a couple
     // more polish/layout ticks to catch up from its initial 0. Until it does,
     // ListView's `clip: true` makes every row (including the button)
@@ -351,6 +351,19 @@ class TstBottomBarTaskList : public QObject
         return settled ? closeButton : nullptr;
     }
 
+    // Copied verbatim from tst_middledragscroll.cpp — see its top-of-file
+    // comment for the phantom-hover trap this guards against: QTest's
+    // synthetic moves do not move the real cursor, and Qt re-syncs hover from
+    // QCursor::pos() whenever a window appears under it, so a stale global
+    // cursor can deliver a phantom hover at a position no test ever sent.
+    // Every pointer move below goes through this rather than a bare
+    // QTest::mouseMove.
+    void moveMouse(QPoint pos)
+    {
+        QCursor::setPos(m_window->mapToGlobal(pos));
+        QTest::mouseMove(m_window, pos);
+    }
+
 private slots:
     void initTestCase()
     {
@@ -373,6 +386,7 @@ private slots:
                      "ConfirmPopup 1.0 qml/ConfirmPopup.qml\n"
                      "PlayGlyph 1.0 qml/PlayGlyph.qml\n"
                      "PauseGlyph 1.0 qml/PauseGlyph.qml\n"
+                     "MiddleDragScroll 1.0 qml/MiddleDragScroll.qml\n"
                      "BottomBar 1.0 qml/BottomBar.qml\n");
         qmldir.close();
 
@@ -503,7 +517,7 @@ private slots:
         }
     }
 
-    // Item 023: expanding/collapsing a batch must show exactly its header row
+    // Expanding/collapsing a batch must show exactly its header row
     // (collapsed) or header+members (expanded), and collapsing again must
     // return to just the header — proven by counting REALIZED taskCloseButton
     // rows, since flattening (jobListView.flatRows) now makes each member a
@@ -598,13 +612,76 @@ private slots:
             return anyDescendantTextContains(m_window->contentItem(), QStringLiteral("file250.mp3"));
         }, 5000), "flicking to the bottom must realize the last member row");
     }
+
+    // The headline claim this item adds: middle-clicking inside the Tasks
+    // list arms Chrome-style autoscroll and free-scrolls it, exactly like
+    // every other scrollable surface (MiddleDragScroll.qml).
+    void middleClickInTheTasksList_armsAndFreeScrollsIt()
+    {
+        QVERIFY(openWindow());
+        QVariantList rows;
+        for (int i = 1; i <= 40; ++i)
+            rows.append(queuedTranscribeRow(i, QStringLiteral("file%1.mp3").arg(i, 3, 10, QLatin1Char('0'))));
+        m_stub->setJobs(rows);
+        QVERIFY(openTasksPopup());
+
+        QQuickItem *listView = waitForSettledListView();
+        QVERIFY2(listView, "the Tasks popup's ListView never settled into a non-zero height");
+        // Proves the assertions below exercise real scrolling, not a no-op
+        // that would pass/fail for the wrong reason on a list that fits.
+        QTRY_VERIFY2(listView->property("contentHeight").toReal() > listView->height(),
+                     "the seeded 40 rows must overflow the list's 320px cap");
+
+        QQuickItem *overlay = findByObjectName(m_window->contentItem(), QStringLiteral("tasksMiddleDrag"));
+        QVERIFY2(overlay, "the Tasks popup must carry a tasksMiddleDrag MiddleDragScroll overlay");
+
+        const QPoint insidePoint =
+            listView->mapToScene(QPointF(listView->width() / 2, 10)).toPoint();
+        moveMouse(insidePoint);
+        QTest::mousePress(m_window, Qt::MiddleButton, Qt::NoModifier, insidePoint);
+        QTest::mouseRelease(m_window, Qt::MiddleButton, Qt::NoModifier, insidePoint);
+
+        // Gesture 1: a quick click (press+release, no drag) stays armed after
+        // release — that's what lets free-scrolling continue from a bare
+        // pointer move below.
+        QVERIFY2(overlay->property("armed").toBool(),
+                 "a quick middle click (press+release, no drag) must arm the Tasks list's autoscroll");
+
+        moveMouse(insidePoint + QPoint(0, 120));
+        QTRY_VERIFY2(listView->property("contentY").toReal() > 0,
+                     "armed autoscroll must free-scroll the Tasks list as the pointer moves");
+    }
+
+    // The overlay now anchors.fill's the whole popup, header included (see
+    // qml/BottomBar.qml's tasksMiddleDrag doc comment for why: the same wide
+    // arm region MainPanel's note page uses). This is the load-bearing
+    // regression guard that reach doesn't come at the cost of the header's
+    // own buttons — MiddleDragScroll is a plain Item that only claims
+    // MiddleButton, so a left-click on Clear must still land.
+    void middleDragOverlay_doesNotSwallowHeaderClicks()
+    {
+        QVERIFY(openWindow());
+        m_stub->setJobs({queuedTranscribeRow(1, QStringLiteral("talk.mp3"))});
+        QVERIFY(openTasksPopup());
+        QVERIFY2(waitForSettledListView(), "the Tasks popup's ListView never settled");
+
+        QQuickItem *clearButton = findByObjectName(m_window->contentItem(), QStringLiteral("clearButton"));
+        QVERIFY2(clearButton, "the Tasks popup's Clear button could not be found");
+
+        const QPoint pt = clearButton->mapToScene(
+            QPointF(clearButton->width() / 2, clearButton->height() / 2)).toPoint();
+        QTest::mouseClick(m_window, Qt::LeftButton, Qt::NoModifier, pt);
+
+        QCOMPARE(TranscriptionControllerStub::s_calls.size(), 1);
+        QCOMPARE(TranscriptionControllerStub::s_calls.at(0).method, QStringLiteral("clearFinished"));
+    }
 };
 
 int main(int argc, char *argv[])
 {
     // Offscreen + sandboxed org/app name: AppSettings.qml's Settings{}
     // element is loaded transitively by BottomBar.qml, and must never touch
-    // the real ~/.config/suopTranscriber (CLAUDE.md: never let testing touch
+    // the real ~/.config/suopTranscriber (tests must never touch
     // the user's real vault or app config).
     qputenv("QT_QPA_PLATFORM", "offscreen");
     qputenv("QT_QUICK_CONTROLS_STYLE", "Basic");

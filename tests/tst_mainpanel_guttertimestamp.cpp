@@ -1,5 +1,5 @@
 // Living spec + runtime verification for MainPanel.qml's gutter timestamp
-// padding (queue item 024): each per-segment gutter timestamp is zero-padded to
+// padding: each per-segment gutter timestamp is zero-padded to
 // fit the file's LARGEST timestamp (gutterMaxT0) so the transcript's left-edge
 // column reads as an aligned ruler. formatGutterTimestamp(t0) is a pure QML
 // function whose padding tier + leading-unit width come from the file's own
@@ -212,8 +212,8 @@ int main(int argc, char *argv[])
 {
     // Offscreen + sandboxed org/app name: MainPanel.qml loads the AppSettings
     // singleton, whose Settings{} element must NEVER touch the real
-    // ~/.config/suopTranscriber (CLAUDE.md: never let testing touch the user's
-    // real vault or app config).
+    // ~/.config/suopTranscriber (tests must never touch the user's real
+    // vault or app config).
     qputenv("QT_QPA_PLATFORM", "offscreen");
     qputenv("QT_QUICK_CONTROLS_STYLE", "Basic");
     QCoreApplication::setOrganizationName(QStringLiteral("suopTranscriberTestHarness"));

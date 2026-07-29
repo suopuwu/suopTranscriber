@@ -35,6 +35,20 @@ private slots:
         QVERIFY(!task.capabilities().cancellableMidRun); // no mid-pass abort hook
     }
 
+    // DiarizeTask must declare needing ONLY diar — this is what
+    // keeps the dispatch-time residency policy (EngineCache::
+    // applyResidencyPolicy) from evicting the engine it's about to
+    // ensureDiar(). (run() ALSO force-evicts diar itself regardless — see
+    // its own doc comment — but that's on top of, not instead of, this.)
+    void diarizeTask_declaresOnlyDiarNeed()
+    {
+        DiarizeTask task(QUrl::fromLocalFile("/vault/a.wav"), QUrl::fromLocalFile("/vault"), QString(), QString(), 0.5);
+        const Task::EngineNeeds needs = task.engineNeeds();
+        QVERIFY(!needs.asr);
+        QVERIFY(!needs.label);
+        QVERIFY(needs.diar);
+    }
+
     void diarizeTask_notYetTranscribed_throwsTaskError()
     {
         QTemporaryDir dir;
@@ -53,7 +67,7 @@ private slots:
         QVERIFY(threw);
     }
 
-    // Item 021: the onnxruntime CUDA arena backing the diar engine grows
+    // The onnxruntime CUDA arena backing the diar engine grows
     // unbounded within a pass — reusing one warm engine across a batch let
     // that growth compound across files, contradicting EngineCache.h's own
     // doc comment. DiarizeTask::run() now evicts the diar engine

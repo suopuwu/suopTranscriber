@@ -305,7 +305,7 @@ private slots:
         driverFile.close();
     }
 
-    // Item 1: the shape everything else depends on. Each chapter heading
+    // The shape everything else depends on. Each chapter heading
     // reserves a ZERO-LENGTH blank line in transcriptArea's document — there is
     // a real empty line exactly where the user sees a title. Pinning this pins
     // the offsets the splice math is written against.
@@ -333,7 +333,7 @@ private slots:
         QCOMPARE(h.value(QStringLiteral("chapterTitle")).toString(), QStringLiteral("Chapter One"));
     }
 
-    // Item 2: the headline claim — a selection spanning body + a heading puts
+    // The headline claim — a selection spanning body + a heading puts
     // the title back on its own line, at the offset its blank line reserved.
     void selectionSpanningAHeading_splicesTheTitleInPlace()
     {
@@ -432,7 +432,7 @@ private slots:
         QCOMPARE(copyWithChapters(), selected);
     }
 
-    // Item 3: the copied text must contain REAL '\n', never U+2029. QTextCursor::
+    // The copied text must contain REAL '\n', never U+2029. QTextCursor::
     // selectedText() returns paragraph separators; QQuickTextEdit::selectedText
     // is supposed to go through toPlainText() for a plain-text document — this
     // verifies it actually does, end to end onto the clipboard. A U+2029 here
@@ -459,7 +459,7 @@ private slots:
         QCOMPARE(copied.count(QLatin1Char('\n')), 2);
     }
 
-    // Item 4: what you SEE is what you copy. A transcript selection sweeping a
+    // What you SEE is what you copy. A transcript selection sweeping a
     // heading mirrors onto that heading's own overlay field (a separate document
     // — a native drag can never reach it), so the title highlights along with the
     // body around it. Keyed off the same predicate as the splice, so the two can
@@ -666,7 +666,7 @@ private slots:
         }
     }
 
-    // Queue item 054: collapsing a chapter drops its body sentences from
+    // Collapsing a chapter drops its body sentences from
     // displaySentences AND stamps `collapsed: true` on the surviving heading
     // entry — the one bit the C++ activeSentenceIndex reads to hold the
     // playback highlight on a collapsed chapter's heading.
@@ -721,8 +721,8 @@ int main(int argc, char *argv[])
 {
     // Offscreen + sandboxed org/app name: MainPanel.qml loads the AppSettings
     // singleton, whose Settings{} element must NEVER touch the real
-    // ~/.config/suopTranscriber (CLAUDE.md: never let testing touch the user's
-    // real vault or app config). Same setup as tst_bottombar_pathsegments.cpp.
+    // ~/.config/suopTranscriber (tests must never touch the user's real vault
+    // or app config). Same setup as tst_bottombar_pathsegments.cpp.
     qputenv("QT_QPA_PLATFORM", "offscreen");
     qputenv("QT_QUICK_CONTROLS_STYLE", "Basic");
     QCoreApplication::setOrganizationName(QStringLiteral("suopTranscriberTestHarness"));

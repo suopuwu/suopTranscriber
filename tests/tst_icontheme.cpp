@@ -448,8 +448,8 @@ private slots:
 int main(int argc, char *argv[])
 {
     // Offscreen + sandboxed org/app name: AppSettings.qml's QtCore Settings{}
-    // element is loaded transitively by AppIcon.qml, and CLAUDE.md forbids
-    // tests touching the real ~/.config/suopTranscriber.
+    // element is loaded transitively by AppIcon.qml, and tests must never
+    // touch the real ~/.config/suopTranscriber.
     qputenv("QT_QPA_PLATFORM", "offscreen");
     qputenv("QT_QUICK_CONTROLS_STYLE", "Basic");
     QCoreApplication::setOrganizationName(QStringLiteral("suopTranscriberTestHarness"));

@@ -1101,8 +1101,8 @@ private:
             AudioRecorderIO::patchWavHeader(m_outputFile, m_bytesWritten, kSampleRate, kChannelCount, kBitsPerSample);
         }
 
-        // Level meter / elapsed time throttling (CLAUDE.md convention, same
-        // shape as TranscriptionController's liveUpdateTick): computed every
+        // Level meter / elapsed time throttling (same shape as
+        // TranscriptionController's liveUpdateTick): computed every
         // mixing tick (kMixTimerIntervalMs, ~20-30ms) but only pushed to the
         // GUI-thread-visible property at ~kLevelUpdateIntervalMs.
         if (!m_sinceLastLevelTick.isValid() || m_sinceLastLevelTick.elapsed() >= kLevelUpdateIntervalMs) {
@@ -1454,8 +1454,15 @@ void AudioRecorder::stopRecording()
     // waitForFinished) reports in. Worker slots for one receiver run FIFO, so
     // an immediately-following start still sees a fully finalized file.
     m_recording = false;
-    emit recordingChanged();
+    // Posted BEFORE the signal, unlike everywhere else: a QML handler runs
+    // synchronously inside this emit, and RecorderPage's restarts monitoring
+    // there. Worker slots run FIFO, so announcing first would let that
+    // monitor `start` overtake this `stop` — the worker would reject it as
+    // "already recording", raising a spurious error banner and leaving
+    // `monitoring` true with nothing metering. The property is already false
+    // above, so any reader in the handler still sees a stopped take.
     QMetaObject::invokeMethod(m_worker, "stop", Qt::QueuedConnection);
+    emit recordingChanged();
 }
 
 void AudioRecorder::addAppCaptureSource(const QString &id, double gain)

@@ -1,5 +1,5 @@
 // Living spec + runtime verification for the sidebar's search filter
-// autocomplete rework (queue item 046): the shared FilterSuggestions dropdown
+// autocomplete: the shared FilterSuggestions dropdown
 // behind BOTH the tag and speaker filters — non-modal, anchored directly under
 // its field, dismissable, keyboard-navigable.
 //
@@ -279,7 +279,7 @@ private slots:
         QCOMPARE(f->property("text").toString(), first + QStringLiteral(", "));
     }
 
-    // Tab commits the highlighted suggestion just like Enter (queue item 075).
+    // Tab commits the highlighted suggestion just like Enter.
     void tabPicksASuggestion_data() { bothFilters_data(); }
     void tabPicksASuggestion()
     {

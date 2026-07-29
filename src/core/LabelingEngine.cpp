@@ -41,8 +41,8 @@ constexpr int kMaxOutputTokens = 700;
 // used above, kMaxChapterOutputTokens leaves ~4000 tokens of headroom for
 // that plus the system prompt/chat-template overhead) — unlike label(),
 // where the tiny fixed output budget makes this non-issue moot.
-// kMaxChapterInputChars itself now lives on the class (LabelingEngine.h) —
-// item P34 needs TranscriptionController to see it too, to window a long
+// kMaxChapterInputChars lives on the class (LabelingEngine.h) —
+// TranscriptionController needs to see it too, to window a long
 // transcript across multiple calls instead of relying on the truncation
 // below to silently drop everything past one window.
 constexpr int kMaxChapterOutputTokens = 3072;
@@ -94,9 +94,8 @@ const char *kSystemPromptSuffix =
 // Feature 3a: the user message is the indexed segment list itself (built in
 // generateChapters() below, "0: text\n1: text\n..."), so this only needs to
 // explain the task and the exact response shape — same register as the
-// label/prelude prompt above, phrased for a small instruct model. Item 27:
-// the density instruction that used to be a fixed "Up to about 20 chapters"
-// sentence now sits between this prefix and suffix (see
+// label/prelude prompt above, phrased for a small instruct model. The
+// density instruction sits between this prefix and suffix (see
 // chapterDensityPhrasing() / LabelingEngine::chapterSystemPrompt()).
 const char *kChapterSystemPromptPrefix =
     "You divide an audio transcript into chapters. You are given the transcript as a "
@@ -216,7 +215,7 @@ QString labelPreludePhrasing(double wordiness)
 // vocabulary is open-ended, so it's appended to the base system prompt
 // rather than baked into the GBNF grammar.
 //
-// Item 15 (Wave E): when NOT hard-restricted, existingTags (if any) is still
+// When NOT hard-restricted, existingTags (if any) is still
 // shown to the model as context, phrased at one of 3 tiers depending on
 // tagReuseBias — a graduated nudge, not a hard rule (that's what
 // restrictToExisting is for).

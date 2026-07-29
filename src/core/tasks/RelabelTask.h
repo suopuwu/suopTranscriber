@@ -33,6 +33,8 @@ public:
     QString displayName() const override;
     // Not pausable: one LLM call with no interruption point (see
     // pauseActive()'s old allowlist, which never included "relabel").
+    // Only the label engine — see run()'s ensureLabel() call.
+    EngineNeeds engineNeeds() const override { return {/*asr=*/false, /*label=*/true, /*diar=*/false}; }
     bool isPersistable() const override { return true; }
     QJsonObject toJson() const override;
     QVariantMap toVariantMap() const override;

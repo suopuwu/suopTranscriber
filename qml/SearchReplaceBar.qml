@@ -33,7 +33,7 @@ RowLayout {
         id: searchField
         visible: panel.searchExpanded
         // Shrinkable rather than a fixed 200 so it gives width back to
-        // titleContainer under pressure on a narrow panel (item 048).
+        // titleContainer under pressure on a narrow panel.
         Layout.fillWidth: true
         Layout.minimumWidth: 90
         Layout.maximumWidth: 200

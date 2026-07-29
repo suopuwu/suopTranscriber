@@ -1,12 +1,12 @@
 # Test suite = living spec sheet. Each tst_* documents expected behaviors from
-# DESIGN.md / CLAUDE.md / StyleGuide.md. Documented-but-unbuilt behaviors live
+# DESIGN.md / StyleGuide.md. Documented-but-unbuilt behaviors live
 # in tst_future_spec as QSKIP placeholders so every ctest run lists them.
 
 find_package(Qt6 6.7 REQUIRED COMPONENTS Test)
 
 set(SUOP_CORE_DIR ${CMAKE_SOURCE_DIR}/src/core)
 
-# Wave N (task system): TranscriptionController.cpp's connectTask() references
+# Task system: TranscriptionController.cpp's connectTask() references
 # every concrete Task subclass (qobject_cast per kind), so ANY test that
 # compiles the controller must also compile the whole tasks/ set to link.
 # One list, appended wherever TranscriptionController.cpp appears, so a new
@@ -261,7 +261,7 @@ suop_add_test(tst_mainpanel_renameundo LINK_QUICK LINK_SVG ICON_ASSETS LINK_GUI
             UsbGrabJob.cpp UsbRuleStore.cpp
             ${SUOP_TASK_SOURCES})
 suop_add_test(tst_mainpanel_exittoplevel LINK_QUICK LINK_SVG ICON_ASSETS LINK_GUI SOURCES IconTheme.cpp Clipboard.cpp TranscriptDisplayBuilder.cpp UndoStack.cpp)
-# Queue item 072: loads the REAL MainPanel.qml and installs the PRODUCTION
+# Loads the REAL MainPanel.qml and installs the PRODUCTION
 # FocusBlurFilter on qApp to prove the app-wide "click outside blurs the focused
 # field" survives a press swallowed by the transcript ScrollView — the exact gap
 # a source scan can't see. Same real-controller dep set as the other MainPanel
@@ -275,6 +275,14 @@ suop_add_test(tst_focusblurfilter LINK_QUICK LINK_SVG ICON_ASSETS LINK_GUI
             UsbGrabJob.cpp UsbRuleStore.cpp
             ${SUOP_TASK_SOURCES})
 suop_add_test(tst_vaultsearchproxymodel SOURCES VaultTreeModel.cpp VaultSearchProxyModel.cpp FileRename.cpp VaultFileOps.cpp)
+# Direct unit test for the pure trash/delete/restore layer. Everything else that
+# touches it goes through a Task (tst_task_trash), which only ever drives the
+# happy path of the Files and Transcript scopes — leaving the containment guards
+# (outside-the-vault, the vault root itself, a folder arriving through the file
+# scope), the recursive Folder scope, AudioOnly's kept-.md contract, and the
+# untrashable lane with no coverage at all. Pure functions taking vaultLocalPath
+# explicitly, so no model and no engine here.
+suop_add_test(tst_vaultfileops SOURCES VaultFileOps.cpp FileRename.cpp)
 suop_add_test(tst_modelmanager SOURCES ModelManager.cpp)
 # Characterization test for the transcript display-model builder lifted out of
 # MainPanel.qml's displayData binding — a pure data-in/data-out transform, so
@@ -422,6 +430,7 @@ suop_add_test(tst_labelingengine LINK_LLAMA SOURCES LabelingEngine.cpp)
 suop_add_test(tst_diarizationengine LINK_SHERPA_ONNX SOURCES DiarizationEngine.cpp AudioDecoder.cpp)
 suop_add_test(tst_future_spec)
 suop_add_test(tst_styleguide)
+suop_add_test(tst_dependency_pins)
 suop_add_test(tst_benchmark_combos)
 suop_add_test(tst_icontheme LINK_QUICK LINK_SVG ICON_ASSETS SOURCES IconTheme.cpp)
 # OPT-IN pixel-snapshot harness — built so it never bit-rots, but DORMANT unless
@@ -502,3 +511,27 @@ suop_add_test(tst_usbregexfield LINK_QUICK LINK_DBUS LINK_WHISPER LINK_LLAMA LIN
             LabelingEngine.cpp DiarizationEngine.cpp EngineManifest.cpp GpuProbe.cpp SubprocessEngine.cpp
             EngineRegistry.cpp ParakeetEngine.cpp
             ${SUOP_TASK_SOURCES})
+# The ONLY harness that loads qml/Main.qml — the app's root ApplicationWindow,
+# and the sole instantiation site of SettingsPopup (hence ModelsPage and
+# BenchmarkPage). Everything else in tests/ loads a component in isolation, so
+# a load failure or binding loop anywhere in the settings UI, or in the
+# window-level focus wiring, was invisible to the whole suite. Also the first
+# target to compile AudioPlayer.cpp/WindowEffects.cpp at all.
+suop_add_test(tst_main_window LINK_QUICK LINK_MULTIMEDIA LINK_SVG ICON_ASSETS LINK_GUI
+    LINK_DBUS LINK_KWINDOWSYSTEM LINK_WHISPER LINK_LLAMA LINK_SHERPA_ONNX
+    SOURCES IconTheme.cpp Clipboard.cpp TranscriptDisplayBuilder.cpp UndoStack.cpp
+            TreeOrdering.cpp VaultSearchProxyModel.cpp FocusBlurFilter.cpp
+            AudioPlayer.cpp AudioRecorder.cpp WindowEffects.cpp DesktopIntegration.cpp
+            UsbGrabberController.cpp UsbDeviceMonitor.cpp UsbRuleStore.cpp UsbGrabJob.cpp
+            VaultTreeModel.cpp TranscriptionController.cpp WhisperCppEngine.cpp VadChunker.cpp
+            ModelManager.cpp AudioDecoder.cpp LabelingEngine.cpp DiarizationEngine.cpp
+            EngineManifest.cpp GpuProbe.cpp SubprocessEngine.cpp EngineRegistry.cpp ParakeetEngine.cpp
+            ${SUOP_TASK_SOURCES})
+
+# The only harness that instantiates SettingsPopup.qml — in the app it is
+# created solely by Main.qml, so nothing in tests/ ever loaded it. Drives the
+# real persistence chain (control -> AppSettings -> debounce -> the vault's
+# settings.json) against a REAL VaultTreeModel on a scratch vault: a stubbed
+# writeVaultSettings would only prove the stub agrees with itself.
+suop_add_test(tst_settingspopup_persist LINK_QUICK LINK_SVG ICON_ASSETS
+    SOURCES IconTheme.cpp VaultTreeModel.cpp FileRename.cpp VaultFileOps.cpp)

@@ -8,19 +8,19 @@ import "TextFormat.js" as TextFormat
 Rectangle {
     id: sidebar
 
-    // Item 9: a VaultSearchProxyModel now sits between the externally-bound
+    // A VaultSearchProxyModel now sits between the externally-bound
     // model and the TreeView, so sidebar.model still means "the vault to
     // show" from the outside while the proxy handles matches-first sorting.
     property alias model: searchProxy.sourceModel
     property TranscriptionController transcriptionController
     property url vaultPath
-    // O7: whatever MainPanel currently has open (audio file or orphaned .md,
+    // Whatever MainPanel currently has open (audio file or orphaned .md,
     // raw local path either way) — fed back down from Main.qml so the tree
     // delegate below can render a persistent "currently open" highlight.
     property string currentPath: ""
     signal fileActivated(string path)
     signal orphanedMdActivated(string path)
-    // Item 2 (Wave E): clicking a search-result transcript snippet opens
+    // Clicking a search-result transcript snippet opens
     // that file AND jumps to/highlights the searched phrase in it.
     signal transcriptMatchActivated(string path, bool isOrphanedMd, string query)
 
@@ -30,7 +30,7 @@ Rectangle {
     property bool searchIncludeTranscriptions: true
     property bool searchExpanded: false
 
-    // Item 16/17 (Wave E): comma-separated tag filter, genuinely hides
+    // Comma-separated tag filter, genuinely hides
     // non-matching rows (unlike searchQuery's dim+sort) via
     // VaultSearchProxyModel.tagFilter.
     property string tagFilterText: ""
@@ -44,7 +44,7 @@ Rectangle {
     readonly property var activeSpeakerFilters: sidebar.speakerFilterText.split(",")
         .map(s => s.trim()).filter(s => s.length > 0)
 
-    // Item 16: MainPanel's tag pill onClicked calls this (Main.qml wires
+    // MainPanel's tag pill onClicked calls this (Main.qml wires
     // sidebar as a direct id, no signal roundtrip needed) — appends this tag
     // to any existing filter (skipping a case-insensitive duplicate) and
     // opens the search area so the active filter is visible.
@@ -64,7 +64,7 @@ Rectangle {
         sidebar.speakerFilterText = existing.join(", ")
     }
 
-    // Item 17 / filter-suggestions rework: the comma-separated-fragment logic
+    // The comma-separated-fragment logic
     // behind BOTH filter autocompletes (tags and speakers). Generic over the
     // field text and its vocabulary so the two call sites below share one
     // implementation — see FilterSuggestions.qml for the shared UI half.
@@ -99,8 +99,8 @@ Rectangle {
             sidebar.transcriptionController.existingVaultTags(sidebar.vaultPath))
     }
 
-    // The speaker mirror — vocabulary from existingVaultSpeakers() (see
-    // queue item 045), which scans the same `speakers:` frontmatter the
+    // The speaker mirror — vocabulary from existingVaultSpeakers(), which
+    // scans the same `speakers:` frontmatter the
     // speaker filter itself matches against.
     function speakerSuggestions() {
         if (!sidebar.transcriptionController || sidebar.vaultPath.toString() === "")
@@ -110,7 +110,7 @@ Rectangle {
             sidebar.transcriptionController.existingVaultSpeakers(sidebar.vaultPath))
     }
 
-    // --- Item 9 helpers: match highlighting + transcript snippet ------------
+    // --- Match highlighting + transcript snippet helpers -------------------
     // escapeHtml/highlightMatch/cleanTranscript/transcriptSnippet moved to
     // TextFormat.js (pure, shared with TreeRowDelegate.qml). The two
     // highlighters took AppSettings.highlightColor as a hidden mid-string-build
@@ -193,9 +193,9 @@ Rectangle {
             sidebar.fileActivated(path)
     }
 
-    // Item 3: multi-select, layered on top of currentPath above rather than
+    // Multi-select, layered on top of currentPath above rather than
     // replacing it — currentPath stays MainPanel's single "what's open"
-    // pointer (O7), selectedPaths is a separate, purely-sidebar-local flat
+    // pointer, selectedPaths is a separate, purely-sidebar-local flat
     // array of note (audio/orphaned-.md) paths. Directories are never
     // selectable — clicking one only ever toggles expand (see treeDelegate's
     // TapHandler), same as before this item.
@@ -247,7 +247,7 @@ Rectangle {
         sidebar.collapsedEmptyDirs = next
     }
 
-    // Item 41: the moving end of a keyboard range gesture (Shift+Up/Down) —
+    // The moving end of a keyboard range gesture (Shift+Up/Down) —
     // distinct from lastClickedPath, which is the fixed anchor the range is
     // measured FROM. A plain click/plain arrow/group-jump collapses both to
     // the same row (single selection); Shift+arrow walks this cursor while
@@ -334,7 +334,7 @@ Rectangle {
     function handleNoteClick(path, isOrphanedMd, modifiers) {
         const shift = (modifiers & Qt.ShiftModifier) !== 0
         const ctrl = (modifiers & Qt.ControlModifier) !== 0
-        // Item 41: the clicked row is the new moving end for any subsequent
+        // The clicked row is the new moving end for any subsequent
         // keyboard Shift+arrow extension (Shift-click's moving end is exactly
         // where the pointer landed).
         sidebar.selectionCursorPath = path
@@ -374,7 +374,7 @@ Rectangle {
     // selectAllButton (and its Ctrl+A mirror) for the old "act on everything"
     // workflow.
 
-    // Item 39: run-all over the CURRENT SEARCH/FILTER RESULTS (the third,
+    // Run-all over the CURRENT SEARCH/FILTER RESULTS (the third,
     // search-menu home for the transcribe/relabel/chapters actions, alongside
     // the ribbon's bulk buttons and treeDelegate's per-row cluster). The
     // filtered/visible note set in whichever mode is active — the flat
@@ -443,7 +443,7 @@ Rectangle {
             .filter((n) => (n.isAudio && n.status === 2) || n.isOrphanedMd)
             .map((n) => n.path)
     }
-    // Item 52: search-scoped "detect speakers" — transcribed audio in the
+    // Search-scoped "detect speakers" — transcribed audio in the
     // filtered set (same rule as searchRelabelPaths(); diarization needs an
     // existing transcript and decodes the audio, so no orphaned .md).
     function searchDetectSpeakersPaths() {
@@ -470,7 +470,7 @@ Rectangle {
     readonly property bool searchFilterActive: sidebar.searchQuery !== ""
         || sidebar.tagFilterText.trim() !== "" || sidebar.speakerFilterText.trim() !== ""
 
-    // Item 41 helpers ------------------------------------------------------
+    // Keyboard range-selection helpers -------------------------------------
     // Parent directory of a note path (everything before the last "/"), used
     // to define a "group" (contiguous run of same-parent notes) for the
     // Ctrl+Up/Down group-boundary jump below.
@@ -672,7 +672,7 @@ Rectangle {
             idx = idx < 0 ? (direction > 0 ? 0 : results.length - 1)
                           : Math.max(0, Math.min(results.length - 1, idx + direction))
             sidebar.activateNote(results[idx].path, results[idx].isOrphanedMd)
-            // Item 41: a plain arrow drives selection exactly like a plain
+            // A plain arrow drives selection exactly like a plain
             // click — collapse the selection (and both range endpoints) onto
             // the single landed note.
             sidebar.selectedPaths = [results[idx].path]
@@ -712,7 +712,7 @@ Rectangle {
         idx = idx < 0 ? (direction > 0 ? 0 : notes.length - 1)
                       : Math.max(0, Math.min(notes.length - 1, idx + direction))
         sidebar.activateNote(notes[idx].path, notes[idx].isOrphanedMd)
-        // Item 41: plain arrow == plain click for selection — single-select
+        // Plain arrow == plain click for selection — single-select
         // the landed note and collapse both range endpoints onto it.
         sidebar.selectedPaths = [notes[idx].path]
         sidebar.lastClickedPath = notes[idx].path
@@ -724,7 +724,7 @@ Rectangle {
         // The visible note set is an input to ribbon eligibility (see
         // refreshSelectionEligibility); re-derive when it changes.
         sidebar.refreshSelectionEligibility()
-        // Item 3: entering/leaving text search swaps which flattened order
+        // Entering/leaving text search swaps which flattened order
         // visibleNotePaths() walks (searchResultsList vs. the TreeView row
         // walk) — a Shift-range anchor or selection built in one context
         // doesn't map cleanly onto the other, so start fresh rather than
@@ -752,14 +752,14 @@ Rectangle {
             sidebar.refreshSearchResults()
             sidebar.refreshSelectionEligibility()
             sidebar.refreshTreeOrdering()
-            // Item 3: vault contents changed (file added/removed/renamed) —
+            // Vault contents changed (file added/removed/renamed) —
             // a stale selectedPaths entry could point at a file that no
             // longer exists, so drop the selection defensively rather than
             // risk bulk actions silently no-op'ing on a vanished path.
             sidebar.selectedPaths = []
             sidebar.lastClickedPath = ""
             sidebar.selectionCursorPath = ""
-            // Item 40 (drag-to-move): a reset recreates every delegate,
+            // Drag-to-move: a reset recreates every delegate,
             // including the one whose DragHandler is driving an in-flight
             // drag. The vault watcher fires on any vault change (a
             // transcription finishing mid-drag, say), so this isn't only the
@@ -794,7 +794,7 @@ Rectangle {
         }
     }
 
-    // P6: push idiom for job-status (queued/active/paused/etc.) —
+    // Push idiom for job-status (queued/active/paused/etc.) —
     // jobStatusForPath() is a plain Q_INVOKABLE lookup, not a reactive
     // property, so delegates need an explicit nudge (via jobStatusRevision
     // below) whenever the controller says some path's resolved status may have
@@ -882,7 +882,7 @@ Rectangle {
                 sidebar.refreshSearchResultsCoalesced()
                 sidebar.refreshSelectionEligibility() // already coalesced
             }
-            // Item 6: labels/tags/chapters are written in-place into an
+            // Labels/tags/chapters are written in-place into an
             // already-existing .md, which QFileSystemWatcher::directoryChanged
             // never fires for — so the tree row would stay stale until some
             // unrelated directory event (e.g. the NEXT file's .md being
@@ -956,7 +956,7 @@ Rectangle {
             sidebar.model.setPendingCombines(sidebar.pendingCombines())
     }
 
-    // Item 51: path -> outputPath, for every file currently a member of a
+    // Path -> outputPath, for every file currently a member of a
     // "ready" (would-combine-if-run) group per detectCombineGroups() — drives
     // both the row highlight and the per-group merge button below. Unlike
     // untranscribedPaths/transcribedPaths/chaptersPaths above (populated
@@ -1104,10 +1104,10 @@ Rectangle {
         onTriggered: sidebar.refreshTreeOrdering()
     }
 
-    // Item 51 refinement: the per-group color (combineGroupColor) moved to
+    // The per-group color (combineGroupColor) moved to
     // TextFormat.js — a pure outputPath -> hue hash with no component state.
 
-    // Item 51 refinement: path of the combine group currently under the
+    // Path of the combine group currently under the
     // pointer (empty when none), pushed by whichever treeDelegate's rowHover
     // enters/leaves a combineEligible row — same push idiom as
     // untranscribedPaths/etc. below. Drives the per-group merge button
@@ -1270,7 +1270,7 @@ Rectangle {
                                                         AppSettings.tagReuseBias, AppSettings.wordiness)
     }
 
-    // Item 40 (folder management): right-click context menu over tree rows /
+    // Folder management: right-click context menu over tree rows /
     // empty tree area to create + delete folders and move a file into another
     // folder. Custom Popups in the same style as the sortModeMenu above and
     // TitleBar.qml's moreActionsMenu — this codebase uses no QQC2 Menu, just a
@@ -1279,8 +1279,8 @@ Rectangle {
     property string ctxPath: ""       // the right-clicked row's own path ("" for empty area)
     property bool ctxIsDir: false
     property bool ctxIsNote: false    // audio file or orphaned .md
-    property bool ctxIsAudio: false   // Item 2: audio file specifically (gates "Delete transcript")
-    property int ctxStatus: 0         // Item 2: VaultTreeModel::Status of the row (2 == Transcribed)
+    property bool ctxIsAudio: false   // Audio file specifically (gates "Delete transcript")
+    property int ctxStatus: 0         // VaultTreeModel::Status of the row (2 == Transcribed)
     // Directory a "New folder" gets created inside: the row itself when a
     // directory is clicked, else the clicked note's parent dir, else the
     // vault root (empty-area right-click).
@@ -1552,7 +1552,7 @@ Rectangle {
         moveToPopup.close()
     }
 
-    // Item 40 (drag-to-move): left-press-and-drag a tree row onto a folder to
+    // Drag-to-move: left-press-and-drag a tree row onto a folder to
     // move it — the same VaultTreeModel::moveFile()/moveFolder() the "Move to…"
     // context menu calls, reachable as a direct gesture. Rows had no drag
     // gesture at all before, so a left-drag fell through to the TreeView's own
@@ -1727,7 +1727,7 @@ Rectangle {
     }
 
 
-    // Item 2 (delete transcript / delete file / delete folder): every delete
+    // Delete transcript / delete file / delete folder: every delete
     // TRIES THE TRASH FIRST and only asks for confirmation if the trash refuses.
     //
     // The old flow confirmed every delete, because the model's one delete call
@@ -2023,7 +2023,7 @@ Rectangle {
         onActivated: sidebar.moveNoteSelection(1)
     }
 
-    // Item 41: Shift+Up/Down extend the selection range from the anchor
+    // Shift+Up/Down extend the selection range from the anchor
     // (mirrors Shift-click), same focus gating as plain Up/Down.
     Shortcut {
         sequence: "Shift+Up"
@@ -2036,7 +2036,7 @@ Rectangle {
         onActivated: sidebar.extendNoteSelection(1)
     }
 
-    // Item 41: Ctrl+Up/Down jump to the current group's (parent-folder's)
+    // Ctrl+Up/Down jump to the current group's (parent-folder's)
     // first/last note, then hop group-by-group on repeat.
     Shortcut {
         sequence: "Ctrl+Up"
@@ -2049,7 +2049,7 @@ Rectangle {
         onActivated: sidebar.jumpToGroupBoundary(1)
     }
 
-    // Item 41: Ctrl+Shift+Up/Down extend the selection to the current group's
+    // Ctrl+Shift+Up/Down extend the selection to the current group's
     // boundary (group jump + Shift-range in one gesture), same focus gating.
     Shortcut {
         sequence: "Ctrl+Shift+Up"
@@ -2124,7 +2124,7 @@ Rectangle {
         // The collapsed half follows the same rule for the same reason: it was
         // a literal 32 (one 22px button row + padding), which only held while
         // the buttons fit on one line. They no longer do — the destructive trio
-        // (CLAUDE.md action parity with MainPanel's cluster) pushed the count
+        // (action parity with MainPanel's cluster) pushed the count
         // past what a narrow sidebar can show in a row, so ribbonFlow wraps and
         // this tracks however many lines it ends up needing.
         height: sidebar.searchExpanded ? expandedColumn.implicitHeight
@@ -2175,7 +2175,7 @@ Rectangle {
                 }
             }
 
-            // Item 1 (Wave E): minimal text toggle instead of a QQC2 CheckBox
+            // Minimal text toggle instead of a QQC2 CheckBox
             // — clearer on/off read via background+outline (green when on)
             // rather than a small tick glyph, and shares the app's rounded
             // corners like every other interactive surface.
@@ -2220,7 +2220,7 @@ Rectangle {
                     searchField.text = ""
                     sidebar.searchQuery = ""
                     sidebar.searchExpanded = false
-                    // Item 49: closing search used to leave the tag
+                    // Closing search used to leave the tag
                     // filter (a separate, orthogonal feature — see
                     // activeTagFilters' doc comment) active, so rows
                     // stayed hidden even after the search UI itself was
@@ -2231,9 +2231,9 @@ Rectangle {
             }
         }
 
-        // Item 17 (Wave E): comma-separated tag filter with autofill
+        // Comma-separated tag filter with autofill
         // suggestions drawn from the vault's existing tag vocabulary.
-        // Separate from searchQuery (item 9's soft/dim+sort search) —
+        // Separate from searchQuery (the soft/dim+sort search) —
         // tagFilter genuinely hides non-matching rows (see
         // VaultSearchProxyModel::filterAcceptsRow).
         RowLayout {
@@ -2317,7 +2317,7 @@ Rectangle {
             }
         }
 
-        // O12: per-tag removable chips for the active tag filter, below the
+        // Per-tag removable chips for the active tag filter, below the
         // raw comma-separated TextField (which stays as-is for typing/
         // autocompleting new tags, see tagSuggestionsPopup) — visual style
         // matches MainPanel's own tagPill (a note's OWN tags, a separate
@@ -2540,9 +2540,9 @@ Rectangle {
             }
         }
 
-        // Item 39: run-all actions scoped to the current search/filter results
+        // Run-all actions scoped to the current search/filter results
         // (searchResultPaths()). Third home for transcribe/relabel/chapters,
-        // matching CLAUDE.md's per-file-action-parity rule (ribbon = bulk,
+        // matching the per-file-action-parity rule (ribbon = bulk,
         // treeDelegate cluster = per-row, this = filtered set). Each button
         // reuses the EXACT controller-call idiom + args its ribbon counterpart
         // uses (transcribeAll/relabelAll/generateChaptersAll), just over its
@@ -2614,7 +2614,7 @@ Rectangle {
                 }
             }
 
-            // Item 52 (CLAUDE.md per-file-action parity): search-scoped
+            // Per-file-action parity: search-scoped
             // "detect speakers", parity with the ribbon's detectSpeakersAllButton
             // — over the transcribed audio in the filtered result set.
             AppIconButton {
@@ -2670,7 +2670,7 @@ Rectangle {
 
     }
 
-    // Item 40 (drag-to-move): the tree's empty space below the last row stands
+    // Drag-to-move: the tree's empty space below the last row stands
     // in for the vault root as a drop target — the root isn't itself a row, so
     // without this there'd be no gesture for dragging a file back OUT of a
     // subfolder. Deliberately declared BEFORE the tree, so it stacks underneath
@@ -2720,7 +2720,7 @@ Rectangle {
         }
     }
 
-    // Item 40 (drag-to-move): the thing that follows the cursor during a row
+    // Drag-to-move: the thing that follows the cursor during a row
     // drag and, through its Drag attached property, IS the drag source Qt
     // hit-tests against the DropAreas. Parented to the sidebar rather than to
     // the dragged row: the row itself must stay put (TreeView owns its layout),
@@ -2833,7 +2833,7 @@ Rectangle {
                 Qt.callLater(tree.forceLayout)
         }
 
-        // Item 40: right-click on empty tree space (below the rows) opens the
+        // Right-click on empty tree space (below the rows) opens the
         // context menu targeting the vault root — so "New folder" at the root
         // is reachable even with no rows to right-click.
         //
@@ -2944,7 +2944,7 @@ Rectangle {
                 return
             tree.expanding = true
             tree.expandAll()
-            // P13(a): expandAll() re-inserts every previously-expanded
+            // expandAll() re-inserts every previously-expanded
             // directory's children synchronously, but the ALREADY pending
             // Qt.callLater(forceLayout) from relayoutForSearchStateChange()
             // (triggered by the same model reset) can fire before this point,
@@ -2956,7 +2956,7 @@ Rectangle {
             // during an ongoing layout!"), and that refusal is a warning plus a
             // silent no-op, not an exception — so calling it from
             // onRowsChanged would log on every single vault change AND leave
-            // the very stale positions P13(a) is about. Defer to the next event
+            // the very stale positions this fix is about. Defer to the next event
             // loop turn in that case. Nothing visual depends on the timing: the
             // row INSERTIONS above are what kill the flash and they've already
             // happened synchronously; this only refreshes cached positions.
@@ -3039,7 +3039,7 @@ Rectangle {
             }
         }
 
-        // Item 8 (Wave E): hover highlight/outline appeared vertically offset
+        // Hover highlight/outline appeared vertically offset
         // from a row's own text in some cases — traced to TreeView (built on
         // TableView) caching each row's Y position from its delegate's
         // implicitHeight, which this file changes reactively per-row
@@ -3056,7 +3056,7 @@ Rectangle {
             target: sidebar
             function onSearchQueryChanged() { tree.relayoutForSearchStateChange() }
             function onSearchIncludeTranscriptionsChanged() { tree.relayoutForSearchStateChange() }
-            // P13(b): searchCloseButton flips searchExpanded=false in the
+            // searchCloseButton flips searchExpanded=false in the
             // SAME tick it clears searchQuery — that synchronously collapses
             // the ribbon (64->32) this TreeView is anchored directly below,
             // while the query-changed relayout above is deferred a full
@@ -3165,7 +3165,7 @@ Rectangle {
         flickable: tree
     }
 
-    // Item 40: folder-management context menu. Same custom-Popup shape as the
+    // Folder-management context menu. Same custom-Popup shape as the
     // sortModeMenu above (this codebase has no QQC2 Menu) — plain Item rows,
     // each with a HoverHandler (pointer cursor) + TapHandler.
     Popup {
@@ -3344,7 +3344,7 @@ Rectangle {
                 }
             }
 
-            // Item 2: "Delete transcript" — only for a transcribed AUDIO row
+            // "Delete transcript" — only for a transcribed AUDIO row
             // (status 2 == TranscribedStatus). Removes the sibling .md,
             // reverting the audio to untranscribed; the audio itself is kept.
             // (An orphaned .md has no audio to keep, so it gets "Delete file"
@@ -3436,7 +3436,7 @@ Rectangle {
                 }
             }
 
-            // Item 2: "Delete file" — for any note row (audio or orphaned .md):
+            // "Delete file" — for any note row (audio or orphaned .md):
             // deletes the file and all its sidecars (audio + .md + partial), or
             // just the orphaned .md alone.
             //
@@ -3486,7 +3486,7 @@ Rectangle {
         }
     }
 
-    // Item 40: "New folder" name entry.
+    // "New folder" name entry.
     Popup {
         id: newFolderPopup
         x: sidebar.clampedMenuX(width)
@@ -3594,7 +3594,7 @@ Rectangle {
         }
     }
 
-    // Item 40: "Move to…" destination picker — one row per vault folder
+    // "Move to…" destination picker — one row per vault folder
     // (VaultTreeModel.vaultFolders(), minus the file's own current dir).
     Popup {
         id: moveToPopup

@@ -318,7 +318,8 @@ private slots:
 int main(int argc, char *argv[])
 {
     // Offscreen + sandboxed org/app name: MainPanel.qml loads AppSettings, whose
-    // Settings{} must NEVER touch the real ~/.config/suopTranscriber (CLAUDE.md).
+    // Settings{} must NEVER touch the real ~/.config/suopTranscriber (tests
+    // must never touch the user's real vault or app config).
     qputenv("QT_QPA_PLATFORM", "offscreen");
     qputenv("QT_QUICK_CONTROLS_STYLE", "Basic");
     QCoreApplication::setOrganizationName(QStringLiteral("suopTranscriberTestHarness"));

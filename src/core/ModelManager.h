@@ -44,8 +44,8 @@ constexpr auto kDefaultModelId = "base.en";
 // deletes remove from here. Default: the writable generic-data location
 // (~/.local/share on Linux) + "/suopTranscriber/models". Overridden by the
 // SUOP_MODELS_DIR env var (used by tests to redirect to a temp dir so they
-// never touch the real store — see CLAUDE.md's "never touch the user's real
-// vault or app config"). The directory is created lazily on first write.
+// never touch the real store — testing must never touch the user's real
+// vault or app config). The directory is created lazily on first write.
 QString modelsStoreDir();
 
 // The read-only "bundled" model directory searched AFTER the writable store
@@ -107,8 +107,8 @@ bool areDiarizationModelsDownloaded();
 // probed once up front — bytesTotal is 0 if the server didn't report a
 // length (progress is then unknown, caller should show indeterminate).
 using DownloadProgressCallback = std::function<void(qint64 bytesDone, qint64 bytesTotal)>;
-// Cooperative pause/cancel for an in-progress download (Wave N task
-// system) — paused()/cancelled() are polled periodically (see
+// Cooperative pause/cancel for an in-progress download —
+// paused()/cancelled() are polled periodically (see
 // downloadToModelsDir()'s doc comment in the .cpp) rather than delivered as
 // an interrupt. Default-constructed (both null) means "never pause or
 // cancel", same optional-callback convention as TranscriptionEngine's
@@ -121,9 +121,9 @@ struct DownloadControl {
 // Returns the local model path, or empty on failure (errorOut set if given).
 // usedFallback, if given, is set to true/false depending on whether an
 // unrecognized modelId forced a default substitution (see class comment).
-// onProgress/control (Wave N): optional real-time byte progress + cooperative
+// onProgress/control: optional real-time byte progress + cooperative
 // pause/cancel for the download itself — a no-op to pass when the model is
-// already downloaded (the common case once item 5's separate download job
+// already downloaded (the common case once the separate download task
 // has already run), since this function returns immediately without
 // touching either callback when the file already exists.
 QString ensureModel(const QString &modelId, QString *errorOut = nullptr,
@@ -250,6 +250,36 @@ bool ensureDiarizationModels(const QString &segmentationModelId, const QString &
                              QString *segmentationPathOut, QString *embeddingPathOut, QString *errorOut = nullptr,
                              bool *usedFallback = nullptr, const DownloadProgressCallback &onProgress = {},
                              const DownloadControl &control = {});
+
+// --- Download integrity (see DEPENDENCIES.md "Downloaded model artifacts") -
+//
+// Every download URL here is a FLOATING ref (huggingface `resolve/main/`, a
+// GitHub release asset), and the only gates on a fetch are curl --fail plus a
+// size check against the response's own Content-Length — both compare the
+// download against what that same response claimed, never against what the app
+// expected. So a re-upload, a mirror serving a different quantization, or a
+// 200-with-an-HTML-page installs as the model. These pin the FINAL INSTALLED
+// file, not the download: both tar.bz2 paths delete the archive right after
+// extracting. Checked ONCE, at install time — never on a presence check
+// (isModelDownloaded() is called freely from QML) and never on a later launch,
+// since every ensure* returns early when the file already resolves.
+
+// Lowercase-hex SHA-256 of path's contents, or empty if it can't be read.
+// Streams (QCryptographicHash::addData(QIODevice*)) — safe on the 2.4 GB gguf.
+QString fileSha256(const QString &path);
+
+// The pinned digest for a store-relative artifact path ("ggml-base.en.bin",
+// "parakeet-tdt-0.6b-v2/encoder.int8.onnx"), or empty when no pin is recorded.
+// Empty means "not pinned yet", not "no pin needed" — the coverage assertion in
+// tst_modelmanager keeps that honest by requiring every catalog artifact to be
+// either pinned or on its declared not-yet-pinned list.
+QString expectedSha256(const QString &storeRelativePath);
+
+// True iff path's digest is expectedHex, or expectedHex is empty (unpinned
+// artifacts are not blocked — they log their computed digest instead, which is
+// how a missing pin gets filled in). False (errorOut set, naming both digests)
+// on a mismatch or an unreadable file. Callers delete the file on false.
+bool verifyFileSha256(const QString &path, const QString &expectedHex, QString *errorOut = nullptr);
 
 // --- Model management (Settings → Models) --------------------------------
 //

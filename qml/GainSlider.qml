@@ -42,6 +42,24 @@ Slider {
         border.width: 1
         border.color: Theme.borderStrong
 
+        // The gain itself, filled from the left up to the handle — the same
+        // read every other slider in the app gives (SliderSetting and SeekBar
+        // both keep the Basic style's stock background, which draws this).
+        // Distinct from levelFill below: that is the SIGNAL, and it reads 0
+        // whenever nothing is being captured, which is exactly when the user
+        // is setting gains by eye.
+        Rectangle {
+            id: gainFill
+            anchors.left: parent.left
+            anchors.verticalCenter: parent.verticalCenter
+            anchors.margins: 1
+            height: parent.height - 2
+            width: control.visualPosition * (parent.width - 2)
+            radius: height / 2
+            color: control.enabled ? Theme.textMuted : Theme.borderStrong
+            opacity: 0.7
+        }
+
         // Live level. Kept UNDER the handle by being a child of the background,
         // so dragging never hides the thing being measured.
         Rectangle {

@@ -52,10 +52,10 @@ function baseNameOf(path) {
     return path.substring(path.lastIndexOf("/") + 1)
 }
 
-// --- Item 9 helpers: match highlighting + transcript snippet -------------
+// --- Match highlighting + transcript snippet helpers ---------------------
 // Rich-text (StyledText) escaping for plain segments around a highlight;
 // Qt rich text supports inline background-color spans fine (only
-// border-radius is unsupported, per the item 11 investigation).
+// border-radius is unsupported).
 function escapeHtml(s) {
     return String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
 }
@@ -82,7 +82,7 @@ function highlightMatch(text, query, highlightColor) {
 // Collapses a raw transcript body (with "[start - end] text [SPEAKER_TURN]"
 // segment lines) into a single normalized-whitespace string for snippet
 // display — the sidebar has no need for segment boundaries, unlike
-// MainPanel's cross-segment search (item 12).
+// MainPanel's cross-segment search.
 function cleanTranscript(body) {
     return String(body).split("\n").map(function (line) {
         return line.replace(/^\[\d{2}:\d{2}:\d{2}\.\d{3} - \d{2}:\d{2}:\d{2}\.\d{3}\]\s*/, "")
@@ -110,7 +110,7 @@ function transcriptSnippet(cleanedBody, query, contextChars, highlightColor) {
     return before + "<span style=\"background-color:" + highlightColor + ";color:white;font-weight:bold\">" + match + "</span>" + after
 }
 
-// Item 51 refinement: stable, distinct color per group, derived from the
+// Stable, distinct color per group, derived from the
 // group's outputPath (unique per group, stable across rescans) via a
 // simple string hash -> hue — no sequential group-index bookkeeping
 // needed, so it stays correct even as groups appear/disappear/reorder.

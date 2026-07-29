@@ -64,6 +64,9 @@ public:
     // prompt cancel between them). See pauseActive()'s old allowlist, which
     // included "chapters" for exactly this reason.
     Capabilities capabilities() const override { return {/*pausable=*/true, /*cancellableMidRun=*/true}; }
+    // Only the label engine — see run()'s ensureLabel() call,
+    // shared with RelabelTask.
+    EngineNeeds engineNeeds() const override { return {/*asr=*/false, /*label=*/true, /*diar=*/false}; }
     bool isPersistable() const override { return true; }
     QJsonObject toJson() const override;
     QVariantMap toVariantMap() const override;

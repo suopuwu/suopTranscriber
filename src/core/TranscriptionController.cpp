@@ -1418,7 +1418,7 @@ void TranscriptionController::togglePauseActive()
     // stacking a second request on top of the still-pending cancel.
     if (m_scheduler->isPausingActiveAsRestart())
         return;
-    // Item 9 (2026-07-14): "loading" (whisper.cpp's blocking, unhookable
+    // "loading" (whisper.cpp's blocking, unhookable
     // model-load call) has no cooperative checkpoint to pause AT. It used to
     // silently reinterpret the tap as cancelActive() + present the job as
     // Paused-via-restart — the "pause broken again" report: a click that
@@ -1428,7 +1428,7 @@ void TranscriptionController::togglePauseActive()
     // BottomBar.qml's pauseButton.enabled) so this is never reached from the
     // UI during that phase, and pauseActive() below is a safe no-op for
     // "loading" if it somehow is. A pause is never turned into a cancel here.
-    // (NOTE for a later wave — items 30/50: a genuine mid-loading pause would
+    // (NOTE: a genuine mid-loading pause would
     // need a real interruption hook that whisper.cpp doesn't expose today;
     // the JobStatus::Paused/activeStopping machinery is left dormant for
     // whenever that lands, not removed.)
@@ -1701,7 +1701,7 @@ bool TranscriptionController::setTags(const QUrl &fileUrl, const QStringList &ta
 
     if (!writeFrontmatterBlock(path, frontmatterLines, body, errorOut))
         return false;
-    // Item P19-style notification: sidebar's tag-derived display (if any)
+    // The sidebar's tag-derived display (if any)
     // should refresh the same way a label edit does — see setLabel()'s
     // matching emit for why (VaultTreeModel::refreshFile(fileUrl)).
     emit finished(fileUrl, true, QString());
@@ -2300,7 +2300,7 @@ int TranscriptionController::activeSentenceIndex(const QVariantList &sentences, 
     // though its gutter timestamp floors to "0:00", so pos==0 lands here, not on
     // the directly-hit branch above. An EXPANDED leading heading (no `collapsed`
     // key) still yields -1, leaving the caller's front-edge clamp to light the
-    // first real sentence, exactly as item 010 established.
+    // first real sentence.
     if (index < 0) {
         const QVariantMap first = sentences.at(0).toMap();
         if (first.value(QStringLiteral("isChapterHeading")).toBool()
@@ -2422,6 +2422,11 @@ QVariantList TranscriptionController::jobs() const
         entry["fileUrl"] = task->fileUrl;
         entry["status"] = taskStatusToString(task->status);
         entry["error"] = task->error;
+        // A non-fatal diagnostic on an otherwise-successful (Done) task — see
+        // Task::warning's doc comment. Distinct from `error`: it never implies
+        // Status::Failed, and the Tasks-list row renders it as such (a small
+        // amber glyph + tooltip, not the failure styling) — see BottomBar.qml.
+        entry["warning"] = task->warning;
         entry["kind"] = task->kind();
         entry["kindLabel"] = task->kindLabel(); // human category label the row shows (BottomBar)
         entry["displayName"] = task->displayName();

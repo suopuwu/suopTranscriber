@@ -72,7 +72,7 @@ public:
 
     // Renames the audio file at fileUrl (and its sibling .md, if any) to
     // newBaseName, preserving each file's extension. Also handles orphaned
-    // .md-only nodes (Feature: Milestone 5 "forgo labels" mode).
+    // .md-only nodes (the "forgo labels" mode).
     // Returns false and sets *errorOut on validation or filesystem failure,
     // without leaving the audio/.md pair mismatched. Synchronous convenience
     // wrapper: calls renameFileOnDisk() then rebuild(). QML now routes rename
@@ -107,7 +107,7 @@ public:
     // overwrite can reuse it; `name` is the source filename for messaging.
     Q_INVOKABLE QVariantMap inspectImportCandidate(const QUrl &fileUrl) const;
 
-    // Item 40 (folder management): creates a new subfolder named `name`
+    // Creates a new subfolder named `name`
     // inside parentDirUrl (QDir::mkpath). Rejects an empty/whitespace-only
     // name, a name containing a path separator or other filesystem-invalid
     // character (same character set renameFile() rejects), a parentDir that
@@ -121,8 +121,8 @@ public:
     // moved file is an AUDIO file it carries its sibling transcript data too —
     // the <fileName>.md sidecar (same full-filename convention as
     // sidecarMdPath()/renameFile(), NOT a stripped stem —) and, if
-    // present, the .<fileName>.partial.jsonl resume-state file (CLAUDE.md
-    // vault layout). A standalone orphaned .md (or any non-audio file) moves
+    // present, the .<fileName>.partial.jsonl resume-state file (DESIGN.md
+    // "Vault / file layout"). A standalone orphaned .md (or any non-audio file) moves
     // on its own. Rejects a move whose source/destination escapes the vault,
     // a destination equal to the file's current directory (no-op), or any
     // destination collision (checked across the whole audio+sidecars set
@@ -214,7 +214,7 @@ public:
     // Irreversible counterpart to trashFolder(), same confirm-first flow.
     Q_INVOKABLE bool deleteFolderPermanently(const QUrl &folderUrl);
 
-    // Item 2 (delete transcript): trashes each audio file's sibling transcript —
+    // Trashes each audio file's sibling transcript —
     // the <fileName>.md sidecar plus, if present, its .<fileName>.partial.jsonl
     // resume-state file — reverting that audio to "untranscribed" (yellow) while
     // KEEPING the audio itself. When a url names an orphaned .md directly,
@@ -315,7 +315,7 @@ public:
     // (.transcriber) are excluded (QDir::Dirs skips hidden entries).
     Q_INVOKABLE QStringList vaultFolders() const;
 
-    // Item 9 (Wave E): vault-scoped settings file (`.transcriber/settings.json`,
+    // Vault-scoped settings file (`.transcriber/settings.json`,
     // JSON) — lives inside the hidden `.transcriber/` config dir, so it's
     // naturally invisible to rebuild()/scanDirectory()'s scan (QDir's default
     // filters exclude hidden entries). writeVaultSettings() creates
@@ -431,7 +431,7 @@ public:
     // correctly updated on disk but the view never re-queries them until
     // some LATER, unrelated directory event (typically the NEXT file's .md
     // being created) happens to force a full rebuild(). That's the "delayed
-    // by one file" symptom (see Item P19's comment on
+    // by one file" symptom (see the comment on
     // TranscriptionController::setLabel()).
     //
     // TranscriptionController::finished(fileUrl, ok, error) already fires
@@ -503,13 +503,13 @@ public:
 
 signals:
     void vaultPathChanged();
-    // Item 2 (delete): a transcript (.md sidecar) was removed by
+    // A transcript (.md sidecar) was removed by
     // deleteTranscript(), leaving the audio in place (fileUrl is the audio
     // file whose transcript was deleted, or the orphaned .md that was
     // removed). MainPanel listens so the open file, if it's this one, reverts
     // to its untranscribed view rather than showing stale transcript data.
     void transcriptDeleted(const QUrl &fileUrl);
-    // Item 2 (delete): a whole file (audio + sidecars, or an orphaned .md)
+    // A whole file (audio + sidecars, or an orphaned .md)
     // was removed by deleteFile(). MainPanel listens so it clears/closes the
     // view when the deleted file is the one currently open.
     void fileDeleted(const QUrl &fileUrl);
@@ -660,7 +660,7 @@ private:
 
     // Backing for LabelRole/TagsRole/TranscriptBodyRole: read lazily from the
     // sidecar .md rather than cached on Node/at rebuild() time, since these
-    // are only needed on-demand (search sort/highlight, Item 9) and staying
+    // are only needed on-demand (search sort/highlight) and staying
     // lazy avoids re-parsing every .md file on every directory change the
     // QFileSystemWatcher reports.
     static QString sidecarMdPath(const Node *node);
@@ -699,8 +699,8 @@ private:
     // m_transcriptBodyCache. Cache correctness relies purely on the
     // mtime+size check below, NOT on any QFileSystemWatcher hook — an
     // in-place frontmatter/body rewrite (e.g. a relabel) changes neither the
-    // directory listing nor triggers rebuild() (see item P19's finding on
-    // this), but DOES change the file's mtime/size, which this cache checks
+    // directory listing nor triggers rebuild(), but DOES change the file's
+    // mtime/size, which this cache checks
     // on every call regardless of what triggered it.
     QString transcriptBody(const QString &mdPath) const;
 

@@ -1,4 +1,5 @@
 #include "SubprocessEngine.h"
+#include "ProcessRunner.h"
 
 #include <QByteArray>
 #include <QDebug>
@@ -163,6 +164,7 @@ std::vector<Segment> SubprocessEngine::transcribe(const AudioChunk &chunk, const
     process.setProcessChannelMode(QProcess::SeparateChannels);
     if (!m_manifestDir.isEmpty())
         process.setWorkingDirectory(m_manifestDir);
+    ProcessRunner::guardChildLifetime(process);
     process.start(program, arguments);
     if (!process.waitForStarted(5000)) {
         qWarning() << "SubprocessEngine: failed to start" << program << arguments << ":" << process.errorString();

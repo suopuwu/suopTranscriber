@@ -9,7 +9,7 @@ import QtQuick
 // 3 vertices) sits left of its bounding-box center, so it's drawn shifted
 // right by a proportional offset to visually balance against PauseGlyph.
 //
-// Item P24: the tip used to sit at width+xOffset, past the canvas's own
+// The tip used to sit at width+xOffset, past the canvas's own
 // raster — it got silently clipped, reading as a blunt/cut triangle. Capping
 // the tip at `width` instead (the offset now only shifts the LEFT edge in,
 // shrinking the triangle's span rather than pushing it past the bounds)

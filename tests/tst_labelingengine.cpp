@@ -86,7 +86,7 @@ private slots:
                   qPrintable("prelude doesn't seem to reflect transcript content: " + result->prelude));
     }
 
-    // Item 14 "auto-categorize" mode: when given an existing tag vocabulary
+    // "Auto-categorize" mode: when given an existing tag vocabulary
     // that's plausible for the transcript, the model should pick from it
     // rather than inventing something else — a real behavioral check, not
     // just "the field is a non-empty string" (which unrestricted mode
@@ -127,7 +127,7 @@ private slots:
         }
     }
 
-    // Item 15 (Wave E): with restrictToExisting=false but a vocabulary still
+    // With restrictToExisting=false but a vocabulary still
     // given, a HIGH tagReuseBias should make the model prefer reusing an
     // existing (even loosely-fitting) tag over inventing a precise new one.
     void highTagReuseBias_prefersExistingTagOverInventingNew()
@@ -251,7 +251,7 @@ private slots:
         }
     }
 
-    // Item 27 (chapter density): density must actually change the chapter
+    // Chapter density: density must actually change the chapter
     // system prompt's instruction — a low density should steer the model
     // toward FEWER boundaries ("conservative"/"few"), a high one toward MORE
     // ("granular"/"30"), with the mid default matching the historical "up to

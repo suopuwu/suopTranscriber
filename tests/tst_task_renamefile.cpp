@@ -97,7 +97,7 @@ private slots:
     // carries the sibling .md url, so plain url equality misses the pairing and
     // the scheduler wouldn't defer the rename behind a running transcription.
     // isSameRecording() pairs an audio file with its <stem>.md so
-    // serialActiveConflictsWith catches it (queue item 015).
+    // serialActiveConflictsWith catches it.
     void isSameRecording_pairsAudioAndSiblingMd_notUnrelatedFiles()
     {
         const QUrl wav = QUrl::fromLocalFile(QStringLiteral("/v/dir/foo.wav"));

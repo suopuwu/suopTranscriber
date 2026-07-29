@@ -204,11 +204,11 @@ private slots:
         QCOMPARE(combo()->property("currentValue").toString(), QStringLiteral("a"));
     }
 
-    // Item 034: the Recorder page's device pickers reuse this same component
+    // The Recorder page's device pickers reuse this same component
     // via labelRole: "name" — the device lists ({id, name}, no downloaded
     // field) don't share the model lists' "label" key. Proves labelRole
     // drives the closed box AND that the late-model-assignment hardening
-    // (done/013) covers device-shaped lists too; the harness's init() already
+    // covers device-shaped lists too; the harness's init() already
     // fails loudly on a QML load error, so this test also proves the
     // delegate's `downloaded !== undefined` guard doesn't throw when the
     // field is simply absent.
@@ -232,8 +232,8 @@ int main(int argc, char *argv[])
 {
     // Offscreen + sandboxed org/app name: AppComboBox.qml loads
     // AppSettings.qml (Settings{} element) transitively, and must never touch
-    // the real ~/.config/suopTranscriber (CLAUDE.md: never let testing touch
-    // the user's real vault or app config). Same setup as tst_sidebar_expand.
+    // the real ~/.config/suopTranscriber (tests must never touch the user's
+    // real vault or app config). Same setup as tst_sidebar_expand.
     qputenv("QT_QPA_PLATFORM", "offscreen");
     qputenv("QT_QUICK_CONTROLS_STYLE", "Basic");
     QCoreApplication::setOrganizationName(QStringLiteral("suopTranscriberTestHarness"));

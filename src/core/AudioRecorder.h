@@ -228,7 +228,7 @@ int pruneTestRecordings(const QString &dir, int keepNewest);
 
 // Parses `pw-dump`'s JSON array (PipeWire's node graph dump) into the same
 // {id, name} shape as availableMicDevices(), for the System Audio source
-// dropdown (see queue item 036). The first entry is always the synthetic
+// dropdown. The first entry is always the synthetic
 // default {"@DEFAULT_MONITOR@", "Default output"} so today's behavior stays
 // the default even when nothing else parses, followed by:
 //  - one entry per "Audio/Sink" node (a real output device's monitor) — id
@@ -297,8 +297,7 @@ QString streamDisplayName(const QVariantMap &props, const QStringList &ancestryN
 // own independent gain. Mic capture uses an explicit Int16/48000Hz/2-channel
 // QAudioFormat matching parec's `--format=s16le --rate=48000 --channels=2`
 // exactly, so both PCM streams are directly mixable sample-for-sample with
-// no resampling step (see CLAUDE.md's load-bearing constraints for this
-// feature).
+// no resampling step.
 //
 // Owns a dedicated QThread (mirrors TranscriptionController): the
 // QAudioSource, the parec QProcess, both byte-queue buffers, and the mixing
@@ -353,8 +352,8 @@ class AudioRecorder : public QObject {
     // Non-empty if `parec` failed to launch/exited unexpectedly (e.g. not
     // installed, or no PulseAudio/PipeWire-pulse server running) or
     // QAudioSource failed to open the requested mic device — surfaced, never
-    // silently swallowed (CLAUDE.md / ModelManager's fallback-logging house
-    // style, even though the mechanism here is different). Recording stops
+    // silently swallowed (ModelManager's fallback-logging house style, even
+    // though the mechanism here is different). Recording stops
     // cleanly (whatever was captured so far is still finalized into a valid
     // WAV) rather than crashing. Cleared at the start of every
     // startRecording() call.

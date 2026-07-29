@@ -75,9 +75,6 @@ ModelPrerequisites ChaptersTask::prerequisites() const
 
 void ChaptersTask::run(TaskContext &ctx)
 {
-    ctx.engines.evictAsr();
-    ctx.engines.evictDiar();
-
     const QString filePath = fileUrl.toLocalFile();
     const QString mdPath = sidecarPath(filePath);
     if (!QFileInfo::exists(mdPath))

@@ -84,15 +84,23 @@ set(SHERPA_ONNX_ENABLE_SPEAKER_DIARIZATION ON CACHE BOOL "" FORCE)
 set(SHERPA_ONNX_ENABLE_C_API ON CACHE BOOL "" FORCE)
 
 # Local patch to the vendored sherpa-onnx submodule (see the patch file's
-# own header comment for what/why) — kept as a diff applied at configure
-# time rather than committed inside the submodule itself, so the submodule
-# stays pinned to the real upstream v1.13.4 tag and a fresh clone (or CI)
-# stays fully reproducible via plain `git submodule update --init` with no
-# extra remotes to manage. Idempotent: `git apply --reverse --check` tells
-# us whether the patch's changes are already present in the working tree
-# (exit 0) before deciding whether to (re-)apply it, so repeated
-# configures — and a submodule that was already patched by a previous
-# configure — don't fail with "patch does not apply".
+# own header comment for what/why). The bulk of the local sherpa-onnx work
+# (batching, progress reporting, memory bounds, GPU-OOM robustness) is NOT
+# this diff — it lives as commits inside the suopuwu/sherpa-onnx fork that
+# .gitmodules now points at, two commits above the upstream v1.13.4 tag
+# ("Use gpu better", "Update session.cc" — see that submodule's own log).
+# This file only carries what hasn't been folded into the pin yet
+# (currently just the diagnostic batch-size logging), applied on top of it
+# at configure time.
+#
+# The guard below checks BOTH directions rather than trusting a single
+# `git apply --reverse --check` as proof of "already applied": that check
+# alone can't tell a patch that's genuinely already applied apart from one
+# that has quietly stopped matching the tree in either direction (exactly
+# how the pre-fork-pin version of this patch rotted invisibly for a while —
+# it never applied forward, but nothing ever checked that). A patch that
+# applies in neither direction now fails the configure instead of being
+# silently treated as done.
 set(SUOP_SHERPA_ONNX_PATCH ${CMAKE_SOURCE_DIR}/patches/sherpa-onnx-batch-segmentation.patch)
 execute_process(
     COMMAND git apply --reverse --check ${SUOP_SHERPA_ONNX_PATCH}
@@ -100,7 +108,25 @@ execute_process(
     RESULT_VARIABLE SUOP_SHERPA_ONNX_PATCH_ALREADY_APPLIED
     OUTPUT_QUIET ERROR_QUIET
 )
-if(NOT SUOP_SHERPA_ONNX_PATCH_ALREADY_APPLIED EQUAL 0)
+if(SUOP_SHERPA_ONNX_PATCH_ALREADY_APPLIED EQUAL 0)
+    message(STATUS "sherpa-onnx-batch-segmentation.patch already applied")
+else()
+    execute_process(
+        COMMAND git apply --check ${SUOP_SHERPA_ONNX_PATCH}
+        WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}/third_party/sherpa-onnx
+        RESULT_VARIABLE SUOP_SHERPA_ONNX_PATCH_CAN_APPLY
+        OUTPUT_QUIET ERROR_QUIET
+    )
+    if(NOT SUOP_SHERPA_ONNX_PATCH_CAN_APPLY EQUAL 0)
+        message(FATAL_ERROR
+            "patches/sherpa-onnx-batch-segmentation.patch applies in "
+            "NEITHER direction against third_party/sherpa-onnx — it is "
+            "neither already applied nor appliable as-is. The submodule "
+            "pin (see .gitmodules) has likely moved out from under it; "
+            "re-derive the patch against the current pinned commit rather "
+            "than force-applying. See DEPENDENCIES.md for the sherpa-onnx "
+            "bump procedure.")
+    endif()
     message(STATUS "Applying local patch: sherpa-onnx-batch-segmentation.patch")
     execute_process(
         COMMAND git apply ${SUOP_SHERPA_ONNX_PATCH}
@@ -110,12 +136,9 @@ if(NOT SUOP_SHERPA_ONNX_PATCH_ALREADY_APPLIED EQUAL 0)
     if(NOT SUOP_SHERPA_ONNX_PATCH_APPLY_RESULT EQUAL 0)
         message(FATAL_ERROR
             "Failed to apply patches/sherpa-onnx-batch-segmentation.patch to "
-            "third_party/sherpa-onnx. It's pinned against v1.13.4 — if the "
-            "submodule was bumped past that, the patch needs re-deriving "
-            "against the new source rather than force-applying.")
+            "third_party/sherpa-onnx despite `git apply --check` reporting "
+            "it would succeed.")
     endif()
-else()
-    message(STATUS "sherpa-onnx-batch-segmentation.patch already applied")
 endif()
 
 add_subdirectory(third_party/sherpa-onnx)
@@ -256,8 +279,10 @@ qt_add_qml_module(suopTranscriber
         qml/ModelsPage.qml
         qml/AppComboBox.qml
         qml/GainSlider.qml
+        qml/GainPercentField.qml
         qml/MiddleDragScroll.qml
         qml/ScrollPage.qml
+        qml/WaveformBar.qml
         qml/CombineRuleRegex.js
         qml/TextFormat.js
     RESOURCES

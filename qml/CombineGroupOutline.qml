@@ -1,7 +1,7 @@
 import QtQuick
 import QtQuick.Shapes
 
-// Item 51: rounded-rect perimeter outline for a row that's a member of a
+// Rounded-rect perimeter outline for a row that's a member of a
 // "ready" combine group (see Sidebar.qml), sized/weighted to match
 // HoverBorder exactly (same strokeWidth, same corner radius) — unlike
 // HoverBorder though, each edge is independently suppressible via

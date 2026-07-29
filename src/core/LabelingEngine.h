@@ -121,7 +121,7 @@ public:
     // multi-hour file silently only getting chapters for its first stretch
     // would read as a bug, not a documented limit.
     //
-    // Item 27 (chapter density): density is a 0.0-1.0 slider (mirrors label()'s
+    // Chapter density: density is a 0.0-1.0 slider (mirrors label()'s
     // wordiness) controlling HOW MANY boundaries to propose — low ("only the
     // few most significant topic shifts") vs high ("granular, up to ~30
     // chapters"). Fed into the system prompt as a 3-tier qualitative

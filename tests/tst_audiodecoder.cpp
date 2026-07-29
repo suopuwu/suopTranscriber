@@ -16,8 +16,11 @@
 #include <QProcess>
 #include <QStandardPaths>
 #include <QTemporaryDir>
+#include <QThread>
 
+#include <atomic>
 #include <cmath>
+#include <limits>
 
 #include "AudioDecoder.h"
 
@@ -65,6 +68,50 @@ QString makeLoudQuietWav(const QString &path)
     return QFileInfo::exists(path) ? path : QString();
 }
 
+// A ~60s synthetic mp3, corrupted throughout with a deterministic PRNG (every
+// 3rd byte from 1% in), for hugeStderrDoesNotDeadlock_andIsStillReported()
+// below. Measured on the dev machine (ffmpeg n8.1.2): this reliably pushes
+// ffmpeg's mp3 decoder into ~90KB of repeated "Header missing" / "Error
+// submitting packet to decoder" -loglevel=error lines — well past the 64KB
+// pipe buffer — while still failing overall (nonzero exit), not limping to a
+// "successful" decode. Confirmed independently (a throwaway Python
+// subprocess.Popen that reads only stdout, never stderr, on this exact file)
+// that this genuinely deadlocks without a stderr drain: it had to be killed
+// by `timeout`, not that it just runs slow.
+QString makeHeavilyCorruptedMp3(const QString &path)
+{
+    QProcess gen;
+    gen.start("ffmpeg",
+              {"-y", "-f", "lavfi", "-i", "sine=frequency=440:duration=60", "-c:a", "libmp3lame", path});
+    if (!gen.waitForFinished(30000) || gen.exitCode() != 0 || !QFileInfo::exists(path))
+        return QString();
+
+    QFile f(path);
+    if (!f.open(QIODevice::ReadWrite))
+        return QString();
+    QByteArray data = f.readAll();
+    const qint64 n = data.size();
+
+    // xorshift32 — deterministic and reproducible across runs; no need for
+    // real entropy, just enough to reliably break mp3 frame sync.
+    quint32 state = 11;
+    const auto nextByte = [&state]() -> char {
+        state ^= state << 13;
+        state ^= state >> 17;
+        state ^= state << 5;
+        return static_cast<char>(state & 0xFF);
+    };
+    for (qint64 i = n / 100; i < n; ++i) {
+        if (i % 3 == 0)
+            data[i] = nextByte();
+    }
+
+    f.seek(0);
+    f.write(data);
+    f.close();
+    return path;
+}
+
 double rms(const std::vector<float> &pcm, std::size_t begin, std::size_t end)
 {
     double sumSquares = 0.0;
@@ -78,6 +125,61 @@ double rms(const std::vector<float> &pcm, std::size_t begin, std::size_t end)
 QStringList dirEntries(const QString &path)
 {
     return QDir(path).entryList(QDir::Files | QDir::Dirs | QDir::NoDotAndDotDot, QDir::Name);
+}
+
+// Hand-rolled canonical IEEE-float WAV (format tag 3, with the "fact" chunk
+// the format expects) — these tests' fixtures need exact raw bytes (a NaN, an
+// Inf, a 2.5 peak) that no ffmpeg filter graph can express, so this writes
+// them directly rather than shelling out to generate the source. Mirrors
+// writeMono16kWav's header-write pattern in SubprocessEngine.cpp, at float32
+// instead of int16 and without its [-1,1] clamp (the whole point here is
+// values outside that range).
+bool writeMonoFloatWav(const QString &path, quint32 sampleRate, const std::vector<float> &samples)
+{
+    QFile file(path);
+    if (!file.open(QIODevice::WriteOnly | QIODevice::Truncate))
+        return false;
+
+    constexpr quint16 channels = 1;
+    constexpr quint16 bitsPerSample = 32;
+    constexpr quint16 blockAlign = channels * bitsPerSample / 8;
+    const quint32 byteRate = sampleRate * blockAlign;
+    const quint32 dataBytes = static_cast<quint32>(samples.size()) * sizeof(float);
+    constexpr quint32 factBytes = 4;
+    const quint32 riffBytes = 4 + (8 + 16) + (8 + factBytes) + (8 + dataBytes);
+
+    const auto putU32 = [&file](quint32 v) {
+        char b[4] = {char(v & 0xff), char((v >> 8) & 0xff), char((v >> 16) & 0xff), char((v >> 24) & 0xff)};
+        file.write(b, 4);
+    };
+    const auto putU16 = [&file](quint16 v) {
+        char b[2] = {char(v & 0xff), char((v >> 8) & 0xff)};
+        file.write(b, 2);
+    };
+
+    file.write("RIFF", 4);
+    putU32(riffBytes);
+    file.write("WAVE", 4);
+
+    file.write("fmt ", 4);
+    putU32(16);
+    putU16(3); // WAVE_FORMAT_IEEE_FLOAT
+    putU16(channels);
+    putU32(sampleRate);
+    putU32(byteRate);
+    putU16(blockAlign);
+    putU16(bitsPerSample);
+
+    file.write("fact", 4);
+    putU32(factBytes);
+    putU32(static_cast<quint32>(samples.size()));
+
+    file.write("data", 4);
+    putU32(dataBytes);
+    file.write(reinterpret_cast<const char *>(samples.data()), static_cast<qint64>(dataBytes));
+
+    file.close();
+    return true;
 }
 
 } // namespace
@@ -175,6 +277,45 @@ private slots:
         const auto pcm = AudioDecoder::decodeTo16kMono(textPath, &error);
         QVERIFY(!pcm.has_value());
         QVERIFY2(!error.isEmpty(), "errorOut must carry ffmpeg's stderr for non-audio input");
+    }
+
+    // Spec: stderr is drained every poll iteration, exactly like
+    // stdout — a pipe's kernel buffer is finite (~64KB on Linux), and ffmpeg
+    // blocked writing a flood of per-frame decode errors past that would
+    // never exit, wedging the poll loop even though decodeTo16kMono only
+    // reads stdout for the actual PCM. The chosen proof: a
+    // deliberately damaged input that provokes >64KB of -loglevel=error
+    // stderr (see makeHeavilyCorruptedMp3's comment, including independent
+    // confirmation via a stdout-only-reading Python subprocess that this
+    // exact file genuinely deadlocks without a stderr drain) — this proves
+    // the drain rather than just asserting a weaker property. The call must
+    // RETURN (nullopt + non-empty error) well within a generous bound,
+    // rather than hang.
+    void hugeStderrDoesNotDeadlock_andIsStillReported()
+    {
+        REQUIRE_FFMPEG();
+
+        QTemporaryDir tempDir;
+        QVERIFY(tempDir.isValid());
+        const QString corrupt = makeHeavilyCorruptedMp3(tempDir.filePath(QStringLiteral("corrupt.mp3")));
+        if (corrupt.isEmpty())
+            QSKIP("could not generate the corrupted mp3 fixture via ffmpeg");
+
+        QElapsedTimer timer;
+        timer.start();
+        QString error;
+        const auto pcm = AudioDecoder::decodeTo16kMono(corrupt, &error);
+        const qint64 elapsedMs = timer.elapsed();
+
+        QVERIFY2(elapsedMs < 15000,
+                 qPrintable(QStringLiteral("decode took %1ms — a stderr drain gap would wedge this "
+                                            "on a full pipe, not just run slow")
+                                .arg(elapsedMs)));
+        QVERIFY2(!pcm.has_value(),
+                 "this file's corruption is dense enough that ffmpeg exits non-zero overall — "
+                 "if this starts failing, the fixture stopped reproducing a genuine failure");
+        QVERIFY2(!error.isEmpty(), "errorOut must carry the accumulated stderr, not a post-exit "
+                                    "readAllStandardError() that would now return almost nothing");
     }
 
     // Spec: NO TEMP WAV (DESIGN.md "Audio"): PCM streams over ffmpeg's stdout
@@ -308,6 +449,190 @@ private slots:
                  qPrintable(QStringLiteral("post-speechnorm loud/quiet RMS ratio %1 — gap barely narrowed "
                                             "from the raw ~22x, leveling isn't actually working")
                                 .arg(ratio)));
+    }
+
+    // Pure-function bounds check on the decode stall watchdog (mirrors how
+    // tst_transcription_queue.cpp tests TranscribeTask::isStalled directly) —
+    // decode output is continuous, so the rule is a flat 60s bound, not
+    // audio-length-relative like the engine's own watchdog.
+    void isDecodeStalled_boundsNoOutputTime()
+    {
+        QVERIFY2(!AudioDecoder::isDecodeStalled(59'000), "59s of silence must not read as stalled");
+        QVERIFY2(AudioDecoder::isDecodeStalled(61'000), "61s of silence must read as stalled");
+    }
+
+    // Spec: a NaN sample fed through ffmpeg's speechnorm filter
+    // spins its rolling-peak tracker forever (NaN compares false against
+    // everything, so the peak-advance loop never converges) — measured on a
+    // real corrupt wireless-mic recording as a 678s kill with zero output, and
+    // would run forever unkilled. The fix decodes WITHOUT speechnorm first
+    // (NaN-safe), scrubs non-finite samples to silence in C++, then applies
+    // speechnorm to the cleaned buffer. This test would have hung before the
+    // fix; it must now both RETURN and yield all-finite output.
+    //
+    // The external timeout below is deliberately independent of the
+    // in-process 60s stall watchdog — it uses DecodeControl's own
+    // real cancel hook from a second thread, so this test still catches a
+    // regression even if the watchdog itself were ever broken, rather than
+    // silently relying on it as the only backstop.
+    void nonFiniteSamplesDecodeInsteadOfHanging()
+    {
+        REQUIRE_FFMPEG();
+
+        QTemporaryDir tempDir;
+        QVERIFY(tempDir.isValid());
+        const QString wavPath = tempDir.filePath(QStringLiteral("nan.wav"));
+
+        // 5s @ 48kHz mono tone (the minimal repro), with one
+        // sample forced to NaN and another to +Inf partway through — the
+        // exact combination measured to hang (Inf alone, or NaN without
+        // speechnorm, are both harmless — also measured).
+        constexpr quint32 sampleRate = 48000;
+        constexpr int seconds = 5;
+        std::vector<float> samples(sampleRate * seconds);
+        for (std::size_t i = 0; i < samples.size(); ++i)
+            samples[i] = 0.2f * std::sin(2.0 * M_PI * 440.0 * static_cast<double>(i) / sampleRate);
+        samples[samples.size() / 2] = std::numeric_limits<float>::quiet_NaN();
+        samples[samples.size() / 2 + 1000] = std::numeric_limits<float>::infinity();
+        QVERIFY(writeMonoFloatWav(wavPath, sampleRate, samples));
+
+        constexpr qint64 kHardTimeoutMs = 30'000;
+        std::atomic<bool> timedOut{false};
+        AudioDecoder::DecodeControl control;
+        control.cancelled = [&timedOut] { return timedOut.load(); };
+
+        std::optional<std::vector<float>> pcm;
+        QString error;
+        QScopedPointer<QThread> worker(QThread::create([&] {
+            pcm = AudioDecoder::decodeTo16kMono(wavPath, &error, control);
+        }));
+
+        QElapsedTimer timer;
+        timer.start();
+        worker->start();
+        const bool joinedInTime = worker->wait(kHardTimeoutMs);
+        if (!joinedInTime) {
+            // Regression path: cancel for real so the worker thread (and its
+            // ffmpeg child) actually unwinds instead of leaking past this test.
+            timedOut = true;
+            worker->wait(15'000);
+        }
+        const qint64 elapsedMs = timer.elapsed();
+
+        QVERIFY2(joinedInTime,
+                 qPrintable(QStringLiteral("decodeTo16kMono did not return within %1ms — regressed back to "
+                                            "the speechnorm-on-NaN hang")
+                                .arg(kHardTimeoutMs)));
+        QVERIFY2(pcm.has_value(), qPrintable(QStringLiteral("expected the scrubbed decode to succeed, got "
+                                                              "error: %1")
+                                                  .arg(error)));
+        QVERIFY2(elapsedMs < 15000,
+                 qPrintable(QStringLiteral("decode took %1ms — should be fast (pass 1 has no speechnorm so "
+                                            "NaN can't wedge it, pass 2 runs on a tiny scrubbed buffer)")
+                                .arg(elapsedMs)));
+
+        int nonFinite = 0;
+        for (float v : *pcm) {
+            if (!std::isfinite(v))
+                ++nonFinite;
+        }
+        QCOMPARE(nonFinite, 0);
+    }
+
+    // Spec: the scrub route must not introduce any
+    // NEW clamping of legitimate finite headroom beyond what
+    // "speechnorm=e=25:p=0.95:r=0.05" already, unconditionally, does today.
+    //
+    // IMPORTANT — measured while writing this test, and worth recording
+    // here rather than silently working around: the originally-drafted test
+    // spec asked for "a synthetic f32 file peaking at 2.5 must not be
+    // flattened to 1.0" i.e. the FINAL decodeTo16kMono() output should
+    // contain values above 1.0. That is unattainable by this decode
+    // function (or ANY decode function) once speechnorm is the last stage
+    // — ffmpeg's own speechnorm `p` peak-target option is hard-bounded to
+    // [0, 1] (`ffmpeg -h filter=speechnorm`), and empirically (three direct
+    // ffmpeg CLI runs with today's UNCHANGED, already-shipped filter
+    // string, no scrub involved at all) a quiet-only signal, a sustained
+    // 2.5-amplitude tone, and a 50ms 2.5-amplitude burst in an otherwise
+    // quiet bed ALL converge to peak ≈0.95 — e=25 is a deliberately
+    // aggressive expansion factor (see the decode function's comment) that
+    // normalizes essentially anything toward the target within
+    // milliseconds. So today's shipped decodeTo16kMono has never returned
+    // samples above ~0.95, corrupt input or not; the "1.56M samples above
+    // 1.0" the real corrupt wireless-mic file was measured to have must
+    // describe the raw/undecoded source, not this function's output.
+    //
+    // What the decision's "must survive" constraint actually rules out, and
+    // what this test verifies instead: the scrub (replace non-finite with
+    // 0) must not degrade a file's legitimate loud content any further than
+    // speechnorm's own unavoidable normalization already does on an
+    // otherwise-identical CLEAN file. Two near-identical fixtures — one
+    // with a NaN forced into the quiet bed (exercises the scrub), one
+    // without (nothing to scrub) — must decode to matching peaks near the
+    // 2.5 burst; a materially LOWER peak on the corrupt one would mean the
+    // scrub (or the two-pass split itself) is adding attenuation beyond
+    // speechnorm's own, which is what an aformat/alimiter prefix would do
+    // and is exactly what was rejected.
+    void legitimateAboveUnityPeaksSurvive()
+    {
+        REQUIRE_FFMPEG();
+
+        QTemporaryDir tempDir;
+        QVERIFY(tempDir.isValid());
+
+        constexpr quint32 sampleRate = 48000;
+        constexpr int seconds = 3;
+        const auto makeSamples = [] {
+            std::vector<float> samples(sampleRate * seconds);
+            for (std::size_t i = 0; i < samples.size(); ++i)
+                samples[i] = 0.05f * std::sin(2.0 * M_PI * 440.0 * static_cast<double>(i) / sampleRate);
+            const std::size_t burstStart = samples.size() / 2;
+            const std::size_t burstLen = sampleRate / 20; // 50ms
+            for (std::size_t i = burstStart; i < burstStart + burstLen && i < samples.size(); ++i)
+                samples[i] = 2.5f * std::sin(2.0 * M_PI * 1000.0 * static_cast<double>(i) / sampleRate);
+            return samples;
+        };
+
+        std::vector<float> corruptSamples = makeSamples();
+        std::vector<float> cleanSamples = makeSamples();
+        // A NaN far from the burst, in the quiet bed — nothing to scrub in
+        // the control fixture, so any difference between the two decoded
+        // peaks is attributable to the scrub/two-pass split, not the burst
+        // itself or ordinary run-to-run ffmpeg variance.
+        corruptSamples[100] = std::numeric_limits<float>::quiet_NaN();
+
+        const QString corruptPath = tempDir.filePath(QStringLiteral("corrupt_with_headroom.wav"));
+        const QString cleanPath = tempDir.filePath(QStringLiteral("clean_with_headroom.wav"));
+        QVERIFY(writeMonoFloatWav(corruptPath, sampleRate, corruptSamples));
+        QVERIFY(writeMonoFloatWav(cleanPath, sampleRate, cleanSamples));
+
+        QString corruptError;
+        QString cleanError;
+        const auto corruptPcm = AudioDecoder::decodeTo16kMono(corruptPath, &corruptError);
+        const auto cleanPcm = AudioDecoder::decodeTo16kMono(cleanPath, &cleanError);
+        QVERIFY2(corruptPcm.has_value(), qPrintable(corruptError));
+        QVERIFY2(cleanPcm.has_value(), qPrintable(cleanError));
+
+        const auto peakOf = [](const std::vector<float> &pcm) {
+            float peak = 0.0f;
+            for (float v : pcm)
+                peak = std::max(peak, std::fabs(v));
+            return peak;
+        };
+        const float corruptPeak = peakOf(*corruptPcm);
+        const float cleanPeak = peakOf(*cleanPcm);
+
+        QVERIFY2(std::isfinite(corruptPeak) && corruptPeak > 0.5f,
+                 qPrintable(QStringLiteral("corrupt-file peak was %1 — the burst should still dominate "
+                                            "after scrubbing one unrelated NaN sample")
+                                .arg(corruptPeak)));
+        QVERIFY2(std::abs(corruptPeak - cleanPeak) < 0.02f,
+                 qPrintable(QStringLiteral("scrubbing a NaN elsewhere in the file changed the burst's peak "
+                                            "from %1 (clean) to %2 (corrupt) — the scrub is attenuating "
+                                            "legitimate headroom beyond what speechnorm already does on its "
+                                            "own, which the chosen route must not do")
+                                .arg(cleanPeak)
+                                .arg(corruptPeak)));
     }
 };
 

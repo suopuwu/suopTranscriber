@@ -275,8 +275,8 @@ int main(int argc, char *argv[])
 {
     // Offscreen + sandboxed org/app name: AppSettings.qml's Settings{} element
     // is loaded transitively (UnderlineField/HoverBorder bind it) and must
-    // never touch the real ~/.config/suopTranscriber (CLAUDE.md: never let
-    // testing touch the user's real vault or app config). UsbGrabberController
+    // never touch the real ~/.config/suopTranscriber (tests must never touch
+    // the user's real vault or app config). UsbGrabberController
     // also persists its rules app-scoped via QSettings, so the same isolation
     // keeps this harness off the user's real grab rules. Same setup as
     // tst_sidebar_expand.cpp.

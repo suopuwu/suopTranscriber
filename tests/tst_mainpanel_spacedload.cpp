@@ -2,7 +2,7 @@
 // has spaces, AND a very large diarized transcript renders fully without any
 // virtualization.
 //
-// The bug (queue item 009): a large diarized file rendered BLANK on cold open.
+// The bug: a large diarized file rendered BLANK on cold open.
 // It looked like a scale problem (3469 eager gutter Repeater delegates + a
 // ~380 KB monolithic TextArea), but a 2x2 probe — {small, large} x {plain,
 // spaced} path — proved size was a red herring: LARGE/PLAIN loads in ~1.2s with

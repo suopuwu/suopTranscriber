@@ -91,7 +91,7 @@ std::optional<EngineDescriptor> resolveEngine(const QString &engineId, const QSt
 
 // Orchestrates: ffmpeg decode -> WhisperCppEngine -> vault sidecar files.
 // Owns a dedicated QThread; transcription (and its file IO) NEVER runs on
-// the GUI thread (see CLAUDE.md). Whole-file transcription only for now —
+// the GUI thread. Whole-file transcription only for now —
 // no VAD chunking / resume yet (DESIGN.md "Durable / resumable
 // transcription" is a later milestone). Runs at most one job at a time but
 // queues additional transcribe() calls (no duplicates by fileUrl) instead of
@@ -293,9 +293,9 @@ public:
     // The transcript-length-aware EFFECTIVE wordiness a
     // label/prelude pass actually uses, given the user's base wordiness slider
     // and the transcript's word count. Caps DOWN for short transcripts (a
-    // 3-sentence transcript shouldn't get a 5-paragraph prelude — P29) AND
+    // 3-sentence transcript shouldn't get a 5-paragraph prelude) AND
     // scales UP for very long ones (a 2-3 hour transcript earns a fuller
-    // prelude tier — item 58). Static + public so the length->tier mapping is
+    // prelude tier). Static + public so the length->tier mapping is
     // unit-testable directly without spinning up a real label model (the
     // relabelJob worker path that consumes it needs a ~2.5GB GGUF loaded).
     static double effectiveWordinessForLength(double baseWordiness, int wordCount);
@@ -433,7 +433,7 @@ public:
     // valid, non-colliding destination and only owns the slow part: the
     // byte-copy). Queued through the SAME worker-thread job pipeline as
     // transcribe()/download()/combine() (a large copy must never block the
-    // GUI thread — CLAUDE.md), so it shows up in jobs()/tasksTotal/the Tasks
+    // GUI thread), so it shows up in jobs()/tasksTotal/the Tasks
     // popup like any other task, with the same cancel/progress plumbing. The
     // job's fileUrl is destUrl (so the Tasks row names the destination file
     // and clicking it opens the imported file once done); a copy failure that
@@ -501,10 +501,9 @@ public:
                                  const QString &embeddingModelId = QString(), double sensitivity = 0.5);
 
     // Bulk wrapper mirroring transcribeAll()/relabelAll(): calls diarizeFile()
-    // for each url. Dedup is entirely delegated to diarizeFile(). Added now so
-    // the OWED Sidebar ribbon / per-row "detect speakers" buttons (CLAUDE.md
-    // per-file-action parity — deferred this wave, another agent owns
-    // Sidebar.qml) only need wiring, no new controller method.
+    // for each url. Dedup is entirely delegated to diarizeFile(). Added so
+    // the Sidebar ribbon's "detect speakers" button (per-file-action
+    // parity) only needs wiring, no new controller method.
     Q_INVOKABLE void diarizeFilesForPaths(const QVariantList &fileUrls, const QUrl &vaultUrl,
                                           const QString &segmentationModelId = QString(),
                                           const QString &embeddingModelId = QString(), double sensitivity = 0.5);
@@ -581,7 +580,7 @@ public:
     // url. Dedup is entirely delegated to generateChapters().
     Q_INVOKABLE void generateChaptersAll(const QVariantList &fileUrls, const QUrl &vaultUrl, double density = 0.5);
 
-    // Items 24/53 ("run all jobs"): enqueues the FULL per-file pipeline for
+    // "Run all jobs": enqueues the FULL per-file pipeline for
     // one file, IN ORDER — transcribe, then detect speakers (diarize), then
     // label (relabel), then chapters — as separate queued jobs so the single
     // background worker runs them strictly in that order (FIFO, one at a time).
@@ -640,7 +639,7 @@ public:
                                          double chapterDensity = 0.5, const QString &segmentationModelId = QString(),
                                          const QString &embeddingModelId = QString(), double sensitivity = 0.5);
 
-    // Item 17 (manual chapters). Inserts a MANUAL "## [timestamp] title" marker
+    // Manual chapters. Inserts a MANUAL "## [timestamp] title" marker
     // (carrying the manual sentinel — see spliceBodyChapters()'s doc comment)
     // at timestampSeconds, in sorted position (before the first segment line
     // at/after that time). A manual marker is preserved across later
@@ -649,7 +648,7 @@ public:
     // so the sidebar/main panel refresh, exactly like setPrelude()/setLabel().
     Q_INVOKABLE void addChapter(const QUrl &fileUrl, double timestampSeconds, const QString &title);
 
-    // Item 17 / item 35 backend. Rewrites the title of the chapter marker at
+    // Rewrites the title of the chapter marker at
     // timestampSeconds in place (works for auto OR manual markers). Editing an
     // AUTO chapter's title PROMOTES it to manual (adds the sentinel) so the
     // next regeneration won't clobber the user's edit — the least-surprising
@@ -657,7 +656,7 @@ public:
     // finished(fileUrl, ok, error).
     Q_INVOKABLE void setChapterTitle(const QUrl &fileUrl, double timestampSeconds, const QString &newTitle);
 
-    // Item 17. Removes the chapter marker at timestampSeconds (auto or manual).
+    // Removes the chapter marker at timestampSeconds (auto or manual).
     // finished ok=false if none exists there. Emits finished(fileUrl, ok, error).
     Q_INVOKABLE void deleteChapter(const QUrl &fileUrl, double timestampSeconds);
 
@@ -781,7 +780,7 @@ public:
     // entries are left alone.
     Q_INVOKABLE void clearFinished();
 
-    // Wave N (task system). Pauses the Active job IN PLACE — a no-op unless
+    // Pauses the Active job IN PLACE — a no-op unless
     // the Active job's kind is "transcribe" or "download" (the only two
     // kinds with a cooperative interruption point: whisper.cpp's
     // abort_callback, blocked on rather than told to abort — see
@@ -951,7 +950,7 @@ public:
     // Rewrite (2026-07-07): a speaker's name is now baked directly into
     // every "[oldName]" segment-line tag in the transcript BODY itself —
     // there is no more separate frontmatter name-lookup layer, since the
-    // vault's .md file is meant to be human-readable standalone (CLAUDE.md);
+    // vault's .md file is meant to be human-readable standalone;
     // a raw file that still showed "[Speaker 1]" everywhere after a rename,
     // with the real name hidden in YAML frontmatter, wasn't. oldName must be
     // the speaker's CURRENT literal tag text — the same string
@@ -1076,8 +1075,8 @@ public:
     // N consecutive identical (same speaker, same text) whisper segments
     // into this one line with a trailing " (×N)" marker — the merge happens
     // at write time, in the file itself, not just in this parsed view. For
-    // sentence-level highlighting synced to playback (see DESIGN.md /
-    // CLAUDE.md "sentence-level only, binary-search on positionChanged").
+    // sentence-level highlighting synced to playback (see DESIGN.md
+    // "Sentence highlighting": binary-search on positionChanged).
     // Cached (see m_sentenceCache) — an append-only live
     // transcription only regex-parses its NEW trailing bytes per call
     // instead of re-parsing the whole (ever-growing) body from scratch.
@@ -1135,7 +1134,7 @@ public:
 
     // Pure, deterministic lookup over ALREADY-PARSED spans (parseSilences()
     // above) — this is what makes "changing the threshold" a UI filter and
-    // NEVER a re-analysis trigger (locked Decision, queue item 084): no
+    // NEVER a re-analysis trigger (a locked decision): no
     // audio, VAD, or task involvement whatsoever, just a scan of the spans
     // already stored in frontmatter. Returns the END of the first span
     // containing positionSeconds whose length is >= thresholdSeconds, or -1
@@ -1156,7 +1155,7 @@ public:
     // AppSettings.loadFromVault call). A job that was Active (mid-
     // transcription) when the app last closed is persisted and reloaded as
     // Queued, NOT resumed from where it left off — no true mid-file resume
-    // exists yet (see CLAUDE.md / DESIGN.md "Durable / resumable
+    // exists yet (see DESIGN.md "Durable / resumable
     // transcription").
     //
     // User correction (2026-07-09): restored jobs are deliberately NOT
@@ -1189,7 +1188,7 @@ public:
     //
     // This sidesteps that entirely: rather than waiting for native code to
     // reach a checkpoint, it ends the OS process immediately. Provably safe
-    // per this app's own durability design — CLAUDE.md/SegmentLineWriter's
+    // per this app's own durability design — see SegmentLineWriter's
     // doc comment: every segment append() already leaves the .md file fully
     // valid and flushed, BY DESIGN, specifically so a kill mid-run (this app
     // has never guaranteed anything more graceful than that) never

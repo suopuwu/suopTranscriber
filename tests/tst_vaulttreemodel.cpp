@@ -1,7 +1,8 @@
 // Living spec: VaultTreeModel — the sidebar tree over an Obsidian-style vault.
 //
 // Sources of truth:
-//   CLAUDE.md  "Vault layout: sibling .md = transcribed (green/yellow indicator)."
+//   DESIGN.md  "Vault / file layout" — sibling .md = transcribed (green/yellow
+//              indicator).
 //   DESIGN.md  "Vault / file layout" — directories with no audio anywhere in
 //              their subtree are hidden; QFileSystemWatcher keeps the tree live.
 //
@@ -174,7 +175,7 @@ private:
 private slots:
     // The deletes below are trash-first, which makes the trash DESTINATION part
     // of the behavior under test — but the real home trash is both the
-    // developer's own (CLAUDE.md: tests never touch real user state) and, per
+    // developer's own (tests never touch real user state) and, per
     // the XDG spec, unusable for a /tmp QTemporaryDir vault on a different
     // filesystem — moveToTrash() would silently fall back to a permanent
     // delete and the trash path would stop being tested at all. Pointing
@@ -188,9 +189,9 @@ private slots:
         qputenv("XDG_DATA_HOME", m_xdgDataHome.path().toUtf8());
     }
 
-    // --- Sibling .md convention (CLAUDE.md: "sibling .md = transcribed") ----
+    // --- Sibling .md convention ("sibling .md = transcribed") ----
 
-    // CLAUDE.md: an audio file with a sibling <fileName>.md (the FULL
+    // An audio file with a sibling <fileName>.md (the FULL
     // filename, extension included) has been transcribed — shown with the
     // green indicator (TranscribedStatus = 2).
     void audioWithSiblingMd_isTranscribed_green()
@@ -231,7 +232,7 @@ private slots:
         QCOMPARE(statusOf(model, "partial.mp3"), int(VaultTreeModel::PartialStatus));
     }
 
-    // CLAUDE.md: no sibling .md yet = not transcribed — yellow indicator
+    // No sibling .md yet = not transcribed — yellow indicator
     // (UntranscribedStatus = 1).
     void audioWithoutSiblingMd_isUntranscribed_yellow()
     {
@@ -489,7 +490,7 @@ private slots:
                                   int(VaultTreeModel::TranscribedStatus), 10000);
     }
 
-    // Queue item 038: a transcript APPEARING flips status only — a row's
+    // A transcript APPEARING flips status only — a row's
     // indicator colour, never the tree's shape — so it must refresh in place
     // with dataChanged(StatusRole) and NOT reset the model (a reset drops the
     // TreeView's expansion state and scroll offset).
@@ -515,7 +516,7 @@ private slots:
                  "the status flip must arrive as a dataChanged carrying StatusRole");
     }
 
-    // Queue item 038: the mirror — a transcript DISAPPEARING (Delete transcript)
+    // The mirror — a transcript DISAPPEARING (Delete transcript)
     // is also status-only and must not reset the model.
     void transcriptDeleted_emitsDataChangedNotReset()
     {
@@ -539,7 +540,7 @@ private slots:
                  "the status flip must arrive as a dataChanged carrying StatusRole");
     }
 
-    // Queue item 038: the whole point is a STABLE QModelIndex across the flip —
+    // The whole point is a STABLE QModelIndex across the flip —
     // a QPersistentModelIndex taken before the transcript appears must survive
     // it. A model reset would invalidate it; this fails loudly if someone
     // re-adds status to sameStructure().
@@ -612,7 +613,7 @@ private slots:
     // directoryChanged echo of the same change rescans, finds the tree
     // structurally identical (the explicit rebuild already applied the removal)
     // and returns without a second reset. A transcript-only trash is NOT
-    // structural (item 038): it only flips status, refreshed in place with
+    // structural: it only flips status, refreshed in place with
     // dataChanged and no reset at all.
     void deleteTrash_resetsOnlyForStructuralChanges()
     {
@@ -637,7 +638,7 @@ private slots:
         QCOMPARE(resetSpy.count(), 1);
 
         // Transcript-only trash (b.wav flips transcribed -> untranscribed):
-        // status is content, not structure (item 038), so this refreshes the
+        // status is content, not structure, so this refreshes the
         // row in place with dataChanged and fires NO model reset.
         QVERIFY(trashTranscriptOne(model, QUrl::fromLocalFile(vault.filePath("b.wav"))));
         QCOMPARE(resetSpy.count(), 1);
@@ -652,7 +653,7 @@ private slots:
         QCOMPARE(resetSpy.count(), 2);
     }
 
-    // Queue item 021: a rename genuinely IS structural (the node's name/path
+    // A rename genuinely IS structural (the node's name/path
     // change, so sameStructure() fails), and unlike delete there is no explicit
     // synchronous rebuild — the WATCHER path is the authoritative one, and it
     // must reset exactly ONCE. This guards the direction the 021 fix could break:
@@ -1107,7 +1108,7 @@ private slots:
     }
 
     // Orphaned .md-only nodes are renameable on their own ("forgo labels"
-    // mode, Milestone 5 item 19).
+    // mode).
     void rename_handlesStandaloneOrphanedMd()
     {
         QTemporaryDir vault;
@@ -1129,7 +1130,7 @@ private slots:
         QCOMPARE(model.data(idx, roleByName(model, "isOrphanedMd")).toBool(), true);
     }
 
-    // --- createFolder / deleteFolder / moveFile (Item 40: folder management) ---
+    // --- createFolder / deleteFolder / moveFile (folder management) ---
 
     // createFolder makes a new subfolder inside a directory that's part of the
     // vault (QDir::mkpath); an empty folder stays hidden from the tree by the
@@ -1415,7 +1416,7 @@ private slots:
         QVERIFY(!folders.contains(vault.filePath(".transcriber")));
     }
 
-    // --- deleteTranscript / deleteFile (Item 2: delete transcript + file) -------
+    // --- deleteTranscript / deleteFile (delete transcript + file) -------
     // NOTE: these assert the source no longer exists AT ITS PATH IN THE VAULT —
     // the invariant that holds whether the delete trashed (recoverable, the
     // preferred path) or fell back to a permanent remove. The trash
@@ -1637,7 +1638,7 @@ private slots:
     }
 
     // The whole reason these take a list: one user action, one rescan. A batch
-    // transcript trash is status-only (item 038), so it refreshes the rows in
+    // transcript trash is status-only, so it refreshes the rows in
     // place with dataChanged and fires NO model reset — and certainly not one
     // reset per entry.
     void trashTranscript_batch_refreshesInPlace_notOncePerEntry()
@@ -2500,7 +2501,7 @@ private slots:
 
     // --- importDestinationFor (drag-and-drop import validation) ----------------
     //
-    // Item 37: the drag-and-drop import copy is now an async worker-thread job
+    // The drag-and-drop import copy is now an async worker-thread job
     // in TranscriptionController (see tst_transcription_queue's
     // importJob_* tests for the actual copy). VaultTreeModel now only owns the
     // cheap, synchronous VALIDATION half — returning the in-vault destination
@@ -2589,7 +2590,7 @@ private slots:
         QVERIFY(!error.isEmpty());
     }
 
-    // --- inspectImportCandidate (item 078: QML-readable per-candidate verdict) -
+    // --- inspectImportCandidate (QML-readable per-candidate verdict) -
     //
     // importDestinationFor() collapses every failure to "" with the message in
     // a QString* QML can't read, so the drop handler can't distinguish a name
@@ -2670,7 +2671,7 @@ private slots:
         QCOMPARE(v.value("reason").toString(), QStringLiteral("no-vault"));
     }
 
-    // --- Search support roles (Item 9: LabelRole/TagsRole/TranscriptBodyRole) --
+    // --- Search support roles (LabelRole/TagsRole/TranscriptBodyRole) --
 
     // An audio file's frontmatter label/tags are exposed via LabelRole/
     // TagsRole, read fresh from the sidecar .md rather than cached on Node.
@@ -2736,7 +2737,7 @@ private slots:
         QVERIFY(!body.contains(QStringLiteral("model:")));
     }
 
-    // Item 9's search-transcriptions behavior only ever covered TranscribedStatus
+    // The search-transcriptions behavior only ever covered TranscribedStatus
     // rows (see Sidebar.qml's original matchesSearch: "status === 2"); an
     // orphaned .md's own content is not exposed via TranscriptBodyRole, since
     // its status is OrphanedMdStatus, not TranscribedStatus.
@@ -2754,7 +2755,7 @@ private slots:
         QVERIFY(model.data(idx, roleByName(model, "transcriptBody")).toString().isEmpty());
     }
 
-    // --- Vault-scoped settings (Item 9: .transcriber/settings.json JSON file) ---
+    // --- Vault-scoped settings (.transcriber/settings.json JSON file) ---
 
     // writeVaultSettings() then readVaultSettings() round-trips arbitrary
     // key/value data through a JSON file inside the vault's hidden

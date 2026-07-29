@@ -1,4 +1,4 @@
-// Living spec: VaultSearchProxyModel — Item 9's sidebar search behavior.
+// Living spec: VaultSearchProxyModel — the sidebar search behavior.
 // Wraps VaultTreeModel to sort matches to the top of their sibling list
 // (never hiding non-matches) and expose a "matchesSearch" role that
 // propagates up through directories containing a matching descendant.
@@ -105,7 +105,7 @@ private slots:
     }
 
     // filterAcceptsRow never hides rows: a query that matches nothing still
-    // leaves every row present (Item 9 asks for "sort to top", not hiding).
+    // leaves every row present (search means "sort to top", not hiding).
     void query_neverHidesNonMatches()
     {
         QTemporaryDir vault;
@@ -231,7 +231,7 @@ private slots:
         QVERIFY(!proxy.data(findByName(proxy, "miss.mp3"), matchesRole).toBool());
     }
 
-    // Item 16/17: unlike searchQuery, tagFilter actually HIDES rows that
+    // Unlike searchQuery, tagFilter actually HIDES rows that
     // don't have every requested tag.
     void tagFilter_hidesRowsMissingAnyRequestedTag()
     {

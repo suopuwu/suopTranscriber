@@ -5,7 +5,7 @@
 // is that every path which opens a file re-populates it. That invariant is
 // exactly what regressed: refreshPreludeAndChapters()'s own doc comment claimed
 // the transcriptLoaded handler called it after a cold open; it did not, and
-// onSourceChanged/onOrphanedMdPathChanged deliberately skip it (Item P23, so a
+// onSourceChanged/onOrphanedMdPathChanged deliberately skip it (so a
 // large file's body read can't block the GUI thread). Net effect: opening a file
 // left the PREVIOUS file's chapters on screen, and a file's own stored chapters
 // never appeared until some unrelated finished()/progressChanged() happened to
@@ -426,8 +426,8 @@ int main(int argc, char *argv[])
 {
     // Offscreen + sandboxed org/app name: MainPanel.qml loads the AppSettings
     // singleton, whose Settings{} element must NEVER touch the real
-    // ~/.config/suopTranscriber (CLAUDE.md: never let testing touch the user's
-    // real vault or app config). Same setup as tst_mainpanel_chapterselection.cpp.
+    // ~/.config/suopTranscriber (tests must never touch the user's real vault
+    // or app config). Same setup as tst_mainpanel_chapterselection.cpp.
     qputenv("QT_QPA_PLATFORM", "offscreen");
     qputenv("QT_QUICK_CONTROLS_STYLE", "Basic");
     QCoreApplication::setOrganizationName(QStringLiteral("suopTranscriberTestHarness"));

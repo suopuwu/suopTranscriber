@@ -233,6 +233,7 @@ private slots:
                      "ConfirmPopup 1.0 qml/ConfirmPopup.qml\n"
                      "PlayGlyph 1.0 qml/PlayGlyph.qml\n"
                      "PauseGlyph 1.0 qml/PauseGlyph.qml\n"
+                     "MiddleDragScroll 1.0 qml/MiddleDragScroll.qml\n"
                      "BottomBar 1.0 qml/BottomBar.qml\n");
         qmldir.close();
 
@@ -369,8 +370,8 @@ int main(int argc, char *argv[])
 {
     // Offscreen + sandboxed org/app name: AppSettings.qml's Settings{} element
     // is loaded transitively by BottomBar.qml, and must never touch the real
-    // ~/.config/suopTranscriber (CLAUDE.md: never let testing touch the user's
-    // real vault or app config).
+    // ~/.config/suopTranscriber (tests must never touch the user's real
+    // vault or app config).
     qputenv("QT_QPA_PLATFORM", "offscreen");
     qputenv("QT_QUICK_CONTROLS_STYLE", "Basic");
     QCoreApplication::setOrganizationName(QStringLiteral("suopTranscriberTestHarness"));

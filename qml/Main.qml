@@ -166,7 +166,7 @@ ApplicationWindow {
     // (StyleGuide.md "Snackbars"); a copy that fails on the worker surfaces
     // as a Failed row in the Tasks popup instead. A NAME COLLISION is not
     // treated as a hard failure — it routes to a separate sticky
-    // Overwrite/Skip snackbar (item 078) instead of the plain error one.
+    // Overwrite/Skip snackbar instead of the plain error one.
     function importDroppedUrls(urls) {
         if (vaultModel.vaultPath.toString() === "") {
             Notifications.error(qsTr("Open a vault before dropping in audio files."))
@@ -207,8 +207,8 @@ ApplicationWindow {
         }
     }
 
-    // Wave D item 3: reverted to the native/portal dialog (was replaced by
-    // VaultFolderDialog.qml in Milestone 4 because its "Open" button is
+    // Reverted to the native/portal dialog (was replaced by
+    // VaultFolderDialog.qml because its "Open" button is
     // greyed out with nothing explicitly selected when browsing into a leaf
     // folder — confirmed via fresh research this session that there is no
     // portal/KDE config option to change that; it's KFileWidget's own
@@ -302,13 +302,13 @@ ApplicationWindow {
         target: vaultModel
         function onVaultPathChanged() {
             AppSettings.lastVaultPath = vaultModel.vaultPath
-            // Item 9 (Wave E): settings are vault-scoped now — load the
+            // Settings are vault-scoped now — load the
             // newly-opened vault's own .transcriber/settings.json (falling back to
             // defaults for a vault that doesn't have one yet) rather than
             // keep whatever the PREVIOUS vault had in memory.
             if (vaultModel.vaultPath.toString() !== "")
                 AppSettings.loadFromVault(vaultModel)
-            // Wave N (task system, item 1): re-queues whatever was still
+            // Re-queues whatever was still
             // Queued/Active in this vault's tasks.json when the app last
             // closed — see TranscriptionController::loadPersistedQueue()'s
             // doc comment for exactly what "resume" means here (the queue
@@ -411,7 +411,7 @@ ApplicationWindow {
         // glass) — these fillers sit only behind their divider-facing rounded
         // corners (sized/positioned in updateBlurRegions), not full-bleed,
         // so they don't sit behind the panels' own translucent bodies and
-        // defeat the blur-behind effect. Milestone 4 filled these with a
+        // defeat the blur-behind effect. These were once filled with a
         // fixed dark chrome color ("#1a1a1a") to fix a mismatched-palette-gray
         // square — but a FIXED opaque color still doesn't match either
         // panel's own (user-configurable, and possibly translucent) color —
@@ -490,7 +490,7 @@ ApplicationWindow {
                     model: vaultModel
                     transcriptionController: transcriptionController
                     vaultPath: vaultModel.vaultPath
-                    // O7: mirrors BottomBar's currentFilePath binding below —
+                    // Mirrors BottomBar's currentFilePath binding below —
                     // orphaned .md and normal audio-player views are
                     // mutually exclusive (see MainPanel's showAudioFile()/
                     // showOrphanedMd()), so exactly one of these is ever the
@@ -500,7 +500,7 @@ ApplicationWindow {
                                     ? mainPanel.player.source.toString().replace("file://", "") : "")
                     onFileActivated: (path) => mainPanel.showAudioFile(path)
                     onOrphanedMdActivated: (path) => mainPanel.showOrphanedMd(path)
-                    // Item 2 (Wave E): open the file (or orphaned .md) then
+                    // Open the file (or orphaned .md) then
                     // jump to/highlight the phrase the sidebar snippet
                     // matched on, in MainPanel's own search mechanism.
                     onTranscriptMatchActivated: (path, isOrphanedMd, query) => {

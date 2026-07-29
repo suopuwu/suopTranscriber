@@ -12,8 +12,8 @@ import SuopTranscriber
 // mapping (the bug this replaces measured y from the whole ribbon and landed
 // several rows too low).
 //
-// Deliberately `modal: false`, against the O21 convention documented in
-// BottomBar.qml. O21's argument (modal gives a real dim + a real input block)
+// Deliberately `modal: false`, against the modal-popup convention documented
+// in BottomBar.qml. Its argument (modal gives a real dim + a real input block)
 // is correct for menus and dialogs and wrong here: an autocomplete must leave
 // its own field visibly lit and still typeable. Non-modal costs the automatic
 // block-plane, which this popup doesn't want either.

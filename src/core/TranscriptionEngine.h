@@ -20,8 +20,8 @@ using ProgressCallback = std::function<void(double secondsDone, double secondsTo
 // DESIGN.md "Native callbacks"). Segment.t0/t1 are chunk-relative; the app
 // applies the offset merge, not the engine.
 using SegmentCallback = std::function<void(const Segment &segment)>;
-// Polled periodically from inside the engine's decode loop (Wave N task
-// system: pause/cancel of an in-progress transcription). Returning true
+// Polled periodically from inside the engine's decode loop (task-system
+// pause/cancel of an in-progress transcription). Returning true
 // means "stop now" — the engine bails out with whatever segments were
 // produced so far, same as if the audio simply ended there. A pause is
 // implemented by BLOCKING inside this callback (busy-checking the same

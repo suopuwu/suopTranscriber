@@ -69,14 +69,14 @@ void applyDiarizationModelFrontmatter(QStringList *frontmatterLines,
 
 void DiarizeTask::run(TaskContext &ctx)
 {
-    // Needs neither the whisper nor the label model — free them now (GPU
-    // hygiene, mirrors RelabelTask's eviction). The diar engine is also
-    // evicted unconditionally, every run — NOT reused even when the resolved
-    // models/threshold match the previous task's, so its onnxruntime CUDA
-    // arena tears down between files instead of accumulating VRAM across a
-    // batch (item 021; see EngineCache.h's class doc comment).
-    ctx.engines.evictAsr();
-    ctx.engines.evictLabel();
+    // Asr/label aren't needed here (engineNeeds()), so TaskRunner's
+    // dispatch-time residency policy already freed them before run() started.
+    // The diar engine IS declared needed — the policy leaves it alone — but
+    // it's evicted here anyway, unconditionally, every run: NOT reused even
+    // when the resolved models/threshold match the previous task's, so its
+    // onnxruntime CUDA arena tears down between files instead of
+    // accumulating VRAM across a batch (see EngineCache.h's class
+    // doc comment).
     ctx.engines.evictDiar();
 
     const QString filePath = fileUrl.toLocalFile();
@@ -157,9 +157,8 @@ void DiarizeTask::run(TaskContext &ctx)
     // An onnxruntime (or other) inference-time failure inside diarize() is
     // indistinguishable from "no speakers found" by the turns vector alone —
     // the out-param is the only signal. Detecting speakers IS this task's
-    // whole purpose, so a failure here fails the task (see item 019's
-    // decision) rather than silently stamping speakerDetection: true with
-    // zero speakers.
+    // whole purpose, so a failure here fails the task rather than silently
+    // stamping speakerDetection: true with zero speakers.
     if (inferenceFailed)
         throw TaskError(QStringLiteral("speaker detection failed (out of memory or model error) — see log"));
 

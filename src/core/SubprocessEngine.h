@@ -30,7 +30,7 @@ public:
     // manifestDir is the engine folder (the QProcess working directory, so a
     // relative `command` like ["python","run.py"] resolves). scratchBaseDir is
     // where the per-call temp WAV is written — pass a caller-owned dir (never
-    // the vault/.transcriber, per CLAUDE.md); empty means QStandardPaths'
+    // the vault/.transcriber); empty means QStandardPaths'
     // TempLocation. language is forwarded as --lang ("auto" by default).
     SubprocessEngine(EngineManifest manifest, QString manifestDir, QString scratchBaseDir = QString(),
                      QString language = QStringLiteral("auto"));

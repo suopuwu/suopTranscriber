@@ -83,8 +83,8 @@ Flow {
         objectName: "transcribeAllButton"
         iconName: "transcribe"
         tooltip: qsTr("Transcribe selected untranscribed audio")
-        // Item 3 (reworked): the ribbon always narrows to the
-        // current selection now (see refreshSelectionEligibility()) —
+        // The ribbon always narrows to the
+        // current selection (see refreshSelectionEligibility()) —
         // an empty selection means nothing to transcribe, so dim
         // like the other bulk buttons rather than silently no-op.
         enabled: sidebarRoot.transcriptionController && sidebarRoot.selectionTranscribePaths.length > 0
@@ -102,14 +102,14 @@ Flow {
         }
     }
 
-    // Wave D item 7: bulk "regenerate auto-title" mirroring
+    // Bulk "regenerate auto-title" mirroring
     // transcribeAllButton above, over already-transcribed files
     // instead of untranscribed ones.
     AppIconButton {
         id: relabelAllButton
         iconName: "relabel"
         tooltip: qsTr("Regenerate titles for selected files")
-        // Item 3 (reworked): same selection-narrowing as
+        // Same selection-narrowing as
         // transcribeAllButton above.
         enabled: sidebarRoot.transcriptionController && sidebarRoot.selectionRelabelPaths.length > 0
         onTapped: {
@@ -130,7 +130,7 @@ Flow {
         id: chaptersAllButton
         iconName: "chapters"
         tooltip: qsTr("Regenerate chapters for selected files")
-        // Item 3 (reworked): same selection-narrowing as
+        // Same selection-narrowing as
         // transcribeAllButton above.
         enabled: sidebarRoot.transcriptionController && sidebarRoot.selectionChaptersPaths.length > 0
         onTapped: {
@@ -141,7 +141,7 @@ Flow {
         }
     }
 
-    // Item 52 (CLAUDE.md per-file-action parity): bulk "detect speakers"
+    // Per-file-action parity (ribbon = bulk, MainPanel = open file): bulk "detect speakers"
     // — runs standalone diarization over the transcribed audio files
     // (same transcribedPaths eligibility relabelAllButton uses, since
     // diarization needs an existing transcript), calling
@@ -355,7 +355,7 @@ Flow {
         }
     }
 
-    // The destructive trio — CLAUDE.md per-file-action parity with
+    // The destructive trio — per-file-action parity with
     // MainPanel's deleteTranscriptButton/deleteAudioOnlyButton/
     // deleteFileButton, which had no bulk counterpart here.
     //
@@ -411,9 +411,9 @@ Flow {
         onTapped: sidebarRoot.beginDeleteFile(sidebarRoot.selectedPaths.slice())
     }
 
-    // Item 3: "N selected" indicator, only shown once a genuine
+    // "N selected" indicator, only shown once a genuine
     // multi-selection exists (2+ rows) — a single selected row is
-    // already communicated by the existing O7 "currently open"
+    // already communicated by the existing "currently open"
     // outline in the tree below, so showing "1 selected" here too
     // would be redundant. Same typography as BottomBar.qml's
     // tasksLabel (the closest existing "small status readout next

@@ -295,7 +295,7 @@ representative of every persistable kind through it, with a completeness
 tripwire that fails if a new persistable kind is added without a factory branch
 (else it would persist fine and be silently dropped on restart).
 
-**Load-bearing invariants** (the actual bug-killers, see `.task/plan.md`):
+**Load-bearing invariants** (the actual bug-killers):
 
 - **Exactly one terminal report per enqueued task.** Whether `run()` finishes,
   throws `TaskError`, or the task is cancelled *before it ever ran*, the queue
@@ -998,6 +998,12 @@ setting.
 - ffmpeg: **LGPL build** (audio-only needs nothing GPL).
 - Out-of-process engines keep any GPL-ish Python deps behind a process boundary,
   which is also a license boundary.
+
+## Dependencies
+
+Vendored submodule pins, downloaded model artifacts, the CUDA-12 compat
+wheels, and the bump procedure/lockstep rules for each live in
+[DEPENDENCIES.md](DEPENDENCIES.md), not here.
 
 ## Packaging: Flatpak is the production target
 

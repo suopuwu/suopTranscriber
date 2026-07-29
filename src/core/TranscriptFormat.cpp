@@ -196,8 +196,8 @@ QStringList parseSpeakersList(const QString &raw)
 //
 // Group map: 1 the whole timestamp expression (parsed via
 // parseCompactTimestamp, not fixed-width digit groups — the compact format's
-// shape varies), 2 the speaker tag's literal text (Item 11, Wave E —
-// optional, only present when it matches one of knownSpeakers exactly), 3
+// shape varies), 2 the speaker tag's literal text (optional, only present
+// when it matches one of knownSpeakers exactly), 3
 // text, 4 the repeat count digits from a trailing " (×N)" marker
 // (SegmentLineWriter's identical-consecutive-line merge — optional,
 // absent/1 means the line wasn't a merge), 5 legacy trailing
@@ -231,7 +231,7 @@ QRegularExpression segmentLinePattern(const QStringList &knownSpeakers)
 
 // Written immediately when a job starts, before whisper_full runs, so a
 // killed/stopped run still leaves a file recording which settings it was
-// transcribed with (see Milestone 4 Task 3 — durability, not full resume).
+// transcribed with (durability, not full resume).
 //
 // modelFallback/modelRequested are only written when ModelManager had to
 // substitute its default model for an unrecognized requestedModelId (see
@@ -279,7 +279,8 @@ QString formatSilencesValue(const std::vector<std::pair<double, double>> &silenc
 void writeFrontmatter(QFile &mdFile, const QString &modelUsed, bool speakerDetection, bool modelFallback,
                       const QString &requestedModelId, const QStringList &speakerLabels,
                       const QString &speakerDetectionError, bool vad, const QString &vadError, bool partial,
-                      const std::optional<std::vector<std::pair<double, double>>> &silences)
+                      const std::optional<std::vector<std::pair<double, double>>> &silences,
+                      const QString &corruptAudioNote)
 {
     QTextStream out(&mdFile);
     out << "---\n";
@@ -301,6 +302,8 @@ void writeFrontmatter(QFile &mdFile, const QString &modelUsed, bool speakerDetec
     // this function's doc comment in the header.
     if (silences)
         out << "silences: " << formatSilencesValue(*silences) << '\n';
+    if (!corruptAudioNote.isEmpty())
+        out << "corruptAudioNote: " << corruptAudioNote << '\n';
     out << "transcribedAt: " << QDateTime::currentDateTime().toString(Qt::ISODate) << '\n';
     if (modelFallback) {
         out << "modelRequested: " << requestedModelId << '\n';
@@ -478,8 +481,8 @@ QString plainTextFromTranscriptBody(const QString &body, const QStringList &know
     return pieces.join(QLatin1Char(' '));
 }
 
-// ParsedSegment is now declared in TranscriptionController.h (Wave N task
-// system) so a ChaptersTask can build one without duplicating the struct.
+// ParsedSegment is declared in TranscriptionController.h so a ChaptersTask
+// can build one without duplicating the struct.
 
 // A lightweight sibling to plainTextFromTranscriptBody() above — walks the
 // same segmentLinePattern().globalMatch() but keeps each segment's t0
@@ -555,7 +558,7 @@ QString formatChapterMarker(const QString &tsText, const QString &title, bool ma
     return line;
 }
 
-// Item 17 body mutators (used by TranscriptionController::editChapterMarker()).
+// Chapter-marker body mutators (used by TranscriptionController::editChapterMarker()).
 // A marker is matched by parsed-timestamp closeness rather than exact string
 // equality: formatTimestamp∘parseCompactTimestamp is identity on a stored
 // marker, but an epsilon compare is robust to any float drift in the double a

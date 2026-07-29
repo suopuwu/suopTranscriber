@@ -39,8 +39,8 @@ private slots:
 
     void partialJsonl_checkpointAppend()
     {
-        QSKIP("DESIGN.md / CLAUDE.md: after each window, append committed segments to "
-              "'.name.partial.jsonl' with the last global offset. NOT BUILT (CLAUDE.md marks it "
+        QSKIP("DESIGN.md: after each window, append committed segments to "
+              "'.name.partial.jsonl' with the last global offset. NOT BUILT (documented as "
               "'future, not yet implemented'). Current durability is coarser: frontmatter at job "
               "start + per-segment flush of the .md itself.");
     }
@@ -88,7 +88,7 @@ private slots:
 
     void vaultConfigJson_appScopedSettingsDivergence()
     {
-        QSKIP("DESIGN.md 'Vault / file layout': RESOLVED for settings (Wave E item 9) — "
+        QSKIP("DESIGN.md 'Vault / file layout': RESOLVED for settings — "
               "appearance/behavior settings now round-trip through <vault>/.transcriber/settings.json "
               "(JSON), see VaultTreeModel::readVaultSettings/writeVaultSettings and "
               "AppSettings.qml's loadFromVault/saveToVault (tested: "
@@ -103,7 +103,7 @@ private slots:
     void noRetranscription_mdPresenceMeansDone()
     {
         QSKIP("DESIGN.md 'Vault / file layout': presence of the sibling .md means done — no "
-              "retranscription. DIVERGENCE (deliberate, Milestone 3 decision): the Transcribe "
+              "retranscription. DIVERGENCE (deliberate): the Transcribe "
               "button re-runs and overwrites; only the status dot reflects .md presence. The "
               "queue does dedup concurrent requests (covered by tst_transcription_queue).");
     }
@@ -131,8 +131,9 @@ private slots:
               "inspection + live use instead of a flaky wall-clock race.");
     }
 
-    // everyFileOpIsATask: BUILT. CLAUDE.md 'Every file/vault operation is a
-    // Task' is now fully realized — file rename/move (RenameFileTask/MoveTask),
+    // everyFileOpIsATask: BUILT. The Task-system rule (DESIGN.md "Task system")
+    // that every file/vault operation is a Task is now fully realized —
+    // file rename/move (RenameFileTask/MoveTask),
     // trash/permanent-delete/restore (TrashTask/DeleteTask/RestoreTask over the
     // VaultFileScope variants), model import/export (ModelIoTask), and FOLDER
     // rename/move (FolderRenameTask/FolderMoveTask) are all instant/serial-lane
@@ -164,12 +165,12 @@ private slots:
 
     void emptyCapture_isDiscardedNotWrittenAsZeroLengthWav()
     {
-        QSKIP("Queue item 033: AudioRecorderWorker::finalizeAndStop() discards a capture that "
+        QSKIP("AudioRecorderWorker::finalizeAndStop() discards a capture that "
               "wrote zero audio bytes (m_bytesWritten == 0) — removing the 44-byte header-only "
               "file and emitting recordingFinished(\"\") instead of dropping a zero-length "
               "suopAudio_*.wav into the vault. That branch lives inside the private worker class "
               "and needs a REAL capture device to reach (open a source, stop before the first mix "
-              "tick), so it has no offline unit path — verified by the manual check in the item. "
+              "tick), so it has no offline unit path — verified by a manual check. "
               "The GUI-side synchronous state machine IS covered by "
               "tst_audiorecorder::startStopRecording_stateFlipsSynchronouslyOnTheCall.");
     }

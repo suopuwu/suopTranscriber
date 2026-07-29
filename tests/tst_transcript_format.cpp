@@ -1,4 +1,4 @@
-// Spec under test — CLAUDE.md load-bearing constraint (vault layout):
+// Spec under test — DESIGN.md "Vault / file layout" load-bearing constraint:
 //
 //   "Sibling .md = transcribed. All transcription data lives in this one
 //    human-readable file — YAML frontmatter (model, speaker detection,
@@ -177,7 +177,7 @@ private slots:
 
     // --- existingVaultTags() + its per-file cache (perf fix: UI lag) ----------
 
-    // Item 17: existingVaultTags() is the vault-wide tag vocabulary behind the
+    // existingVaultTags() is the vault-wide tag vocabulary behind the
     // sidebar's tag autocomplete. Sidebar.qml's tagSuggestions() calls it from
     // a BINDING, so it re-runs on every keystroke in the tag filter — and the
     // underlying scan (collectVaultTags) walks every .md in the vault. It is
@@ -230,7 +230,7 @@ private slots:
                  (QStringList{QStringLiteral("banana"), QStringLiteral("quokka")}));
     }
 
-    // Queue item 045: existingVaultSpeakers() is the speaker equivalent of
+    // existingVaultSpeakers() is the speaker equivalent of
     // existingVaultTags() over the `speakers:` frontmatter key — deduped,
     // case-insensitively sorted, cache-served on the second call, and it
     // survives in-place vault edits.
@@ -265,7 +265,7 @@ private slots:
                  (QStringList{QStringLiteral("Bob"), QStringLiteral("carol"), QStringLiteral("Dave")}));
     }
 
-    // Queue item 045: the tags and speakers scans use SEPARATE per-key caches,
+    // The tags and speakers scans use SEPARATE per-key caches,
     // so a vault whose files carry BOTH keys must return each key's own values
     // regardless of the order the two scans run in — a single shared path-keyed
     // cache would hand the second scan the first scan's answer.
@@ -425,7 +425,7 @@ private slots:
         QVERIFY(body.contains(QStringLiteral("[00:00:11.000 - 00:00:14.500] And another speaker. [SPEAKER_TURN]")));
     }
 
-    // DESIGN.md/CLAUDE.md "Sentence highlighting": parseSentences() turns the
+    // DESIGN.md "Sentence highlighting": parseSentences() turns the
     // segment lines back into {t0, text} — the structured form the
     // playback-highlight binary search needs. Timestamps round-trip exactly
     // (parseTimestamp is the literal inverse of formatTimestamp), and the
@@ -465,12 +465,12 @@ private slots:
 
         // Legacy fixture (no leading "[Speaker N]" tag) parses with an empty
         // speaker string for every sentence — old already-transcribed files
-        // must not crash or misparse under the new (Item 11, Wave E) regex.
+        // must not crash or misparse under the new regex.
         QCOMPARE(s0.value("speaker").toString(), QString());
         QCOMPARE(s1.value("speaker").toString(), QString());
     }
 
-    // Item 11 (Wave E): a leading "[Speaker N]" tag (written when speaker
+    // A leading "[Speaker N]" tag (written when speaker
     // detection is on) is parsed into each sentence's "speaker" field
     // verbatim (the literal tag text, not translated through any lookup —
     // see the 2026-07-07 rewrite) and stripped from the parsed text,
@@ -828,7 +828,7 @@ private slots:
         QCOMPARE(controller.activeSentenceIndex(twoHeadings, 0.5), -1);
     }
 
-    // Queue item 054: a COLLAPSED chapter's heading is the only visible line for
+    // A COLLAPSED chapter's heading is the only visible line for
     // that chapter (its body is dropped from displaySentences), so playback
     // inside its time range must hold the highlight ON the heading rather than
     // walking back to the previous chapter's last line.
@@ -883,7 +883,7 @@ private slots:
         QCOMPARE(controller.activeSentenceIndex(leading, 0.0), 0);
         QCOMPARE(controller.activeSentenceIndex(leading, 3.0), 0);
 
-        // Item 077: a collapsed chapter OPENS the transcript at t0 > 0 (its real
+        // A collapsed chapter OPENS the transcript at t0 > 0 (its real
         // marker is a hair into the file — lead-in silence — even though the
         // gutter floors it to "0:00"). Before playback reaches that t0, the
         // highlight must STILL rest on the collapsed heading, not fall through
@@ -898,7 +898,7 @@ private slots:
 
         // Contrast: an EXPANDED chapter opening the transcript at t0 > 0 still
         // yields -1 before its marker (the QML front-edge clamp then lights the
-        // first real sentence, per item 010) — proves the fix keys strictly on
+        // first real sentence) — proves the fix keys strictly on
         // the `collapsed` flag, not merely on a leading heading.
         QVariantList leadingExpandedGap;
         leadingExpandedGap.append(heading(0.5));
@@ -907,7 +907,7 @@ private slots:
         QCOMPARE(controller.activeSentenceIndex(leadingExpandedGap, 0.4), -1);
     }
 
-    // Silence phase 3 (queue item 085): the between-segment divider is
+    // Silence phase 3: the between-segment divider is
     // ANOTHER zero-length pseudo-entry interleaved into displaySentences
     // (isSilenceMarker), same treatment as a chapter heading — the
     // sentence-level playback highlight must never land on it, and (unlike a
@@ -1215,7 +1215,7 @@ private slots:
                  "a present-but-empty silence list must still write an (empty-valued) silences: key");
     }
 
-    // The upsertKey() contract (CLAUDE.md; also what DetectSilenceTask's
+    // The upsertKey() contract (what DetectSilenceTask's
     // in-place backfill relies on): adding "silences:" to an ALREADY-WRITTEN
     // .md must leave every OTHER frontmatter key and the entire body
     // byte-for-byte untouched — same guarantee applyDiarizationModelFrontmatter()
@@ -1264,7 +1264,7 @@ private slots:
         QCOMPARE(newBody, body);
     }
 
-    // Silence phase 2 (queue item 084): parseSilences() is formatSilencesValue()'s
+    // Silence phase 2: parseSilences() is formatSilencesValue()'s
     // inverse, turning the compact "start-end, start-end" frontmatter value
     // back into the {t0, t1} map list nextSilenceSkipTarget() below consumes.
     void parseSilences_roundTripsCompactFormatAndHandlesEmpty()
@@ -1285,10 +1285,10 @@ private slots:
         QVERIFY(controller.parseSilences(QStringLiteral("   ")).isEmpty());
     }
 
-    // Silence phase 2 (queue item 084): nextSilenceSkipTarget() is a PURE
+    // Silence phase 2: nextSilenceSkipTarget() is a PURE
     // lookup over already-parsed spans — this is what makes the threshold a
-    // UI filter rather than a re-analysis trigger. Covers every case the
-    // work order calls out: a gap below threshold is NOT skipped; a position
+    // UI filter rather than a re-analysis trigger. Covers the
+    // key cases: a gap below threshold is NOT skipped; a position
     // inside a >=threshold span returns its end; a position outside any span
     // returns the -1 sentinel; and changing ONLY the threshold (same spans,
     // same position) flips the outcome with nothing re-derived.
@@ -2235,7 +2235,7 @@ private slots:
         QVERIFY2(!meta.value("tags").toString().isEmpty(), "auto-label must populate tags");
     }
 
-    // Item 9: "regenerate auto-title" — relabel() re-runs ONLY the labeling
+    // "regenerate auto-title" — relabel() re-runs ONLY the labeling
     // pass on an already-transcribed file (no re-transcription) and, unlike
     // a fresh transcribe's autoLabel pass (which only ever appends, since
     // those keys can't already exist), must REPLACE existing label/prelude/
@@ -2306,7 +2306,7 @@ private slots:
         QCOMPARE(controller.readTranscriptBody(audioUrl), bodyBeforeRelabel);
     }
 
-    // Item 14 "auto-categorize" mode, full pipeline: with restrictTagsToExisting,
+    // "Auto-categorize" mode, full pipeline: with restrictTagsToExisting,
     // relabel() must scan the REST OF THE VAULT for existing tags (not just
     // the file being labeled — it has none of its own yet) and constrain
     // generation to that vocabulary. Exercises the actual vault-scanning
@@ -2382,7 +2382,7 @@ private slots:
         }
     }
 
-    // Queue item 027: a benchmark / diarization-sweep that fails in run()
+    // A benchmark / diarization-sweep that fails in run()
     // (here: a non-decodable file → BenchmarkTask/DiarizationSweepTask throw
     // before emitting their run-finished summary) MUST route the failure to
     // benchmarkFailed, so the Benchmark page leaves its "Running…" state and

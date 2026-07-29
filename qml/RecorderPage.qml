@@ -17,9 +17,9 @@ Item {
     property VaultTreeModel vaultTreeModel
     signal openVaultRequested()
 
-    // Recorder page's live duration counter — audioRecorder.elapsedMs is
-    // wall-clock ms since capture actually began (see AudioRecorder.h). Its own
-    // copy of MainPanel.formatDuration (a tiny pure formatter) — cheaper than a
+    // Recorder page's duration counter — fed takeDurationMs, not the shared
+    // capture clock (see that property). Its own copy of
+    // MainPanel.formatDuration (a tiny pure formatter) — cheaper than a
     // shared-util dependency for one call site.
     function formatDuration(ms) {
         const totalSeconds = Math.floor(ms / 1000)
@@ -30,6 +30,19 @@ Item {
 
     property bool useMic: true
     property bool useSystemAudio: false
+    // Top of every source's gain range, as a multiplier — one number so the
+    // three sliders and the three percent fields can't disagree about where
+    // "full" is. 4x because the useful correction for a quiet source (a laptop
+    // mic, an app turned down in the mixer) is a boost, and 2x often wasn't
+    // enough of one; the mix clamps at 16-bit either way (see mixPcm16N).
+    readonly property real maxSourceGain: 4.0
+    // Top of what can be TYPED into a percent readout, which is deliberately
+    // higher than the slider's: the drag range is a comfort range (unity a
+    // quarter along), while a source that needs more than 4x is a real case
+    // the number field is the only way to reach. The slider pins at its own
+    // top while the value is above it, and dragging it drops back into
+    // 0-400% — the number is the authority, not the handle position.
+    readonly property real maxTypedGain: 20.0
     // Test mode: the next take goes to a temp directory instead of the vault
     // (see AudioRecorderIO::buildTestOutputFilePath()), for checking levels
     // without leaving real audio files in the tree. Session-only — a mode you
@@ -139,8 +152,8 @@ Item {
     // the Connections block below) for the scrolling waveform Canvas, oldest
     // first, capped at ~100 (see waveformCanvas below). AppSettings.
     // animationsEnabled off collapses this to a single-element "static
-    // level" array instead of a scrolling history (CLAUDE.md/this
-    // app's convention: that flag kills continuous-update CPU/GPU work).
+    // level" array instead of a scrolling history (this app's
+    // convention: that flag kills continuous-update CPU/GPU work).
     property var levelSamples: []
 
     // Absolute path of the most recent finished recording, for the in-page
@@ -156,6 +169,29 @@ Item {
     // kLevelUpdateIntervalMs AND a mix actually happened", so ticks are not
     // evenly spaced and index*75ms would drift the playhead against the audio.
     property var recordedLevels: []
+
+    // True when `ms` opens a NEW capture session rather than continuing
+    // `history`'s. The capture clock (AudioRecorderWorker::m_elapsed) is
+    // monotonic WITHIN a graph and restarts at 0 with every graph, so a tick
+    // that fails to advance it is proof the graph changed — which is exactly
+    // what a tick still in flight when a take supersedes monitoring looks
+    // like. It has to be caught here: recordedLevels/monitorLevels are the
+    // waveform's x-axis, and WaveformBar both binary-searches it and walks it
+    // as a fill polygon, so one out-of-order entry self-intersects the
+    // outline and leaves an unfilled wedge. Pure, and the unit under test —
+    // same shape as WaveformBar.windowStartFor().
+    function isNewCaptureEpoch(history, ms) {
+        return history.length > 0 && ms <= history[history.length - 1].ms
+    }
+
+    // The same {ms, level} pairs for the MONITOR preview, kept strictly apart
+    // from recordedLevels: monitoring resumes the moment a take ends, and a
+    // monitor session restarts elapsedMs at 0, so appending its ticks to the
+    // take's history would run that x-axis backwards (WaveformBar binary-
+    // searches it). Oldest dropped rather than halved — this only ever feeds a
+    // live 30s window, where old samples are off-screen, whereas the take
+    // history's axis has to keep matching the file.
+    property var monitorLevels: []
 
     // Rolling peak DISPLAY level per capture source, keyed "<kind>:<id>" (the
     // same key sourcePeakKey() builds from an audioRecorder.sourceLevels
@@ -179,6 +215,26 @@ Item {
     // clock restarts with each capture, so a stale hold would pin a peak from
     // the previous run.
     property var sourcePeakHoldUntil: ({})
+
+    // Length of the take now running, or of the last one that finished — NOT
+    // the capture session's clock. audioRecorder.elapsedMs is shared with
+    // monitoring, which runs from the moment the page opens and restarts at 0
+    // after every take, so a readout bound straight to it counted up while the
+    // recorder sat idle. Frozen at the finished take's length rather than
+    // zeroed: after Stop, the number beside the waveform should say how long
+    // the thing under review is.
+    property int lastTakeMs: 0
+    // Just lastTakeMs — not a live ternary reading audioRecorder.elapsedMs
+    // while recording. elapsedMs is a cached field the worker only refreshes
+    // on the NEXT tick (AudioRecorder::startRecording() flips `recording`
+    // synchronously but posts the worker's restart across the thread
+    // boundary), so right at the tap that starts a new take it can still hold
+    // the PREVIOUS session's value for one tick's worth of time. onLevelUpdated
+    // keeps lastTakeMs caught up every tick during a take, and the Record
+    // button zeroes it before that same tap starts the worker — reading it
+    // directly is what makes "a new take starts a new clock" true at the tap,
+    // not one tick later.
+    readonly property int takeDurationMs: recorderPage.lastTakeMs
 
     // elapsedMs at which the CURRENT unbroken run of silence began, or -1 if
     // the last tick had signal. A start MARK rather than a running total: a
@@ -220,6 +276,19 @@ Item {
             return "\u2014"
         const db = recorderPage.audioRecorder.dbFromDisplayLevel(displayLevel)
         return Math.round(db) + " dB"
+    }
+
+    // The one tooltip every peak readout shares. The ideal range is READ back
+    // from the shared band rule rather than typed, so the numbers it names can
+    // never disagree with the colour the readout beside them is painted.
+    readonly property string peakTooltip: {
+        const base = qsTr("Rolling peak over the last 3s, in dBFS (0 = full scale) \u2014 match this across sources to equalize them.")
+        const rec = recorderPage.audioRecorder
+        if (!rec)
+            return base
+        const good = Math.round(rec.dbFromDisplayLevel(rec.levelBandGoodFloor()))
+        const hot = Math.round(rec.dbFromDisplayLevel(rec.levelBandHotFloor()))
+        return base + " " + qsTr("While speaking, aim for %1 to %2 dB \u2014 below that is too quiet to equalize, above it clips.").arg(good).arg(hot)
     }
 
     function sourcePeakFor(kind, id) {
@@ -384,6 +453,18 @@ Item {
     readonly property bool capturing: recorderPage.audioRecorder
         ? (recorderPage.audioRecorder.recording || recorderPage.audioRecorder.monitoring)
         : false
+    // A finished take owns the waveform frame even though the meters are live
+    // again. Keyed on the captured history rather than lastRecordingPath:
+    // that path only lands when the worker finishes finalizing (parec kill +
+    // up to a 1s waitForFinished after the button flips), and the frame must
+    // not flicker through a live monitor wave in between.
+    readonly property bool reviewing: recorderPage.recordedLevels.length > 0
+        && !(recorderPage.audioRecorder && recorderPage.audioRecorder.recording)
+    // What the waveform is: a live scroll, or the take under review.
+    readonly property bool waveformLive: recorderPage.capturing && !recorderPage.reviewing
+    readonly property var waveformSamples:
+        (recorderPage.reviewing || (recorderPage.audioRecorder && recorderPage.audioRecorder.recording))
+        ? recorderPage.recordedLevels : recorderPage.monitorLevels
 
     // Makes the live capture match the armed set, whatever changed. Toggling a
     // source used to only repaint: `useMic`/`useSystemAudio` were read once, at
@@ -402,6 +483,24 @@ Item {
             recorderPage.reconcileAppSources()
         }
         recorderPage.updateMonitoring()
+    }
+
+    // The reader beside setAppGain()'s writer: the row's slider and its percent
+    // field must resolve the same number, and the field can't go through the
+    // slider (a Slider clamps value to `to`, which would hide a typed gain
+    // above maxSourceGain).
+    function appGainFor(name) {
+        const gain = AppSettings.recordingAppGains[name]
+        return gain !== undefined ? gain : 1.0
+    }
+
+    // One writer for the per-app gain map, shared by that row's slider and its
+    // percent field. Whole-map reassignment is what AppSettings notifies on —
+    // mutating recordingAppGains[name] in place changes nothing anyone sees.
+    function setAppGain(name, gain) {
+        let gains = Object.assign({}, AppSettings.recordingAppGains)
+        gains[name] = gain
+        AppSettings.recordingAppGains = gains
     }
 
     // Drops whatever is capturing but no longer armed, then upserts everything
@@ -437,6 +536,15 @@ Item {
                       || recorderPage.enabledAppCaptureSources().length > 0
         const want = recorderPage.visible && armed
         if (want && !rec.monitoring) {
+            // A new capture session restarts elapsedMs at 0, and the peak
+            // holds and preview history are both stamped on that clock — carry
+            // them across and a peak from the last take stays pinned until the
+            // new session catches up. The same reset the Record button does,
+            // minus recordedLevels: that belongs to the take now under review.
+            recorderPage.sourcePeaks = ({})
+            recorderPage.sourcePeakHoldUntil = ({})
+            recorderPage.sourceLevelsByKey = ({})
+            recorderPage.monitorLevels = []
             rec.startMonitoring(recorderPage.useMic, recorderPage.selectedMicId,
                                 recorderPage.useSystemAudio, AppSettings.recordingMicGain,
                                 AppSettings.recordingSystemGain, recorderPage.selectedSystemSourceId,
@@ -483,6 +591,14 @@ Item {
     // it was the error currently showing.
     Connections {
         target: recorderPage.audioRecorder
+        // startRecording() tears monitoring down and nothing restarted it, so
+        // every meter on the page sat dead from the moment a take ended until
+        // the user happened to toggle a source. updateMonitoring() is
+        // idempotent and early-returns while a take runs, so one handler
+        // covers the take-ended, start-rejected and worker-auto-stopped paths
+        // alike. Safe to run inside this emit only because stopRecording()
+        // posts the worker teardown first — see its comment.
+        function onRecordingChanged() { recorderPage.updateMonitoring() }
         function onRecordingFinished(filePath) {
             // An empty path means the capture wrote nothing and the file was
             // discarded (see AudioRecorder::recordingFinished) — leave the
@@ -493,6 +609,12 @@ Item {
             recorderPlayer.source = "file://" + filePath
         }
         function onLevelUpdated() {
+            // Only a take advances the readout. Monitor ticks carry the same
+            // elapsedMs (see takeDurationMs) and must leave the finished take's
+            // length standing.
+            if (recorderPage.audioRecorder.recording)
+                recorderPage.lastTakeMs = recorderPage.audioRecorder.elapsedMs
+
             // Mapped to a display level HERE, once per tick, not per-point
             // in onPaint — see AudioRecorderIO::displayLevelFromRms() for
             // why raw RMS is unusable as a pixel coordinate.
@@ -519,14 +641,32 @@ Item {
             // and the canvas can only draw ~width columns anyway. 12000
             // entries is roughly 15 minutes at ~13 ticks/second before the
             // first halving.
-            const history = recorderPage.recordedLevels.slice()
-            history.push({ ms: recorderPage.audioRecorder.elapsedMs, level: level })
-            if (history.length > 12000)
-                recorderPage.recordedLevels = history.filter((_, i) => i % 2 === 0)
-            else
-                recorderPage.recordedLevels = history
-
-            waveformCanvas.requestPaint()
+            const captureMs = recorderPage.audioRecorder.elapsedMs
+            if (recorderPage.audioRecorder.recording) {
+                if (recorderPage.isNewCaptureEpoch(recorderPage.recordedLevels, captureMs)) {
+                    recorderPage.recordedLevels = [{ ms: captureMs, level: level }]
+                } else {
+                    const history = recorderPage.recordedLevels.slice()
+                    history.push({ ms: captureMs, level: level })
+                    if (history.length > 12000)
+                        recorderPage.recordedLevels = history.filter((_, i) => i % 2 === 0)
+                    else
+                        recorderPage.recordedLevels = history
+                }
+            } else {
+                // Monitoring: preview only, and it must never reach the take's
+                // history. ~2 minutes at ~13 ticks/second, four times the 30s
+                // the bar actually draws.
+                if (recorderPage.isNewCaptureEpoch(recorderPage.monitorLevels, captureMs)) {
+                    recorderPage.monitorLevels = [{ ms: captureMs, level: level }]
+                } else {
+                    const preview = recorderPage.monitorLevels.slice()
+                    preview.push({ ms: captureMs, level: level })
+                    if (preview.length > 1600)
+                        preview.shift()
+                    recorderPage.monitorLevels = preview
+                }
+            }
 
             // Whole-map reassignment, like AppSettings.recordingAppGains:
             // QML does not signal on in-place mutation of a var-held object.
@@ -554,16 +694,6 @@ Item {
             // forward would leave a meter frozen mid-groove.
             recorderPage.sourceLevelsByKey = levels
         }
-    }
-
-    // The playhead is drawn inside waveformCanvas's onPaint, so it only moves
-    // when something asks for a repaint; QMediaPlayer's positionChanged fires
-    // at its own ~50-100ms cadence, which is exactly the right rate.
-    Connections {
-        target: recorderPlayer
-        function onPositionChanged() { waveformCanvas.requestPaint() }
-        function onDurationChanged() { waveformCanvas.requestPaint() }
-        function onPlayingChanged() { waveformCanvas.requestPaint() }
     }
 
     // No vault open: don't let the user configure mic/folder pickers
@@ -641,6 +771,7 @@ Item {
                             recorderPage.sourcePeakHoldUntil = ({})
                             recorderPage.sourceLevelsByKey = ({})
                                 recorderPage.recordedLevels = []
+                                recorderPage.lastTakeMs = 0
                                 recorderPlayer.pause()
                                 recorderPage.audioRecorder.startRecording(
                                     recorderPage.vaultPath, AppSettings.recordingOutputFolder,
@@ -793,7 +924,8 @@ Item {
 
                 Label {
                     id: recordingDurationLabel
-                    text: recorderPage.formatDuration(recorderPage.audioRecorder ? recorderPage.audioRecorder.elapsedMs : 0)
+                    objectName: "recordingDurationLabel"
+                    text: recorderPage.formatDuration(recorderPage.takeDurationMs)
                     color: "white"
                     font.pixelSize: 16
                 }
@@ -869,135 +1001,43 @@ Item {
                 }
             }
 
-            // Scrolling waveform/level indicator — mirrors playPauseIcon's
-            // Canvas idiom above (getContext("2d")/onPaint), fed from
-            // recorderPage.levelSamples (pushed on each throttled
-            // levelUpdated tick, see the Connections block above).
-            Canvas {
+            // Time-windowed waveform + interactive playhead — see
+            // WaveformBar.qml's doc comment for why it's windowed rather than
+            // squashing the whole take into one frame.
+            WaveformBar {
                 id: waveformCanvas
+                objectName: "waveformBar"
                 Layout.fillWidth: true
                 Layout.preferredHeight: 80
 
-                onWidthChanged: requestPaint()
-                onHeightChanged: requestPaint()
-                // MainPanel builds RecorderPage eagerly with visible bound to
-                // the recorder screen being open, so this Canvas is created
-                // while its ancestor is hidden. `visible` here is EFFECTIVE
-                // visibility, so this fires when the page is opened — without
-                // it the empty frame's first paint depends on a size change
-                // landing at a renderable moment.
-                onVisibleChanged: if (waveformCanvas.visible) waveformCanvas.requestPaint()
+                // Live while the capture graph is running (a take OR merely
+                // monitoring — elapsedMs advances for both, see AudioRecorder's
+                // shared worker start), EXCEPT once a finished take is under
+                // review: monitoring resumes the instant a take ends, and
+                // `capturing` alone would throw that take's playhead away.
+                live: recorderPage.waveformLive
+                samples: recorderPage.waveformSamples
+                windowMs: 30000
+                waveStyle: AppSettings.recordingWaveformStyle
+                mirrored: AppSettings.recordingWaveformMirrored
+                positionMs: recorderPage.waveformLive
+                            ? (recorderPage.audioRecorder ? recorderPage.audioRecorder.elapsedMs : 0)
+                            : recorderPlayer.position
+                durationMs: recorderPage.waveformLive
+                            ? (recorderPage.audioRecorder ? recorderPage.audioRecorder.elapsedMs : 0)
+                            : recorderPlayer.duration
+                // Static bar at the last-known level — no scrolling history —
+                // while animations are off (that flag kills
+                // continuous-update CPU/GPU work app-wide).
+                staticLevel: AppSettings.animationsEnabled ? -1
+                             : (recorderPage.levelSamples.length > 0
+                                ? recorderPage.levelSamples[recorderPage.levelSamples.length - 1] : -1)
 
-                onPaint: {
-                    const ctx = getContext("2d")
-                    ctx.reset()
-
-                    // Frame FIRST, wave second. Every level path below returns
-                    // early (no samples yet, animations off, review mode), so
-                    // anything drawn after them is skipped in exactly the
-                    // states where the empty frame is the only thing there is
-                    // to see. Inset by half a pixel so the 1px stroke lands on
-                    // whole pixels instead of straddling the canvas edge.
-                    const frameRadius = AppSettings.borderRadius
-                    ctx.beginPath()
-                    ctx.roundedRect(0.5, 0.5, width - 1, height - 1, frameRadius, frameRadius)
-                    // Darker than the page behind it (mainBackgroundColor) so
-                    // the display reads as an inset screen — but it is the
-                    // outline, not this fill, that makes it visible at rest.
-                    ctx.fillStyle = "#1a1a1a"
-                    ctx.fill()
-                    ctx.lineWidth = 1
-                    // The same dim outline an unselected, unhovered source
-                    // toggle wears — a full-white frame read as an active
-                    // element rather than a container.
-                    ctx.strokeStyle = Theme.borderStrong
-                    ctx.stroke()
-
-                    // Clip strictly INSIDE the stroke: a full-scale wave spans
-                    // the whole height at the left/right edges and would
-                    // otherwise paint over the outline and out through the
-                    // rounded corners.
-                    const innerRadius = Math.max(0, frameRadius - 1)
-                    ctx.beginPath()
-                    ctx.roundedRect(1, 1, width - 2, height - 2, innerRadius, innerRadius)
-                    ctx.clip()
-
-                    const samples = recorderPage.levelSamples
-                    if (samples.length === 0)
-                        return
-
-                    // Mirrored about the vertical centre — a soundwave, not a
-                    // baseline-anchored graph. Doubles the visible excursion
-                    // for the same level and reads as audio rather than as a
-                    // line chart.
-                    const mid = height / 2
-
-                    // Review mode: not capturing, and a finished take's whole
-                    // level history is in hand. Plots the ENTIRE recording
-                    // across the canvas width with a playhead, instead of the
-                    // live 100-sample scrolling window — the playhead only
-                    // means anything against a fixed, whole-file x-axis.
-                    if (!recorderPage.audioRecorder.recording && recorderPage.recordedLevels.length > 0) {
-                        const history = recorderPage.recordedLevels
-                        const span = Math.max(1, history[history.length - 1].ms)
-                        ctx.beginPath()
-                        for (let i = 0; i < history.length; i++) {
-                            const x = width * history[i].ms / span
-                            const y = mid - history[i].level * mid
-                            if (i === 0)
-                                ctx.moveTo(x, y)
-                            else
-                                ctx.lineTo(x, y)
-                        }
-                        for (let i = history.length - 1; i >= 0; i--)
-                            ctx.lineTo(width * history[i].ms / span, mid + history[i].level * mid)
-                        ctx.closePath()
-                        ctx.fillStyle = "#6fdf9f"
-                        ctx.fill()
-
-                        // The playhead. Positioned off the PLAYER's own clock
-                        // against the player's own duration — never against
-                        // `span` (the recorder's elapsed ms), which is the
-                        // wall clock at the last level tick and runs a few
-                        // hundred ms past the file's real end.
-                        if (recorderPlayer.duration > 0) {
-                            const playX = width * recorderPlayer.position / recorderPlayer.duration
-                            ctx.fillStyle = "#e07a7a"
-                            ctx.fillRect(playX, 0, 2, height)
-                        }
-                        return
-                    }
-
-                    if (!AppSettings.animationsEnabled) {
-                        // Static bar at the last-known level — no scrolling
-                        // history while animations are off.
-                        const half = samples[samples.length - 1] * mid
-                        ctx.fillStyle = "#6fdf9f"
-                        ctx.fillRect(0, mid - half, width, half * 2)
-                        return
-                    }
-
-                    const maxSamples = 100
-                    const stepX = width / Math.max(1, maxSamples - 1)
-                    ctx.beginPath()
-                    for (let i = 0; i < samples.length; i++) {
-                        const x = width - (samples.length - i) * stepX
-                        const y = mid - samples[i] * mid
-                        if (i === 0)
-                            ctx.moveTo(x, y)
-                        else
-                            ctx.lineTo(x, y)
-                    }
-                    // ...and back along the mirrored bottom edge to close the
-                    // filled body.
-                    for (let i = samples.length - 1; i >= 0; i--) {
-                        const x = width - (samples.length - i) * stepX
-                        ctx.lineTo(x, mid + samples[i] * mid)
-                    }
-                    ctx.closePath()
-                    ctx.fillStyle = "#6fdf9f"
-                    ctx.fill()
-                }
+                interactive: true
+                // AudioPlayer's `position` is a writable Q_PROPERTY
+                // (AudioPlayer.h:17, READ position WRITE setPosition), so the
+                // seek is a plain assignment — no extra C++ needed.
+                onSeekRequested: ms => recorderPlayer.position = ms
             }
 
             // Shared warning banner (StyleGuide.md "Warning banners"): shows
@@ -1114,7 +1154,7 @@ Item {
                     enabled: recorderPage.useMic
                     hoverEnabled: true
                     from: 0.0
-                    to: 2.0
+                    to: recorderPage.maxSourceGain
                     value: AppSettings.recordingMicGain
                     onMoved: AppSettings.recordingMicGain = value
 
@@ -1124,16 +1164,16 @@ Item {
                     }
                 }
 
-                Label {
-                    id: micGainPercentLabel
-                    // Fixed, not implicit: an implicitly-sized readout grows
-                    // from "0%" to "200%" as the user drags and shortens the
-                    // slider under their cursor.
-                    Layout.preferredWidth: 44
-                    horizontalAlignment: Text.AlignRight
-                    text: Math.round(micGainSlider.value * 100) + "%"
-                    color: micGainSlider.enabled ? Theme.textPrimary : Theme.textMuted
-                    font.pixelSize: 11
+                GainPercentField {
+                    id: micGainPercentField
+                    objectName: "micGainPercentField"
+                    enabled: micGainSlider.enabled
+                    // The setting, NOT micGainSlider.value: a Slider clamps
+                    // its value to `to`, so reading the handle would redisplay
+                    // an above-ceiling gain as 400%.
+                    gain: AppSettings.recordingMicGain
+                    maxGain: recorderPage.maxTypedGain
+                    onGainEdited: g => AppSettings.recordingMicGain = g
                 }
 
                 Label {
@@ -1149,7 +1189,7 @@ Item {
                            : Theme.textMuted
                     font.pixelSize: 11
                     ToolTip.visible: micPeakHover.hovered
-                    ToolTip.text: qsTr("Rolling peak over the last 3s, in dBFS (0 = full scale) — match this across sources to equalize them")
+                    ToolTip.text: recorderPage.peakTooltip
                     ToolTip.delay: 500
                     HoverHandler { id: micPeakHover }
                 }
@@ -1257,7 +1297,7 @@ Item {
                     enabled: recorderPage.useSystemAudio
                     hoverEnabled: true
                     from: 0.0
-                    to: 2.0
+                    to: recorderPage.maxSourceGain
                     value: AppSettings.recordingSystemGain
                     onMoved: AppSettings.recordingSystemGain = value
 
@@ -1267,16 +1307,13 @@ Item {
                     }
                 }
 
-                Label {
-                    id: systemGainPercentLabel
-                    // Fixed, not implicit: an implicitly-sized readout grows
-                    // from "0%" to "200%" as the user drags and shortens the
-                    // slider under their cursor.
-                    Layout.preferredWidth: 44
-                    horizontalAlignment: Text.AlignRight
-                    text: Math.round(systemGainSlider.value * 100) + "%"
-                    color: systemGainSlider.enabled ? Theme.textPrimary : Theme.textMuted
-                    font.pixelSize: 11
+                GainPercentField {
+                    id: systemGainPercentField
+                    objectName: "systemGainPercentField"
+                    enabled: systemGainSlider.enabled
+                    gain: AppSettings.recordingSystemGain
+                    maxGain: recorderPage.maxTypedGain
+                    onGainEdited: g => AppSettings.recordingSystemGain = g
                 }
 
                 Label {
@@ -1292,7 +1329,7 @@ Item {
                            : Theme.textMuted
                     font.pixelSize: 11
                     ToolTip.visible: systemPeakHover.hovered
-                    ToolTip.text: qsTr("Rolling peak over the last 3s, in dBFS (0 = full scale) — match this across sources to equalize them")
+                    ToolTip.text: recorderPage.peakTooltip
                     ToolTip.delay: 500
                     HoverHandler { id: systemPeakHover }
                 }
@@ -1488,14 +1525,9 @@ Item {
                             peakColor: recorderPage.bandColor(peak)
                             metering: recorderPage.capturing
                             from: 0.0
-                            to: 2.0
-                            value: AppSettings.recordingAppGains[modelData.name] !== undefined
-                                   ? AppSettings.recordingAppGains[modelData.name] : 1.0
-                            onMoved: {
-                                let g = Object.assign({}, AppSettings.recordingAppGains)
-                                g[modelData.name] = value
-                                AppSettings.recordingAppGains = g
-                            }
+                            to: recorderPage.maxSourceGain
+                            value: recorderPage.appGainFor(modelData.name)
+                            onMoved: recorderPage.setAppGain(modelData.name, value)
 
                             HoverHandler {
                                 cursorShape: Qt.PointingHandCursor
@@ -1503,16 +1535,13 @@ Item {
                             }
                         }
 
-                        Label {
-                            id: appCaptureGainPercentLabel
-                            // Fixed, not implicit: an implicitly-sized readout
-                            // grows from "0%" to "200%" as the user drags and
-                            // shortens the slider under their cursor.
-                            Layout.preferredWidth: 44
-                            horizontalAlignment: Text.AlignRight
-                            text: Math.round(appCaptureGainSlider.value * 100) + "%"
-                            color: appCaptureGainSlider.enabled ? Theme.textPrimary : Theme.textMuted
-                            font.pixelSize: 11
+                        GainPercentField {
+                            id: appCaptureGainPercentField
+                            objectName: "appCaptureGainPercentField"
+                            enabled: appCaptureGainSlider.enabled
+                            gain: recorderPage.appGainFor(modelData.name)
+                            maxGain: recorderPage.maxTypedGain
+                            onGainEdited: g => recorderPage.setAppGain(modelData.name, g)
                         }
 
                         Label {
@@ -1529,7 +1558,7 @@ Item {
                                    : Theme.textMuted
                             font.pixelSize: 11
                             ToolTip.visible: appCapturePeakHover.hovered
-                            ToolTip.text: qsTr("Rolling peak over the last 3s, in dBFS (0 = full scale) — match this across sources to equalize them")
+                            ToolTip.text: recorderPage.peakTooltip
                             ToolTip.delay: 500
                             HoverHandler { id: appCapturePeakHover }
                         }

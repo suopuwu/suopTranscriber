@@ -1,4 +1,4 @@
-// Living spec (queue item 028): opening a file from the sidebar (or the bottom
+// Living spec: opening a file from the sidebar (or the bottom
 // bar) must drop out of ANY open top-level screen — the recorder, the USB
 // grabber, or the benchmark page. Every file-open funnels through MainPanel's
 // showAudioFile() / showOrphanedMd(), so those two functions call
@@ -267,7 +267,7 @@ private slots:
         assertAllScreensClosed();
     }
 
-    // Queue item 037: setTopLevelScreen() makes "two screens open at once"
+    // setTopLevelScreen() makes "two screens open at once"
     // unrepresentable — opening one closes every other, and "" closes them all.
     void setTopLevelScreen_openingOneClosesTheOthers()
     {

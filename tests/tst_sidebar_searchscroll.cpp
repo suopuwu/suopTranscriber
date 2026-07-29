@@ -1,5 +1,5 @@
 // Living spec + runtime verification for the sidebar file tree recovering its
-// scrollability after a search is cleared (queue item 049). A non-empty text
+// scrollability after a search is cleared. A non-empty text
 // query hides the whole TreeView (visible: searchQuery === "") and shows the
 // flat searchResultsView instead; a QQuickTableView releases its realized
 // delegates while invisible, so contentHeight collapses toward the viewport

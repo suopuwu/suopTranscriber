@@ -2,7 +2,7 @@ pragma Singleton
 import QtQuick
 import QtCore
 
-// Item 9 (Wave E): appearance/behavior settings now live in the VAULT
+// Appearance/behavior settings now live in the VAULT
 // (<vault>/.transcriber/settings.json — VaultTreeModel::readVaultSettings/
 // writeVaultSettings), not an app-scoped QSettings .conf file — different
 // vaults can have different look/behavior preferences. lastVaultPath stays
@@ -65,8 +65,8 @@ Item {
     // Connections. Off by default (a behavior change to playback shouldn't
     // silently switch on). The threshold is a PURE UI FILTER over the
     // already-stored raw VAD spans — changing it never re-runs VAD or any
-    // other task, only what counts as "long enough to skip" (locked Decision,
-    // queue item 084). Vault-scoped like every other behavior toggle here.
+    // other task, only what counts as "long enough to skip" (locked
+    // decision). Vault-scoped like every other behavior toggle here.
     property bool skipSilenceEnabled: false
     property real skipSilenceThresholdSeconds: 3
 
@@ -76,26 +76,26 @@ Item {
     // per file, not something to silently switch on for everyone.
     property bool autoLabelEnabled: false
 
-    // Item 14: when autoLabelEnabled, tags freely generate new ones by
+    // When autoLabelEnabled, tags freely generate new ones by
     // default (false). Restricting to the vault's existing tag vocabulary
     // is an explicit opt-in — auto-categorizing (leaving a file untagged
     // when nothing existing fits) is a deliberately different mode, not
     // the default behavior.
     property bool restrictTagsToExisting: false
 
-    // Item 15 (Wave E): soft nudge (0.0-1.0) between inventing new tags vs.
+    // Soft nudge (0.0-1.0) between inventing new tags vs.
     // reusing existing ones, when NOT hard-restricted (restrictTagsToExisting
     // above is the hard on/off switch; this is a gradient for when it's off).
     // Higher = more willing to reuse an existing tag even if it's only a
     // loose/"stretched" fit, rather than invent a precise new one.
     property real tagReuseBias: 0.5
 
-    // Feature 1: how verbose the AI-generated label and prelude are, 0.0
+    // How verbose the AI-generated label and prelude are, 0.0
     // (terse) to 1.0 (descriptive). Same vault-scoped/debounced-save/reset
     // mechanism as tagReuseBias above.
     property real wordiness: 0.5
 
-    // Item 27: chapter-generation density (0.0-1.0) passed straight through
+    // Chapter-generation density (0.0-1.0) passed straight through
     // to TranscriptionController::generateChapters() (default 0.5). Unlike
     // wordiness/tagReuseBias (which map to 3 discrete prompt tiers) this is a
     // genuinely continuous knob — higher = more chapters. Same vault-scoped/
@@ -125,13 +125,13 @@ Item {
     // instead of its filename in the tree, when one exists.
     property bool useLabelsSidebar: true
 
-    // Independently toggleable per surface (Milestone 5 item 20).
+    // Independently toggleable per surface.
     property bool hideExtensionsSidebar: false
     property bool hideExtensionsMainPanel: false
 
     // Main panel's sentence-playback highlight (see MainPanel.qml's
-    // sentenceHighlightOverlay) and Ctrl+F search-match highlight (Item 7,
-    // Wave E: searchMatchOverlay) — both real overlay Rectangles. Color is
+    // sentenceHighlightOverlay) and Ctrl+F search-match highlight
+    // (searchMatchOverlay) — both real overlay Rectangles. Color is
     // shared (highlightColor); radius has its OWN setting (highlightRadius),
     // separate from the generic UI borderRadius, since the user wants these
     // two independently adjustable.
@@ -274,6 +274,14 @@ Item {
     property real recordingMicGain: 1.0
     property real recordingSystemGain: 1.0
 
+    // "filled" (closed mirrored/baseline body) or "line" (stroked outline
+    // only) — see WaveformBar.qml's waveStyle for the paint-path split.
+    property string recordingWaveformStyle: "filled"
+    // Mirror the wave about the vertical centre. Purely cosmetic — the level
+    // feeding this is ONE scalar RMS over every interleaved sample
+    // (AudioRecorderIO::rmsPcm16), so there is no L/R to show either way.
+    property bool recordingWaveformMirrored: false
+
     // Per-application capture state for the recorder's per-app rows, keyed by
     // the ancestry-resolved application display name ("Discord", not
     // "Chromium") — the same key the rows themselves use, and the only handle
@@ -399,7 +407,9 @@ Item {
         autoCombineAfterGrab: false,
         recordingOutputFolder: "",
         recordingMicGain: 1.0,
-        recordingSystemGain: 1.0
+        recordingSystemGain: 1.0,
+        recordingWaveformStyle: "filled",
+        recordingWaveformMirrored: false
     })
 
     // QML `color` values need to be stringified before crossing into a
@@ -548,6 +558,8 @@ Item {
         function onRecordingOutputFolderChanged() { appSettings.scheduleSave() }
         function onRecordingMicGainChanged() { appSettings.scheduleSave() }
         function onRecordingSystemGainChanged() { appSettings.scheduleSave() }
+        function onRecordingWaveformStyleChanged() { appSettings.scheduleSave() }
+        function onRecordingWaveformMirroredChanged() { appSettings.scheduleSave() }
         // combineRules/iconOverrides aren't in `defaults` (see their own doc
         // comments) but still need the same debounced-save-on-change wiring
         // as every other persisted key.

@@ -281,7 +281,7 @@ std::vector<DiarizedTurn> DiarizationEngine::diarize(const std::vector<float> &p
             }
         } else {
             // Already on CPU (or no model paths) — no lower-memory tier left;
-            // this is a real failure (item 019's signal → DiarizeTask throws).
+            // this is a real failure (the signal makes DiarizeTask throw).
             if (inferenceFailed)
                 *inferenceFailed = true;
             return turns;

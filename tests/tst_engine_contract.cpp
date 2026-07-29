@@ -1,7 +1,7 @@
 // tst_engine_contract — living spec for DESIGN.md "Engine architecture".
 //
 // The engine abstraction lives at the **Segment level, not the transport**
-// (CLAUDE.md load-bearing constraint): every engine — the in-process
+// (a load-bearing constraint, DESIGN.md "Engine architecture"): every engine — the in-process
 // whisper.cpp default or a future out-of-process JSONL subprocess — consumes
 // an AudioChunk and returns std::vector<Segment>. Only the adapter differs.
 //
@@ -183,7 +183,7 @@ private slots:
         QVERIFY(cparams.flash_attn);
     }
 
-    // Spec (DESIGN.md "Engine architecture" + CLAUDE.md): engines return
+    // Spec (DESIGN.md "Engine architecture"): engines return
     // chunk-relative timestamps; the APP applies offsetSeconds during the
     // merge. Demonstrated with a FakeEngine standing in for "any engine" —
     // the same assertions must hold for WhisperCppEngine and any future
@@ -377,7 +377,7 @@ private slots:
                  qPrintable(QStringLiteral("transcript missing 'country': ") + QString::fromStdString(allText)));
     }
 
-    // Spec (queue item 026): the bundled out-of-process NeMo engine
+    // Spec: the bundled out-of-process NeMo engine
     // (engines/parakeet/manifest.json) and the in-process sherpa-onnx model
     // parakeet-tdt-0.6b-v2 are two DIFFERENT Parakeet backends. Their labels
     // must not collide — the NeMo engine, being the optional fallback that is

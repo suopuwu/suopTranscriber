@@ -49,7 +49,7 @@ EngineCache::AsrHandle EngineCache::ensureAsr(const QString &modelId, const QStr
     }
     handle.fellBack = modelFallback;
 
-    // Item 50 (why a stale/failed load isn't retried mid-job): whisper's
+    // Why a stale/failed load isn't retried mid-job: whisper's
     // model load is a single blocking call with no abort hook — see
     // TranscribeTask::run()'s "loading" phase doc comment for the full
     // rationale. Rebuild only when the resolved model differs from what's
@@ -127,12 +127,14 @@ void EngineCache::evictAsr()
 {
     m_asr.reset();
     m_asrModelPath.clear();
+    ++m_asrEvictionCount;
 }
 
 void EngineCache::evictLabel()
 {
     m_label.reset();
     m_labelModelPath.clear();
+    ++m_labelEvictionCount;
 }
 
 void EngineCache::evictDiar()
@@ -148,4 +150,14 @@ void EngineCache::evictAll()
     evictAsr();
     evictLabel();
     evictDiar();
+}
+
+void EngineCache::applyResidencyPolicy(bool needAsr, bool needLabel, bool needDiar)
+{
+    if (!needAsr)
+        evictAsr();
+    if (!needLabel)
+        evictLabel();
+    if (!needDiar)
+        evictDiar();
 }

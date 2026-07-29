@@ -37,6 +37,18 @@ private slots:
         QVERIFY(!task.capabilities().pausable); // no interruption point
     }
 
+    // RelabelTask must declare needing ONLY the label engine — so
+    // the dispatch-time residency policy leaves it resident across a run of
+    // relabel/chapters tasks while still evicting asr/diar.
+    void relabelTask_declaresOnlyLabelNeed()
+    {
+        RelabelTask task(QUrl::fromLocalFile("/vault/a.wav"), QUrl::fromLocalFile("/vault"), false, 0.5, 0.5, false);
+        const Task::EngineNeeds needs = task.engineNeeds();
+        QVERIFY(!needs.asr);
+        QVERIFY(needs.label);
+        QVERIFY(!needs.diar);
+    }
+
     void relabelTask_notYetTranscribed_throwsTaskError()
     {
         QTemporaryDir dir;

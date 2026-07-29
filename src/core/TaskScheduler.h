@@ -209,7 +209,7 @@ private:
     void startTask(int index);
     void startInstantTask(int index);
     bool serialActiveConflictsWith(const QUrl &fileUrl) const;
-    void onTaskFinished(Task *task, bool ok, const QString &error);
+    void onTaskFinished(Task *task, bool ok, const QString &error, const QString &warning);
     int indexOfTask(const Task *task) const;
     void removeTaskAt(int index);
     void cancelTaskAt(int index);

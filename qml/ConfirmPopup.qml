@@ -16,9 +16,9 @@ import SuopTranscriber
 //     // ... later: deleteConfirm.open()
 //
 // This chrome was copy-pasted across ModelsPage, MainPanel and Sidebar (and a
-// divergent Dialog variant in BenchmarkPage) — the CLAUDE.md note that the
-// delete dialogs "behave like siblings" was describing four hand-kept copies
-// that had already started to drift (one forgot dim/focus/closePolicy). The
+// divergent Dialog variant in BenchmarkPage) — the delete dialogs were meant
+// to "behave like siblings" but were four hand-kept copies that had already
+// started to drift (one forgot dim/focus/closePolicy). The
 // popup chrome and the two-button row are identical every time; only the
 // message text and what the confirm button does differ, which are exactly the
 // `message`/`confirmText` properties and the `confirmed()` signal.

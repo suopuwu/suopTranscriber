@@ -169,6 +169,16 @@ class TstBottomBarTaskModel : public QObject
         return out;
     }
 
+    // The non-fatal-warning glyph (BottomBar.qml's warningGlyph) —
+    // one delegate per row, like taskModelDetailLabels() above, only its
+    // `visible` flips on whether that row's "warning" field is non-empty.
+    QList<QQuickItem *> taskWarningGlyphs() const
+    {
+        QList<QQuickItem *> out;
+        collectByObjectName(m_window->contentItem(), QStringLiteral("taskWarningGlyph"), out);
+        return out;
+    }
+
     // jobListPopup has no objectName (nothing else needs one), so it's found
     // by C++ class rather than by name — a Popup is a QObject child of its
     // declaring Item regardless of open state (only its CONTENT reparents
@@ -234,6 +244,7 @@ private slots:
                      "ConfirmPopup 1.0 qml/ConfirmPopup.qml\n"
                      "PlayGlyph 1.0 qml/PlayGlyph.qml\n"
                      "PauseGlyph 1.0 qml/PauseGlyph.qml\n"
+                     "MiddleDragScroll 1.0 qml/MiddleDragScroll.qml\n"
                      "BottomBar 1.0 qml/BottomBar.qml\n");
         qmldir.close();
 
@@ -365,6 +376,54 @@ private slots:
         }
     }
 
+    // A Done task carrying a non-fatal "warning" (e.g. TranscribeTask
+    // surfacing a corrupt-audio repair) must render a DISTINCT indicator from
+    // both a warning-free Done row and a genuinely Failed row — the task
+    // succeeded, so this must never look like the failure state.
+    void doneRowWithWarning_rendersDistinctlyFromCleanDoneAndFailedRows()
+    {
+        QVERIFY(openWindow());
+        // "error"/"durationMs" are set on every real jobs() row unconditionally
+        // (see TranscriptionController::jobs()) — set them explicitly here too
+        // so an absent key never masquerades as a real gap in BottomBar's
+        // bindings (modelData.error/.warning read undefined vs. "" the same
+        // for THIS test's purposes, but the pre-existing error-tooltip binding
+        // warns on assigning undefined to a QString property).
+        QVariantMap warnedRow = transcribeRow(1, QStringLiteral("corrupt.mp3"), QStringLiteral("tiny.en"));
+        warnedRow[QStringLiteral("status")] = QStringLiteral("done");
+        warnedRow[QStringLiteral("error")] = QString();
+        warnedRow[QStringLiteral("warning")] =
+            QStringLiteral("196249 sample(s) were non-finite (NaN/Inf) and replaced with silence, starting at 12s");
+        warnedRow[QStringLiteral("durationMs")] = 4200;
+
+        QVariantMap cleanDoneRow = transcribeRow(2, QStringLiteral("clean.mp3"), QStringLiteral("tiny.en"));
+        cleanDoneRow[QStringLiteral("status")] = QStringLiteral("done");
+        cleanDoneRow[QStringLiteral("error")] = QString();
+        cleanDoneRow[QStringLiteral("warning")] = QString();
+        cleanDoneRow[QStringLiteral("durationMs")] = 3000;
+
+        QVariantMap failedRow = transcribeRow(3, QStringLiteral("broken.mp3"), QStringLiteral("tiny.en"));
+        failedRow[QStringLiteral("status")] = QStringLiteral("failed");
+        failedRow[QStringLiteral("error")] = QStringLiteral("audio decode failed");
+        failedRow[QStringLiteral("durationMs")] = 1000;
+
+        QVERIFY2(showJobs({warnedRow, cleanDoneRow, failedRow}),
+                 "the three rows never rendered their taskModelDetail labels");
+
+        const QList<QQuickItem *> glyphs = taskWarningGlyphs();
+        QCOMPARE(glyphs.size(), 3); // one delegate per row, like taskModelDetailLabels()
+        int visibleCount = 0;
+        for (QQuickItem *glyph : glyphs) {
+            if (!glyph->isVisible())
+                continue;
+            ++visibleCount;
+            QCOMPARE(glyph->property("text").toString(), QString::fromUtf8("\xE2\x9A\xA0")); // "⚠"
+        }
+        QVERIFY2(visibleCount == 1,
+                 "exactly the warned row's glyph must be visible — not the clean Done row's, "
+                 "and not the Failed row's (a warning must never look like a failure)");
+    }
+
     // A stale or out-of-process (`engine:<id>`) modelId that matches nothing
     // in any catalog must still render as ITSELF, never as blank — the whole
     // point is to never misrepresent (or silently drop) which model a queued
@@ -387,8 +446,8 @@ int main(int argc, char *argv[])
 {
     // Offscreen + sandboxed org/app name: AppSettings.qml's Settings{}
     // element is loaded transitively by BottomBar.qml, and must never touch
-    // the real ~/.config/suopTranscriber (CLAUDE.md: never let testing touch
-    // the user's real vault or app config).
+    // the real ~/.config/suopTranscriber (tests must never touch the user's
+    // real vault or app config).
     qputenv("QT_QPA_PLATFORM", "offscreen");
     qputenv("QT_QUICK_CONTROLS_STYLE", "Basic");
     QCoreApplication::setOrganizationName(QStringLiteral("suopTranscriberTestHarness"));

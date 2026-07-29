@@ -258,8 +258,8 @@ private slots:
 
 int main(int argc, char *argv[])
 {
-    // Offscreen + sandboxed org/app name (CLAUDE.md: never let testing touch
-    // the user's real vault or app config — AppSettings.qml's Settings{}
+    // Offscreen + sandboxed org/app name (tests must never touch the user's
+    // real vault or app config — AppSettings.qml's Settings{}
     // element writes lastVaultPath the moment it loads). Same setup as
     // tst_middledragscroll.
     qputenv("QT_QPA_PLATFORM", "offscreen");

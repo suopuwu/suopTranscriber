@@ -23,7 +23,25 @@ struct DecodeControl {
     std::function<bool()> cancelled;
 };
 
+// Non-finite (NaN/Inf) samples scrubbed to silence during decode — see
+// decodeTo16kMono()'s doc comment for why they can't just pass through.
+// Default-constructed means "none found". nonFiniteSampleCount and
+// firstNonFiniteSeconds (post-resample, 16kHz-relative) are kept even though
+// the scrub always proceeds, so a caller can surface WHERE a file was
+// corrupt rather than silently producing a gap nothing explains.
+struct DecodeDiagnostics {
+    std::size_t nonFiniteSampleCount = 0;
+    std::optional<double> firstNonFiniteSeconds;
+};
+
 std::optional<std::vector<float>> decodeTo16kMono(const QString &filePath, QString *errorOut = nullptr,
-                                                    const DecodeControl &control = {});
+                                                    const DecodeControl &control = {},
+                                                    DecodeDiagnostics *diagnosticsOut = nullptr);
+
+// Decode output is CONTINUOUS — ffmpeg streams raw PCM the whole time it works,
+// so unlike the engine's per-window silence (TranscribeTask::isStalled) a decode
+// that has emitted nothing for this long is wedged regardless of file length.
+// Generous enough to absorb a slow disk or a paused-then-resumed process.
+bool isDecodeStalled(qint64 noOutputElapsedMs);
 
 }

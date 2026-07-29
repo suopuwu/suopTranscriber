@@ -135,7 +135,7 @@ private slots:
 
     // The actual claim under test: clicking selectAllButton (and, equally,
     // pressing Ctrl+A with the tree focused) populates selectedPaths with
-    // every visible note. Item 041: the ribbon now derives eligibility from
+    // every visible note. The ribbon now derives eligibility from
     // the MODEL (refreshSelectionEligibility() narrowing searchResultNotes()
     // to the selection), not from a delegate-fed map, so there is no
     // bulkTargetPaths() to call here anymore — the selection→eligibility
@@ -216,7 +216,7 @@ private slots:
         QCOMPARE(sidebarItem->property("selectedPaths").toList().size(), 5);
     }
 
-    // Item 041 regression: the ribbon's eligibility must cover EVERY selected
+    // Regression: the ribbon's eligibility must cover EVERY selected
     // row, not just the handful TreeView has realized. The old delegate-fed
     // maps only described realized rows, so a select-all in a vault taller than
     // the viewport left most eligible files invisible to the ribbon — buttons

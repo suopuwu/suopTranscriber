@@ -35,8 +35,8 @@ struct DiarizedTurn; // DiarizationEngine.h — forward-declared so this header
                      // takes a const-ref to a vector of these).
 struct LabelResult; // LabelingEngine.h — forward-declared for writeLabelingFields()
 
-// Writes segment lines to an open sidecar .md file (see appendSegmentLine's
-// former doc comment / CLAUDE.md "vault layout"), merging a REPEATING CYCLE
+// Writes segment lines to an open sidecar .md file (see DESIGN.md "Vault /
+// file layout"), merging a REPEATING CYCLE
 // of consecutive segments (period 1..maxCycleLength — one repeated line, or
 // a repeating block of 2, 3, ... lines) into just ONE copy of the cycle —
 // whisper.cpp occasionally hallucinates the exact same sentence, OR the
@@ -140,7 +140,7 @@ struct ResolvedChapter {
 // with synthetic values, without needing a real label model.
 QString spliceBodyChapters(const QString &body, const QList<ResolvedChapter> &chapters);
 
-// Item 52 (standalone speaker diarization): given an already-transcribed
+// Standalone speaker diarization: given an already-transcribed
 // .md's `body` and its frontmatter "speakers:" allowlist (`knownSpeakers`),
 // assigns each segment line the diarized speaker `turns` say it overlaps
 // (labelForSegment()'s time-overlap rule) and splices a "[Speaker N]" tag
@@ -164,7 +164,7 @@ QString spliceBodySpeakers(const QString &body, const QStringList &knownSpeakers
                             const std::vector<DiarizedTurn> &turns, double totalSeconds,
                             QStringList *appliedSpeakersOut = nullptr);
 
-// --- Transcript-format / vault-file helpers (Wave N task system) ---------
+// --- Transcript-format / vault-file helpers (task system) ----------------
 // Declared here (definitions stay in the .cpp, same file-scope-not-anonymous
 // pattern already used above for isEngineModelId/discoverEngines/etc. and for
 // spliceBodySpeakers/spliceBodyChapters) so a Task subclass in src/core/tasks/
@@ -204,10 +204,17 @@ bool transcriptIsLabeled(const QString &label, const QString &tags, const QStrin
 // "checked, genuinely no silence found" and WRITES the key with an empty
 // value — the key is present for every transcription that got a real answer
 // one way or another, distinct from "never checked".
+//
+// corruptAudioNote: empty omits the key (the common case). Non-empty records
+// that AudioDecoder scrubbed non-finite (NaN/Inf) samples to silence — see
+// AudioDecoder.cpp's decode-then-scrub-then-speechnorm comment — so a
+// silent, unexplained gap in the transcript has a written cause instead of
+// looking like a transcription bug.
 void writeFrontmatter(QFile &mdFile, const QString &modelUsed, bool speakerDetection, bool modelFallback,
                       const QString &requestedModelId, const QStringList &speakerLabels,
                       const QString &speakerDetectionError, bool vad, const QString &vadError, bool partial,
-                      const std::optional<std::vector<std::pair<double, double>>> &silences = std::nullopt);
+                      const std::optional<std::vector<std::pair<double, double>>> &silences = std::nullopt,
+                      const QString &corruptAudioNote = QString());
 
 // Formats a list of (start, end) SILENCE spans (VadChunker::complementSpans()'
 // output) into the compact "12.4-18.9, 45-52.3" frontmatter value — the same

@@ -89,6 +89,18 @@ public:
     Q_INVOKABLE void pause() { m_playing = false; emit playingChanged(); }
     Q_INVOKABLE void stop() { m_playing = false; emit playingChanged(); }
 
+    // duration has no setter on the real AudioPlayer either (QMediaPlayer
+    // reports it from the decoded file), so this is test-only: without it
+    // there is no way to give WaveformBar a non-zero durationMs, and its
+    // seek is gated on durationMs > 0.
+    Q_INVOKABLE void setDurationForTest(qint64 ms)
+    {
+        if (m_duration == ms)
+            return;
+        m_duration = ms;
+        emit durationChanged();
+    }
+
 signals:
     void sourceChanged();
     void playingChanged();
@@ -139,6 +151,25 @@ public:
     Q_INVOKABLE qreal decayPeak(qreal previousPeak, qreal currentLevel, qreal decayPerTick) const
     {
         return AudioRecorderIO::decayPeak(previousPeak, currentLevel, decayPerTick);
+    }
+    // Missing until now, and silently so: RecorderPage's onLevelUpdated calls
+    // it on every tick, so without it each tick threw a TypeError in QML and
+    // abandoned the rest of the handler — no test could observe the peaks,
+    // holds or per-source levels at all. Delegates to the real rule, like the
+    // helpers above.
+    Q_INVOKABLE QVariantMap holdPeak(qreal previousPeak, qint64 previousHoldUntilMs,
+                                      qreal currentLevel, qint64 nowMs, qint64 holdMs,
+                                      qreal decayPerTick) const
+    {
+        return AudioRecorderIO::holdPeak(previousPeak, previousHoldUntilMs, currentLevel, nowMs,
+                                          holdMs, decayPerTick);
+    }
+    // Also missing until now, for the same reason as holdPeak above: with
+    // sourcePeaks now actually populated, formatPeakDb() (RecorderPage.qml)
+    // reaches this the moment any source has a peak above the display floor.
+    Q_INVOKABLE qreal dbFromDisplayLevel(qreal displayLevel) const
+    {
+        return AudioRecorderIO::dbFromDisplayLevel(displayLevel);
     }
     Q_INVOKABLE QVariantList appCaptureRows(const QVariantList &streams,
                                             const QStringList &rememberedNames) const
@@ -338,6 +369,24 @@ private:
         QTest::mouseClick(view, Qt::LeftButton, Qt::KeyboardModifiers(), c.toPoint());
     }
 
+    // Same idea, but at a specific LOCAL point rather than the item's centre
+    // — for asserting which x was actually clicked (WaveformBar's two hit
+    // zones use different axes depending on y).
+    static void tap(QQuickView *view, QQuickItem *item, const QPoint &local)
+    {
+        QVERIFY(item);
+        const QPointF scenePos = item->mapToScene(local);
+        QTest::mouseClick(view, Qt::LeftButton, Qt::KeyboardModifiers(), scenePos.toPoint());
+    }
+
+    // QTest::keyClicks() is declared for QWidget only, and a QQuickView is a
+    // QWindow — so type into the focused item a character at a time.
+    static void typeText(QQuickView *view, const QString &text)
+    {
+        for (const QChar &c : text)
+            QTest::keyClick(view, c.toLatin1());
+    }
+
     static QQuickItem *find(QQuickView *view, const QString &name)
     {
         if (QQuickItem *direct = view->rootObject()->findChild<QQuickItem *>(name))
@@ -457,7 +506,7 @@ private slots:
         QVERIFY(find(&view, QStringLiteral("recordToggleButton")));
     }
 
-    // Item 032's headline claim, at runtime: turning System Audio ON must turn
+    // The exclusivity rule, at runtime: turning System Audio ON must turn
     // per-app capture OFF — and must NOT leave the per-app toggle greyed out,
     // which is the behavior it replaced.
     void systemAudioTurnsPerAppCaptureOffRatherThanGreyingIt()
@@ -481,14 +530,14 @@ private slots:
         // The toggle must be live, not disabled, while a per-app row is armed.
         QVERIFY2(sysToggle->isEnabled(),
                  "System Audio toggle is disabled while a per-app row is armed — "
-                 "that is the greying-out behavior item 032 removed");
+                 "that is the greying-out behavior deselection replaced");
         tap(&view, sysToggle);
 
         QTRY_COMPARE(page->property("useSystemAudio").toBool(), true);
         // ...and the per-app row it deselected is still interactive.
         QVERIFY2(appToggle->isEnabled(),
                  "per-app toggle went disabled when System Audio turned on — "
-                 "item 032 requires deselection, not greying out");
+                 "the rule requires deselection, not greying out");
     }
 
     // The reverse direction of the same rule.
@@ -514,7 +563,7 @@ private slots:
         QTRY_COMPARE(page->property("useSystemAudio").toBool(), false);
     }
 
-    // Item 036: a row must survive its application going quiet. This is the
+    // A row must survive its application going quiet. This is the
     // claim the whole id -> name re-keying exists for.
     void perAppRowSurvivesItsApplicationGoingQuiet()
     {
@@ -538,7 +587,7 @@ private slots:
         QCOMPARE(row.value(QStringLiteral("active")).toBool(), false);
     }
 
-    // Item 036's dot: active reflects a live stream, not merely a remembered row.
+    // The dot: active reflects a live stream, not merely a remembered row.
     void activeDotTracksWhetherTheStreamIsLive()
     {
         QQuickView view;
@@ -556,7 +605,7 @@ private slots:
         QTRY_VERIFY2(!dot->isVisible(), "dot stayed visible after the stream went away");
     }
 
-    // Item 031: the selected system source must survive re-enumeration that
+    // The selected system source must survive re-enumeration that
     // reorders the list — the desync this fixed.
     void systemSourceSelectionSurvivesReordering()
     {
@@ -594,7 +643,7 @@ private slots:
                      "a vanished system source raised no warning");
     }
 
-    // Item 029: with test mode armed, a take must be reported as temporary —
+    // With test mode armed, a take must be reported as temporary —
     // the vault must not be where it lands.
     void testModeMarksTheTakeTemporary()
     {
@@ -614,7 +663,7 @@ private slots:
                  "recording started with testMode=false while the toggle was on");
     }
 
-    // Item 026: the three source rows share ONE measured label column, so their
+    // The three source rows share ONE measured label column, so their
     // toggles line up. Geometry, not a source scan.
     void sourceTogglesShareOneMeasuredWidth()
     {
@@ -754,6 +803,77 @@ private slots:
         QVERIFY(rec->isRecording());
     }
 
+    // The reported bug: the duration readout must not advance from monitor
+    // ticks, even though the waveform and per-source maximums must.
+    void theTimerStandsStillWhileMerelyMonitoring()
+    {
+        QQuickView view;
+        QQuickItem *page = nullptr;
+        AudioRecorderStub *rec = nullptr;
+        QVERIFY(openRecorder(&view, &page, &rec));
+        QTRY_VERIFY(rec->isMonitoring());
+        QVERIFY(!rec->isRecording());
+
+        QVariantMap micLevel;
+        micLevel[QStringLiteral("kind")] = QStringLiteral("mic");
+        micLevel[QStringLiteral("id")] = QStringLiteral("");
+        micLevel[QStringLiteral("level")] = 0.5;
+        rec->tickLevel(0.5, { micLevel }, 4000);
+
+        QCOMPARE(page->property("takeDurationMs").toInt(), 0);
+        QQuickItem *label = find(&view, QStringLiteral("recordingDurationLabel"));
+        QVERIFY2(label, "recordingDurationLabel not found");
+        QVERIFY2(label->property("text").toString() == QStringLiteral("00:00"),
+                 "the readout counted up while nothing was being recorded");
+
+        QVERIFY2(qvariant_cast<QVariantList>(page->property("levelSamples")).size() > 0,
+                 "the waveform must keep sampling while idle");
+        const QVariantMap peaks = page->property("sourcePeaks").toMap();
+        QVERIFY2(peaks.value(QStringLiteral("mic:")).toReal() > 0.0,
+                 "the per-source maximums must keep moving while idle");
+    }
+
+    // A take's duration must climb while recording, then freeze at the
+    // finished take's length rather than reset to 0 once monitoring resumes.
+    void theTimerFreezesAtTheFinishedTakesLength()
+    {
+        QQuickView view;
+        QQuickItem *page = nullptr;
+        AudioRecorderStub *rec = nullptr;
+        QVERIFY(openRecorder(&view, &page, &rec));
+        QTRY_VERIFY(rec->isMonitoring());
+
+        QVariantMap micLevel;
+        micLevel[QStringLiteral("kind")] = QStringLiteral("mic");
+        micLevel[QStringLiteral("id")] = QStringLiteral("");
+        micLevel[QStringLiteral("level")] = 0.5;
+
+        tap(&view, find(&view, QStringLiteral("recordToggleButton")));
+        QTRY_COMPARE(rec->startCount(), 1);
+        rec->tickLevel(0.5, { micLevel }, 3000);
+        QCOMPARE(page->property("takeDurationMs").toInt(), 3000);
+        QQuickItem *label = find(&view, QStringLiteral("recordingDurationLabel"));
+        QVERIFY2(label, "recordingDurationLabel not found");
+        QCOMPARE(label->property("text").toString(), QStringLiteral("00:03"));
+
+        tap(&view, find(&view, QStringLiteral("recordToggleButton")));
+        QTRY_VERIFY(!rec->isRecording());
+        QVariantMap quietLevel;
+        quietLevel[QStringLiteral("kind")] = QStringLiteral("mic");
+        quietLevel[QStringLiteral("id")] = QStringLiteral("");
+        quietLevel[QStringLiteral("level")] = 0.2;
+        rec->tickLevel(0.2, { quietLevel }, 500);
+
+        QVERIFY2(page->property("takeDurationMs").toInt() == 3000,
+                 "a post-take monitor tick must not disturb the frozen take length");
+        QCOMPARE(label->property("text").toString(), QStringLiteral("00:03"));
+
+        tap(&view, find(&view, QStringLiteral("recordToggleButton")));
+        QTRY_COMPARE(rec->startCount(), 2);
+        QVERIFY2(page->property("takeDurationMs").toInt() == 0,
+                 "a new take must start a new clock, not carry the previous length forward");
+    }
+
     // Refinements 3 and 4: the meters colour by band, and the band rule is the
     // shared one — not a threshold RecorderPage re-derives.
     void metersColourByTheSharedLevelBand()
@@ -785,6 +905,30 @@ private slots:
         QVERIFY(low.isValid() && good.isValid() && hot.isValid());
         QVERIFY2(low != good && good != hot && low != hot,
                  "the three level bands must be visually distinct");
+    }
+
+    // The peak readout's hover must say what to aim for, and must say it in the
+    // numbers the shared band rule actually uses — a hardcoded range would drift
+    // from the colour the readout is painted.
+    void peakTooltipNamesTheIdealSpeakingRange()
+    {
+        QQuickView view;
+        QQuickItem *page = nullptr;
+        AudioRecorderStub *rec = nullptr;
+        QVERIFY(openRecorder(&view, &page, &rec));
+
+        const QString tip = page->property("peakTooltip").toString();
+        QVERIFY2(!tip.isEmpty(), "RecorderPage must expose a shared peakTooltip");
+
+        const int good = qRound(AudioRecorderIO::dbFromDisplayLevel(
+            AudioRecorderIO::levelBandGoodFloor()));
+        const int hot = qRound(AudioRecorderIO::dbFromDisplayLevel(
+            AudioRecorderIO::levelBandHotFloor()));
+        QVERIFY2(tip.contains(QString::number(good)) && tip.contains(QString::number(hot)),
+                 qPrintable(QStringLiteral("the peak tooltip must name the good band (%1..%2 dB); got: %3")
+                                .arg(good).arg(hot).arg(tip)));
+        QVERIFY2(tip.contains(QStringLiteral("dBFS")),
+                 "the peak tooltip must still explain the unit it reads in");
     }
 
     // The page-level half of the monitor-supersedes-take rule.
@@ -822,6 +966,148 @@ private slots:
         QCOMPARE(rec->startCount(), 1);
     }
 
+    // The capture clock restarts at 0 with every capture graph, and a monitor
+    // tick still in flight when Record is pressed is delivered AFTER the
+    // history is cleared — carrying the monitor clock. Appended blindly it
+    // sits ahead of the take's own first tick, and WaveformBar's fill walks
+    // the samples as a polygon: one backwards step self-intersects the outline
+    // and leaves an unfilled triangle across the left of the frame (and breaks
+    // lowerBoundMs()'s binary search).
+    void aStaleMonitorTickCannotRunTheWaveformAxisBackwards()
+    {
+        QQuickView view;
+        QQuickItem *page = nullptr;
+        AudioRecorderStub *rec = nullptr;
+        QVERIFY(openRecorder(&view, &page, &rec));
+        QTRY_VERIFY(rec->isMonitoring());
+
+        // Monitoring has been running a while.
+        rec->tickLevel(0.4, {}, 12000);
+        rec->tickLevel(0.4, {}, 12075);
+
+        tap(&view, find(&view, QStringLiteral("recordToggleButton")));
+        QTRY_VERIFY(rec->isRecording());
+
+        // One monitor tick lands after the press — the race this guards.
+        rec->tickLevel(0.4, {}, 12150);
+        // Then the take's own clock, from zero.
+        rec->tickLevel(0.5, {}, 75);
+        rec->tickLevel(0.6, {}, 150);
+
+        const QVariantList levels = page->property("recordedLevels").toList();
+        QVERIFY2(!levels.isEmpty(), "the take recorded no levels at all");
+        qint64 previous = -1;
+        for (const QVariant &entry : levels) {
+            const qint64 ms = entry.toMap().value(QStringLiteral("ms")).toLongLong();
+            QVERIFY2(ms > previous,
+                     "recordedLevels ran backwards — WaveformBar binary-searches this array and "
+                     "walks it as a fill polygon, so an out-of-order sample leaves an unfilled "
+                     "wedge across the left of the waveform");
+            previous = ms;
+        }
+        QCOMPARE(levels.first().toMap().value(QStringLiteral("ms")).toLongLong(), qint64(75));
+    }
+
+    // Mirror image of aStaleMonitorTickCannotRunTheWaveformAxisBackwards(): a
+    // take's own trailing tick can still be in flight when it is stopped, and
+    // is delivered AFTER updateMonitoring() has cleared monitorLevels for the
+    // resumed session — carrying the take clock ahead of the new monitor
+    // session's own first tick. Same wedge, in the monitor preview this time.
+    void aStaleTakeTickCannotRunTheMonitorPreviewBackwards()
+    {
+        QQuickView view;
+        QQuickItem *page = nullptr;
+        AudioRecorderStub *rec = nullptr;
+        QVERIFY(openRecorder(&view, &page, &rec));
+        QTRY_VERIFY(rec->isMonitoring());
+
+        tap(&view, find(&view, QStringLiteral("recordToggleButton")));
+        QTRY_VERIFY(rec->isRecording());
+        rec->tickLevel(0.5, {}, 5000);
+
+        tap(&view, find(&view, QStringLiteral("recordToggleButton")));
+        QTRY_VERIFY(rec->isMonitoring());
+
+        // The take's own trailing tick lands after the stop — the race this
+        // guards — followed by the new monitor session's clock, from zero.
+        rec->tickLevel(0.4, {}, 5075);
+        rec->tickLevel(0.4, {}, 75);
+
+        const QVariantList levels = page->property("monitorLevels").toList();
+        QVERIFY2(!levels.isEmpty(), "monitoring recorded no levels at all");
+        qint64 previous = -1;
+        for (const QVariant &entry : levels) {
+            const qint64 ms = entry.toMap().value(QStringLiteral("ms")).toLongLong();
+            QVERIFY2(ms > previous,
+                     "monitorLevels ran backwards — WaveformBar binary-searches this array and "
+                     "walks it as a fill polygon, so an out-of-order sample leaves an unfilled "
+                     "wedge across the left of the waveform");
+            previous = ms;
+        }
+        QCOMPARE(levels.first().toMap().value(QStringLiteral("ms")).toLongLong(), qint64(75));
+    }
+
+    // Monitoring used to just... stop, forever, once a take ended
+    // — nothing ever called updateMonitoring() again. The meters (gain-slider
+    // fills, per-source peaks) sat dead until the user happened to toggle a
+    // source.
+    void monitoringResumesWhenTheTakeEnds()
+    {
+        QQuickView view;
+        QQuickItem *page = nullptr;
+        AudioRecorderStub *rec = nullptr;
+        QVERIFY(openRecorder(&view, &page, &rec));
+        QTRY_VERIFY(rec->isMonitoring());
+
+        tap(&view, find(&view, QStringLiteral("recordToggleButton")));
+        QTRY_VERIFY(rec->isRecording());
+        QVERIFY(!rec->isMonitoring());
+
+        tap(&view, find(&view, QStringLiteral("recordToggleButton")));
+        QTRY_VERIFY2(rec->isMonitoring(), "the meters stayed dead after the take ended");
+        QCOMPARE(rec->monitorStartCount(), 2);
+    }
+
+    // SCOPE LIMIT, deliberately recorded: the stub's stopRecording() has no
+    // worker, so this harness cannot see the C++ post-before-emit ordering
+    // (AudioRecorder::stopRecording() must post the worker's "stop" before
+    // emitting recordingChanged(), or the monitor restart this test drives
+    // would race it and be rejected as "already recording"). That half is
+    // guarded by source scan in tst_styleguide, per
+    // recordingSurvivesTheMonitorTeardownItSupersedes()'s comment above.
+    void theFinishedTakeStaysReviewableWhileMonitoringResumes()
+    {
+        QQuickView view;
+        QQuickItem *page = nullptr;
+        AudioRecorderStub *rec = nullptr;
+        QVERIFY(openRecorder(&view, &page, &rec));
+        QTRY_VERIFY(rec->isMonitoring());
+
+        tap(&view, find(&view, QStringLiteral("recordToggleButton")));
+        QTRY_VERIFY(rec->isRecording());
+        rec->tickLevel(0.5, {}, 1000);
+        rec->tickLevel(0.5, {}, 1200);
+        QTRY_VERIFY(page->property("recordedLevels").toList().size() > 0);
+
+        tap(&view, find(&view, QStringLiteral("recordToggleButton")));
+        QTRY_VERIFY(rec->isMonitoring());
+
+        QVERIFY(page->property("capturing").toBool());
+        QVERIFY2(page->property("reviewing").toBool(), "the finished take must stay under review");
+        QVERIFY2(!page->property("waveformLive").toBool(),
+                 "the waveform must not flip back to a live scroll while a take is under review");
+
+        QQuickItem *bar = find(&view, QStringLiteral("waveformBar"));
+        QVERIFY(bar);
+        QVERIFY2(!bar->property("live").toBool(),
+                 "the WaveformBar instance itself must not be live while reviewing");
+
+        const int recordedCountBeforeMonitorTick = page->property("recordedLevels").toList().size();
+        rec->tickLevel(0.7, {}, 50);
+        QTest::qWait(50);
+        QCOMPARE(page->property("recordedLevels").toList().size(), recordedCountBeforeMonitorTick);
+    }
+
     // Dragging the mic gain slider must reach the worker. The meter measures
     // POST-gain, so a gain the worker never receives makes the slider look
     // inert — which is exactly how it behaved.
@@ -848,7 +1134,133 @@ private slots:
                  "the recorder was handed the wrong gain");
     }
 
-    // Item 034: both device pickers are the shared component, not bare
+    // The percent beside each slider is typed, not just read: the sliders now
+    // reach 400%, so unity sits a quarter along and every ordinary correction
+    // is a few pixels of drag. A typed number must land on the live capture by
+    // the same route a drag does.
+    void typingAPercentSetsTheGainAndReachesTheRecorder()
+    {
+        QQuickView view;
+        QQuickItem *page = nullptr;
+        AudioRecorderStub *rec = nullptr;
+        QVERIFY(openRecorder(&view, &page, &rec));
+        QTRY_VERIFY(rec->isMonitoring());
+
+        QQuickItem *slider = find(&view, QStringLiteral("micGainSlider"));
+        QVERIFY(slider);
+        QCOMPARE(slider->property("to").toReal(), 4.0);
+
+        QQuickItem *field = find(&view, QStringLiteral("micGainPercentField"));
+        QVERIFY2(field, "the mic gain percent readout is not an editable field");
+
+        // The slider and its number are one reading, so the readout hugs the
+        // groove instead of sitting a full row-spacing (12px) away. Measured,
+        // not source-scanned: this is the only thing that proves the layout
+        // honours the negative margin rather than clamping it away.
+        QVERIFY2(field->x() - (slider->x() + slider->width()) < 12.0,
+                 "the gain readout is a full row-spacing from its slider");
+
+        const int before = rec->micEnabledCalls().size();
+
+        // Typed the way a user does: focus (which selects the "%"-suffixed
+        // text whole), type over it, commit with Return.
+        field->forceActiveFocus();
+        QTRY_VERIFY(field->hasActiveFocus());
+        typeText(&view, QStringLiteral("250"));
+        QTest::keyClick(&view, Qt::Key_Return);
+
+        QTRY_COMPARE(slider->property("value").toReal(), 2.5);
+        QTRY_VERIFY2(rec->micEnabledCalls().size() > before,
+                     "a typed gain never reached the recorder — the number moved but the live "
+                     "capture kept its original gain");
+        QVERIFY2(qFuzzyCompare(rec->micEnabledCalls().last().second, 2.5),
+                 "the recorder was handed the wrong gain");
+        QCOMPARE(field->property("text").toString(), QStringLiteral("250%"));
+
+        page->setProperty("useMic", false); // release the stub's devices
+    }
+
+    // A number past the SLIDER's 400% ceiling is kept, not dragged back down
+    // to it: the slider pins at its own top, but the setting (and the
+    // readout, which resolves the setting rather than the clamped handle)
+    // keep the typed value. Only the higher TYPED ceiling (maxTypedGain,
+    // 2000%) still clamps.
+    void aTypedPercentCanExceedTheSliderCeiling()
+    {
+        QQuickView view;
+        QQuickItem *page = nullptr;
+        AudioRecorderStub *rec = nullptr;
+        QVERIFY(openRecorder(&view, &page, &rec));
+
+        QQuickItem *slider = find(&view, QStringLiteral("micGainSlider"));
+        QQuickItem *field = find(&view, QStringLiteral("micGainPercentField"));
+        QVERIFY(slider && field);
+
+        field->forceActiveFocus();
+        QTRY_VERIFY(field->hasActiveFocus());
+        typeText(&view, QStringLiteral("900"));
+        QTest::keyClick(&view, Qt::Key_Return);
+
+        QTRY_COMPARE(field->property("gain").toReal(), 9.0);
+        QCOMPARE(field->property("text").toString(), QStringLiteral("900%"));
+        // The slider pins at its own ceiling and does NOT drag the setting
+        // back down.
+        QCOMPARE(slider->property("value").toReal(), 4.0);
+
+        // Above the typed ceiling too: clamps at maxTypedGain (20.0 == 2000%).
+        field->forceActiveFocus();
+        field->setProperty("text", QStringLiteral("5000"));
+        QTest::keyClick(&view, Qt::Key_Return);
+        QTRY_COMPARE(field->property("gain").toReal(), 20.0);
+        QCOMPARE(field->property("text").toString(), QStringLiteral("2000%"));
+
+        // Restore the shared AppSettings singleton: it outlives this test, and
+        // a boosted mic gain left behind would be read as intent by the next
+        // one.
+        field->forceActiveFocus();
+        field->setProperty("text", QStringLiteral("100"));
+        QTest::keyClick(&view, Qt::Key_Return);
+        QTRY_COMPARE(slider->property("value").toReal(), 1.0);
+        page->setProperty("useMic", false);
+    }
+
+    // The above-ceiling boost is not just a number on screen — it has to
+    // reach the live capture the same route an ordinary typed gain does.
+    void aTypedAboveCeilingPercentReachesTheRecorder()
+    {
+        QQuickView view;
+        QQuickItem *page = nullptr;
+        AudioRecorderStub *rec = nullptr;
+        QVERIFY(openRecorder(&view, &page, &rec));
+        QTRY_VERIFY(rec->isMonitoring());
+
+        QQuickItem *slider = find(&view, QStringLiteral("micGainSlider"));
+        QQuickItem *field = find(&view, QStringLiteral("micGainPercentField"));
+        QVERIFY(slider && field);
+
+        const int before = rec->micEnabledCalls().size();
+
+        field->forceActiveFocus();
+        QTRY_VERIFY(field->hasActiveFocus());
+        typeText(&view, QStringLiteral("800"));
+        QTest::keyClick(&view, Qt::Key_Return);
+
+        QTRY_VERIFY2(rec->micEnabledCalls().size() > before,
+                     "a typed above-ceiling gain never reached the recorder — the number moved "
+                     "but the live capture kept its original gain");
+        QVERIFY2(qFuzzyCompare(rec->micEnabledCalls().last().second, 8.0),
+                 "the recorder was handed the wrong gain");
+        QCOMPARE(field->property("text").toString(), QStringLiteral("800%"));
+
+        // Restore the shared AppSettings singleton, same as the test above.
+        field->forceActiveFocus();
+        field->setProperty("text", QStringLiteral("100"));
+        QTest::keyClick(&view, Qt::Key_Return);
+        QTRY_COMPARE(slider->property("value").toReal(), 1.0);
+        page->setProperty("useMic", false);
+    }
+
+    // Both device pickers are the shared component, not bare
     // QQC2 ComboBoxes — the drift this closed.
     void deviceCombosAreTheSharedComponent()
     {
@@ -866,13 +1278,92 @@ private slots:
                      qPrintable(name + QStringLiteral(" is not an AppComboBox")));
         }
     }
+
+    // WaveformBar's clamped-centring rule, called directly — assigning
+    // positionMs would destroy RecorderPage's own binding and make any later
+    // assertion in the same test meaningless.
+    void waveformBarWindowStartForClampsAtBothEdges()
+    {
+        QQuickView view;
+        QQuickItem *page = nullptr;
+        AudioRecorderStub *rec = nullptr;
+        QVERIFY(openRecorder(&view, &page, &rec));
+
+        QQuickItem *bar = find(&view, QStringLiteral("waveformBar"));
+        QVERIFY2(bar, "waveform bar did not materialise");
+
+        struct Row { qint64 positionMs; qint64 durationMs; qint64 expected; };
+        const QList<Row> rows = {
+            {5000, 20000, 0},       // whole take fits inside the window
+            {5000, 120000, 0},      // clamped at the start
+            {60000, 120000, 45000}, // centred
+            {118000, 120000, 90000}, // clamped at the end
+            {0, 0, 0},               // no division by zero
+        };
+        for (const Row &row : rows) {
+            QVariant out;
+            QVERIFY(QMetaObject::invokeMethod(
+                bar, "windowStartFor", Q_RETURN_ARG(QVariant, out),
+                Q_ARG(QVariant, row.positionMs), Q_ARG(QVariant, row.durationMs),
+                Q_ARG(QVariant, qint64(30000))));
+            QCOMPARE(out.toLongLong(), row.expected);
+        }
+    }
+
+    // ONE seek axis, the whole take, at every height. The bar used to seek by
+    // visible WINDOW above a bottom strip and by WHOLE TAKE on it; the strip
+    // is gone, and a surviving invisible band that answered a click
+    // differently would read as a bug. Driven as real clicks because a source
+    // scan cannot see which axis actually ran.
+    void waveformBarTapSeeksAcrossTheWholeTakeAtEveryHeight()
+    {
+        QQuickView view;
+        QQuickItem *page = nullptr;
+        AudioRecorderStub *rec = nullptr;
+        QVERIFY(openRecorder(&view, &page, &rec));
+
+        // The mic is armed by default, which keeps the capture graph
+        // "live" (monitoring) and disables seeking — disarm it so the bar
+        // is in review mode, like it would be once a take has actually
+        // finished.
+        page->setProperty("useMic", false);
+        QTRY_VERIFY2(!rec->isMonitoring(), "monitoring never stopped after disarming the mic");
+        QVERIFY(!rec->isRecording());
+
+        auto *player = view.rootObject()->findChild<AudioPlayerStub *>();
+        QVERIFY2(player, "recorderPlayer (AudioPlayerStub) not found");
+        player->setDurationForTest(120000);
+
+        QQuickItem *bar = find(&view, QStringLiteral("waveformBar"));
+        QVERIFY2(bar, "waveform bar did not materialise");
+        QTRY_VERIFY2(bar->width() > 0 && bar->height() > 0, "waveform bar never got laid out");
+
+        const int x = int(bar->width() * 0.75);
+        // Duration 120000 is well past windowMs (30000), so the two axes give
+        // different answers and the test can tell them apart: whole-take is
+        // 120000 * 0.75 = 90000, while the old window axis would have landed
+        // at 0 + 30000 * 0.75 = 22500.
+        const qint64 wholeTake = 90000;
+
+        // Top of the bar — where the window axis used to run.
+        tap(&view, bar, QPoint(x, 10));
+        QTRY_COMPARE(player->position(), wholeTake);
+
+        // Bottom of the bar, where the strip's hit zone used to be. Seek back
+        // first, so landing on the same answer proves this tap moved the
+        // playhead rather than finding it already there.
+        player->setPosition(0);
+        QTRY_COMPARE(player->position(), qint64(0));
+        tap(&view, bar, QPoint(x, int(bar->height()) - 2));
+        QTRY_COMPARE(player->position(), wholeTake);
+    }
 };
 
 int main(int argc, char *argv[])
 {
     // Never touch the real app config — this harness loads AppSettings, which
-    // persists (see CLAUDE.md "never let testing touch the user's real vault or
-    // app config"). A harness-specific org/app name sends QSettings somewhere
+    // persists (tests must never touch the user's real vault or
+    // app config). A harness-specific org/app name sends QSettings somewhere
     // disposable instead.
     QCoreApplication::setOrganizationName(QStringLiteral("suopTranscriberTestHarness"));
     QCoreApplication::setApplicationName(QStringLiteral("tst_recorderpage_sources"));

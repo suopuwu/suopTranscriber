@@ -1,4 +1,5 @@
 #include "GpuProbe.h"
+#include "ProcessRunner.h"
 
 #include <QProcess>
 #include <QStringList>
@@ -12,6 +13,7 @@ namespace {
 QString runProbe(const QString &program, const QStringList &args, int timeoutMs = 3000)
 {
     QProcess process;
+    ProcessRunner::guardChildLifetime(process);
     process.start(program, args);
     if (!process.waitForStarted(timeoutMs))
         return QString();

@@ -27,7 +27,8 @@
 // permanently un-grabbed.
 QVariantList usbVolumesForSerial(const QVariantList &mountedVolumes, const QString &deviceSerial);
 
-// QML-facing coordinator for the USB Grabber feature (see CLAUDE.md) — the
+// QML-facing coordinator for the USB Grabber feature (see DESIGN.md "USB
+// import") — the
 // single entry point QML binds against, mirroring TranscriptionController's
 // role for transcription (see Main.qml's `TranscriptionController { id:
 // transcriptionController }` + MainPanel's `transcriptionController:

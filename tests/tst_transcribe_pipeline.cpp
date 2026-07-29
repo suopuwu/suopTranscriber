@@ -1,7 +1,7 @@
 // tst_transcribe_pipeline — living spec for the SHARED transcription pipeline
 // (src/core/TranscribePipeline.*), the windowing + per-window streaming loop
 // used by BOTH TranscribeTask and BenchmarkTask so their segmentation/timing
-// are identical (CLAUDE.md: no parallel code paths).
+// are identical (no parallel code paths).
 //
 // Exercised with a FakeEngine (same minimal conforming engine pattern as
 // tst_engine_contract.cpp): engines emit CHUNK-RELATIVE timestamps and the
@@ -103,7 +103,7 @@ void TstTranscribePipeline::runWindows_appliesOffsetMerge()
 
 // onSegment fires once per produced segment across ALL windows (2 windows x
 // 2 segments = 4), in production order — the live-streaming contract the UI
-// (and item 066's benchmark flow-in) depends on.
+// (and the benchmark page's live flow-in) depends on.
 void TstTranscribePipeline::runWindows_streamsPerSegmentInOrder()
 {
     FakeEngine engine;

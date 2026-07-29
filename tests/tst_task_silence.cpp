@@ -59,8 +59,8 @@ class TestTaskSilence : public QObject {
     Q_OBJECT
 private slots:
     // TranscriptionController persists rolling-average phase timing via a
-    // plain QSettings() (see RollingAverage.h) — CLAUDE.md "Never let
-    // testing touch the user's real vault or app config" applies here just
+    // plain QSettings() (see RollingAverage.h) — the "never let
+    // testing touch the user's real vault or app config" rule applies here just
     // as much as to lastVaultPath: setTestModeEnabled() redirects every
     // QSettings/QStandardPaths lookup for the rest of this process into an
     // isolated "qttest" sandbox instead of the real ~/.config/suopTranscriber
@@ -78,6 +78,21 @@ private slots:
         QVERIFY(!task.isStructuralFileOp());
         QVERIFY(task.capabilities().pausable);
         QVERIFY(!task.capabilities().cancellableMidRun); // no mid-pass abort hook, same as DiarizeTask
+    }
+
+    // DetectSilenceTask never resolves an EngineCache-resident
+    // engine of its own (VAD loads/frees inline — see run()'s doc comment),
+    // so it deliberately does NOT override engineNeeds(): the base class
+    // default ({} — needs nothing) is what makes the dispatch-time residency
+    // policy free whatever a previous task left resident, replacing the
+    // evictAsr()/evictLabel()/evictDiar() calls this run() used to hand-write.
+    void detectSilenceTask_usesDefaultEngineNeeds_needsNothing()
+    {
+        DetectSilenceTask task(QUrl::fromLocalFile("/vault/a.wav"), QUrl::fromLocalFile("/vault"));
+        const Task::EngineNeeds needs = task.engineNeeds();
+        QVERIFY(!needs.asr);
+        QVERIFY(!needs.label);
+        QVERIFY(!needs.diar);
     }
 
     void detectSilenceTask_declaresVadModelPrerequisite()
@@ -106,7 +121,7 @@ private slots:
         QVERIFY(threw);
     }
 
-    // Item 010 regression: an empty-but-error-free VAD result (chunkingError
+    // Regression: an empty-but-error-free VAD result (chunkingError
     // empty, speechSpans empty) must NOT be trusted when the transcript has
     // real segments — trusting it would complement an empty list into a
     // single whole-file silence span, which is what the observed bug wrote
@@ -147,7 +162,7 @@ private slots:
 
     // Genuinely silent file: empty speechSpans AND no transcript segments —
     // the fallback's empty span list still complements to the correct
-    // whole-file silence, so the item 010 guard doesn't regress this case.
+    // whole-file silence, so the empty-result guard doesn't regress this case.
     void selectSilences_emptySpeechSpansNoSegments_yieldsWholeFileSilence()
     {
         const auto silences = DetectSilenceTask::selectSilences(QString(), {}, {}, 42.0);

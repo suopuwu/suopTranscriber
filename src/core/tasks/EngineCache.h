@@ -18,17 +18,23 @@ class DiarizationEngine;
 // (rather than owning an engine per Task) preserves that reuse while letting
 // each kind's doing-code live in its own file.
 //
-// GPU memory hygiene mirrors the old TranscriptionWorker: at most one big
-// model (ASR or labeling) is kept resident, so a transcribe evicts the label
-// engine and vice versa; evictAll() drops everything once the queue drains
-// (see TaskRunner's idle eviction, formerly evictIdle()). A DiarizationEngine
-// is built fresh for every diarize task — DiarizeTask::run() calls
-// evictDiar() before ensureDiar(), so the reuse guard in ensureDiar() never
-// actually reuses one across tasks — because letting the onnxruntime CUDA
-// arena carry over between files let it grow unbounded across a batch
-// (measured ~29 GB on one real recording; see
-// patches/sherpa-onnx-batch-segmentation.patch and item 021). Only tracked
-// here so evictAll() can still release it.
+// GPU memory hygiene: at most one big model (ASR or labeling) is kept
+// resident at a time, plus diarization. Which engines survive a given task's
+// dispatch is decided by ONE rule — applyResidencyPolicy(), called by
+// TaskRunner::execute() with the dispatching Task's own Task::EngineNeeds —
+// rather than each kind hand-clearing its siblings (that hand-
+// written approach is exactly how a diarization arena survived into an
+// unrelated transcribe and pressured the GPU into an uncatchable ggml
+// abort). evictAll() drops everything once the queue drains (see
+// TaskRunner's idle eviction, formerly evictIdle()).
+//
+// A DiarizationEngine is additionally built fresh for every diarize task
+// even though diarize DECLARES needing it (so the policy leaves it alone):
+// DiarizeTask::run() calls evictDiar() itself before ensureDiar(), so the
+// reuse guard in ensureDiar() never actually reuses one across tasks —
+// because letting the onnxruntime CUDA arena carry over between files let it
+// grow unbounded across a batch (measured ~29 GB on one real recording; see
+// patches/sherpa-onnx-batch-segmentation.patch).
 class EngineCache {
 public:
     EngineCache();
@@ -75,27 +81,38 @@ public:
     DiarizationEngine *ensureDiar(const QString &segmentationModelId, const QString &embeddingModelId,
                                    float threshold, QString *error);
 
-    // Drop the ASR engine specifically — a labeling task calls this so the
-    // label model doesn't share VRAM with a resident whisper model.
+    // Drop the ASR engine specifically. Called by applyResidencyPolicy() for
+    // any dispatching task that doesn't declare needing it.
     void evictAsr();
-    // Drop the labeling engine specifically — a transcribe task calls this
-    // (the old run()'s opening m_labelingEngine.reset()).
+    // Drop the labeling engine specifically. Called by applyResidencyPolicy()
+    // for any dispatching task that doesn't declare needing it.
     void evictLabel();
-    // Drop the diarization engine specifically — a relabel/chapters task
-    // calls this alongside evictAsr() (mirrors the old relabelJob()'s
-    // opening m_engine.reset()/m_diarizationEngine.reset() pair; diarization
-    // is never actually resident there today, reset defensively anyway in
-    // case that ever changes), and DiarizeTask::run() calls it at the start
-    // of every run (see class doc comment).
+    // Drop the diarization engine specifically. Called by
+    // applyResidencyPolicy() for any dispatching task that doesn't declare
+    // needing it, AND by DiarizeTask::run() unconditionally on every run even
+    // though diarize DOES declare needing it (see class doc comment for why
+    // that one is force-fresh regardless of the policy).
     void evictDiar();
     // Release every resident engine — called when the queue drains so a warm
     // model doesn't sit on VRAM indefinitely (old evictIdle()).
     void evictAll();
 
-    // How many times evictDiar() has run (directly or via evictAll()) —
-    // exposed purely so tst_task_diarize.cpp can assert DiarizeTask evicts
-    // the diar engine on every run() (item 021) without needing a real
-    // downloaded sherpa-onnx model to observe engine identity directly.
+    // The single residency rule: evict whichever of the three
+    // engines the dispatching task did NOT declare needing (Task::
+    // EngineNeeds), called by TaskRunner::execute() before run(). A needed
+    // engine is left untouched here — its own ensureXxx() call inside run()
+    // still decides reuse-vs-rebuild via its usual reuse key — which is what
+    // lets a run of consecutive same-need tasks (e.g. a transcribe batch)
+    // reuse one warm engine across files instead of paying a reload each time.
+    void applyResidencyPolicy(bool needAsr, bool needLabel, bool needDiar);
+
+    // Eviction counters — exposed purely so tests can assert eviction
+    // happened (diarEvictionCount) or didn't (the residency
+    // policy) without needing a real downloaded model to observe engine
+    // IDENTITY directly. asrEvictionCount()/labelEvictionCount() mirror the
+    // original diarEvictionCount().
+    int asrEvictionCount() const { return m_asrEvictionCount; }
+    int labelEvictionCount() const { return m_labelEvictionCount; }
     int diarEvictionCount() const { return m_diarEvictionCount; }
 
 private:
@@ -107,5 +124,7 @@ private:
     QString m_diarSegPath;
     QString m_diarEmbedPath;
     float m_diarThreshold = 0.5f; // part of the reuse key alongside the two paths
+    int m_asrEvictionCount = 0;
+    int m_labelEvictionCount = 0;
     int m_diarEvictionCount = 0;
 };

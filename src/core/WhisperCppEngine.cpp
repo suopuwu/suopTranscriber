@@ -195,7 +195,6 @@ std::vector<Segment> WhisperCppEngine::transcribe(const AudioChunk &chunk, const
     whisper_full(m_ctx, wparams, chunk.pcm16kMono.data(), static_cast<int>(chunk.pcm16kMono.size()));
 
     // Segments are chunk-relative on purpose — the app (not the engine)
-    // owns the offset merge (see DESIGN.md "Engine architecture" and
-    // CLAUDE.md's load-bearing constraints).
+    // owns the offset merge (see DESIGN.md "Engine architecture").
     return segments;
 }

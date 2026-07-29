@@ -38,7 +38,7 @@ std::vector<Window> groupSegmentsIntoWindows(const std::vector<std::pair<double,
 // whole-file window (today's behavior) rather than blocking transcription —
 // vadErrorOut (if given) is set to a human-readable reason exactly when that
 // fallback happens, so the caller can record it honestly in frontmatter
-// (never a silent substitution, per CLAUDE.md's "Unrecognized model id"
+// (never a silent substitution — DESIGN.md's "Unrecognized model id"
 // precedent for ModelManager).
 //
 // speechSpansOut (silence-capture feature, phase 1): when non-null and the
@@ -54,7 +54,7 @@ std::vector<Window> computeWindows(const std::vector<float> &pcm16kMono, const Q
                                     double targetWindowSeconds = 180.0, double maxWindowSeconds = 300.0);
 
 // Pure complement of `speechSpans` over [0, totalSeconds] — the non-speech
-// (silence-and-noise, CLAUDE.md/the silence-phase-1 decision: VAD's
+// (silence-and-noise — by decision, VAD's
 // non-speech bucket covers both, no separate RMS pass) stretches a caller
 // records as the `silences:` frontmatter list. speechSpans need not be
 // sorted; this sorts + merges overlapping/touching spans defensively before

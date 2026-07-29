@@ -1,4 +1,4 @@
-// Living spec for queue item 072: the app-wide "click outside a focused text
+// Living spec for the app-wide "click outside a focused text
 // field blurs (commits) it" behavior, made UNIVERSAL by a C++ application-level
 // event filter (FocusBlurFilter) installed on qApp.
 //
@@ -305,7 +305,7 @@ private slots:
 
         QTRY_VERIFY2(!m_titleField->hasActiveFocus(),
                      "a press over the transcript ScrollView must blur the focused title "
-                     "despite the ScrollView eating the press (queue item 072, gap A)");
+                     "despite the ScrollView eating the press");
     }
 
     // The press-vs-bounds rule (a press INSIDE the focused field must KEEP focus,
@@ -389,7 +389,7 @@ private slots:
         QVERIFY(fieldA->hasActiveFocus());
         pressAtScene(&view, sceneCenter(fieldB));
         QTRY_VERIFY2(!fieldA->hasActiveFocus(),
-                     "an outside press must blur the focused field (queue item 072)");
+                     "an outside press must blur the focused field");
 
         // fieldB: same again for a DIFFERENT field — proving the blur isn't keyed
         // to one specific field id (completeness gap B).
@@ -398,7 +398,7 @@ private slots:
         pressAtScene(&view, sceneCenter(fieldA));
         QTRY_VERIFY2(!fieldB->hasActiveFocus(),
                      "an outside press must blur ANY focused field, not just one "
-                     "(queue item 072, gap B)");
+                     "(completeness gap B)");
     }
 };
 
@@ -406,7 +406,8 @@ int main(int argc, char *argv[])
 {
     // Offscreen + sandboxed org/app name: MainPanel.qml loads the AppSettings
     // singleton, whose Settings{} element must NEVER touch the real
-    // ~/.config/suopTranscriber (CLAUDE.md).
+    // ~/.config/suopTranscriber (tests must never touch the user's real
+    // vault or app config).
     qputenv("QT_QPA_PLATFORM", "offscreen");
     qputenv("QT_QUICK_CONTROLS_STYLE", "Basic");
     QCoreApplication::setOrganizationName(QStringLiteral("suopTranscriberTestHarness"));

@@ -57,14 +57,6 @@ ModelPrerequisites RelabelTask::prerequisites() const
 
 void RelabelTask::run(TaskContext &ctx)
 {
-    // Mirrors TranscribeTask's eviction of the label engine, inverted: this
-    // task needs only the label engine, so free whisper's GPU-resident model
-    // now rather than let it sit warm through a labeling pass that never
-    // touches it. Diarization is never actually resident here either —
-    // evicted defensively in case that ever changes.
-    ctx.engines.evictAsr();
-    ctx.engines.evictDiar();
-
     const QString filePath = fileUrl.toLocalFile();
     const QString mdPath = sidecarPath(filePath);
     if (!QFileInfo::exists(mdPath))

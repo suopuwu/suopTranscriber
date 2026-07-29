@@ -70,7 +70,7 @@ ColumnLayout {
         font.family: "monospace"
         background: UnderlineField { focused: patternField.activeFocus }
         onEditingFinished: root.committed(text)
-        // Item 13: editable text needs an I-beam.
+        // Editable text needs an I-beam.
         HoverHandler { cursorShape: Qt.IBeamCursor }
     }
 

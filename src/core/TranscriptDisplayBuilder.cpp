@@ -96,7 +96,7 @@ QVariantMap TranscriptDisplayBuilder::build(const QVariantList &sentences,
     std::optional<QString> previousSpeaker;
     int chapterIdx = 0;
     // Real t0 of the chapter the CURRENT sentence falls under (-1 = before
-    // the first chapter marker / no chapters). Item 33 keys collapse off
+    // the first chapter marker / no chapters). Collapse is keyed off
     // this; the displayT0 the heading itself renders at is separately
     // clamped (see below), so the two are tracked independently.
     double currentChapterT0 = -1;
@@ -135,7 +135,7 @@ QVariantMap TranscriptDisplayBuilder::build(const QVariantList &sentences,
         previousSpeaker.reset(); // next real sentence's gutter shows fresh after a section break
     };
 
-    // Silence phase 3 (queue item 085): a THIRD kind of zero-length
+    // Silence phase 3: a THIRD kind of zero-length
     // pseudo-entry, reserving its own blank document line exactly like
     // pushHeading above — isSilenceMarker (not isChapterHeading) is what
     // tells every downstream consumer (gutterTimestampModel, speakerDimModel,

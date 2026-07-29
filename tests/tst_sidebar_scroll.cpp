@@ -1,5 +1,5 @@
 // Living spec + runtime verification for Sidebar.qml's scroll-offset
-// preservation across a model reset (queue item 039). A reset drops every
+// preservation across a model reset. A reset drops every
 // QModelIndex, so QQuickTreeView collapses to root rows, contentHeight shrinks,
 // and the Flickable clamps contentY — the user's scroll position is silently
 // lost by the time expandAllNow() puts the rows back. Sidebar.qml now samples

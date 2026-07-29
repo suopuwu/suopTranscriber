@@ -16,7 +16,7 @@ Popup {
     property var transcriptionController: null
     property var vaultTreeModel: null
 
-    // Item 38: the settings dialog is split into pages selected from a
+    // The settings dialog is split into pages selected from a
     // left-hand navigation rail. currentPage indexes into pageNames and gates
     // which per-section wrappers in contentColumn are visible, so the user
     // sees one page at a time instead of one giant scroll. Purely a
@@ -437,7 +437,7 @@ Popup {
         onAccepted: AppSettings.progressGlowColor = selectedColor
     }
 
-    // Item 38: left navigation rail — one entry per page in pageNames. Each
+    // Left navigation rail — one entry per page in pageNames. Each
     // entry sets currentPage; the matching section wrappers in contentColumn
     // show, the rest hide. Anchored (not in a Layout) so scrollArea/the
     // middle-drag overlay can anchor to its right edge as siblings.
@@ -496,7 +496,7 @@ Popup {
     }
 
     // Persistent dialog chrome — title + global actions, reachable from every
-    // page (Item 38 moved these out of the scrolling content).
+    // page (moved out of the scrolling content).
     RowLayout {
         id: headerRow
         anchors.left: navColumn.right
@@ -621,7 +621,7 @@ Popup {
             clip: true
             spacing: 10
 
-            // ===== Page 0: Appearance section (Item 38 page wrapper) =====
+            // ===== Page 0: Appearance section =====
             ColumnLayout {
                 Layout.fillWidth: true
                 spacing: 10
@@ -820,7 +820,7 @@ Popup {
 
             }
 
-            // ===== Page 1: Sidebar section (Item 38 page wrapper) =====
+            // ===== Page 1: Sidebar section =====
             ColumnLayout {
                 Layout.fillWidth: true
                 spacing: 10
@@ -1104,6 +1104,75 @@ Popup {
 
             }
 
+            // --- Recorder waveform ---
+            ColumnLayout {
+                Layout.fillWidth: true
+                spacing: 10
+                visible: settingsPopup.currentPage === 0
+
+            Label {
+                text: qsTr("Recorder Waveform")
+                color: "white"
+                font.bold: true
+            }
+
+            RowLayout {
+                Layout.fillWidth: true
+                Label {
+                    Layout.preferredWidth: 90
+                    Layout.alignment: Qt.AlignVCenter
+                    wrapMode: Text.WordWrap
+                    color: "white"
+                    text: qsTr("Waveform")
+                }
+                Flow {
+                    Layout.fillWidth: true
+                    spacing: 6
+                    Repeater {
+                        model: [
+                            { id: "filled", label: qsTr("Filled") },
+                            { id: "line", label: qsTr("Line") }
+                        ]
+                        Item {
+                            id: waveStyleChip
+                            required property var modelData
+                            readonly property bool current: AppSettings.recordingWaveformStyle === waveStyleChip.modelData.id
+                            implicitWidth: waveStyleChipLabel.implicitWidth + 20
+                            implicitHeight: 30
+
+                            HoverHandler { id: waveStyleChipHover; cursorShape: Qt.PointingHandCursor }
+                            TapHandler { onTapped: AppSettings.recordingWaveformStyle = waveStyleChip.modelData.id }
+
+                            Rectangle {
+                                anchors.fill: parent
+                                radius: AppSettings.borderRadius
+                                color: waveStyleChip.current ? "#33ffffff"
+                                       : (waveStyleChipHover.hovered ? Theme.surfaceHover : Theme.surface)
+                                border.width: 1
+                                border.color: waveStyleChip.current ? AppSettings.accentColor : Theme.border
+                            }
+                            Label {
+                                id: waveStyleChipLabel
+                                anchors.centerIn: parent
+                                text: waveStyleChip.modelData.label
+                                color: waveStyleChip.current ? "white" : "#bbbbbb"
+                                font.pixelSize: 12
+                            }
+                        }
+                    }
+                }
+                SettingResetButton { propertyName: "recordingWaveformStyle" }
+            }
+
+            ToggleSetting {
+                id: recordingWaveformMirroredToggle
+                label: qsTr("Mirror the wave above and below the centre line")
+                labelWrap: true
+                propertyName: "recordingWaveformMirrored"
+            }
+
+            }
+
             // Accent Color section (page 0)
             ColumnLayout {
                 Layout.fillWidth: true
@@ -1193,7 +1262,7 @@ Popup {
                 SettingResetButton { propertyName: "highlightColor" }
             }
 
-            // Item 7 (Wave E): playback + Ctrl+F search-match highlight radius,
+            // Playback + Ctrl+F search-match highlight radius,
             // now independently adjustable from the app-wide border radius
             // above (was previously hardcoded to follow it).
             SliderSetting {
@@ -1602,7 +1671,7 @@ Popup {
                 font.pixelSize: 11
             }
 
-            // Item 15 (Wave E): only meaningful when NOT hard-restricted —
+            // Only meaningful when NOT hard-restricted —
             // restrictTagsToExisting above is already a hard rule, so this
             // gradient wouldn't have anything to adjust while it's on.
             SliderSetting {
@@ -1667,7 +1736,7 @@ Popup {
                 font.pixelSize: 11
             }
 
-            // Item 27: chapter-generation density. Deliberately NOT gated on
+            // Chapter-generation density. Deliberately NOT gated on
             // autoLabelEnabledSwitch (unlike the two sliders above) — chapters
             // are generated on demand via the "Generate chapters" button
             // regardless of whether the auto-label pass is enabled, so this
@@ -2018,7 +2087,7 @@ Popup {
                             onTextChanged: previewTimer.restart()
                         }
 
-                        // Item 43: was a non-modal Popup reparented onto the
+                        // Was a non-modal Popup reparented onto the
                         // small "ⓘ" info button (regexInfoButton), positioned
                         // relative to THAT button rather than this popup's own
                         // root — near an edge, or after the rule list scrolls,

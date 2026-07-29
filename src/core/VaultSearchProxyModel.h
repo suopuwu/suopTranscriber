@@ -13,7 +13,7 @@
 // dims non-matches visually rather than removing them, so filterAcceptsRow()
 // always accepts free-text (searchQuery) matching.
 //
-// Item 16/17 (Wave E): tagFilter is a SEPARATE, harder filter — unlike free
+// tagFilter is a SEPARATE, harder filter — unlike free
 // text search, a tag filter genuinely HIDES rows that don't have every
 // requested tag (a directory is kept if ANY descendant has all the
 // requested tags, same recursive-match shape as matchesSearch below).

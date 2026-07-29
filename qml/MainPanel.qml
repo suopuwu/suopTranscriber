@@ -123,7 +123,7 @@ Rectangle {
     // down this file. Editing while this file's transcription job is
     // actively appending live segments would fight the same text the user
     // is typing into.
-    // activeIsForeground (Wave N, task system): the blocking overlay must NOT
+    // activeIsForeground: the blocking overlay must NOT
     // appear for a Background task (a benchmark/sweep on this same file — see
     // Task::Presentation). `busy` alone is true for those too now that they're
     // real queued tasks, so gating on presentation is what keeps a benchmark
@@ -142,7 +142,7 @@ Rectangle {
         && mainPanel.transcriptionController.busy
         && mainPanel.transcriptionController.activeIsForeground
         && mainPanel.transcriptionController.currentFile.toString() === mainPanel.player.source.toString()
-    // Item 55: true only in the window between THIS file's (re)transcription
+    // True only in the window between THIS file's (re)transcription
     // job starting and the first NEW segment actually landing on disk — i.e.
     // while the OLD transcript is still all that's visible and nothing live
     // has streamed in yet. Set true whenever transcribingThisFile flips true,
@@ -241,7 +241,7 @@ Rectangle {
         && mainPanel.busyOrQueuedKeys.indexOf(mainPanel.player.source.toString() + " " + "transcribe") !== -1
 
     signal openVaultRequested()
-    // Item 16 (Wave E): a tag pill was clicked — Main.qml routes this to
+    // A tag pill was clicked — Main.qml routes this to
     // sidebar.applyTagFilter(tag).
     signal tagActivated(string tag)
     // A speaker pill was clicked — Main.qml routes this to
@@ -269,14 +269,14 @@ Rectangle {
     // file back in the vault without dragging the panel off what you're reading.
     property url closedByDeleteUrl: ""
 
-    // Feature 2: multi-paragraph, editable prelude (upgrades O26's old
+    // Multi-paragraph, editable prelude (upgrades the old
     // read-only single-line summary) — lives in the .md BODY, not
     // metadata/frontmatter (see TranscriptionController::readPrelude()),
     // so it needs its own property, populated alongside metadata in
     // refreshMetadata() below.
     property string prelude: ""
 
-    // Feature 3b/3c: chapter markers (see
+    // Chapter markers (see
     // TranscriptionController::readChapters()) — shared by the seek-bar tick
     // marks (3b) and the chapter list (3c), populated once alongside
     // prelude/metadata in refreshMetadata() below rather than each
@@ -284,18 +284,18 @@ Rectangle {
     property var chapters: []
     property bool chaptersExpanded: true
 
-    // Item 34/35: at most ONE chapter title is in click-to-edit/selectable
+    // At most ONE chapter title is in click-to-edit/selectable
     // state at a time — keyed by the chapter's REAL t0 (chapters[i].t0, the
     // same timestamp setChapterTitle/deleteChapter expect), shared by BOTH
     // the TOC row and the in-transcript heading so activating one exits the
     // other. -1 = none editing (no chapter has a negative timestamp, so it's
     // a safe sentinel even for the t0==0 first chapter). This single-state
-    // approach is what kills item 34's multiple-simultaneous-highlights bug:
+    // approach is what kills the multiple-simultaneous-highlights bug:
     // a title is a plain, non-selectable label until it becomes the one
     // active edit field, so no two rows can hold lingering selections at once.
     property real editingChapterTs: -1
 
-    // Item 33: which chapters are collapsed in the transcript body, keyed by
+    // Which chapters are collapsed in the transcript body, keyed by
     // String(chapterT0) → true. displayData below drops a collapsed chapter's
     // body sentences from BOTH the flowing text and displaySentences (keeping
     // the heading itself), so the monolithic transcriptArea string, its
@@ -305,8 +305,8 @@ Rectangle {
     property string searchQuery: ""
     property bool searchExpanded: false
     property int searchMatchIndex: -1
-    // Item 13: total match count + this match's 1-based ordinal, for the
-    // "a/b" display next to the search field. Item 7: raw start/length of
+    // Total match count + this match's 1-based ordinal, for the
+    // "a/b" display next to the search field. Raw start/length of
     // the CURRENT match (in the same position space as parseSentences'
     // start/length), feeding searchMatchRect below.
     property int searchMatchCount: 0
@@ -314,7 +314,7 @@ Rectangle {
     property int searchMatchStart: -1
     property int searchMatchLength: 0
 
-    // Item 7: replace state. There is no separate find pattern — searchQuery
+    // Replace state. There is no separate find pattern — searchQuery
     // above IS the pattern, so the one search field drives both
     // search-as-you-type and replace and the two can never disagree about
     // what "the match" is. Consequently the mode toggles below govern search
@@ -383,7 +383,7 @@ Rectangle {
         filenameSubtitle.text = mainPanel.currentFileBase()
     }
 
-    // Item P23: split out of refreshMetadata() above — prelude/chapters live
+    // Split out of refreshMetadata() above — prelude/chapters live
     // in the transcript BODY (not frontmatter), so populating them calls
     // readPrelude()/readChapters(), which themselves call the SAME
     // readTranscriptBody() transcriptBody/sentences now load asynchronously
@@ -420,7 +420,7 @@ Rectangle {
             preludeEditor.fieldText = mainPanel.prelude
     }
 
-    // Item 17: insert a MANUAL chapter marker at the current playback
+    // Insert a MANUAL chapter marker at the current playback
     // position and drop straight into renaming it. Player-backed only (adding
     // "at the playhead" is meaningless for an orphaned .md with no audio) —
     // the add affordance is hidden in that case. addChapter/setChapterTitle/
@@ -433,14 +433,14 @@ Rectangle {
             return
         const seconds = mainPanel.player.position / 1000
         const title = qsTr("New chapter")
-        // Item 20: undo of an add is a delete at the same timestamp.
+        // Undo of an add is a delete at the same timestamp.
         undoStack.push({type: "chapterEdit", op: "add", fileUrl: url,
                             timestamp: seconds, title: title, manual: true})
         mainPanel.transcriptionController.addChapter(url, seconds, title)
         mainPanel.editingChapterTs = seconds
     }
 
-    // Item 35: commit a chapter rename via setChapterTitle (which promotes an
+    // Commit a chapter rename via setChapterTitle (which promotes an
     // auto chapter to manual on edit, per the backend). No-op on an empty or
     // unchanged title, mirroring commitRename()/commitPrelude(). Keyed by the
     // chapter's real t0 — shared by the TOC row and the transcript heading.
@@ -451,20 +451,20 @@ Rectangle {
         const trimmed = newValue.trim()
         if (trimmed === "" || trimmed === oldTitle)
             return
-        // Item 20: rename is symmetric — undo restores oldTitle, redo re-applies.
+        // Rename is symmetric — undo restores oldTitle, redo re-applies.
         undoStack.push({type: "chapterEdit", op: "rename", fileUrl: url,
                             timestamp: timestamp, oldTitle: oldTitle, newTitle: trimmed})
         mainPanel.transcriptionController.setChapterTitle(url, timestamp, trimmed)
     }
 
-    // Item 17: remove a chapter marker. manual is carried into the undo entry
+    // Remove a chapter marker. manual is carried into the undo entry
     // so an undo (add-back) can be recorded honestly, though addChapter always
     // re-creates a manual marker regardless.
     function deleteChapterAt(timestamp, title, manual) {
         const url = mainPanel.currentFileUrl()
         if (!mainPanel.transcriptionController || String(url) === "")
             return
-        // Item 20: undo of a delete re-adds the chapter with its old title.
+        // Undo of a delete re-adds the chapter with its old title.
         undoStack.push({type: "chapterEdit", op: "delete", fileUrl: url,
                             timestamp: timestamp, title: title, manual: manual})
         mainPanel.transcriptionController.deleteChapter(url, timestamp)
@@ -472,7 +472,7 @@ Rectangle {
             mainPanel.editingChapterTs = -1
     }
 
-    // Item 33: toggle a chapter's collapsed state in the transcript (keyed by
+    // Toggle a chapter's collapsed state in the transcript (keyed by
     // its real t0). Reassigns the whole map so collapsedChaptersChanged fires
     // and displayData re-evaluates (a plain in-place mutation wouldn't notify).
     function toggleChapterCollapse(chapterT0) {
@@ -605,7 +605,7 @@ Rectangle {
         mainPanel.refreshMetadata()
     }
 
-    // Item 13: tags are comma-separated (see TranscriptionController's
+    // Tags are comma-separated (see TranscriptionController's
     // frontmatter format — not a YAML list), so split+trim+drop-empties here.
     function currentTags() {
         const meta = mainPanel.metadata
@@ -677,7 +677,7 @@ Rectangle {
         return mainPanel.currentMdUrl
     }
 
-    // Item 2 (delete): the open file's two destructive actions. Both TRY THE
+    // The open file's two destructive actions. Both TRY THE
     // TRASH FIRST and only confirm if the trash refuses — the same flow, and
     // the same reasoning, as Sidebar.qml's beginDeleteFile() (see its comment
     // for why confirming a recoverable delete was friction that cried wolf).
@@ -725,7 +725,8 @@ Rectangle {
     // listener may prompt or the confirm would double-open). Without a controller
     // (plain-model harnesses) it falls back to the synchronous model.trash* +
     // handleTrashResult here. A 1-element list: these calls are batch-shaped and
-    // MainPanel's cluster is the single-open-file half of the CLAUDE.md parity.
+    // MainPanel's cluster is the single-open-file half of the per-file-action
+    // parity (the Sidebar ribbon is the bulk half).
     function requestDeleteTranscript() {
         const url = mainPanel.currentFileUrl()
         if (String(url) === "")
@@ -816,7 +817,7 @@ Rectangle {
             }
         }
 
-        // Item P16: reverse of this op is renaming trimmed back to oldName
+        // Reverse of this op is renaming trimmed back to oldName
         // — stored ready-to-replay (not just "oldName") so undoLast() can
         // invoke renameSpeaker() directly without re-deriving anything.
         undoStack.push({type: "speakerRename", fileUrl: mainPanel.currentFileUrl(),
@@ -1062,7 +1063,7 @@ Rectangle {
         }
     }
 
-    // Item P16 / Item 46: undo+redo for the small manual edits this panel
+    // Undo+redo for the small manual edits this panel
     // can make directly (label, prelude, tags, transcript text, speaker
     // rename) — a stack of {type, ...} entries, each recording BOTH its
     // pre-edit (oldValue) and post-edit (newValue) state so the SAME entry can
@@ -1142,7 +1143,7 @@ Rectangle {
             break
         }
         case "chapterEdit": {
-            // Item 20: chapter add/rename/delete, undoable/redoable like every
+            // Chapter add/rename/delete, undoable/redoable like every
             // other entry type. All three backend calls emit finished(), which
             // the Connections block refreshes chapters from — so, unlike the
             // label/prelude/tags cases above, no explicit
@@ -1191,7 +1192,7 @@ Rectangle {
         mainPanel.applyHistoryEntry(entry, "redo")
     }
 
-    // Item 51: clears the selection in the panel's main selectable text
+    // Clears the selection in the panel's main selectable text
     // bodies (transcript + prelude). deselect() is a no-op when there is no
     // selection, so this is always safe — it never disturbs cursor position
     // or focus. Called by the root deselect TapHandler below when a click
@@ -1208,7 +1209,7 @@ Rectangle {
             titleField.focus = false
         if (filenameSubtitle.activeFocus)
             filenameSubtitle.focus = false
-        // Item 34: clicking a non-interactive region also commits+exits any
+        // Clicking a non-interactive region also commits+exits any
         // in-progress chapter-title edit — the active title's onEditingChanged
         // handler forces its own blur (→ commit) when this clears.
         mainPanel.editingChapterTs = -1
@@ -1412,7 +1413,7 @@ Rectangle {
         }
     }
 
-    // Item P15/P20: adds/removes one tag from the current file's list and
+    // Adds/removes one tag from the current file's list and
     // rewrites the whole list via setTags() (there is no single-tag add/
     // remove call — TranscriptionController always writes the full,
     // comma-joined set). Works for both the orphaned-md and player-backed
@@ -1460,7 +1461,7 @@ Rectangle {
         mainPanel.transcriptionController.setTags(mainPanel.currentFileUrl(), updated)
     }
 
-    // Item P23: transcriptBody/sentences used to be readonly computed
+    // transcriptBody/sentences used to be readonly computed
     // properties that called readTranscriptBody()/parseSentences()
     // DIRECTLY inside their binding — on a large already-transcribed file,
     // that meant a full synchronous regex-parse-the-whole-file pass ran on
@@ -1517,7 +1518,7 @@ Rectangle {
         mainPanel.transcriptBody = ""
         mainPanel.sentences = []
         mainPanel.transcriptLoadingFor = ""
-        // Item P23: prelude/chapters are per-file BODY content, populated only
+        // Prelude/chapters are per-file BODY content, populated only
         // by refreshPreludeAndChapters() — which deliberately can't run on this
         // path (see its doc comment) and never runs at all for a file with
         // nothing to load (untranscribed, or no file). Clearing here is what
@@ -1574,7 +1575,7 @@ Rectangle {
                 return // superseded by a later file switch — discard
             mainPanel.transcriptBody = body
             mainPanel.sentences = loadedSentences
-            // Item P23: the cold-open path defers prelude/chapters to here (see
+            // The cold-open path defers prelude/chapters to here (see
             // refreshPreludeAndChapters()'s doc comment) — this background load
             // just warmed the body cache for this exact file, so the reads it
             // does are cheap and can't block the GUI thread.
@@ -1586,14 +1587,14 @@ Rectangle {
             // edit and would clobber live toggles.
             mainPanel.initCollapsedFromFrontmatter()
         }
-        // Item 10/P23: same live-update gating the old computed bindings
+        // Same live-update gating the old computed bindings
         // used (currentFile matching the open file) — a synchronous
         // refresh here is cheap (small incremental parse via the existing
         // prefix-diff cache), unlike the cold-open case above.
         function onLiveUpdateTickChanged() {
             if (mainPanel.player
                     && mainPanel.transcriptionController.currentFile.toString() === mainPanel.player.source.toString()) {
-                // Item 32: a live tick means the first segment has been
+                // A live tick means the first segment has been
                 // written, which strictly postdates the frontmatter written
                 // at job START — so hasMetadata is guaranteed readable
                 // by now. onProgressChanged (the other metadata-refresh site)
@@ -1606,7 +1607,7 @@ Rectangle {
                 // guarantees refreshTranscriptSync() below sees hasMetadata
                 // true (it gates the body read on it), so live output shows.
                 mainPanel.refreshMetadata()
-                // Item 55: the new transcript has started being written — drop
+                // The new transcript has started being written — drop
                 // the blur/spinner overlay so live output streams in visibly.
                 mainPanel.awaitingFirstSegment = false
                 mainPanel.refreshTranscriptSync()
@@ -1640,7 +1641,7 @@ Rectangle {
     // distinctSpeakerIds/commitSpeakerRename still work off the raw on-disk
     // sentences[i].speaker directly (see effectiveSpeakerName()'s doc
     // comment for why the override is deliberately NOT baked in there).
-    // Item P32: chapter headings (mainPanel.chapters, each {t0, title}) are
+    // Chapter headings (mainPanel.chapters, each {t0, title}) are
     // interleaved into this SAME list in time order, as zero-length pseudo-
     // "sentence" entries (isChapterHeading: true) that reserve one real
     // blank line in `text` for themselves — a genuine document line, not
@@ -1718,7 +1719,7 @@ Rectangle {
     //
     // NOTE this is emphatically NOT something a worker thread could have
     // fixed — QQuickItems can only be created on the GUI thread. The file
-    // read + regex parse were already moved off-thread (see item P23 /
+    // read + regex parse were already moved off-thread (see
     // loadTranscriptAsync); this was the rest of the cost.
     //
     // Each entry carries `idx` (its own index into displaySentences, assigned
@@ -1746,7 +1747,7 @@ Rectangle {
                 s => !s.isChapterHeading && !s.isSilenceMarker && s.speaker !== mainPanel.gutterSpeakerFilter)
     readonly property var chapterHeadingModel:
         mainPanel.displaySentences.filter(s => s.isChapterHeading)
-    // Silence phase 3 (queue item 085): one entry per divider reserved by
+    // Silence phase 3: one entry per divider reserved by
     // pushSilenceMarker above, keyed off the same idx the timestamp/speaker
     // gutters use (see silenceMarkerRepeater below the chapter-heading one).
     readonly property var silenceMarkerModel:
@@ -1905,7 +1906,7 @@ Rectangle {
         ? mainPanel.transcriptionController.parseSilences(mainPanel.metadata.silences)
         : []
 
-    // Silence phase 3 (queue item 085): minimum span length worth a VISUAL
+    // Silence phase 3: minimum span length worth a VISUAL
     // between-segment divider. Deliberately separate from
     // AppSettings.skipSilenceThresholdSeconds — that one governs PLAYBACK
     // SKIPPING (phase 2) and is user-configurable down to sub-second values
@@ -2027,7 +2028,7 @@ Rectangle {
         return Qt.rect(x, y, width, height)
     }
 
-    // Item 7: same shape as activeSentenceRect above, but for the current
+    // Same shape as activeSentenceRect above, but for the current
     // Ctrl+F search match instead of the playing sentence.
     readonly property rect searchMatchRect: {
         void transcriptArea.length
@@ -2044,7 +2045,7 @@ Rectangle {
         return Qt.rect(x, y, width, height)
     }
 
-    // Item 12: search ignores segment-line formatting entirely — built from
+    // Search ignores segment-line formatting entirely — built from
     // mainPanel.displaySentences (already timestamp-free/reactive), joining
     // just the spoken text with single spaces so a query can start at the
     // end of one segment and finish at the start of the next. `map` keeps
@@ -2063,7 +2064,7 @@ Rectangle {
         return {clean: clean, map: map}
     }
 
-    // Item 13/7: every non-overlapping match of the current pattern in the
+    // Every non-overlapping match of the current pattern in the
     // clean corpus, left to right, as {index, length}. One global-RegExp scan
     // now answers the "a/b" count, the current match's ordinal, AND the match
     // range itself — the three separate indexOf scans this used before the
@@ -2157,12 +2158,12 @@ Rectangle {
         // steal focus from the search field, which would stop repeated
         // Enter presses from working (each jumps to the next match without
         // needing to re-click into it). The visible highlight itself is
-        // searchMatchOverlay (Item 7), not the native selection.
+        // searchMatchOverlay, not the native selection.
         transcriptArea.select(selStart, selEnd)
         Qt.callLater(mainPanel.scrollMatchIntoView)
     }
 
-    // Item P10: select() alone does NOT scroll the match into view here —
+    // Select() alone does NOT scroll the match into view here —
     // transcriptArea is readOnly and never takes focus in locateMatch()
     // (deliberately, so repeated Enter keeps working from the search
     // field), and QQC2's automatic cursor-follow scrolling only engages for
@@ -2225,7 +2226,7 @@ Rectangle {
         mainPanel.locateMatch(mainPanel.searchMatchIndex < 0 ? 0 : mainPanel.searchMatchIndex + 1)
     }
 
-    // Item 7: compiles searchQuery into a JS RegExp — treated as literal text
+    // Compiles searchQuery into a JS RegExp — treated as literal text
     // (special chars escaped) unless findRegexEnabled, always with "g" when
     // `global`, plus "i" when findCaseInsensitive. An invalid pattern sets
     // the inline findReplaceError banner and returns null instead of
@@ -2312,13 +2313,13 @@ Rectangle {
     // identities' change handlers (player.source for audio, orphanedMdPath for
     // an orphaned .md) so the two modes reset identically.
     //
-    // Item P8: restart the repaint nudge on EVERY file open, not just the
+    // Restart the repaint nudge on EVERY file open, not just the
     // empty->populated transition (see transcriptRepaintNudgeTimer's own doc
     // comment below) — switching directly between two already-transcribed files
     // never passes through an empty state, so onTranscriptBodyChanged's own
-    // trigger alone would miss it. Item P16: reset per-file undo history so
+    // trigger alone would miss it. Reset per-file undo history so
     // Ctrl+Z can never reach across a file switch into a different note's edits.
-    // Item P23: refreshMetadata() is done by each caller BEFORE this (cheap
+    // refreshMetadata() is done by each caller BEFORE this (cheap
     // frontmatter read) but refreshPreludeAndChapters() is NOT — this is the
     // cold-open case, see beginTranscriptLoad()'s doc comment.
     function resetForFileOpen() {
@@ -2329,7 +2330,7 @@ Rectangle {
         // A pending "undo could reopen this" only holds while the panel
         // stays where the delete left it — see closedByDeleteUrl.
         mainPanel.closedByDeleteUrl = ""
-        // Item 33/34: collapse + which-chapter-is-editing are per-file
+        // Collapse + which-chapter-is-editing are per-file
         // view state keyed by this file's chapter timestamps — reset on a
         // file switch so they never leak into a different note's chapters.
         mainPanel.collapsedChapters = ({})
@@ -2390,7 +2391,7 @@ Rectangle {
                     && mainPanel.transcriptionController.isSameFile(fileUrl, mainPanel.player.source))
                 mainPanel.refreshTranscriptSync()
         }
-        // Item 10: frontmatter is written at job START (durability, see
+        // Frontmatter is written at job START (durability, see
         // TranscriptionController), before any segment lines exist — so
         // hasMetadata can flip true well before onFinished fires.
         // Re-checking on every progress tick (for the file currently open)
@@ -2404,7 +2405,7 @@ Rectangle {
             }
         }
     }
-    // Item 2 (delete): react to a transcript/file deletion of the OPEN file —
+    // React to a transcript/file deletion of the OPEN file —
     // whether triggered here (MainPanel's delete icons) or from the Sidebar's
     // context menu for the same file. transcriptDeleted keeps the audio, so
     // just re-read metadata (it reverts to untranscribed); fileDeleted removes
@@ -2481,7 +2482,7 @@ Rectangle {
                 mainPanel.showAudioFile(path)
         }
     }
-    // Item O10: typing now searches immediately (not just on Enter) —
+    // Typing searches immediately (not just on Enter) —
     // reset first (clears the stale match's highlight/count instantly) then
     // locate the FIRST match from the very start of the corpus. Enter
     // (searchField.onAccepted -> jumpToNextMatch) still advances from the
@@ -2491,7 +2492,7 @@ Rectangle {
         mainPanel.locateMatch(0)
     }
 
-    // Item 7: the mode toggles now feed the live search as well as replace
+    // The mode toggles now feed the live search as well as replace
     // (searchQuery is the pattern for both), so flipping one re-runs the
     // search from the top the same way retyping the query does — otherwise
     // the highlight and the "a/b" count would keep describing the OLD mode.
@@ -2505,7 +2506,7 @@ Rectangle {
         mainPanel.locateMatch(0)
     }
 
-    // O1: on first open of an already-transcribed file, transcriptArea can
+    // On first open of an already-transcribed file, transcriptArea can
     // transiently compute a wrong (oversized) width for one frame right as
     // `visible` flips true and `text` is set in the same tick, leaving the
     // text invisible (while the highlight overlay, a separate Rectangle,
@@ -2526,13 +2527,13 @@ Rectangle {
         }
     }
 
-    // Item 8 (Wave D): follow the transcript as it grows during an active
+    // Follow the transcript as it grows during an active
     // transcription of the currently-open file — only while that job is
     // actually running, so browsing a finished transcript never gets
     // yanked to the bottom. Qt.callLater so the TextArea/ScrollView have
     // re-laid-out with the new text before contentHeight is read.
     //
-    // O6: only if the user was ALREADY scrolled at/near the bottom before
+    // Only if the user was ALREADY scrolled at/near the bottom before
     // this change — otherwise a user who scrolled up to re-read earlier
     // text would get yanked back down on every new segment. Checked here,
     // BEFORE Qt.callLater/new layout, against the current (pre-growth)
@@ -2580,7 +2581,7 @@ Rectangle {
         }
     }
 
-    // Item P16: undoes the last label/prelude/tag/transcript/speaker-rename
+    // Undoes the last label/prelude/tag/transcript/speaker-rename
     // edit made through this panel — see undoStack's own doc comment above.
     Shortcut {
         sequence: "Ctrl+Z"
@@ -2588,7 +2589,7 @@ Rectangle {
         onActivated: mainPanel.undoLast()
     }
 
-    // Item 46 / Item 20: redo — re-applies the most recently undone edit.
+    // Redo — re-applies the most recently undone edit.
     // Bound to BOTH conventional redo chords (Ctrl+Y and Ctrl+Shift+Z), each
     // as its own Shortcut so both work regardless of platform habit. Gated
     // the same way Ctrl+Z is (panel focus + a non-empty redoStack).
@@ -2598,7 +2599,7 @@ Rectangle {
         onActivated: mainPanel.redoLast()
     }
 
-    // Item 7: Ctrl+H opens the SAME bar Ctrl+F does — there is only one now —
+    // Ctrl+H opens the SAME bar Ctrl+F does — there is only one now —
     // but arms the replace row on the way in, so the old "jump straight to
     // replace" muscle memory still lands somewhere useful. Same enable-gate
     // as Ctrl+F. Not a toggle: it's "get me to replace", so pressing it twice
@@ -2613,7 +2614,7 @@ Rectangle {
         }
     }
 
-    // Item 51: a plain left-click landing on a non-interactive region (the
+    // A plain left-click landing on a non-interactive region (the
     // panel's empty background, a gap between rows) clears any active text
     // selection. Attached to the root so it only fires when nothing deeper
     // under the pointer consumes the press — a deeper handler always wins
@@ -2683,7 +2684,7 @@ Rectangle {
         // replace the old hand-rolled transcriptViewportContainer chrome.
         header: [
 
-        // Item 13: playback progress bar relocated to the very top, full
+        // Playback progress bar relocated to the very top, full
         // width, with a play/pause icon instead of a separate Play button.
         // Hidden entirely for the orphaned-md text-only view (nothing to
         // play).
@@ -2699,7 +2700,7 @@ Rectangle {
             Item {
                 id: titleContainer
                 Layout.fillWidth: true
-                // Item 048: without a floor, this is the only fillWidth item
+                // Without a floor, this is the only fillWidth item
                 // in the sticky title RowLayout, so once the search/replace
                 // cluster expands (~350px of fixed-width controls) the
                 // RowLayout squeezes titleContainer toward 0 instead of
@@ -2768,7 +2769,7 @@ Rectangle {
 
                             Keys.onEscapePressed: titleField.text = mainPanel.displayTitle()
 
-                            // Item 13: QQC2 TextField has no built-in I-beam
+                            // QQC2 TextField has no built-in I-beam
                             // — add one so it reads as editable text, same
                             // idiom as transcriptArea/searchField.
                             HoverHandler { cursorShape: Qt.IBeamCursor }
@@ -2810,7 +2811,7 @@ Rectangle {
                         }
                     }
 
-                    // Item P5: when "labels" mode is showing an AI-generated
+                    // When "labels" mode is showing an AI-generated
                     // label instead of the real filename (see
                     // AppSettings.useLabelsMainPanel/displayTitle()), the
                     // actual on-disk file is no longer visible anywhere —
@@ -2860,11 +2861,11 @@ Rectangle {
                 }
             }
 
-            // Item 28: transcribe as an icon button (same 22x22 box as the
+            // Transcribe as an icon button (same 22x22 box as the
             // regenerate/search icons it now sits beside), replacing the old
             // full-width text Button that lived down in the scrollable
             // content below the model combo. Same enable/tooltip logic the
-            // old Button had (Wave F: a manual click always re-runs,
+            // old Button had (a manual click always re-runs,
             // regardless of stored-metadata match) — modelCombo is declared
             // lower in this file but still resolves fine since ids are scoped
             // to the whole document.
@@ -2937,7 +2938,7 @@ Rectangle {
                                                                         AppSettings.diarizationSensitivity)
             }
 
-            // Item 9: regenerate auto-title — re-runs just the AI labeling
+            // Regenerate auto-title — re-runs just the AI labeling
             // pass on the already-transcribed text (no re-transcription).
             // Visible whenever there's a transcript to label, independent of
             // AppSettings.autoLabelEnabled (that setting is about running
@@ -2960,7 +2961,7 @@ Rectangle {
                                                                      AppSettings.wordiness)
             }
 
-            // Feature 3c: "Generate chapters" — mirrors regenerateLabelButton
+            // "Generate chapters" — mirrors regenerateLabelButton
             // above exactly, including orphaned-.md support: chapter
             // generation (TranscriptionController::generateChaptersJob())
             // only ever reads the .md's existing frontmatter/body, never the
@@ -2982,7 +2983,7 @@ Rectangle {
                 onTapped: mainPanel.transcriptionController.generateChapters(generateChaptersButton.targetUrl, mainPanel.vaultPath, AppSettings.chapterDensity)
             }
 
-            // Item 52: "Detect speakers" — runs speaker diarization
+            // "Detect speakers" — runs speaker diarization
             // (TranscriptionController::diarizeFile()) as its own standalone job
             // on the already-transcribed OPEN file, WITHOUT re-transcribing.
             // Lets the user add speaker detection after the fact, or redo it.
@@ -2991,7 +2992,7 @@ Rectangle {
             // real audio-backed transcribed file — not an orphaned .md (no
             // audio to diarize). See DESIGN.md "Speaker diarization".
             //
-            // Parity (CLAUDE.md): the bulk counterparts exist on the Sidebar
+            // Per-file-action parity: the bulk counterparts exist on the Sidebar
             // ribbon (detectSpeakersAllButton) and its search-scoped mirror
             // (searchDetectSpeakersButton); the old per-row hover cluster was
             // intentionally removed. Enforced by tst_styleguide's
@@ -3013,7 +3014,7 @@ Rectangle {
                                                                         AppSettings.diarizationSensitivity)
             }
 
-            // Item 2: "Delete transcript" — removes the open transcribed audio
+            // "Delete transcript" — removes the open transcribed audio
             // file's sibling .md (VaultTreeModel::trashTranscript()), reverting
             // it to untranscribed while KEEPING the audio. Only for a
             // transcribed AUDIO file (an orphaned .md has no audio to keep — it
@@ -3057,7 +3058,7 @@ Rectangle {
                 onTapped: mainPanel.requestDeleteAudioOnly()
             }
 
-            // Item 2: "Delete file" — deletes the whole open file and its
+            // "Delete file" — deletes the whole open file and its
             // sidecars (VaultTreeModel::trashFiles()): audio + .md + partial,
             // or an orphaned .md alone. Shown for any open file (audio OR
             // orphaned .md). Same isQueued gate as above.
@@ -3082,11 +3083,11 @@ Rectangle {
                 onTapped: mainPanel.requestDeleteFile()
             }
 
-            // Item 18: search icon → expands to a text field, Ctrl+F while
+            // Search icon → expands to a text field, Ctrl+F while
             // the main panel has focus. Searches title/tags (via
             // metadata, already loaded) + the transcript body
             // (jumpToNextMatch() selects/scrolls the next match below).
-            // Item 7: this field is ALSO the find pattern for replace — the
+            // This field is ALSO the find pattern for replace — the
             // .*/Aa toggles and the Replace checkbox sit right after it, and
             // the replace row unfolds below the whole title row.
             // Extracted to SearchReplaceBar.qml. Layout.fillWidth is gated on
@@ -3100,7 +3101,7 @@ Rectangle {
             }
         },
 
-        // Item 7: the replace row — sticky, right under the title/search row.
+        // The replace row — sticky, right under the title/search row.
         // The find half of this bar is the search row above (searchField IS
         // the pattern, .*/Aa are its modes), so all that lives here is the
         // replacement string, the two actions, and the shared error banner.
@@ -3130,7 +3131,7 @@ Rectangle {
         // are gone.
             ColumnLayout {
                 id: scrollableContent
-                // Item 55: while a (re)transcription for THIS file has started
+                // While a (re)transcription for THIS file has started
                 // but no new segment has streamed in yet, dim + hard-disable the
                 // stale transcript so it can't be selected/hovered/edited (the
                 // transcribingOverlay in the bodyOverlay slot shows a spinner on
@@ -3151,14 +3152,14 @@ Rectangle {
                 width: notePage.availableContentWidth
                 spacing: 12
 
-                // Item 13: there was previously no way to see generated tags at all
+                // There was previously no way to see generated tags at all
                 // (auto-labeling wrote them to frontmatter but nothing displayed
                 // them). Small rounded pills, one per comma-separated tag.
                 Flow {
                     id: tagsRow
                     Layout.fillWidth: true
                     spacing: 6
-                    // Item P15/P20: the add-tag affordance needs to be
+                    // The add-tag affordance needs to be
                     // reachable even before this file has any tags at all —
                     // visible whenever there's an actual transcript to attach
                     // tags to (mirrors preludeContainer/chapterListColumn's own
@@ -3231,7 +3232,7 @@ Rectangle {
 
                                     Keys.onEscapePressed: tagField.text = tagPill.modelData
 
-                                    // Item 13: editable text needs an I-beam.
+                                    // Editable text needs an I-beam.
                                     HoverHandler { cursorShape: Qt.IBeamCursor }
                                 }
 
@@ -3259,7 +3260,7 @@ Rectangle {
                                     }
                                 }
 
-                                // Item P20: per-pill delete — always visible
+                                // Per-pill delete — always visible
                                 // (not hover-only) so its hit target is
                                 // predictable/discoverable, same treatment
                                 // as searchCloseButton's "x" elsewhere in
@@ -3312,12 +3313,12 @@ Rectangle {
                         onActiveFocusChanged: if (!activeFocus) text = ""
                         Keys.onEscapePressed: text = ""
 
-                        // Item 13: editable text needs an I-beam.
+                        // Editable text needs an I-beam.
                         HoverHandler { cursorShape: Qt.IBeamCursor }
                     }
                 }
 
-                // Item 11 (Wave E): one pill per distinct speaker id detected in
+                // One pill per distinct speaker id detected in
                 // THIS transcript, showing its current display name (default:
                 // "Speaker N"). Click-to-rename mirrors the title's own
                 // Label<->TextField swap pattern; renaming rewrites every one of
@@ -3478,7 +3479,7 @@ Rectangle {
 
                                     background: UnderlineField { implicitHeight: 0; plainUntilHovered: true; focused: speakerNameField.activeFocus }
 
-                                    // Item 13: editable text needs an I-beam.
+                                    // Editable text needs an I-beam.
                                     HoverHandler { cursorShape: Qt.IBeamCursor }
 
                                     Keys.onEscapePressed: speakerNameField.text = mainPanel.effectiveSpeakerName(speakerPillItem.modelData)
@@ -3606,8 +3607,8 @@ Rectangle {
                     }
                 }
 
-                // Feature 2 (upgrades O26's old read-only single-line
-                // summary): a click-to-edit, multi-paragraph prelude —
+                // A click-to-edit, multi-paragraph prelude (upgrades the
+                // old read-only single-line summary) —
                 // same muted secondary-text treatment as the "Previously
                 // transcribed" label above (color/pixelSize) when not being
                 // edited, just larger and unbolded so it reads as
@@ -3625,7 +3626,7 @@ Rectangle {
                     visible: mainPanel.hasMetadata
                 }
 
-                // Feature 3c: collapsible chapter list — same tap-to-seek
+                // Collapsible chapter list — same tap-to-seek
                 // idiom as the seek-bar tick marks (3b) and
                 // timestampClickArea further below. Only ever visible once
                 // mainPanel.chapters is non-empty — unlike the prelude editor
@@ -3807,7 +3808,7 @@ Rectangle {
                         onPicked: (id) => AppSettings.diarizationEmbeddingModel = id
                     }
 
-                    // O35 / Item 25: the coarse "gpu"/"cpu" kind of the
+                    // The coarse "gpu"/"cpu" kind of the
                     // backend that loaded the active model (activeBackendKind,
                     // not the raw Vulkan/CUDA/CPU name) — matching the bottom
                     // bar's own indicator. Empty (and hidden) until the first
@@ -3934,7 +3935,7 @@ Rectangle {
                 HoverHandler {
                     cursorShape: Qt.IBeamCursor
                 }
-                // Regression fix: Item 7 made ALL native selection invisible
+                // Regression fix: search highlighting made ALL native selection invisible
                 // (transparent) to avoid double-highlighting jumpToNextMatch's
                 // select() call against searchMatchOverlay below — but that
                 // also hid genuine user click-drag selection entirely, which
@@ -3949,8 +3950,8 @@ Rectangle {
                 selectionColor: transcriptArea.selectionIsSearchMatch ? "transparent" : Qt.rgba(0.35, 0.55, 0.85, 0.5)
                 selectedTextColor: transcriptArea.selectionIsSearchMatch ? transcriptArea.color : "#ffffff"
 
-                // Real bug, found via an offscreen QML reproduction (not
-                // guessed) — see .task/plan.md for the repro transcript.
+                // Real bug, reproduced in an offscreen QML harness (not
+                // guessed).
                 // Querying positionToRectangle() from EACH gutter delegate's
                 // own binding can run BEFORE this control's internal text
                 // layout has caught up to a newly-changed `text` value (Qt
@@ -4070,7 +4071,7 @@ Rectangle {
                     }
                 }
 
-                // Item P27: TextEdit (not plain Text) so a speaker name in
+                // TextEdit (not plain Text) so a speaker name in
                 // the gutter is independently selectable/copyable with its
                 // own I-beam cursor — this is a distinct Item from
                 // transcriptArea (a sibling child positioned on top of it,
@@ -4148,7 +4149,7 @@ Rectangle {
                     }
                 }
 
-                // Item P32: one heading row per chapter marker, interleaved
+                // One heading row per chapter marker, interleaved
                 // into displaySentences by displayData above (see its own
                 // doc comment) — each heading pseudo-entry reserved a real
                 // blank line in transcriptArea's own text, so
@@ -4172,7 +4173,7 @@ Rectangle {
                     }
                 }
 
-                // Silence phase 3 (queue item 085, locked decision): one
+                // Silence phase 3 (locked decision): one
                 // centered divider row per qualifying stored `silences:`
                 // span (mainPanel.silenceMarkerModel), interleaved into
                 // displayData/pushSilenceMarker exactly like a chapter
@@ -4217,7 +4218,7 @@ Rectangle {
                     height: mainPanel.activeSentenceRect.height
                 }
 
-                // Item 7 (Wave E): Ctrl+F search match is now a real rounded
+                // Ctrl+F search match is now a real rounded
                 // overlay too, not just the TextArea's native (unrounded,
                 // system-styled) selection rectangle — transcriptArea's own
                 // selectionColor is only made transparent WHILE the current
@@ -4240,7 +4241,7 @@ Rectangle {
 
             } // end scrollableContent ColumnLayout (ScrollPage's content child)
 
-        // Item 55: loading overlay shown from the instant THIS file's
+        // Loading overlay shown from the instant THIS file's
         // (re)transcription starts until the first new segment lands (see
         // showTranscribingOverlay / awaitingFirstSegment). A dim scrim over
         // the (already dimmed + disabled) stale transcript plus a centered
@@ -4366,7 +4367,7 @@ Rectangle {
         vaultTreeModel: mainPanel.vaultTreeModel
     }
 
-    // Item 2 (delete): reached ONLY when the trash refused the open file — a
+    // Reached ONLY when the trash refused the open file — a
     // successful trash never opens this, it posts a snackbar with Undo (see
     // requestDeleteFile()/requestDeleteTranscript()). So the wording promises no
     // trash: it used to say "Moved to the trash" on every delete, which is

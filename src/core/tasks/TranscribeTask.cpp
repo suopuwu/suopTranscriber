@@ -44,8 +44,8 @@ constexpr qint64 kLiveUpdateThrottleMs = 200;
 // Bound to the FILE's own total duration, not the current window's — runWindows()
 // (TranscribePipeline.cpp) owns per-window boundaries, which would give a
 // tighter bound, but that file is out of scope for this change. Using the
-// coarser whole-file bound is still exactly what CLAUDE.md's non-negotiable
-// requires ("audio-length-relative, NOT a flat wall-clock cap"): a longer
+// coarser whole-file bound still satisfies the non-negotiable
+// ("audio-length-relative, NOT a flat wall-clock cap"): a longer
 // recording earns proportionally more silent runway before it's ever
 // considered wedged, so a genuinely long file is never falsely killed —
 // at the cost of a proportionally later trip on a huge file that really is
@@ -60,6 +60,17 @@ bool TranscribeTask::isStalled(qint64 noProgressElapsedMs, double fileSeconds)
         static_cast<qint64>(kStallRealtimeMultiplier * std::max(0.0, fileSeconds) * 1000.0);
     const qint64 threshold = std::max(kStallFloorMs, scaledMs);
     return noProgressElapsedMs > threshold;
+}
+
+QString TranscribeTask::corruptAudioWarning(const AudioDecoder::DecodeDiagnostics &diagnostics)
+{
+    if (diagnostics.nonFiniteSampleCount == 0)
+        return {};
+    return QStringLiteral("%1 sample(s) were non-finite (NaN/Inf) and replaced with "
+                          "silence, starting at %2")
+        .arg(diagnostics.nonFiniteSampleCount)
+        .arg(diagnostics.firstNonFiniteSeconds ? formatTimestamp(*diagnostics.firstNonFiniteSeconds)
+                                                : QStringLiteral("unknown"));
 }
 
 TranscribeTask::TranscribeTask(QUrl file, QUrl vault, QString modelId, QObject *parent)
@@ -97,11 +108,6 @@ void TranscribeTask::run(TaskContext &ctx)
     // retargeted this at a merged output — see the class doc comment.
     const QString filePath = fileUrl.toLocalFile();
     const QString vaultPath = vaultUrl.toLocalFile();
-
-    // GPU memory hygiene: transcribe and label tasks never run concurrently
-    // (one task at a time), so there's no reason to keep the label engine's
-    // GPU-resident weights around while a transcription runs.
-    ctx.engines.evictLabel();
 
     // Wall-clock timer for whichever phase is currently running, restarted
     // (recording the PREVIOUS phase's duration via phaseDurationMs) at each
@@ -148,9 +154,21 @@ void TranscribeTask::run(TaskContext &ctx)
     };
     decodeControl.cancelled = [&ctx] { return ctx.cancelRequested(); };
     QString decodeError;
-    auto pcm = AudioDecoder::decodeTo16kMono(filePath, &decodeError, decodeControl);
+    AudioDecoder::DecodeDiagnostics decodeDiagnostics;
+    auto pcm = AudioDecoder::decodeTo16kMono(filePath, &decodeError, decodeControl, &decodeDiagnostics);
     if (!pcm)
         throw TaskError(decodeError.isEmpty() ? QStringLiteral("audio decode failed") : decodeError);
+
+    // Corrupt (non-finite) samples were scrubbed to silence rather than left
+    // to hang ffmpeg's speechnorm filter — record where, so the
+    // resulting silent gap in the transcript has a written cause rather than
+    // looking like a transcription bug. Surfaced twice from the one string:
+    // permanently in the frontmatter below, and live in the Tasks list via
+    // TaskContext::reportWarning() — the task still succeeds
+    // (Status::Done), it just has something to say.
+    const QString corruptAudioNote = corruptAudioWarning(decodeDiagnostics);
+    if (!corruptAudioNote.isEmpty())
+        ctx.reportWarning(corruptAudioNote);
 
     // Transcribe is pure ASR — speaker diarization is a SEPARATE task
     // (DiarizeTask), never run inline here. A fresh transcript is therefore
@@ -199,7 +217,7 @@ void TranscribeTask::run(TaskContext &ctx)
     // list (a standalone diarize task splices real speakers in later).
     writeFrontmatter(mdFile, asr.modelUsedName, /*speakerDetection=*/false, asr.fellBack, m_modelId,
                       /*speakerLabels=*/{}, /*speakerDetectionError=*/QString(), vadActive, vadError,
-                      /*partial=*/true, initialSilences);
+                      /*partial=*/true, initialSilences, corruptAudioNote);
     SegmentLineWriter lineWriter(mdFile);
 
     // "transcribing": the engine's own per-segment progress, blended across
@@ -283,7 +301,7 @@ void TranscribeTask::run(TaskContext &ctx)
     TranscribePipeline::runWindows(*asr.engine, *pcm, windows, onProgress, onSegment, onAbort, &failureCount);
     mdFile.close();
 
-    // The watchdog tripped: fail retryably (per CLAUDE.md — a Task-system
+    // The watchdog tripped: fail retryably (a Task-system
     // failure, not a silent hang) so the Tasks list shows it and the queue
     // advances to the next file rather than wedging the rest of an overnight
     // batch behind it, same as any other TaskError. Checked BEFORE the plain
@@ -304,8 +322,8 @@ void TranscribeTask::run(TaskContext &ctx)
 
     // An inference failure (e.g. onnxruntime OOM) dropped one or more
     // sub-windows silently at the engine level — the transcript that was
-    // written is real but incomplete. Fail the task (see item 019's
-    // decision) BEFORE the `partial: true` marker is dropped below, so the
+    // written is real but incomplete. Fail the task BEFORE the
+    // `partial: true` marker is dropped below, so the
     // vault keeps showing this file as not-done/retryable rather than a
     // green Done hiding missing audio.
     if (failureCount > 0)

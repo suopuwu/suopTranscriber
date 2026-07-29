@@ -2,11 +2,13 @@
 #include "ProcessRunner.h"
 
 #include <QCoreApplication>
+#include <QCryptographicHash>
 #include <QDebug>
 #include <QDir>
 #include <QElapsedTimer>
 #include <QFile>
 #include <QFileInfo>
+#include <QHash>
 #include <QProcess>
 #include <QStandardPaths>
 #include <QThread>
@@ -272,12 +274,58 @@ bool isVadModelDownloaded()
 
 namespace {
 
+// Pinned SHA-256 per store-relative artifact path — the runtime counterpart of
+// CMakeLists.txt's suop_fetch_cuda12_wheel(name url sha256) block, deliberately
+// the same shape: one contiguous list of name + digest, nothing clever.
+//
+// Function-local static, not namespace-scope static const: this table is read
+// through an exported function, and a namespace-scope one read across a TU
+// boundary during static init silently reads EMPTY (the trap PhaseTimer's
+// timedPhases and JobListFormatter already document).
+//
+// An absent entry means NOT PINNED YET, and a fresh download of it logs the
+// digest it computed so the constant can be filled in — the only route for an
+// artifact nobody has a known-good local copy of. See DEPENDENCIES.md for how a
+// digest is captured and when a pin must be bumped.
+const QHash<QString, QString> &pinnedSha256()
+{
+    static const QHash<QString, QString> pins = {
+        // Whisper ggml tiers (huggingface.co/ggerganov/whisper.cpp, floating `main`).
+        // base.en/small.en captured via HF's x-linked-etag header (no local copy
+        // existed at pin time) — the other three cross-checked local sha256sum
+        // against x-linked-etag and agreed exactly.
+        {QStringLiteral("ggml-tiny.en.bin"), QStringLiteral("921e4cf8686fdd993dcd081a5da5b6c365bfde1162e72b08d75ac75289920b1f")},
+        {QStringLiteral("ggml-base.en.bin"), QStringLiteral("a03779c86df3323075f5e796cb2ce5029f00ec8869eee3fdfb897afe36c6d002")},
+        {QStringLiteral("ggml-small.en.bin"), QStringLiteral("c6138d6d58ecc8322097e0f987c32f1be8bb0a18532a3f88f734d1bbf9c41e5d")},
+        {QStringLiteral("ggml-medium.en.bin"), QStringLiteral("cc37e93478338ec7700281a7ac30a10128929eb8f427dda2e865faa8f6da4356")},
+        {QStringLiteral("ggml-large-v3.bin"), QStringLiteral("64d182b440b98d5203c4f9bd541544d84c605196c4f7b845dfa11fb23594d1e2")},
+        // VAD + auto-labeling
+        {QStringLiteral("ggml-silero-v6.2.0.bin"), QStringLiteral("2aa269b785eeb53a82983a20501ddf7c1d9c48e33ab63a41391ac6c9f7fb6987")},
+        {QStringLiteral("Qwen3-4B-Instruct-2507-Q4_K_M.gguf"), QStringLiteral("3605803b982cb64aead44f6c1b2ae36e3acdb41d8e46c8a94c6533bc4c67e597")},
+        // Diarization segmentation — the EXTRACTED inner file, not the tar.bz2
+        {QStringLiteral("pyannote-segmentation-3.0-int8.onnx"), QStringLiteral("d582f4b4c6b48205de7e0643c57df0df5615a3c176189be3fc461e9d18827b5d")},
+        {QStringLiteral("reverb-diarization-v1-int8.onnx"), QStringLiteral("b9d683988380daa45cade934279c456003a43c48a5b5d6f213b3b3d134b25027")},
+        // Diarization embedding (direct .onnx)
+        {QStringLiteral("wespeaker-resnet293-lm.onnx"), QStringLiteral("f65dbc820e534eef64ae12d1e289e20244d60e60f7f00d7b092092b1c458be2e")},
+        {QStringLiteral("3dspeaker-campplus-en.onnx"), QStringLiteral("357a834f702b80161e5b981182c038e18553c1f2ca752ed6cec2052365d4129b")},
+        {QStringLiteral("nemo-titanet-large.onnx"), QStringLiteral("d51abcf31717ef28162f26acb9d44dd4127c3d44c9b8624f699f3425daca8e77")},
+        // Parakeet bundle — the four extracted members, keyed by bundle-relative
+        // path (the archive also carries a test_wavs/ dir we neither need nor pin)
+        {QStringLiteral("parakeet-tdt-0.6b-v2/encoder.int8.onnx"), QStringLiteral("a32b12d17bbbc309d0686fbbcc2987b5e9b8333a7da83fa6b089f0a2acd651ab")},
+        {QStringLiteral("parakeet-tdt-0.6b-v2/decoder.int8.onnx"), QStringLiteral("b6bb64963457237b900e496ee9994b59294526439fbcc1fecf705b31a15c6b4e")},
+        {QStringLiteral("parakeet-tdt-0.6b-v2/joiner.int8.onnx"), QStringLiteral("7946164367946e7f9f29a122407c3252b680dbae9a51343eb2488d057c3c43d2")},
+        {QStringLiteral("parakeet-tdt-0.6b-v2/tokens.txt"), QStringLiteral("ec182b70dd42113aff6c5372c75cac58c952443eb22322f57bbd7f53977d497d")},
+    };
+    return pins;
+}
+
 // Probes Content-Length via a HEAD request, without downloading anything —
 // best-effort only: 0 if the server doesn't report a length or the probe
 // fails (caller then shows indeterminate progress instead of a percentage).
 qint64 probeContentLength(const QString &url)
 {
     QProcess curl;
+    ProcessRunner::guardChildLifetime(curl);
     curl.start("curl", {"-sIL", url});
     if (!curl.waitForFinished(10000))
         return 0;
@@ -303,7 +351,7 @@ qint64 probeContentLength(const QString &url)
 // waitForFinished(-1) — polls every 100ms instead, which both reports real
 // byte progress (against an upfront HEAD probe of Content-Length) and gives
 // a cooperative checkpoint for pause (SIGSTOP the curl process, SIGCONT to
-// resume — Linux-only, per CLAUDE.md's "Linux (CachyOS) primary") and cancel
+// resume — Linux-only, Linux being the app's primary target) and cancel
 // (kill the process, remove the partial file). Still fully synchronous from
 // the CALLER's point of view (this runs on TranscriptionWorker's own
 // dedicated thread, never the GUI thread — blocking there is fine, same as
@@ -318,6 +366,7 @@ QString downloadToModelsDir(const QDir &modelsDir, const QString &fileName, cons
     const qint64 totalBytes = probeContentLength(url);
 
     QProcess curl;
+    ProcessRunner::guardChildLifetime(curl);
     curl.start("curl", {"-L", "--fail", "-o", tmpPath, url});
     if (!curl.waitForStarted(10000)) {
         if (errorOut)
@@ -367,6 +416,17 @@ QString downloadToModelsDir(const QDir &modelsDir, const QString &fileName, cons
     if (onProgress)
         onProgress(finalSize, totalBytes > 0 ? totalBytes : finalSize);
 
+    // Identity check, distinct from the size check above: that one asks whether
+    // the transfer completed, this one whether the bytes are the artifact we
+    // meant to install. Done on the .part, so a mismatch never exists under the
+    // real name. fileName is the store-relative key for a direct download; for
+    // the two tar.bz2 routes it is "<name>.tar.bz2" (unpinned by design — those
+    // verify their EXTRACTED files instead, at their own call sites).
+    if (!verifyFileSha256(tmpPath, expectedSha256(fileName), errorOut)) {
+        QFile::remove(tmpPath);
+        return {};
+    }
+
     // Qt's rename does NOT overwrite an existing target and returns false — a
     // stale modelPath already existing here would otherwise leave the fresh
     // .part orphaned while we return modelPath as if the download succeeded.
@@ -404,6 +464,7 @@ QString downloadAndExtractFromTarBz2(const QDir &modelsDir, const QString &local
     const QString modelPath = modelsDir.filePath(localFileName);
     QProcess tar;
     tar.setStandardOutputFile(modelPath);
+    ProcessRunner::guardChildLifetime(tar);
     tar.start("tar", {"-xjf", archivePath, "-O", pathInsideArchive});
     tar.waitForFinished(-1);
     QFile::remove(archivePath);
@@ -412,6 +473,14 @@ QString downloadAndExtractFromTarBz2(const QDir &modelsDir, const QString &local
         if (errorOut)
             *errorOut = QStringLiteral("model archive extraction failed: %1")
                             .arg(QString::fromUtf8(tar.readAllStandardError()));
+        QFile::remove(modelPath);
+        return {};
+    }
+
+    // tar exiting 0 proves the bzip2 stream was intact, not that it was the
+    // right archive — and the archive is already deleted, so the extracted file
+    // is the only thing left to check.
+    if (!verifyFileSha256(modelPath, expectedSha256(localFileName), errorOut)) {
         QFile::remove(modelPath);
         return {};
     }
@@ -455,6 +524,7 @@ QString downloadAndExtractBundle(const QDir &modelsDir, const QString &destDirNa
         return {}; // download failed/cancelled — errorOut already set
 
     QProcess tar;
+    ProcessRunner::guardChildLifetime(tar);
     tar.start("tar", {"-xjf", archivePath, "-C", destDir.path(), "--strip-components=1"});
     tar.waitForFinished(-1);
     QFile::remove(archivePath);
@@ -465,9 +535,63 @@ QString downloadAndExtractBundle(const QDir &modelsDir, const QString &destDirNa
                             .arg(QString::fromUtf8(tar.readAllStandardError()));
         return {};
     }
+
+    // Each required member is pinned by its bundle-relative path — a wrong
+    // archive can extract cleanly and satisfy allPresent() with the wrong
+    // weights. Anything extra the archive carries (test_wavs/) is unpinned and
+    // unused, so it is not checked.
+    for (const QString &f : requiredFiles) {
+        const QString member = destDir.filePath(f);
+        if (!verifyFileSha256(member, expectedSha256(QStringLiteral("%1/%2").arg(destDirName, f)), errorOut)) {
+            QFile::remove(member); // leave the bundle incomplete, so isComplete() stays false
+            return {};
+        }
+    }
     return destDir.path();
 }
 
+}
+
+QString fileSha256(const QString &path)
+{
+    QFile f(path);
+    if (!f.open(QIODevice::ReadOnly))
+        return {};
+    QCryptographicHash hash(QCryptographicHash::Sha256);
+    if (!hash.addData(&f)) // streams the device; never buffers the whole file
+        return {};
+    return QString::fromLatin1(hash.result().toHex());
+}
+
+QString expectedSha256(const QString &storeRelativePath)
+{
+    return pinnedSha256().value(storeRelativePath);
+}
+
+bool verifyFileSha256(const QString &path, const QString &expectedHex, QString *errorOut)
+{
+    const QString actual = fileSha256(path);
+    if (actual.isEmpty()) {
+        if (errorOut)
+            *errorOut = QStringLiteral("could not read %1 to verify it").arg(path);
+        return false;
+    }
+    if (expectedHex.isEmpty()) {
+        // Not pinned yet — don't block, but print the digest, because this log
+        // line IS the capture mechanism for an artifact nobody has locally.
+        qInfo() << "ModelManager: no pinned SHA-256 for" << path << "— computed" << actual
+                << "(record it in pinnedSha256(); see DEPENDENCIES.md)";
+        return true;
+    }
+    if (actual == expectedHex)
+        return true;
+    if (errorOut)
+        *errorOut = QStringLiteral("%1 does not match its pinned SHA-256: expected %2, got %3. If "
+                                   "upstream legitimately re-published this file, bump the pin "
+                                   "(see DEPENDENCIES.md); otherwise the download was substituted "
+                                   "or corrupted.")
+                        .arg(QFileInfo(path).fileName(), expectedHex, actual);
+    return false;
 }
 
 QString ensureModel(const QString &modelId, QString *errorOut, bool *usedFallback,
@@ -768,6 +892,24 @@ bool deleteModel(const QString &id, QString *errorOut)
     return true;
 }
 
+// QFile::copy() returns TRUE on a short read (verified empirically against
+// Qt 6.11: a source that shrank mid-copy produced a truncated destination and
+// copy() still succeeded; a yanked USB device's EIO takes the same branch). A
+// model import/export is exactly a removable-media operation, so a truncated
+// .bin landing in the store while the task reports Done is the normal failure,
+// not an exotic one — compare the landed size against the source's stat, same
+// fix UsbGrabJob's copyGrabbedFile() already carries. Rejects any MISMATCH, not
+// just a short one, so a still-being-written source is caught too.
+bool copyVerified(const QString &from, const QString &to)
+{
+    if (!QFile::copy(from, to))
+        return false;
+    if (QFileInfo(to).size() == QFileInfo(from).size())
+        return true;
+    QFile::remove(to);   // never leave a truncated model in the store
+    return false;
+}
+
 bool importModel(const QString &id, const QString &sourcePath, QString *errorOut)
 {
     const ModelLayout layout = modelLayout(id);
@@ -813,7 +955,7 @@ bool importModel(const QString &id, const QString &sourcePath, QString *errorOut
         for (const QString &fileName : layout.fileNames) {
             const QString dest = destDir.filePath(fileName);
             QFile::remove(dest);
-            if (!QFile::copy(sourceDir.filePath(fileName), dest)) {
+            if (!copyVerified(sourceDir.filePath(fileName), dest)) {
                 if (errorOut)
                     *errorOut = QStringLiteral("could not copy %1 into the store").arg(fileName);
                 return false;
@@ -829,7 +971,7 @@ bool importModel(const QString &id, const QString &sourcePath, QString *errorOut
     }
     const QString dest = store.filePath(layout.fileNames.first());
     QFile::remove(dest);
-    if (!QFile::copy(sourcePath, dest)) {
+    if (!copyVerified(sourcePath, dest)) {
         if (errorOut)
             *errorOut = QStringLiteral("could not copy into the store");
         return false;
@@ -868,7 +1010,7 @@ bool exportModel(const QString &id, const QString &destDir, QString *errorOut)
         for (int i = 0; i < layout.fileNames.size() && i < 4; ++i) {
             const QString out = outBundle.filePath(layout.fileNames.at(i));
             QFile::remove(out);
-            if (!QFile::copy(sources[i], out)) {
+            if (!copyVerified(sources[i], out)) {
                 if (errorOut)
                     *errorOut = QStringLiteral("could not copy %1").arg(layout.fileNames.at(i));
                 return false;
@@ -885,7 +1027,7 @@ bool exportModel(const QString &id, const QString &destDir, QString *errorOut)
         }
         const QString out = dest.filePath(fileName);
         QFile::remove(out);
-        if (!QFile::copy(src, out)) {
+        if (!copyVerified(src, out)) {
             if (errorOut)
                 *errorOut = QStringLiteral("could not copy %1").arg(fileName);
             return false;

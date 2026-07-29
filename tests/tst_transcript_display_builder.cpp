@@ -347,7 +347,7 @@ private slots:
         QCOMPARE(entryAt(r, 1).value(QStringLiteral("start")).toInt(), 2);
     }
 
-    // ---- collapse (item 33) -----------------------------------------------
+    // ---- collapse ----------------------------------------------------------
 
     // A collapsed chapter's body sentences vanish from BOTH `text` and the
     // entry list (the heading itself stays, flagged collapsed) — the whole

@@ -15,6 +15,8 @@
 #include <QUrl>
 #include <QtTest>
 
+#include <algorithm>
+
 #include "tasks/CombineTask.h"
 #include "tasks/EngineCache.h"
 #include "tasks/ImportTask.h"
@@ -32,7 +34,11 @@ struct NullContextFixture {
 
 bool ffmpegOnPath()
 {
-    return !QStandardPaths::findExecutable(QStringLiteral("ffmpeg")).isEmpty();
+    // CombineTask's validation step also shells out to ffprobe, which ships
+    // in the same package as ffmpeg on every distro this app targets — treat
+    // the pair as one dependency for test-skip purposes.
+    return !QStandardPaths::findExecutable(QStringLiteral("ffmpeg")).isEmpty()
+        && !QStandardPaths::findExecutable(QStringLiteral("ffprobe")).isEmpty();
 }
 
 // Mirrors tst_filecombine.cpp's makeWav() — a real (tiny) wav ffmpeg's
@@ -43,6 +49,39 @@ QString makeWav(const QString &dir, const QString &name)
     QProcess gen;
     gen.start("ffmpeg", {"-y", "-loglevel", "error", "-f", "lavfi", "-i",
                           "sine=frequency=440:sample_rate=16000:duration=1", path});
+    if (!gen.waitForFinished(15000) || gen.exitCode() != 0)
+        return {};
+    return path;
+}
+
+// Same shape as makeWav(), but at a caller-chosen sample rate — used to
+// reproduce CombineTask's real corrupt-output failure mode: ffmpeg's concat
+// demuxer with `-c copy` happily concatenates sources at different sample
+// rates and exits 0, but the merged duration comes out reinterpreted under
+// the first source's rate (confirmed empirically: 1s@16kHz + 1s@44.1kHz
+// concats to ~3.76s, not 2s).
+QString makeWavAtRate(const QString &dir, const QString &name, int sampleRate)
+{
+    const QString path = dir + "/" + name;
+    QProcess gen;
+    gen.start("ffmpeg", {"-y", "-loglevel", "error", "-f", "lavfi", "-i",
+                          QStringLiteral("sine=frequency=440:sample_rate=%1:duration=1").arg(sampleRate),
+                          "-ar", QString::number(sampleRate), "-ac", "1", "-c:a", "pcm_s16le", path});
+    if (!gen.waitForFinished(15000) || gen.exitCode() != 0)
+        return {};
+    return path;
+}
+
+// Same shape as makeWavAtRate(), but holds the sample rate fixed and varies
+// the sample codec/format instead — isolates the mismatch to exactly one
+// property (bit depth), unlike makeWavAtRate's pair which differs in rate.
+QString makeWavWithCodec(const QString &dir, const QString &name, const QString &codec)
+{
+    const QString path = dir + "/" + name;
+    QProcess gen;
+    gen.start("ffmpeg", {"-y", "-loglevel", "error", "-f", "lavfi", "-i",
+                          "sine=frequency=440:sample_rate=16000:duration=1", "-ar", "16000", "-ac", "1", "-c:a", codec,
+                          path});
     if (!gen.waitForFinished(15000) || gen.exitCode() != 0)
         return {};
     return path;
@@ -91,6 +130,140 @@ private slots:
         CombineTask task({dir.path() + "/nonexistent.wav"}, QUrl::fromLocalFile(dir.path() + "/out.wav"), false);
         NullContextFixture fixture;
         QVERIFY_EXCEPTION_THROWN(task.run(fixture.ctx), TaskError);
+    }
+
+    // ffmpeg's concat demuxer exits 0 whenever it wrote packets, even across
+    // sources it silently reinterpreted under the wrong format — concatenating
+    // two sources at different sample rates reproduces that deterministically
+    // (see makeWavAtRate()'s comment). CombineTask now probes every source's
+    // format up front (ensureSourcesAreFormatCompatible()) and
+    // refuses BEFORE ffmpeg ever runs, so this mismatch is caught earlier than
+    // it used to be: no ffmpeg process, no output file, nothing to quarantine.
+    // validateCombinedOutput()'s duration cross-check remains the
+    // safety net for whatever this probe can't see (e.g. a mismatch ffprobe's
+    // stream fields don't capture) — see
+    // combineTask_mismatchedFormatSources_areRefusedWithASpecificMessage below
+    // for the new probe-stage coverage, including the error message contents.
+    void combineTask_mismatchedRateSources_failsValidationAndKeepsSources()
+    {
+        if (!ffmpegOnPath())
+            QSKIP("ffmpeg not on PATH");
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        const QString a = makeWavAtRate(dir.path(), "part1.wav", 16000);
+        const QString b = makeWavAtRate(dir.path(), "part2.wav", 44100);
+        QVERIFY(!a.isEmpty() && !b.isEmpty());
+        const QString outputPath = dir.path() + "/merged.wav";
+
+        CombineTask task({a, b}, QUrl::fromLocalFile(outputPath), /*deleteOriginals=*/false);
+        NullContextFixture fixture;
+        QVERIFY_EXCEPTION_THROWN(task.run(fixture.ctx), TaskError);
+
+        // Preserving the originals is the entire point of this check.
+        QVERIFY(QFileInfo::exists(a));
+        QVERIFY(QFileInfo::exists(b));
+        // Caught at the up-front format probe now, before ffmpeg starts — no
+        // output was ever written, so there's nothing to quarantine either.
+        QVERIFY(!QFileInfo::exists(outputPath));
+        QVERIFY(!QFileInfo::exists(dir.path() + "/merged.suspect.wav"));
+    }
+
+    // The probe's error message is the entire point of "refuse, don't
+    // silently reinterpret" — it must name the offending file and say
+    // concretely how it differs, not just "sources are incompatible". Same
+    // sample rate as the reference on purpose (isolates the mismatch to bit
+    // depth alone, unlike the rate-mismatch test above).
+    void combineTask_mismatchedFormatSources_areRefusedWithASpecificMessage()
+    {
+        if (!ffmpegOnPath())
+            QSKIP("ffmpeg not on PATH");
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        const QString a = makeWavWithCodec(dir.path(), "part1.wav", "pcm_s16le");
+        const QString b = makeWavWithCodec(dir.path(), "part2.wav", "pcm_f32le");
+        QVERIFY(!a.isEmpty() && !b.isEmpty());
+        const QString outputPath = dir.path() + "/merged.wav";
+
+        CombineTask task({a, b}, QUrl::fromLocalFile(outputPath), /*deleteOriginals=*/false);
+        NullContextFixture fixture;
+        QString errorMessage;
+        try {
+            task.run(fixture.ctx);
+            QFAIL("expected a TaskError for mismatched sample formats");
+        } catch (const TaskError &e) {
+            errorMessage = e.message();
+        }
+
+        QVERIFY2(errorMessage.contains(QStringLiteral("part2.wav")), qPrintable(errorMessage));
+        QVERIFY2(errorMessage.contains(QStringLiteral("32-bit float")), qPrintable(errorMessage));
+        QVERIFY2(errorMessage.contains(QStringLiteral("16-bit")), qPrintable(errorMessage));
+
+        // Refused before any source moved or any ffmpeg process ran.
+        QVERIFY(QFileInfo::exists(a));
+        QVERIFY(QFileInfo::exists(b));
+        QVERIFY(!QFileInfo::exists(outputPath));
+    }
+
+    // Negative control for the mismatch tests above: identical-format sources
+    // must still take the fast `-c copy` path, not get quietly re-encoded — a
+    // silent re-encode of every multi-GB combine this vault actually does
+    // would be a large performance regression. A stream copy's output size
+    // tracks the sum of its sources' sizes (minus one shared WAV header —
+    // measured at 78 bytes for ffmpeg's default lavfi WAV writer); a
+    // different sample format/rate slipping in would move it by far more.
+    void combineTask_compatibleSources_stillStreamCopy()
+    {
+        if (!ffmpegOnPath())
+            QSKIP("ffmpeg not on PATH");
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        const QString a = makeWav(dir.path(), "part1.wav");
+        const QString b = makeWav(dir.path(), "part2.wav");
+        QVERIFY(!a.isEmpty() && !b.isEmpty());
+        const qint64 sizeA = QFileInfo(a).size();
+        const qint64 sizeB = QFileInfo(b).size();
+        const QString outputPath = dir.path() + "/merged.wav";
+
+        CombineTask task({a, b}, QUrl::fromLocalFile(outputPath), /*deleteOriginals=*/false);
+        NullContextFixture fixture;
+        task.run(fixture.ctx); // doesn't throw -> compatible sources still succeed
+
+        QVERIFY(QFileInfo::exists(outputPath));
+        const qint64 mergedSize = QFileInfo(outputPath).size();
+        const qint64 tolerance = std::max<qint64>(500, (sizeA + sizeB) / 100);
+        QVERIFY2(qAbs((sizeA + sizeB) - mergedSize) < tolerance,
+                 qPrintable(QStringLiteral("merged size %1 not close to sourceA+sourceB %2 (tolerance %3) — "
+                                            "looks re-encoded, not stream-copied")
+                                .arg(mergedSize)
+                                .arg(sizeA + sizeB)
+                                .arg(tolerance)));
+    }
+
+    // Negative control for the test above: a validator that rejects good
+    // merges would be worse than the bug it exists to catch. Same-rate,
+    // same-format sources must still combine, pass validation, and move into
+    // .combined/ exactly as before validation was added.
+    void combineTask_goodSources_passesValidationAndMovesSources()
+    {
+        if (!ffmpegOnPath())
+            QSKIP("ffmpeg not on PATH");
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        const QString a = makeWav(dir.path(), "part1.wav");
+        const QString b = makeWav(dir.path(), "part2.wav");
+        QVERIFY(!a.isEmpty() && !b.isEmpty());
+        const QString outputPath = dir.path() + "/merged.wav";
+
+        CombineTask task({a, b}, QUrl::fromLocalFile(outputPath), /*deleteOriginals=*/false);
+        NullContextFixture fixture;
+        task.run(fixture.ctx); // doesn't throw -> validation passed
+
+        QVERIFY(QFileInfo::exists(outputPath));
+        QVERIFY(!QFileInfo::exists(dir.path() + "/merged.suspect.wav"));
+        QVERIFY(!QFileInfo::exists(a));
+        QVERIFY(!QFileInfo::exists(b));
+        QVERIFY(QFileInfo::exists(dir.path() + "/.combined/part1.wav"));
+        QVERIFY(QFileInfo::exists(dir.path() + "/.combined/part2.wav"));
     }
 
     // A default (move-to-.combined/) combine is undoable: the inverse restores
@@ -249,7 +422,7 @@ private slots:
         QCOMPARE(check.readAll(), QByteArray("original content"));
     }
 
-    // Item 078: opting into overwrite (the drop handler's Overwrite snackbar
+    // Opting into overwrite (the drop handler's Overwrite snackbar
     // action) lifts the collision guard above and replaces the destination's
     // bytes — mirrors the no-overwrite test but with overwrite=true, asserting
     // it does NOT throw and DOES replace the audio bytes with the source's.
@@ -277,7 +450,7 @@ private slots:
         QCOMPARE(check.readAll(), QByteArray("new content"));
     }
 
-    // Queue item 051: the import copy must carry the SOURCE's mtime, not "now"
+    // The import copy must carry the SOURCE's mtime, not "now"
     // — the file-tree "Date Modified" sort keys off the audio file's mtime as
     // recording time, so an old recording imported today must not jump to the
     // top of the newest-first list (matches UsbGrabJob/CombineTask's restamp).

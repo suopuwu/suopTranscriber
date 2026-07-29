@@ -159,6 +159,7 @@ void TaskScheduler::startTask(int index)
     Task *task = m_tasks[index].get();
     task->status = Task::Status::Active;
     task->error.clear();
+    task->warning.clear();
 
     // A pause/cancel left over from the PREVIOUS task must never leak into this
     // one. resetControl() clears the runner's control block; the cancel INTENT
@@ -227,6 +228,7 @@ void TaskScheduler::startInstantTask(int index)
     Task *task = m_tasks[index].get();
     task->status = Task::Status::Active;
     task->error.clear();
+    task->warning.clear();
     m_instantActive = task;
 
     // Connected once, like a serial task — for its typed result signals. The
@@ -239,7 +241,7 @@ void TaskScheduler::startInstantTask(int index)
     QMetaObject::invokeMethod(m_instantRunner, "execute", Qt::QueuedConnection, Q_ARG(Task *, task));
 }
 
-void TaskScheduler::onTaskFinished(Task *task, bool ok, const QString &error)
+void TaskScheduler::onTaskFinished(Task *task, bool ok, const QString &error, const QString &warning)
 {
     // Instant lane (see Task::Lane / startInstantTask()): a separate, parallel
     // path that never touched the serial-lane UI state, so its completion doesn't
@@ -250,6 +252,7 @@ void TaskScheduler::onTaskFinished(Task *task, bool ok, const QString &error)
         if (indexOfTask(task) >= 0) {
             task->status = ok ? Task::Status::Done : Task::Status::Failed;
             task->error = error;
+            task->warning = warning;
             task->durationMs = 0; // instant by construction — no elapsed tracking
         }
         emitQueueChanged();
@@ -275,9 +278,13 @@ void TaskScheduler::onTaskFinished(Task *task, bool ok, const QString &error)
         if (pausedAsRestart) {
             task->status = Task::Status::Paused;
             task->error.clear();
+            // Whatever run() reported before this restart-as-cancel belongs to
+            // the aborted pass, not whatever the resumed run ends up reporting.
+            task->warning.clear();
         } else {
             task->status = ok ? Task::Status::Done : Task::Status::Failed;
             task->error = error;
+            task->warning = warning;
             // The observer returns this task's final active-work duration
             // (excludes paused stretches) and fires the terminal-status typed
             // emits controller-side.

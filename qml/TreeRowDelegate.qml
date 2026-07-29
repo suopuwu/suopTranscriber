@@ -23,7 +23,7 @@ Item {
     // vertical ScrollBar is an OVERLAY needing a dedicated lane, and
     // AppSettings.sidebarRightMargin is the ONE setting for that
     // whole right-side gap, live-reactive via columnWidthProvider).
-    // Item 2 (Wave E): snippetText now wraps instead of truncating,
+    // snippetText now wraps instead of truncating,
     // so its height is variable — grow to fit instead of a fixed 44.
     implicitHeight: treeDelegate.showSnippet ? (28 + snippetText.implicitHeight + 4) : 28
 
@@ -92,7 +92,7 @@ Item {
         && !sidebarRoot.transcriptionController.matchesExistingTranscription(
                "file://" + treeDelegate.path, AppSettings.defaultModel)
 
-    // Wave D item 7: inverse of bulkEligible — already-transcribed
+    // Inverse of bulkEligible — already-transcribed
     // audio files, for the per-row + bulk "regenerate auto-title".
     readonly property bool relabelEligible: treeDelegate.isAudio && treeDelegate.status === 2
 
@@ -161,7 +161,7 @@ Item {
     // the icons were covering the tail of a long name (user report).
     readonly property bool renamingThisRow: sidebarRoot.renamingPath === treeDelegate.path
 
-    // Item 51: true iff this row is a member of a "ready" (would-
+    // True iff this row is a member of a "ready" (would-
     // combine-if-run) split-recording group per
     // sidebarRoot.combineReadyPaths — a genuinely reactive binding (both
     // combineReadyPaths and path have real NOTIFY signals), unlike
@@ -200,7 +200,7 @@ Item {
     readonly property bool combineBottomMerged: treeDelegate.combineEligible
             && sidebarRoot.combineBottomMergedPaths[treeDelegate.path] === true
 
-    // P6: JobStatus int for this row's file (None/Queued/Active/
+    // JobStatus int for this row's file (None/Queued/Active/
     // Paused/Done/Failed, see TranscriptionController::JobStatus) —
     // unlike bulkEligible/relabelEligible above this can't be a
     // readonly binding (jobStatusForPath() is a plain Q_INVOKABLE
@@ -246,7 +246,7 @@ Item {
         }
     }
 
-    // Item 9: ellipsis-bounded transcript snippet around the first
+    // Ellipsis-bounded transcript snippet around the first
     // match, shown only when there's an active query, transcript
     // search is enabled, and this row's body actually contains it —
     // rows that only matched by name/label/tags show no snippet.
@@ -256,7 +256,7 @@ Item {
         ? TextFormat.transcriptSnippet(treeDelegate.cleanedBody, sidebarRoot.searchQuery, 40,
                                AppSettings.highlightColor) : ""
     readonly property bool showSnippet: treeDelegate.snippetText !== ""
-    // Item 8 fix: showSnippet can also flip because transcriptBody
+    // showSnippet can also flip because transcriptBody
     // changed independently of sidebarRoot.searchQuery/
     // searchIncludeTranscriptions (e.g. a transcript streaming in
     // live while search is already active) — neither of treeRoot's two
@@ -282,7 +282,7 @@ Item {
         // for it), so it must not offer a pointing hand — the cursor is
         // the only thing that would still claim it is.
         cursorShape: treeDelegate.isCombinePlaceholder ? Qt.ArrowCursor : Qt.PointingHandCursor
-        // Item 51 refinement: pushes this row's group into
+        // Pushes this row's group into
         // sidebarRoot.hoveredCombineGroup so the ONE per-group merge
         // button (see groupMergeButton) reveals on hovering ANY
         // member row, not just this exact one. Reference-counted
@@ -310,7 +310,7 @@ Item {
         }
     }
 
-    // Item 40: right-click (or press-and-hold) opens the folder-
+    // Right-click (or press-and-hold) opens the folder-
     // management context menu for this row — separate TapHandler so
     // it doesn't disturb the left-click open/expand handler below.
     TapHandler {
@@ -427,7 +427,7 @@ Item {
             // Grabs keyboard focus so Up/Down (see the Shortcut
             // items near Ctrl+F's) can move between notes right
             // after a click — never touches sidebarRoot.currentPath, so
-            // the persistent "currently open" outline (O7) is
+            // the persistent "currently open" outline is
             // unaffected; clicking into MainPanel afterward moves
             // activeFocus away exactly as it always has.
             treeDelegate.treeView.forceActiveFocus()
@@ -452,7 +452,7 @@ Item {
                 // is being built.
                 const soleSelection = sidebarRoot.selectedPaths.length === 1
                         && sidebarRoot.selectedPaths[0] === treeDelegate.path
-                // Item 082: renaming the OPEN file could need an extra
+                // Renaming the OPEN file could need an extra
                 // click. A background STRUCTURE-change rebuild (an import,
                 // USB grab, combine, or delete landing another file while
                 // you work — VaultTreeModel::rebuild only resets on a
@@ -474,7 +474,7 @@ Item {
                     sidebarRoot.renamingCaretScenePos = treeRowTap.point.scenePosition
                     return
                 }
-                // Item 3: Shift/Ctrl-click multi-select — see
+                // Shift/Ctrl-click multi-select — see
                 // sidebarRoot.handleNoteClick's doc comment. modifiers
                 // comes from this TapHandler's own point (Qt
                 // doesn't pass them as an onTapped argument).
@@ -484,7 +484,7 @@ Item {
         }
     }
 
-    // Item 40 (drag-to-move): press-and-drag this row to move it into a
+    // Drag-to-move: press-and-drag this row to move it into a
     // folder. All the state (including WHICH paths are moving) lives on
     // the sidebarRoot — see sidebarRoot.beginRowDrag's doc comment.
     DragHandler {
@@ -542,7 +542,7 @@ Item {
         }
     }
 
-    // Item 40 (drag-to-move): every row is a drop target. A directory
+    // Drag-to-move: every row is a drop target. A directory
     // row takes the drop itself; a note row forwards it to the note's
     // own parent directory, so dropping onto a file means "into the
     // folder that file lives in" (standard file-manager behavior)
@@ -587,7 +587,7 @@ Item {
         }
     }
 
-    // Item 40 (drag-to-move): the fill for the folder a drop would land
+    // Drag-to-move: the fill for the folder a drop would land
     // in — covering the destination folder AND every row inside it (see
     // treeDelegate.inFolderHighlight), so the drop's whole landing zone
     // is what lights up. Keyed off sidebarRoot.rowDragDest rather than this
@@ -678,7 +678,7 @@ Item {
                 && !treeDelegate.inFolderHighlight
     }
 
-    // O7: persistent highlight for whatever MainPanel currently has
+    // Persistent highlight for whatever MainPanel currently has
     // open, distinct from HoverBorder above (which is hover-only and
     // white) so both can be visible at once without being confused.
     Rectangle {
@@ -693,11 +693,11 @@ Item {
         border.color: AppSettings.sidebarSelectionBorderColor
     }
 
-    // Item 3: multi-select highlight — border-only (not a fill, so
-    // it composes with the O7 "currently open" rectangle above
+    // Multi-select highlight — border-only (not a fill, so
+    // it composes with the "currently open" rectangle above
     // instead of competing with it) and only shown once a genuine
     // multi-selection exists (2+ rows), since a lone selected row is
-    // already the same row O7's highlight marks as open. Reuses
+    // already the row the open-file highlight marks. Reuses
     // AppSettings.highlightColor (the same color already used for
     // search-match spans) rather than adding a new configurable
     // color for what's a secondary affordance.
@@ -713,7 +713,7 @@ Item {
         border.color: AppSettings.highlightColor
     }
 
-    // Item 51: border-only (not a fill, so it composes with the
+    // Border-only (not a fill, so it composes with the
     // selection highlight above instead of covering it) highlight for
     // rows that are members of a "ready" — would-combine-if-run —
     // split-recording group, colored per-group (TextFormat.combineGroupColor),
@@ -890,7 +890,7 @@ Item {
                      : (treeDelegate.isOrphanedMd ? "#3498db" : "#f1c40f")
             }
 
-            // P6: separate small dot for an in-progress transcription
+            // Separate small dot for an in-progress transcription
             // job (Queued/Active/Paused) — deliberately distinct from
             // the transcribed/untranscribed dot above rather than
             // overloading it, since a Done/Failed job alongside an
@@ -968,14 +968,14 @@ Item {
                 // A combine placeholder has no name to show and
                 // combinePlaceholderRow above stands in its place.
                 visible: !treeDelegate.renamingThisRow && !treeDelegate.isCombinePlaceholder
-                // Item 1 (Wave D): sidebarRoot previously always showed the
+                // sidebarRoot previously always showed the
                 // raw filename — AppSettings.useLabelsSidebar lets it
                 // show the stored label instead, when one exists. That
                 // choice is load-bearing beyond display now: inline
                 // rename edits whatever this shows, so with the toggle
                 // on, a labelled row renames its LABEL, not its file
                 // (see TextFormat.renameInitialText/performRename).
-                // Item 9: when the query matches this text directly,
+                // When the query matches this text directly,
                 // the match is highlighted via rich text.
                 //
                 // Bug: this Text had no width bound at all, so a long
@@ -994,11 +994,10 @@ Item {
                 // icons faded in, for icons that weren't even always
                 // present).
                 Layout.fillWidth: true
-                // Item 8 bug fix: elide + Text.StyledText is an
+                // Elide + Text.StyledText is an
                 // unsupported/unpredictable combination in Qt
                 // Quick's Text (see snippetText's identical fix
-                // above, item 2/Wave E, which this file already
-                // documents) — this Text switches to StyledText
+                // above) — this Text switches to StyledText
                 // whenever a search query is active (for the
                 // highlight <span> markup below), so eliding must be
                 // OFF exactly then. clip: true is the backstop that
@@ -1069,7 +1068,7 @@ Item {
                 // the default boxed one.
                 background: UnderlineField { focused: rowRenameField.activeFocus }
 
-                // Item 13: a QQC2 TextField gets no I-beam on its own.
+                // A QQC2 TextField gets no I-beam on its own.
                 // Declared on the field itself so it wins over the whole
                 // row's PointingHandCursor (rowHover) while editing —
                 // the row still reads as clickable, this text as typable.
@@ -1143,7 +1142,7 @@ Item {
             }
         }
 
-        // Item 2 (Wave E): fixes 4 issues with this row — (1) no
+        // Fixes 4 issues with this row — (1) no
         // longer truncates: elide is documented as unsupported/
         // unpredictable together with StyledText in Qt Quick's Text
         // (the likely cause of (2) below too), so this now WRAPS
@@ -1219,7 +1218,7 @@ Item {
         }
     }
 
-    // Item 51 refinement: ONE "combine this group now" button per
+    // ONE "combine this group now" button per
     // group, not one per row — it used to live in this row's
     // already-busy per-file action cluster (transcribe/relabel/
     // chapters icons), competing with the row's own hover highlight

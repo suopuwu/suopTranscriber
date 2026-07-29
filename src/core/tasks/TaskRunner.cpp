@@ -12,6 +12,12 @@ TaskRunner::TaskRunner(QObject *parent)
 
 void TaskRunner::execute(Task *task)
 {
+    // The residency policy: evict whatever this task did not
+    // declare needing, BEFORE run() gets a chance to call ensureXxx() —
+    // see Task::EngineNeeds / EngineCache::applyResidencyPolicy.
+    const Task::EngineNeeds needs = task->engineNeeds();
+    m_engines.applyResidencyPolicy(needs.asr, needs.label, needs.diar);
+
     TaskContext ctx(m_engines, m_control, [task](bool isPaused) { emit task->paused(isPaused); });
 
     bool ok = true;
@@ -22,5 +28,5 @@ void TaskRunner::execute(Task *task)
         ok = false;
         error = e.message();
     }
-    emit taskFinished(task, ok, error);
+    emit taskFinished(task, ok, error, ctx.warning());
 }

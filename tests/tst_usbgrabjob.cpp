@@ -1,6 +1,6 @@
 // Living spec: runUsbGrabScan() — the scan+filter+dedup+copy walk for one USB
-// grab rule against one already-mounted device (see CLAUDE.md's "USB Grabber"
-// feature and DESIGN.md's "USB import" section: diff against the vault by
+// grab rule against one already-mounted device (see DESIGN.md's "USB import"
+// section: diff against the vault by
 // filename + size + mtime and copy only new audio in, never reading file
 // content).
 //
@@ -162,7 +162,7 @@ private slots:
             QVERIFY2(fractions[i] >= fractions[i - 1] - 1e-9, "progress must not go backwards");
         QVERIFY(qFuzzyCompare(fractions.last() + 1.0, 1.0 + 1.0)); // last == 1.0
 
-        // Item 056: the 15 tiny already-present files are excluded from the
+        // The 15 tiny already-present files are excluded from the
         // denominator entirely (they're skipped, not work), so the denominator
         // is exactly the 4 MiB big file and the FIRST report is that copy's own
         // first chunk (near 0), NOT near 94% as the old per-count logic gave.
@@ -228,7 +228,7 @@ private slots:
 
     // onTotalsKnown fires once, before any copy, with the count of files this
     // grab will actually copy — matching the rule's filters AND not already
-    // present/combined in the vault (item 056) — the "N files" the Tasks row
+    // present/combined in the vault — the "N files" the Tasks row
     // names the grab by. Here all 3 .wav are new, so the count is 3; the
     // extension-filtered-out ones are excluded, same predicate as the byte
     // pre-count.

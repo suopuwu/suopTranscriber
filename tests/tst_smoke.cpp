@@ -1,6 +1,6 @@
 #include <QtTest>
 
-// Placeholder — populated by the Milestone 6 test-writing step.
+// Placeholder smoke test — keeps the test harness itself buildable.
 class Tstsmoke : public QObject
 {
     Q_OBJECT

@@ -1,6 +1,7 @@
 // Living spec + runtime verification for MiddleDragScroll.qml — the shared
 // Chrome-style middle-click autoscroll overlay used by MainPanel (transcript),
-// Sidebar (file tree) and SettingsPopup (settings page).
+// Sidebar (file tree), SettingsPopup (settings page) and BottomBar (the Tasks
+// list).
 //
 // Same harness shape as tst_sidebar_expand.cpp / tst_sidebar_dragmove.cpp
 // (read their top-of-file comments first): a REAL offscreen QQuickView loading
@@ -405,8 +406,8 @@ private slots:
 
 int main(int argc, char *argv[])
 {
-    // Offscreen + sandboxed org/app name (CLAUDE.md: never let testing touch
-    // the user's real vault or app config). Same setup as tst_sidebar_expand.
+    // Offscreen + sandboxed org/app name (tests must never touch the user's
+    // real vault or app config). Same setup as tst_sidebar_expand.
     qputenv("QT_QPA_PLATFORM", "offscreen");
     qputenv("QT_QUICK_CONTROLS_STYLE", "Basic");
     QCoreApplication::setOrganizationName(QStringLiteral("suopTranscriberTestHarness"));

@@ -402,7 +402,7 @@ private slots:
         QCOMPARE(titleText(), QStringLiteral("half-typed name"));
     }
 
-    // Item 074: a rename fired from the SIDEBAR for the open file (nothing in
+    // A rename fired from the SIDEBAR for the open file (nothing in
     // the panel focused) updates the title AT ONCE — synchronously, via the
     // controller's pending-rename store (pendingRenamesRevisionChanged), before
     // the deferred RenameFileTask completes.
@@ -426,7 +426,7 @@ private slots:
         QTRY_COMPARE(titleText(), QStringLiteral("chat.m4a"));
     }
 
-    // Queue item 018: the filename subtitle names the REAL on-disk file, so it
+    // The filename subtitle names the REAL on-disk file, so it
     // shows the extension (talk.m4a), not the bare stem (talk). The text binding
     // evaluates regardless of the labels-mode visibility gate.
     void filenameSubtitle_showsTheExtension()
@@ -442,7 +442,7 @@ private slots:
         QTRY_COMPARE(sub->property("text").toString(), QStringLiteral("talk.m4a"));
     }
 
-    // Queue item 018: the subtitle shows stem+ext, but renameFile() takes a stem
+    // The subtitle shows stem+ext, but renameFile() takes a stem
     // and re-appends the real extension — so committing "chat.m4a" must strip the
     // typed extension and yield chat.m4a, NOT chat.m4a.m4a.
     void committingTheSubtitle_stripsTheExtension_noDoubleExt()
@@ -463,7 +463,7 @@ private slots:
                  "the typed extension must be stripped, not double-appended");
     }
 
-    // Queue item 019, issue 1: a raw audio file's title edit must RENAME the
+    // A raw audio file's title edit must RENAME the
     // file (there's no label), never route to setLabel. No sidecar .md means no
     // label was invented either.
     void rawAudioTitleEditRenamesFile()
@@ -486,7 +486,7 @@ private slots:
                  "editing a raw audio title must rename, not invent a label sidecar");
     }
 
-    // Queue item 019, issue 2: a transcribed-but-unlabeled file's title edit must
+    // A transcribed-but-unlabeled file's title edit must
     // rename the file, not silently create a label.
     void unlabeledTranscribedTitleEditRenamesNotLabels()
     {
@@ -511,7 +511,7 @@ private slots:
                  "editing an unlabeled title must rename, not invent a label");
     }
 
-    // Queue item 019, issue 1b: clicking empty background (deselectTextSelections)
+    // Clicking empty background (deselectTextSelections)
     // must blur a focused titleField so its edit commits.
     void clickOutsideBlursTitleField()
     {
@@ -527,7 +527,7 @@ private slots:
                      "an empty-space click must blur the focused title field");
     }
 
-    // Queue item 019, issue 3: the confirm checkmark is visible only while the
+    // The confirm checkmark is visible only while the
     // field is focused AND edited, and its tap action (titleField.focus = false)
     // commits the rename and hides it again.
     void confirmCheckmarkVisibilityAndCommit()
@@ -552,7 +552,7 @@ private slots:
         QTRY_VERIFY2(!check->isVisible(), "checkmark must hide again after commit");
     }
 
-    // Queue item 023: the filename-subtitle field commits on BOTH Enter and blur.
+    // The filename-subtitle field commits on BOTH Enter and blur.
     // Two commits fired before the first rename result repoints the panel must
     // collapse to ONE rename (renameInFlight guard) — without it the second
     // fires against the already-moved old path and hits "File does not exist."
@@ -576,7 +576,7 @@ private slots:
         QVERIFY(QFileInfo::exists(m_vaultDir.filePath(QStringLiteral("chat.m4a"))));
     }
 
-    // Queue item 023: same double-commit collapse for titleField's file-rename
+    // Same double-commit collapse for titleField's file-rename
     // branch (unlabeled file, non-labels routing) — that branch had no guard.
     void renameTitleField_doubleCommitFiresOnlyOneRename()
     {
@@ -597,7 +597,7 @@ private slots:
         QVERIFY(QFileInfo::exists(m_vaultDir.filePath(QStringLiteral("chat.m4a"))));
     }
 
-    // Queue item 029: the title names the FILE, never its location. A file in a
+    // The title names the FILE, never its location. A file in a
     // sub-folder must show just its base filename + extension, not the vault-
     // relative path (displayTitle() used to render the whole relative path).
     void title_showsBaseName_notContainingFolders()
@@ -616,7 +616,7 @@ private slots:
         QDir(m_vaultDir.filePath(QStringLiteral("sub"))).removeRecursively();
     }
 
-    // Queue item 029 companion: the title shows stem+ext, but renameFile() takes
+    // Companion: the title shows stem+ext, but renameFile() takes
     // a stem and re-appends the real extension — committing "chat.m4a" must strip
     // the typed extension and yield chat.m4a, NOT chat.m4a.m4a. (Default config
     // is labels-mode ON and transcript() writes no label:, so commitRename routes
@@ -639,7 +639,7 @@ private slots:
                  "typed extension must be stripped, not double-appended");
     }
 
-    // Queue item 029 companion: merely focusing+blurring the title (committing the
+    // Companion: merely focusing+blurring the title (committing the
     // unchanged name, now WITH its extension) must fire NO rename — an unguarded
     // commit would rename talk.m4a -> talk.m4a.m4a. Proves the blur-to-double-ext
     // bug (pre-existing for root files, newly exposed for sub-folders) is closed.
@@ -665,8 +665,8 @@ int main(int argc, char *argv[])
 {
     // Offscreen + sandboxed org/app name: MainPanel.qml loads the AppSettings
     // singleton, whose Settings{} element must NEVER touch the real
-    // ~/.config/suopTranscriber (CLAUDE.md: never let testing touch the user's
-    // real vault or app config).
+    // ~/.config/suopTranscriber (tests must never touch the user's real
+    // vault or app config).
     qputenv("QT_QPA_PLATFORM", "offscreen");
     qputenv("QT_QUICK_CONTROLS_STYLE", "Basic");
     QCoreApplication::setOrganizationName(QStringLiteral("suopTranscriberTestHarness"));

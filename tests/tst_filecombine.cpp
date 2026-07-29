@@ -63,10 +63,13 @@ QString touchFile(const QString &dir, const QString &name, int secondsAgo)
 
 // The merge itself shells out to ffmpeg (concat demuxer, stream copy), so the
 // end-to-end mtime tests below need it on PATH and need REAL audio — same
-// precedent as tst_audiodecoder.
+// precedent as tst_audiodecoder. CombineTask's post-merge validation also
+// shells out to ffprobe (ships in the same package as ffmpeg on every distro
+// this app targets), so treat the pair as one dependency for skip purposes.
 bool ffmpegOnPath()
 {
-    return !QStandardPaths::findExecutable(QStringLiteral("ffmpeg")).isEmpty();
+    return !QStandardPaths::findExecutable(QStringLiteral("ffmpeg")).isEmpty()
+        && !QStandardPaths::findExecutable(QStringLiteral("ffprobe")).isEmpty();
 }
 
 // A real (tiny) wav ffmpeg's concat demuxer will actually accept, backdated
@@ -499,7 +502,7 @@ private slots:
         QVERIFY(controller.differentiatorNonParticipatingFiles(QStringLiteral("^(\\d+)$"), 0, files).isEmpty());
     }
 
-    // Item 51: combineGroup() is the sidebar's per-row "combine this group"
+    // combineGroup() is the sidebar's per-row "combine this group"
     // button — same matching as runCombineScan() but scoped to the ONE group
     // whose outputPath matches, and must not touch any other detected group.
     void combineGroup_enqueuesOnlyTheMatchingReadyGroup()

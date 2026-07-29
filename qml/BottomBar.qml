@@ -8,7 +8,7 @@ Item {
 
     property string vaultLocalPath: ""
     property TranscriptionController transcriptionController
-    // Wave D item 2: the currently-open file's raw local path (audio file or
+    // The currently-open file's raw local path (audio file or
     // orphaned .md — whatever MainPanel currently shows), empty if none.
     property string currentFilePath: ""
     // The bottom-left path, split into independently clickable segments, in
@@ -53,11 +53,11 @@ Item {
     // file's LOCAL path (fileUrl minus the "file://" prefix, same convention
     // Sidebar.qml's fileActivated uses), for the caller to open in MainPanel.
     signal taskActivated(string path)
-    // Percentage TEXT (item 6): this phase's own 0..1 (see
+    // Percentage TEXT: this phase's own 0..1 (see
     // TranscriptionController::progress's doc comment for why it's phase-
     // relative, not blended across the whole job).
     readonly property real taskProgress: transcriptionController ? transcriptionController.progress : 0
-    // Item 6 (user correction): the PROGRESS BAR's fill instead sweeps
+    // The PROGRESS BAR's fill instead sweeps
     // smoothly across the job's WHOLE lifetime — see
     // TranscriptionController::overallProgress's doc comment.
     readonly property real taskOverallProgress: transcriptionController ? transcriptionController.overallProgress : 0
@@ -66,8 +66,8 @@ Item {
     // Whether a job is actively running right now — distinct from tasksTotal
     // (which also counts Done/Failed jobs still sitting in the persistent,
     // dismissible history list, see TranscriptionController's class doc).
-    // True while ANY task is Active — a benchmark/sweep included. Wave N: a
-    // benchmark is a real queued task now (Presentation::Background), so it
+    // True while ANY task is Active — a benchmark/sweep included. A
+    // benchmark is a real queued task (Presentation::Background), so it
     // sets `busy` and feeds `overallProgress` like everything else; the old
     // separate benchmarkActive/benchmarkProgress glow path is gone.
     readonly property bool busy: transcriptionController ? transcriptionController.busy : false
@@ -147,7 +147,7 @@ Item {
     // comment), which only reads correctly if every phase actually shows
     // real (if approximate) motion instead of a spinner with no width.
     readonly property string currentPhase: transcriptionController ? transcriptionController.currentPhase : ""
-    // Wave N (task system): true while the Active job is paused (only
+    // True while the Active job is paused (only
     // "transcribe"/"download" kinds are truly pausable — see
     // TranscriptionController::pauseActive()'s doc comment).
     readonly property bool activePaused: transcriptionController ? transcriptionController.activePaused : false
@@ -159,7 +159,7 @@ Item {
     // made the first click look like it did nothing (user report,
     // 2026-07-10).
     readonly property bool activeStopping: transcriptionController ? transcriptionController.activeStopping : false
-    // Wave N (task system): whether the Active task can pause AT ALL, read
+    // Whether the Active task can pause AT ALL, read
     // straight off its Task::capabilities().pausable via the controller — the
     // hardcoded kind allowlist ("transcribe"/"download"/"combine"/"chapters")
     // is gone. The task is the single source of truth, so this can never drift
@@ -167,7 +167,7 @@ Item {
     // was the 2026-07-09 pause bug). The finer "can pause RIGHT NOW" (phase
     // gating) stays in canPauseNow() below.
     readonly property bool activeCanPause: transcriptionController ? transcriptionController.activeCanPause : false
-    // Item 9: whether the pause/play button should be ENABLED right now
+    // Whether the pause/play button should be ENABLED right now
     // (visibility is handled separately — the button is only SHOWN for a
     // pausable kind or a resumable queue). Starting a queued job (idle) and
     // resuming an already-paused job are always allowed; while a job is
@@ -188,8 +188,8 @@ Item {
     // Shared by the bottom bar's and the popup header's pause/play button —
     // kept in one place so the glyph and the tap behavior (see both
     // TapHandlers) can never drift out of sync with each other. Always the
-    // ordinary pause/play glyph regardless of phase: item 9 (2026-07-14)
-    // removed the old "loading = cancel-and-restart" behavior entirely, so
+    // ordinary pause/play glyph regardless of phase: the old "loading =
+    // cancel-and-restart" behavior is gone entirely, so
     // the button never doubles as a stop — during a phase that can't be
     // paused yet ("loading") it's simply greyed (see canPauseNow()), not
     // shown with a distinct stop affordance.
@@ -241,14 +241,14 @@ Item {
             return m + ":" + String(s).padStart(2, "0")
         return s + "s"
     }
-    // Item 4/7: "elapsed / ~ETA left" while the ETA is knowable (see
+    // "elapsed / ~ETA left" while the ETA is knowable (see
     // TranscriptionController::estimatedRemainingMs()'s doc comment for when
     // it isn't — e.g. the "loading" phase), otherwise just elapsed.
     readonly property string elapsedEtaText: {
         if (!bottomBar.busy)
             return ""
         const elapsed = bottomBar.formatDuration(bottomBar.activeElapsedMs)
-        // O16: a real cooperative pause never changes Job::status (it stays
+        // A real cooperative pause never changes Job::status (it stays
         // "active" the whole time — see JobStatus::Paused's doc comment for
         // the one narrow case where it doesn't), so this is the one place
         // that has to check activePaused directly rather than trusting the
@@ -268,7 +268,7 @@ Item {
             ? (elapsed + " / ~" + bottomBar.formatDuration(bottomBar.estimatedRemainingMs) + " left")
             : elapsed
     }
-    // Item 3 (reorder): position of jobId among Queued-only entries (the
+    // Reorder: position of jobId among Queued-only entries (the
     // ordering TranscriptionController::moveQueuedJob()'s newIndex counts
     // within) — -1 if jobId isn't currently Queued. Used by the popup's
     // per-row up/down buttons to compute the target index and to disable
@@ -325,7 +325,7 @@ Item {
         bottomRightRadius: AppSettings.useSystemTitlebar ? 0 : AppSettings.borderRadius
     }
 
-    // P11: alternative progress-bar style — a thin glowing line across the
+    // Alternative progress-bar style — a thin glowing line across the
     // top edge of the bar, sweeping across the job's WHOLE lifetime (same
     // taskOverallProgress the existing ProgressBar below uses, for a smooth
     // blended-across-phases sweep rather than progress's per-phase reset).
@@ -425,7 +425,7 @@ Item {
             }
         }
 
-        // Item 4 (Wave E): the segments must read as ONE continuous
+        // The segments must read as ONE continuous
         // left-aligned string, so exactly ONE of them may claim
         // Layout.fillWidth and it must be the LAST. Give the claim to an
         // earlier segment and it takes the whole row, shoving everything after
@@ -471,7 +471,7 @@ Item {
                     // it's the one that elides there rather than at its end.
                     elide: segment.isRoot ? Text.ElideMiddle : Text.ElideRight
                     text: segment.modelData.text
-                    // Wave D item 2: the in-vault part is dimmer than the root.
+                    // The in-vault part is dimmer than the root.
                     color: segment.isRoot ? Theme.textMuted : Theme.textDisabled
                     font.pixelSize: 11
                     // Underline only the hovered segment, not the whole path:
@@ -567,7 +567,7 @@ Item {
             font.pixelSize: 11
         }
 
-        // Item 4/7: elapsed/ETA for whatever's currently running.
+        // Elapsed/ETA for whatever's currently running.
         Label {
             visible: bottomBar.busy && bottomBar.elapsedEtaText !== ""
             text: bottomBar.elapsedEtaText
@@ -575,7 +575,7 @@ Item {
             font.pixelSize: 11
         }
 
-        // Item 2: pause/resume the Active job — only meaningful for
+        // Pause/resume the Active job — only meaningful for
         // "transcribe"/"download" kinds (see canPause()'s doc comment);
         // hidden entirely rather than shown-but-inert for the others, so a
         // click never silently does nothing. Doubles as the "resume a
@@ -587,7 +587,7 @@ Item {
             id: pauseButton
             visible: (bottomBar.busy && bottomBar.activeCanPause)
                 || (!bottomBar.busy && bottomBar.frontQueuedJob !== null)
-            // Item 9: greyed (not just hidden) while the current phase can't
+            // Greyed (not just hidden) while the current phase can't
             // be paused — during "loading" the button is visible but disabled
             // rather than silently reinterpreting the tap as a cancel. Also
             // covers the activeStopping window (see canPauseNow()).
@@ -631,7 +631,7 @@ Item {
             }
         }
 
-        // Item 9: the bottom bar shows ONLY a pause/resume button now — the
+        // The bottom bar shows ONLY a pause/resume button now — the
         // separate stop/cancel button was removed as redundant. Cancelling
         // the active job still lives in the Tasks popup (per-row × button,
         // and "Cancel all"), which is where per-job cancel belongs.
@@ -658,7 +658,7 @@ Item {
             visible: bottomBar.busy && !(AppSettings.progressGlowEnabled && AppSettings.progressGlowHidesBar)
         }
 
-        // P22 / item 25: which backend actually loaded the active model —
+        // Which backend actually loaded the active model —
         // reduced to just "gpu"/"cpu" (see TranscriptionController::
         // activeBackendKind) rather than the raw "Vulkan"/"CUDA"/"CPU" name,
         // per the user's request. Empty (hidden) until a model has loaded,
@@ -672,7 +672,7 @@ Item {
 
         Item {
             id: tasksButton
-            // Item 36: always visible — the counter reads "0/0 tasks" when
+            // Always visible — the counter reads "0/0 tasks" when
             // idle (fresh start / after Clear) rather than vanishing, so the
             // Tasks popup stays reachable and the count is a stable fixture.
             Layout.preferredWidth: tasksLabel.implicitWidth
@@ -699,7 +699,7 @@ Item {
         }
     }
 
-    // Item 6 (Milestone 5): persistent, dismissible task list — like a
+    // Persistent, dismissible task list — like a
     // download manager. Completed/failed jobs stay listed (with status)
     // until individually dismissed or "Clear" is clicked, instead of
     // vanishing the instant they finish.
@@ -712,18 +712,18 @@ Item {
         // directly put the popup mostly off the right edge of the window.
         // Anchor to bottomBar's own right edge instead.
         x: bottomBar.width - width - 8
-        // Item 29: wide enough that a typical "kind + filename + status" row
+        // Wide enough that a typical "kind + filename + status" row
         // reads without the filename getting truncated mid-word — the kind
         // badge (~62) and status label (~96) are fixed, so the earlier 360
         // left the fillWidth filename too little room.
         width: 560
-        // Item 21: one deliberate, symmetric inner padding used BOTH as the
+        // One deliberate, symmetric inner padding used BOTH as the
         // ColumnLayout's margin (below) AND in this height calc, so the gap
         // below the task list is exactly the gap above the header/Clear-button
         // row. The height now hugs the content (header + capped ScrollView) —
         // no artificial min-height floor, which was the only thing that ever
         // left uneven vertical slack below the list.
-        // P18: Math.min is a ceiling only — with many real tasks
+        // Math.min is a ceiling only — with many real tasks
         // jobColumn.implicitHeight (header + capped ScrollView content) could
         // exceed the window; the inner ScrollView's own Layout.preferredHeight
         // cap (below) keeps rows scrollable well before this outer cap is hit
@@ -748,7 +748,7 @@ Item {
         // With padding:0, top and bottom are both exactly innerPadding.
         padding: 0
         clip: true
-        // O21: was modal:false, which gives Qt no dim rectangle and no real
+        // Was modal:false, which gives Qt no dim rectangle and no real
         // block-plane — clicks/hover reached whatever was behind the popup
         // (both MouseArea- and TapHandler-based) at the same time as the
         // popup itself. CloseOnPressOutside still closes it on an outside
@@ -757,7 +757,14 @@ Item {
         modal: true
         dim: true
         focus: false
-        closePolicy: Popup.CloseOnPressOutside | Popup.CloseOnEscape
+        // Suspended (NoAutoClose) while tasksMiddleDrag is armed: Escape and
+        // click-outside are how Chrome-style autoscroll cancels itself too, so
+        // without this the popup's own close would race the disarm and shut the
+        // whole Tasks list instead (same gate as SettingsPopup / BenchmarkPage's
+        // transcript preview).
+        closePolicy: tasksMiddleDrag.armed
+                     ? Popup.NoAutoClose
+                     : (Popup.CloseOnPressOutside | Popup.CloseOnEscape)
 
         background: Rectangle {
             color: Theme.surfaceDialog
@@ -779,7 +786,7 @@ Item {
         ColumnLayout {
             id: jobColumn
             anchors.fill: parent
-            // Item 21: symmetric with the popup height's 2*innerPadding, so
+            // Symmetric with the popup height's 2*innerPadding, so
             // the padding below the list equals the padding above the header.
             anchors.margins: jobListPopup.innerPadding
             // Right edge only: reach into the padding so the overlay bar lands
@@ -800,7 +807,7 @@ Item {
                     color: "white"
                     font.bold: true
                 }
-                // Item 2: pause/resume the Active job — only one job is
+                // Pause/resume the Active job — only one job is
                 // ever Active at a time, so a single header-level button
                 // (rather than a per-row one) covers it; only meaningful for
                 // "transcribe"/"download" kinds (see canPause()'s doc
@@ -812,7 +819,7 @@ Item {
                     id: popupPauseButton
                     visible: (bottomBar.busy && bottomBar.activeCanPause)
                         || (!bottomBar.busy && bottomBar.frontQueuedJob !== null)
-                    // Item 9: same enable gating as the bottom bar's own
+                    // Same enable gating as the bottom bar's own
                     // pauseButton (greyed during "loading"/stopping) — shared
                     // via canPauseNow() so the two never drift apart.
                     enabled: bottomBar.canPauseNow()
@@ -848,7 +855,7 @@ Item {
                         color: Theme.textPrimary
                     }
                 }
-                // Item 3: cancels every Queued job, then the Active one too
+                // Cancels every Queued job, then the Active one too
                 // (same immediate-vs-next-checkpoint caveat as the per-row
                 // cancel button below — see
                 // TranscriptionController::cancelAll()'s doc comment).
@@ -875,6 +882,7 @@ Item {
                 }
                 Button {
                     id: clearButton
+                    objectName: "clearButton"
                     text: qsTr("Clear")
                     hoverEnabled: true
                     onClicked: bottomBar.transcriptionController.clearFinished()
@@ -907,7 +915,7 @@ Item {
                 // ListView's own contentHeight (capped) breaks that cycle.
                 Layout.preferredHeight: Math.min(jobListView.contentHeight, 320)
                 clip: true
-                // Item 023: this ListView used to sit inside a ScrollView — a
+                // This ListView used to sit inside a ScrollView — a
                 // Flickable nested in a Flickable, the standard anti-pattern —
                 // which combined with the non-flattened model below to defeat
                 // virtualization outright for an expanded large batch.
@@ -920,7 +928,7 @@ Item {
                 // multiple of what's visible, instead of one mega-delegate
                 // fanning out an entire batch via a nested Repeater.
                 cacheBuffer: 240
-                // Items 10/11: bind to the pre-partitioned sortedJobs view
+                // Bind to the pre-partitioned sortedJobs view
                 // (see TranscriptionController::sortedJobs) — the
                 // currently-running/next-to-run jobs sit at the TOP in
                 // real run order, with finished (done/failed/cancelled)
@@ -951,7 +959,7 @@ Item {
                     jobListView.expandedBatches = next
                 }
 
-                // Item 023: flattens sortedJobs (each batch header carrying a
+                // Flattens sortedJobs (each batch header carrying a
                 // `members` array — see TranscriptionController::
                 // collapseBatches()) into ONE row per rendered list item, so
                 // every visible row — batch header, standalone task, and each
@@ -1065,7 +1073,7 @@ Item {
                         const s = modelData.fileUrl ? modelData.fileUrl.toString() : ""
                         return s.substring(s.lastIndexOf("/") + 1)
                     }
-                    // O16: same root cause as bottomBar.elapsedEtaText —
+                    // Same root cause as bottomBar.elapsedEtaText —
                     // a real cooperative pause never changes
                     // modelData.status away from "active" (only
                     // JobStatus::Paused's narrow loading-restart edge
@@ -1075,13 +1083,21 @@ Item {
                     // Active row whenever modelData.status === "active"
                     // (there's only ever one).
                     readonly property bool isActivePaused: modelData.status === "active" && bottomBar.activePaused
-                    // O20: a cancelled job is reported as
+                    // A cancelled job is reported as
                     // status: Failed, error: "Cancelled" by the backend
                     // (see TranscriptionController::jobs()'s doc
                     // comment) — same as any other failure otherwise, so
                     // without this check a user-initiated cancel and a
                     // genuine transcription failure render identically.
                     readonly property bool isCancelled: modelData.status === "failed" && modelData.error === "Cancelled"
+                    // A non-fatal diagnostic on an otherwise-successful task
+                    // (Task::warning, e.g. TranscribeTask's
+                    // corrupt-audio repair note). Deliberately NOT surfaced
+                    // for a batch header: collapseBatches() carries no
+                    // aggregate warning field, only per-member rows do —
+                    // expanding the batch still reveals it on the member
+                    // that has one.
+                    readonly property string warningText: modelData.warning || ""
                     readonly property string statusText: {
                         if (jobRow.isActivePaused)
                             return qsTr("paused")
@@ -1105,7 +1121,7 @@ Item {
                     // Distinguishes what kind of work this job actually
                     // is — the same queue/worker thread runs full
                     // transcriptions, "regenerate label" jobs, speaker
-                    // renames, and (Wave N) model downloads, which
+                    // renames, and model downloads, which
                     // otherwise look identical in this list (same
                     // status colors).
                     readonly property string kindLabel: modelData.kindLabel
@@ -1143,7 +1159,7 @@ Item {
                                 .arg(Number(modelData.diarizationThreshold).toFixed(2))
                         return ""
                     }
-                    // Item 4/7: elapsed/ETA while this IS the active
+                    // Elapsed/ETA while this IS the active
                     // row (there's only ever one, so bottomBar's own
                     // elapsedEtaText is unambiguously about THIS row
                     // whenever status is "active"); final duration once
@@ -1170,7 +1186,7 @@ Item {
                             return bottomBar.formatDuration(modelData.durationMs)
                         return ""
                     }
-                    // Item 3: up/down only make sense among Queued rows
+                    // Up/down only make sense among Queued rows
                     // — see queuedPositionOf()'s doc comment. Never for a
                     // batch header or a member (a batch keeps its enqueue
                     // order; reorder stays a standalone-row affordance).
@@ -1238,6 +1254,28 @@ Item {
                                 radius: 4
                                 color: jobRow.statusColor
                             }
+                            // Non-fatal warning on an otherwise-successful
+                            // task (jobRow.warningText) — a small glyph
+                            // *prefix*, not a full icon slot (StyleGuide's
+                            // Iconography carve-out: "a ✓/⚠ glyph used as a
+                            // text prefix inside a larger label stays as it
+                            // is"), colored the same amber as Snackbar's
+                            // "warning" kind. Deliberately NOT the status
+                            // dot's color/shape — the task succeeded, this
+                            // must never read as the failure state above.
+                            Label {
+                                id: warningGlyph
+                                objectName: "taskWarningGlyph"
+                                visible: jobRow.warningText !== ""
+                                text: "⚠" // ⚠
+                                color: "#e0a25a"
+                                font.pixelSize: 10
+
+                                HoverHandler { id: warningHover }
+                                ToolTip.visible: warningHover.hovered
+                                ToolTip.text: jobRow.warningText
+                                ToolTip.delay: 400
+                            }
                             Label {
                                 id: kindLabel
                                 Layout.preferredWidth: 80
@@ -1294,7 +1332,7 @@ Item {
                                 color: Theme.textSecondary
                                 font.pixelSize: 9
 
-                                // O20: surface the real error message on
+                                // Surface the real error message on
                                 // hover for a genuine failure (not a
                                 // cancel) — the row itself has no room
                                 // to show it inline without blowing past
@@ -1307,7 +1345,7 @@ Item {
                             }
 
 
-                            // Item 3: reorder — Queued standalone rows only
+                            // Reorder — Queued standalone rows only
                             // (a batch reorders as a unit it doesn't expose).
                             Item {
                                 id: moveUpButton
@@ -1424,7 +1462,7 @@ Item {
                                     : qsTr("Undo")
                             }
 
-                            // Item 3: one button for both "cancel"
+                            // One button for both "cancel"
                             // (Queued/Active — stops it, see
                             // TranscriptionController::cancelJob()'s doc
                             // comment for the immediate-vs-next-
@@ -1477,6 +1515,25 @@ Item {
                         }
                 }
             }
+        }
+
+        // Chrome/Firefox-style middle-click autoscroll for the task list — see
+        // MiddleDragScroll.qml for the whole design. A sibling of jobColumn,
+        // not a child of it: a ColumnLayout child would be laid out as one more
+        // row, and a ListView child would land in the flickable's contentItem
+        // and scroll away with the rows. The ListView IS the Flickable, so no
+        // ScrollView .contentItem indirection is needed.
+        //
+        // Fills the whole popup, header included, so a middle-click anywhere in
+        // the Tasks surface arms the list — same reach as the note page. It
+        // can't shadow the header's buttons: this is a plain Item whose only
+        // enabled handler takes MiddleButton, so left-clicks and hover cursors
+        // fall through (the reason it is not a MouseArea).
+        MiddleDragScroll {
+            id: tasksMiddleDrag
+            objectName: "tasksMiddleDrag"
+            anchors.fill: parent
+            flickable: jobListView
         }
     }
 }

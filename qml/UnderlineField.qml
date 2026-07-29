@@ -1,7 +1,7 @@
 import QtQuick
 import SuopTranscriber
 
-// Item 14 (Wave E): shared TextField background — a thin white bottom
+// Shared TextField background — a thin white bottom
 // underline instead of the default QQC2 boxed background, shown only while
 // the field has focus. Used as every TextField's `background:` override so
 // styling stays in one place.

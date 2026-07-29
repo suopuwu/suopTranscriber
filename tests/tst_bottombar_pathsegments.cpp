@@ -174,6 +174,7 @@ private slots:
                       "ConfirmPopup 1.0 qml/ConfirmPopup.qml\n"
                       "PlayGlyph 1.0 qml/PlayGlyph.qml\n"
                       "PauseGlyph 1.0 qml/PauseGlyph.qml\n"
+                      "MiddleDragScroll 1.0 qml/MiddleDragScroll.qml\n"
                       "BottomBar 1.0 qml/BottomBar.qml\n");
         qmldir.close();
 
@@ -360,7 +361,7 @@ private slots:
         QCOMPARE(DesktopIntegrationStub::s_calls.at(0).url, QUrl(QStringLiteral("file:///elsewhere/stray.mp3")));
     }
 
-    // Item 4 (Wave E): the segments must read as ONE continuous left-aligned
+    // The segments must read as ONE continuous left-aligned
     // string. That holds only if exactly one segment claims Layout.fillWidth
     // and it's the LAST — an earlier claim takes the whole row and shoves
     // everything after it against the right edge, leaving a gap mid-path.
@@ -392,7 +393,7 @@ int main(int argc, char *argv[])
 {
     // Offscreen + sandboxed org/app name: AppSettings.qml's Settings{} element
     // is loaded transitively by BottomBar.qml, and must never touch the real
-    // ~/.config/suopTranscriber (CLAUDE.md: never let testing touch the user's
+    // ~/.config/suopTranscriber (tests must never touch the user's
     // real vault or app config). Same setup as tst_sidebar_expand.cpp.
     qputenv("QT_QPA_PLATFORM", "offscreen");
     qputenv("QT_QUICK_CONTROLS_STYLE", "Basic");
