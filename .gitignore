@@ -6,6 +6,8 @@ CLAUDE.md
 # --- CMake / C++ build ---
 build/
 cmake-build-*/
+Testing/
+CMakeUserPresets.json
 CMakeCache.txt
 CMakeFiles/
 cmake_install.cmake
@@ -52,6 +54,8 @@ engines/**/.venv/
 
 # --- Editors / OS ---
 .idea/
+.vscode/
+.qmlls.ini
 *.swp
 .DS_Store
 
