@@ -471,6 +471,37 @@ public:
     // file that's since been deleted/renamed, or one outside the vault).
     Q_INVOKABLE void refreshFile(const QUrl &fileUrl);
 
+    // The subset of `paths` that still resolves to a node in the tree, in the
+    // order given. For pruning a selection across a rebuild: a reset
+    // invalidates every QModelIndex, so Sidebar.qml has to re-derive what is
+    // still selectable, and the alternative it used to take — dropping the
+    // selection wholesale — meant ANY file appearing or disappearing anywhere
+    // in the vault silently deselected everything the user had picked (and
+    // took the selection-gated ribbon buttons with it, re-flowing the ribbon).
+    //
+    // Matches whole nodes by absolute path, so it is correct for the audio
+    // files and orphaned .md files a selection can hold, and naturally drops
+    // anything now spoken for by a pending combine. Cheap: one depth-first
+    // walk per candidate, and a selection is a handful of entries.
+    Q_INVOKABLE QStringList retainExistingPaths(const QStringList &paths) const;
+
+    // The transcript body for one row, fetched ON DEMAND instead of pushed
+    // into every delegate through TranscriptBodyRole.
+    //
+    // TreeRowDelegate used to take transcriptBody as a REQUIRED property, so
+    // TreeView pulled the whole body for every row it realized — and these
+    // bodies are big (measured on a real vault: 67 sidecars, 5.6 MB total,
+    // 86 KB mean, 256 KB largest). The role is cached by mtime+size so this
+    // was not disk I/O, but it still marshalled ~2 MB per model reset into
+    // QML, and cleanedBody's `&& transcriptBody` truthiness test materialised
+    // each one as a JS string. Measured 36-43 ms inside a single
+    // beginResetModel/endResetModel pair on that vault, against a 0.5 ms
+    // filesystem scan.
+    //
+    // Nothing reads it unless a text search with "include transcriptions" is
+    // active, so the delegate now calls this only in that case.
+    Q_INVOKABLE QString transcriptBodyForPath(const QString &path) const;
+
     // The file an in-flight recording is being written into (absolute local
     // path; empty = none), pushed down from QML where AudioRecorder lives.
     // Marks that one row IsRecordingRole and withholds it from
@@ -643,6 +674,36 @@ private:
     // Deep structural compare of two subtrees: name/path/flags/status/child
     // order, deliberately NOT mdModified (see Node::mdModified).
     static bool sameStructure(const Node *a, const Node *b);
+
+    // Deep copy of a scanned subtree. applyStructuralDiff() adopts new rows by
+    // CLONING rather than moving them out of the freshly-scanned tree: on a
+    // bail-out that tree is what the caller resets onto, and a half-cannibalised
+    // one is a crash (it was — null children reached collectAudioPaths()).
+    static std::unique_ptr<Node> cloneSubtree(const Node *src, Node *parent);
+
+    // A node's IDENTITY for diffing. Everything sameStructure() compares
+    // except children — two nodes with equal keys are the same row and can be
+    // kept in place; anything else is a remove plus an insert.
+    static QString nodeKey(const Node *node);
+
+    // Splices `fresh`'s shape onto the live tree with beginInsertRows/
+    // beginRemoveRows instead of a full reset, recursing into rows that
+    // survived. Returns false if it can't (nothing done, caller resets).
+    //
+    // Why this exists rather than the reset it replaces: a reset invalidates
+    // every QModelIndex, so TreeView loses its whole expansion state and the
+    // Flickable clamps contentY, and Sidebar.qml then has to REBUILD both
+    // inside one frame or the collapsed tree is painted. That recovery was
+    // never reliably within a frame on a real vault — measured 33-78ms of
+    // dropped frames — and the user-visible result was the folder's contents
+    // vanishing and every row below sliding up ~140px before snapping back.
+    //
+    // An insert/remove has nothing to recover: expansion, scroll offset,
+    // delegates and selection all survive untouched, so there is no window in
+    // which a wrong state can be shown no matter how long the work takes.
+    // That is the difference between making the flash rare and making it
+    // impossible.
+    bool applyStructuralDiff(Node *fresh, Node *current);
     // Walks both trees in lockstep (callers guarantee sameStructure) emitting
     // one dataChanged per parent whose children's mdModified moved.
     void emitContentChanges(const Node *fresh, Node *current);

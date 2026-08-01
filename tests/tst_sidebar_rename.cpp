@@ -474,19 +474,28 @@ private slots:
         QVERIFY(sidebarItem);
         QTRY_COMPARE(sidebarItem->property("currentPath").toString(), audioPath);
 
-        // Reproduce the background structure-change rebuild that clears the
-        // selection while a file stays open — e.g. an import / USB-grab / combine
-        // landing another file in the vault while you work. rebuild() only emits
-        // a real modelReset when the file set actually changed (an unchanged
-        // rescan early-returns with content-only refreshes), so we add a sibling
-        // file THEN refresh: onModelReset then clears selectedPaths but leaves
-        // currentPath (the still-open file) intact.
+        // Reproduce the background structure-change rebuild that happens while
+        // a file stays open — e.g. an import / USB-grab / combine landing
+        // another file in the vault while you work. rebuild() only emits a
+        // real modelReset when the file set actually changed (an unchanged
+        // rescan early-returns with content-only refreshes), so we add a
+        // sibling file THEN refresh.
         QVERIFY(touch(vault.filePath(QStringLiteral("other.mp3"))));
         QObject *vaultModel = view.rootObject()->findChild<QObject *>(QStringLiteral("vaultModel"));
         QVERIFY(vaultModel);
         QMetaObject::invokeMethod(vaultModel, "refresh", Qt::DirectConnection);
-        QTRY_COMPARE(sidebarItem->property("selectedPaths").toList().size(), 0);
+        // onModelReset PRUNES the selection to the paths that survived rather
+        // than dropping it wholesale (VaultTreeModel::retainExistingPaths) —
+        // wiping it deselected everything on any unrelated vault change and
+        // reflowed the ribbon with it, see tst_sidebar_reflow.cpp. talk.mp3
+        // still exists, so it is still selected, and currentPath is untouched.
+        QTRY_COMPARE(sidebarItem->property("selectedPaths").toStringList(), (QStringList{audioPath}));
         QCOMPARE(sidebarItem->property("currentPath").toString(), audioPath);
+
+        // Now clear it by hand, which is what this test is actually about: the
+        // open file NOT being part of the selection, so the single click below
+        // can only be explained by currentPath having outlived the reset.
+        sidebarItem->setProperty("selectedPaths", QStringList{});
 
         // The rebuild recreated every delegate; re-locate the row + item.
         QTRY_VERIFY(treeItem->property("rows").toInt() > 0);

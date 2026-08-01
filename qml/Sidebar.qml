@@ -758,13 +758,25 @@ Rectangle {
             sidebar.refreshSearchResults()
             sidebar.refreshSelectionEligibility()
             sidebar.refreshTreeOrdering()
-            // Vault contents changed (file added/removed/renamed) —
-            // a stale selectedPaths entry could point at a file that no
-            // longer exists, so drop the selection defensively rather than
-            // risk bulk actions silently no-op'ing on a vanished path.
-            sidebar.selectedPaths = []
-            sidebar.lastClickedPath = ""
-            sidebar.selectionCursorPath = ""
+            // Vault contents changed (file added/removed/renamed) — a stale
+            // selectedPaths entry could point at a file that no longer
+            // exists, and a bulk action on a vanished path silently no-ops.
+            // PRUNE to what survived rather than dropping the lot: the reset
+            // fires for any change anywhere in the vault, so clearing meant a
+            // recording finishing three folders away deselected everything
+            // the user had picked. That was visible as a sidebar reflow, not
+            // just lost state — the ribbon's selection-gated buttons vanished
+            // with it and the Flow re-wrapped the survivors (measured in
+            // tst_sidebar_reflow: 17 buttons -> 15 on an unrelated file add).
+            sidebar.selectedPaths = sidebar.model
+                    ? sidebar.model.retainExistingPaths(sidebar.selectedPaths) : []
+            // Both range endpoints have to survive as MEMBERS of the pruned
+            // selection: a Shift-click anchored on a path that no longer
+            // exists would extend a range from nowhere.
+            if (sidebar.selectedPaths.indexOf(sidebar.lastClickedPath) < 0)
+                sidebar.lastClickedPath = ""
+            if (sidebar.selectedPaths.indexOf(sidebar.selectionCursorPath) < 0)
+                sidebar.selectionCursorPath = ""
             // Drag-to-move: a reset recreates every delegate,
             // including the one whose DragHandler is driving an in-flight
             // drag. The vault watcher fires on any vault change (a
@@ -781,6 +793,33 @@ Rectangle {
             // renameFolder() rebuild, and commitActiveRename() has already
             // cleared the state by then, so this is a no-op in that case.
             sidebar.cancelRename()
+        }
+        // A vault change now normally SPLICES rows instead of resetting the
+        // model (VaultTreeModel::applyStructuralDiff), so onModelReset above
+        // no longer fires for the common case and these two carry what it used
+        // to do. The reset path still exists (vault switch, or a splice that
+        // bailed), hence both.
+        //
+        // Coalesced, and deliberately not per-row: one user action can splice
+        // several runs of rows, and each of these walks the whole vault.
+        function onRowsInserted(parent, first, last) {
+            sidebar.refreshTreeOrderingCoalesced()
+            sidebar.refreshSearchResultsCoalesced()
+            sidebar.refreshSelectionEligibility() // already coalesced
+        }
+        function onRowsRemoved(parent, first, last) {
+            // The rows are already gone from the model here, so a selected
+            // path that went with them no longer resolves — same pruning the
+            // reset path does, for the same reason.
+            sidebar.selectedPaths = sidebar.model
+                    ? sidebar.model.retainExistingPaths(sidebar.selectedPaths) : []
+            if (sidebar.selectedPaths.indexOf(sidebar.lastClickedPath) < 0)
+                sidebar.lastClickedPath = ""
+            if (sidebar.selectedPaths.indexOf(sidebar.selectionCursorPath) < 0)
+                sidebar.selectionCursorPath = ""
+            sidebar.refreshTreeOrderingCoalesced()
+            sidebar.refreshSearchResultsCoalesced()
+            sidebar.refreshSelectionEligibility()
         }
         // Undo-of-delete restore signals (emitted AFTER the rebuild's modelReset
         // — see VaultTreeModel::applyRestoreOutcome, which rebuilds THEN emits).
@@ -2945,9 +2984,18 @@ Rectangle {
         // itself, never the user — hence the gate.
         property real lastUserContentY: 0
         property real pendingContentY: -1
+        // Sampled alongside the offset, and for the same reason: the
+        // synchronous half of restorePendingContentY() needs a clamp bound,
+        // and tree.contentHeight is NOT usable there (see below). This is the
+        // last height that was true while the tree was actually settled.
+        property real lastUserContentHeight: 0
         onContentYChanged: {
             if (!tree.expandPending && !tree.expanding)
                 tree.lastUserContentY = tree.contentY
+        }
+        onContentHeightChanged: {
+            if (!tree.expandPending && !tree.expanding)
+                tree.lastUserContentHeight = tree.contentHeight
         }
 
         // insideLayout: true when the caller is itself running inside
@@ -2986,22 +3034,48 @@ Rectangle {
             tree.restorePendingContentY()
         }
 
-        // Deferred, always: in the insideLayout case forceLayout() itself is
-        // only queued above, so contentHeight isn't final yet. Qt.callLater
-        // callbacks run in queue order, so this lands after that layout.
-        // Clamped rather than assigned raw — the tree may genuinely be shorter
-        // now (rows were deleted), and an out-of-range contentY leaves the
-        // Flickable showing blank space below the last row.
+        // Synchronously FIRST, then re-asserted after the deferred layout.
+        //
+        // This used to be deferred-only, and that was the whole of the
+        // remaining "quick sidebar reflow" on any file add/remove: the reset
+        // collapses the view, the Flickable clamps contentY to ~0, and
+        // expandAllNow() puts every row back in the same pass — but the
+        // offset came back one Qt.callLater later. Measured on an 80-row tree
+        // scrolled to contentY 900: one frame at cy=18 (rows and
+        // contentHeight already restored to 81/2268, so ONLY the offset was
+        // wrong), then a second frame still rendering the top rows, ~15ms of
+        // scroll-jump-and-snap-back before it settled.
+        //
+        // expandAll() has already re-inserted every row synchronously by the
+        // time this runs, but contentHeight has NOT caught up: the
+        // insideLayout case only QUEUES forceLayout(), so contentHeight is
+        // still the COLLAPSED value here and clamping the restore against it
+        // just reproduces the clamp being undone (measured: restores 18
+        // instead of 900). Hence the height hint — the last height that was
+        // true while the tree was settled, which for a one-file change is
+        // within a row of the correct one.
         function restorePendingContentY() {
             if (tree.pendingContentY < 0)
                 return
             const target = tree.pendingContentY
             tree.pendingContentY = -1
-            Qt.callLater(function() {
-                const maxY = Math.max(0, tree.contentHeight - tree.height)
-                tree.contentY = Math.max(0, Math.min(target, maxY))
-                tree.lastUserContentY = tree.contentY
-            })
+            tree.applyContentY(target, tree.lastUserContentHeight)
+            // Re-asserted once the queued layout has published the real
+            // contentHeight: the tree may genuinely be shorter now (rows were
+            // deleted), in which case the hinted clamp above was too generous.
+            // A no-op whenever the synchronous restore already landed right.
+            Qt.callLater(function() { tree.applyContentY(target, 0) })
+        }
+
+        // Clamped rather than assigned raw — an out-of-range contentY leaves
+        // the Flickable showing blank space below the last row. heightHint
+        // covers the caller above, whose contentHeight is stale; pass 0 to
+        // clamp against the live value.
+        function applyContentY(target, heightHint) {
+            const height = Math.max(tree.contentHeight, heightHint)
+            const maxY = Math.max(0, height - tree.height)
+            tree.contentY = Math.max(0, Math.min(target, maxY))
+            tree.lastUserContentY = tree.contentY
         }
 
         // The view has NOT processed the reset when this runs — a QML
@@ -3018,6 +3092,45 @@ Rectangle {
                 tree.pendingContentY = tree.lastUserContentY
                 tree.expandPending = true
                 expandRetryTimer.start()
+            }
+            // A vault change normally SPLICES rows now rather than resetting
+            // (VaultTreeModel::applyStructuralDiff), which is what keeps the
+            // collapsed tree from ever being painted: existing rows keep their
+            // expansion, so there is nothing to rebuild inside a frame. But a
+            // freshly inserted folder has no expansion state yet and TreeView
+            // expands nothing on its own, and this tree's contract is
+            // everything-expanded.
+            //
+            // Expands ONLY the inserted rows — and that is a genuine
+            // improvement over the expandAll() the reset path still needs: it
+            // no longer destroys a collapse the user made on some unrelated
+            // folder every time any file appears.
+            // Rows leaving shrink contentHeight, and if the view was pinned at
+            // the bottom the Flickable's own clamp lands a frame LATE — the
+            // tree renders its new row positions at the old offset for that
+            // frame, i.e. the content jumps and settles back. Clamp in the
+            // same turn the rows left in.
+            // No onRowsRemoved counterpart on purpose. Removing a row while the
+            // view is pinned at the very BOTTOM leaves one frame drawn ~a row
+            // off, because contentHeight is still the pre-removal value when
+            // rowsRemoved fires (TableView publishes it a layout later) and the
+            // Flickable's clamp therefore lands a frame late. Clamping here,
+            // and clamping after a forceLayout(), were both tried and are both
+            // no-ops for exactly that reason — see tst_sidebar_reflow's
+            // QEXPECT_FAIL. Left undone rather than left as code that looks
+            // like it does something.
+            function onRowsInserted(parent, first, last) {
+                for (let i = first; i <= last; i++) {
+                    const idx = searchProxy.index(i, 0, parent)
+                    if (!searchProxy.data(idx, VaultTreeModel.IsDirRole))
+                        continue
+                    // -1 when the new row isn't visible (its parent is
+                    // collapsed) — nothing to expand, and it will be handled
+                    // if that parent is ever opened.
+                    const row = tree.rowAtIndex(idx)
+                    if (row >= 0)
+                        tree.expandRecursively(row, -1)
+                }
             }
         }
 

@@ -91,7 +91,16 @@ Item {
     // Proxy-provided passthrough of VaultTreeModel::TranscriptBodyRole
     // (empty unless this is a TranscribedStatus audio row) — used to
     // build the search-result snippet below.
-    required property string transcriptBody
+    // NOT a required property (i.e. not pulled from TranscriptBodyRole for
+    // every realized row): these bodies run to tens or hundreds of KB, and
+    // handing one to every delegate cost 36-43ms per model reset on a real
+    // vault. See VaultTreeModel::transcriptBodyForPath(). Fetched only while a
+    // transcript-including search is actually running, which is the only time
+    // cleanedBody below reads it.
+    readonly property string transcriptBody:
+        (sidebarRoot.searchQuery !== "" && sidebarRoot.searchIncludeTranscriptions
+         && sidebarRoot.model && treeDelegate.status === 2)
+            ? sidebarRoot.model.transcriptBodyForPath(treeDelegate.path) : ""
 
     // "transcribe all" (bulk) skips files whose stored settings
     // already match what bulk would use (untranscribed OR the

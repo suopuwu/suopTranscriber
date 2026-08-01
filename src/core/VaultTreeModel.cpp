@@ -231,9 +231,128 @@ void VaultTreeModel::rebuild(bool forceReset)
         return;
     }
 
+    // Splice the difference in place when possible — see applyStructuralDiff()
+    // for why a reset is worth this much trouble to avoid. On failure it may
+    // have emitted some rows already, so the reset below is the required
+    // correction, not merely a fallback.
+    if (!forceReset && applyStructuralDiff(fresh.get(), m_root.get())) {
+        // Content (status dots, rewritten sidecars) still has to land: the
+        // splice only reconciles which ROWS exist, and a row that survived can
+        // still have a changed .md behind it.
+        emitContentChanges(fresh.get(), m_root.get());
+        return;
+    }
+
     beginResetModel();
     m_root = std::move(fresh);
     endResetModel();
+}
+
+std::unique_ptr<VaultTreeModel::Node> VaultTreeModel::cloneSubtree(const Node *src, Node *parent)
+{
+    auto copy = std::make_unique<Node>();
+    copy->name = src->name;
+    copy->path = src->path;
+    copy->isDir = src->isDir;
+    copy->isAudio = src->isAudio;
+    copy->isOrphanedMd = src->isOrphanedMd;
+    copy->isCombinePlaceholder = src->isCombinePlaceholder;
+    copy->combineSourceCount = src->combineSourceCount;
+    copy->status = src->status;
+    copy->mdModified = src->mdModified;
+    copy->parent = parent;
+    copy->children.reserve(src->children.size());
+    for (const auto &child : src->children)
+        copy->children.push_back(cloneSubtree(child.get(), copy.get()));
+    return copy;
+}
+
+QString VaultTreeModel::nodeKey(const Node *node)
+{
+    return node->path + QLatin1Char('\x1f') + node->name + QLatin1Char('\x1f')
+           + QString::number(int(node->isDir)) + QString::number(int(node->isAudio))
+           + QString::number(int(node->isOrphanedMd))
+           + QString::number(int(node->isCombinePlaceholder))
+           + QLatin1Char('\x1f') + QString::number(node->combineSourceCount);
+}
+
+bool VaultTreeModel::applyStructuralDiff(Node *fresh, Node *current)
+{
+    const QModelIndex parentIdx = indexForNode(current);
+    // indexForNode() returns an invalid index both for the root (correct — the
+    // root's children live under an invalid parent) and for a node no longer
+    // reachable from m_root (a bug). Only the root may be invalid here.
+    if (!parentIdx.isValid() && current != m_root.get())
+        return false;
+
+    // Precomputed once — the passes below compare against it repeatedly, and
+    // `fresh` is only ever read (pass 2 CLONES rather than moves, so a bail-out
+    // leaves it a complete tree for the caller's fallback reset to adopt).
+    QList<QString> freshOrder;
+    freshOrder.reserve(int(fresh->children.size()));
+    QSet<QString> freshKeys;
+    freshKeys.reserve(int(fresh->children.size()));
+    for (const auto &child : fresh->children) {
+        freshOrder.append(nodeKey(child.get()));
+        freshKeys.insert(freshOrder.constLast());
+    }
+
+    // Pass 1 — remove what's gone, walking backwards so each contiguous run's
+    // indices stay valid as it's erased.
+    for (int i = int(current->children.size()) - 1; i >= 0; --i) {
+        if (freshKeys.contains(nodeKey(current->children[size_t(i)].get())))
+            continue;
+        int first = i;
+        while (first > 0 && !freshKeys.contains(nodeKey(current->children[size_t(first - 1)].get())))
+            --first;
+        beginRemoveRows(parentIdx, first, i);
+        current->children.erase(current->children.begin() + first,
+                                current->children.begin() + i + 1);
+        endRemoveRows();
+        i = first;
+    }
+
+    // Pass 2 — insert what's new. Both lists come from the same deterministic
+    // scan order (QDir::DirsFirst | QDir::Name, placeholders appended), so the
+    // survivors above are already in fresh's relative order and each new node
+    // belongs at its own index in fresh.
+    for (size_t j = 0; j < size_t(freshOrder.size()); ++j) {
+        if (j < current->children.size() && nodeKey(current->children[j].get()) == freshOrder.at(int(j)))
+            continue;
+        size_t last = j;
+        while (last + 1 < size_t(freshOrder.size())
+               && (last + 1 >= current->children.size()
+                   || nodeKey(current->children[last + 1].get()) != freshOrder.at(int(last + 1))))
+            ++last;
+        beginInsertRows(parentIdx, int(j), int(last));
+        for (size_t k = j; k <= last; ++k) {
+            current->children.insert(current->children.begin() + int(k),
+                                     cloneSubtree(fresh->children[k].get(), current));
+        }
+        endInsertRows();
+        j = last;
+    }
+
+    // A mismatch here means the two orderings disagreed and the splice above
+    // produced a tree that isn't `fresh` — bail so the caller resets rather
+    // than leaving the view describing something that was never scanned.
+    if (current->children.size() != size_t(freshOrder.size()))
+        return false;
+    for (size_t i = 0; i < current->children.size(); ++i) {
+        if (nodeKey(current->children[i].get()) != freshOrder.at(int(i)))
+            return false;
+    }
+
+    // Recurse into every directory row: the ones that survived may differ
+    // deeper down, and a just-cloned one already matches so its walk is a
+    // cheap no-op.
+    for (size_t i = 0; i < current->children.size(); ++i) {
+        if (!current->children[i]->isDir)
+            continue;
+        if (!applyStructuralDiff(fresh->children[i].get(), current->children[i].get()))
+            return false;
+    }
+    return true;
 }
 
 bool VaultTreeModel::sameStructure(const Node *a, const Node *b)
@@ -1351,4 +1470,26 @@ void VaultTreeModel::refreshFile(const QUrl &fileUrl)
         return;
 
     emit dataChanged(idx, idx);
+}
+
+QString VaultTreeModel::transcriptBodyForPath(const QString &path) const
+{
+    const Node *node = findNodeByPath(m_root.get(), path);
+    // Same gating as TranscriptBodyRole in data(): an untranscribed row has no
+    // body, and asking for one must not read a stale/absent sidecar.
+    if (!node || node->status != TranscribedStatus)
+        return {};
+    const QString mdPath = sidecarMdPath(node);
+    return mdPath.isEmpty() ? QString() : transcriptBody(mdPath);
+}
+
+QStringList VaultTreeModel::retainExistingPaths(const QStringList &paths) const
+{
+    QStringList kept;
+    kept.reserve(paths.size());
+    for (const QString &path : paths) {
+        if (!path.isEmpty() && findNodeByPath(m_root.get(), path))
+            kept << path;
+    }
+    return kept;
 }

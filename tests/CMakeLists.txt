@@ -480,6 +480,7 @@ suop_add_test(tst_sidebar_rename LINK_QUICK LINK_SVG ICON_ASSETS SOURCES VaultTr
 suop_add_test(tst_sidebar_expand LINK_QUICK LINK_SVG ICON_ASSETS SOURCES VaultTreeModel.cpp VaultSearchProxyModel.cpp IconTheme.cpp TreeOrdering.cpp FileRename.cpp VaultFileOps.cpp)
 suop_add_test(tst_sidebar_scroll LINK_QUICK LINK_SVG ICON_ASSETS SOURCES VaultTreeModel.cpp VaultSearchProxyModel.cpp IconTheme.cpp TreeOrdering.cpp FileRename.cpp VaultFileOps.cpp)
 suop_add_test(tst_sidebar_guides LINK_QUICK LINK_SVG ICON_ASSETS SOURCES VaultTreeModel.cpp VaultSearchProxyModel.cpp IconTheme.cpp TreeOrdering.cpp FileRename.cpp VaultFileOps.cpp)
+suop_add_test(tst_sidebar_reflow LINK_QUICK LINK_SVG ICON_ASSETS SOURCES VaultTreeModel.cpp VaultSearchProxyModel.cpp IconTheme.cpp TreeOrdering.cpp FileRename.cpp VaultFileOps.cpp)
 suop_add_test(tst_sidebar_selectall LINK_QUICK LINK_SVG ICON_ASSETS SOURCES VaultTreeModel.cpp VaultSearchProxyModel.cpp IconTheme.cpp TreeOrdering.cpp FileRename.cpp VaultFileOps.cpp)
 suop_add_test(tst_sidebar_filtersuggestions LINK_QUICK LINK_SVG ICON_ASSETS SOURCES VaultTreeModel.cpp VaultSearchProxyModel.cpp IconTheme.cpp TreeOrdering.cpp FileRename.cpp VaultFileOps.cpp)
 # The ONLY sidebar harness that renders inside a real ApplicationWindow (hence a

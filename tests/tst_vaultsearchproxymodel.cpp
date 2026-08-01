@@ -527,11 +527,25 @@ private slots:
         collectPersistent(proxy, held);
         QVERIFY(!held.isEmpty());
 
-        // Move triggers rebuild() -> begin/endResetModel; the handler re-enters
-        // the proxy mid-reset, and invalidate() walks `held` back to the freed
-        // source Nodes. Pre-fix this segfaulted here.
+        // The move itself no longer resets: rebuild() splices rows in place now
+        // (VaultTreeModel::applyStructuralDiff), which is a good thing and is
+        // also why it can no longer drive this test. Run it anyway — a splice
+        // with persistent indexes held across a nested move is worth proving
+        // safe on its own — then force the RESET path below.
         QVERIFY(source.moveFile(QUrl::fromLocalFile(vault.filePath("outer/roamer.mp3")),
                                 QUrl::fromLocalFile(vault.filePath("outer/inner"))));
+        QVERIFY(findByName(proxy, "roamer.mp3").isValid());
+
+        // Now the case this test exists for. setVaultPath() forces
+        // begin/endResetModel (rebuild(true)) even onto an identical shape, so
+        // the reentrant handler fires mid-reset while `held` still points at
+        // source Nodes the rebuild just freed. Pre-fix this segfaulted here.
+        QTemporaryDir vault2;
+        QVERIFY(vault2.isValid());
+        QVERIFY(QDir().mkpath(vault2.filePath("outer/inner")));
+        QVERIFY(touch(vault2.filePath("outer/sibling/clip.mp3")));
+        QVERIFY(touch(vault2.filePath("outer/inner/roamer.mp3")));
+        source.setVaultPath(QUrl::fromLocalFile(vault2.path()));
 
         // Survived, the tree is consistent, and the deferred invalidate applied
         // the handler's keys.
