@@ -736,6 +736,77 @@ private slots:
         QCOMPARE(statusOf(controller, fileB), QStringLiteral("failed"));
     }
 
+    // The file a take is being written into is refused by the queue: it is
+    // still growing and its WAV header still understates its size, so
+    // transcribing it would read a truncated recording. The recorder publishes
+    // the path (AudioRecorder::activeRecordingPath); QML binds it here.
+    void activeRecording_isRefusedByTheQueue()
+    {
+        VaultFixture vault;
+        TranscriptionController controller;
+        const QUrl recording = vault.audioUrl("take.wav");
+        const QUrl other = vault.audioUrl("other.wav");
+
+        controller.setActiveRecordingPath(recording.toLocalFile());
+
+        controller.transcribe(recording, vault.vaultUrl, kModelId);
+        QCOMPARE(controller.tasksTotal(), 0); // refused, not queued
+
+        // Only THAT file: everything else queues normally while a take runs.
+        controller.transcribe(other, vault.vaultUrl, kModelId);
+        QCOMPARE(controller.tasksTotal(), 1);
+        QTRY_COMPARE(controller.tasksCompleted(), 1);
+    }
+
+    // Clearing the path (the worker reported the file finalized) hands the file
+    // straight back — the refusal is a live gate, not a permanent blacklist.
+    void activeRecording_queueableOnceTheTakeEnds()
+    {
+        VaultFixture vault;
+        TranscriptionController controller;
+        const QUrl recording = vault.audioUrl("take.wav");
+
+        controller.setActiveRecordingPath(recording.toLocalFile());
+        controller.transcribe(recording, vault.vaultUrl, kModelId);
+        QCOMPARE(controller.tasksTotal(), 0);
+
+        controller.setActiveRecordingPath(QString());
+        controller.transcribe(recording, vault.vaultUrl, kModelId);
+        QCOMPARE(controller.tasksTotal(), 1);
+        QTRY_COMPARE(controller.tasksCompleted(), 1);
+    }
+
+    // The guard reads Task::touchedFiles(), not fileUrl — a trash over a
+    // selection carries a QList<QUrl> and sets fileUrl to only the FIRST of
+    // it, so a fileUrl-only check would wave through a multi-file trash whose
+    // second entry is the file being recorded, deleting it mid-write.
+    void activeRecording_isRefusedInsideAMultiFileTrash()
+    {
+        VaultFixture vault;
+        TranscriptionController controller;
+        const QUrl other = vault.audioUrl("other.wav");
+        const QUrl recording = vault.audioUrl("take.wav");
+
+        controller.setActiveRecordingPath(recording.toLocalFile());
+        // recording is deliberately NOT first: fileUrl is `other`.
+        controller.trash(QStringLiteral("files"), {other, recording}, vault.vaultUrl);
+        QCOMPARE(controller.tasksTotal(), 0);
+    }
+
+    // A task may name the sibling .md rather than the audio (rename/trash
+    // routinely do), and that is the same recording — isSameRecording(), not
+    // url equality, is what the guard compares with.
+    void activeRecording_isRefusedViaItsSiblingMd()
+    {
+        VaultFixture vault;
+        TranscriptionController controller;
+        const QUrl recording = vault.audioUrl("take.wav");
+
+        controller.setActiveRecordingPath(recording.toLocalFile());
+        controller.trash(QStringLiteral("transcript"), {vault.audioUrl("take.md")}, vault.vaultUrl);
+        QCOMPARE(controller.tasksTotal(), 0);
+    }
+
     // A multi-select bulk op stamps every task it enqueues with ONE shared
     // batchId (so the underlying per-file tasks still run/report individually),
     // and sortedJobs() collapses them into a single Tasks row. This is the

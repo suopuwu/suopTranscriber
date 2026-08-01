@@ -202,19 +202,52 @@ QByteArray buildWavHeader(quint32 dataSize, quint32 sampleRate = 48000, quint16 
 void patchWavHeader(QFile &file, quint32 dataSize, quint32 sampleRate = 48000, quint16 channelCount = 2,
                      quint16 bitsPerSample = 16);
 
-// "<vaultUrl>/[outputRelativeFolder/]suopAudio_yyyyMMdd-HHmmss.wav" — see
-// AudioRecorder::startRecording()'s doc comment for the exact join rule
-// (outputRelativeFolder empty => straight under the vault root).
-QString buildOutputFilePath(const QUrl &vaultUrl, const QString &outputRelativeFolder, const QDateTime &timestamp);
+// A typed recording name reduced to something safe to join into a path:
+// trimmed, a user-typed ".wav" extension dropped, every filesystem-invalid
+// character (/\:*?"<>|) and control character removed, leading/trailing dots
+// stripped (so "." and ".." can never survive as a name that means a
+// directory), capped at 120 characters. Empty when nothing usable is left —
+// the caller then falls back to the timestamp name. Pure, because the same
+// rule has to run in two places that must never disagree: the path built at
+// record time and the live preview the page shows while the user types.
+QString sanitizeRecordingName(const QString &requestedName);
 
-// "<tempRoot>/suopTranscriber-test/suopAudio_yyyyMMdd-HHmmss.wav" — where a
-// TEST recording goes: outside the vault entirely, so a level check never
-// leaves a real untranscribed audio file in the tree. tempRoot is
-// QDir::tempPath() in production; injected so this is testable against a
-// QTemporaryDir. On this app's target (CachyOS) /tmp is tmpfs, so a test take
-// never reaches a disk in the first place — which is why there is no separate
-// in-memory capture path to maintain.
-QString buildTestOutputFilePath(const QString &tempRoot, const QDateTime &timestamp);
+// "<vaultUrl>/[outputRelativeFolder/]<name>.wav" — see
+// AudioRecorder::startRecording()'s doc comment for the exact join rule
+// (outputRelativeFolder empty => straight under the vault root). <name> is
+// sanitizeRecordingName(requestedName), or "suopAudio_yyyyMMdd-HHmmss" when
+// that yields nothing. Still a pure join: collisions are resolved separately,
+// by uniquePathForRecording().
+QString buildOutputFilePath(const QUrl &vaultUrl, const QString &outputRelativeFolder,
+                            const QDateTime &timestamp, const QString &requestedName = QString());
+
+// desiredPath itself if nothing is in the way, else the same path with "_N"
+// appended to the base name for the lowest N >= 2 that is free — so a series
+// of takes under one name reads "interview", "interview_2", "interview_3" and
+// the number names WHICH take it is. (UsbGrabJob.cpp's own collision suffix
+// starts at _1; it is deduplicating a copy of a file that already exists
+// elsewhere, not numbering a sequence the user is creating, so the two
+// deliberately differ.)
+//
+// "In the way" means EITHER the .wav or a sibling .md of that base name
+// exists. The .md check is load-bearing, not caution: a sibling .md IS the
+// transcript of a recording in this vault, so writing a fresh take next to an
+// orphaned "notes.md" would silently adopt someone else's transcript as its
+// own. Reads the filesystem (like pruneTestRecordings above), so it is
+// testable against a QTemporaryDir with no audio hardware.
+QString uniquePathForRecording(const QString &desiredPath);
+
+// "<tempRoot>/suopTranscriber-test/<name>.wav" — where a TEST recording goes:
+// outside the vault entirely, so a level check never leaves a real
+// untranscribed audio file in the tree. <name> follows buildOutputFilePath()'s
+// rule (sanitizeRecordingName(requestedName), or a timestamp when that yields
+// nothing) — a test take is a faithful preview of a real one, and that
+// includes its name. tempRoot is QDir::tempPath() in production; injected so
+// this is testable against a QTemporaryDir. On this app's target (CachyOS)
+// /tmp is tmpfs, so a test take never reaches a disk in the first place —
+// which is why there is no separate in-memory capture path to maintain.
+QString buildTestOutputFilePath(const QString &tempRoot, const QDateTime &timestamp,
+                                 const QString &requestedName = QString());
 
 // Deletes all but the `keepNewest` most recent suopAudio_*.wav files in `dir`,
 // newest by filename (the timestamp in the name sorts lexicographically —
@@ -367,6 +400,18 @@ class AudioRecorder : public QObject {
     // an in-progress slider drag.
     Q_PROPERTY(QVariantList systemSources READ systemSources NOTIFY sourcesChanged)
     Q_PROPERTY(QVariantList appStreams READ appStreams NOTIFY sourcesChanged)
+    // Absolute path of the file the CURRENT take is being written into, empty
+    // when no take is in flight. The vault tree's watcher surfaces that file
+    // the moment the worker creates it, so without this the app has no way to
+    // tell a half-written recording from an ordinary audio file: it is
+    // openable, queueable and trashable while it is still growing. Whoever
+    // gates on a file being busy needs the path, not just `recording`.
+    //
+    // Held from just BEFORE the worker is asked to start until the worker
+    // reports the file finalized — deliberately WIDER than `recording`, which
+    // flips back on the stop click while the header patch and flush are still
+    // outstanding.
+    Q_PROPERTY(QString activeRecordingPath READ activeRecordingPath NOTIFY activeRecordingPathChanged)
 
 public:
     explicit AudioRecorder(QObject *parent = nullptr);
@@ -376,6 +421,7 @@ public:
     qreal currentLevel() const { return m_currentLevel; }
     qint64 elapsedMs() const { return m_elapsedMs; }
     QString lastError() const { return m_lastError; }
+    QString activeRecordingPath() const { return m_activeRecordingPath; }
 
     // Thin QML-facing wrapper over AudioRecorderIO::displayLevelFromRms() —
     // the recorder page maps each currentLevel sample through this ONCE, as
@@ -424,6 +470,24 @@ public:
         return AudioRecorderIO::pendingCaptureAdditions(desired, activeIds);
     }
 
+    // Thin QML-facing wrapper over AudioRecorderIO::sanitizeRecordingName(),
+    // matching the displayLevel()/appCaptureRows() precedent — the page needs
+    // the sanitized name to say what the take will actually be called.
+    Q_INVOKABLE QString sanitizeRecordingName(const QString &requestedName) const
+    {
+        return AudioRecorderIO::sanitizeRecordingName(requestedName);
+    }
+
+    // The file name (no directory) the NEXT take would be written to, given
+    // the destination the page currently has set — i.e. startRecording()'s own
+    // path decision, run without starting anything. The page compares it
+    // against the name the user typed: a difference IS the collision, so the
+    // warning and the file that eventually lands can't disagree about what
+    // counts as taken.
+    Q_INVOKABLE QString plannedRecordingFileName(const QUrl &vaultUrl,
+                                                  const QString &outputRelativeFolder,
+                                                  const QString &requestedName, bool testMode) const;
+
     // {id, name} per input device from QMediaDevices::audioInputs() — id is
     // the device's own stable QAudioDevice::id() (opaque, NOT the friendly
     // name), name is description() for the QML dropdown label.
@@ -447,6 +511,10 @@ public:
     // capturing on the worker thread. A no-op that sets lastError (without
     // touching recording state) if a recording is already in progress, or if
     // NONE of useMic / useSystemAudio / appCaptureSources is requested.
+    // requestedName empty (or unusable — see sanitizeRecordingName()) falls
+    // back to the timestamp name; a name already taken at the destination
+    // gets a "_N" suffix rather than overwriting (see
+    // AudioRecorderIO::uniquePathForRecording()).
     // systemSourceId is one of availableSystemSources()'s opaque ids (or
     // empty, meaning the default monitor) — see startSystemAudio() in the
     // .cpp for how it's mapped to a capture binary + args. appCaptureSources
@@ -460,7 +528,8 @@ public:
     // prunes older test takes first — vaultUrl and outputRelativeFolder are
     // ignored. Everything else about the capture is identical, so a test
     // take is a faithful preview of what a real one would sound like.
-    Q_INVOKABLE void startRecording(const QUrl &vaultUrl, const QString &outputRelativeFolder, bool useMic,
+    Q_INVOKABLE void startRecording(const QUrl &vaultUrl, const QString &outputRelativeFolder,
+                                     const QString &requestedName, bool useMic,
                                      const QString &micDeviceId, bool useSystemAudio, double micGain,
                                      double systemGain, const QString &systemSourceId = QString(),
                                      const QVariantList &appCaptureSources = {}, bool testMode = false);
@@ -523,6 +592,7 @@ signals:
     // m_activeCaptureSourceIds changed — see activeCaptureSourceIds.
     void activeCaptureSourcesChanged();
     void monitoringChanged();
+    void activeRecordingPathChanged();
     // Emitted once stopRecording() (or an internal auto-stop triggered by a
     // fatal capture error — see lastError's doc comment) has fully
     // finalized the WAV file on disk. filePath is EMPTY when the capture
@@ -534,6 +604,9 @@ private:
     // Swaps in a fresh enumeration, emitting sourcesChanged() only on a real
     // difference — see the systemSources property.
     void applySources(const QVariantList &sources);
+    // Idempotent: the failure rollback and the worker's stopped() can both
+    // reach it for one take.
+    void clearActiveRecordingPath();
 
     QThread m_thread;
     AudioRecorderWorker *m_worker = nullptr;
@@ -544,6 +617,7 @@ private:
     QVariantList m_sourceLevels;
     QStringList m_activeCaptureSourceIds;
     QString m_lastError;
+    QString m_activeRecordingPath;
     QProcess *m_sourceProbe = nullptr; // non-null only while a pw-dump is in flight
     QVariantList m_systemSources;
     QVariantList m_appStreams;

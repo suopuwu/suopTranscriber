@@ -301,6 +301,17 @@ QString CombineTask::displayName() const
     return QStringLiteral("Combine %1 files").arg(m_sourcePaths.size());
 }
 
+QList<QUrl> CombineTask::touchedFiles() const
+{
+    QList<QUrl> urls;
+    urls.reserve(m_sourcePaths.size() + 1);
+    for (const QString &path : m_sourcePaths)
+        urls << QUrl::fromLocalFile(path);
+    if (!fileUrl.isEmpty())
+        urls << fileUrl; // the output, which this task creates
+    return urls;
+}
+
 QJsonObject CombineTask::toJson() const
 {
     return {{QStringLiteral("combineSourcePaths"), QJsonArray::fromStringList(m_sourcePaths)},

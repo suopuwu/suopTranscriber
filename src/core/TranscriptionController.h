@@ -183,6 +183,14 @@ class TranscriptionController : public QObject, public TaskSchedulerObserver {
     // tying it to progress clogged the GUI thread.
     Q_PROPERTY(int liveUpdateTick READ liveUpdateTick NOTIFY liveUpdateTickChanged)
     Q_PROPERTY(int pendingRenamesRevision READ pendingRenamesRevision NOTIFY pendingRenamesRevisionChanged)
+    // Absolute path of the file an in-flight recording is being written into,
+    // empty when none. WRITTEN from QML (bound to AudioRecorder's property of
+    // the same name) rather than read from an AudioRecorder here: the recorder
+    // is a QML-owned object and the controller has never held a reference to
+    // it. Forwarded straight to the scheduler, which is where the enqueue
+    // refusal lives — see TaskScheduler::setActiveRecordingUrl().
+    Q_PROPERTY(QString activeRecordingPath READ activeRecordingPath WRITE setActiveRecordingPath
+                       NOTIFY activeRecordingPathChanged)
     // True while the Active job is paused; false whenever nothing is Active.
     // Only transcribe/download are truly pausable — see pauseActive().
     Q_PROPERTY(bool activePaused READ isActivePaused NOTIFY activePausedChanged)
@@ -1005,6 +1013,9 @@ public:
     Q_INVOKABLE QString pendingRenameStem(const QUrl &fileUrl) const;
     int pendingRenamesRevision() const { return m_pendingRenamesRevision; }
 
+    QString activeRecordingPath() const { return m_activeRecordingPath; }
+    void setActiveRecordingPath(const QString &path);
+
     // Moves one or more recording files (each carrying its .md sidecar +
     // .partial.jsonl resume state) into destDirUrl, as instant-lane tasks —
     // one MoveTask per file, all in ONE undo batch (a single "Moved N files"
@@ -1391,6 +1402,7 @@ signals:
     // task completing/failing). Views read pendingRenameStem() gated on this so
     // the read is reactive — see pendingRenameStem()'s doc comment.
     void pendingRenamesRevisionChanged();
+    void activeRecordingPathChanged();
     // Fired per file when a moveFiles() task completes. oldUrl is the file's
     // original location; newUrl is its new location (empty on failure). QML
     // repoints the player to newUrl when the moved file was the open one.
@@ -1627,6 +1639,7 @@ private:
     VaultTreeModel *m_vaultModel = nullptr;
     QHash<QString, QString> m_pendingRenames; // oldLocalFilePath -> new stem
     int m_pendingRenamesRevision = 0;
+    QString m_activeRecordingPath;
     bool m_busy = false;
     double m_progress = 0.0;
     // True once the Active SelfCumulative task emits its first real progress()

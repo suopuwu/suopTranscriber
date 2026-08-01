@@ -245,6 +245,7 @@ qt_add_qml_module(suopTranscriber
         qml/Snackbar.qml
         qml/SnackbarHost.qml
         qml/HoverBorder.qml
+        qml/HoverUnderlineLabel.qml
         qml/CombineGroupOutline.qml
         qml/UnderlineField.qml
         qml/TextRedoShortcut.qml

@@ -453,7 +453,10 @@ Item {
 
             Repeater {
                 model: bottomBar.pathSegments
-                delegate: Label {
+                // Underline-on-hover only the hovered segment, not the whole
+                // path: each segment is its own target, so underlining all of
+                // them would misreport what the click is about to open.
+                delegate: HoverUnderlineLabel {
                     id: segment
 
                     // Carries an objectName purely so tst_bottombar_pathsegments
@@ -474,33 +477,23 @@ Item {
                     // The in-vault part is dimmer than the root.
                     color: segment.isRoot ? Theme.textMuted : Theme.textDisabled
                     font.pixelSize: 11
-                    // Underline only the hovered segment, not the whole path:
-                    // each segment is its own target, so underlining all of
-                    // them would misreport what the click is about to open.
-                    font.underline: segmentHover.hovered
 
-                    HoverHandler {
-                        id: segmentHover
-                        cursorShape: Qt.PointingHandCursor
-                    }
-                    TapHandler {
-                        onTapped: {
-                            // The file itself opens its folder with the file
-                            // selected; a folder segment just opens that
-                            // folder. Either way the file manager's window is
-                            // raised and focused — see DesktopIntegration for
-                            // the activation token that takes.
-                            if (segment.modelData.isFile)
-                                DesktopIntegration.revealInFileManager("file://" + segment.modelData.path)
-                            else
-                                DesktopIntegration.openInFileManager("file://" + segment.modelData.path)
-                        }
+                    onTapped: {
+                        // The file itself opens its folder with the file
+                        // selected; a folder segment just opens that
+                        // folder. Either way the file manager's window is
+                        // raised and focused — see DesktopIntegration for
+                        // the activation token that takes.
+                        if (segment.modelData.isFile)
+                            DesktopIntegration.revealInFileManager("file://" + segment.modelData.path)
+                        else
+                            DesktopIntegration.openInFileManager("file://" + segment.modelData.path)
                     }
                 }
             }
         }
 
-        Label {
+        HoverUnderlineLabel {
             id: taskLabel
             objectName: "bottomBarTaskLabel"
             // When the path yields its slack (bottomBarPathShrinkToContent),
@@ -508,6 +501,11 @@ Item {
             // fixed 160 box.
             Layout.fillWidth: AppSettings.bottomBarPathShrinkToContent
             Layout.preferredWidth: AppSettings.bottomBarPathShrinkToContent ? -1 : 160
+            // The label's box absorbs the row's slack, so its TEXT has to be
+            // right-aligned inside it — left-aligned, "Detect speakers: x.wav"
+            // hangs off the end of the path like a continuation of it instead
+            // of reading as its own right-hand status field.
+            horizontalAlignment: Text.AlignRight
             elide: Text.ElideMiddle
             // bottomBarTaskTextFit: shrink the font (down to 8px) to fit,
             // wrapping to a second line, before falling back to elide. Bounded
@@ -523,23 +521,17 @@ Item {
 
             readonly property bool clickable: AppSettings.bottomBarTaskClickOpensFile
                 && bottomBar.displayJobFileUrl.toString() !== ""
+            interactive: taskLabel.clickable
 
-            HoverHandler {
-                id: taskLabelHover
-                cursorShape: taskLabel.clickable ? Qt.PointingHandCursor : Qt.ArrowCursor
-            }
-            TapHandler {
-                enabled: taskLabel.clickable
-                // Small target beside other controls — see the pauseButton
-                // TapHandler for why ReleaseWithinBounds.
-                gesturePolicy: TapHandler.ReleaseWithinBounds
-                // Same file://-stripping convention as the Tasks-popup rows
-                // (see the jobRow TapHandler ~line 1115) and Sidebar's
-                // fileActivated — Main.qml's onTaskActivated opens it.
-                onTapped: bottomBar.taskActivated(
-                    bottomBar.displayJobFileUrl.toString().replace("file://", ""))
-            }
-            ToolTip.visible: AppSettings.bottomBarTaskTooltip && taskLabelHover.hovered
+            // Same file://-stripping convention as the Tasks-popup rows
+            // (see the jobRow TapHandler) and Sidebar's fileActivated —
+            // Main.qml's onTaskActivated opens it.
+            onTapped: bottomBar.taskActivated(
+                bottomBar.displayJobFileUrl.toString().replace("file://", ""))
+
+            // Hover still tracks while inert (only the underline and the tap
+            // are gated), so an unclickable label keeps its tooltip.
+            ToolTip.visible: AppSettings.bottomBarTaskTooltip && taskLabel.hovered
                 && taskLabel.text !== ""
             ToolTip.text: taskLabel.text
             ToolTip.delay: 400
@@ -670,32 +662,18 @@ Item {
             font.pixelSize: 11
         }
 
-        Item {
-            id: tasksButton
+        // A text-only click target like the path segments and the task label
+        // beside it — underline on hover, no HoverBorder ring (which boxed a
+        // counter whose width changes as the numbers grow).
+        HoverUnderlineLabel {
+            id: tasksLabel
             // Always visible — the counter reads "0/0 tasks" when
             // idle (fresh start / after Clear) rather than vanishing, so the
             // Tasks popup stays reachable and the count is a stable fixture.
-            Layout.preferredWidth: tasksLabel.implicitWidth
-            Layout.preferredHeight: tasksLabel.implicitHeight
-
-            HoverHandler {
-                id: tasksHover
-                cursorShape: Qt.PointingHandCursor
-            }
-            TapHandler {
-                onTapped: jobListPopup.visible ? jobListPopup.close() : jobListPopup.open()
-            }
-            HoverBorder {
-                anchors.fill: parent
-                active: tasksHover.hovered
-            }
-            Label {
-                id: tasksLabel
-                text: qsTr("%1/%2 tasks").arg(bottomBar.tasksCompleted).arg(bottomBar.tasksTotal)
-                color: Theme.textMuted
-                font.pixelSize: 11
-                font.underline: tasksHover.hovered
-            }
+            text: qsTr("%1/%2 tasks").arg(bottomBar.tasksCompleted).arg(bottomBar.tasksTotal)
+            color: Theme.textMuted
+            font.pixelSize: 11
+            onTapped: jobListPopup.visible ? jobListPopup.close() : jobListPopup.open()
         }
     }
 
@@ -707,7 +685,7 @@ Item {
         id: jobListPopup
         objectName: "tasksPopup"
         y: -height - 4
-        // tasksButton.x is relative to the RowLayout it's nested in, not to
+        // tasksLabel.x is relative to the RowLayout it's nested in, not to
         // bottomBar (this popup's actual positioning parent) — using it
         // directly put the popup mostly off the right edge of the window.
         // Anchor to bottomBar's own right edge instead.

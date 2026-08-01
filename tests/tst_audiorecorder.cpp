@@ -74,7 +74,12 @@ private slots:
     void patchWavHeader_rewritesSizeFieldsInPlace();
     void filenameTimestamp_matchesPattern();
     void outputPath_withAndWithoutSubfolder();
+    void sanitizeRecordingName_stripsPathAndExtensionAndDots();
+    void outputPath_usesTheRequestedNameWhenGiven();
     void testOutputPath_livesUnderTempNotTheVault();
+    void testOutputPath_honoursTheRequestedName();
+    void uniquePathForRecording_appendsTheLowestFreeNumber();
+    void uniquePathForRecording_treatsAnOrphanedMdAsTaken();
     void pruneTestRecordings_keepsTheNewestNAndNothingElse();
     void pruneTestRecordings_missingDirectoryIsANoOp();
     void pruneTestRecordings_keepMoreThanPresentRemovesNothing();
@@ -200,6 +205,37 @@ void TstAudioRecorder::outputPath_withAndWithoutSubfolder()
     QCOMPARE(withoutFolder, QStringLiteral("/tmp/myvault/suopAudio_20260713-140509.wav"));
 }
 
+void TstAudioRecorder::sanitizeRecordingName_stripsPathAndExtensionAndDots()
+{
+    QCOMPARE(AudioRecorderIO::sanitizeRecordingName(QStringLiteral(" notes.wav ")), QStringLiteral("notes"));
+    QCOMPARE(AudioRecorderIO::sanitizeRecordingName(QStringLiteral("a/b:c")), QStringLiteral("abc"));
+    QCOMPARE(AudioRecorderIO::sanitizeRecordingName(QStringLiteral("..")), QString());
+    QCOMPARE(AudioRecorderIO::sanitizeRecordingName(QStringLiteral(".hidden")), QStringLiteral("hidden"));
+    QCOMPARE(AudioRecorderIO::sanitizeRecordingName(QString()), QString());
+
+    const QString tooLong(300, QLatin1Char('x'));
+    QCOMPARE(AudioRecorderIO::sanitizeRecordingName(tooLong).length(), 120);
+}
+
+void TstAudioRecorder::outputPath_usesTheRequestedNameWhenGiven()
+{
+    const QUrl vaultUrl = QUrl::fromLocalFile(QStringLiteral("/tmp/myvault"));
+    const QDateTime ts(QDate(2026, 7, 13), QTime(14, 5, 9));
+
+    const QString named = AudioRecorderIO::buildOutputFilePath(vaultUrl, QStringLiteral("recordings"), ts,
+                                                                QStringLiteral("interview"));
+    QCOMPARE(named, QStringLiteral("/tmp/myvault/recordings/interview.wav"));
+
+    // Empty/whitespace/unusable requested names must still fall back to the
+    // timestamp name — this is the default-path regression guard for
+    // outputPath_withAndWithoutSubfolder above.
+    for (const QString &unusable : { QString(), QStringLiteral("   "), QStringLiteral("..") }) {
+        const QString fallback =
+            AudioRecorderIO::buildOutputFilePath(vaultUrl, QString(), ts, unusable);
+        QCOMPARE(fallback, QStringLiteral("/tmp/myvault/suopAudio_20260713-140509.wav"));
+    }
+}
+
 void TstAudioRecorder::testOutputPath_livesUnderTempNotTheVault()
 {
     const QDateTime ts(QDate(2026, 7, 26), QTime(9, 5, 3));
@@ -210,6 +246,49 @@ void TstAudioRecorder::testOutputPath_livesUnderTempNotTheVault()
     // already pins for the vault path — the two must not drift apart.
     const QString fileName = QFileInfo(path).fileName();
     QVERIFY(QRegularExpression(QStringLiteral("^suopAudio_\\d{8}-\\d{6}\\.wav$")).match(fileName).hasMatch());
+}
+
+void TstAudioRecorder::testOutputPath_honoursTheRequestedName()
+{
+    const QDateTime ts(QDate(2026, 7, 26), QTime(9, 5, 3));
+    const QString path =
+        AudioRecorderIO::buildTestOutputFilePath(QStringLiteral("/tmp"), ts, QStringLiteral("levels"));
+    QCOMPARE(path, QStringLiteral("/tmp/suopTranscriber-test/levels.wav"));
+}
+
+void TstAudioRecorder::uniquePathForRecording_appendsTheLowestFreeNumber()
+{
+    QTemporaryDir dir;
+    QVERIFY(dir.isValid());
+
+    // A free name is returned unchanged.
+    QCOMPARE(AudioRecorderIO::uniquePathForRecording(dir.filePath(QStringLiteral("notes.wav"))),
+             dir.filePath(QStringLiteral("notes.wav")));
+
+    QFile notes(dir.filePath(QStringLiteral("notes.wav")));
+    QVERIFY(notes.open(QIODevice::WriteOnly));
+    // Numbering starts at 2, not 1 — see Decisions.
+    QCOMPARE(AudioRecorderIO::uniquePathForRecording(dir.filePath(QStringLiteral("notes.wav"))),
+             dir.filePath(QStringLiteral("notes_2.wav")));
+
+    QFile notes2(dir.filePath(QStringLiteral("notes_2.wav")));
+    QVERIFY(notes2.open(QIODevice::WriteOnly));
+    QCOMPARE(AudioRecorderIO::uniquePathForRecording(dir.filePath(QStringLiteral("notes.wav"))),
+             dir.filePath(QStringLiteral("notes_3.wav")));
+}
+
+void TstAudioRecorder::uniquePathForRecording_treatsAnOrphanedMdAsTaken()
+{
+    QTemporaryDir dir;
+    QVERIFY(dir.isValid());
+
+    // Only the .md sibling exists — no .wav at all — yet it must still count
+    // as taken, or a fresh take silently adopts a stale transcript.
+    QFile notesMd(dir.filePath(QStringLiteral("notes.md")));
+    QVERIFY(notesMd.open(QIODevice::WriteOnly));
+
+    QCOMPARE(AudioRecorderIO::uniquePathForRecording(dir.filePath(QStringLiteral("notes.wav"))),
+             dir.filePath(QStringLiteral("notes_2.wav")));
 }
 
 void TstAudioRecorder::pruneTestRecordings_keepsTheNewestNAndNothingElse()
@@ -562,14 +641,14 @@ void TstAudioRecorder::startStopRecording_stateFlipsSynchronouslyOnTheCall()
     // a second tap post a duplicate start, whose rejection then clobbered the
     // live recording's state. No event loop is spun between the call and the
     // assertion, so nothing from the worker thread can have landed yet.
-    recorder.startRecording(QUrl::fromLocalFile(dir.path()), QString(), /*useMic=*/true, QString(),
+    recorder.startRecording(QUrl::fromLocalFile(dir.path()), QString(), QString(), /*useMic=*/true, QString(),
                             /*useSystemAudio=*/false, 1.0, 1.0);
     QVERIFY2(recorder.isRecording(), "startRecording() must reflect the click synchronously");
     QCOMPARE(changed.count(), 1);
 
     // A duplicate start (the impatient second click) must be a no-op that
     // neither posts to the worker nor disturbs the state.
-    recorder.startRecording(QUrl::fromLocalFile(dir.path()), QString(), /*useMic=*/true, QString(),
+    recorder.startRecording(QUrl::fromLocalFile(dir.path()), QString(), QString(), /*useMic=*/true, QString(),
                             /*useSystemAudio=*/false, 1.0, 1.0);
     QVERIFY(recorder.isRecording());
     QCOMPARE(changed.count(), 1);

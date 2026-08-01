@@ -266,6 +266,12 @@ Rectangle {
         const paths = []
         for (let r = 0; r < tree.rows; r++) {
             const rowIndex = tree.index(r, 0)
+            // A file still being recorded is audio, but it is not a note you
+            // can act on — leaving it here would let Ctrl+A select it and an
+            // arrow-key step OPEN it, both of which route around the row's
+            // own disabled TapHandler.
+            if (searchProxy.data(rowIndex, VaultTreeModel.IsRecordingRole))
+                continue
             if (searchProxy.data(rowIndex, VaultTreeModel.IsAudioRole)
                     || searchProxy.data(rowIndex, VaultTreeModel.IsOrphanedMdRole))
                 paths.push(searchProxy.data(rowIndex, VaultTreeModel.PathRole))
@@ -1046,9 +1052,18 @@ Rectangle {
     // which has a use-after-free history when it lands mid source-model reset
     // — so the number and timing of these writes must not change.
     function refreshTreeOrdering() {
+        // allAudioPaths() (complete) for the SORT KEYS: every displayed row
+        // needs one, including a file being recorded into — omit it and the
+        // proxy has no key for that row, so it sinks to the bottom of the tree
+        // and stays there until an unrelated model reset rebuilds the keys.
         const audioPaths = (sidebar.transcriptionController && sidebar.model) ? sidebar.model.allAudioPaths() : []
-        const groups = (audioPaths.length > 0 && AppSettings.combineRules.length > 0)
-                ? sidebar.transcriptionController.detectCombineGroups(AppSettings.combineRules, audioPaths) : []
+        // ...but combine GROUPING is an action input: a group that swallowed a
+        // half-written take would offer a merge button that merges the wrong
+        // set.
+        const groupPaths = (sidebar.transcriptionController && sidebar.model)
+                ? sidebar.model.actionableAudioPaths() : []
+        const groups = (groupPaths.length > 0 && AppSettings.combineRules.length > 0)
+                ? sidebar.transcriptionController.detectCombineGroups(AppSettings.combineRules, groupPaths) : []
         // mtimes is only fetched when actually needed — audioLastModified()
         // walks the whole tree, no need to pay for that on the (default)
         // "name" mode. TreeOrdering::compute() never reads it in that mode,
@@ -1254,14 +1269,15 @@ Rectangle {
     // TitleBar's "⋯" menu action: unlike transcribeAllButton (which targets
     // the current SELECTION narrowed to untranscribed audio, see
     // selectionTranscribePaths), this queues every audio file in the vault,
-    // including already-transcribed ones — VaultTreeModel.allAudioPaths()
+    // including already-transcribed ones — VaultTreeModel.actionableAudioPaths()
     // walks the full tree directly rather than relying on realized
     // delegates. transcribe()'s only in-flight gate is isQueued(), so this
-    // unconditionally re-runs each file (see TranscriptionController.h).
+    // unconditionally re-runs each file (see TranscriptionController.h) — the
+    // "actionable" list is what keeps a take still being recorded out of it.
     function forceRetranscribeAll() {
         if (!sidebar.transcriptionController || sidebar.vaultPath.toString() === "")
             return
-        const paths = sidebar.model.allAudioPaths()
+        const paths = sidebar.model.actionableAudioPaths()
         if (paths.length === 0)
             return
         const urls = paths.map((p) => "file://" + p)

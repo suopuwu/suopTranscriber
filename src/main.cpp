@@ -85,6 +85,13 @@ int main(int argc, char *argv[])
     QCoreApplication::setOrganizationName("suopTranscriber");
     QCoreApplication::setApplicationName("suopTranscriber");
 
+    // Wayland reports this as the window's app_id, which is the only thing
+    // KWin/Plasma matches a running window to its launcher entry by (task-manager
+    // icon and name, "pin to taskbar"). Must stay in sync with the filename
+    // `make install` writes into ~/.local/share/applications — see the Makefile's
+    // DESKTOP_FILE; tst_styleguide guards the pair.
+    QGuiApplication::setDesktopFileName(QStringLiteral("org.suop.Transcriber"));
+
     // VaultSearchProxyModel.fileSortKeys is a typed SortKeyMap (see
     // src/core/SortKey.h) that TreeOrdering.compute() produces and Sidebar.qml
     // passes straight through to the proxy as an opaque value. Register it so

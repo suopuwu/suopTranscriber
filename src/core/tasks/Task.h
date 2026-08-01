@@ -189,6 +189,16 @@ public:
     // transcribe queued on it. Such a run is still a real queued task (Tasks row
     // + glow) — it just doesn't monopolize its file's per-file UI.
     virtual bool occupiesFile() const { return true; }
+    // EVERY vault file this task would act on. Default: just fileUrl, which is
+    // the whole story for the single-file kinds. The multi-file kinds
+    // (trash/delete over a selection) must override — they carry a QList<QUrl>
+    // and set fileUrl to only the FIRST of it, so a fileUrl-only check reads a
+    // ten-file trash as touching one file and waves the other nine through.
+    // Used by the enqueue guard that refuses to act on a file being recorded.
+    virtual QList<QUrl> touchedFiles() const
+    {
+        return fileUrl.isEmpty() ? QList<QUrl>{} : QList<QUrl>{ fileUrl };
+    }
     // Opt-IN persistence (default: not saved across a restart). A kind whose
     // inputs name an external/removable path (import, usbGrab) simply never
     // overrides this — no more persistQueue() opt-OUT that a new kind forgets.

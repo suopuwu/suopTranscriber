@@ -23,6 +23,10 @@ ApplicationWindow {
 
     VaultTreeModel {
         id: vaultModel
+        // Marks the row of the file a take is being written into, and keeps it
+        // out of allAudioPaths() — the watcher surfaces that file the instant
+        // the recorder creates it, long before it is a playable recording.
+        activeRecordingPath: audioRecorder.activeRecordingPath
     }
 
     AudioPlayer {
@@ -41,6 +45,11 @@ ApplicationWindow {
         // model owns the orphaned-vs-audio classification. Same wiring as
         // UsbGrabberController's vaultTreeModel binding.
         vaultTreeModel: vaultModel
+        // The take in flight, so the queue can refuse any task on a file that
+        // is still being written (TaskScheduler::setActiveRecordingUrl). Bound
+        // here rather than the controller holding an AudioRecorder: the
+        // recorder is a QML-owned object, and this is the one place both exist.
+        activeRecordingPath: audioRecorder.activeRecordingPath
     }
 
     // Auto undo-snackbar for ANY undoable task (Task::undoLabel/makeUndoTask) —

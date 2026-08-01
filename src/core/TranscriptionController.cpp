@@ -851,6 +851,15 @@ int TranscriptionController::enqueueTask(std::unique_ptr<Task> task, int insertI
     return m_scheduler->enqueueTask(std::move(task), insertIndex);
 }
 
+void TranscriptionController::setActiveRecordingPath(const QString &path)
+{
+    if (m_activeRecordingPath == path)
+        return;
+    m_activeRecordingPath = path;
+    m_scheduler->setActiveRecordingUrl(path.isEmpty() ? QUrl() : QUrl::fromLocalFile(path));
+    emit activeRecordingPathChanged();
+}
+
 void TranscriptionController::transcribe(const QUrl &fileUrl, const QUrl &vaultUrl, const QString &modelId,
                                           bool autoLabel, bool restrictTagsToExisting,
                                           double tagReuseBias, double wordiness)

@@ -22,8 +22,10 @@
 
 #include <QtTest>
 
+#include <QDateTime>
 #include <QDir>
 #include <QFile>
+#include <QFileInfo>
 #include <QQmlEngine>
 #include <QQuickItem>
 #include <QQuickView>
@@ -181,19 +183,42 @@ public:
     {
         return AudioRecorderIO::pendingCaptureAdditions(desired, activeIds);
     }
+    // Delegating to the real AudioRecorderIO helpers, like every other pure
+    // helper above — the page's warning/preview logic is under test, not a
+    // second implementation of the naming rule.
+    Q_INVOKABLE QString sanitizeRecordingName(const QString &requestedName) const
+    {
+        return AudioRecorderIO::sanitizeRecordingName(requestedName);
+    }
+    Q_INVOKABLE QString plannedRecordingFileName(const QUrl &vaultUrl, const QString &outputRelativeFolder,
+                                                  const QString &requestedName, bool testMode) const
+    {
+        const QString desired = testMode
+            ? AudioRecorderIO::buildTestOutputFilePath(QDir::tempPath(), QDateTime::currentDateTime(),
+                                                        requestedName)
+            : AudioRecorderIO::buildOutputFilePath(vaultUrl, outputRelativeFolder,
+                                                    QDateTime::currentDateTime(), requestedName);
+        return QFileInfo(AudioRecorderIO::uniquePathForRecording(desired)).fileName();
+    }
 
     Q_INVOKABLE QVariantList availableMicDevices() const { return m_micDevices; }
 
     // Hardware entry points — faked, but they record what they were asked to do
     // so a test can assert on it.
     Q_INVOKABLE void refreshSources() { ++m_refreshCount; }
+    // Re-ordered to mirror the real AudioRecorder::startRecording() signature
+    // (positions 6/7/8 — useSystemAudio/micGain/systemGain/systemSourceId —
+    // were positionally wrong before, coercing gains/source-id into nonsense),
+    // with requestedName inserted third to match.
     Q_INVOKABLE void startRecording(const QUrl &vaultUrl, const QString &outputRelativeFolder,
-                                     bool useMic, const QString &micDeviceId, bool useSystemAudio,
-                                     const QString &systemSourceId, qreal micGain, qreal systemGain,
+                                     const QString &requestedName, bool useMic,
+                                     const QString &micDeviceId, bool useSystemAudio, qreal micGain,
+                                     qreal systemGain, const QString &systemSourceId,
                                      const QVariantList &appSources, bool testMode)
     {
         m_startVaultUrl = vaultUrl;
         m_startRelativeFolder = outputRelativeFolder;
+        m_startRequestedName = requestedName;
         m_startUseMic = useMic;
         m_startMicDeviceId = micDeviceId;
         m_startUseSystemAudio = useSystemAudio;
@@ -305,6 +330,7 @@ public:
     int refreshCount() const { return m_refreshCount; }
     int startCount() const { return m_startCount; }
     QUrl startVaultUrl() const { return m_startVaultUrl; }
+    QString startRequestedName() const { return m_startRequestedName; }
     bool startTestMode() const { return m_startTestMode; }
     QVariantList startAppSources() const { return m_startAppSources; }
     QList<QPair<QString, double>> addedSources() const { return m_addedSources; }
@@ -339,6 +365,7 @@ private:
     int m_startCount = 0;
     QUrl m_startVaultUrl;
     QString m_startRelativeFolder;
+    QString m_startRequestedName;
     bool m_startUseMic = false;
     QString m_startMicDeviceId;
     bool m_startUseSystemAudio = false;
@@ -1356,6 +1383,132 @@ private slots:
         QTRY_COMPARE(player->position(), qint64(0));
         tap(&view, bar, QPoint(x, int(bar->height()) - 2));
         QTRY_COMPARE(player->position(), wholeTake);
+    }
+
+    // The name field's value must reach startRecording() as the third
+    // argument — the whole point of the feature is that a typed name is what
+    // the take actually gets called.
+    void recordingName_isPassedToStartRecording()
+    {
+        QQuickView view;
+        QQuickItem *page = nullptr;
+        AudioRecorderStub *rec = nullptr;
+        QVERIFY(openRecorder(&view, &page, &rec));
+
+        QQuickItem *field = find(&view, QStringLiteral("recordingNameField"));
+        QVERIFY2(field, "recordingNameField did not materialise");
+        field->forceActiveFocus();
+        typeText(&view, QStringLiteral("interview"));
+        QTRY_COMPARE(page->property("recordingName").toString(), QStringLiteral("interview"));
+
+        tap(&view, find(&view, QStringLiteral("recordToggleButton")));
+        QTRY_COMPARE(rec->startCount(), 1);
+        QCOMPARE(rec->startRequestedName(), QStringLiteral("interview"));
+    }
+
+    // A name that collides with a file already at the destination must be
+    // flagged before the user presses record, and the flag must name the
+    // SAME numbered file startRecording() would actually land on.
+    void duplicateName_warnsAndPlansANumberedFile()
+    {
+        QTemporaryDir vaultDir;
+        QVERIFY(vaultDir.isValid());
+        QFile existing(vaultDir.filePath(QStringLiteral("interview.wav")));
+        QVERIFY(existing.open(QIODevice::WriteOnly));
+
+        QQuickView view;
+        QQuickItem *page = nullptr;
+        AudioRecorderStub *rec = nullptr;
+        QVERIFY(openRecorder(&view, &page, &rec));
+
+        // The driver hard-codes a vault path that doesn't exist on disk —
+        // point it at a real QTemporaryDir so uniquePathForRecording() has
+        // something to stat.
+        page->setProperty("vaultLocalPath", vaultDir.path());
+        page->setProperty("vaultPath", QUrl::fromLocalFile(vaultDir.path()));
+
+        QQuickItem *field = find(&view, QStringLiteral("recordingNameField"));
+        QVERIFY2(field, "recordingNameField did not materialise");
+        field->forceActiveFocus();
+        typeText(&view, QStringLiteral("interview"));
+        QTRY_COMPARE(page->property("recordingName").toString(), QStringLiteral("interview"));
+
+        QTRY_VERIFY2(!page->property("recordingNameWarning").toString().isEmpty(),
+                     "a colliding name raised no warning");
+        QVERIFY2(page->property("recordingNameWarning").toString().contains(QStringLiteral("interview_2.wav")),
+                 "the warning must name the numbered file the take will actually land on");
+        QCOMPARE(page->property("plannedFileName").toString(), QStringLiteral("interview_2.wav"));
+    }
+
+    // The banner's colour is keyed on WHICH message won the precedence chain,
+    // not merely on the name warning being non-empty — a real error still
+    // outranks the advisory in colour, exactly as it does in text.
+    void duplicateName_bannerUsesTheAdvisoryColour()
+    {
+        QTemporaryDir vaultDir;
+        QVERIFY(vaultDir.isValid());
+        QFile existing(vaultDir.filePath(QStringLiteral("interview.wav")));
+        QVERIFY(existing.open(QIODevice::WriteOnly));
+
+        QQuickView view;
+        QQuickItem *page = nullptr;
+        AudioRecorderStub *rec = nullptr;
+        QVERIFY(openRecorder(&view, &page, &rec));
+
+        page->setProperty("vaultLocalPath", vaultDir.path());
+        page->setProperty("vaultPath", QUrl::fromLocalFile(vaultDir.path()));
+
+        QQuickItem *field = find(&view, QStringLiteral("recordingNameField"));
+        QVERIFY2(field, "recordingNameField did not materialise");
+        field->forceActiveFocus();
+        typeText(&view, QStringLiteral("interview"));
+        QTRY_VERIFY2(!page->property("recordingNameWarning").toString().isEmpty(),
+                     "a colliding name raised no warning");
+
+        QQuickItem *banner = find(&view, QStringLiteral("recorderWarningBanner"));
+        QVERIFY2(banner, "the shared warning banner did not materialise");
+        QTRY_COMPARE(banner->property("color").value<QColor>(), QColor("#d8b45a")); // Theme.warning
+
+        page->setProperty("recordingFolderError", QStringLiteral("destination rejected"));
+        QTRY_COMPARE(banner->property("color").value<QColor>(), QColor("#e07a7a")); // Theme.danger
+    }
+
+    // Negative control: a name that is NOT taken anywhere must raise no
+    // warning at all.
+    void unusedName_showsNoWarning()
+    {
+        QQuickView view;
+        QQuickItem *page = nullptr;
+        AudioRecorderStub *rec = nullptr;
+        QVERIFY(openRecorder(&view, &page, &rec));
+
+        QQuickItem *field = find(&view, QStringLiteral("recordingNameField"));
+        QVERIFY2(field, "recordingNameField did not materialise");
+        field->forceActiveFocus();
+        typeText(&view, QStringLiteral("brand-new-take"));
+        QTRY_COMPARE(page->property("recordingName").toString(), QStringLiteral("brand-new-take"));
+
+        QVERIFY2(page->property("recordingNameWarning").toString().isEmpty(),
+                 "a free name must not raise the collision warning");
+    }
+
+    // The output path is chosen once, at startRecording() — changing the name
+    // mid-take can't retroactively rename the file already being written.
+    void recordingNameField_isDisabledDuringATake()
+    {
+        QQuickView view;
+        QQuickItem *page = nullptr;
+        AudioRecorderStub *rec = nullptr;
+        QVERIFY(openRecorder(&view, &page, &rec));
+
+        QQuickItem *field = find(&view, QStringLiteral("recordingNameField"));
+        QVERIFY2(field, "recordingNameField did not materialise");
+        QVERIFY(field->property("enabled").toBool());
+
+        tap(&view, find(&view, QStringLiteral("recordToggleButton")));
+        QTRY_COMPARE(rec->startCount(), 1);
+        QTRY_VERIFY2(!field->property("enabled").toBool(),
+                     "the name field must be disabled while a take is in progress");
     }
 };
 

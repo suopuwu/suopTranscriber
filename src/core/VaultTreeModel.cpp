@@ -511,6 +511,8 @@ QVariant VaultTreeModel::data(const QModelIndex &index, int role) const
         return node->isCombinePlaceholder;
     case CombineSourceCountRole:
         return node->combineSourceCount;
+    case IsRecordingRole:
+        return isActiveRecordingNode(node);
     case LabelRole: {
         const QString mdPath = sidecarMdPath(node);
         return mdPath.isEmpty() ? QString() : frontmatterField(mdPath, QStringLiteral("label"));
@@ -554,6 +556,7 @@ QHash<int, QByteArray> VaultTreeModel::roleNames() const
         {TranscriptBodyRole, "transcriptBody"},
         {IsCombinePlaceholderRole, "isCombinePlaceholder"},
         {CombineSourceCountRole, "combineSourceCount"},
+        {IsRecordingRole, "isRecording"},
     };
 }
 
@@ -1205,6 +1208,15 @@ void VaultTreeModel::collectAudioPaths(const Node *node, QStringList &out)
         collectAudioPaths(child.get(), out);
 }
 
+QStringList VaultTreeModel::actionableAudioPaths() const
+{
+    if (m_activeRecordingPath.isEmpty())
+        return allAudioPaths();
+    QStringList out = allAudioPaths();
+    out.removeAll(m_activeRecordingPath);
+    return out;
+}
+
 QVariantMap VaultTreeModel::audioLastModified() const
 {
     QVariantMap out;
@@ -1243,7 +1255,10 @@ QVariantList VaultTreeModel::searchResults(const QString &query, bool includeTra
 void VaultTreeModel::collectSearchResults(const Node *node, const QString &queryLower, bool includeTranscriptions,
                                            QVariantList &out) const
 {
-    if (node->isAudio || node->isOrphanedMd) {
+    // A file mid-recording is withheld from search for the same reason it is
+    // withheld from allAudioPaths(): every result row is an openable,
+    // bulk-actionable note, and this one is neither yet.
+    if ((node->isAudio || node->isOrphanedMd) && !isActiveRecordingNode(node)) {
         const QString mdPath = sidecarMdPath(node);
         const QString label = mdPath.isEmpty() ? QString() : frontmatterField(mdPath, QStringLiteral("label"));
         const QString tags = mdPath.isEmpty() ? QString() : frontmatterField(mdPath, QStringLiteral("tags"));
@@ -1296,6 +1311,29 @@ QModelIndex VaultTreeModel::indexForNode(const Node *node) const
             return createIndex(static_cast<int>(i), 0, const_cast<Node *>(node));
     }
     return {};
+}
+
+void VaultTreeModel::setActiveRecordingPath(const QString &path)
+{
+    if (m_activeRecordingPath == path)
+        return;
+    const QString previous = m_activeRecordingPath;
+    m_activeRecordingPath = path;
+    // Both ends need repainting: the row that just became busy, and the one
+    // that just stopped being. Targeted dataChanged rather than a rebuild —
+    // nothing about the file SET changed, only this one row's meaning, and a
+    // rebuild here would reset the model (losing selection/expansion) every
+    // time a take starts or stops.
+    for (const QString &affected : { previous, path }) {
+        if (affected.isEmpty())
+            continue;
+        if (Node *node = findNodeByPath(m_root.get(), affected)) {
+            const QModelIndex idx = indexForNode(node);
+            if (idx.isValid())
+                emit dataChanged(idx, idx, { IsRecordingRole, StatusRole });
+        }
+    }
+    emit activeRecordingPathChanged();
 }
 
 void VaultTreeModel::refreshFile(const QUrl &fileUrl)

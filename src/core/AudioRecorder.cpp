@@ -15,6 +15,7 @@
 #include <QMap>
 #include <QMediaDevices>
 #include <QProcess>
+#include <QRegularExpression>
 #include <QTimer>
 #include <QVariantMap>
 
@@ -280,19 +281,66 @@ void patchWavHeader(QFile &file, quint32 dataSize, quint32 sampleRate, quint16 c
     file.seek(resumePos);
 }
 
-QString buildOutputFilePath(const QUrl &vaultUrl, const QString &outputRelativeFolder, const QDateTime &timestamp)
+QString sanitizeRecordingName(const QString &requestedName)
+{
+    QString name = requestedName.trimmed();
+    // A user who types "notes.wav" means the recording "notes", not
+    // "notes.wav.wav".
+    if (name.endsWith(QStringLiteral(".wav"), Qt::CaseInsensitive))
+        name.chop(4);
+    static const QRegularExpression invalid(QStringLiteral("[/\\\\:*?\"<>|\\x00-\\x1f]"));
+    name.remove(invalid);
+    // Leading/trailing dots go last, after the character strip: it is what
+    // stops "." and ".." (names that mean a DIRECTORY, not a new child — the
+    // same pair FileRename.h's isValidVaultEntryName() rejects) from
+    // surviving, and stops a hidden ".foo" recording.
+    while (name.startsWith(QLatin1Char('.')) || name.endsWith(QLatin1Char('.')))
+        name = name.startsWith(QLatin1Char('.')) ? name.mid(1) : name.chopped(1);
+    name = name.trimmed();
+    // Most Linux filesystems cap a component at 255 bytes; 120 leaves room for
+    // the "_N" suffix and a ".partial.jsonl" sidecar on the same base name.
+    return name.left(120);
+}
+
+QString buildOutputFilePath(const QUrl &vaultUrl, const QString &outputRelativeFolder,
+                            const QDateTime &timestamp, const QString &requestedName)
 {
     QString base = vaultUrl.toLocalFile();
     if (!outputRelativeFolder.isEmpty())
         base += QLatin1Char('/') + outputRelativeFolder;
-    return base + QStringLiteral("/suopAudio_") + timestamp.toString(QStringLiteral("yyyyMMdd-HHmmss"))
+    const QString name = sanitizeRecordingName(requestedName);
+    return base + QLatin1Char('/')
+        + (name.isEmpty()
+               ? QStringLiteral("suopAudio_") + timestamp.toString(QStringLiteral("yyyyMMdd-HHmmss"))
+               : name)
         + QStringLiteral(".wav");
 }
 
-QString buildTestOutputFilePath(const QString &tempRoot, const QDateTime &timestamp)
+QString buildTestOutputFilePath(const QString &tempRoot, const QDateTime &timestamp,
+                                 const QString &requestedName)
 {
-    return tempRoot + QStringLiteral("/suopTranscriber-test/suopAudio_")
-        + timestamp.toString(QStringLiteral("yyyyMMdd-HHmmss")) + QStringLiteral(".wav");
+    return buildOutputFilePath(QUrl::fromLocalFile(tempRoot + QStringLiteral("/suopTranscriber-test")),
+                               QString(), timestamp, requestedName);
+}
+
+QString uniquePathForRecording(const QString &desiredPath)
+{
+    const QFileInfo info(desiredPath);
+    const QString dir = info.absolutePath();
+    const QString baseName = info.completeBaseName();
+    const QString suffix = info.suffix();
+    const auto taken = [&dir, &suffix](const QString &candidateBase) {
+        // The .md sibling counts: see uniquePathForRecording()'s declaration.
+        return QFileInfo::exists(dir + QLatin1Char('/') + candidateBase + QLatin1Char('.') + suffix)
+            || QFileInfo::exists(dir + QLatin1Char('/') + candidateBase + QStringLiteral(".md"));
+    };
+    if (!taken(baseName))
+        return desiredPath;
+    for (int n = 2;; ++n) {
+        const QString candidate = QStringLiteral("%1_%2").arg(baseName).arg(n);
+        if (!taken(candidate))
+            return dir + QLatin1Char('/') + candidate + QLatin1Char('.') + suffix;
+    }
 }
 
 int pruneTestRecordings(const QString &dir, int keepNewest)
@@ -1226,6 +1274,7 @@ AudioRecorder::AudioRecorder(QObject *parent)
         if (ok)
             return;
         m_recording = false;
+        clearActiveRecordingPath();
         m_lastError = error;
         emit lastErrorChanged();
         emit recordingChanged();
@@ -1249,6 +1298,12 @@ AudioRecorder::AudioRecorder(QObject *parent)
         m_recording = false;
         m_currentLevel = 0.0;
         m_sourceLevels.clear();
+        // Released HERE, not in stopRecording(), and that asymmetry is the
+        // point: stopRecording() flips `recording` on the click, while the
+        // worker is still patching the WAV header and flushing. Freeing the
+        // path any earlier would hand the file back to the vault UI while it
+        // is still being written.
+        clearActiveRecordingPath();
         emit recordingChanged();
         emit levelUpdated();
         emit recordingFinished(filePath);
@@ -1331,6 +1386,14 @@ void AudioRecorder::refreshSources()
     probe->start(QStringLiteral("pw-dump"), {});
 }
 
+void AudioRecorder::clearActiveRecordingPath()
+{
+    if (m_activeRecordingPath.isEmpty())
+        return;
+    m_activeRecordingPath.clear();
+    emit activeRecordingPathChanged();
+}
+
 void AudioRecorder::applySources(const QVariantList &sources)
 {
     const QVariantList apps = AudioRecorderIO::filterAppStreams(sources);
@@ -1341,11 +1404,22 @@ void AudioRecorder::applySources(const QVariantList &sources)
     emit sourcesChanged();
 }
 
+QString AudioRecorder::plannedRecordingFileName(const QUrl &vaultUrl, const QString &outputRelativeFolder,
+                                                 const QString &requestedName, bool testMode) const
+{
+    const QString desired = testMode
+        ? AudioRecorderIO::buildTestOutputFilePath(QDir::tempPath(), QDateTime::currentDateTime(), requestedName)
+        : AudioRecorderIO::buildOutputFilePath(vaultUrl, outputRelativeFolder, QDateTime::currentDateTime(),
+                                                requestedName);
+    return QFileInfo(AudioRecorderIO::uniquePathForRecording(desired)).fileName();
+}
+
 // How many past test takes survive the next one. Enough to A/B a gain change
 // against the take before it; not a growing pile of RAM on tmpfs.
 static constexpr int kKeepTestRecordings = 3;
 
-void AudioRecorder::startRecording(const QUrl &vaultUrl, const QString &outputRelativeFolder, bool useMic,
+void AudioRecorder::startRecording(const QUrl &vaultUrl, const QString &outputRelativeFolder,
+                                    const QString &requestedName, bool useMic,
                                     const QString &micDeviceId, bool useSystemAudio, double micGain,
                                     double systemGain, const QString &systemSourceId,
                                     const QVariantList &appCaptureSources, bool testMode)
@@ -1363,10 +1437,24 @@ void AudioRecorder::startRecording(const QUrl &vaultUrl, const QString &outputRe
         // run.
         AudioRecorderIO::pruneTestRecordings(QDir::tempPath() + QStringLiteral("/suopTranscriber-test"),
                                              kKeepTestRecordings);
-        outputPath = AudioRecorderIO::buildTestOutputFilePath(QDir::tempPath(), QDateTime::currentDateTime());
+        outputPath = AudioRecorderIO::buildTestOutputFilePath(QDir::tempPath(), QDateTime::currentDateTime(),
+                                                              requestedName);
     } else {
-        outputPath = AudioRecorderIO::buildOutputFilePath(vaultUrl, outputRelativeFolder, QDateTime::currentDateTime());
+        outputPath = AudioRecorderIO::buildOutputFilePath(vaultUrl, outputRelativeFolder,
+                                                          QDateTime::currentDateTime(), requestedName);
     }
+    // Resolved here rather than in the builders so they stay pure joins, and
+    // resolved on the GUI thread because it is two stat calls, not real work.
+    // The page previews the same decision via plannedRecordingFileName(); this
+    // is the authoritative one, since the folder can change under it.
+    outputPath = AudioRecorderIO::uniquePathForRecording(outputPath);
+    // Published BEFORE the worker is told to start: the file appears in the
+    // vault tree the instant the worker opens it, and the tree's own watcher
+    // can surface it before any signal makes it back across the thread
+    // boundary. Anything gating on this path has to be armed first or the row
+    // is briefly live.
+    m_activeRecordingPath = outputPath;
+    emit activeRecordingPathChanged();
     m_lastError.clear();
     emit lastErrorChanged();
     // Reflect the click NOW rather than when the worker's started() gets back

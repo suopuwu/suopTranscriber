@@ -23,6 +23,8 @@ public:
     QString kindLabel() const override { return QStringLiteral("Delete"); }
     QString displayName() const override;
     Lane lane() const override { return Lane::Instant; }
+    // fileUrl is only the first of the selection — see Task::touchedFiles().
+    QList<QUrl> touchedFiles() const override { return m_urls; }
 
     void run(TaskContext &ctx) override;
 

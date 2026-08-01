@@ -42,6 +42,12 @@ public:
     std::unique_ptr<Task> makeUndoTask() const override;
     bool undoStillApplicable() const override;
 
+    // fileUrl is the OUTPUT, so the default (fileUrl alone) would report a
+    // combine as touching a file that does not exist yet and NONE of the files
+    // it actually reads and then archives away. The sources are the ones that
+    // must not be a take still being recorded.
+    QList<QUrl> touchedFiles() const override;
+
     void run(TaskContext &ctx) override;
 
     const QStringList &sourcePaths() const { return m_sourcePaths; }

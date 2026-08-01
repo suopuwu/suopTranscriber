@@ -149,7 +149,29 @@ public:
     bool isPausingActiveAsRestart() const { return m_pausingActiveAsRestart; }
     const QHash<int, QString> &batchLabels() const { return m_batchLabels; }
 
+    // The file an in-flight recording is being written into (empty = none). A
+    // task touching it is refused by enqueueTask(): that file is growing, its
+    // WAV header still says the wrong size, and transcribing/moving/trashing it
+    // mid-take corrupts either the take or the result.
+    //
+    // The check sits HERE, not in the controller, because this is the only true
+    // chokepoint: moveFiles() and undoTask() reach the queue via
+    // enqueueBatch()/the scheduler directly, bypassing the controller's own
+    // enqueueTask() forwarder. The scheduler still learns nothing about the
+    // recorder — it is handed a url, not an AudioRecorder.
+    void setActiveRecordingUrl(const QUrl &url) { m_activeRecordingUrl = url; }
+    QUrl activeRecordingUrl() const { return m_activeRecordingUrl; }
+    // True if `task` would act on the file being recorded — what enqueueTask()
+    // refuses on. Public so the UI can ask the same question it will be
+    // answered with, rather than reimplementing the comparison.
+    bool touchesActiveRecording(const Task &task) const;
+    // The rule itself, over raw urls — for the callers that must decide BEFORE
+    // they have a Task (the transcribe→combine redirect).
+    bool urlsTouchActiveRecording(const QList<QUrl> &urls) const;
+
     // --- Queue mutation entry points (controller Q_INVOKABLEs forward here) ---
+    // Returns the new task's id, or -1 if it was refused (see
+    // setActiveRecordingUrl) — in which case `task` is destroyed, not queued.
     int enqueueTask(std::unique_ptr<Task> task, int insertIndex = -1);
     int enqueueBatch(std::vector<std::unique_ptr<Task>> tasks, const QString &displayLabel = {});
     void withBatch(const QString &displayLabel, const std::function<void()> &fn);
@@ -217,7 +239,9 @@ private:
     void maybeEmitUndoAvailable(const Task *task, bool ok);
     bool batchHasMembers(int batchId) const;
     bool isCombineQueued(const QString &outputPath) const;
-    void enqueueCombineJob(const CombineGroup &group, const QUrl &vaultUrl, bool deleteOriginals,
+    // False if refused (a source is being recorded) — this kind bypasses
+    // enqueueTask(), so it carries its own copy of that guard.
+    bool enqueueCombineJob(const CombineGroup &group, const QUrl &vaultUrl, bool deleteOriginals,
                            int insertIndex = -1);
     int enqueueReadyCombineGroups(const QVariantList &rules, const QStringList &audioPaths,
                                   const QUrl &vaultUrl, bool deleteOriginals,
@@ -239,6 +263,7 @@ private:
     int m_nextJobId = 1;
     int m_currentBatchId = 0;
     QHash<int, QString> m_batchLabels;
+    QUrl m_activeRecordingUrl;
 
     // queueChanged coalescing — see emitQueueChanged()/QueueChangedHold.
     int m_queueChangedHold = 0;

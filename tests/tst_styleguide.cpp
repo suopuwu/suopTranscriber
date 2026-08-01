@@ -2377,6 +2377,48 @@ private slots:
                  "the test-mode branch must never reference vaultUrl");
     }
 
+    // The recording-name field, and the shared banner's advisory it feeds —
+    // StyleGuide.md "Text fields" (a pure text box keeps its resting
+    // underline) and "Colors (both surfaces)" (a caution is not an error).
+    void recorderPage_nameFieldAndWarningBanner()
+    {
+        const QString src = stripComments(readAll(QStringLiteral(SUOP_QML_DIR "/RecorderPage.qml")));
+        const QString page = enclosingBlock(src, QStringLiteral("id: recorderPage"));
+        QVERIFY(!page.isEmpty());
+
+        const QString content = enclosingBlock(page, QStringLiteral("id: recorderContent"));
+        QVERIFY(!content.isEmpty());
+        const int nameField = content.indexOf(QStringLiteral("id: recordingNameField"));
+        const int waveform = content.indexOf(QStringLiteral("id: waveformCanvas"));
+        QVERIFY2(nameField >= 0, "the controls row must gain a recording-name field");
+        QVERIFY2(nameField < waveform, "the recording-name field must be declared above the waveform");
+
+        const QString fieldBlock = enclosingBlock(content, QStringLiteral("id: recordingNameField"));
+        QVERIFY(!fieldBlock.isEmpty());
+        QVERIFY2(fieldBlock.contains(
+                         QStringLiteral("UnderlineField { focused: recordingNameField.activeFocus }")),
+                 "the recording-name field is a pure text box — it must keep its resting underline "
+                 "(no plainUntilHovered)");
+        QVERIFY2(fieldBlock.contains(QStringLiteral("cursorShape: Qt.IBeamCursor")),
+                 "QQC2 gives a TextField no I-beam of its own — the name field needs its own "
+                 "HoverHandler, like MainPanel's fields");
+
+        const QString banner = enclosingBlock(page, QStringLiteral("objectName: \"recorderWarningBanner\""));
+        QVERIFY2(!banner.isEmpty(), "the shared warning banner must exist");
+        QVERIFY2(banner.contains(QStringLiteral("recorderPage.recordingNameWarning")),
+                 "the shared banner must show the recording-name advisory");
+        const int lastErrorIdx = banner.indexOf(QStringLiteral("audioRecorder.lastError"));
+        const int nameWarningIdx = banner.indexOf(QStringLiteral("recorderPage.recordingNameWarning"));
+        QVERIFY(lastErrorIdx >= 0 && nameWarningIdx >= 0);
+        QVERIFY2(lastErrorIdx < nameWarningIdx,
+                 "lastError must still take precedence over the name advisory in the text chain");
+
+        // Two-tone: Theme.warning for the advisory, Theme.danger for every
+        // real error — never a single flat colour for the whole banner.
+        QVERIFY2(banner.contains(QStringLiteral("Theme.warning")) && banner.contains(QStringLiteral("Theme.danger")),
+                 "the banner's colour must be two-tone — a caution reads differently from an error");
+    }
+
     // An active capture must be visible from EVERY page, not
     // just the recorder's. Two different booleans are spelled "recording" —
     // the titlebar's page-open flag and AudioRecorder's actual capture state —
@@ -3556,9 +3598,13 @@ private slots:
         QVERIFY2(src.contains(QStringLiteral("property string renamingText")),
                  "the editor's live text must be mirrored on the sidebar so a click on another row can "
                  "commit a rename the editor itself never gets a blur for");
-        const int rowTapIdx2 = src.indexOf(QStringLiteral("id: treeRowTap"));
-        QVERIFY2(rowTapIdx2 >= 0, "treeRowTap must exist");
-        QVERIFY2(src.mid(rowTapIdx2, 1200).contains(QStringLiteral("commitActiveRename()")),
+        // enclosingBlock(), not a fixed-width mid() window: a window silently
+        // stops guarding the moment the handler grows past it (this one did,
+        // on an unrelated comment), and it can just as silently start matching
+        // the NEXT element instead.
+        const QString rowTapBlock = enclosingBlock(stripComments(src), QStringLiteral("id: treeRowTap"));
+        QVERIFY2(!rowTapBlock.isEmpty(), "treeRowTap must exist");
+        QVERIFY2(rowTapBlock.contains(QStringLiteral("commitActiveRename()")),
                  "clicking a different row while an inline rename is open must commit it — that click "
                  "never blurs the editor (FocusScope), so nothing else will");
 
@@ -4530,14 +4576,93 @@ private slots:
         QVERIFY2(placeholderRow.contains(QStringLiteral("combineSourceCount")),
                  "the placeholder must say how many parts it is merging");
 
-        // Not clickable: it has nothing to open, rename or act on.
+        // Not clickable: it has nothing to open, rename or act on. Shares the
+        // rowInert gate with the mid-recording row (see
+        // treeRow_recordingRowIsInert below) — one name, so a future guard
+        // can't pick up only one of the two states.
+        QVERIFY2(src.contains(QStringLiteral(
+                         "readonly property bool rowInert: treeDelegate.isCombinePlaceholder "
+                         "|| treeDelegate.isRecording")),
+                 "rowInert must be the single name for the interaction-suppressing row states");
         QVERIFY2(enclosingBlock(src, QStringLiteral("id: treeRowTap"))
-                     .contains(QStringLiteral("enabled: !treeDelegate.isCombinePlaceholder")),
+                     .contains(QStringLiteral("enabled: !treeDelegate.rowInert")),
                  "the row TapHandler must be disabled for a combine placeholder — it has no file to open");
         QVERIFY2(enclosingBlock(src, QStringLiteral("id: treeRowContextTap"))
-                     .contains(QStringLiteral("enabled: !treeDelegate.isCombinePlaceholder")),
+                     .contains(QStringLiteral("enabled: !treeDelegate.rowInert")),
                  "the context-menu TapHandler must be disabled for a combine placeholder — every entry "
                  "in that menu acts on a file");
+    }
+
+    // The file a take is being written into shows up in the tree the instant
+    // the recorder creates it (VaultTreeModel's watcher), while it is still
+    // growing and its WAV header still understates its size. Unlike a combine
+    // placeholder it IS a real audio row — isAudio is true, it has a name — so
+    // NOTHING goes false on its own and every gate has to name it. The queue
+    // refuses tasks on it regardless (TaskScheduler::enqueueTask, covered by
+    // tst_transcription_queue); these are the guards that stop the UI OFFERING
+    // an action that would be refused.
+    void treeRow_recordingRowIsInert()
+    {
+        const QString src = stripComments(sidebarTreeSrc());
+        QVERIFY2(src.contains(QStringLiteral("required property bool isRecording")),
+                 "the tree delegate must take VaultTreeModel's isRecording role");
+
+        // Open / context menu / drag — the three ways a row acts on its file.
+        // (The tap gate is also what keeps it out of sidebar.selectedPaths,
+        // and so out of every selection-driven bulk action.)
+        QVERIFY2(enclosingBlock(src, QStringLiteral("id: treeRowTap"))
+                     .contains(QStringLiteral("enabled: !treeDelegate.rowInert")),
+                 "a row whose file is mid-recording must not be openable");
+        QVERIFY2(enclosingBlock(src, QStringLiteral("id: treeRowContextTap"))
+                     .contains(QStringLiteral("enabled: !treeDelegate.rowInert")),
+                 "a row whose file is mid-recording must have no context menu");
+        QVERIFY2(enclosingBlock(src, QStringLiteral("id: rowDragHandler"))
+                     .contains(QStringLiteral("!treeDelegate.rowInert")),
+                 "a file mid-recording must not be draggable into another folder — isAudio alone is "
+                 "true for it, so the kind test does not exclude it");
+
+        // Arrow-key navigation and Ctrl+A route around the delegate's own
+        // TapHandler entirely: they walk visibleNotePaths() and call
+        // activateNote() directly.
+        QVERIFY2(functionBody(src, QStringLiteral("function visibleNotePaths()"))
+                     .contains(QStringLiteral("VaultTreeModel.IsRecordingRole")),
+                 "visibleNotePaths() must skip a mid-recording file — otherwise Ctrl+A selects it and "
+                 "an arrow-key step opens it, both bypassing the row's disabled TapHandler");
+
+        // "What exists" vs "what may I act on" are two different lists, and the
+        // sort keys need the FIRST. Building them from the actionable list
+        // instead left the recording row with no key at all, so it sank to the
+        // bottom of the tree until an unrelated model reset rebuilt them.
+        const QString ordering = functionBody(src, QStringLiteral("function refreshTreeOrdering()"));
+        QVERIFY2(!ordering.isEmpty(), "refreshTreeOrdering() must exist");
+        QVERIFY2(ordering.contains(QStringLiteral("const audioPaths = (sidebar.transcriptionController "
+                                                   "&& sidebar.model) ? sidebar.model.allAudioPaths()")),
+                 "the tree's SORT KEYS must come from the complete allAudioPaths() — a displayed row "
+                 "with no sort key sinks to the bottom of the sidebar");
+        QVERIFY2(ordering.contains(QStringLiteral("sidebar.model.actionableAudioPaths()")),
+                 "combine GROUPING is an action input and must use actionableAudioPaths() — a group "
+                 "that swallowed a half-written take would offer a merge over the wrong set");
+        QVERIFY2(functionBody(src, QStringLiteral("function forceRetranscribeAll()"))
+                     .contains(QStringLiteral("actionableAudioPaths()")),
+                 "bulk retranscribe must skip a file still being recorded");
+        QVERIFY2(src.contains(QStringLiteral("sidebar.model.actionableAudioPaths(),")),
+                 "the ribbon's vault-wide combine scan must skip a file still being recorded");
+
+        // It must not merely be inert — it has to SAY why, or an unclickable
+        // row reads as a broken one.
+        QVERIFY2(src.contains(QStringLiteral("treeDelegate.isRecording ? AppSettings.recordingActiveColor")),
+                 "the status dot must show the recording colour for a take in flight");
+        QVERIFY2(src.contains(QStringLiteral("treeDelegate.isRecording ? Theme.textMuted")),
+                 "a mid-recording row's name must be muted — full white reads as an ordinary open-able file");
+
+        // The path itself: recorder -> both consumers, bound in the one place
+        // AudioRecorder exists.
+        const QString main = stripComments(readAll(QStringLiteral(SUOP_QML_DIR "/Main.qml")));
+        QVERIFY2(main.contains(QStringLiteral("activeRecordingPath: audioRecorder.activeRecordingPath")),
+                 "Main.qml must feed AudioRecorder's in-flight path to its consumers");
+        QVERIFY2(main.count(QStringLiteral("activeRecordingPath: audioRecorder.activeRecordingPath")) == 2,
+                 "BOTH the vault tree model (to mark/withhold the row) and the transcription controller "
+                 "(to refuse tasks on it) must be fed the in-flight recording path");
     }
 
     // Combining is RULE-DRIVEN ONLY: a merge may only ever happen for a group
@@ -4937,17 +5062,70 @@ private slots:
     }
 
     // The task counter is always visible (reads "0/0 tasks" when
-    // idle) — its Item must NOT be gated on tasksTotal > 0.
+    // idle) — it must NOT be gated on tasksTotal > 0.
     void bottomBar_tasksCounterAlwaysVisible()
     {
-        const QString bar = readAll(QStringLiteral(SUOP_QML_DIR "/BottomBar.qml"));
+        const QString bar = stripComments(readAll(QStringLiteral(SUOP_QML_DIR "/BottomBar.qml")));
         QVERIFY2(!bar.isEmpty(), "qml/BottomBar.qml must exist");
-        const int idx = bar.indexOf(QStringLiteral("id: tasksButton"));
-        QVERIFY2(idx >= 0, "tasksButton must exist");
+        const int idx = bar.indexOf(QStringLiteral("id: tasksLabel"));
+        QVERIFY2(idx >= 0, "the tasks counter (id: tasksLabel) must exist");
         const QString block = bar.mid(idx, 400);
         QVERIFY2(!block.contains(QStringLiteral("visible: bottomBar.tasksTotal > 0")),
-                 "tasksButton must no longer be gated on tasksTotal > 0 — the "
-                 "counter stays visible, reading 0/0 when idle");
+                 "the tasks counter must no longer be gated on tasksTotal > 0 — it "
+                 "stays visible, reading 0/0 when idle");
+    }
+
+    // StyleGuide "Text-only click targets": the bottom bar's three bare-text
+    // targets (path segments, the current-task label, the tasks counter) share
+    // one HoverUnderlineLabel component — underline on hover, no HoverBorder
+    // ring. No QQuickView here renders hover, so this is a source-scan guard:
+    // the component must own the hover/tap mechanics, and all three call sites
+    // must actually use it rather than re-rolling a HoverHandler + font.underline.
+    void hoverUnderlineLabel_isTheTextOnlyClickTargetConvention()
+    {
+        const QString comp = stripComments(
+            readAll(QStringLiteral(SUOP_QML_DIR "/HoverUnderlineLabel.qml")));
+        QVERIFY2(!comp.isEmpty(), "qml/HoverUnderlineLabel.qml must exist");
+        QVERIFY2(comp.contains(QStringLiteral("font.underline: root.interactive && labelHover.hovered")),
+                 "HoverUnderlineLabel must underline on hover, gated by interactive");
+        QVERIFY2(comp.contains(QStringLiteral("cursorShape: root.interactive ? Qt.PointingHandCursor")),
+                 "StyleGuide \"Interactable hover behavior\": the pointing-hand cursor still "
+                 "applies to a text-only click target");
+        QVERIFY2(comp.contains(QStringLiteral("enabled: root.interactive")),
+                 "interactive must gate the tap too, so an inert label can never advertise a "
+                 "click it won't perform");
+        QVERIFY2(!comp.contains(QStringLiteral("HoverBorder")),
+                 "the whole point of this component is NOT drawing the HoverBorder ring");
+
+        const QString bar = stripComments(readAll(QStringLiteral(SUOP_QML_DIR "/BottomBar.qml")));
+        QVERIFY2(!bar.isEmpty(), "qml/BottomBar.qml must exist");
+        for (const QString &id : {QStringLiteral("id: segment"), QStringLiteral("id: taskLabel"),
+                                  QStringLiteral("id: tasksLabel")}) {
+            const int idx = bar.indexOf(id);
+            QVERIFY2(idx >= 0, qPrintable(QStringLiteral("%1 must exist").arg(id)));
+            // The type name sits on the line above the id.
+            const int declStart = bar.lastIndexOf(QStringLiteral("HoverUnderlineLabel"), idx);
+            QVERIFY2(declStart >= 0 && idx - declStart < 120,
+                     qPrintable(QStringLiteral("%1 must be a HoverUnderlineLabel — text-only click "
+                                               "targets share one component").arg(id)));
+        }
+        QVERIFY2(!bar.contains(QStringLiteral("active: tasksHover.hovered")),
+                 "the tasks counter must no longer wear a HoverBorder — it underlines on hover "
+                 "like the path segments beside it");
+    }
+
+    // The current-task label sits in a box that absorbs the bottom bar's
+    // slack, so its text must be right-aligned inside that box — otherwise it
+    // renders flush against the path and reads as a continuation of it.
+    void bottomBar_taskLabelIsRightAligned()
+    {
+        const QString bar = stripComments(readAll(QStringLiteral(SUOP_QML_DIR "/BottomBar.qml")));
+        QVERIFY2(!bar.isEmpty(), "qml/BottomBar.qml must exist");
+        const int idx = bar.indexOf(QStringLiteral("id: taskLabel"));
+        QVERIFY2(idx >= 0, "the task label must exist");
+        const QString block = bar.mid(idx, 900);
+        QVERIFY2(block.contains(QStringLiteral("horizontalAlignment: Text.AlignRight")),
+                 "the bottom-bar task label must right-align its text within its box");
     }
 
     // The bottom bar's backend indicator shows the coarse
@@ -7237,6 +7415,36 @@ private slots:
                                     .arg(spawns)
                                     .arg(guards)));
         }
+    }
+
+    // The desktop entry `make install` writes and the app_id main.cpp reports
+    // are matched by string only — nothing at build time relates them. When
+    // they drift the app still launches from KRunner, it just detaches from its
+    // own launcher (generic icon, unpinnable), which is easy to miss.
+    void desktopFileName_matchesTheInstalledLauncherId()
+    {
+        const QString main = stripComments(readAll(QStringLiteral(SUOP_SRC_DIR "/main.cpp")));
+        // Escaped literal, NOT R"(...)": moc doesn't parse raw strings, it just
+        // counts bare quotes — an odd number swallows the rest of the file, so
+        // Q_OBJECT is never seen and the class links with no vtable.
+        static const QRegularExpression call(
+            QStringLiteral("setDesktopFileName\\(\\s*QStringLiteral\\(\"([^\"]+)\"\\)"));
+        const QRegularExpressionMatch m = call.match(main);
+        QVERIFY2(m.hasMatch(), "src/main.cpp must call setDesktopFileName(), or the running window "
+                               "won't associate with the installed .desktop entry");
+        const QString appId = m.captured(1);
+
+        const QString makefile = readAll(QStringLiteral(SUOP_REPO_DIR "/Makefile"));
+        QVERIFY2(makefile.contains(QStringLiteral("/%1.desktop").arg(appId)),
+                 qPrintable(QStringLiteral("main.cpp sets app_id '%1' but the Makefile's DESKTOP_FILE "
+                                           "installs a differently-named entry").arg(appId)));
+
+        const QString tmpl =
+            readAll(QStringLiteral(SUOP_REPO_DIR "/dist/%1.desktop.in").arg(appId));
+        QVERIFY2(!tmpl.isEmpty(),
+                 qPrintable(QStringLiteral("dist/%1.desktop.in must exist").arg(appId)));
+        QVERIFY2(tmpl.contains(QStringLiteral("Exec=@SUOP_TRANSCRIBER_EXEC@")),
+                 "the launcher template's Exec must stay the placeholder the Makefile substitutes");
     }
 
 };

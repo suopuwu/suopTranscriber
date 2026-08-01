@@ -19,6 +19,21 @@ must show both:
   - Overlay/anchor it on the interactive element; bind its `active` property
     to that element's own `hovered` state.
 
+### Text-only click targets
+
+Bare inline text that is itself the target (bottom-bar path segments, the
+current-task label, the `x/y tasks` counter) **underlines on hover instead of
+taking a `HoverBorder`** — a box around a run of text reads as a button it
+isn't, and around a variable-width readout it jitters as the text resizes. The
+pointing-hand cursor still applies.
+
+- Convention: reusable `qml/HoverUnderlineLabel.qml` — a `Label` that owns its
+  `HoverHandler`/`TapHandler`, exposes `hovered`, and emits `tapped()`.
+- `interactive: false` gates the underline AND the tap together, so a label
+  that can't be clicked never advertises that it can.
+- This is the exception to "Outline" above, not a second option for buttons:
+  anything with its own box (icon buttons, rows, chips) keeps `HoverBorder`.
+
 ## Border radius
 
 - One global setting: `AppSettings.borderRadius` (`qml/AppSettings.qml`).

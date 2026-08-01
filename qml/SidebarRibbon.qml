@@ -194,7 +194,7 @@ Flow {
     // Separates the per-file bulk pipeline (transcribe/label/chapters/
     // speakers/run-all, all narrowed to the current selection via the
     // selection*Paths) from combine, which is a different kind of
-    // action: a vault-wide scan over allAudioPaths() that ignores the
+    // action: a vault-wide scan over actionableAudioPaths() that ignores the
     // selection entirely. Same shape/reasoning as ribbonDivider above.
     Item {
         id: ribbonCombineDivider
@@ -224,7 +224,7 @@ Flow {
         enabled: sidebarRoot.transcriptionController && AppSettings.combineRules.length > 0
         onTapped: {
             sidebarRoot.transcriptionController.runCombineScan(
-                        AppSettings.combineRules, sidebarRoot.model.allAudioPaths(),
+                        AppSettings.combineRules, sidebarRoot.model.actionableAudioPaths(),
                         sidebarRoot.vaultPath, AppSettings.deleteOriginalsAfterCombine)
         }
     }

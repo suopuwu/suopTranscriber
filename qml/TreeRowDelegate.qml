@@ -55,6 +55,18 @@ Item {
     // guards below: the two TapHandlers and the drag.
     required property bool isCombinePlaceholder
     required property int combineSourceCount
+    // The file a take is being written into RIGHT NOW — see VaultTreeModel::
+    // setActiveRecordingPath(). Unlike a combine placeholder this IS a real
+    // audio row (it keeps its name, and isAudio is true), so none of the
+    // eligibility bindings go false on their own: every gate has to name it
+    // explicitly. The queue refuses tasks on it regardless
+    // (TaskScheduler::enqueueTask), so these guards are about not OFFERING an
+    // action that would be rejected, not about safety.
+    required property bool isRecording
+    // Interaction-suppressing states, together: a row that isn't a real,
+    // finished file yet. One name so a new gate can't pick up only half of
+    // them.
+    readonly property bool rowInert: treeDelegate.isCombinePlaceholder || treeDelegate.isRecording
 
     // Is the combine this placeholder stands for the job actually
     // RUNNING right now (vs. still queued behind other work)? A combine
@@ -278,10 +290,10 @@ Item {
 
     HoverHandler {
         id: rowHover
-        // A placeholder isn't clickable (both TapHandlers are disabled
+        // An inert row isn't clickable (both TapHandlers are disabled
         // for it), so it must not offer a pointing hand — the cursor is
         // the only thing that would still claim it is.
-        cursorShape: treeDelegate.isCombinePlaceholder ? Qt.ArrowCursor : Qt.PointingHandCursor
+        cursorShape: treeDelegate.rowInert ? Qt.ArrowCursor : Qt.PointingHandCursor
         // Pushes this row's group into
         // sidebarRoot.hoveredCombineGroup so the ONE per-group merge
         // button (see groupMergeButton) reveals on hovering ANY
@@ -317,8 +329,9 @@ Item {
         id: treeRowContextTap
         acceptedButtons: Qt.RightButton
         // Every entry in that menu (open/rename/move/delete/combine)
-        // acts on a file, and a placeholder has none yet.
-        enabled: !treeDelegate.isCombinePlaceholder
+        // acts on a file — a placeholder has none yet, and a recording's
+        // is still being written.
+        enabled: !treeDelegate.rowInert
         onTapped: {
             const p = treeDelegate.mapToItem(sidebarRoot, treeRowContextTap.point.position.x,
                                                treeRowContextTap.point.position.y)
@@ -410,8 +423,13 @@ Item {
     TapHandler {
         id: treeRowTap
         // A placeholder has nothing to open, expand, or rename — see
-        // isCombinePlaceholder. Inert rather than click-then-fail.
-        enabled: !treeDelegate.isCombinePlaceholder
+        // isCombinePlaceholder. A recording's file exists but is still
+        // growing, so opening it would play a truncated take and its
+        // rename would race the writer. Inert rather than
+        // click-then-fail: this is also what keeps such a row out of
+        // sidebarRoot.selectedPaths, and so out of every bulk action
+        // driven by the selection.
+        enabled: !treeDelegate.rowInert
         onTapped: {
             // Clicking a DIFFERENT row while an inline rename is open
             // must commit it (blur convention) — and nothing else will,
@@ -499,8 +517,11 @@ Item {
         // file-move drag (the handler's default grabPermissions would
         // otherwise steal the TextInput's selection grab). Mirrors the
         // !renamingThisRow gate already used on the row's name element.
+        // rowInert covers the recording case: isAudio is true for it, so the
+        // kind test alone would happily let the user drag a file that is
+        // mid-write into another folder.
         enabled: (treeDelegate.isDir || treeDelegate.isAudio || treeDelegate.isOrphanedMd)
-                 && !treeDelegate.renamingThisRow
+                 && !treeDelegate.renamingThisRow && !treeDelegate.rowInert
         // grabPermissions is deliberately left at the DEFAULT. The
         // obvious worry is that the enclosing TreeView (a Flickable)
         // steals the grab once the stroke passes its own flick
@@ -885,9 +906,22 @@ Item {
                 Layout.preferredWidth: 8
                 Layout.preferredHeight: 8
                 radius: 4
-                color: treeDelegate.status === 2 ? Theme.success
+                // A take in flight outranks every transcription status: the
+                // file is not untranscribed-and-ready, it is not finished
+                // being written. Same red the titlebar and window rim use for
+                // "recording", so the one signal reads the same everywhere.
+                color: treeDelegate.isRecording ? AppSettings.recordingActiveColor
+                     : treeDelegate.status === 2 ? Theme.success
                      : treeDelegate.status === 4 ? "#e67e22"
                      : (treeDelegate.isOrphanedMd ? "#3498db" : "#f1c40f")
+
+                HoverHandler {
+                    id: recordingDotHover
+                    enabled: treeDelegate.isRecording
+                }
+                ToolTip.visible: recordingDotHover.hovered
+                ToolTip.text: qsTr("Recording — available once the take is stopped")
+                ToolTip.delay: 500
             }
 
             // Separate small dot for an in-progress transcription
@@ -1042,7 +1076,10 @@ Item {
                             ? TextFormat.highlightMatch(base, sidebarRoot.searchQuery, AppSettings.highlightColor)
                             : base
                 }
-                color: "white"
+                // Muted while the take is still being written — the row is
+                // inert, and a name in full white reads as an ordinary
+                // openable file.
+                color: treeDelegate.isRecording ? Theme.textMuted : "white"
             }
 
             // Inline rename editor — present only for the one row being

@@ -1,5 +1,6 @@
 #include "TaskScheduler.h"
 
+#include <QDebug>
 #include <QFile>
 #include <QFileInfo>
 #include <QJsonArray>
@@ -101,9 +102,40 @@ bool TaskScheduler::isCombineQueued(const QString &outputPath) const
     return TaskQuery::isCombineQueued(m_tasks, outputPath);
 }
 
+// The one implementation of "does this touch the take in flight"; everything
+// else adapts its inputs to it.
+bool TaskScheduler::urlsTouchActiveRecording(const QList<QUrl> &urls) const
+{
+    if (m_activeRecordingUrl.isEmpty())
+        return false;
+    return std::any_of(urls.cbegin(), urls.cend(), [this](const QUrl &url) {
+        // isSameRecording(), not url equality: a task may carry the sibling
+        // .md rather than the audio (a rename/trash routinely does), and that
+        // names the same recording.
+        return isSameRecording(url, m_activeRecordingUrl);
+    });
+}
+
+bool TaskScheduler::touchesActiveRecording(const Task &task) const
+{
+    return urlsTouchActiveRecording(task.touchedFiles());
+}
+
 // The ONE way a task enters the queue.
 int TaskScheduler::enqueueTask(std::unique_ptr<Task> task, int insertIndex)
 {
+    if (touchesActiveRecording(*task)) {
+        // Refused, not deferred: waiting would be worse than useless here.
+        // A take has no known end — it runs until the user stops it — so a
+        // queued transcribe of it would sit at the head of the queue blocking
+        // everything behind it for an unbounded time, and would then run
+        // against whatever the file happened to be. The UI's job is to not
+        // offer the action; this is the backstop that makes the bulk paths
+        // (transcribe-all, combine scan, a multi-file trash) safe regardless.
+        qWarning() << "TaskScheduler: refusing" << task->kind()
+                   << "on the file being recorded:" << m_activeRecordingUrl.toLocalFile();
+        return -1;
+    }
     int insertAt = (insertIndex < 0) ? frontOfQueueInsertIndex() : insertIndex;
 
     // The models this kind declared it needs, each queued as its own
@@ -615,15 +647,26 @@ void TaskScheduler::moveQueuedJob(int id, int newIndex)
     emitQueueChanged();
 }
 
-void TaskScheduler::enqueueCombineJob(const CombineGroup &group, const QUrl &vaultUrl, bool deleteOriginals,
+bool TaskScheduler::enqueueCombineJob(const CombineGroup &group, const QUrl &vaultUrl, bool deleteOriginals,
                                       int insertIndex)
 {
     auto task = std::make_unique<CombineTask>(group.files, QUrl::fromLocalFile(group.outputPath), deleteOriginals);
+    // This kind inserts into m_tasks itself rather than going through
+    // enqueueTask() (it wants the explicit insertIndex and has no
+    // prerequisites), so the recording guard has to be repeated here — it is
+    // NOT covered by the one in enqueueTask. Checked before the id is taken so
+    // a refused job doesn't burn one.
+    if (touchesActiveRecording(*task)) {
+        qWarning() << "TaskScheduler: refusing combine — a source is being recorded:"
+                   << m_activeRecordingUrl.toLocalFile();
+        return false;
+    }
     task->id = m_nextJobId++;
     task->vaultUrl = vaultUrl;
     task->status = Task::Status::Queued;
     const int at = (insertIndex < 0) ? frontOfQueueInsertIndex() : insertIndex;
     m_tasks.insert(m_tasks.begin() + std::clamp(at, 0, static_cast<int>(m_tasks.size())), std::move(task));
+    return true;
 }
 
 // The scheduler-level preflight .task/plan.md flagged as the hardest port: it can
@@ -660,6 +703,16 @@ bool TaskScheduler::maybeRedirectForCombine(int index)
     const QString filePath = transcribe->fileUrl.toLocalFile();
     for (const CombineGroup &group : CombineScanner::findCombineGroups(m_combineRules, m_combineAudioPaths)) {
         if (group.status != QStringLiteral("ready") || !group.files.contains(filePath))
+            continue;
+        // Checked BEFORE the redirect, not after: if the combine can't be
+        // enqueued, repointing this transcribe at the merged output would
+        // leave it aimed at a file nothing is going to produce. Leaving the
+        // group alone lets the transcribe run against its own real file.
+        QList<QUrl> groupUrls;
+        groupUrls.reserve(group.files.size());
+        for (const QString &source : group.files)
+            groupUrls << QUrl::fromLocalFile(source);
+        if (urlsTouchActiveRecording(groupUrls))
             continue;
         transcribe->fileUrl = QUrl::fromLocalFile(group.outputPath);
         if (!isCombineQueued(group.outputPath))

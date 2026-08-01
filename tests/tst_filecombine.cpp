@@ -545,6 +545,40 @@ private slots:
         QCOMPARE(job.value("fileUrl").toUrl(), QUrl::fromLocalFile(targetA.value("outputPath").toString()));
     }
 
+    // A combine's fileUrl is its OUTPUT, so the enqueue guard's default
+    // (fileUrl alone) would report it as touching a file that doesn't exist
+    // yet and none of the SOURCES it actually reads and archives away. With
+    // CombineTask::touchedFiles() reporting the sources, a group containing
+    // the file a take is being written into is refused outright — the UI
+    // already keeps such a file out of the group (actionableAudioPaths()),
+    // and this is the backstop under it.
+    void combineGroup_refusedWhenASourceIsBeingRecorded()
+    {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        const QString a1 = touchFile(dir.path(), "TXA_MIC001_orig.wav", 60);
+        const QString a2 = touchFile(dir.path(), "TXA_MIC002_orig.wav", 40);
+
+        TranscriptionController controller;
+        const QVariantList rules = {rule("group", "^(TXA)_MIC\\d{3}_orig\\.wav$")};
+        const QStringList allPaths = {a1, a2};
+        const QVariantMap group = findGroup(controller.detectCombineGroups(rules, allPaths), "group");
+        QCOMPARE(group.value("status").toString(), QStringLiteral("ready"));
+
+        // a2 is deliberately not the group's first member.
+        controller.setActiveRecordingPath(a2);
+        controller.combineGroup(rules, allPaths, group.value("outputPath").toString(),
+                                 QUrl::fromLocalFile(dir.path()), false);
+        QVERIFY2(controller.jobs().isEmpty(),
+                 "a combine whose SOURCE is still being recorded must be refused");
+
+        // Once the take ends the same group combines normally.
+        controller.setActiveRecordingPath(QString());
+        controller.combineGroup(rules, allPaths, group.value("outputPath").toString(),
+                                 QUrl::fromLocalFile(dir.path()), false);
+        QCOMPARE(controller.jobs().size(), 1);
+    }
+
     // A group that isn't "ready" (here: a singleton, only one match) must be
     // silently ignored — no job enqueued.
     void combineGroup_nonReadyGroupIsIgnored()

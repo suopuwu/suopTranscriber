@@ -27,6 +27,10 @@ class VaultTreeModel : public QAbstractItemModel {
     QML_ELEMENT
     Q_PROPERTY(QUrl vaultPath READ vaultPath WRITE setVaultPath NOTIFY vaultPathChanged)
     Q_PROPERTY(QString vaultLocalPath READ vaultLocalPath NOTIFY vaultPathChanged)
+    // See setActiveRecordingPath(). Writable so QML can bind it straight to
+    // AudioRecorder's property of the same name.
+    Q_PROPERTY(QString activeRecordingPath READ activeRecordingPath WRITE setActiveRecordingPath
+                       NOTIFY activeRecordingPathChanged)
 
 public:
     enum Roles {
@@ -45,6 +49,11 @@ public:
         // CombineSourceCountRole is how many parts it will merge.
         IsCombinePlaceholderRole,
         CombineSourceCountRole,
+        // See setActiveRecordingPath(). True for the one row whose file a take
+        // is currently being written into — the row exists (the watcher sees
+        // the file the moment the worker creates it) but must not be openable
+        // or actionable until the recording is finalized.
+        IsRecordingRole,
     };
     Q_ENUM(Roles)
 
@@ -365,8 +374,23 @@ public:
     // Every audio file's absolute path in the vault, transcribed or not —
     // walks the full tree rather than relying on which TreeView rows happen
     // to be realized (Sidebar's untranscribedPaths/transcribedPaths only
-    // cover the current viewport). Used by "force retranscribe all".
+    // cover the current viewport).
+    //
+    // "Every" includes a file currently being recorded into: this answers
+    // WHAT EXISTS, and the tree's sort keys are built from it, so dropping a
+    // row here drops its sort key and drops the row to the bottom of the
+    // sidebar until something else forces a re-sort. For "what may I act on",
+    // use actionableAudioPaths() below — conflating the two is what put a
+    // live recording at the bottom of the tree.
     Q_INVOKABLE QStringList allAudioPaths() const;
+
+    // allAudioPaths() minus the file a take is being written into — the list
+    // for anything that ENQUEUES work (bulk retranscribe, the combine scan)
+    // rather than merely displaying. The queue refuses such a task anyway
+    // (TaskScheduler::enqueueTask), but a combine GROUPS its inputs before
+    // enqueueing, so a half-written file left in the list reshapes a group
+    // that then merges the wrong set.
+    Q_INVOKABLE QStringList actionableAudioPaths() const;
 
     // Same traversal as allAudioPaths(), paired with each file's mtime —
     // Sidebar.qml's file-tree sort feature (Name / Date Modified asc/desc)
@@ -447,6 +471,17 @@ public:
     // file that's since been deleted/renamed, or one outside the vault).
     Q_INVOKABLE void refreshFile(const QUrl &fileUrl);
 
+    // The file an in-flight recording is being written into (absolute local
+    // path; empty = none), pushed down from QML where AudioRecorder lives.
+    // Marks that one row IsRecordingRole and withholds it from
+    // allAudioPaths() — the file is real and growing, so it must not read as
+    // ordinary, playable, transcribable audio until the take is finalized.
+    // Deliberately NOT a combine-style placeholder: the row keeps its name and
+    // stays visible, because watching the take appear is the point; it is only
+    // inert.
+    Q_INVOKABLE void setActiveRecordingPath(const QString &path);
+    QString activeRecordingPath() const { return m_activeRecordingPath; }
+
     // Combine placeholders: the tree's view of combines that are queued or
     // running but haven't landed on disk yet. `pending` is one entry per such
     // combine — {"outputPath": string, "sources": [string]} — and Sidebar.qml
@@ -503,6 +538,7 @@ public:
 
 signals:
     void vaultPathChanged();
+    void activeRecordingPathChanged();
     // A transcript (.md sidecar) was removed by
     // deleteTranscript(), leaving the audio in place (fileUrl is the audio
     // file whose transcript was deleted, or the orphaned .md that was
@@ -648,6 +684,12 @@ private:
     // node no longer reachable from m_root (shouldn't happen; defensive).
     QModelIndex indexForNode(const Node *node) const;
     static void collectAudioPaths(const Node *node, QStringList &out);
+    // True for the one audio node the recorder is currently writing.
+    bool isActiveRecordingNode(const Node *node) const
+    {
+        return node && node->isAudio && !m_activeRecordingPath.isEmpty()
+            && node->path == m_activeRecordingPath;
+    }
     static void collectAudioLastModified(const Node *node, QVariantMap &out);
     // Backs vaultFolders() — a raw filesystem walk (not a tree walk), so
     // empty/content-less folders the tree prunes are still listed as move
@@ -740,4 +782,6 @@ private:
     // Keyed by sidecar .md path — see frontmatterField()'s doc comment.
     // mutable for the same reason as m_transcriptBodyCache.
     mutable QHash<QString, CachedFrontmatter> m_frontmatterCache;
+    // See setActiveRecordingPath().
+    QString m_activeRecordingPath;
 };

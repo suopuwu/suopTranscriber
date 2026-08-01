@@ -211,6 +211,7 @@ private slots:
             "Snackbar 1.0 qml/Snackbar.qml\n"
             "SnackbarHost 1.0 qml/SnackbarHost.qml\n"
             "HoverBorder 1.0 qml/HoverBorder.qml\n"
+            "HoverUnderlineLabel 1.0 qml/HoverUnderlineLabel.qml\n"
             "CombineGroupOutline 1.0 qml/CombineGroupOutline.qml\n"
             "UnderlineField 1.0 qml/UnderlineField.qml\n"
             "TextRedoShortcut 1.0 qml/TextRedoShortcut.qml\n"

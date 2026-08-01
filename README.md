@@ -50,8 +50,16 @@ git clone --recursive https://github.com/suopuwu/suopTranscriber.git
 cd suopTranscriber
 make build        # = cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
                   #   + cmake --build build
-make run          # build + launch
+make install      # desktop entry + ~/.local/bin/suopTranscriber wrapper
+make run          # build + install + launch
+make uninstall    # remove both
 ```
+
+`make install` doesn't copy anything out of the working tree — the app finds
+`models/`, `engines/`, and its CUDA compat `lib/` next to the binary, so the
+installed wrapper just `exec`s `build/suopTranscriber` in place. It makes the
+app startable from KRunner / an app launcher (and from any shell); the repo has
+to stay put, and `make build` alone picks up changes.
 
 Or directly:
 

@@ -3065,6 +3065,121 @@ private slots:
         QVERIFY(model.allAudioPaths().isEmpty());
     }
 
+    // --- setActiveRecordingPath() (the file a take is being written into) --------
+
+    // The recorder creates its output file at the START of a take and grows it,
+    // so the watcher surfaces it immediately. It must not be swept into a bulk
+    // action (retranscribe-everything, the combine scan) — but it must still be
+    // ENUMERATED, because the sidebar's sort keys are built per audio path and
+    // a row with no key sinks to the bottom of the tree. Hence two lists.
+    void actionableAudioPaths_excludeTheRecording_allAudioPathsStillListsIt()
+    {
+        QTemporaryDir vault;
+        QVERIFY(vault.isValid());
+        QVERIFY(touch(vault.filePath("done.wav")));
+        QVERIFY(touch(vault.filePath("take.wav")));
+
+        VaultTreeModel model;
+        model.setVaultPath(QUrl::fromLocalFile(vault.path()));
+        QCOMPARE(model.allAudioPaths().size(), 2);
+        QCOMPARE(model.actionableAudioPaths().size(), 2);
+
+        model.setActiveRecordingPath(vault.filePath("take.wav"));
+        QCOMPARE(model.actionableAudioPaths(), QStringList{ vault.filePath("done.wav") });
+        // The regression this pairing exists for: dropping the recording from
+        // allAudioPaths() too left its row without a sort key, so it fell to
+        // the bottom of the sidebar and stayed there until an unrelated model
+        // reset (starting the NEXT take) rebuilt the keys.
+        QStringList all = model.allAudioPaths();
+        all.sort();
+        QCOMPARE(all, QStringList({ vault.filePath("done.wav"), vault.filePath("take.wav") }));
+
+        // Handed straight back when the take ends — a live gate, not a
+        // permanent exclusion.
+        model.setActiveRecordingPath(QString());
+        QCOMPARE(model.actionableAudioPaths().size(), 2);
+    }
+
+    // IsRecordingRole marks exactly that one row, so the delegate can make it
+    // inert (no open, no context menu, no drag) without any other row changing.
+    void activeRecordingPath_marksOnlyItsOwnRow()
+    {
+        QTemporaryDir vault;
+        QVERIFY(vault.isValid());
+        QVERIFY(touch(vault.filePath("done.wav")));
+        QVERIFY(touch(vault.filePath("take.wav")));
+
+        VaultTreeModel model;
+        model.setVaultPath(QUrl::fromLocalFile(vault.path()));
+        model.setActiveRecordingPath(vault.filePath("take.wav"));
+
+        int recordingRows = 0;
+        int checked = 0;
+        for (int r = 0; r < model.rowCount(QModelIndex()); ++r) {
+            const QModelIndex idx = model.index(r, 0, QModelIndex());
+            if (!model.data(idx, VaultTreeModel::IsAudioRole).toBool())
+                continue;
+            ++checked;
+            const bool isRecording = model.data(idx, VaultTreeModel::IsRecordingRole).toBool();
+            const QString path = model.data(idx, VaultTreeModel::PathRole).toString();
+            QCOMPARE(isRecording, path == vault.filePath("take.wav"));
+            if (isRecording)
+                ++recordingRows;
+        }
+        QCOMPARE(checked, 2);
+        QCOMPARE(recordingRows, 1);
+    }
+
+    // Search results are openable, bulk-actionable rows, so the in-flight take
+    // is withheld there too — otherwise typing its name hands back a row that
+    // routes around the tree delegate's own guards entirely.
+    void activeRecordingPath_isWithheldFromSearchResults()
+    {
+        QTemporaryDir vault;
+        QVERIFY(vault.isValid());
+        QVERIFY(touch(vault.filePath("interview.wav")));
+        QVERIFY(touch(vault.filePath("interview_2.wav")));
+
+        VaultTreeModel model;
+        model.setVaultPath(QUrl::fromLocalFile(vault.path()));
+        QCOMPARE(model.searchResults(QStringLiteral("interview"), true).size(), 2);
+
+        model.setActiveRecordingPath(vault.filePath("interview_2.wav"));
+        const QVariantList results = model.searchResults(QStringLiteral("interview"), true);
+        QCOMPARE(results.size(), 1);
+        QCOMPARE(results.first().toMap().value(QStringLiteral("path")).toString(),
+                 vault.filePath("interview.wav"));
+    }
+
+    // Setting the path must repaint the affected rows WITHOUT resetting the
+    // model: a reset drops the sidebar's selection and expansion state, and a
+    // take starting is no reason to lose either.
+    void activeRecordingPath_emitsDataChangedNotAReset()
+    {
+        QTemporaryDir vault;
+        QVERIFY(vault.isValid());
+        QVERIFY(touch(vault.filePath("take.wav")));
+
+        VaultTreeModel model;
+        model.setVaultPath(QUrl::fromLocalFile(vault.path()));
+
+        QSignalSpy resetSpy(&model, &QAbstractItemModel::modelReset);
+        QSignalSpy changedSpy(&model, &QAbstractItemModel::dataChanged);
+
+        model.setActiveRecordingPath(vault.filePath("take.wav"));
+        QCOMPARE(resetSpy.count(), 0);
+        QCOMPARE(changedSpy.count(), 1);
+
+        // Setting the same path again is a no-op, not a second repaint.
+        model.setActiveRecordingPath(vault.filePath("take.wav"));
+        QCOMPARE(changedSpy.count(), 1);
+
+        // Clearing repaints the row that just stopped being busy.
+        model.setActiveRecordingPath(QString());
+        QCOMPARE(resetSpy.count(), 0);
+        QCOMPARE(changedSpy.count(), 2);
+    }
+
     // --- audioLastModified() (Sidebar.qml file-tree sort: Date Modified) --------
 
     // One entry per audio path (same set allAudioPaths() returns), each

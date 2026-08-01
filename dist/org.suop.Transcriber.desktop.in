@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=suopTranscriber
+Comment=GPU-accelerated transcription vault for recorded audio
+Exec=@SUOP_TRANSCRIBER_EXEC@
+Icon=audio-input-microphone
+Terminal=false
+Categories=AudioVideo;Audio;
+Keywords=transcribe;transcription;transcript;speech;whisper;parakeet;audio;
+StartupNotify=true

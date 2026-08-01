@@ -36,6 +36,8 @@ public:
     QString kindLabel() const override { return QStringLiteral("Move to trash"); }
     QString displayName() const override;
     Lane lane() const override { return Lane::Instant; }
+    // fileUrl is only the first of the selection — see Task::touchedFiles().
+    QList<QUrl> touchedFiles() const override { return m_urls; }
 
     // Undoable iff something actually went to the trash (restorable non-empty).
     QString undoLabel() const override;

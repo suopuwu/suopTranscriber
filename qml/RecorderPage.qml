@@ -49,6 +49,40 @@ Item {
     // are in right now, not a preference; persisting it would make a
     // forgotten toggle silently discard a real recording.
     property bool testMode: false
+    // What the next take is called, before the ".wav". Empty = the timestamp
+    // name, which stays the default so recording is still one click. Kept
+    // ACROSS takes rather than cleared after each: a second take under the
+    // same name is exactly the collision the "_N" suffix exists for, so a
+    // series of takes named "interview" numbers itself. Session-only, like
+    // testMode above — a name is what you are recording right now, and a
+    // persisted one would silently attach itself to an unrelated take weeks
+    // later.
+    property string recordingName: ""
+    // The file name the next take would ACTUALLY land on, straight from the
+    // C++ that will decide it (AudioRecorder::plannedRecordingFileName) — never
+    // re-derived here, or the warning and the written file could disagree
+    // about what counts as taken.
+    readonly property string plannedFileName: recorderPage.audioRecorder
+        ? recorderPage.audioRecorder.plannedRecordingFileName(
+              recorderPage.vaultPath, AppSettings.recordingOutputFolder,
+              recorderPage.recordingName, recorderPage.testMode)
+        : ""
+    // Non-empty when the typed name won't be used verbatim — either it
+    // sanitises away to nothing, or something at the destination already
+    // holds it and the take will be numbered. Shown in the page's shared
+    // warning banner (see below).
+    readonly property string recordingNameWarning: {
+        if (!recorderPage.audioRecorder || recorderPage.recordingName.trim() === "")
+            return ""
+        const clean = recorderPage.audioRecorder.sanitizeRecordingName(recorderPage.recordingName)
+        if (clean === "")
+            return qsTr("That name can't be used as a file name — this take will be saved with a "
+                        + "timestamp name instead.")
+        if (recorderPage.plannedFileName !== clean + ".wav")
+            return qsTr("\"%1.wav\" already exists here — this take will be saved as \"%2\".")
+                   .arg(clean).arg(recorderPage.plannedFileName)
+        return ""
+    }
     property string selectedMicId: ""
     property var micDevices: []
     // Selected AudioRecorder::availableSystemSources() id — "" means the
@@ -775,6 +809,7 @@ Item {
                                 recorderPlayer.pause()
                                 recorderPage.audioRecorder.startRecording(
                                     recorderPage.vaultPath, AppSettings.recordingOutputFolder,
+                                    recorderPage.recordingName,
                                     recorderPage.useMic, recorderPage.selectedMicId,
                                     recorderPage.useSystemAudio, AppSettings.recordingMicGain,
                                     AppSettings.recordingSystemGain, recorderPage.selectedSystemSourceId,
@@ -930,6 +965,32 @@ Item {
                     font.pixelSize: 16
                 }
 
+                // What to call the take. A pure text box (StyleGuide.md "Text
+                // fields") — it exists only to be typed into, so it keeps its
+                // resting underline rather than going plainUntilHovered.
+                // Disabled during a take for the same reason the test-mode
+                // toggle is: the output path is chosen once, at
+                // startRecording().
+                TextField {
+                    id: recordingNameField
+                    objectName: "recordingNameField"
+                    Layout.preferredWidth: 200
+                    enabled: !recorderPage.audioRecorder.recording
+                    placeholderText: qsTr("Recording name")
+                    text: recorderPage.recordingName
+                    font.pixelSize: 11
+                    background: UnderlineField { focused: recordingNameField.activeFocus }
+                    onTextEdited: recorderPage.recordingName = text
+                    ToolTip.visible: recordingNameHover.hovered
+                    ToolTip.text: qsTr("Name for the next recording — blank uses a timestamp")
+                    ToolTip.delay: 500
+                    // Editable text needs an I-beam.
+                    HoverHandler {
+                        id: recordingNameHover
+                        cursorShape: Qt.IBeamCursor
+                    }
+                }
+
                 Item { Layout.fillWidth: true }
 
                 // Where the next recording lands. "" means the vault root —
@@ -1042,16 +1103,35 @@ Item {
 
             // Shared warning banner (StyleGuide.md "Warning banners"): shows
             // whichever of the folder-picker rejection / audioRecorder's own
-            // lastError is currently non-empty. No dismiss button — clears
-            // itself the next time the folder picker succeeds/reopens, or
-            // the next time lastErrorChanged reports an empty string.
+            // lastError / the recording-name advisory is currently non-empty.
+            // No dismiss button — clears itself the next time the folder
+            // picker succeeds/reopens, lastErrorChanged reports an empty
+            // string, or the name stops colliding. Two-tone colour below: a
+            // rejection/lastError is a real error, the name advisory is a
+            // caution.
             Label {
+                objectName: "recorderWarningBanner"
                 Layout.fillWidth: true
                 visible: text !== ""
                 text: recorderPage.recordingFolderError !== "" ? recorderPage.recordingFolderError
                       : recorderPage.systemSourceWarning !== "" ? recorderPage.systemSourceWarning
-                      : (recorderPage.audioRecorder ? recorderPage.audioRecorder.lastError : "")
-                color: Theme.danger
+                      : (recorderPage.audioRecorder && recorderPage.audioRecorder.lastError !== "")
+                        ? recorderPage.audioRecorder.lastError
+                        : recorderPage.recordingNameWarning
+                // Two tones, because the banner now carries two kinds of
+                // message: a rejection or a capture failure is an error, while
+                // "your name is taken, the take will be numbered" is a caution
+                // the user may well accept as-is. Theme.warning is the app's
+                // existing "not an error" tone (the recorder's own too-quiet
+                // level band already uses it). Keyed on which message actually
+                // won the precedence chain above, not on the name warning
+                // merely being non-empty — a real error outranks the advisory
+                // in colour exactly as it does in text.
+                color: (recorderPage.recordingFolderError === ""
+                        && recorderPage.systemSourceWarning === ""
+                        && (!recorderPage.audioRecorder || recorderPage.audioRecorder.lastError === "")
+                        && recorderPage.recordingNameWarning !== "")
+                       ? Theme.warning : Theme.danger
                 font.pixelSize: 11
                 wrapMode: Text.WordWrap
             }
