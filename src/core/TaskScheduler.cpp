@@ -365,21 +365,18 @@ void TaskScheduler::maybeEmitUndoAvailable(const Task *task, bool ok)
     // to finish. ---
     if (task->batchId != 0) {
         const int batchId = task->batchId;
-        int undoableDone = 0;
-        int labelMemberIndex = -1;
-        for (int i = 0; i < static_cast<int>(m_tasks.size()); ++i) {
-            const Task *t = m_tasks[i].get();
+        QList<const Task *> undoableDone;
+        for (const auto &owned : m_tasks) {
+            const Task *t = owned.get();
             if (t->batchId != batchId)
                 continue;
             if (t->status != Task::Status::Done && t->status != Task::Status::Failed)
                 return; // a sibling is still pending — this isn't the last one
-            if (t->status == Task::Status::Done && t->makeUndoTask()) {
-                ++undoableDone;
-                labelMemberIndex = i;
-            }
+            if (t->status == Task::Status::Done && t->makeUndoTask())
+                undoableDone.append(t);
         }
-        if (undoableDone > 0 && labelMemberIndex >= 0)
-            m_observer->emitUndoAvailable(batchId, m_tasks[labelMemberIndex]->batchUndoLabel(undoableDone));
+        if (!undoableDone.isEmpty())
+            m_observer->emitUndoAvailable(batchId, undoableDone.last()->batchUndoLabel(undoableDone));
         return;
     }
 

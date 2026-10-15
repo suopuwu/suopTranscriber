@@ -467,6 +467,16 @@ Rectangle {
             .filter((n) => n.isAudio)
             .map((n) => n.path)
     }
+    // Search-scoped "compress" — the files in the filtered set that `target`
+    // ("voice" / "lossless") applies to (TranscriptionController.
+    // isCompressibleAudio, the same filter compressAudioFiles() applies).
+    function searchCompressPaths(target) {
+        if (!sidebar.transcriptionController)
+            return []
+        return sidebar.searchResultNotes()
+            .filter((n) => n.isAudio && sidebar.transcriptionController.isCompressibleAudio(n.path, target))
+            .map((n) => n.path)
+    }
 
     // Whether any filter/search is actually narrowing the visible set — the
     // search buttons stay disabled otherwise so they can't silently run over
@@ -883,6 +893,14 @@ Rectangle {
             if (!ok)
                 Notifications.error(error === "" ? qsTr("Couldn't move — name taken or invalid.") : error)
         }
+        // Applied in place like a rename (VaultTreeModel::applyRenameOutcome),
+        // so the path-keyed sort keys need the same recompute onFileRenamed does.
+        function onAudioCompressed(oldUrl, newUrl) {
+            sidebar.refreshTreeOrdering()
+            // An in-place FLAC → FLAC voice replace changes eligibility with no
+            // row inserted or removed.
+            sidebar.refreshSelectionEligibility()
+        }
         // Async trash completed (controller path): whatever went to the trash
         // already offered its Undo via the generic undo snackbar (undoAvailable);
         // here we only prompt for the entries the filesystem REFUSED (still on
@@ -1269,6 +1287,8 @@ Rectangle {
     property var selectionRelabelPaths: []
     property var selectionChaptersPaths: []
     property var selectionRunAllPaths: []
+    property var selectionCompressVoicePaths: []
+    property var selectionCompressLosslessPaths: []
     property bool selectionEligibilityRefreshPending: false
     // DEFERRED + coalesced, deliberately: the search*Paths() helpers walk
     // searchProxy.data(...) over every proxy row, and several callers fire
@@ -1295,6 +1315,8 @@ Rectangle {
             sidebar.selectionRelabelPaths = []
             sidebar.selectionChaptersPaths = []
             sidebar.selectionRunAllPaths = []
+            sidebar.selectionCompressVoicePaths = []
+            sidebar.selectionCompressLosslessPaths = []
             return
         }
         const narrow = (paths) => paths.filter((p) => selected.indexOf(p) >= 0)
@@ -1302,6 +1324,8 @@ Rectangle {
         sidebar.selectionRelabelPaths = narrow(sidebar.searchRelabelPaths())
         sidebar.selectionChaptersPaths = narrow(sidebar.searchChaptersPaths())
         sidebar.selectionRunAllPaths = narrow(sidebar.searchRunAllPaths())
+        sidebar.selectionCompressVoicePaths = narrow(sidebar.searchCompressPaths("voice"))
+        sidebar.selectionCompressLosslessPaths = narrow(sidebar.searchCompressPaths("lossless"))
     }
     onSelectedPathsChanged: sidebar.refreshSelectionEligibility()
 
@@ -2719,6 +2743,25 @@ Rectangle {
                 }
             }
 
+            // Search-scoped "compress", parity with the ribbon's
+            // compressAllButton — over the compressible files in the filtered
+            // result set (see searchCompressPaths()).
+            CompressButton {
+                id: searchCompressButton
+                objectName: "searchCompressButton"
+                tooltip: qsTr("Compress results")
+                Layout.preferredWidth: 22
+                Layout.preferredHeight: 22
+                voiceEnabled: !!sidebar.transcriptionController && sidebar.searchFilterActive
+                              && sidebar.searchCompressPaths("voice").length > 0
+                losslessEnabled: !!sidebar.transcriptionController && sidebar.searchFilterActive
+                                 && sidebar.searchCompressPaths("lossless").length > 0
+                onCompressRequested: target => {
+                    const urls = sidebar.searchCompressPaths(target).map((p) => "file://" + p)
+                    sidebar.transcriptionController.compressAudioFiles(urls, sidebar.vaultPath, target)
+                }
+            }
+
             Item { Layout.fillWidth: true }
         }
         }
@@ -3334,6 +3377,10 @@ Rectangle {
                     cursorShape: Qt.PointingHandCursor
                 }
                 TapHandler {
+                    // WithinBounds takes the press exclusively; the default DragThreshold
+                    // only grabs passively, so the press also reached the tree row beneath
+                    // and opened that file once the menu closed. Same on every entry.
+                    gesturePolicy: TapHandler.WithinBounds
                     onTapped: {
                         contextMenu.close()
                         sidebar.beginCreateFolder(sidebar.ctxCreateInDir)
@@ -3375,6 +3422,7 @@ Rectangle {
                     cursorShape: Qt.PointingHandCursor
                 }
                 TapHandler {
+                    gesturePolicy: TapHandler.WithinBounds
                     onTapped: {
                         // Captured before close(): the menu's ctx* state is
                         // shared, and the deferred call below runs after it may
@@ -3414,6 +3462,7 @@ Rectangle {
                     cursorShape: Qt.PointingHandCursor
                 }
                 TapHandler {
+                    gesturePolicy: TapHandler.WithinBounds
                     onTapped: {
                         contextMenu.close()
                         sidebar.openMoveTo()
@@ -3447,6 +3496,7 @@ Rectangle {
                     cursorShape: Qt.PointingHandCursor
                 }
                 TapHandler {
+                    gesturePolicy: TapHandler.WithinBounds
                     onTapped: {
                         // No confirm up front: beginDeleteFolder() trashes
                         // (recoverable, Undo offered in a snackbar) and only
@@ -3496,6 +3546,7 @@ Rectangle {
                     cursorShape: Qt.PointingHandCursor
                 }
                 TapHandler {
+                    gesturePolicy: TapHandler.WithinBounds
                     onTapped: {
                         contextMenu.close()
                         sidebar.beginDeleteTranscript(
@@ -3541,6 +3592,7 @@ Rectangle {
                     cursorShape: Qt.PointingHandCursor
                 }
                 TapHandler {
+                    gesturePolicy: TapHandler.WithinBounds
                     onTapped: {
                         contextMenu.close()
                         sidebar.beginDeleteAudioOnly(
@@ -3589,6 +3641,7 @@ Rectangle {
                     cursorShape: Qt.PointingHandCursor
                 }
                 TapHandler {
+                    gesturePolicy: TapHandler.WithinBounds
                     onTapped: {
                         contextMenu.close()
                         sidebar.beginDeleteFile(
@@ -3771,6 +3824,8 @@ Rectangle {
                         cursorShape: Qt.PointingHandCursor
                     }
                     TapHandler {
+                        // Exclusive press: see contextMenu.
+                        gesturePolicy: TapHandler.WithinBounds
                         onTapped: sidebar.moveNoteTo(moveFolderRow.modelData)
                     }
                     Rectangle {

@@ -48,25 +48,30 @@ checkout against upstream cannot resolve the pinned commit.
 ```
 git clone --recursive https://github.com/suopuwu/suopTranscriber.git
 cd suopTranscriber
-make build        # = cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
-                  #   + cmake --build build
+make build        # = cmake -S . -B build-Release -G Ninja -DCMAKE_BUILD_TYPE=Release
+                  #   + cmake --build build-Release
 make install      # desktop entry + ~/.local/bin/suopTranscriber wrapper
 make run          # build + install + launch
 make uninstall    # remove both
 ```
 
+Each build type gets its own tree — `make run` uses `build-Release/`, and
+`make run BUILD_TYPE=Debug` uses `build-Debug/`, so the two stay warm
+independently instead of invalidating each other on every switch. Point your
+IDE at `build-${buildType}` to share them.
+
 `make install` doesn't copy anything out of the working tree — the app finds
 `models/`, `engines/`, and its CUDA compat `lib/` next to the binary, so the
-installed wrapper just `exec`s `build/suopTranscriber` in place. It makes the
-app startable from KRunner / an app launcher (and from any shell); the repo has
-to stay put, and `make build` alone picks up changes.
+installed wrapper just `exec`s `build-Release/suopTranscriber` in place. It
+makes the app startable from KRunner / an app launcher (and from any shell);
+the repo has to stay put, and `make build` alone picks up changes.
 
 Or directly:
 
 ```
-cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
-cmake --build build
-./build/suopTranscriber [/path/to/vault]
+cmake -S . -B build-Release -G Ninja -DCMAKE_BUILD_TYPE=Release
+cmake --build build-Release
+./build-Release/suopTranscriber [/path/to/vault]
 ```
 
 Configure options:

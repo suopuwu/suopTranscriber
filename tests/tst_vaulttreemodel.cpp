@@ -3054,6 +3054,83 @@ private slots:
         QVERIFY(!model.isPathInsideVault(vault.filePath("recordings/../../escaped")));
     }
 
+    // --- vaultRelativePath() (destination-folder pickers) ------------------------
+
+    void vaultRelativePath_insideGivesRelative_rootGivesDot()
+    {
+        QTemporaryDir vault;
+        QVERIFY(vault.isValid());
+        QVERIFY(QDir().mkpath(vault.filePath("recordings/nested")));
+        VaultTreeModel model;
+        model.setVaultPath(QUrl::fromLocalFile(vault.path()));
+
+        QCOMPARE(model.vaultRelativePath(vault.path()), QStringLiteral("."));
+        QCOMPARE(model.vaultRelativePath(vault.filePath("recordings/nested")), QStringLiteral("recordings/nested"));
+        QCOMPARE(model.vaultRelativePath(vault.filePath("recordings/not-yet")), QStringLiteral("recordings/not-yet"));
+        // A ".." that stays inside is normalized away, not echoed back.
+        QCOMPARE(model.vaultRelativePath(vault.filePath("recordings/nested/../x")), QStringLiteral("recordings/x"));
+    }
+
+    void vaultRelativePath_outsideOrEscapingGivesEmpty()
+    {
+        QTemporaryDir vault;
+        QTemporaryDir sibling;
+        QVERIFY(vault.isValid() && sibling.isValid());
+        QVERIFY(QDir().mkpath(vault.filePath("recordings")));
+        QVERIFY(QFile::link(sibling.path(), vault.filePath("out-link")));
+        VaultTreeModel model;
+        model.setVaultPath(QUrl::fromLocalFile(vault.path()));
+
+        QCOMPARE(model.vaultRelativePath(sibling.path()), QString());
+        QCOMPARE(model.vaultRelativePath(vault.filePath("recordings/../..")), QString());
+        QCOMPARE(model.vaultRelativePath(vault.filePath("recordings/../../escaped")), QString());
+        QCOMPARE(model.vaultRelativePath(vault.filePath("not-yet/../../escaped")), QString());
+        // Lexically inside, but the symlink resolves outside.
+        QCOMPARE(model.vaultRelativePath(vault.filePath("out-link")), QString());
+        QCOMPARE(model.vaultRelativePath(vault.filePath("out-link/new")), QString());
+        // A child whose name merely starts with ".." is still inside.
+        QVERIFY(QDir().mkpath(vault.filePath("..hidden")));
+        QCOMPARE(model.vaultRelativePath(vault.filePath("..hidden")), QStringLiteral("..hidden"));
+    }
+
+    // Vault opened through a symlink (or picked through one) still yields a
+    // relative path, not a fallback absolute one — both sides canonicalize.
+    void vaultRelativePath_symlinkedVaultSpelling()
+    {
+        QTemporaryDir real;
+        QTemporaryDir links;
+        QVERIFY(real.isValid() && links.isValid());
+        QVERIFY(QDir().mkpath(real.filePath("vault/Interviews")));
+        const QString vaultLink = links.filePath("vault-link");
+        QVERIFY(QFile::link(real.filePath("vault"), vaultLink));
+
+        VaultTreeModel viaLink;
+        viaLink.setVaultPath(QUrl::fromLocalFile(vaultLink));
+        QCOMPARE(viaLink.vaultRelativePath(real.filePath("vault/Interviews")), QStringLiteral("Interviews"));
+        QCOMPARE(viaLink.vaultRelativePath(real.filePath("vault")), QStringLiteral("."));
+
+        VaultTreeModel viaReal;
+        viaReal.setVaultPath(QUrl::fromLocalFile(real.filePath("vault")));
+        QCOMPARE(viaReal.vaultRelativePath(vaultLink + QStringLiteral("/Interviews")), QStringLiteral("Interviews"));
+    }
+
+    // QML hands over FolderDialog.selectedFolder's url string; a percent-encoded
+    // space must decode, not survive as a literal "%20" directory name.
+    void vaultRelativePath_acceptsFileUrlWithSpaces()
+    {
+        QTemporaryDir vault;
+        QVERIFY(vault.isValid());
+        QVERIFY(QDir().mkpath(vault.filePath("My Recordings/Day 1")));
+        VaultTreeModel model;
+        model.setVaultPath(QUrl::fromLocalFile(vault.path()));
+
+        const QUrl url = QUrl::fromLocalFile(vault.filePath("My Recordings/Day 1"));
+        QVERIFY(url.toString(QUrl::FullyEncoded).contains(QStringLiteral("%20")));
+        QCOMPARE(model.vaultRelativePath(url.toString(QUrl::FullyEncoded)), QStringLiteral("My Recordings/Day 1"));
+        QCOMPARE(model.vaultRelativePath(url.toString()), QStringLiteral("My Recordings/Day 1"));
+        QCOMPARE(model.vaultRelativePath(QUrl::fromLocalFile(QStringLiteral("/tmp")).toString()), QString());
+    }
+
     // --- allAudioPaths() (TitleBar "force retranscribe all") ---------------------
 
     // Every audio file's absolute path is returned regardless of transcribed

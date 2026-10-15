@@ -191,6 +191,25 @@ Flow {
         }
     }
 
+    // Bulk compress over the selection, to FLAC voice or lossless FLAC —
+    // undoable (originals go to the trash), one snackbar reporting the space
+    // saved. Deliberately NOT part of runAllButton: it replaces the original,
+    // so explicit only. Mirrors MainPanel's compressAudioButton.
+    CompressButton {
+        id: compressAllButton
+        objectName: "compressAllButton"
+        tooltip: qsTr("Compress selected files")
+        voiceEnabled: !!sidebarRoot.transcriptionController && sidebarRoot.selectionCompressVoicePaths.length > 0
+        losslessEnabled: !!sidebarRoot.transcriptionController
+                         && sidebarRoot.selectionCompressLosslessPaths.length > 0
+        onCompressRequested: target => {
+            const paths = target === "voice" ? sidebarRoot.selectionCompressVoicePaths
+                                             : sidebarRoot.selectionCompressLosslessPaths
+            sidebarRoot.transcriptionController.compressAudioFiles(paths.map((p) => "file://" + p),
+                                                                   sidebarRoot.vaultPath, target)
+        }
+    }
+
     // Separates the per-file bulk pipeline (transcribe/label/chapters/
     // speakers/run-all, all narrowed to the current selection via the
     // selection*Paths) from combine, which is a different kind of
@@ -305,6 +324,8 @@ Flow {
                             cursorShape: Qt.PointingHandCursor
                         }
                         TapHandler {
+                            // Exclusive press: see Sidebar.qml contextMenu.
+                            gesturePolicy: TapHandler.WithinBounds
                             onTapped: {
                                 AppSettings.sortMode = sortOptionRow.modelData.value
                                 sortModeMenu.close()

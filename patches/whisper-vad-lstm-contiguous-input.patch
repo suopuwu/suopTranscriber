@@ -1,0 +1,44 @@
+# suopTranscriber local patch — whisper.cpp VAD: materialize the LSTM input
+# transpose so the CPU matmul can't be handed a meaningless row stride.
+#
+# whisper_vad_build_lstm_layer() feeds ggml_transpose(cur) straight into
+# ggml_mul_mat(). `cur` is a 1-column view (ggml_view_2d(..., 1, 128, ...)),
+# so the transpose has ne == [128, 1]: a single row, whose nb[1] is inherited
+# from the view and describes nothing. ggml_is_contiguous() reports true
+# anyway — dimensions of extent 1 are exempt from its stride check — so
+# ggml_compute_forward_mul_mat takes the GGML_USE_LLAMAFILE fast path and
+# derives ldb from that stride, calling
+#     llamafile_sgemm(m=512, n=1, k=128, lda=128, ldb=1, ldc=512)
+# which trips `assert(ldb >= k)` three lines before its own
+# `if (n < 2) return false`. ldb is never actually read on that path, so a
+# Release build (NDEBUG) is unaffected and correct — but a Debug build aborts
+# on the first VAD frame, i.e. VAD gating cannot run at all under a Debug
+# build, and neither can `tests/tst_vadchunking` with SUOP_TEST_VAD_MODEL set.
+#
+# Fixing it here rather than in ggml: whisper's VAD is the caller producing
+# the degenerate operand, and llama.cpp is the more frequently bumped
+# submodule. Cost is one ggml_cont of 128 floats per VAD frame.
+#
+# Re-derive this against the new tree on any whisper.cpp bump — see
+# DEPENDENCIES.md.
+
+diff --git a/src/whisper.cpp b/src/whisper.cpp
+index 2a95bdb1..355c49b0 100644
+--- a/src/whisper.cpp
++++ b/src/whisper.cpp
+@@ -4583,7 +4583,14 @@ static ggml_tensor * whisper_vad_build_lstm_layer(ggml_context * ctx0,
+     const whisper_vad_model & model = vctx.model;
+     const int hdim = model.hparams.lstm_hidden_size;
+ 
+-    struct ggml_tensor * x_t = ggml_transpose(ctx0, cur);
++    // ggml_cont: `cur` is a 1-column view, so its transpose has ne[1] == 1 and
++    // inherits a row stride (nb[1]) that describes nothing. ggml_is_contiguous()
++    // still reports true (dims of extent 1 are exempt from the stride check), so
++    // ggml-cpu takes the llamafile fast path and derives ldb from that stride:
++    // llamafile_sgemm(m=512, n=1, k=128, ldb=1) trips assert(ldb >= k) three
++    // lines before its own `if (n < 2) return false`. Materializing the
++    // transpose gives it a real stride; 128 floats per VAD frame.
++    struct ggml_tensor * x_t = ggml_cont(ctx0, ggml_transpose(ctx0, cur));
+ 
+     // Create operations using the input-to-hidden weights.
+     struct ggml_tensor * inp_gate = ggml_mul_mat(ctx0, model.lstm_ih_weight, x_t);

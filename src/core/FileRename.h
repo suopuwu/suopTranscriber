@@ -35,6 +35,11 @@ bool isSameRecording(const QUrl &a, const QUrl &b);
 // still resolves. Empty for either argument ⇒ false.
 bool pathIsInsideVault(const QString &candidatePath, const QString &vaultLocalPath);
 
+// candidatePath relative to the vault root, both sides canonicalized the same
+// way as pathIsInsideVault() (so a vault opened via a symlink still matches).
+// Contract: "." = the vault root itself, empty = outside the vault / invalid.
+QString vaultRelativePathOf(const QString &candidatePath, const QString &vaultLocalPath);
+
 // The PURE filesystem MOVE of a recording (an audio file + its <name>.md
 // sidecar + .<name>.partial.jsonl resume state, or a standalone orphaned .md)
 // from its current folder into destDirUrl — validation + the renames +

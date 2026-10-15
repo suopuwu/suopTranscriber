@@ -139,7 +139,8 @@ Python-only engines (faster-whisper, etc.).
 
 Every unit of background work — transcribe, detect-speakers (diarize),
 relabel, chapters, rename/merge speaker, combine split recordings, import,
-USB grab, model download, model benchmark, diarization sweep — is a
+USB grab, model download, model benchmark, diarization sweep, audio
+compression — is a
 **polymorphic `Task`** (`src/core/tasks/Task.h`), one subclass per kind. They
 all run through **one FIFO queue**, on one worker thread (`TaskRunner`), at most
 one at a time — so nothing contends for the GPU, and a warm model
@@ -186,6 +187,44 @@ its `QFileSystemWatcher`), reporting `fileRenamed`/`fileMoved(oldUrl, newUrl,
 ok, error)` that QML repoints the player on — the synchronous
 `VaultTreeModel::renameFile()`/`moveFile()` survive only as no-controller
 fallbacks (plain filename mode / test harnesses).
+
+**Recording format — encoded live.** `AudioRecorder` mixes every source into
+s16le 48 kHz stereo; `AppSettings.recordingFormat` (bound to
+`AudioRecorder.recordingFormat`) picks what reaches disk. `flac16m` (default,
+~70 MB/hour) and `flac` (~250 MB/hour) pipe the mix into an `ffmpeg` child
+(`AudioRecorderIO::liveEncoderArguments()`) as it is captured; `wav`
+(~690 MB/hour) writes the PCM directly with a header re-stamped every 250 ms.
+`flac16m` is the default because it is exactly what every engine decodes to
+(`AudioDecoder`: 16 kHz mono), so transcripts are identical to the WAV's; Opus
+at 64 kbps measurably shifted whisper output on noisy multi-speaker audio
+(measured 2026-10-13: 6–15% word drift vs a 2–5% noise floor), so it is not
+offered. Crash durability: the encoder is deliberately NOT tied to the app's
+lifetime (`guardChildLifetime`) — if the app dies, its stdin closes and ffmpeg
+finishes the file properly; `-flush_packets 1` means even a killed encoder
+leaves every encoded frame decodable (only the header's total length is
+missing). A take is never re-encoded afterwards.
+
+**Compress action** (`CompressAudioTask`, Serial + Background, undoable). The
+one way to shrink an existing file: `compressAudioFiles(urls, vault, target)`
+from the shared `CompressButton` (a menu of both targets) at three sites — the
+ribbon's `compressAllButton`, `searchCompressButton`, and MainPanel's
+`compressAudioButton`. Two targets, eligibility per
+`CompressAudioTask::isCompressible()`:
+- `voice` — a `.wav`, or a `.flac` whose STREAMINFO isn't already 16 kHz mono,
+  becomes FLAC voice.
+- `lossless` — a `.wav` becomes FLAC at its own rate and channels.
+
+Either lands at `<stem>.flac`: encoded to a hidden same-folder temp, verified
+(full decode + duration within 0.5 s), then the original goes to the trash and
+the temp is renamed into place without overwriting — so FLAC → FLAC voice
+keeps its path (QML reloads the player rather than repointing it). Any failure
+or cancel keeps the original. One undo batch per action; its snackbar reports
+the bytes saved (`batchUndoLabel()` sums the members) and
+`RevertCompressionTask` restores the original. Success emits
+`audioCompressed(oldUrl, newUrl)`, applied to the tree in place like a rename.
+Never part of run-all — it replaces the original, so it only runs on explicit
+request. If another live task names the file at dispatch it finishes untouched
+with a warning.
 
 **Undo is the inverse task** (`Task::undoLabel()`/`makeUndoTask()`). An undoable
 kind returns a label and a factory for its inverse (a rename-back, a move-back);

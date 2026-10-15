@@ -40,7 +40,7 @@ public:
     // folder. makeUndoTask() runs after run() so it uses the new location
     // captured there. batchUndoLabel() summarizes a multi-file move.
     QString undoLabel() const override;
-    QString batchUndoLabel(int count) const override;
+    QString batchUndoLabel(const QList<const Task *> &undoableMembers) const override;
     std::unique_ptr<Task> makeUndoTask() const override;
     bool undoStillApplicable() const override;
 

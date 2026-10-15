@@ -35,6 +35,7 @@ ApplicationWindow {
 
     AudioRecorder {
         id: audioRecorder
+        recordingFormat: AppSettings.recordingFormat
     }
 
     TranscriptionController {
@@ -147,12 +148,59 @@ ApplicationWindow {
     // when useSystemTitlebar is on, a window-manager close request — since
     // they all funnel through this ONE signal, not just TitleBar.qml's
     // button.
-    onClosing: {
+    onClosing: (close) => {
+        // The hard exit below would cut a take off before the worker writes the
+        // WAV header, leaving an unplayable file. `recording` flips false on the
+        // Stop click while finalization still runs; activeRecordingPath is only
+        // cleared once the file is finalized, so it covers that window too.
+        if (audioRecorder.recording) {
+            close.accepted = false
+            if (!window.quitAfterRecordingStops)
+                stopRecordingAndQuitPopup.open()
+            return
+        }
+        if (audioRecorder.activeRecordingPath !== "") {
+            close.accepted = false
+            window.quitAfterRecordingStops = true // re-closed from onRecordingFinished
+            return
+        }
         // Flush any debounced settings save before the hard ::_exit(0) below —
         // that exit never lets AppSettings' saveTimer fire, so a setting changed
         // in the last ~250ms before closing would otherwise be lost.
         AppSettings.flushPendingSave()
         transcriptionController.terminateApplicationImmediately()
+    }
+
+    // Set only by confirming stopRecordingAndQuitPopup (or closing mid-
+    // finalize); cancel leaves it false.
+    property bool quitAfterRecordingStops: false
+
+    ConfirmPopup {
+        id: stopRecordingAndQuitPopup
+        message: qsTr("A recording is in progress. Stop recording and quit?")
+        confirmText: qsTr("Stop and quit")
+        onConfirmed: {
+            window.quitAfterRecordingStops = true
+            if (audioRecorder.recording)
+                audioRecorder.stopRecording()
+            else if (audioRecorder.activeRecordingPath === "")
+                window.close() // the take already finished while this was open
+            // else: already finalizing — onRecordingFinished re-closes
+        }
+    }
+
+    Connections {
+        target: audioRecorder
+        // Fires on an error-stop too, so a failed finalize can't strand the quit.
+        function onRecordingFinished(filePath) {
+            if (window.quitAfterRecordingStops)
+                window.close()
+        }
+        // A take that stopped on its own leaves the prompt asking about nothing.
+        function onRecordingChanged() {
+            if (!audioRecorder.recording && !window.quitAfterRecordingStops)
+                stopRecordingAndQuitPopup.close()
+        }
     }
 
     function openVaultDialog() {

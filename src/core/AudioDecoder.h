@@ -1,6 +1,7 @@
 #pragma once
 
 #include <QString>
+#include <QStringList>
 
 #include <functional>
 #include <optional>
@@ -43,5 +44,15 @@ std::optional<std::vector<float>> decodeTo16kMono(const QString &filePath, QStri
 // that has emitted nothing for this long is wedged regardless of file length.
 // Generous enough to absorb a slow disk or a paused-then-resumed process.
 bool isDecodeStalled(qint64 noOutputElapsedMs);
+
+// Runs ffprobe on `path` with the given extra arguments and returns trimmed
+// stdout, or nullopt on any failure (missing binary, non-zero exit, timeout).
+// The app's one ffprobe spawn site, shared by every caller that probes.
+std::optional<QString> runFfprobe(const QString &path, const QStringList &args);
+
+// A media file's duration in seconds, or nullopt on any failure. Callers treat
+// "couldn't check" as a validation failure rather than skipping the check:
+// ffprobe ships in the same package as ffmpeg, which the app hard-requires.
+std::optional<double> probeDurationSeconds(const QString &path);
 
 }

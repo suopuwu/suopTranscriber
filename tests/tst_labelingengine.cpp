@@ -9,6 +9,8 @@
 #include <QtTest>
 
 #include <QFileInfo>
+#include <QJsonDocument>
+#include <QJsonObject>
 
 #include "LabelingEngine.h"
 
@@ -358,6 +360,82 @@ private slots:
         QCOMPARE(result->at(0).title, QStringLiteral("Trade show marketing costs"));
         QCOMPARE(result->at(1).afterSegmentIndex, 3);
         QCOMPARE(result->at(1).title, QStringLiteral("Office lease renewal"));
+    }
+
+    // repairTruncatedLabelJson(): label()'s salvage for a generation the
+    // output-token budget cut mid-JSON (the runaway case a randomly-seeded
+    // sampler occasionally produces on long high-wordiness transcripts —
+    // this used to fail the whole label task as "model did not produce
+    // valid JSON"). Pure string repair, no model, no QSKIP. Each case is a
+    // literal truncation shape of a kGrammar-valid response.
+
+    void repairTruncatedLabelJson_completeResponsePassesThroughUnchanged()
+    {
+        const QString complete =
+            QStringLiteral("{\"label\": \"A\", \"prelude\": \"B\", \"tags\": \"c, d\"}");
+        QCOMPARE(repairTruncatedLabelJson(complete), complete);
+    }
+
+    void repairTruncatedLabelJson_cutMidString_closesAndKeepsLeadingFields()
+    {
+        const auto doc = QJsonDocument::fromJson(
+            repairTruncatedLabelJson(
+                QStringLiteral("{\"label\": \"Knife Sharpening\", \"prelude\": \"The transcript beg"))
+                .toUtf8());
+        QVERIFY(doc.isObject());
+        QCOMPARE(doc.object().value("label").toString(), QStringLiteral("Knife Sharpening"));
+        QCOMPARE(doc.object().value("prelude").toString(), QStringLiteral("The transcript beg"));
+    }
+
+    void repairTruncatedLabelJson_cutAfterColon_suppliesEmptyValue()
+    {
+        const auto doc = QJsonDocument::fromJson(
+            repairTruncatedLabelJson(
+                QStringLiteral("{\"label\": \"A\", \"prelude\": \"B\", \"tags\":"))
+                .toUtf8());
+        QVERIFY(doc.isObject());
+        QCOMPARE(doc.object().value("label").toString(), QStringLiteral("A"));
+        QCOMPARE(doc.object().value("tags").toString(), QString());
+    }
+
+    void repairTruncatedLabelJson_cutAfterComma_dropsTheComma()
+    {
+        const auto doc = QJsonDocument::fromJson(
+            repairTruncatedLabelJson(QStringLiteral("{\"label\": \"A\", \"prelude\": \"B\","))
+                .toUtf8());
+        QVERIFY(doc.isObject());
+        QCOMPARE(doc.object().value("prelude").toString(), QStringLiteral("B"));
+    }
+
+    void repairTruncatedLabelJson_cutMidEscape_dropsThePartialEscape()
+    {
+        // Dangling lone backslash...
+        auto doc = QJsonDocument::fromJson(
+            repairTruncatedLabelJson(QStringLiteral("{\"label\": \"A\", \"prelude\": \"line\\")).toUtf8());
+        QVERIFY(doc.isObject());
+        QCOMPARE(doc.object().value("prelude").toString(), QStringLiteral("line"));
+
+        // ...and a partial \uXXXX with only some of its hex digits.
+        doc = QJsonDocument::fromJson(
+            repairTruncatedLabelJson(QStringLiteral("{\"label\": \"A\", \"prelude\": \"x\\u00")).toUtf8());
+        QVERIFY(doc.isObject());
+        QCOMPARE(doc.object().value("prelude").toString(), QStringLiteral("x"));
+    }
+
+    // A cut before the label's value is complete is beyond salvage — the
+    // repaired text must NOT parse into an object with a non-empty label
+    // (label() then reports the budget error instead of writing junk).
+    void repairTruncatedLabelJson_cutInsideLabelKey_staysUnsalvageable()
+    {
+        const auto doc =
+            QJsonDocument::fromJson(repairTruncatedLabelJson(QStringLiteral("{\"lab")).toUtf8());
+        QVERIFY(!doc.isObject() || doc.object().value("label").toString().isEmpty());
+    }
+
+    void repairTruncatedLabelJson_nonObjectTextReturnsUnchanged()
+    {
+        QCOMPARE(repairTruncatedLabelJson(QString()), QString());
+        QCOMPARE(repairTruncatedLabelJson(QStringLiteral("yes")), QStringLiteral("yes"));
     }
 };
 

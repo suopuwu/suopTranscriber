@@ -31,6 +31,7 @@
 // Nothing here touches the user's vault or ~/.config/suopTranscriber. The trash
 // is real, but only ever receives files from the QTemporaryDir vault.
 
+#include <QSet>
 #include <QtTest>
 
 #include <QColor>
@@ -222,6 +223,7 @@ private slots:
                      "singleton Notifications 1.0 qml/Notifications.qml\n"
                      "AppIcon 1.0 qml/AppIcon.qml\n"
                      "AppIconButton 1.0 qml/AppIconButton.qml\n"
+                     "CompressButton 1.0 qml/CompressButton.qml\n"
                      "ConfirmPopup 1.0 qml/ConfirmPopup.qml\n"
                      "HoverBorder 1.0 qml/HoverBorder.qml\n"
                      "UnderlineField 1.0 qml/UnderlineField.qml\n"
@@ -294,6 +296,60 @@ private slots:
     {
         QFile::remove(m_audioPath);
         QFile::remove(m_mdPath);
+    }
+
+    // The transcript header's action icons wrap instead of clipping: on a
+    // narrow panel they drop below the title (shown whole) and wrap there,
+    // every visible icon staying inside the panel. (Lives in this harness because it is the
+    // one with a real player source, which most of the icons need.)
+    void headerActionIconsWrapOnANarrowPanel()
+    {
+        QQuickView view;
+        QVERIFY2(openPanel(&view), "could not load MainPanel.qml / locate it");
+        m_player->setSource(QUrl::fromLocalFile(m_audioPath));
+        QTRY_VERIFY(m_panel->property("hasMetadata").toBool());
+
+        auto *flow = m_panel->findChild<QQuickItem *>(QStringLiteral("headerActionsFlow"));
+        QVERIFY(flow);
+        const auto visibleIcons = [flow] {
+            QList<QQuickItem *> out;
+            for (QQuickItem *c : flow->childItems())
+                if (c->isVisible() && c->width() > 0)
+                    out << c;
+            return out;
+        };
+        QTRY_VERIFY(visibleIcons().size() >= 5);
+        const auto rows = [this](const QList<QQuickItem *> &items) {
+            QSet<int> tops;
+            for (QQuickItem *i : items)
+                tops.insert(qRound(i->mapToItem(m_panel, QPointF()).y()));
+            return tops.size();
+        };
+        auto *header = m_panel->findChild<QQuickItem *>(QStringLiteral("titleHeaderRow"));
+        auto *titleField = m_panel->findChild<QQuickItem *>(QStringLiteral("titleField"));
+        QVERIFY(header && titleField);
+        QTRY_VERIFY(!header->property("stacked").toBool());
+        QTRY_COMPARE(rows(visibleIcons()), 1);
+
+        // Too narrow for title + icons side by side: the icons move to their
+        // own line under the title (and wrap there), the title shown whole.
+        view.rootObject()->setWidth(260);
+        QTRY_VERIFY(header->property("stacked").toBool());
+        QTRY_VERIFY(rows(visibleIcons()) > 1);
+        QVERIFY(visibleIcons().first()->mapToItem(m_panel, QPointF()).y()
+                > titleField->mapToItem(m_panel, QPointF()).y() + titleField->height() - 1);
+        QVERIFY2(titleField->width() >= titleField->property("contentWidth").toReal(),
+                 qPrintable(QStringLiteral("title cut off: %1 < %2").arg(titleField->width())
+                                .arg(titleField->property("contentWidth").toReal())));
+        for (QQuickItem *icon : visibleIcons()) {
+            const qreal right = icon->mapToItem(m_panel, QPointF(icon->width(), 0)).x();
+            QVERIFY2(right <= m_panel->width(), qPrintable(QStringLiteral("%1 clipped at x=%2 of %3")
+                                                               .arg(icon->objectName()).arg(right)
+                                                               .arg(m_panel->width())));
+        }
+        auto *title = m_panel->findChild<QQuickItem *>(QStringLiteral("titleContainer"));
+        QVERIFY(title);
+        QVERIFY2(title->width() >= 80, qPrintable(QStringLiteral("title squeezed to %1").arg(title->width())));
     }
 
     // The reported bug, end to end and in the user's order: open the file, delete

@@ -241,12 +241,29 @@ private:
     // identical and was previously duplicated between the two.
     // onTokens, when set, is invoked as generation proceeds with the number
     // of output tokens decoded so far — the only signal available for
-    // sub-call progress, since a grammar-constrained generation stops when
-    // the grammar completes, not at maxOutputTokens.
+    // sub-call progress, since a grammar-constrained generation normally
+    // stops when the grammar completes, not at maxOutputTokens.
+    // budgetExhausted, when set, reports that the loop DID run the full
+    // maxOutputTokens without the grammar completing — the returned text is
+    // then truncated mid-shape and the caller's parse failure should blame
+    // the budget, not the model.
     std::optional<QString> runGrammarConstrained(const QString &systemPrompt, const QString &userText,
                                                   const char *grammar, int maxOutputTokens, QString *errorOut,
-                                                  const std::function<void(int)> &onTokens = {});
+                                                  const std::function<void(int)> &onTokens = {},
+                                                  bool *budgetExhausted = nullptr);
 
     llama_model *m_model = nullptr;
     llama_context *m_ctx = nullptr;
 };
+
+// Best-effort structural completion of a label() response that hit the
+// output-token budget mid-generation: drops a dangling escape (including a
+// partial \uXXXX), closes an unterminated string, supplies an empty value if
+// the cut landed right after a key's colon, drops a trailing comma, and
+// closes the object. Because kGrammar fixes the key order, a salvage that
+// parses AND has a non-empty label lost at worst the tail of the prelude
+// and/or the tags — label() accepts exactly that case (with a qWarning)
+// rather than failing the whole task on an already-spent generation. Pure
+// string-in/string-out so every truncation shape is unit-testable without a
+// model.
+QString repairTruncatedLabelJson(const QString &raw);

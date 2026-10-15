@@ -349,6 +349,22 @@ Rectangle {
         return (minutes < 10 ? "0" : "") + minutes + ":" + (seconds < 10 ? "0" : "") + seconds
     }
 
+    // Which compress targets apply to the open file (compressAudioButton).
+    // Plain properties refreshed imperatively — isCompressibleAudio() reads
+    // the file header, and an in-place FLAC → FLAC voice replace changes that
+    // with no source change for a binding to track.
+    // The title's floor in the sticky header row — headerActionsFlow wraps
+    // to keep it.
+    readonly property real titleMinWidth: 80
+    property bool openFileVoiceCompressible: false
+    property bool openFileLosslessCompressible: false
+    function refreshOpenFileCompressible() {
+        const tc = mainPanel.transcriptionController
+        const src = mainPanel.player ? mainPanel.player.source.toString() : ""
+        mainPanel.openFileVoiceCompressible = !!tc && src !== "" && tc.isCompressibleAudio(src, "voice")
+        mainPanel.openFileLosslessCompressible = !!tc && src !== "" && tc.isCompressibleAudio(src, "lossless")
+    }
+
     function refreshMetadata() {
         // resolvedMdUrl() not currentMdUrl — see resolvedMdUrl()'s doc comment
         // (this runs from onOrphanedMdPathChanged, where the property is stale).
@@ -823,10 +839,23 @@ Rectangle {
         undoStack.push({type: "speakerRename", fileUrl: mainPanel.currentFileUrl(),
                             reverseOld: trimmed, reverseNew: oldName})
 
-        const updated = Object.assign({}, mainPanel.pendingSpeakerRenames)
-        updated[oldName] = trimmed
-        mainPanel.pendingSpeakerRenames = updated
+        mainPanel.applyOptimisticSpeakerRename(oldName, trimmed)
         mainPanel.transcriptionController.renameSpeaker(mainPanel.currentFileUrl(), oldName, trimmed)
+    }
+
+    // The optimistic overlay shared by commitSpeakerRename() and the undo/redo
+    // replay. gutterSpeakerFilter holds a DISPLAYED name, and the overlay
+    // changes what's displayed — so the filter must follow or every line dims.
+    function applyOptimisticSpeakerRename(rawName, newName) {
+        mainPanel.retargetGutterSpeakerFilter(mainPanel.effectiveSpeakerName(rawName), newName)
+        const updated = Object.assign({}, mainPanel.pendingSpeakerRenames)
+        updated[rawName] = newName
+        mainPanel.pendingSpeakerRenames = updated
+    }
+
+    function retargetGutterSpeakerFilter(fromName, toName) {
+        if (mainPanel.gutterSpeakerFilter !== "" && mainPanel.gutterSpeakerFilter === fromName)
+            mainPanel.gutterSpeakerFilter = toName
     }
 
     // Reconciles a renameSpeaker() call once its background rewrite
@@ -919,6 +948,21 @@ Rectangle {
             if (isOpenAudio || isOrphaned)
                 mainPanel.resyncIdentityFields()
         }
+        // The open file was compressed (or the compress undone). Same repoint
+        // as onFileMoved, but the extension changed, so the identity fields
+        // resync for real. FLAC → FLAC voice keeps the path: reload instead.
+        function onAudioCompressed(oldUrl, newUrl) {
+            const tc = mainPanel.transcriptionController
+            if (!mainPanel.player || !tc.isSameFile(mainPanel.player.source, oldUrl))
+                return
+            if (tc.isSameFile(oldUrl, newUrl)) {
+                mainPanel.player.reload()
+                mainPanel.refreshOpenFileCompressible()
+                return
+            }
+            mainPanel.player.source = newUrl // fires onSourceChanged -> refreshMetadata
+            mainPanel.resyncIdentityFields()
+        }
         function onSpeakerRenamed(fileUrl, oldName, ok, error) {
             if (fileUrl.toString() !== mainPanel.currentFileUrl().toString())
                 return
@@ -926,6 +970,9 @@ Rectangle {
                 mainPanel.sentencesRevision += 1
             } else {
                 Notifications.error(error)
+                // The display reverts to oldName below; the filter reverts with it.
+                if (oldName in mainPanel.pendingSpeakerRenames)
+                    mainPanel.retargetGutterSpeakerFilter(mainPanel.pendingSpeakerRenames[oldName], oldName)
             }
             // Either way the optimistic override is no longer needed: on
             // success the reparse (sentencesRevision above) now shows the
@@ -1053,6 +1100,10 @@ Rectangle {
             if (fileUrl.toString() !== mainPanel.currentFileUrl().toString())
                 return
             if (ok) {
+                // The loser's name is gone after the reparse — a filter on it
+                // follows to the merged speaker rather than dimming every line.
+                mainPanel.retargetGutterSpeakerFilter(mainPanel.effectiveSpeakerName(sourceName),
+                                                      mainPanel.effectiveSpeakerName(targetName))
                 mainPanel.sentencesRevision += 1
             } else {
                 Notifications.error(error)
@@ -1136,9 +1187,7 @@ Rectangle {
             // background rewrite + sentencesRevision bump.
             const from = undo ? entry.reverseOld : entry.reverseNew
             const to = undo ? entry.reverseNew : entry.reverseOld
-            const updated = Object.assign({}, mainPanel.pendingSpeakerRenames)
-            updated[from] = to
-            mainPanel.pendingSpeakerRenames = updated
+            mainPanel.applyOptimisticSpeakerRename(from, to)
             mainPanel.transcriptionController.renameSpeaker(entry.fileUrl, from, to)
             break
         }
@@ -1740,11 +1789,17 @@ Rectangle {
     readonly property var gutterSpeakerModel:
         mainPanel.displaySentences.filter(s => s.showGutter && s.speaker !== "")
     // Recomputes when the user toggles a speaker filter (empty model while no
-    // filter is active, which is the state every file open starts in).
-    readonly property var speakerDimModel:
-        mainPanel.gutterSpeakerFilter === "" ? []
-            : mainPanel.displaySentences.filter(
-                s => !s.isChapterHeading && !s.isSilenceMarker && s.speaker !== mainPanel.gutterSpeakerFilter)
+    // filter is active, which is the state every file open starts in). A
+    // filter naming no speaker in the transcript (a re-diarize, an external
+    // edit, any path that didn't retarget it) counts as no filter — otherwise
+    // every line would match "not this speaker" and the whole transcript dims.
+    readonly property var speakerDimModel: {
+        const filter = mainPanel.gutterSpeakerFilter
+        if (filter === "" || !mainPanel.displaySentences.some(s => s.speaker === filter))
+            return []
+        return mainPanel.displaySentences.filter(
+            s => !s.isChapterHeading && !s.isSilenceMarker && s.speaker !== filter)
+    }
     readonly property var chapterHeadingModel:
         mainPanel.displaySentences.filter(s => s.isChapterHeading)
     // Silence phase 3: one entry per divider reserved by
@@ -2345,6 +2400,7 @@ Rectangle {
         function onSourceChanged() {
             mainPanel.refreshMetadata()
             mainPanel.resetForFileOpen()
+            mainPanel.refreshOpenFileCompressible()
         }
         // Pressing play snaps the current sentence to the top immediately,
         // rather than waiting for the next sentence boundary to advance.
@@ -2692,13 +2748,30 @@ Rectangle {
             panel: mainPanel
         },
 
-        RowLayout {
+        // Title + actions. Two columns when the title's full text and the
+        // actions' single line fit side by side; otherwise one column, the
+        // actions on their own full-width line under the title (where the
+        // icons can still wrap) — so neither the title nor an icon is ever
+        // cut off.
+        GridLayout {
+            id: titleHeaderRow
+            objectName: "titleHeaderRow"
             Layout.fillWidth: true
-            spacing: 8
+            // Never a floor on the panel: a computed minimum (title + every
+            // icon) would hold the header wider than a narrow panel, so it
+            // would never see the width that should stack it.
+            Layout.minimumWidth: 0
+            columnSpacing: 8
+            rowSpacing: 6
+            readonly property real titleDemand: Math.max(titleField.contentWidth + 8, mainPanel.titleMinWidth)
+            readonly property bool stacked: titleHeaderRow.titleDemand + titleHeaderRow.columnSpacing
+                                            + headerActionsRow.oneLineWidth > titleHeaderRow.width
+            columns: stacked ? 1 : 2
             visible: mainPanel.currentMdUrl !== ""
 
             Item {
                 id: titleContainer
+                objectName: "titleContainer"
                 Layout.fillWidth: true
                 // Without a floor, this is the only fillWidth item
                 // in the sticky title RowLayout, so once the search/replace
@@ -2707,7 +2780,7 @@ Rectangle {
                 // giving it graceful room — that reads as the title getting
                 // clipped. A minimumWidth stops the collapse; searchField
                 // below gives back width in turn so the row still fits.
-                Layout.minimumWidth: 80
+                Layout.minimumWidth: mainPanel.titleMinWidth
                 implicitHeight: titleColumn.implicitHeight
 
                 ColumnLayout {
@@ -2861,243 +2934,311 @@ Rectangle {
                 }
             }
 
-            // Transcribe as an icon button (same 22x22 box as the
-            // regenerate/search icons it now sits beside), replacing the old
-            // full-width text Button that lived down in the scrollable
-            // content below the model combo. Same enable/tooltip logic the
-            // old Button had (a manual click always re-runs,
-            // regardless of stored-metadata match) — modelCombo is declared
-            // lower in this file but still resolves fine since ids are scoped
-            // to the whole document.
-            AppIconButton {
-                id: transcribeIconButton
-                visible: mainPanel.hasAudio
+            RowLayout {
+                id: headerActionsRow
+                objectName: "headerActionsRow"
+                spacing: 8
+                readonly property real oneLineWidth: headerActionsFlow.oneLineWidth + headerActionsRow.spacing
+                                                     + searchReplaceBar.implicitWidth
+                // Right-aligned beside the title; full width when stacked (and
+                // whenever search is expanded, so its field can grow).
+                Layout.alignment: titleHeaderRow.stacked ? Qt.AlignLeft | Qt.AlignTop : Qt.AlignRight | Qt.AlignVCenter
+                Layout.fillWidth: titleHeaderRow.stacked || mainPanel.searchExpanded
+                Layout.minimumWidth: 0
 
-                readonly property bool isActive: mainPanel.transcriptionController && mainPanel.player
-                    && mainPanel.transcriptionController.busy
-                    && mainPanel.transcriptionController.activeOccupiesFile
-                    && mainPanel.transcriptionController.currentFile.toString() === mainPanel.player.source.toString()
-                readonly property bool isQueued: mainPanel.transcriptionController && mainPanel.player
-                    && mainPanel.player.source.toString() !== ""
-                    && mainPanel.transcriptionController.queuedFileUrls.some(
-                           u => u.toString() === mainPanel.player.source.toString())
-                enabled: visible && mainPanel.transcriptionController
-                         && !transcribeIconButton.isActive && !transcribeIconButton.isQueued
+                // The per-file action icons. A Flow so that, stacked under the title
+                // on a very narrow panel, they wrap onto further lines rather than
+                // clipping off the right edge.
+                Flow {
+                    id: headerActionsFlow
+                    objectName: "headerActionsFlow"
+                    spacing: 8
+                    // Width of every visible icon on one line, recomputed from each
+                    // icon's own visibleChanged/widthChanged.
+                    property real oneLineWidth: 0
+                    function recomputeOneLineWidth() {
+                        let w = 0
+                        let n = 0
+                        for (const child of headerActionsFlow.children) {
+                            if (!child.visible)
+                                continue
+                            w += child.width
+                            ++n
+                        }
+                        headerActionsFlow.oneLineWidth = w + Math.max(0, n - 1) * headerActionsFlow.spacing
+                    }
+                    Component.onCompleted: {
+                        for (const child of headerActionsFlow.children) {
+                            child.visibleChanged.connect(headerActionsFlow.recomputeOneLineWidth)
+                            child.widthChanged.connect(headerActionsFlow.recomputeOneLineWidth)
+                        }
+                        headerActionsFlow.recomputeOneLineWidth()
+                    }
+                    Layout.preferredWidth: Math.min(headerActionsFlow.oneLineWidth,
+                        Math.max(22, titleHeaderRow.width - searchReplaceBar.implicitWidth - headerActionsRow.spacing))
+                    Layout.minimumWidth: 0
 
-                iconName: "transcribe"
-                iconSize: 13
-                tooltip: transcribeIconButton.isActive ? qsTr("Transcribing…")
-                         : transcribeIconButton.isQueued ? qsTr("Queued…")
-                         : (mainPanel.transcriptionController && mainPanel.transcriptionController.busy
-                            ? qsTr("Add to queue")
-                            : (mainPanel.hasMetadata ? qsTr("Re-transcribe") : qsTr("Transcribe")))
+                    // Transcribe as an icon button (same 22x22 box as the
+                    // regenerate/search icons it now sits beside), replacing the old
+                    // full-width text Button that lived down in the scrollable
+                    // content below the model combo. Same enable/tooltip logic the
+                    // old Button had (a manual click always re-runs,
+                    // regardless of stored-metadata match) — modelCombo is declared
+                    // lower in this file but still resolves fine since ids are scoped
+                    // to the whole document.
+                    AppIconButton {
+                        id: transcribeIconButton
+                        visible: mainPanel.hasAudio
 
-                // AppSettings.defaultModel, not modelCombo.currentValue: the picker is a
-                // VIEW of the setting (it writes back via onPicked), so reading the
-                // setting here keeps this button and the sidebar/ribbon transcribe
-                // entry points (which already read AppSettings.defaultModel) from
-                // ever queuing a different model than what's displayed.
-                onTapped: mainPanel.transcriptionController.transcribe(mainPanel.player.source, mainPanel.vaultPath,
-                                                                         AppSettings.defaultModel,
-                                                                         AppSettings.autoLabelEnabled,
-                                                                         AppSettings.restrictTagsToExisting,
-                                                                         AppSettings.tagReuseBias,
-                                                                         AppSettings.wordiness)
-            }
+                        readonly property bool isActive: mainPanel.transcriptionController && mainPanel.player
+                            && mainPanel.transcriptionController.busy
+                            && mainPanel.transcriptionController.activeOccupiesFile
+                            && mainPanel.transcriptionController.currentFile.toString() === mainPanel.player.source.toString()
+                        readonly property bool isQueued: mainPanel.transcriptionController && mainPanel.player
+                            && mainPanel.player.source.toString() !== ""
+                            && mainPanel.transcriptionController.queuedFileUrls.some(
+                                   u => u.toString() === mainPanel.player.source.toString())
+                        enabled: visible && mainPanel.transcriptionController
+                                 && !transcribeIconButton.isActive && !transcribeIconButton.isQueued
 
-            // "Run all available jobs" — queues every pipeline step the open
-            // file hasn't had yet (transcribe / detect speakers / label /
-            // chapters, see runAllJobs()). Available for ANY audio file,
-            // transcribed or not: the skipping happens in runAllJobs(), and on
-            // a fully processed file the tap is a deliberate no-op. Still not
-            // shown for an orphaned .md (no audio — the relabel/chapters icons
-            // handle that case).
-            AppIconButton {
-                id: runAllIconButton
-                visible: mainPanel.transcriptionController && mainPanel.hasAudio
-                readonly property bool isQueued: mainPanel.transcriptionController && mainPanel.player
-                    && mainPanel.transcriptionController.queuedFileUrls.some(
-                           u => u.toString() === mainPanel.player.source.toString())
-                enabled: visible && !runAllIconButton.isQueued
-                         && !(mainPanel.transcriptionController.busy
-                              && mainPanel.transcriptionController.activeOccupiesFile
-                              && mainPanel.transcriptionController.currentFile.toString()
-                                 === mainPanel.player.source.toString())
+                        iconName: "transcribe"
+                        iconSize: 13
+                        tooltip: transcribeIconButton.isActive ? qsTr("Transcribing…")
+                                 : transcribeIconButton.isQueued ? qsTr("Queued…")
+                                 : (mainPanel.transcriptionController && mainPanel.transcriptionController.busy
+                                    ? qsTr("Add to queue")
+                                    : (mainPanel.hasMetadata ? qsTr("Re-transcribe") : qsTr("Transcribe")))
 
-                iconName: "run-all"
-                tooltip: qsTr("Run all available jobs (transcribe, detect speakers, label, chapters)")
+                        // AppSettings.defaultModel, not modelCombo.currentValue: the picker is a
+                        // VIEW of the setting (it writes back via onPicked), so reading the
+                        // setting here keeps this button and the sidebar/ribbon transcribe
+                        // entry points (which already read AppSettings.defaultModel) from
+                        // ever queuing a different model than what's displayed.
+                        onTapped: mainPanel.transcriptionController.transcribe(mainPanel.player.source, mainPanel.vaultPath,
+                                                                                 AppSettings.defaultModel,
+                                                                                 AppSettings.autoLabelEnabled,
+                                                                                 AppSettings.restrictTagsToExisting,
+                                                                                 AppSettings.tagReuseBias,
+                                                                                 AppSettings.wordiness)
+                    }
 
-                onTapped: mainPanel.transcriptionController.runAllJobs(mainPanel.player.source, mainPanel.vaultPath,
-                                                                        AppSettings.defaultModel,
-                                                                        AppSettings.restrictTagsToExisting,
-                                                                        AppSettings.tagReuseBias,
-                                                                        AppSettings.wordiness,
-                                                                        AppSettings.chapterDensity,
-                                                                        AppSettings.diarizationSegmentationModel,
-                                                                        AppSettings.diarizationEmbeddingModel,
-                                                                        AppSettings.diarizationSensitivity)
-            }
+                    // "Run all available jobs" — queues every pipeline step the open
+                    // file hasn't had yet (transcribe / detect speakers / label /
+                    // chapters, see runAllJobs()). Available for ANY audio file,
+                    // transcribed or not: the skipping happens in runAllJobs(), and on
+                    // a fully processed file the tap is a deliberate no-op. Still not
+                    // shown for an orphaned .md (no audio — the relabel/chapters icons
+                    // handle that case).
+                    AppIconButton {
+                        id: runAllIconButton
+                        visible: mainPanel.transcriptionController && mainPanel.hasAudio
+                        readonly property bool isQueued: mainPanel.transcriptionController && mainPanel.player
+                            && mainPanel.transcriptionController.queuedFileUrls.some(
+                                   u => u.toString() === mainPanel.player.source.toString())
+                        enabled: visible && !runAllIconButton.isQueued
+                                 && !(mainPanel.transcriptionController.busy
+                                      && mainPanel.transcriptionController.activeOccupiesFile
+                                      && mainPanel.transcriptionController.currentFile.toString()
+                                         === mainPanel.player.source.toString())
 
-            // Regenerate auto-title — re-runs just the AI labeling
-            // pass on the already-transcribed text (no re-transcription).
-            // Visible whenever there's a transcript to label, independent of
-            // AppSettings.autoLabelEnabled (that setting is about running
-            // automatically after each transcription, not gating manual
-            // regeneration).
-            AppIconButton {
-                id: regenerateLabelButton
-                visible: mainPanel.transcriptionController && (mainPanel.hasTranscript || mainPanel.transcribeInFlight)
-                readonly property url targetUrl: mainPanel.currentMdUrl
-                enabled: visible && mainPanel.busyOrQueuedKeys.indexOf(regenerateLabelButton.targetUrl.toString() + " " + "relabel") === -1
+                        iconName: "run-all"
+                        tooltip: qsTr("Run all available jobs (transcribe, detect speakers, label, chapters)")
 
-                iconName: "relabel"
-                iconSize: 14
-                tooltip: qsTr("Regenerate label, prelude, and tags")
+                        onTapped: mainPanel.transcriptionController.runAllJobs(mainPanel.player.source, mainPanel.vaultPath,
+                                                                                AppSettings.defaultModel,
+                                                                                AppSettings.restrictTagsToExisting,
+                                                                                AppSettings.tagReuseBias,
+                                                                                AppSettings.wordiness,
+                                                                                AppSettings.chapterDensity,
+                                                                                AppSettings.diarizationSegmentationModel,
+                                                                                AppSettings.diarizationEmbeddingModel,
+                                                                                AppSettings.diarizationSensitivity)
+                    }
 
-                onTapped: mainPanel.transcriptionController.relabel(regenerateLabelButton.targetUrl,
-                                                                     mainPanel.vaultPath,
-                                                                     AppSettings.restrictTagsToExisting,
-                                                                     AppSettings.tagReuseBias,
-                                                                     AppSettings.wordiness)
-            }
+                    // Regenerate auto-title — re-runs just the AI labeling
+                    // pass on the already-transcribed text (no re-transcription).
+                    // Visible whenever there's a transcript to label, independent of
+                    // AppSettings.autoLabelEnabled (that setting is about running
+                    // automatically after each transcription, not gating manual
+                    // regeneration).
+                    AppIconButton {
+                        id: regenerateLabelButton
+                        visible: mainPanel.transcriptionController && (mainPanel.hasTranscript || mainPanel.transcribeInFlight)
+                        readonly property url targetUrl: mainPanel.currentMdUrl
+                        enabled: visible && mainPanel.busyOrQueuedKeys.indexOf(regenerateLabelButton.targetUrl.toString() + " " + "relabel") === -1
 
-            // "Generate chapters" — mirrors regenerateLabelButton
-            // above exactly, including orphaned-.md support: chapter
-            // generation (TranscriptionController::generateChaptersJob())
-            // only ever reads the .md's existing frontmatter/body, never the
-            // audio file, so it works identically whether the row is
-            // player-backed or an orphaned .md — placed here in the
-            // icon-button cluster rather than inside the chapter list's own
-            // header row so it's still reachable to generate a FIRST set of
-            // chapters when mainPanel.chapters is still empty (the list
-            // itself only renders once chapters.length > 0).
-            AppIconButton {
-                id: generateChaptersButton
-                visible: mainPanel.transcriptionController && (mainPanel.hasTranscript || mainPanel.transcribeInFlight)
-                readonly property url targetUrl: mainPanel.currentMdUrl
-                enabled: visible && mainPanel.busyOrQueuedKeys.indexOf(generateChaptersButton.targetUrl.toString() + " " + "chapters") === -1
+                        iconName: "relabel"
+                        iconSize: 14
+                        tooltip: qsTr("Regenerate label, prelude, and tags")
 
-                iconName: "chapters"
-                tooltip: qsTr("Generate chapters")
+                        onTapped: mainPanel.transcriptionController.relabel(regenerateLabelButton.targetUrl,
+                                                                             mainPanel.vaultPath,
+                                                                             AppSettings.restrictTagsToExisting,
+                                                                             AppSettings.tagReuseBias,
+                                                                             AppSettings.wordiness)
+                    }
 
-                onTapped: mainPanel.transcriptionController.generateChapters(generateChaptersButton.targetUrl, mainPanel.vaultPath, AppSettings.chapterDensity)
-            }
+                    // "Generate chapters" — mirrors regenerateLabelButton
+                    // above exactly, including orphaned-.md support: chapter
+                    // generation (TranscriptionController::generateChaptersJob())
+                    // only ever reads the .md's existing frontmatter/body, never the
+                    // audio file, so it works identically whether the row is
+                    // player-backed or an orphaned .md — placed here in the
+                    // icon-button cluster rather than inside the chapter list's own
+                    // header row so it's still reachable to generate a FIRST set of
+                    // chapters when mainPanel.chapters is still empty (the list
+                    // itself only renders once chapters.length > 0).
+                    AppIconButton {
+                        id: generateChaptersButton
+                        visible: mainPanel.transcriptionController && (mainPanel.hasTranscript || mainPanel.transcribeInFlight)
+                        readonly property url targetUrl: mainPanel.currentMdUrl
+                        enabled: visible && mainPanel.busyOrQueuedKeys.indexOf(generateChaptersButton.targetUrl.toString() + " " + "chapters") === -1
 
-            // "Detect speakers" — runs speaker diarization
-            // (TranscriptionController::diarizeFile()) as its own standalone job
-            // on the already-transcribed OPEN file, WITHOUT re-transcribing.
-            // Lets the user add speaker detection after the fact, or redo it.
-            // Unlike regenerateLabel/generateChapters (which read only the .md),
-            // diarization decodes the AUDIO, so this is offered only for a
-            // real audio-backed transcribed file — not an orphaned .md (no
-            // audio to diarize). See DESIGN.md "Speaker diarization".
-            //
-            // Per-file-action parity: the bulk counterparts exist on the Sidebar
-            // ribbon (detectSpeakersAllButton) and its search-scoped mirror
-            // (searchDetectSpeakersButton); the old per-row hover cluster was
-            // intentionally removed. Enforced by tst_styleguide's
-            // sidebar_detectSpeakersActionParityAcrossAllSites.
-            AppIconButton {
-                id: detectSpeakersButton
-                visible: mainPanel.transcriptionController && mainPanel.hasAudio && (mainPanel.hasMetadata || mainPanel.transcribeInFlight)
-                readonly property url targetUrl: mainPanel.player.source
-                enabled: visible && mainPanel.busyOrQueuedKeys.indexOf(detectSpeakersButton.targetUrl.toString() + " " + "diarize") === -1
+                        iconName: "chapters"
+                        tooltip: qsTr("Generate chapters")
 
-                iconName: "speakers"
-                iconSize: 14
-                tooltip: qsTr("Detect speakers")
+                        onTapped: mainPanel.transcriptionController.generateChapters(generateChaptersButton.targetUrl, mainPanel.vaultPath, AppSettings.chapterDensity)
+                    }
 
-                onTapped: mainPanel.transcriptionController.diarizeFile(detectSpeakersButton.targetUrl,
-                                                                        mainPanel.vaultPath,
-                                                                        AppSettings.diarizationSegmentationModel,
-                                                                        AppSettings.diarizationEmbeddingModel,
-                                                                        AppSettings.diarizationSensitivity)
-            }
+                    // "Detect speakers" — runs speaker diarization
+                    // (TranscriptionController::diarizeFile()) as its own standalone job
+                    // on the already-transcribed OPEN file, WITHOUT re-transcribing.
+                    // Lets the user add speaker detection after the fact, or redo it.
+                    // Unlike regenerateLabel/generateChapters (which read only the .md),
+                    // diarization decodes the AUDIO, so this is offered only for a
+                    // real audio-backed transcribed file — not an orphaned .md (no
+                    // audio to diarize). See DESIGN.md "Speaker diarization".
+                    //
+                    // Per-file-action parity: the bulk counterparts exist on the Sidebar
+                    // ribbon (detectSpeakersAllButton) and its search-scoped mirror
+                    // (searchDetectSpeakersButton); the old per-row hover cluster was
+                    // intentionally removed. Enforced by tst_styleguide's
+                    // sidebar_detectSpeakersActionParityAcrossAllSites.
+                    AppIconButton {
+                        id: detectSpeakersButton
+                        visible: mainPanel.transcriptionController && mainPanel.hasAudio && (mainPanel.hasMetadata || mainPanel.transcribeInFlight)
+                        readonly property url targetUrl: mainPanel.player.source
+                        enabled: visible && mainPanel.busyOrQueuedKeys.indexOf(detectSpeakersButton.targetUrl.toString() + " " + "diarize") === -1
 
-            // "Delete transcript" — removes the open transcribed audio
-            // file's sibling .md (VaultTreeModel::trashTranscript()), reverting
-            // it to untranscribed while KEEPING the audio. Only for a
-            // transcribed AUDIO file (an orphaned .md has no audio to keep — it
-            // gets "Delete file" instead). Disabled while a job is
-            // queued/active for this file (deleting its sidecar mid-write would
-            // fight the worker) — same isQueued gate the regenerate icons use.
-            AppIconButton {
-                id: deleteTranscriptButton
-                visible: mainPanel.transcriptionController && mainPanel.vaultTreeModel
-                         && mainPanel.hasAudio && mainPanel.hasMetadata
-                readonly property url targetUrl: mainPanel.player.source
-                enabled: visible && mainPanel.busyOrQueuedUrls.indexOf(deleteTranscriptButton.targetUrl.toString()) === -1
+                        iconName: "speakers"
+                        iconSize: 14
+                        tooltip: qsTr("Detect speakers")
 
-                iconName: "delete-transcript"
-                iconSize: 14
-                iconColor: deleteTranscriptButton.enabled ? Theme.danger : Theme.textDisabled
-                tooltip: qsTr("Delete transcript (keep audio)")
+                        onTapped: mainPanel.transcriptionController.diarizeFile(detectSpeakersButton.targetUrl,
+                                                                                mainPanel.vaultPath,
+                                                                                AppSettings.diarizationSegmentationModel,
+                                                                                AppSettings.diarizationEmbeddingModel,
+                                                                                AppSettings.diarizationSensitivity)
+                    }
 
-                onTapped: mainPanel.requestDeleteTranscript()
-            }
+                    // "Compress" — re-encodes the open file as FLAC voice or lossless
+                    // FLAC (TranscriptionController::compressAudioFiles()); the
+                    // original goes to the trash, so the snackbar offers undo and
+                    // reports the space saved. Never part of run-all. Bulk
+                    // counterparts: the ribbon's compressAllButton and
+                    // searchCompressButton.
+                    CompressButton {
+                        id: compressAudioButton
+                        objectName: "compressAudioButton"
+                        readonly property url targetUrl: mainPanel.player.source
+                        readonly property bool idle: mainPanel.busyOrQueuedKeys.indexOf(
+                            compressAudioButton.targetUrl.toString() + " " + "compressAudio") === -1
+                        visible: !!mainPanel.transcriptionController && mainPanel.hasAudio
+                                 && (mainPanel.openFileVoiceCompressible || mainPanel.openFileLosslessCompressible)
+                        voiceEnabled: visible && idle && mainPanel.openFileVoiceCompressible
+                        losslessEnabled: visible && idle && mainPanel.openFileLosslessCompressible
+                        tooltip: qsTr("Compress audio")
+                        onCompressRequested: target => mainPanel.transcriptionController.compressAudioFiles(
+                            [compressAudioButton.targetUrl], mainPanel.vaultPath, target)
+                    }
 
-            // "Delete audio only" — the complement of "Delete transcript", and
-            // gated identically: a transcribed AUDIO file (orphanedMdPath == ""
-            // + hasMetadata), never an orphaned .md (no audio to drop)
-            // and never an untranscribed one (nothing to keep, so it would just
-            // duplicate "Delete file"). Same isQueued gate — dropping the audio
-            // out from under a running job would fight the worker.
-            AppIconButton {
-                id: deleteAudioOnlyButton
-                objectName: "deleteAudioOnlyButton"
-                visible: mainPanel.transcriptionController && mainPanel.vaultTreeModel
-                         && mainPanel.hasAudio && mainPanel.hasMetadata
-                readonly property url targetUrl: mainPanel.player.source
-                enabled: visible && mainPanel.busyOrQueuedUrls.indexOf(deleteAudioOnlyButton.targetUrl.toString()) === -1
+                    // "Delete transcript" — removes the open transcribed audio
+                    // file's sibling .md (VaultTreeModel::trashTranscript()), reverting
+                    // it to untranscribed while KEEPING the audio. Only for a
+                    // transcribed AUDIO file (an orphaned .md has no audio to keep — it
+                    // gets "Delete file" instead). Disabled while a job is
+                    // queued/active for this file (deleting its sidecar mid-write would
+                    // fight the worker) — same isQueued gate the regenerate icons use.
+                    AppIconButton {
+                        id: deleteTranscriptButton
+                        visible: mainPanel.transcriptionController && mainPanel.vaultTreeModel
+                                 && mainPanel.hasAudio && mainPanel.hasMetadata
+                        readonly property url targetUrl: mainPanel.player.source
+                        enabled: visible && mainPanel.busyOrQueuedUrls.indexOf(deleteTranscriptButton.targetUrl.toString()) === -1
 
-                iconName: "delete-audio"
-                iconSize: 14
-                iconColor: deleteAudioOnlyButton.enabled ? Theme.danger : Theme.textDisabled
-                tooltip: qsTr("Delete audio (keep transcript)")
+                        iconName: "delete-transcript"
+                        iconSize: 14
+                        iconColor: deleteTranscriptButton.enabled ? Theme.danger : Theme.textDisabled
+                        tooltip: qsTr("Delete transcript (keep audio)")
 
-                onTapped: mainPanel.requestDeleteAudioOnly()
-            }
+                        onTapped: mainPanel.requestDeleteTranscript()
+                    }
 
-            // "Delete file" — deletes the whole open file and its
-            // sidecars (VaultTreeModel::trashFiles()): audio + .md + partial,
-            // or an orphaned .md alone. Shown for any open file (audio OR
-            // orphaned .md). Same isQueued gate as above.
-            //
-            // `iconObjectName` names the inner AppIcon "deleteFileIcon" —
-            // tst_mainpanel_deleteundo looks that up to assert the glyph's
-            // painted color flips danger->disabled with the queue state, which
-            // the button's own objectName can't answer.
-            AppIconButton {
-                id: deleteFileButton
-                objectName: "deleteFileButton"
-                iconObjectName: "deleteFileIcon"
-                visible: mainPanel.vaultTreeModel && mainPanel.currentMdUrl !== ""
-                readonly property url targetUrl: mainPanel.currentFileUrl()
-                enabled: visible && mainPanel.busyOrQueuedUrls.indexOf(deleteFileButton.targetUrl.toString()) === -1
+                    // "Delete audio only" — the complement of "Delete transcript", and
+                    // gated identically: a transcribed AUDIO file (orphanedMdPath == ""
+                    // + hasMetadata), never an orphaned .md (no audio to drop)
+                    // and never an untranscribed one (nothing to keep, so it would just
+                    // duplicate "Delete file"). Same isQueued gate — dropping the audio
+                    // out from under a running job would fight the worker.
+                    AppIconButton {
+                        id: deleteAudioOnlyButton
+                        objectName: "deleteAudioOnlyButton"
+                        visible: mainPanel.transcriptionController && mainPanel.vaultTreeModel
+                                 && mainPanel.hasAudio && mainPanel.hasMetadata
+                        readonly property url targetUrl: mainPanel.player.source
+                        enabled: visible && mainPanel.busyOrQueuedUrls.indexOf(deleteAudioOnlyButton.targetUrl.toString()) === -1
 
-                iconName: "delete-file"
-                iconSize: 14
-                iconColor: deleteFileButton.enabled ? Theme.danger : Theme.textDisabled
-                tooltip: qsTr("Delete file")
+                        iconName: "delete-audio"
+                        iconSize: 14
+                        iconColor: deleteAudioOnlyButton.enabled ? Theme.danger : Theme.textDisabled
+                        tooltip: qsTr("Delete audio (keep transcript)")
 
-                onTapped: mainPanel.requestDeleteFile()
-            }
+                        onTapped: mainPanel.requestDeleteAudioOnly()
+                    }
 
-            // Search icon → expands to a text field, Ctrl+F while
-            // the main panel has focus. Searches title/tags (via
-            // metadata, already loaded) + the transcript body
-            // (jumpToNextMatch() selects/scrolls the next match below).
-            // This field is ALSO the find pattern for replace — the
-            // .*/Aa toggles and the Replace checkbox sit right after it, and
-            // the replace row unfolds below the whole title row.
-            // Extracted to SearchReplaceBar.qml. Layout.fillWidth is gated on
-            // searchExpanded so the collapsed bar (just the search icon) claims
-            // no row space — expanded, it competes with titleContainer for
-            // width exactly as the individual controls used to.
-            SearchReplaceBar {
-                id: searchReplaceBar
-                panel: mainPanel
-                Layout.fillWidth: mainPanel.searchExpanded
+                    // "Delete file" — deletes the whole open file and its
+                    // sidecars (VaultTreeModel::trashFiles()): audio + .md + partial,
+                    // or an orphaned .md alone. Shown for any open file (audio OR
+                    // orphaned .md). Same isQueued gate as above.
+                    //
+                    // `iconObjectName` names the inner AppIcon "deleteFileIcon" —
+                    // tst_mainpanel_deleteundo looks that up to assert the glyph's
+                    // painted color flips danger->disabled with the queue state, which
+                    // the button's own objectName can't answer.
+                    AppIconButton {
+                        id: deleteFileButton
+                        objectName: "deleteFileButton"
+                        iconObjectName: "deleteFileIcon"
+                        visible: mainPanel.vaultTreeModel && mainPanel.currentMdUrl !== ""
+                        readonly property url targetUrl: mainPanel.currentFileUrl()
+                        enabled: visible && mainPanel.busyOrQueuedUrls.indexOf(deleteFileButton.targetUrl.toString()) === -1
+
+                        iconName: "delete-file"
+                        iconSize: 14
+                        iconColor: deleteFileButton.enabled ? Theme.danger : Theme.textDisabled
+                        tooltip: qsTr("Delete file")
+
+                        onTapped: mainPanel.requestDeleteFile()
+                    }
+                }
+
+                // Search icon → expands to a text field, Ctrl+F while
+                // the main panel has focus. Searches title/tags (via
+                // metadata, already loaded) + the transcript body
+                // (jumpToNextMatch() selects/scrolls the next match below).
+                // This field is ALSO the find pattern for replace — the
+                // .*/Aa toggles and the Replace checkbox sit right after it, and
+                // the replace row unfolds below the whole title row.
+                // Extracted to SearchReplaceBar.qml. Layout.fillWidth is gated on
+                // searchExpanded so the collapsed bar (just the search icon) claims
+                // no row space — expanded, it competes with titleContainer for
+                // width exactly as the individual controls used to.
+                SearchReplaceBar {
+                    id: searchReplaceBar
+                    panel: mainPanel
+                    Layout.fillWidth: mainPanel.searchExpanded
+                    Layout.alignment: Qt.AlignTop
+                }
             }
         },
 
@@ -4330,6 +4471,7 @@ Rectangle {
         vaultLocalPath: mainPanel.vaultLocalPath
         vaultPath: mainPanel.vaultPath
         vaultTreeModel: mainPanel.vaultTreeModel
+        transcriptionController: mainPanel.transcriptionController
         onOpenVaultRequested: mainPanel.openVaultRequested()
     }
 

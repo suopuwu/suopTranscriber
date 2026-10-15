@@ -1,4 +1,20 @@
-BUILD_DIR := build
+# One build tree PER build type, rather than one `build/` whose CMAKE_BUILD_TYPE
+# is whatever the last configure happened to set. A shared tree silently
+# inherits a type nobody chose: the IDE configures Debug, `make build` only
+# runs `configure` when build.ninja is MISSING, so `make run` goes on building
+# the IDE's Debug cache forever — which is how a Debug-only ggml assert in
+# whisper's VAD (see patches/whisper-vad-lstm-contiguous-input.patch) ended up
+# reachable from `make run` at all. Keying the directory on the type makes that
+# drift impossible instead of merely detectable, and both trees stay warm, so
+# alternating between the IDE and the terminal costs an incremental build
+# rather than a full one (a type flip in one tree invalidates every object).
+#
+# `make run BUILD_TYPE=Debug` is the assert-enabled build — worth reaching for
+# when something misbehaves, since ggml/whisper assert-guard real invariants
+# that Release compiles out. Note `make install BUILD_TYPE=Debug` repoints the
+# ~/.local/bin wrapper at the Debug tree: last install wins, by design.
+BUILD_TYPE ?= Release
+BUILD_DIR  := build-$(BUILD_TYPE)
 JOBS ?= $(shell nproc)
 # Subset filter for `make test-one` (ctest -R regex).
 T ?=
@@ -23,10 +39,10 @@ LAUNCHER_BIN := $(BINDIR)/suopTranscriber
 # window shows no icon/name in the task manager. tst_styleguide guards the pair.
 DESKTOP_FILE := $(APPDIR)/org.suop.Transcriber.desktop
 
-.PHONY: configure build install uninstall run clean test test-failed test-one snapshots-update snapshots-check
+.PHONY: configure build install uninstall run clean clean-all test test-failed test-one snapshots-update snapshots-check
 
 configure:
-	cmake -S . -B $(BUILD_DIR) -G Ninja -DCMAKE_BUILD_TYPE=Release
+	cmake -S . -B $(BUILD_DIR) -G Ninja -DCMAKE_BUILD_TYPE=$(BUILD_TYPE)
 
 build:
 	@test -f $(BUILD_DIR)/build.ninja || $(MAKE) configure
@@ -72,5 +88,13 @@ snapshots-update: build
 snapshots-check: build
 	env SUOP_SNAPSHOT=compare $(BUILD_DIR)/tests/tst_visual_snapshot
 
+# Removes only THIS build type's tree; `clean-all` takes every type. Both are
+# expensive to undo — a from-scratch build is ~80 minutes of compile work and
+# re-downloads ~2.9G into _deps (onnxruntime + the CUDA-12 wheels), so it needs
+# the network back. Ninja's incremental build is reliable here; reach for these
+# when a configure-level input changed, not on suspicion of staleness.
 clean:
 	rm -rf $(BUILD_DIR)
+
+clean-all:
+	rm -rf build build-*

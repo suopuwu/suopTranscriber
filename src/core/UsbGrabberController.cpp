@@ -333,6 +333,13 @@ void UsbGrabberController::startGrabJob(const UsbGrabRule &rule, const QString &
     if (!m_transcriptionController)
         return;
 
+    const QString destinationRefusal =
+        usbGrabDestinationRefusal(rule.destinationFolder, m_vaultTreeModel->vaultLocalPath());
+    if (!destinationRefusal.isEmpty()) {
+        setLastError(destinationRefusal);
+        return;
+    }
+
     const QString destinationPath = resolveDestinationPath(rule);
     const int jobId = m_transcriptionController->enqueueUsbGrab(
         rule, mountPath, QUrl::fromLocalFile(destinationPath),
@@ -523,6 +530,14 @@ void UsbGrabberController::requestGrabPreview(const QString &deviceSerial)
     // committing to it). resolveEffectiveRule() still applies the same
     // device-then-catch-all resolution a real grab would use.
     const UsbGrabRule rule = resolveEffectiveRule(deviceSerial, volumes.first().toMap());
+
+    const QString destinationRefusal =
+        usbGrabDestinationRefusal(rule.destinationFolder, m_vaultTreeModel->vaultLocalPath());
+    if (!destinationRefusal.isEmpty()) {
+        setLastError(destinationRefusal);
+        emit grabPreviewReady(deviceSerial, QVariantList(), m_lastError);
+        return;
+    }
 
     // A preview must cover exactly what triggerManualGrab() would do, so it
     // previews EVERY mounted volume and emits grabPreviewReady ONCE with the

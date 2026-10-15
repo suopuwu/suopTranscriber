@@ -110,16 +110,16 @@ bool isSameRecording(const QUrl &a, const QUrl &b)
         && fa.completeBaseName() == fb.completeBaseName();
 }
 
-bool pathIsInsideVault(const QString &candidatePath, const QString &vaultLocalPath)
+QString vaultRelativePathOf(const QString &candidatePath, const QString &vaultLocalPath)
 {
     if (vaultLocalPath.isEmpty() || candidatePath.isEmpty())
-        return false;
+        return QString();
 
     // The vault root itself must exist (it always does once opened) for
     // canonicalization to mean anything.
     const QString vaultCanonical = QFileInfo(vaultLocalPath).canonicalFilePath();
     if (vaultCanonical.isEmpty())
-        return false;
+        return QString();
 
     // candidatePath may not exist yet (e.g. a folder about to be created) —
     // QFileInfo::canonicalFilePath() returns empty for a nonexistent path, so
@@ -131,7 +131,7 @@ bool pathIsInsideVault(const QString &candidatePath, const QString &vaultLocalPa
     while (!QFileInfo::exists(ancestor)) {
         const QString parent = QFileInfo(ancestor).absolutePath();
         if (parent == ancestor)
-            return false; // walked past the filesystem root without finding anything real
+            return QString(); // walked past the filesystem root without finding anything real
         const QString name = QFileInfo(ancestor).fileName();
         tail = tail.isEmpty() ? name : name + '/' + tail;
         ancestor = parent;
@@ -139,14 +139,25 @@ bool pathIsInsideVault(const QString &candidatePath, const QString &vaultLocalPa
 
     const QString ancestorCanonical = QFileInfo(ancestor).canonicalFilePath();
     if (ancestorCanonical.isEmpty())
-        return false;
-    const QString candidateCanonical = tail.isEmpty() ? ancestorCanonical : ancestorCanonical + '/' + tail;
+        return QString();
+    // Lexically cleaning is safe only here: the ancestor is symlink-free, and a
+    // ".." in the not-yet-existing tail can't follow a link.
+    const QString candidateCanonical =
+        tail.isEmpty() ? ancestorCanonical : QDir::cleanPath(ancestorCanonical + '/' + tail);
 
     if (candidateCanonical == vaultCanonical)
-        return true;
+        return QStringLiteral(".");
 
     const QString relative = QDir(vaultCanonical).relativeFilePath(candidateCanonical);
-    return !relative.startsWith(QStringLiteral("..")) && !QDir::isAbsolutePath(relative);
+    // Component test, not a prefix test: "..foo" is a legal child name.
+    if (relative == QStringLiteral("..") || relative.startsWith(QStringLiteral("../")) || QDir::isAbsolutePath(relative))
+        return QString();
+    return relative;
+}
+
+bool pathIsInsideVault(const QString &candidatePath, const QString &vaultLocalPath)
+{
+    return !vaultRelativePathOf(candidatePath, vaultLocalPath).isEmpty();
 }
 
 bool moveRecordingFile(const QUrl &fileUrl, const QUrl &destDirUrl, const QString &vaultLocalPath, QUrl *newUrlOut,

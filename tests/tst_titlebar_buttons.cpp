@@ -109,6 +109,7 @@ private slots:
                      "HoverBorder 1.0 qml/HoverBorder.qml\n"
                      "AppIcon 1.0 qml/AppIcon.qml\n"
                      "AppIconButton 1.0 qml/AppIconButton.qml\n"
+                     "CompressButton 1.0 qml/CompressButton.qml\n"
                      "ConfirmPopup 1.0 qml/ConfirmPopup.qml\n"
                      "TitleBar 1.0 qml/TitleBar.qml\n");
         qmldir.close();

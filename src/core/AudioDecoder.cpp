@@ -130,6 +130,30 @@ bool isDecodeStalled(qint64 noOutputElapsedMs)
     return noOutputElapsedMs > kDecodeStallMs;
 }
 
+std::optional<QString> runFfprobe(const QString &path, const QStringList &args)
+{
+    QProcess probe;
+    ProcessRunner::guardChildLifetime(probe);
+    QStringList fullArgs = args;
+    fullArgs << path;
+    probe.start(QStringLiteral("ffprobe"), fullArgs);
+    if (!probe.waitForFinished(10'000) || probe.exitStatus() != QProcess::NormalExit || probe.exitCode() != 0)
+        return std::nullopt;
+    return QString::fromUtf8(probe.readAllStandardOutput()).trimmed();
+}
+
+std::optional<double> probeDurationSeconds(const QString &path)
+{
+    const std::optional<QString> out =
+        runFfprobe(path, {QStringLiteral("-v"), QStringLiteral("error"), QStringLiteral("-show_entries"),
+                          QStringLiteral("format=duration"), QStringLiteral("-of"), QStringLiteral("csv=p=0")});
+    if (!out)
+        return std::nullopt;
+    bool ok = false;
+    const double seconds = out->toDouble(&ok);
+    return (ok && seconds >= 0.0) ? std::make_optional(seconds) : std::nullopt;
+}
+
 std::optional<std::vector<float>> decodeTo16kMono(const QString &filePath, QString *errorOut,
                                                     const DecodeControl &control,
                                                     DecodeDiagnostics *diagnosticsOut)

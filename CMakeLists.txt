@@ -27,6 +27,58 @@ find_package(KF6WindowSystem 6.19 REQUIRED)
 
 qt_standard_project_setup(REQUIRES 6.7)
 
+# Apply one of patches/*.patch to a vendored submodule at configure time.
+#
+# The guard checks BOTH directions rather than trusting a single
+# `git apply --reverse --check` as proof of "already applied": that check
+# alone can't tell a patch that's genuinely already applied apart from one
+# that has quietly stopped matching the tree in either direction (exactly how
+# the pre-fork-pin version of the sherpa-onnx patch rotted invisibly for a
+# while — it never applied forward, but nothing ever checked that). A patch
+# that applies in neither direction fails the configure instead of being
+# silently treated as done. What it still CAN'T catch is a patch applying to
+# the wrong hunk — read the diff after any submodule bump.
+function(suop_apply_vendored_patch SUBMODULE_DIR PATCH_NAME)
+    set(patch_file ${CMAKE_SOURCE_DIR}/patches/${PATCH_NAME})
+    set(submodule ${CMAKE_SOURCE_DIR}/${SUBMODULE_DIR})
+    execute_process(
+        COMMAND git apply --reverse --check ${patch_file}
+        WORKING_DIRECTORY ${submodule}
+        RESULT_VARIABLE already_applied
+        OUTPUT_QUIET ERROR_QUIET
+    )
+    if(already_applied EQUAL 0)
+        message(STATUS "${PATCH_NAME} already applied")
+        return()
+    endif()
+    execute_process(
+        COMMAND git apply --check ${patch_file}
+        WORKING_DIRECTORY ${submodule}
+        RESULT_VARIABLE can_apply
+        OUTPUT_QUIET ERROR_QUIET
+    )
+    if(NOT can_apply EQUAL 0)
+        message(FATAL_ERROR
+            "patches/${PATCH_NAME} applies in NEITHER direction against "
+            "${SUBMODULE_DIR} — it is neither already applied nor appliable "
+            "as-is. The submodule pin (see .gitmodules) has likely moved out "
+            "from under it; "
+            "re-derive the patch against the current pinned commit rather "
+            "than force-applying. See DEPENDENCIES.md for the bump procedure.")
+    endif()
+    message(STATUS "Applying local patch: ${PATCH_NAME}")
+    execute_process(
+        COMMAND git apply ${patch_file}
+        WORKING_DIRECTORY ${submodule}
+        RESULT_VARIABLE apply_result
+    )
+    if(NOT apply_result EQUAL 0)
+        message(FATAL_ERROR
+            "Failed to apply patches/${PATCH_NAME} to ${SUBMODULE_DIR} "
+            "despite `git apply --check` reporting it would succeed.")
+    endif()
+endfunction()
+
 # whisper.cpp is linked in-process (see DESIGN.md); GGML_VULKAN is the
 # cross-vendor floor, GGML_CUDA is an opt-in NVIDIA fast path.
 set(GGML_VULKAN ${SUOP_ENABLE_VULKAN} CACHE BOOL "" FORCE)
@@ -49,6 +101,9 @@ endif()
 set(WHISPER_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
 set(WHISPER_BUILD_TESTS OFF CACHE BOOL "" FORCE)
 set(WHISPER_BUILD_SERVER OFF CACHE BOOL "" FORCE)
+# Local patch to the vendored whisper.cpp submodule (see the patch file's own
+# header for what/why). Debug builds abort on the first VAD frame without it.
+suop_apply_vendored_patch(third_party/whisper.cpp whisper-vad-lstm-contiguous-input.patch)
 add_subdirectory(third_party/whisper.cpp)
 
 # sherpa-onnx (speaker diarization — pyannote segmentation + CAM++ embedding
@@ -92,54 +147,7 @@ set(SHERPA_ONNX_ENABLE_C_API ON CACHE BOOL "" FORCE)
 # This file only carries what hasn't been folded into the pin yet
 # (currently just the diagnostic batch-size logging), applied on top of it
 # at configure time.
-#
-# The guard below checks BOTH directions rather than trusting a single
-# `git apply --reverse --check` as proof of "already applied": that check
-# alone can't tell a patch that's genuinely already applied apart from one
-# that has quietly stopped matching the tree in either direction (exactly
-# how the pre-fork-pin version of this patch rotted invisibly for a while —
-# it never applied forward, but nothing ever checked that). A patch that
-# applies in neither direction now fails the configure instead of being
-# silently treated as done.
-set(SUOP_SHERPA_ONNX_PATCH ${CMAKE_SOURCE_DIR}/patches/sherpa-onnx-batch-segmentation.patch)
-execute_process(
-    COMMAND git apply --reverse --check ${SUOP_SHERPA_ONNX_PATCH}
-    WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}/third_party/sherpa-onnx
-    RESULT_VARIABLE SUOP_SHERPA_ONNX_PATCH_ALREADY_APPLIED
-    OUTPUT_QUIET ERROR_QUIET
-)
-if(SUOP_SHERPA_ONNX_PATCH_ALREADY_APPLIED EQUAL 0)
-    message(STATUS "sherpa-onnx-batch-segmentation.patch already applied")
-else()
-    execute_process(
-        COMMAND git apply --check ${SUOP_SHERPA_ONNX_PATCH}
-        WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}/third_party/sherpa-onnx
-        RESULT_VARIABLE SUOP_SHERPA_ONNX_PATCH_CAN_APPLY
-        OUTPUT_QUIET ERROR_QUIET
-    )
-    if(NOT SUOP_SHERPA_ONNX_PATCH_CAN_APPLY EQUAL 0)
-        message(FATAL_ERROR
-            "patches/sherpa-onnx-batch-segmentation.patch applies in "
-            "NEITHER direction against third_party/sherpa-onnx — it is "
-            "neither already applied nor appliable as-is. The submodule "
-            "pin (see .gitmodules) has likely moved out from under it; "
-            "re-derive the patch against the current pinned commit rather "
-            "than force-applying. See DEPENDENCIES.md for the sherpa-onnx "
-            "bump procedure.")
-    endif()
-    message(STATUS "Applying local patch: sherpa-onnx-batch-segmentation.patch")
-    execute_process(
-        COMMAND git apply ${SUOP_SHERPA_ONNX_PATCH}
-        WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}/third_party/sherpa-onnx
-        RESULT_VARIABLE SUOP_SHERPA_ONNX_PATCH_APPLY_RESULT
-    )
-    if(NOT SUOP_SHERPA_ONNX_PATCH_APPLY_RESULT EQUAL 0)
-        message(FATAL_ERROR
-            "Failed to apply patches/sherpa-onnx-batch-segmentation.patch to "
-            "third_party/sherpa-onnx despite `git apply --check` reporting "
-            "it would succeed.")
-    endif()
-endif()
+suop_apply_vendored_patch(third_party/sherpa-onnx sherpa-onnx-batch-segmentation.patch)
 
 add_subdirectory(third_party/sherpa-onnx)
 
@@ -254,6 +262,7 @@ qt_add_qml_module(suopTranscriber
         qml/UsbToggle.qml
         qml/AppIcon.qml
         qml/AppIconButton.qml
+        qml/CompressButton.qml
         qml/SettingResetButton.qml
         qml/ToggleSetting.qml
         qml/SliderSetting.qml
@@ -421,6 +430,10 @@ qt_add_qml_module(suopTranscriber
         src/core/tasks/DiarizeTask.cpp
         src/core/tasks/DetectSilenceTask.h
         src/core/tasks/DetectSilenceTask.cpp
+        src/core/tasks/CompressAudioTask.h
+        src/core/tasks/CompressAudioTask.cpp
+        src/core/tasks/RevertCompressionTask.h
+        src/core/tasks/RevertCompressionTask.cpp
         src/core/tasks/TranscribeTask.h
         src/core/tasks/TranscribeTask.cpp
         src/core/tasks/BenchmarkTask.h

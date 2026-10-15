@@ -1289,6 +1289,9 @@ private slots:
 
         controller.runAllJobs(file, vault.vaultUrl, kModelId);
 
+        // Compression discards the original WAV, so it is explicit-only:
+        // run-all never plans or queues it, even on an uncompressed WAV.
+        QVERIFY(!controller.pendingJobKinds(file).contains(QStringLiteral("compressAudio")));
         QCOMPARE(controller.tasksTotal(), 4);
         QCOMPARE(controller.jobs().at(0).toMap().value("kind").toString(), QStringLiteral("transcribe"));
         QCOMPARE(controller.jobs().at(1).toMap().value("kind").toString(), QStringLiteral("diarize"));
@@ -1307,6 +1310,30 @@ private slots:
         // Whole pipeline drains (each fails fast on the zero-byte models, but
         // the ordering/kinds above are stable throughout — that's the point).
         QTRY_COMPARE(controller.tasksCompleted(), 4);
+    }
+
+    // The explicit compress action takes only files its target applies to
+    // (by type — the FLAC header rule is tst_task_compress's), once each, as
+    // one batch; an unknown target queues nothing.
+    void compressAudioFiles_queuesOnlyCompressibleFilesOnceEach()
+    {
+        VaultFixture vault;
+        TranscriptionController controller;
+        controller.compressAudioFiles({vault.audioUrl("a.wav"), vault.audioUrl("b.mp3"),
+                                       vault.audioUrl("a.wav").toString()},
+                                      vault.vaultUrl, QStringLiteral("voice"));
+        QCOMPARE(controller.tasksTotal(), 1);
+        const QVariantMap job = controller.jobs().at(0).toMap();
+        QCOMPARE(job.value("kind").toString(), QStringLiteral("compressAudio"));
+        QCOMPARE(job.value("fileUrl").toUrl(), vault.audioUrl("a.wav"));
+        QTRY_COMPARE(controller.tasksCompleted(), 1);
+
+        // Lossless never takes a FLAC (it already is one).
+        controller.compressAudioFiles({vault.audioUrl("c.flac")}, vault.vaultUrl, QStringLiteral("lossless"));
+        controller.compressAudioFiles({vault.audioUrl("d.wav")}, vault.vaultUrl, QStringLiteral("opus"));
+        QCOMPARE(controller.tasksTotal(), 1);
+        QVERIFY(TranscriptionController::isCompressibleAudio(vault.audioUrl("e.wav").toString(), QStringLiteral("lossless")));
+        QVERIFY(!TranscriptionController::isCompressibleAudio(vault.audioUrl("e.flac").toString(), QStringLiteral("lossless")));
     }
 
     // "Run all available jobs": runAllJobs() on a file that already has a
@@ -1391,6 +1418,30 @@ private slots:
         QCOMPARE(controller.tasksTotal(), 0);
         QVERIFY(controller.jobs().isEmpty());
         QVERIFY(!controller.isBusy());
+    }
+
+    // A transcribed .md with NO segment text at all (a fully-silent
+    // recording transcribes to frontmatter plus an empty body) reports
+    // nothing pending — every derived pass needs segments to work on, so
+    // run-all enqueueing them would only enqueue guaranteed "no transcript
+    // text" failures.
+    void runAllJobs_emptyTranscriptBody_enqueuesNothing()
+    {
+        VaultFixture vault;
+        const QUrl file = vault.audioUrl("a.wav");
+        QFile md(vault.dir.path() + "/a.wav.md");
+        QVERIFY(md.open(QIODevice::WriteOnly));
+        // Verbatim shape of a real silent-recording transcript: metadata
+        // frontmatter, no speakers line, no segment lines.
+        md.write("---\nmodel: parakeet-tdt-0.6b-v2\nvad: true\nsilences: 0-2.859\n---\n");
+        md.close();
+
+        TranscriptionController controller;
+        QVERIFY(controller.pendingJobKinds(file).isEmpty());
+
+        controller.runAllJobs(file, vault.vaultUrl, kModelId);
+        QCOMPARE(controller.tasksTotal(), 0);
+        QVERIFY(controller.jobs().isEmpty());
     }
 
     // pendingJobKinds() derives "still needs to run" purely from the .md,

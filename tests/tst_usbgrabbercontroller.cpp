@@ -59,12 +59,14 @@ struct GrabFixture {
         return f.write(content) == content.size();
     }
 
-    void saveRule(const QString &serial, bool enabled, bool autoGrab)
+    void saveRule(const QString &serial, bool enabled, bool autoGrab,
+                  const QString &destinationFolder = QString())
     {
         QVariantMap rule;
         rule[QStringLiteral("deviceSerial")] = serial;
         rule[QStringLiteral("enabled")] = enabled;
         rule[QStringLiteral("autoGrab")] = autoGrab;
+        rule[QStringLiteral("destinationFolder")] = destinationFolder;
         controller.saveRule(rule);
     }
 
@@ -456,6 +458,38 @@ private slots:
         // The point of the feature: a grab is a job in the ONE task queue, not
         // a thread of its own — so it gets a Tasks row, the glow, pause/cancel.
         QCOMPARE(fx.usbGrabJobCount(), 1);
+    }
+
+    // Rules load from disk unvalidated, so a hand-edited destinationFolder
+    // that escapes the vault must be refused at grab time, not just in the picker.
+    void hotplug_destinationOutsideVault_refusedWithError_data()
+    {
+        QTest::addColumn<QString>("destinationFolder");
+        QTest::newRow("dotdot") << QStringLiteral("../escaped");
+        QTest::newRow("nested dotdot") << QStringLiteral("Interviews/../../escaped");
+        QTest::newRow("absolute") << QStringLiteral("/tmp");
+    }
+    void hotplug_destinationOutsideVault_refusedWithError()
+    {
+        QFETCH(QString, destinationFolder);
+        GrabFixture fx;
+        fx.saveRule(QStringLiteral("DEV-A"), /*enabled=*/true, /*autoGrab=*/true, destinationFolder);
+
+        fx.hotplug(QStringLiteral("DEV-A"));
+
+        QCOMPARE(fx.usbGrabJobCount(), 0);
+        QVERIFY(fx.controller.lastError().contains(QStringLiteral("outside the vault")));
+    }
+
+    void hotplug_destinationSubfolderInsideVault_stillGrabs()
+    {
+        GrabFixture fx;
+        fx.saveRule(QStringLiteral("DEV-A"), /*enabled=*/true, /*autoGrab=*/true, QStringLiteral("Interviews/USB"));
+
+        fx.hotplug(QStringLiteral("DEV-A"));
+
+        QCOMPARE(fx.usbGrabJobCount(), 1);
+        QVERIFY(fx.controller.lastError().isEmpty());
     }
 
     void hotplug_noVaultOpen_doesNotGrab()

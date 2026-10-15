@@ -1,5 +1,11 @@
 #include "LabelingEngine.h"
 
+// For repairTruncatedLabelJson() below, which is compiled in BOTH build
+// flavors (it sits outside the SUOP_ENABLE_LABELING guard).
+#include <QRegularExpression>
+
+#include <utility>
+
 // AI auto-labeling links llama.cpp in-process. When the build is configured
 // with -DSUOP_ENABLE_LABELING=OFF the llama target isn't built and <llama.h>
 // isn't available, so the whole llama-backed implementation is compiled out
@@ -20,17 +26,25 @@
 
 namespace {
 
-// Conservative defaults, not empirically tuned against real multi-hour
-// transcripts yet (flagged during design research): Qwen3-4B-Instruct-2507
-// has a 262K native context, but resident KV-cache size scales with n_ctx
-// and this engine may run alongside a resident whisper.cpp model on the same
-// GPU — kContextTokens caps VRAM use rather than using the model's max.
-constexpr int kContextTokens = 8192;
+// Re-tuned on real multi-hour vault transcripts 2026-08-09: for >20k-word
+// transcripts effectiveWordinessForLength() floors wordiness at 0.9, and that
+// tier's full label+prelude+tags responses measure ~600-900 output tokens —
+// the old 700-token cap truncated them mid-JSON, so every long transcript's
+// label task failed with "model did not produce valid JSON". Qwen3-4B's KV
+// cache costs ~144 KiB/token (~2.3 GiB at 16384), affordable because
+// EngineCache::applyResidencyPolicy() guarantees no ASR/diarization model is
+// resident while a label-family task runs.
+constexpr int kContextTokens = 16384;
 // ~4 chars/token is a rough English estimate; leaves headroom in
-// kContextTokens for the system prompt, chat-template overhead, and the
-// generation budget below.
+// kContextTokens for the system prompt (which grows with the vault's tag
+// vocabulary), chat-template overhead, and the generation budget below.
 constexpr int kMaxInputChars = 24000;
-constexpr int kMaxOutputTokens = 700;
+// ~3x the ~600-900 tokens a real top-tier (wordiness 0.9) label+prelude+tags
+// response measures on multi-hour transcripts. The dist sampler seeds
+// randomly (LLAMA_DEFAULT_SEED is "random"), so a rare generation runs away
+// (e.g. a looping tags list); it is cut here and salvaged by
+// repairTruncatedLabelJson() instead of failing the task.
+constexpr int kMaxOutputTokens = 2560;
 
 // Feature 3a ("generate chapters"): a SEPARATE pair of limits from label()'s
 // above — the output shape scales with however many chapters the model
@@ -38,9 +52,8 @@ constexpr int kMaxOutputTokens = 700;
 // JSON object, so kMaxOutputTokens itself would be far too small. Both
 // constants are sized to fit comfortably within kContextTokens together
 // (kMaxChapterInputChars is ~4000 tokens at the same ~4 chars/token estimate
-// used above, kMaxChapterOutputTokens leaves ~4000 tokens of headroom for
-// that plus the system prompt/chat-template overhead) — unlike label(),
-// where the tiny fixed output budget makes this non-issue moot.
+// used above, leaving several thousand tokens of headroom for the output
+// budget plus the system prompt/chat-template overhead).
 // kMaxChapterInputChars lives on the class (LabelingEngine.h) —
 // TranscriptionController needs to see it too, to window a long
 // transcript across multiple calls instead of relying on the truncation
@@ -64,6 +77,14 @@ constexpr int kChapterMergeExcerptChars = 220;
 // grammar is far more reliable for a small model to satisfy every time than
 // a fully generic one. The `string` rule is llama.cpp's own proven one from
 // grammars/json.gbnf (third_party/llama.cpp), reused verbatim.
+//
+// The strings are deliberately UNbounded: a char-level {0,N} length bound
+// would guarantee the response fits the output budget, but bounds big enough
+// for a prelude (thousands of chars) make llama.cpp's grammar sampler fork
+// deep parallel stacks and stall generation to a crawl (measured 2026-08-09:
+// a {0,1900}-bounded prelude never finished; MAX_REPETITION_THRESHOLD also
+// rejects bounds >= 2000 outright). Runaway generations are instead cut by
+// kMaxOutputTokens and salvaged — see repairTruncatedLabelJson().
 constexpr auto kGrammar = R"GBNF(
 root   ::= "{" ws "\"label\"" ws ":" ws string "," ws "\"prelude\"" ws ":" ws string "," ws "\"tags\"" ws ":" ws string ws "}"
 string ::= "\"" ( [^"\\\x7F\x00-\x1F] | "\\" (["\\bfnrt] | "u" [0-9a-fA-F]{4}) )* "\""
@@ -324,8 +345,11 @@ LabelingEngine::~LabelingEngine()
 std::optional<QString> LabelingEngine::runGrammarConstrained(const QString &systemPrompt, const QString &userText,
                                                                const char *grammar, int maxOutputTokens,
                                                                QString *errorOut,
-                                                               const std::function<void(int)> &onTokens)
+                                                               const std::function<void(int)> &onTokens,
+                                                               bool *budgetExhausted)
 {
+    if (budgetExhausted)
+        *budgetExhausted = false;
     if (!isValid()) {
         if (errorOut)
             *errorOut = QStringLiteral("labeling engine not initialized");
@@ -389,10 +413,15 @@ std::optional<QString> LabelingEngine::runGrammarConstrained(const QString &syst
     std::string response;
     const int nCtx = llama_n_ctx(m_ctx);
     bool overflowed = false;
+    // Stays true only when the loop runs the full budget without the grammar
+    // completing (EOG) — the response is then truncated mid-shape, and the
+    // caller's JSON parse failure is a budget problem, not a model problem.
+    bool exhausted = true;
     for (int i = 0; i < maxOutputTokens; ++i) {
         const int nCtxUsed = llama_memory_seq_pos_max(llama_get_memory(m_ctx), 0) + 1;
         if (nCtxUsed + batch.n_tokens > nCtx) {
             overflowed = true;
+            exhausted = false;
             break;
         }
         if (llama_decode(m_ctx, batch) != 0) {
@@ -403,13 +432,17 @@ std::optional<QString> LabelingEngine::runGrammarConstrained(const QString &syst
         }
 
         llama_token newToken = llama_sampler_sample(chain, m_ctx, -1);
-        if (llama_vocab_is_eog(vocab, newToken))
+        if (llama_vocab_is_eog(vocab, newToken)) {
+            exhausted = false;
             break;
+        }
 
         char buf[256];
         const int n = llama_token_to_piece(vocab, newToken, buf, sizeof(buf), 0, true);
-        if (n < 0)
+        if (n < 0) {
+            exhausted = false;
             break;
+        }
         response.append(buf, n);
         // Throttled: one callback per 8 tokens is well under any repaint
         // rate and keeps the per-token cost of the hook negligible.
@@ -427,6 +460,12 @@ std::optional<QString> LabelingEngine::runGrammarConstrained(const QString &syst
         return std::nullopt;
     }
 
+    if (exhausted)
+        qWarning() << "runGrammarConstrained: output budget" << maxOutputTokens
+                   << "exhausted before the grammar completed; response tail:"
+                   << QString::fromStdString(response).right(300);
+    if (budgetExhausted)
+        *budgetExhausted = exhausted;
     return QString::fromStdString(response);
 }
 
@@ -435,15 +474,30 @@ std::optional<LabelResult> LabelingEngine::label(const QString &transcriptText, 
                                                   QString *errorOut, const std::function<void(int)> &onTokens)
 {
     const QString systemPrompt = buildSystemPrompt(existingTags, restrictToExisting, tagReuseBias, wordiness);
+    bool budgetExhausted = false;
     const auto response = runGrammarConstrained(systemPrompt, transcriptText.left(kMaxInputChars), kGrammar,
-                                                 kMaxOutputTokens, errorOut, onTokens);
+                                                 kMaxOutputTokens, errorOut, onTokens, &budgetExhausted);
     if (!response)
         return std::nullopt;
 
-    const QJsonDocument doc = QJsonDocument::fromJson(response->toUtf8());
+    QJsonDocument doc = QJsonDocument::fromJson(response->toUtf8());
+    if (!doc.isObject() && budgetExhausted) {
+        // The generation ran away (random sampler seed — usually a looping
+        // tags list) and the budget cut it mid-JSON. The prompt-decode work
+        // is already paid for; salvage the complete leading fields instead
+        // of failing the task and regenerating from scratch.
+        const QJsonDocument repaired = QJsonDocument::fromJson(repairTruncatedLabelJson(*response).toUtf8());
+        if (repaired.isObject() && !repaired.object().value(QStringLiteral("label")).toString().isEmpty()) {
+            qWarning() << "label: response hit the" << kMaxOutputTokens
+                       << "token output budget; salvaged the completed fields";
+            doc = repaired;
+        }
+    }
     if (!doc.isObject()) {
         if (errorOut)
-            *errorOut = QStringLiteral("model did not produce valid JSON: %1").arg(*response);
+            *errorOut = budgetExhausted
+                            ? QStringLiteral("response was cut off at the %1-token output budget").arg(kMaxOutputTokens)
+                            : QStringLiteral("model did not produce valid JSON: %1").arg(*response);
         return std::nullopt;
     }
 
@@ -483,15 +537,18 @@ std::optional<QList<Chapter>> LabelingEngine::generateChapters(const QStringList
                    << "chars — chapters past that point will not be proposed";
     }
 
+    bool budgetExhausted = false;
     const auto response = runGrammarConstrained(chapterSystemPrompt(density), indexed, kChapterGrammar,
-                                                 kMaxChapterOutputTokens, errorOut, onTokens);
+                                                 kMaxChapterOutputTokens, errorOut, onTokens, &budgetExhausted);
     if (!response)
         return std::nullopt;
 
     const QJsonDocument doc = QJsonDocument::fromJson(response->toUtf8());
     if (!doc.isArray()) {
         if (errorOut)
-            *errorOut = QStringLiteral("model did not produce a valid JSON array: %1").arg(*response);
+            *errorOut = budgetExhausted ? QStringLiteral("response was cut off at the %1-token output budget")
+                                              .arg(kMaxChapterOutputTokens)
+                                        : QStringLiteral("model did not produce a valid JSON array: %1").arg(*response);
         return std::nullopt;
     }
 
@@ -632,3 +689,42 @@ QString LabelingEngine::chapterSystemPrompt(double)
 }
 
 #endif // SUOP_ENABLE_LABELING
+
+// Outside the SUOP_ENABLE_LABELING guard: pure string repair, no llama
+// dependency — see the header doc comment for the contract.
+QString repairTruncatedLabelJson(const QString &raw)
+{
+    QString s = raw.trimmed();
+    if (s.isEmpty() || !s.startsWith(QLatin1Char('{')))
+        return s;
+
+    bool inString = false;
+    bool escaped = false;
+    for (const QChar c : std::as_const(s)) {
+        if (!inString)
+            inString = c == QLatin1Char('"');
+        else if (escaped)
+            escaped = false;
+        else if (c == QLatin1Char('\\'))
+            escaped = true;
+        else if (c == QLatin1Char('"'))
+            inString = false;
+    }
+
+    if (escaped)
+        s.chop(1); // a lone trailing backslash can't be completed
+    if (inString) {
+        // A cut inside a \uXXXX escape leaves fewer than 4 hex digits — the
+        // whole partial escape has to go before the string can be closed.
+        static const QRegularExpression kPartialUnicodeEscape(QStringLiteral("\\\\u[0-9a-fA-F]{0,3}$"));
+        s.remove(kPartialUnicodeEscape);
+        s += QLatin1Char('"');
+    }
+    if (s.endsWith(QLatin1Char(',')))
+        s.chop(1);
+    if (s.endsWith(QLatin1Char(':')))
+        s += QStringLiteral(" \"\"");
+    if (!s.endsWith(QLatin1Char('}')))
+        s += QLatin1Char('}');
+    return s;
+}

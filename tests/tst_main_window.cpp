@@ -220,6 +220,7 @@ private slots:
             "UsbToggle 1.0 qml/UsbToggle.qml\n"
             "AppIcon 1.0 qml/AppIcon.qml\n"
             "AppIconButton 1.0 qml/AppIconButton.qml\n"
+            "CompressButton 1.0 qml/CompressButton.qml\n"
             "SettingResetButton 1.0 qml/SettingResetButton.qml\n"
             "ToggleSetting 1.0 qml/ToggleSetting.qml\n"
             "SliderSetting 1.0 qml/SliderSetting.qml\n"

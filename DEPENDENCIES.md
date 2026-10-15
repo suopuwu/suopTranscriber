@@ -11,8 +11,8 @@ submodule commit, a fetched wheel, or a `ModelManager` file name/URL.
 | path | pin (describe) |
 |---|---|
 | `third_party/llama.cpp` | `gguf-v0.19.0-985-gaff6eb6e7` |
-| `third_party/whisper.cpp` | `v1.8.5-249-g080bbbe8` |
-| `third_party/sherpa-onnx` | `v1.13.4-2-g7398790f` — fork, `suopuwu/sherpa-onnx`, not upstream `k2-fsa/sherpa-onnx` |
+| `third_party/whisper.cpp` | `v1.8.5-251-ga630b35c` |
+| `third_party/sherpa-onnx` | `v1.13.4-3-ga5ceedc2` — fork, `suopuwu/sherpa-onnx`, not upstream `k2-fsa/sherpa-onnx` |
 
 **Downloaded model artifacts** (`src/core/ModelManager.{h,cpp}`). Each installed file is
 pinned by SHA-256 in `pinnedSha256()` in `ModelManager.cpp` — the runtime counterpart of the
@@ -65,14 +65,19 @@ QFuture overload).
 **llama.cpp** — edit the submodule pin, `cd third_party/llama.cpp && git
 checkout <new-commit>`, `git -C third_party/llama.cpp rev-parse HEAD` to
 confirm. Bump this one FIRST — see lockstep rules. Build:
-`cmake --build build -j`. Check: labeling still runs (`SUOP_ENABLE_LABELING`
+`make build`. Check: labeling still runs (`SUOP_ENABLE_LABELING`
 build, run an auto-title/chapters task) — a ggml ABI break shows up as a
 build failure, not a silent one.
 
-**whisper.cpp** — same submodule-checkout procedure, done AFTER llama.cpp.
-Build, then transcribe a short real file with the default tier — confirms the
-in-process link (`WhisperCppEngine`) still produces segments, not just that it
-compiled.
+**whisper.cpp** — same submodule-checkout procedure, done AFTER llama.cpp,
+plus re-deriving `patches/whisper-vad-lstm-contiguous-input.patch` against the
+new tree (`git apply --check` it, don't force it — the configure guard fails
+loudly if it applies in neither direction, but can't tell you it landed on the
+wrong hunk). Build, then transcribe a short real file with the default tier —
+confirms the in-process link (`WhisperCppEngine`) still produces segments, not
+just that it compiled — and run `tests/tst_vadchunking` with
+`SUOP_TEST_VAD_MODEL` set, which is what actually exercises the patched VAD
+graph.
 
 **sherpa-onnx** — the pin is a fork (`suopuwu/sherpa-onnx`) sitting on top of
 upstream tags, plus a configure-time patch
@@ -88,7 +93,7 @@ into the fork yet. A bump means:
    tell you the patch is now applying to the WRONG lines — read the diff.
 3. Re-check the onnxruntime CUDA SONAMEs (next entry) — a bumped sherpa-onnx
    can ship a different bundled onnxruntime.
-Build: `cmake --build build -j` (the configure step fails loudly if the patch
+Build: `make build` (the configure step fails loudly if the patch
 doesn't apply). Check: run a diarization task and confirm the GPU is actually
 used (see the CUDA-12 wheels check below) — CPU fallback is silent.
 
@@ -100,7 +105,7 @@ fetched onnxruntime build. Run `ldd` on the built
 CUDA-13 onnxruntime build), find the matching PyPI wheel version for each
 `nvidia_*_cu1N` package, update both the version and the `URL_HASH SHA256=`
 in the matching `suop_fetch_cuda12_wheel` call. Check: `ldd` the copied
-`.so`s in `build/lib/` against what the provider actually needs — don't trust
+`.so`s in `build-Release/lib/` against what the provider actually needs — don't trust
 that "it downloaded" means "it matches".
 
 **Downloaded models** — edit the constant (`kVadModelFileName` /

@@ -13,6 +13,10 @@
     "chapters": "chapters.svg",
     "speakers": "speakers.svg",
     "combine": "combine.svg",
+    "compress": "compress.svg",
+    "format-voice": "format-voice.svg",
+    "format-flac": "format-flac.svg",
+    "format-wav": "format-wav.svg",
     "group-merge": "group-merge.svg",
 
     "delete-transcript": "delete-transcript.svg",

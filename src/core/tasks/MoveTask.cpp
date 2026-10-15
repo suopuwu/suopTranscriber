@@ -28,8 +28,9 @@ QString MoveTask::undoLabel() const
     return QStringLiteral("Moved %1").arg(QFileInfo(fileUrl.toLocalFile()).fileName());
 }
 
-QString MoveTask::batchUndoLabel(int count) const
+QString MoveTask::batchUndoLabel(const QList<const Task *> &undoableMembers) const
 {
+    const qsizetype count = undoableMembers.size();
     // One snackbar for the whole multi-select move; a batch of one keeps the
     // specific single-file label.
     if (count <= 1)

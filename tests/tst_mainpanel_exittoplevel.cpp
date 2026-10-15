@@ -155,6 +155,7 @@ private slots:
                       "singleton Notifications 1.0 qml/Notifications.qml\n"
                       "AppIcon 1.0 qml/AppIcon.qml\n"
                       "AppIconButton 1.0 qml/AppIconButton.qml\n"
+                      "CompressButton 1.0 qml/CompressButton.qml\n"
                       "ConfirmPopup 1.0 qml/ConfirmPopup.qml\n"
                       "HoverBorder 1.0 qml/HoverBorder.qml\n"
                       "UnderlineField 1.0 qml/UnderlineField.qml\n"

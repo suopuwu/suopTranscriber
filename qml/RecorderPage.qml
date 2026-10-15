@@ -15,6 +15,8 @@ Item {
     property string vaultLocalPath: ""
     property url vaultPath
     property VaultTreeModel vaultTreeModel
+    // Reports when an explicit compress (or its undo) replaced the take's file.
+    property TranscriptionController transcriptionController
     signal openVaultRequested()
 
     // Recorder page's duration counter — fed takeDurationMs, not the shared
@@ -98,25 +100,15 @@ Item {
     // actually making noise, so binding rows to this made a row (and its
     // gain) vanish the moment a call ended.
     readonly property var appStreams: recorderPage.audioRecorder ? recorderPage.audioRecorder.appStreams : []
-    // Every application display name seen live this session, plus every name
-    // the user has configured in an earlier one. A row survives its app going
-    // quiet — or the app restarting — by being remembered here, which is only
-    // sound because the name is stable, unlike the "stream:<object.serial>"
-    // id this state used to be keyed on (a serial dies with the connection).
-    //
-    // Seeded from the persisted per-app maps so an app you configured in an
-    // earlier session gets a row immediately — before it has played anything
-    // this session, which is the only way a row could otherwise appear.
-    // Union of both maps' keys: an app can have been armed without its gain
-    // moved off 1.0, or vice versa.
-    property var rememberedAppNames: {
-        const names = Object.keys(AppSettings.recordingAppGains)
-        for (const name of Object.keys(AppSettings.recordingAppCaptureEnabled)) {
-            if (names.indexOf(name) < 0)
-                names.push(name)
-        }
-        return names
-    }
+    // The names a row exists for: every app that is armed or has a non-default
+    // gain in the persisted per-app maps, plus every app live right now — one
+    // spelling per AudioRecorder::appNameKey(), saved spellings first so the
+    // row keeps the name its settings are stored under. A row survives its app
+    // going quiet only if it is configured; an untouched one leaves with its
+    // stream, which is what keeps name variants from piling up as permanent
+    // rows. Maintained by recomputeRememberedAppNames() rather than bound:
+    // see that function for why.
+    property var rememberedAppNames: []
     // {name, ids, active} per row — see AudioRecorderIO::buildAppCaptureRows().
     // Reads appStreams and rememberedAppNames directly so both register as
     // binding dependencies.
@@ -375,13 +367,76 @@ Item {
         // nothing: there is simply nothing to target yet.
         const sources = []
         for (const row of recorderPage.appCaptureRows) {
-            if (!AppSettings.recordingAppCaptureEnabled[row.name])
+            if (!recorderPage.isAppArmed(row.name))
                 continue
-            const gain = AppSettings.recordingAppGains[row.name]
+            const gain = recorderPage.appGainFor(row.name)
             for (const id of row.ids)
-                sources.push({ id: id, gain: gain !== undefined ? gain : 1.0 })
+                sources.push({ id: id, gain: gain })
         }
         return sources
+    }
+
+    // A per-app settings value for `name`, found under ANY spelling of that
+    // app (see AudioRecorder::appNameKey) — so "discord" inherits what was
+    // saved for "Discord". Exact key first: it is the common case and costs
+    // no key computation.
+    function appSetting(map, name) {
+        if (map[name] !== undefined)
+            return map[name]
+        const rec = recorderPage.audioRecorder
+        if (!rec)
+            return undefined
+        const key = rec.appNameKey(name)
+        for (const other of Object.keys(map)) {
+            if (rec.appNameKey(other) === key)
+                return map[other]
+        }
+        return undefined
+    }
+
+    // `map` with every spelling of `name`'s app replaced by one `name` entry
+    // (or none, for value undefined) — a write collapses old variants rather
+    // than leaving a stale twin that appSetting() might find first.
+    function withAppSetting(map, name, value) {
+        const rec = recorderPage.audioRecorder
+        const key = rec ? rec.appNameKey(name) : name
+        const out = {}
+        for (const other of Object.keys(map)) {
+            if ((rec ? rec.appNameKey(other) : other) !== key)
+                out[other] = map[other]
+        }
+        if (value !== undefined)
+            out[name] = value
+        return out
+    }
+
+    function isAppArmed(name) {
+        return recorderPage.appSetting(AppSettings.recordingAppCaptureEnabled, name) === true
+    }
+
+    // Assigned only when the list actually differs: every reassignment
+    // re-evaluates appCaptureRows and rebuilds each row delegate, which must
+    // not happen on every 3s poll or on a gain-slider drag.
+    function recomputeRememberedAppNames() {
+        const rec = recorderPage.audioRecorder
+        if (!rec)
+            return
+        const armed = AppSettings.recordingAppCaptureEnabled
+        const gains = AppSettings.recordingAppGains
+        const candidates = Object.keys(armed).filter(name => armed[name] === true)
+            .concat(Object.keys(gains).filter(name => gains[name] !== 1.0))
+            .concat(recorderPage.appStreams.map(stream => stream.name))
+        const names = []
+        const keys = []
+        for (const name of candidates) {
+            const key = rec.appNameKey(name)
+            if (key === "" || keys.indexOf(key) >= 0)
+                continue
+            keys.push(key)
+            names.push(name)
+        }
+        if (names.join("\n") !== recorderPage.rememberedAppNames.join("\n"))
+            recorderPage.rememberedAppNames = names
     }
 
     // A "stream:<object.serial>" id is only valid while that connection lives
@@ -406,29 +461,7 @@ Item {
             : ""
     }
 
-    // Union in every name the enumeration has ever shown, so a row outlives
-    // its stream. Assigned only on a real addition: an unconditional
-    // reassignment would re-evaluate appCaptureRows (and rebuild every
-    // Repeater delegate) on each 3s poll, yanking a slider out from under a
-    // drag — the same trap the old refreshAppStreams() guarded against.
-    //
-    // rememberedAppNames starts as a BINDING (seeded from the persisted maps
-    // above); the plain assignment below destroys that binding on the first
-    // real addition. That is fine, not a bug to "fix" — the seed only needs
-    // to hold until the first live enumeration, and .slice() above already
-    // copies the seeded value into `names` before this overwrites it.
-    onAppStreamsChanged: {
-        const names = recorderPage.rememberedAppNames.slice()
-        let added = false
-        for (const stream of recorderPage.appStreams) {
-            if (stream.name !== "" && names.indexOf(stream.name) < 0) {
-                names.push(stream.name)
-                added = true
-            }
-        }
-        if (added)
-            recorderPage.rememberedAppNames = names
-    }
+    onAppStreamsChanged: recorderPage.recomputeRememberedAppNames()
 
     onVisibleChanged: {
         if (recorderPage.visible)
@@ -437,6 +470,7 @@ Item {
         recorderPage.updateMonitoring()
     }
     Component.onCompleted: {
+        recorderPage.recomputeRememberedAppNames()
         recorderPage.refreshDevices()
         recorderPage.recomputeSourceToggleWidth()
         // onVisibleChanged only fires on a CHANGE, so a page that loads already
@@ -464,8 +498,15 @@ Item {
     // running capture. Reads activeCaptureSourceIds so this re-evaluates when
     // the worker confirms an addition, not only when the graph changes —
     // otherwise a rejected add would never be retried.
+    //
+    // updateMonitoring() too: an armed app only counts as armed once it has a
+    // live stream id, and at page load the async pw-dump hasn't returned yet —
+    // without this an app armed from settings (mic and system off) never
+    // started metering until some unrelated toggle re-ran it. Idempotent, and
+    // it reads nothing that feeds back into appCaptureRows.
     onAppCaptureRowsChanged: {
         recorderPage.joinLateSources()
+        recorderPage.updateMonitoring()
         recorderPage.recomputeSourceToggleWidth()
     }
 
@@ -524,7 +565,7 @@ Item {
     // slider (a Slider clamps value to `to`, which would hide a typed gain
     // above maxSourceGain).
     function appGainFor(name) {
-        const gain = AppSettings.recordingAppGains[name]
+        const gain = recorderPage.appSetting(AppSettings.recordingAppGains, name)
         return gain !== undefined ? gain : 1.0
     }
 
@@ -532,9 +573,7 @@ Item {
     // percent field. Whole-map reassignment is what AppSettings notifies on —
     // mutating recordingAppGains[name] in place changes nothing anyone sees.
     function setAppGain(name, gain) {
-        let gains = Object.assign({}, AppSettings.recordingAppGains)
-        gains[name] = gain
-        AppSettings.recordingAppGains = gains
+        AppSettings.recordingAppGains = recorderPage.withAppSetting(AppSettings.recordingAppGains, name, gain)
     }
 
     // Drops whatever is capturing but no longer armed, then upserts everything
@@ -610,8 +649,14 @@ Item {
         target: AppSettings
         // Arming/disarming a per-app row, and per-app gain changes, both land
         // here — reconcileAppSources() upserts, so one handler covers both.
-        function onRecordingAppCaptureEnabledChanged() { recorderPage.syncCapture() }
-        function onRecordingAppGainsChanged() { recorderPage.reconcileAppSources() }
+        function onRecordingAppCaptureEnabledChanged() {
+            recorderPage.recomputeRememberedAppNames()
+            recorderPage.syncCapture()
+        }
+        function onRecordingAppGainsChanged() {
+            recorderPage.recomputeRememberedAppNames()
+            recorderPage.reconcileAppSources()
+        }
         // Without these two, dragging the mic or system slider only moved the
         // number: the worker was handed a gain once, when capture started, and
         // nothing ever revised it — so the meter (which measures POST-gain)
@@ -771,295 +816,477 @@ Item {
             spacing: 12
 
             // Start/Stop + disable-animations + duration counter row.
-            RowLayout {
-                Layout.fillWidth: true
+            // A Flow, not a RowLayout: at a narrow window the row wraps
+            // instead of clipping its right end off-screen. Flow ignores
+            // Layout attached properties, so every child sizes itself.
+            Flow {
+                id: recorderControlsFlow
+                objectName: "recorderControlsFlow"
+                // Pinned to the column, not fillWidth: a Flow's implicitWidth
+                // is its widest line, which the layout would otherwise treat
+                // as a floor and refuse to narrow below.
+                Layout.preferredWidth: recorderContent.width
+                Layout.minimumWidth: 0
                 // Nested layouts default Layout.fillHeight to true, which
-                // would let these rows soak up the page's leftover height and
-                // push the waveform away from the controls row above it.
+                // would let this row soak up the page's leftover height and
+                // push the waveform away from the controls above it.
                 Layout.fillHeight: false
                 spacing: 12
 
-                Item {
-                    id: recordToggleButton
-                    objectName: "recordToggleButton"
-                    Layout.preferredWidth: 32
-                    Layout.preferredHeight: 32
-                    enabled: recorderPage.useMic || recorderPage.useSystemAudio
-                             || recorderPage.enabledAppCaptureSources().length > 0
-                             || recorderPage.audioRecorder.recording
-
-                    HoverHandler {
-                        id: recordToggleHover
-                        cursorShape: Qt.PointingHandCursor
-                        enabled: recordToggleButton.enabled
+                // The transport/mode buttons and the take clock — wraps within
+                // itself only on a window too narrow even for them.
+                Flow {
+                    id: recorderButtonsFlow
+                    objectName: "recorderButtonsFlow"
+                    spacing: 12
+                    width: Math.min(recorderButtonsFlow.oneLineWidth, recorderControlsFlow.width)
+                    // Recomputed from each child's own visibleChanged/widthChanged.
+                    property real oneLineWidth: 0
+                    function recomputeOneLineWidth() {
+                        let w = 0
+                        let n = 0
+                        for (const child of recorderButtonsFlow.children) {
+                            if (!child.visible)
+                                continue
+                            w += child.width
+                            ++n
+                        }
+                        recorderButtonsFlow.oneLineWidth = w + Math.max(0, n - 1) * recorderButtonsFlow.spacing
                     }
-                    TapHandler {
-                        enabled: recordToggleButton.enabled
-                        onTapped: {
-                            if (recorderPage.audioRecorder.recording) {
-                                recorderPage.audioRecorder.stopRecording()
-                            } else {
-                                recorderPage.recordingFolderError = ""
-                                recorderPage.silentCaptureStartMs = -1
-                    recorderPage.sourcePeaks = ({})
-                            recorderPage.sourcePeakHoldUntil = ({})
-                            recorderPage.sourceLevelsByKey = ({})
-                                recorderPage.recordedLevels = []
-                                recorderPage.lastTakeMs = 0
-                                recorderPlayer.pause()
-                                recorderPage.audioRecorder.startRecording(
-                                    recorderPage.vaultPath, AppSettings.recordingOutputFolder,
-                                    recorderPage.recordingName,
-                                    recorderPage.useMic, recorderPage.selectedMicId,
-                                    recorderPage.useSystemAudio, AppSettings.recordingMicGain,
-                                    AppSettings.recordingSystemGain, recorderPage.selectedSystemSourceId,
-                                    recorderPage.enabledAppCaptureSources(),
-                                    recorderPage.testMode)
+                    Component.onCompleted: {
+                        for (const child of recorderButtonsFlow.children) {
+                            child.visibleChanged.connect(recorderButtonsFlow.recomputeOneLineWidth)
+                            child.widthChanged.connect(recorderButtonsFlow.recomputeOneLineWidth)
+                        }
+                        recorderButtonsFlow.recomputeOneLineWidth()
+                    }
+
+                    Item {
+                        id: recordToggleButton
+                        objectName: "recordToggleButton"
+                        width: 32
+                        height: 32
+                        enabled: recorderPage.useMic || recorderPage.useSystemAudio
+                                 || recorderPage.enabledAppCaptureSources().length > 0
+                                 || recorderPage.audioRecorder.recording
+
+                        HoverHandler {
+                            id: recordToggleHover
+                            cursorShape: Qt.PointingHandCursor
+                            enabled: recordToggleButton.enabled
+                        }
+                        TapHandler {
+                            enabled: recordToggleButton.enabled
+                            onTapped: {
+                                if (recorderPage.audioRecorder.recording) {
+                                    recorderPage.audioRecorder.stopRecording()
+                                } else {
+                                    recorderPage.recordingFolderError = ""
+                                    recorderPage.silentCaptureStartMs = -1
+                        recorderPage.sourcePeaks = ({})
+                                recorderPage.sourcePeakHoldUntil = ({})
+                                recorderPage.sourceLevelsByKey = ({})
+                                    recorderPage.recordedLevels = []
+                                    recorderPage.lastTakeMs = 0
+                                    recorderPlayer.pause()
+                                    recorderPage.audioRecorder.startRecording(
+                                        recorderPage.vaultPath, AppSettings.recordingOutputFolder,
+                                        recorderPage.recordingName,
+                                        recorderPage.useMic, recorderPage.selectedMicId,
+                                        recorderPage.useSystemAudio, AppSettings.recordingMicGain,
+                                        AppSettings.recordingSystemGain, recorderPage.selectedSystemSourceId,
+                                        recorderPage.enabledAppCaptureSources(),
+                                        recorderPage.testMode)
+                                }
+                            }
+                        }
+                        Rectangle {
+                            anchors.fill: parent
+                            radius: AppSettings.borderRadius
+                            color: (recordToggleHover.hovered && recordToggleButton.enabled) ? Theme.surfaceHover : Theme.surface
+                        }
+                        HoverBorder {
+                            anchors.fill: parent
+                            active: recordToggleButton.enabled && recordToggleHover.hovered
+                        }
+                        ToolTip.visible: recordToggleHover.hovered
+                        ToolTip.text: recorderPage.audioRecorder.recording ? qsTr("Stop recording") : qsTr("Start recording")
+                        ToolTip.delay: 500
+                        AppIcon {
+                            anchors.centerIn: parent
+                            name: recorderPage.audioRecorder.recording ? "stop" : "record"
+                            iconSize: 16
+                            color: recorderPage.audioRecorder.recording ? "#e07a7a" : "#6fdf9f"
+                        }
+                    }
+
+                    // Global animations/blur kill switch — placed here per the
+                    // user's explicit placement decision, but affects the whole
+                    // app (every existing Behavior/compositor blur already gates
+                    // on AppSettings.animationsEnabled), not just this page.
+                    Item {
+                        id: animationsToggleButton
+                        width: 32
+                        height: 32
+
+                        HoverHandler {
+                            id: animationsToggleHover
+                            cursorShape: Qt.PointingHandCursor
+                        }
+                        TapHandler {
+                            onTapped: AppSettings.animationsEnabled = !AppSettings.animationsEnabled
+                        }
+                        Rectangle {
+                            anchors.fill: parent
+                            radius: AppSettings.borderRadius
+                            color: animationsToggleHover.hovered ? Theme.surfaceHover : Theme.surface
+                        }
+                        HoverBorder {
+                            anchors.fill: parent
+                            active: animationsToggleHover.hovered
+                        }
+                        ToolTip.visible: animationsToggleHover.hovered
+                        ToolTip.text: AppSettings.animationsEnabled ? qsTr("Disable animations") : qsTr("Enable animations")
+                        ToolTip.delay: 500
+                        AppIcon {
+                            anchors.centerIn: parent
+                            name: "freeze"
+                            iconSize: 15
+                            color: AppSettings.animationsEnabled ? Theme.textPrimary : "#6fdf9f"
+                        }
+                    }
+
+                    // Play back the take you just made without leaving the page.
+                    Item {
+                        id: playLastRecordingButton
+                        width: 32
+                        height: 32
+                        enabled: recorderPage.lastRecordingPath !== ""
+                                 && !recorderPage.audioRecorder.recording
+
+                        HoverHandler {
+                            id: playLastRecordingHover
+                            cursorShape: Qt.PointingHandCursor
+                            enabled: playLastRecordingButton.enabled
+                        }
+                        TapHandler {
+                            enabled: playLastRecordingButton.enabled
+                            onTapped: recorderPlayer.togglePlay()
+                        }
+                        Rectangle {
+                            anchors.fill: parent
+                            radius: AppSettings.borderRadius
+                            color: (playLastRecordingHover.hovered && playLastRecordingButton.enabled)
+                                   ? Theme.surfaceHover : Theme.surface
+                        }
+                        HoverBorder {
+                            anchors.fill: parent
+                            active: playLastRecordingButton.enabled && playLastRecordingHover.hovered
+                        }
+                        ToolTip.visible: playLastRecordingHover.hovered
+                        ToolTip.text: recorderPlayer.playing ? qsTr("Pause playback")
+                                                             : qsTr("Play the last recording")
+                        ToolTip.delay: 500
+                        AppIcon {
+                            anchors.centerIn: parent
+                            name: recorderPlayer.playing ? "pause" : "play"
+                            iconSize: 15
+                            color: playLastRecordingButton.enabled ? Theme.textPrimary : Theme.textMuted
+                        }
+                    }
+
+                    // Route the next take to a temp directory instead of the
+                    // vault, for checking levels without leaving real audio
+                    // files in the tree.
+                    Item {
+                        id: testModeToggleButton
+                        objectName: "testModeToggleButton"
+                        width: 32
+                        height: 32
+                        // The mode is fixed for the duration of a take: the output
+                        // path is chosen at startRecording().
+                        enabled: !recorderPage.audioRecorder.recording
+
+                        HoverHandler {
+                            id: testModeToggleHover
+                            cursorShape: Qt.PointingHandCursor
+                            enabled: testModeToggleButton.enabled
+                        }
+                        TapHandler {
+                            enabled: testModeToggleButton.enabled
+                            onTapped: recorderPage.testMode = !recorderPage.testMode
+                        }
+                        Rectangle {
+                            anchors.fill: parent
+                            radius: AppSettings.borderRadius
+                            color: (testModeToggleHover.hovered && testModeToggleButton.enabled)
+                                   ? Theme.surfaceHover : Theme.surface
+                        }
+                        HoverBorder {
+                            anchors.fill: parent
+                            active: testModeToggleButton.enabled && testModeToggleHover.hovered
+                        }
+                        ToolTip.visible: testModeToggleHover.hovered
+                        ToolTip.text: recorderPage.testMode
+                                      ? qsTr("Test mode on — recordings are temporary and never enter the vault")
+                                      : qsTr("Test mode — record temporarily to check levels")
+                        ToolTip.delay: 500
+                        AppIcon {
+                            anchors.centerIn: parent
+                            name: "benchmark"
+                            iconSize: 15
+                            color: recorderPage.testMode ? "#6fdf9f" : Theme.textPrimary
+                        }
+                    }
+
+                    // What the next take is written as — the same setting as
+                    // Settings → Recorder; the icon names the current choice.
+                    // Locked during a take like the test toggle: the format is
+                    // fixed at startRecording().
+                    Item {
+                        id: recordingFormatButton
+                        objectName: "recordingFormatButton"
+                        width: 32
+                        height: 32
+                        enabled: !recorderPage.audioRecorder.recording
+                        readonly property var options: AppSettings.recordingFormatOptions()
+                        readonly property var current:
+                            options.find(o => o.id === AppSettings.recordingFormat) || options[0]
+
+                        HoverHandler {
+                            id: recordingFormatHover
+                            cursorShape: Qt.PointingHandCursor
+                            enabled: recordingFormatButton.enabled
+                        }
+                        TapHandler {
+                            enabled: recordingFormatButton.enabled
+                            onTapped: recordingFormatMenu.visible ? recordingFormatMenu.close()
+                                                                  : recordingFormatMenu.open()
+                        }
+                        Rectangle {
+                            anchors.fill: parent
+                            radius: AppSettings.borderRadius
+                            color: (recordingFormatHover.hovered && recordingFormatButton.enabled)
+                                   ? Theme.surfaceHover : Theme.surface
+                        }
+                        HoverBorder {
+                            anchors.fill: parent
+                            active: recordingFormatButton.enabled && recordingFormatHover.hovered
+                        }
+                        ToolTip.visible: recordingFormatHover.hovered && !recordingFormatMenu.visible
+                        ToolTip.text: qsTr("Recording format: %1").arg(recordingFormatButton.current.label)
+                        ToolTip.delay: 500
+                        AppIcon {
+                            objectName: "recordingFormatIcon"
+                            anchors.centerIn: parent
+                            name: recordingFormatButton.current.icon
+                            iconSize: 15
+                            color: recordingFormatButton.enabled ? Theme.textPrimary : Theme.textMuted
+                        }
+
+                        Popup {
+                            id: recordingFormatMenu
+                            objectName: "recordingFormatMenu"
+                            x: 0
+                            y: recordingFormatButton.height + 4
+                            width: 220
+                            padding: 4
+                            // Kept inside the window: near its right edge the menu
+                            // shifts left rather than clipping.
+                            margins: 8
+                            modal: true
+                            dim: true
+                            focus: false
+                            closePolicy: Popup.CloseOnPressOutside | Popup.CloseOnEscape
+
+                            background: Rectangle {
+                                color: Theme.surfaceDialog
+                                radius: AppSettings.borderRadius
+                                border.width: 1
+                                border.color: Theme.border
+                            }
+
+                            Column {
+                                width: recordingFormatMenu.width - recordingFormatMenu.padding * 2
+                                spacing: 2
+
+                                Repeater {
+                                    model: recordingFormatButton.options
+                                    delegate: Item {
+                                        id: formatOptionRow
+                                        required property var modelData
+                                        objectName: "recordingFormatOption_" + modelData.id
+                                        width: parent.width
+                                        height: 28
+
+                                        HoverHandler {
+                                            id: formatOptionHover
+                                            cursorShape: Qt.PointingHandCursor
+                                        }
+                                        TapHandler {
+                                            // Exclusive press: see Sidebar.qml contextMenu.
+                                            gesturePolicy: TapHandler.WithinBounds
+                                            onTapped: {
+                                                AppSettings.recordingFormat = formatOptionRow.modelData.id
+                                                recordingFormatMenu.close()
+                                            }
+                                        }
+                                        Rectangle {
+                                            anchors.fill: parent
+                                            radius: AppSettings.borderRadius
+                                            color: formatOptionHover.hovered ? Theme.surfaceHover : "transparent"
+                                        }
+                                        AppIcon {
+                                            id: formatOptionIcon
+                                            anchors.left: parent.left
+                                            anchors.leftMargin: 8
+                                            anchors.verticalCenter: parent.verticalCenter
+                                            name: formatOptionRow.modelData.icon
+                                            iconSize: 14
+                                            color: AppSettings.recordingFormat === formatOptionRow.modelData.id
+                                                   ? AppSettings.accentColor : Theme.textPrimary
+                                        }
+                                        Text {
+                                            anchors.left: formatOptionIcon.right
+                                            anchors.leftMargin: 8
+                                            anchors.verticalCenter: parent.verticalCenter
+                                            text: (AppSettings.recordingFormat === formatOptionRow.modelData.id ? "✓ " : "")
+                                                  + formatOptionRow.modelData.label
+                                            color: "white"
+                                            font.pixelSize: 12
+                                        }
+                                    }
+                                }
                             }
                         }
                     }
-                    Rectangle {
-                        anchors.fill: parent
-                        radius: AppSettings.borderRadius
-                        color: (recordToggleHover.hovered && recordToggleButton.enabled) ? Theme.surfaceHover : Theme.surface
-                    }
-                    HoverBorder {
-                        anchors.fill: parent
-                        active: recordToggleButton.enabled && recordToggleHover.hovered
-                    }
-                    ToolTip.visible: recordToggleHover.hovered
-                    ToolTip.text: recorderPage.audioRecorder.recording ? qsTr("Stop recording") : qsTr("Start recording")
-                    ToolTip.delay: 500
-                    AppIcon {
-                        anchors.centerIn: parent
-                        name: recorderPage.audioRecorder.recording ? "stop" : "record"
-                        iconSize: 16
-                        color: recorderPage.audioRecorder.recording ? "#e07a7a" : "#6fdf9f"
+
+                    Label {
+                        id: recordingDurationLabel
+                        objectName: "recordingDurationLabel"
+                        height: 32
+                        verticalAlignment: Text.AlignVCenter
+                        text: recorderPage.formatDuration(recorderPage.takeDurationMs)
+                        color: "white"
+                        font.pixelSize: 16
                     }
                 }
 
-                // Global animations/blur kill switch — placed here per the
-                // user's explicit placement decision, but affects the whole
-                // app (every existing Behavior/compositor blur already gates
-                // on AppSettings.animationsEnabled), not just this page.
-                Item {
-                    id: animationsToggleButton
-                    Layout.preferredWidth: 32
-                    Layout.preferredHeight: 32
+                // Name + destination + folder picker. Beside the buttons it
+                // takes all the remaining width (the name field stretches);
+                // when that remainder is narrower than its natural width it
+                // drops to its own full-width line instead.
+                RowLayout {
+                    id: recorderNameRow
+                    objectName: "recorderNameRow"
+                    spacing: 12
+                    height: 32
+                    readonly property real naturalWidth: 200 + recorderNameRow.spacing * 2
+                                                         + Math.min(recordingDestinationLabel.implicitWidth, 260) + 32
+                    readonly property real besideButtons: recorderControlsFlow.width - recorderButtonsFlow.width
+                                                          - recorderControlsFlow.spacing
+                    width: besideButtons >= naturalWidth ? besideButtons : recorderControlsFlow.width
 
-                    HoverHandler {
-                        id: animationsToggleHover
-                        cursorShape: Qt.PointingHandCursor
-                    }
-                    TapHandler {
-                        onTapped: AppSettings.animationsEnabled = !AppSettings.animationsEnabled
-                    }
-                    Rectangle {
-                        anchors.fill: parent
-                        radius: AppSettings.borderRadius
-                        color: animationsToggleHover.hovered ? Theme.surfaceHover : Theme.surface
-                    }
-                    HoverBorder {
-                        anchors.fill: parent
-                        active: animationsToggleHover.hovered
-                    }
-                    ToolTip.visible: animationsToggleHover.hovered
-                    ToolTip.text: AppSettings.animationsEnabled ? qsTr("Disable animations") : qsTr("Enable animations")
-                    ToolTip.delay: 500
-                    AppIcon {
-                        anchors.centerIn: parent
-                        name: "freeze"
-                        iconSize: 15
-                        color: AppSettings.animationsEnabled ? Theme.textPrimary : "#6fdf9f"
-                    }
-                }
-
-                // Play back the take you just made without leaving the page.
-                Item {
-                    id: playLastRecordingButton
-                    Layout.preferredWidth: 32
-                    Layout.preferredHeight: 32
-                    enabled: recorderPage.lastRecordingPath !== ""
-                             && !recorderPage.audioRecorder.recording
-
-                    HoverHandler {
-                        id: playLastRecordingHover
-                        cursorShape: Qt.PointingHandCursor
-                        enabled: playLastRecordingButton.enabled
-                    }
-                    TapHandler {
-                        enabled: playLastRecordingButton.enabled
-                        onTapped: recorderPlayer.togglePlay()
-                    }
-                    Rectangle {
-                        anchors.fill: parent
-                        radius: AppSettings.borderRadius
-                        color: (playLastRecordingHover.hovered && playLastRecordingButton.enabled)
-                               ? Theme.surfaceHover : Theme.surface
-                    }
-                    HoverBorder {
-                        anchors.fill: parent
-                        active: playLastRecordingButton.enabled && playLastRecordingHover.hovered
-                    }
-                    ToolTip.visible: playLastRecordingHover.hovered
-                    ToolTip.text: recorderPlayer.playing ? qsTr("Pause playback")
-                                                         : qsTr("Play the last recording")
-                    ToolTip.delay: 500
-                    AppIcon {
-                        anchors.centerIn: parent
-                        name: recorderPlayer.playing ? "pause" : "play"
-                        iconSize: 15
-                        color: playLastRecordingButton.enabled ? Theme.textPrimary : Theme.textMuted
-                    }
-                }
-
-                // Route the next take to a temp directory instead of the
-                // vault, for checking levels without leaving real audio
-                // files in the tree.
-                Item {
-                    id: testModeToggleButton
-                    objectName: "testModeToggleButton"
-                    Layout.preferredWidth: 32
-                    Layout.preferredHeight: 32
-                    // The mode is fixed for the duration of a take: the output
-                    // path is chosen at startRecording().
-                    enabled: !recorderPage.audioRecorder.recording
-
-                    HoverHandler {
-                        id: testModeToggleHover
-                        cursorShape: Qt.PointingHandCursor
-                        enabled: testModeToggleButton.enabled
-                    }
-                    TapHandler {
-                        enabled: testModeToggleButton.enabled
-                        onTapped: recorderPage.testMode = !recorderPage.testMode
-                    }
-                    Rectangle {
-                        anchors.fill: parent
-                        radius: AppSettings.borderRadius
-                        color: (testModeToggleHover.hovered && testModeToggleButton.enabled)
-                               ? Theme.surfaceHover : Theme.surface
-                    }
-                    HoverBorder {
-                        anchors.fill: parent
-                        active: testModeToggleButton.enabled && testModeToggleHover.hovered
-                    }
-                    ToolTip.visible: testModeToggleHover.hovered
-                    ToolTip.text: recorderPage.testMode
-                                  ? qsTr("Test mode on — recordings are temporary and never enter the vault")
-                                  : qsTr("Test mode — record temporarily to check levels")
-                    ToolTip.delay: 500
-                    AppIcon {
-                        anchors.centerIn: parent
-                        name: "benchmark"
-                        iconSize: 15
-                        color: recorderPage.testMode ? "#6fdf9f" : Theme.textPrimary
-                    }
-                }
-
-                Label {
-                    id: recordingDurationLabel
-                    objectName: "recordingDurationLabel"
-                    text: recorderPage.formatDuration(recorderPage.takeDurationMs)
-                    color: "white"
-                    font.pixelSize: 16
-                }
-
-                // What to call the take. A pure text box (StyleGuide.md "Text
-                // fields") — it exists only to be typed into, so it keeps its
-                // resting underline rather than going plainUntilHovered.
-                // Disabled during a take for the same reason the test-mode
-                // toggle is: the output path is chosen once, at
-                // startRecording().
-                TextField {
-                    id: recordingNameField
-                    objectName: "recordingNameField"
-                    Layout.preferredWidth: 200
-                    enabled: !recorderPage.audioRecorder.recording
-                    placeholderText: qsTr("Recording name")
-                    text: recorderPage.recordingName
-                    font.pixelSize: 11
-                    background: UnderlineField { focused: recordingNameField.activeFocus }
-                    onTextEdited: recorderPage.recordingName = text
-                    ToolTip.visible: recordingNameHover.hovered
-                    ToolTip.text: qsTr("Name for the next recording — blank uses a timestamp")
-                    ToolTip.delay: 500
-                    // Editable text needs an I-beam.
-                    HoverHandler {
-                        id: recordingNameHover
-                        cursorShape: Qt.IBeamCursor
-                    }
-                }
-
-                Item { Layout.fillWidth: true }
-
-                // Where the next recording lands. "" means the vault root —
-                // the same join rule AudioRecorderIO::buildOutputFilePath()
-                // applies, spelled out here so the destination is never
-                // implicit (the picker button alone showed nothing). Elides
-                // from the left so a deep subfolder still shows its leaf.
-                Label {
-                    id: recordingDestinationLabel
-                    Layout.maximumWidth: 260
-                    text: recorderPage.testMode
-                          ? qsTr("Test recording (temporary)")
-                          : (AppSettings.recordingOutputFolder === ""
-                             ? qsTr("Vault root")
-                             : AppSettings.recordingOutputFolder)
-                    color: recorderPage.testMode ? "#6fdf9f" : Theme.textMuted
-                    font.pixelSize: 11
-                    elide: Text.ElideLeft
-
-                    HoverHandler {
-                        id: recordingDestinationHover
-                    }
-                    ToolTip.visible: recordingDestinationHover.hovered
-                    ToolTip.text: recorderPage.testMode
-                                  ? qsTr("Test recordings are temporary and are not saved to the vault")
-                                  : qsTr("Recordings are saved to %1")
-                                    .arg(recorderPage.vaultLocalPath
-                                         + (AppSettings.recordingOutputFolder === ""
-                                            ? "" : "/" + AppSettings.recordingOutputFolder))
-                    ToolTip.delay: 500
-                }
-
-                // Output folder picker.
-                Item {
-                    id: changeFolderButton
-                    Layout.preferredWidth: 32
-                    Layout.preferredHeight: 32
-
-                    HoverHandler {
-                        id: changeFolderHover
-                        cursorShape: Qt.PointingHandCursor
-                    }
-                    TapHandler {
-                        onTapped: {
-                            const sub = AppSettings.recordingOutputFolder
-                            recordingFolderDialog.currentFolder =
-                                "file://" + recorderPage.vaultLocalPath + (sub ? "/" + sub : "")
-                            recordingFolderDialog.open()
+                    // What to call the take. A pure text box (StyleGuide.md "Text
+                    // fields") — it exists only to be typed into, so it keeps its
+                    // resting underline rather than going plainUntilHovered.
+                    // Disabled during a take for the same reason the test-mode
+                    // toggle is: the output path is chosen once, at
+                    // startRecording().
+                    TextField {
+                        id: recordingNameField
+                        objectName: "recordingNameField"
+                        Layout.fillWidth: true
+                        Layout.minimumWidth: 120
+                        Layout.preferredHeight: 32
+                        enabled: !recorderPage.audioRecorder.recording
+                        placeholderText: qsTr("Recording name")
+                        text: recorderPage.recordingName
+                        font.pixelSize: 11
+                        background: UnderlineField { focused: recordingNameField.activeFocus }
+                        onTextEdited: recorderPage.recordingName = text
+                        ToolTip.visible: recordingNameHover.hovered
+                        ToolTip.text: qsTr("Name for the next recording — blank uses a timestamp")
+                        ToolTip.delay: 500
+                        // Editable text needs an I-beam.
+                        HoverHandler {
+                            id: recordingNameHover
+                            cursorShape: Qt.IBeamCursor
                         }
                     }
-                    Rectangle {
-                        anchors.fill: parent
-                        radius: AppSettings.borderRadius
-                        color: changeFolderHover.hovered ? Theme.surfaceHover : Theme.surface
+
+                    // Where the next recording lands. "" means the vault root —
+                    // the same join rule AudioRecorderIO::buildOutputFilePath()
+                    // applies, spelled out here so the destination is never
+                    // implicit (the picker button alone showed nothing). Elides
+                    // from the left so a deep subfolder still shows its leaf.
+                    Label {
+                        id: recordingDestinationLabel
+                        Layout.preferredWidth: Math.min(implicitWidth, 260)
+                        Layout.preferredHeight: 32
+                        verticalAlignment: Text.AlignVCenter
+                        text: recorderPage.testMode
+                              ? qsTr("Test recording (temporary)")
+                              : (AppSettings.recordingOutputFolder === ""
+                                 ? qsTr("Vault root")
+                                 : AppSettings.recordingOutputFolder)
+                        color: recorderPage.testMode ? "#6fdf9f" : Theme.textMuted
+                        font.pixelSize: 11
+                        elide: Text.ElideLeft
+
+                        HoverHandler {
+                            id: recordingDestinationHover
+                        }
+                        ToolTip.visible: recordingDestinationHover.hovered
+                        ToolTip.text: recorderPage.testMode
+                                      ? qsTr("Test recordings are temporary and are not saved to the vault")
+                                      : qsTr("Recordings are saved to %1")
+                                        .arg(recorderPage.vaultLocalPath
+                                             + (AppSettings.recordingOutputFolder === ""
+                                                ? "" : "/" + AppSettings.recordingOutputFolder))
+                        ToolTip.delay: 500
                     }
-                    HoverBorder {
-                        anchors.fill: parent
-                        active: changeFolderHover.hovered
-                    }
-                    ToolTip.visible: changeFolderHover.hovered
-                    ToolTip.text: qsTr("Change output folder")
-                    ToolTip.delay: 500
-                    AppIcon {
-                        anchors.centerIn: parent
-                        name: "folder"
-                        iconSize: 15
-                        color: Theme.textPrimary
+
+                    // Output folder picker.
+                    Item {
+                        id: changeFolderButton
+                        objectName: "changeFolderButton"
+                        Layout.preferredWidth: 32
+                        Layout.preferredHeight: 32
+
+                        HoverHandler {
+                            id: changeFolderHover
+                            cursorShape: Qt.PointingHandCursor
+                        }
+                        TapHandler {
+                            onTapped: {
+                                const sub = AppSettings.recordingOutputFolder
+                                recordingFolderDialog.currentFolder =
+                                    "file://" + recorderPage.vaultLocalPath + (sub ? "/" + sub : "")
+                                recordingFolderDialog.open()
+                            }
+                        }
+                        Rectangle {
+                            anchors.fill: parent
+                            radius: AppSettings.borderRadius
+                            color: changeFolderHover.hovered ? Theme.surfaceHover : Theme.surface
+                        }
+                        HoverBorder {
+                            anchors.fill: parent
+                            active: changeFolderHover.hovered
+                        }
+                        ToolTip.visible: changeFolderHover.hovered
+                        ToolTip.text: qsTr("Change output folder")
+                        ToolTip.delay: 500
+                        AppIcon {
+                            anchors.centerIn: parent
+                            name: "folder"
+                            iconSize: 15
+                            color: Theme.textPrimary
+                        }
                     }
                 }
+
             }
 
             // Time-windowed waveform + interactive playhead — see
@@ -1545,26 +1772,32 @@ Item {
                             TapHandler {
                                 enabled: appCaptureToggle.enabled
                                 onTapped: {
-                                    let e = Object.assign({}, AppSettings.recordingAppCaptureEnabled)
-                                    e[modelData.name] = !e[modelData.name]
-                                    AppSettings.recordingAppCaptureEnabled = e
+                                    const name = modelData.name
+                                    const arming = !recorderPage.isAppArmed(name)
                                     // Reciprocal of systemAudioToggle's clear
                                     // — turning a per-app row ON drops System
                                     // Audio rather than being blocked by it.
                                     // Only on the ON edge: turning a row off
                                     // must not silently enable anything.
-                                    if (e[modelData.name])
+                                    // Before the write: disarming a quiet,
+                                    // default-gain row destroys this very
+                                    // delegate inside that assignment.
+                                    if (arming)
                                         recorderPage.useSystemAudio = false
+                                    // Disarm deletes rather than storing false,
+                                    // so the map holds only what is configured.
+                                    AppSettings.recordingAppCaptureEnabled = recorderPage.withAppSetting(
+                                        AppSettings.recordingAppCaptureEnabled, name, arming ? true : undefined)
                                 }
                             }
                             Rectangle {
                                 anchors.fill: parent
                                 radius: AppSettings.borderRadius
-                                color: AppSettings.recordingAppCaptureEnabled[modelData.name]
+                                color: recorderPage.isAppArmed(modelData.name)
                                        ? (appCaptureToggleHover.hovered ? Theme.success : Theme.successDim)
                                        : (appCaptureToggleHover.hovered ? Theme.surfaceHover : Theme.surface)
                                 border.width: 1
-                                border.color: AppSettings.recordingAppCaptureEnabled[modelData.name] ? Theme.success : Theme.borderStrong
+                                border.color: recorderPage.isAppArmed(modelData.name) ? Theme.success : Theme.borderStrong
 
                                 Behavior on color { ColorAnimation { duration: AppSettings.animationsEnabled ? 100 : 0 } }
                             }
@@ -1575,7 +1808,7 @@ Item {
                                 horizontalAlignment: Text.AlignHCenter
                                 elide: Text.ElideRight
                                 text: modelData.name
-                                color: AppSettings.recordingAppCaptureEnabled[modelData.name] ? "white" : Theme.textMuted
+                                color: recorderPage.isAppArmed(modelData.name) ? "white" : Theme.textMuted
                                 font.pixelSize: 11
                             }
                         }
@@ -1598,7 +1831,7 @@ Item {
                             // gain for a source that isn't being captured is
                             // inert, and must LOOK inert. No longer gated on
                             // `recording` — a live take honours gain changes.
-                            enabled: AppSettings.recordingAppCaptureEnabled[modelData.name] === true
+                            enabled: recorderPage.isAppArmed(modelData.name)
                             level: recorderPage.appRowLevel(modelData.ids)
                             peak: recorderPage.appRowPeak(modelData.ids)
                             levelColor: recorderPage.bandColor(level)
@@ -1652,18 +1885,48 @@ Item {
         id: recorderPlayer
     }
 
+    Connections {
+        target: recorderPage.transcriptionController
+        // The just-reviewed take was compressed (or the compress undone): the
+        // old file is gone, so the review player moves to the new one
+        // (stopped — it can't resume mid-stream across a source swap). FLAC →
+        // FLAC voice keeps the path, so that case reloads instead.
+        // isSameFile, not toString(): a spaced path stringifies differently
+        // per QUrl construction. The stem is unchanged by construction, so
+        // only the extension is swapped on the stored path.
+        function onAudioCompressed(oldUrl, newUrl) {
+            const tc = recorderPage.transcriptionController
+            const oldPath = recorderPage.lastRecordingPath
+            if (oldPath === "" || !tc.isSameFile(oldUrl, "file://" + oldPath))
+                return
+            const newStr = newUrl.toString()
+            recorderPage.lastRecordingPath = oldPath.substring(0, oldPath.lastIndexOf("."))
+                + newStr.substring(newStr.lastIndexOf("."))
+            if (tc.isSameFile(recorderPlayer.source, oldUrl)) {
+                recorderPlayer.pause()
+                if (tc.isSameFile(oldUrl, newUrl))
+                    recorderPlayer.reload()
+                else
+                    recorderPlayer.source = newUrl
+            }
+        }
+    }
+
     FolderDialog {
         id: recordingFolderDialog
         onAccepted: {
-            const localPath = recordingFolderDialog.selectedFolder.toString().replace("file://", "")
-            if (!recorderPage.vaultTreeModel || !recorderPage.vaultTreeModel.isPathInsideVault(localPath)) {
+            // vaultRelativePath canonicalizes both sides, so a vault opened via a
+            // symlink still yields a relative path instead of falling through to
+            // an absolute one; "" = outside, "." = the vault root.
+            const relative = recorderPage.vaultTreeModel
+                ? recorderPage.vaultTreeModel.vaultRelativePath(recordingFolderDialog.selectedFolder.toString())
+                : ""
+            if (relative === "") {
                 recorderPage.recordingFolderError = qsTr("That folder is outside the vault — pick a location inside it.")
                 return
             }
             recorderPage.recordingFolderError = ""
-            const prefix = recorderPage.vaultLocalPath + "/"
-            AppSettings.recordingOutputFolder = localPath === recorderPage.vaultLocalPath ? ""
-                : (localPath.startsWith(prefix) ? localPath.slice(prefix.length) : localPath)
+            AppSettings.recordingOutputFolder = relative === "." ? "" : relative
         }
     }
 }

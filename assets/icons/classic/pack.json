@@ -12,6 +12,10 @@
     "chapters": "≡",
     "speakers": "☻",
     "combine": "⛓",
+    "compress": "⇊",
+    "format-voice": "🗣",
+    "format-flac": "HQ",
+    "format-wav": "≋",
     "group-merge": "⊕",
 
     "delete-transcript": "⌫",

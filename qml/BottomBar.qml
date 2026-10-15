@@ -493,6 +493,23 @@ Item {
             }
         }
 
+        // Exactly one child of this row absorbs its slack, and everything
+        // AFTER that child is what reads as right-aligned. Normally the
+        // absorber is the path (greedy mode) or the task label (shrink mode) —
+        // but the task label is hidden whenever there's no job to show, and an
+        // invisible Layout child claims nothing, which left the whole
+        // right-hand cluster ("x/x tasks" included) packed against the path
+        // instead of the right margin. This spacer covers exactly that gap.
+        // Visible only when it has work to do: a zero-width VISIBLE child
+        // would still cost the row two `spacing` gaps.
+        Item {
+            id: rightSlackSpacer
+            objectName: "bottomBarSpacer"
+            visible: AppSettings.bottomBarPathShrinkToContent && !bottomBar.hasDisplayJob
+            Layout.fillWidth: true
+            Layout.preferredWidth: 0
+        }
+
         HoverUnderlineLabel {
             id: taskLabel
             objectName: "bottomBarTaskLabel"
@@ -667,6 +684,10 @@ Item {
         // counter whose width changes as the numbers grow).
         HoverUnderlineLabel {
             id: tasksLabel
+            // Carries an objectName purely so tst_bottombar_pathsegments can
+            // locate it and assert where it lands (same trick as the path's
+            // "pathSegment").
+            objectName: "bottomBarTasksCount"
             // Always visible — the counter reads "0/0 tasks" when
             // idle (fresh start / after Clear) rather than vanishing, so the
             // Tasks popup stays reachable and the count is a stable fixture.

@@ -1,6 +1,7 @@
 #include "UsbGrabJob.h"
 
 #include "CombineNaming.h"
+#include "FileRename.h"
 #include "VaultTreeModel.h"
 
 #include <QCoreApplication>
@@ -255,6 +256,17 @@ QString usbGrabRefusalReason(const QString &scanRoot, const QString &destination
             .arg(source);
     }
     return QString();
+}
+
+QString usbGrabDestinationRefusal(const QString &destinationFolder, const QString &vaultLocalPath)
+{
+    const QString refusal =
+        QStringLiteral("Refusing to grab into \"%1\": the destination folder is outside the vault.").arg(destinationFolder);
+    if (QDir::isAbsolutePath(destinationFolder))
+        return refusal;
+    const QString resolved =
+        destinationFolder.isEmpty() ? vaultLocalPath : vaultLocalPath + QLatin1Char('/') + destinationFolder;
+    return pathIsInsideVault(resolved, vaultLocalPath) ? QString() : refusal;
 }
 
 UsbGrabScanResult runUsbGrabScan(const UsbGrabRule &rule, const QString &mountPath,

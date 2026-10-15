@@ -23,7 +23,8 @@ Popup {
     // presentation reorg — every control/binding/save-hook is unchanged, only
     // grouped behind a page gate.
     readonly property var pageNames: [qsTr("Appearance"), qsTr("Sidebar & Layout"),
-                                      qsTr("Transcription & AI"), qsTr("Combine"), qsTr("Models")]
+                                      qsTr("Transcription & AI"), qsTr("Recorder"), qsTr("Combine"),
+                                      qsTr("Models")]
     property int currentPage: 0
 
     // Whether the (long) per-icon override grid is expanded. Collapsed by
@@ -190,6 +191,7 @@ Popup {
                 || !AppSettings.isDefault("rimWidth")
                 || !AppSettings.isDefault("rimColor")
                 || !AppSettings.isDefault("recordingActiveColor")
+                || !AppSettings.isDefault("recordingFormat")
                 || !AppSettings.isDefault("highlightColor")
                 || !AppSettings.isDefault("highlightRadius")
                 || !AppSettings.isDefault("sidebarSelectionColor")
@@ -1108,7 +1110,7 @@ Popup {
             ColumnLayout {
                 Layout.fillWidth: true
                 spacing: 10
-                visible: settingsPopup.currentPage === 0
+                visible: settingsPopup.currentPage === 3
 
             Label {
                 text: qsTr("Recorder Waveform")
@@ -1169,6 +1171,50 @@ Popup {
                 label: qsTr("Mirror the wave above and below the centre line")
                 labelWrap: true
                 propertyName: "recordingWaveformMirrored"
+            }
+
+            }
+
+            // --- Recording file format ---
+            ColumnLayout {
+                Layout.fillWidth: true
+                spacing: 10
+                visible: settingsPopup.currentPage === 3
+
+            Label {
+                text: qsTr("Recordings")
+                color: "white"
+                font.bold: true
+            }
+
+            RowLayout {
+                Layout.fillWidth: true
+                Label {
+                    Layout.fillWidth: true
+                    Layout.alignment: Qt.AlignVCenter
+                    color: "white"
+                    text: qsTr("Save takes as")
+                }
+                AppComboBox {
+                    id: recordingFormatCombo
+                    objectName: "recordingFormatCombo"
+                    Layout.preferredWidth: 180
+                    model: AppSettings.recordingFormatOptions()
+                    selectedId: AppSettings.recordingFormat
+                    onPicked: id => AppSettings.recordingFormat = id
+                }
+                SettingResetButton { propertyName: "recordingFormat" }
+            }
+
+            Label {
+                Layout.fillWidth: true
+                wrapMode: Text.WordWrap
+                color: Theme.textMuted
+                font.pixelSize: 11
+                text: qsTr("FLAC voice ≈ 70 MB/hour — exactly what transcription uses, so transcripts are "
+                           + "unchanged; playback is mono and loses highs. FLAC ≈ 250 MB/hour, full quality. "
+                           + "WAV ≈ 690 MB/hour. Takes are encoded as they are recorded; the compress button "
+                           + "turns existing WAV or full-quality FLAC files into FLAC voice.")
             }
 
             }
@@ -1798,7 +1844,7 @@ Popup {
             ColumnLayout {
                 Layout.fillWidth: true
                 spacing: 10
-                visible: settingsPopup.currentPage === 3
+                visible: settingsPopup.currentPage === 4
 
             Label {
                 text: qsTr("Combine split recordings")
@@ -2591,7 +2637,7 @@ Popup {
             // the app-global model store (see DESIGN.md "Model management").
             ModelsPage {
                 Layout.fillWidth: true
-                visible: settingsPopup.currentPage === 4
+                visible: settingsPopup.currentPage === 5
                 transcriptionController: settingsPopup.transcriptionController
             }
 

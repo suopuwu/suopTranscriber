@@ -1,5 +1,6 @@
 #include "TaskQuery.h"
 
+#include "FileRename.h" // isSameRecording()
 #include "tasks/DownloadTask.h"
 #include "tasks/Task.h"
 
@@ -72,6 +73,24 @@ bool TaskQuery::isQueued(const TaskList &tasks, const QUrl &fileUrl)
             && (task->status == Task::Status::Queued || task->status == Task::Status::Active
                 || task->status == Task::Status::Paused))
             return true;
+    }
+    return false;
+}
+
+bool TaskQuery::otherLiveTaskTouches(const TaskList &tasks, const Task *self)
+{
+    const QList<QUrl> mine = self->touchedFiles();
+    for (const auto &task : tasks) {
+        if (task.get() == self
+            || (task->status != Task::Status::Queued && task->status != Task::Status::Active
+                && task->status != Task::Status::Paused))
+            continue;
+        for (const QUrl &theirs : task->touchedFiles()) {
+            for (const QUrl &url : mine) {
+                if (isSameRecording(theirs, url))
+                    return true;
+            }
+        }
     }
     return false;
 }

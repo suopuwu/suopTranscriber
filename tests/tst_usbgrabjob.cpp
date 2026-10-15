@@ -801,6 +801,25 @@ private slots:
         QVERIFY(!usbGrabRefusalReason(device.path(), device.filePath("Nested/Vault")).isEmpty());
     }
 
+    // A rule's destinationFolder must keep the grab inside the vault, however
+    // it's spelled — rules load from disk unvalidated.
+    void destinationRefusal_rejectsEscapes_allowsSubfolders()
+    {
+        QTemporaryDir vault;
+        QVERIFY(vault.isValid());
+        QCOMPARE(usbGrabDestinationRefusal(QString(), vault.path()), QString());
+        QCOMPARE(usbGrabDestinationRefusal(QStringLiteral("Interviews/USB"), vault.path()), QString());
+        QVERIFY(!usbGrabDestinationRefusal(QStringLiteral(".."), vault.path()).isEmpty());
+        QVERIFY(!usbGrabDestinationRefusal(QStringLiteral("a/../../escaped"), vault.path()).isEmpty());
+        QVERIFY(!usbGrabDestinationRefusal(QStringLiteral("/tmp"), vault.path()).isEmpty());
+
+        // A symlink inside the vault pointing out of it is an escape too.
+        QTemporaryDir outside;
+        QVERIFY(outside.isValid());
+        QVERIFY(QFile::link(outside.path(), vault.filePath("out-link")));
+        QVERIFY(!usbGrabDestinationRefusal(QStringLiteral("out-link/sub"), vault.path()).isEmpty());
+    }
+
     // End-to-end: a refused run reports the reason through the result's refusal
     // and copies nothing. Uses a destination inside the scan root (a refusal that's
     // safe to actually execute, unlike pointing a real job at "/").

@@ -533,6 +533,43 @@ private slots:
                  "while the Tasks popup is open");
     }
 
+    // Closing mid-recording must not hard-exit before the recorder's worker
+    // writes the WAV header: onClosing (the ONE close path) refuses while a take
+    // is live or still finalizing, and the quit resumes only from
+    // onRecordingFinished. Main.qml has no QQuickView harness (component
+    // harnesses don't load it), hence a scan.
+    void mainClose_waitsForRecordingToFinalize()
+    {
+        const QString src = stripComments(readAll(QStringLiteral(SUOP_QML_DIR "/Main.qml")));
+        const QString closing = functionBody(src, QStringLiteral("onClosing:"));
+        QVERIFY2(!closing.isEmpty(), "Main.qml must have an onClosing handler");
+        const int exitIdx = closing.indexOf(QStringLiteral("terminateApplicationImmediately()"));
+        QVERIFY2(exitIdx >= 0, "onClosing must still end in the hard exit");
+        const int recIdx = closing.indexOf(QStringLiteral("audioRecorder.recording"));
+        const int finIdx = closing.indexOf(QStringLiteral("audioRecorder.activeRecordingPath"));
+        QVERIFY2(recIdx >= 0 && recIdx < exitIdx,
+                 "onClosing must check audioRecorder.recording before the hard exit");
+        QVERIFY2(finIdx >= 0 && finIdx < exitIdx,
+                 "onClosing must also wait out finalization (activeRecordingPath still set) — "
+                 "`recording` flips false on the Stop click, before the header is written");
+        QVERIFY2(closing.count(QStringLiteral("close.accepted = false")) >= 2,
+                 "both the live-take and the finalizing branch must refuse the close");
+
+        const int popupIdx = src.indexOf(QStringLiteral("id: stopRecordingAndQuitPopup"));
+        QVERIFY2(popupIdx >= 0, "Main.qml must declare stopRecordingAndQuitPopup");
+        const QString confirm = functionBody(src.mid(popupIdx), QStringLiteral("onConfirmed:"));
+        QVERIFY2(confirm.contains(QStringLiteral("audioRecorder.stopRecording()"))
+                     && confirm.contains(QStringLiteral("quitAfterRecordingStops = true")),
+                 "the stop-and-quit confirm must arm the quit and stop the take");
+        QVERIFY2(!confirm.contains(QStringLiteral("terminateApplicationImmediately")),
+                 "confirm must not exit directly — that truncates the recording");
+
+        const QString finished = functionBody(src, QStringLiteral("function onRecordingFinished("));
+        QVERIFY2(finished.contains(QStringLiteral("quitAfterRecordingStops"))
+                     && finished.contains(QStringLiteral("window.close()")),
+                 "the quit must resume from onRecordingFinished via window.close()");
+    }
+
     // Regression: Sidebar.qml's treeDelegate (a TreeView row) recycles a
     // fixed pool of delegate Items as rows scroll in/out of view. Required
     // properties bound to model roles (path/isAudio/label/...) get reassigned
@@ -707,6 +744,71 @@ private slots:
                  "the bare deviceEnabledSwitch must be replaced by a labeled UsbToggle");
         QVERIFY2(!src.contains(QStringLiteral("id: catchAllEnabledSwitch")),
                  "the bare catchAllEnabledSwitch must be replaced by a labeled UsbToggle");
+    }
+
+    // The destination picker must resolve through VaultTreeModel::vaultRelativePath
+    // (canonical, symlink-aware, url-decoding) — a hand-rolled prefix strip of
+    // toString().replace("file://") kept "%20" and fell back to absolute paths.
+    void usbGrabberDestinationPicker_usesVaultRelativePath()
+    {
+        const QString src = stripComments(readAll(QStringLiteral(SUOP_QML_DIR "/UsbGrabberPage.qml")));
+        const QString helper = functionBody(src, QStringLiteral("function relativeToVault("));
+        QVERIFY2(helper.contains(QStringLiteral("vaultRelativePath(")),
+                 "relativeToVault() must delegate to vaultTreeModel.vaultRelativePath()");
+        QVERIFY2(!src.contains(QStringLiteral(".replace(\"file://\"")),
+                 "no hand-rolled file:// stripping — pass the url to vaultRelativePath()");
+        const QString accepted = functionBody(src, QStringLiteral("onAccepted:"));
+        QVERIFY2(accepted.contains(QStringLiteral("relativeToVault(usbDestinationFolderDialog.selectedFolder)")),
+                 "the dialog must hand its selectedFolder url straight to relativeToVault()");
+    }
+
+    // Popup menu rows over the vault tree must take the press exclusively: a
+    // default (DragThreshold) TapHandler only grabs passively, so the press also
+    // reached the tree row beneath and opened that file once the menu closed.
+    // tst_sidebar_contextmenu proves it for contextMenu; this pins the others.
+    void sidebarPopupMenus_tapHandlersTakeThePressExclusively_data()
+    {
+        QTest::addColumn<QString>("file");
+        QTest::addColumn<QString>("popupId");
+        QTest::newRow("context menu") << QStringLiteral("Sidebar.qml") << QStringLiteral("contextMenu");
+        QTest::newRow("move to") << QStringLiteral("Sidebar.qml") << QStringLiteral("moveToPopup");
+        QTest::newRow("sort mode") << QStringLiteral("SidebarRibbon.qml") << QStringLiteral("sortModeMenu");
+    }
+    void sidebarPopupMenus_tapHandlersTakeThePressExclusively()
+    {
+        QFETCH(QString, file);
+        QFETCH(QString, popupId);
+        const QString src = stripComments(readAll(QStringLiteral(SUOP_QML_DIR "/") + file));
+        const qsizetype idAt = src.indexOf(QStringLiteral("id: ") + popupId + QLatin1Char('\n'));
+        QVERIFY2(idAt >= 0, qPrintable(popupId + QStringLiteral(" must exist in ") + file));
+        const qsizetype popupAt = src.lastIndexOf(QStringLiteral("Popup {"), idAt);
+        QVERIFY(popupAt >= 0);
+        const QString popup = functionBody(src.mid(popupAt), QStringLiteral("Popup {"));
+        int handlers = 0;
+        for (qsizetype at = popup.indexOf(QStringLiteral("TapHandler {")); at >= 0;
+             at = popup.indexOf(QStringLiteral("TapHandler {"), at + 1)) {
+            ++handlers;
+            QVERIFY2(functionBody(popup.mid(at), QStringLiteral("TapHandler {"))
+                         .contains(QStringLiteral("gesturePolicy: TapHandler.WithinBounds")),
+                     qPrintable(QStringLiteral("every TapHandler in %1 needs gesturePolicy: "
+                                               "TapHandler.WithinBounds").arg(popupId)));
+        }
+        QVERIFY2(handlers > 0, qPrintable(popupId + QStringLiteral(" has no TapHandlers — guard is stale")));
+    }
+
+    // Same contract for the recorder's output-folder picker: a text-prefix strip
+    // stored an ABSOLUTE path whenever the vault's spelling differed (symlink),
+    // which the recorder then joined onto the vault.
+    void recorderFolderPicker_usesVaultRelativePath()
+    {
+        const QString src = stripComments(readAll(QStringLiteral(SUOP_QML_DIR "/RecorderPage.qml")));
+        const qsizetype dialog = src.indexOf(QStringLiteral("id: recordingFolderDialog"));
+        QVERIFY2(dialog >= 0, "RecorderPage must keep recordingFolderDialog");
+        const QString accepted = functionBody(src.mid(dialog), QStringLiteral("onAccepted:"));
+        QVERIFY2(accepted.contains(QStringLiteral("vaultRelativePath(recordingFolderDialog.selectedFolder")),
+                 "the recorder folder dialog must resolve through vaultTreeModel.vaultRelativePath()");
+        QVERIFY2(!src.contains(QStringLiteral(".replace(\"file://\"")),
+                 "no hand-rolled file:// stripping in RecorderPage");
     }
 
     // The USB grabber top-level screen was pulled out of the
@@ -1189,7 +1291,9 @@ private slots:
         // "stream:<object.serial>" id cannot do (the serial dies with the
         // connection and a new one is minted on reconnect) — the name is
         // what makes a persistent row possible.
-        QVERIFY2(slider.contains(QStringLiteral("enabled: AppSettings.recordingAppCaptureEnabled[modelData.name]")),
+        // Through isAppArmed(), which resolves any spelling of the app (see
+        // AudioRecorder::appNameKey) to its saved arm.
+        QVERIFY2(slider.contains(QStringLiteral("enabled: recorderPage.isAppArmed(modelData.name)")),
                  "a per-app gain slider must gate on that app's own capture toggle, the way "
                  "micGainSlider gates on useMic — otherwise it stays live for a source that "
                  "isn't being captured");
@@ -1278,8 +1382,8 @@ private slots:
         QVERIFY(!page.isEmpty());
 
         QVERIFY2(page.contains(QStringLiteral("property var rememberedAppNames")),
-                 "the page must remember every application name seen live this session, or a row "
-                 "can never survive its app going quiet");
+                 "the page must remember every configured application name, or a row can never "
+                 "survive its app going quiet");
         QVERIFY2(page.contains(QStringLiteral("readonly property var appCaptureRows")),
                  "the row model must be a distinct property from the live appStreams list");
 
@@ -1291,12 +1395,17 @@ private slots:
                  "binding rows straight to the live stream list is the regression this guard exists "
                  "to prevent — a row (and its gain) would vanish the instant its app goes quiet");
 
-        const QString onAppStreamsChanged = functionBody(page, QStringLiteral("onAppStreamsChanged:"));
-        QVERIFY2(!onAppStreamsChanged.isEmpty(), "RecorderPage must handle onAppStreamsChanged to remember names");
-        QVERIFY2(onAppStreamsChanged.contains(QStringLiteral("indexOf")) || onAppStreamsChanged.contains(QStringLiteral("added")),
-                 "the union into rememberedAppNames must be conditional on a real addition — an "
-                 "unconditional reassignment rebuilds every Repeater delegate on each 3s poll, "
-                 "yanking a slider out from under a drag");
+        QVERIFY2(page.contains(QStringLiteral("onAppStreamsChanged: recorderPage.recomputeRememberedAppNames()")),
+                 "RecorderPage must recompute rememberedAppNames when the live streams change");
+        const QString recompute = functionBody(page, QStringLiteral("function recomputeRememberedAppNames()"));
+        QVERIFY2(!recompute.isEmpty(), "RecorderPage must define recomputeRememberedAppNames()");
+        QVERIFY2(recompute.contains(QStringLiteral(".join(")) && recompute.contains(QStringLiteral("!==")),
+                 "rememberedAppNames must be reassigned only on a real change — an unconditional "
+                 "reassignment rebuilds every Repeater delegate on each 3s poll, yanking a slider "
+                 "out from under a drag");
+        QVERIFY2(recompute.contains(QStringLiteral("appNameKey")),
+                 "remembered names must be deduplicated by AudioRecorder::appNameKey — exact-string "
+                 "membership is what made every spelling of one app its own permanent row");
 
         const QString dot = enclosingBlock(page, QStringLiteral("id: appCaptureActiveDot"));
         QVERIFY2(!dot.isEmpty(), "the per-app row must have an active-stream dot");
@@ -1825,7 +1934,7 @@ private slots:
         QVERIFY2(systemToggle.contains(QStringLiteral("if (recorderPage.useSystemAudio)")),
                  "the System Audio clear must be guarded on its own ON edge");
         // Keyed by application name, not stream id.
-        QVERIFY2(appToggle.contains(QStringLiteral("if (e[modelData.name])")),
+        QVERIFY2(appToggle.contains(QStringLiteral("if (arming)")),
                  "the per-app clear must be guarded on that row's own ON edge");
 
         QVERIFY2(!enclosingBlock(page, QStringLiteral("id: appCaptureExclusionNote")).isEmpty(),
@@ -3300,6 +3409,33 @@ private slots:
     // guard that the page state, the rail selector, the per-section page
     // gating, and the persistent chrome all exist rather than a behavioral
     // test.
+    // Recorder settings (take format, waveform) live on their own "Recorder"
+    // settings page — they used to sit at the bottom of Appearance, where
+    // nobody looking for the recording format would find them.
+    void settingsPopup_recorderSettingsAreOnTheRecorderPage()
+    {
+        const QString src = stripComments(readAll(QStringLiteral(SUOP_QML_DIR "/SettingsPopup.qml")));
+        const int namesAt = src.indexOf(QStringLiteral("property var pageNames"));
+        QVERIFY2(namesAt >= 0, "SettingsPopup must declare pageNames");
+        const QString names = src.mid(namesAt, src.indexOf(QLatin1Char(']'), namesAt) - namesAt);
+        static const QRegularExpression pageRe(QStringLiteral("qsTr\\(\"([^\"]+)\"\\)"));
+        QStringList pages;
+        for (auto it = pageRe.globalMatch(names); it.hasNext();)
+            pages << it.next().captured(1);
+        const int recorderPage = pages.indexOf(QStringLiteral("Recorder"));
+        QVERIFY2(recorderPage >= 0, qPrintable(QStringLiteral("pageNames must include \"Recorder\": ") + pages.join(u',')));
+
+        const QString gate = QStringLiteral("visible: settingsPopup.currentPage === ");
+        for (const QString &control : {QStringLiteral("id: recordingFormatCombo"),
+                                       QStringLiteral("id: recordingWaveformMirroredToggle")}) {
+            const int at = src.indexOf(control);
+            QVERIFY2(at >= 0, qPrintable(control + QStringLiteral(" must exist")));
+            const int gateAt = src.lastIndexOf(gate, at);
+            QVERIFY2(gateAt >= 0, qPrintable(control + QStringLiteral(" must sit in a page-gated section")));
+            QCOMPARE(src.mid(gateAt + gate.size(), 2).trimmed().toInt(), recorderPage);
+        }
+    }
+
     void settingsPopup_multiPageNavigation()
     {
         const QString src = readAll(QStringLiteral(SUOP_QML_DIR "/SettingsPopup.qml"));
@@ -6339,6 +6475,50 @@ private slots:
                  "searchDetectSpeakersPaths()");
     }
 
+    // Compress (undoable, to FLAC voice or lossless FLAC) at all three
+    // per-file-action sites, each the shared CompressButton offering both
+    // targets — and NOT reachable through run-all: it replaces the original,
+    // so it only runs on explicit request.
+    void compressActionParityAndNeverInRunAll()
+    {
+        const QString sidebar = stripComments(sidebarTreeSrc());
+        const QString mainPanel = stripComments(mainPanelSrc());
+        const QString call = QStringLiteral("transcriptionController.compressAudioFiles(");
+
+        for (const QString &site : {QStringLiteral("id: compressAllButton"), QStringLiteral("id: searchCompressButton")}) {
+            const QString block = enclosingBlock(sidebar, site);
+            const QRegularExpression typed(QStringLiteral("CompressButton\\s*\\{\\s*") + QRegularExpression::escape(site));
+            QVERIFY2(typed.match(sidebar).hasMatch(), qPrintable(site + QStringLiteral(" must be a CompressButton")));
+            QVERIFY2(block.contains(QStringLiteral("voiceEnabled:")) && block.contains(QStringLiteral("losslessEnabled:"))
+                         && block.contains(call),
+                     qPrintable(site + QStringLiteral(" must offer both targets and call compressAudioFiles()")));
+        }
+        const QString ribbon = enclosingBlock(sidebar, QStringLiteral("id: compressAllButton"));
+        QVERIFY2(ribbon.contains(QStringLiteral("sidebar.selectionCompressVoicePaths"))
+                     && ribbon.contains(QStringLiteral("sidebar.selectionCompressLosslessPaths")),
+                 "ribbon compressAllButton must act on the selection's per-target eligible paths");
+        QVERIFY2(functionBody(sidebar, QStringLiteral("function searchCompressPaths(")).contains(QStringLiteral("isCompressibleAudio(")),
+                 "searchCompressPaths() must filter by isCompressibleAudio()");
+        const QString panel = enclosingBlock(mainPanel, QStringLiteral("id: compressAudioButton"));
+        QVERIFY2(panel.contains(call) && panel.contains(QStringLiteral("mainPanel.openFileVoiceCompressible"))
+                     && panel.contains(QStringLiteral("mainPanel.openFileLosslessCompressible")),
+                 "MainPanel compressAudioButton must gate each target on its openFile*Compressible");
+        // Plain properties refreshed imperatively, not a binding over the
+        // invokable: an in-place FLAC replace changes the answer with no
+        // source change to re-trigger a binding.
+        QVERIFY2(functionBody(mainPanel, QStringLiteral("function refreshOpenFileCompressible(")).contains(QStringLiteral("isCompressibleAudio(")),
+                 "refreshOpenFileCompressible() must compute eligibility via isCompressibleAudio()");
+        QVERIFY2(functionBody(mainPanel, QStringLiteral("function onAudioCompressed(")).contains(QStringLiteral("refreshOpenFileCompressible()")),
+                 "an in-place compress must refresh the open file's eligibility");
+
+        for (const QString &runAll : {QStringLiteral("id: runAllButton"), QStringLiteral("id: searchRunAllButton")}) {
+            const QString block = enclosingBlock(sidebar, runAll);
+            QVERIFY2(!block.isEmpty(), qPrintable(runAll + QStringLiteral(" must exist")));
+            QVERIFY2(!block.contains(QStringLiteral("compress"), Qt::CaseInsensitive),
+                     qPrintable(runAll + QStringLiteral(" must never compress")));
+        }
+    }
+
     // Regression: "regenerate chapters" was reachable from the
     // per-file-action-parity sites, but every one of them gated on
     // relabelEligible (isAudio required), so an orphaned .md (audio deleted,
@@ -7368,6 +7548,24 @@ private slots:
                  "before levelFill before peakLine, or the gain fill buries the live meter");
     }
 
+    // Takes are encoded live (AudioRecorder's FLAC encoder); nothing
+    // compresses a finished take afterwards — replacing a file is the
+    // explicit, undoable compress action only. That encoder is the one
+    // deliberate exception to everyProcessSpawnGuardsChildLifetime: it must
+    // outlive a crashed app, whose closing stdin is what makes it finish the
+    // file (and an s16 pipe at EOF can't wedge it).
+    void recorder_neverCompressesAFinishedTake()
+    {
+        const QString page = stripComments(readAll(QStringLiteral(SUOP_QML_DIR "/RecorderPage.qml")));
+        QVERIFY2(!page.contains(QStringLiteral("compressRecording(")) && !page.contains(QStringLiteral("compressAudioFiles(")),
+                 "RecorderPage must not compress takes — the recorder encodes them live");
+        const QString recorder = stripComments(readAll(QStringLiteral(SUOP_SRC_DIR "/core/AudioRecorder.cpp")));
+        QVERIFY2(recorder.contains(QStringLiteral("liveEncoderArguments(")),
+                 "AudioRecorder must encode takes live via liveEncoderArguments()");
+        QVERIFY2(!recorder.contains(QStringLiteral("guardChildLifetime(")),
+                 "the live encoder must NOT be killed with the app — it finalizes the take on stdin EOF");
+    }
+
     // Every QProcess spawned by these files must be tied to the app's
     // lifetime via ProcessRunner::guardChildLifetime (PR_SET_PDEATHSIG) or a
     // wedged child (ffmpeg on a NaN sample, curl on a stalled connection, …)
@@ -7388,6 +7586,7 @@ private slots:
         const QStringList files = {
             QStringLiteral(SUOP_SRC_DIR "/core/AudioDecoder.cpp"),
             QStringLiteral(SUOP_SRC_DIR "/core/tasks/CombineTask.cpp"),
+            QStringLiteral(SUOP_SRC_DIR "/core/tasks/CompressAudioTask.cpp"),
             QStringLiteral(SUOP_SRC_DIR "/core/SubprocessEngine.cpp"),
             QStringLiteral(SUOP_SRC_DIR "/core/GpuProbe.cpp"),
             QStringLiteral(SUOP_SRC_DIR "/core/ModelManager.cpp"),

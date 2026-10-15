@@ -61,6 +61,7 @@
 #include "tasks/CombineTask.h"
 #include "tasks/DeleteTask.h"
 #include "tasks/DetectSilenceTask.h"
+#include "tasks/CompressAudioTask.h"
 #include "tasks/DiarizationSweepTask.h"
 #include "tasks/DiarizeTask.h"
 #include "tasks/DownloadTask.h"
@@ -74,6 +75,7 @@
 #include "tasks/RenameFileTask.h"
 #include "tasks/RenameSpeakerTask.h"
 #include "tasks/RestoreTask.h"
+#include "tasks/RevertCompressionTask.h"
 #include "tasks/Task.h"
 #include "tasks/TrashTask.h"
 #include "tasks/TaskFactory.h"
@@ -610,6 +612,21 @@ void TranscriptionController::connectTask(Task *task)
                     }
                     emit fileRenamed(oldUrl, newUrl, ok, error);
                 });
+    } else if (auto *compress = qobject_cast<CompressAudioTask *>(task)) {
+        connect(compress, &CompressAudioTask::audioCompressed, this,
+                [this](const QUrl &oldUrl, const QUrl &newUrl) {
+                    // In place, like a rename — see the RenameFileTask branch.
+                    if (m_vaultModel)
+                        m_vaultModel->applyRenameOutcome(oldUrl, newUrl);
+                    emit audioCompressed(oldUrl, newUrl);
+                });
+    } else if (auto *revert = qobject_cast<RevertCompressionTask *>(task)) {
+        connect(revert, &RevertCompressionTask::audioCompressed, this,
+                [this](const QUrl &oldUrl, const QUrl &newUrl) {
+                    if (m_vaultModel)
+                        m_vaultModel->applyRenameOutcome(oldUrl, newUrl);
+                    emit audioCompressed(oldUrl, newUrl);
+                });
     } else if (auto *moveFileTask = qobject_cast<MoveTask *>(task)) {
         connect(moveFileTask, &MoveTask::fileMoved, this, &TranscriptionController::fileMoved);
     } else if (auto *folderRename = qobject_cast<FolderRenameTask *>(task)) {
@@ -969,6 +986,49 @@ void TranscriptionController::detectSilences(const QUrl &fileUrl, const QUrl &va
     enqueueTask(std::make_unique<DetectSilenceTask>(fileUrl, vaultUrl));
 }
 
+bool TranscriptionController::isCompressQueued(const QUrl &fileUrl) const
+{
+    // Not TaskQuery::isKindQueued(): that skips tasks that don't occupy their
+    // file, which a queued compress deliberately doesn't.
+    const QString path = fileUrl.toLocalFile();
+    for (const auto &t : m_scheduler->tasks()) {
+        if (qobject_cast<CompressAudioTask *>(t.get()) && t->fileUrl.toLocalFile() == path
+            && (t->status == Task::Status::Queued || t->status == Task::Status::Active
+                || t->status == Task::Status::Paused))
+            return true;
+    }
+    return false;
+}
+
+bool TranscriptionController::isCompressibleAudio(const QString &pathOrUrl, const QString &target)
+{
+    const auto t = CompressAudioTask::targetFromString(target);
+    return t && CompressAudioTask::isCompressible(
+        pathOrUrl.startsWith(QStringLiteral("file:")) ? QUrl(pathOrUrl).toLocalFile() : pathOrUrl, *t);
+}
+
+void TranscriptionController::compressAudioFiles(const QVariantList &fileUrls, const QUrl &vaultUrl,
+                                                 const QString &target)
+{
+    const auto t = CompressAudioTask::targetFromString(target);
+    if (!t)
+        return;
+    std::vector<std::unique_ptr<Task>> tasks;
+    QSet<QString> batched;
+    for (const QVariant &entry : fileUrls) {
+        const QUrl url = QUrl::fromLocalFile(entry.toUrl().toLocalFile());
+        const QString path = url.toLocalFile();
+        if (path.isEmpty() || !CompressAudioTask::isCompressible(path, *t) || path == m_activeRecordingPath
+            || isCompressQueued(url)
+            || batched.contains(path))
+            continue;
+        batched.insert(path);
+        tasks.push_back(std::make_unique<CompressAudioTask>(url, vaultUrl, *t));
+    }
+    if (!tasks.empty())
+        m_scheduler->enqueueBatch(std::move(tasks));
+}
+
 void TranscriptionController::relabel(const QUrl &fileUrl, const QUrl &vaultUrl, bool restrictTagsToExisting,
                                        double tagReuseBias, double wordiness)
 {
@@ -1030,6 +1090,7 @@ QStringList TranscriptionController::pendingJobKinds(const QUrl &fileUrl) const
         return {QStringLiteral("diarize"), QStringLiteral("relabel"), QStringLiteral("chapters")};
 
     QString speakerDetection, label, tags;
+    QStringList knownSpeakers;
     for (const QString &line : std::as_const(frontmatterLines)) {
         const int colon = line.indexOf(QLatin1Char(':'));
         if (colon < 0)
@@ -1042,7 +1103,17 @@ QStringList TranscriptionController::pendingJobKinds(const QUrl &fileUrl) const
             label = value;
         else if (key == QStringLiteral("tags"))
             tags = value;
+        else if (key == QStringLiteral("speakers"))
+            knownSpeakers = parseSpeakersList(value);
     }
+
+    // No segment text at all (a fully-silent recording transcribes to an
+    // empty body) — every derived pass needs segments to work on, so queuing
+    // any of them would enqueue guaranteed failures. Run-all is a no-op on
+    // such a file; the manual per-file actions still run and report their
+    // own "no transcript text" errors.
+    if (plainTextFromTranscriptBody(body, knownSpeakers).isEmpty())
+        return {};
 
     QStringList pending;
     if (!MdFrontmatter::isTrue(speakerDetection))
@@ -1149,6 +1220,10 @@ void TranscriptionController::runAllJobsForPaths(const QVariantList &fileUrls, c
 // (which emits nothing) runs at the end, before the scheduler's queueChanged.
 void TranscriptionController::onSerialTaskStarting(Task *task, bool wasCancelling)
 {
+    // Decided at dispatch, not enqueue: what matters is whether anything
+    // still needs the WAV at the moment it would be replaced.
+    if (auto *compress = qobject_cast<CompressAudioTask *>(task))
+        compress->setContended(TaskQuery::otherLiveTaskTouches(m_scheduler->tasks(), task));
     m_activePaused = false;
     emit activePausedChanged();
     if (wasCancelling)

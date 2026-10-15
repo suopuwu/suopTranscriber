@@ -87,6 +87,12 @@ public:
     // real op — see Task::occupiesFile()).
     static bool isQueued(const TaskList &tasks, const QUrl &fileUrl);
 
+    // True if any Queued/Active/Paused task OTHER than `self` touches one of
+    // self's files (same recording by isSameRecording(), so a task on the
+    // sibling .md counts). Ignores occupiesFile(): a queued benchmark still
+    // reads the file, so it still needs it to exist.
+    static bool otherLiveTaskTouches(const TaskList &tasks, const Task *self);
+
     // True if a Queued/Active/Paused task of exactly `kind` already occupies
     // fileUrl — the per-KIND dedup a derived pass wants: a transcribe in
     // flight must NOT block queueing a label/chapters/diarize behind it, but a

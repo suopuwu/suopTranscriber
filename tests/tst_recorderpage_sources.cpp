@@ -26,6 +26,7 @@
 #include <QDir>
 #include <QFile>
 #include <QFileInfo>
+#include <QJSValue>
 #include <QQmlEngine>
 #include <QQuickItem>
 #include <QQuickView>
@@ -89,6 +90,8 @@ public:
 
     Q_INVOKABLE void play() { m_playing = true; emit playingChanged(); }
     Q_INVOKABLE void pause() { m_playing = false; emit playingChanged(); }
+    Q_INVOKABLE void reload() { ++reloads; }
+    int reloads = 0;
     Q_INVOKABLE void stop() { m_playing = false; emit playingChanged(); }
 
     // duration has no setter on the real AudioPlayer either (QMediaPlayer
@@ -117,6 +120,17 @@ private:
 };
 
 class VaultTreeModelStub : public QObject { Q_OBJECT };
+
+// audioCompressed is emitted by the test directly.
+class TranscriptionControllerStub : public QObject
+{
+    Q_OBJECT
+public:
+    Q_INVOKABLE bool isSameFile(const QUrl &a, const QUrl &b) const { return a.toLocalFile() == b.toLocalFile(); }
+
+signals:
+    void audioCompressed(const QUrl &oldUrl, const QUrl &newUrl);
+};
 
 // See this file's top comment for why this one is functional rather than an
 // empty uncreatable shell.
@@ -178,6 +192,7 @@ public:
     {
         return AudioRecorderIO::buildAppCaptureRows(streams, rememberedNames);
     }
+    Q_INVOKABLE QString appNameKey(const QString &name) const { return AudioRecorderIO::appNameKey(name); }
     Q_INVOKABLE QVariantList pendingCaptureAdditions(const QVariantList &desired,
                                                       const QStringList &activeIds) const
     {
@@ -249,6 +264,7 @@ public:
         if (!useMic && !useSystemAudio && appCaptureSources.isEmpty())
             return;
         ++m_monitorStartCount;
+        m_monitorAppSources = appCaptureSources;
         m_monitoring = true;
         emit monitoringChanged();
     }
@@ -333,6 +349,7 @@ public:
     QString startRequestedName() const { return m_startRequestedName; }
     bool startTestMode() const { return m_startTestMode; }
     QVariantList startAppSources() const { return m_startAppSources; }
+    QVariantList monitorAppSources() const { return m_monitorAppSources; }
     QList<QPair<QString, double>> addedSources() const { return m_addedSources; }
 
 signals:
@@ -373,6 +390,7 @@ private:
     qreal m_startMicGain = 1.0;
     qreal m_startSystemGain = 1.0;
     QVariantList m_startAppSources;
+    QVariantList m_monitorAppSources;
     bool m_startTestMode = false;
     double m_micGain = 1.0;
     QList<QPair<QString, double>> m_addedSources;
@@ -482,6 +500,7 @@ private slots:
                       "singleton Notifications 1.0 qml/Notifications.qml\n"
                       "AppIcon 1.0 qml/AppIcon.qml\n"
                       "AppIconButton 1.0 qml/AppIconButton.qml\n"
+                      "CompressButton 1.0 qml/CompressButton.qml\n"
                       "AppComboBox 1.0 qml/AppComboBox.qml\n"
                       "HoverBorder 1.0 qml/HoverBorder.qml\n"
                       "MiddleDragScroll 1.0 qml/MiddleDragScroll.qml\n"
@@ -494,6 +513,7 @@ private slots:
             [](QQmlEngine *, QJSEngine *) -> QObject * { return new IconTheme; });
         qmlRegisterType<AudioRecorderStub>("SuopTranscriber", 1, 0, "AudioRecorder");
         qmlRegisterType<AudioPlayerStub>("SuopTranscriber", 1, 0, "AudioPlayer");
+        qmlRegisterType<TranscriptionControllerStub>("SuopTranscriber", 1, 0, "TranscriptionController");
         qmlRegisterUncreatableType<VaultTreeModelStub>(
             "SuopTranscriber", 1, 0, "VaultTreeModel",
             QStringLiteral("stub — this harness leaves it null"));
@@ -505,10 +525,12 @@ private slots:
             "    width: 1100\n"
             "    height: 800\n"
             "    AudioRecorder { id: recStub; objectName: \"recStub\" }\n"
+            "    TranscriptionController { id: tcStub; objectName: \"tcStub\" }\n"
             "    RecorderPage {\n"
             "        objectName: \"recorderPage\"\n"
             "        anchors.fill: parent\n"
             "        audioRecorder: recStub\n"
+            "        transcriptionController: tcStub\n"
             "        vaultLocalPath: \"/tmp/suop-harness-vault\"\n"
             "        vaultPath: \"file:///tmp/suop-harness-vault\"\n"
             "    }\n"
@@ -590,7 +612,12 @@ private slots:
         QTRY_COMPARE(page->property("useSystemAudio").toBool(), false);
     }
 
-    // A row must survive its application going quiet. This is the
+    static QObject *appSettings(QQuickView *view)
+    {
+        return view->engine()->singletonInstance<QObject *>("SuopTranscriber", "AppSettings");
+    }
+
+    // A CONFIGURED row must survive its application going quiet. This is the
     // claim the whole id -> name re-keying exists for.
     void perAppRowSurvivesItsApplicationGoingQuiet()
     {
@@ -604,6 +631,9 @@ private slots:
         QCOMPARE(page->property("appCaptureRows").toList().first().toMap()
                      .value(QStringLiteral("name")).toString(),
                  QStringLiteral("Discord"));
+        tap(&view, find(&view, QStringLiteral("appCaptureToggle")));
+        QTRY_VERIFY(appSettings(&view)->property("recordingAppCaptureEnabled").toMap()
+                        .value(QStringLiteral("Discord")).toBool());
 
         // Discord stops making noise: its stream disappears from enumeration.
         rec->setAppStreams({});
@@ -612,6 +642,71 @@ private slots:
         const QVariantMap row = page->property("appCaptureRows").toList().first().toMap();
         QCOMPARE(row.value(QStringLiteral("name")).toString(), QStringLiteral("Discord"));
         QCOMPARE(row.value(QStringLiteral("active")).toBool(), false);
+    }
+
+    // ...but an UNTOUCHED row leaves with its stream. Remembering every name
+    // ever seen is what turned each spelling variant of one app into a
+    // permanent row.
+    void anUnconfiguredRowLeavesWithItsStream()
+    {
+        QQuickView view;
+        QQuickItem *page = nullptr;
+        AudioRecorderStub *rec = nullptr;
+        QVERIFY(openRecorder(&view, &page, &rec));
+
+        rec->setAppStreams({appStream(QStringLiteral("stream:1"), QStringLiteral("Discord"))});
+        QTRY_COMPARE(page->property("appCaptureRows").toList().size(), 1);
+        rec->setAppStreams({});
+        QTRY_COMPARE(page->property("appCaptureRows").toList().size(), 0);
+
+        // Arming and then disarming a quiet row is back to untouched: gone,
+        // and nothing left behind in the persisted map.
+        rec->setAppStreams({appStream(QStringLiteral("stream:2"), QStringLiteral("Discord"))});
+        QTRY_COMPARE(page->property("appCaptureRows").toList().size(), 1);
+        tap(&view, find(&view, QStringLiteral("appCaptureToggle")));
+        QTRY_VERIFY(appSettings(&view)->property("recordingAppCaptureEnabled").toMap()
+                        .value(QStringLiteral("Discord")).toBool());
+        rec->setAppStreams({});
+        QTRY_COMPARE(page->property("appCaptureRows").toList().size(), 1);
+        tap(&view, find(&view, QStringLiteral("appCaptureToggle")));
+        QTRY_COMPARE(page->property("appCaptureRows").toList().size(), 0);
+        QVERIFY(appSettings(&view)->property("recordingAppCaptureEnabled").toMap().isEmpty());
+    }
+
+    // The reported duplicate: a saved "Discord" and a live "discord" are one
+    // row, under the saved spelling, and the variant inherits the saved arm
+    // and gain — so it is captured without being re-armed.
+    void aNameVariantJoinsTheSavedRowAndInheritsItsSettings()
+    {
+        QQuickView view;
+        QQuickItem *page = nullptr;
+        AudioRecorderStub *rec = nullptr;
+        QVERIFY(openRecorder(&view, &page, &rec));
+        QObject *settings = appSettings(&view);
+        QVERIFY(settings);
+        settings->setProperty("recordingAppCaptureEnabled", QVariantMap{{QStringLiteral("Discord"), true}});
+        settings->setProperty("recordingAppGains", QVariantMap{{QStringLiteral("Discord"), 1.5}});
+        QTRY_COMPARE(page->property("appCaptureRows").toList().size(), 1);
+
+        rec->setAppStreams({appStream(QStringLiteral("stream:1"), QStringLiteral("discord")),
+                            appStream(QStringLiteral("stream:2"), QStringLiteral("Discord"))});
+        QTRY_VERIFY(page->property("appCaptureRows").toList().first().toMap()
+                        .value(QStringLiteral("active")).toBool());
+        const QVariantList rows = page->property("appCaptureRows").toList();
+        QCOMPARE(rows.size(), 1);
+        QCOMPARE(rows.first().toMap().value(QStringLiteral("name")).toString(), QStringLiteral("Discord"));
+
+        QVariant ret;
+        QVERIFY(QMetaObject::invokeMethod(page, "enabledAppCaptureSources", Q_RETURN_ARG(QVariant, ret)));
+        const QVariantList sources = ret.userType() == qMetaTypeId<QJSValue>()
+            ? ret.value<QJSValue>().toVariant().toList()
+            : ret.toList();
+        QCOMPARE(sources.size(), 2);
+        for (const QVariant &source : sources)
+            QCOMPARE(source.toMap().value(QStringLiteral("gain")).toDouble(), 1.5);
+
+        settings->setProperty("recordingAppCaptureEnabled", QVariantMap());
+        settings->setProperty("recordingAppGains", QVariantMap());
     }
 
     // The dot: active reflects a live stream, not merely a remembered row.
@@ -813,6 +908,37 @@ private slots:
         QTRY_COMPARE(page->property("useMic").toBool(), false);
         QTRY_VERIFY2(!rec->isMonitoring(),
                      "nothing is armed but the recorder is still holding devices open");
+    }
+
+    // Auto-grab on load: with mic and system audio off, an app armed from
+    // settings has no stream id until the async pw-dump lands — monitoring
+    // must start when it does, not wait for some unrelated toggle.
+    void anArmedAppStartsMonitoringWhenItsStreamArrivesAfterLoad()
+    {
+        QQuickView view;
+        QQuickItem *page = nullptr;
+        AudioRecorderStub *rec = nullptr;
+        QVERIFY(openRecorder(&view, &page, &rec));
+        QTRY_VERIFY(rec->isMonitoring());
+        tap(&view, find(&view, QStringLiteral("micToggle")));
+        QTRY_VERIFY(!rec->isMonitoring());
+        QCOMPARE(page->property("useSystemAudio").toBool(), false);
+
+        QObject *settings = appSettings(&view);
+        QVERIFY(settings);
+        settings->setProperty("recordingAppCaptureEnabled", QVariantMap{{QStringLiteral("Discord"), true}});
+        // Armed but silent: nothing to capture yet, so nothing is held open.
+        QTRY_COMPARE(page->property("appCaptureRows").toList().size(), 1);
+        QVERIFY(!rec->isMonitoring());
+
+        rec->setAppStreams({appStream(QStringLiteral("stream:7"), QStringLiteral("Discord"))});
+        QTRY_VERIFY2(rec->isMonitoring(),
+                     "an armed app's stream appeared but monitoring never started");
+        QCOMPARE(rec->monitorAppSources().size(), 1);
+        QCOMPARE(rec->monitorAppSources().first().toMap().value(QStringLiteral("id")).toString(),
+                 QStringLiteral("stream:7"));
+
+        settings->setProperty("recordingAppCaptureEnabled", QVariantMap());
     }
 
     // A take supersedes monitoring rather than being refused by it.
@@ -1287,6 +1413,43 @@ private slots:
         page->setProperty("useMic", false);
     }
 
+    // A compress (or its undo) of the just-reviewed take moves the review
+    // player to the new file; an in-place FLAC → FLAC voice replace keeps the
+    // path and reloads instead. (Nothing compresses a finished take on its
+    // own — tst_styleguide::recorder_neverCompressesAFinishedTake.)
+    void compressedTakeMovesOrReloadsTheReviewPlayer()
+    {
+        QQuickView view;
+        QQuickItem *page = nullptr;
+        AudioRecorderStub *rec = nullptr;
+        QVERIFY(openRecorder(&view, &page, &rec));
+        auto *tc = view.rootObject()->findChild<TranscriptionControllerStub *>(QStringLiteral("tcStub"));
+        QVERIFY(tc);
+        auto *player = view.rootObject()->findChild<AudioPlayerStub *>();
+        QVERIFY(player);
+
+        const QString wav = QStringLiteral("/tmp/suop-harness-vault/take.wav");
+        emit rec->recordingFinished(wav);
+        QCOMPARE(page->property("lastRecordingPath").toString(), wav);
+        const QString flac = QStringLiteral("/tmp/suop-harness-vault/take.flac");
+        emit tc->audioCompressed(QUrl::fromLocalFile(wav), QUrl::fromLocalFile(flac));
+        QCOMPARE(page->property("lastRecordingPath").toString(), flac);
+        QCOMPARE(player->source().toLocalFile(), flac);
+        QCOMPARE(player->reloads, 0);
+
+        // In place: same url, so the player must re-open rather than no-op.
+        emit tc->audioCompressed(QUrl::fromLocalFile(flac), QUrl::fromLocalFile(flac));
+        QCOMPARE(page->property("lastRecordingPath").toString(), flac);
+        QCOMPARE(player->reloads, 1);
+
+        // A spaced path must still match (toString() spellings differ).
+        const QString spaced = QStringLiteral("/tmp/suop-harness-vault/my take.wav");
+        emit rec->recordingFinished(spaced);
+        emit tc->audioCompressed(QUrl::fromLocalFile(spaced),
+                                 QUrl::fromLocalFile(QStringLiteral("/tmp/suop-harness-vault/my take.flac")));
+        QCOMPARE(page->property("lastRecordingPath").toString(), QStringLiteral("/tmp/suop-harness-vault/my take.flac"));
+    }
+
     // Both device pickers are the shared component, not bare
     // QQC2 ComboBoxes — the drift this closed.
     void deviceCombosAreTheSharedComponent()
@@ -1304,6 +1467,92 @@ private slots:
             QVERIFY2(combo->property("labelRole").isValid(),
                      qPrintable(name + QStringLiteral(" is not an AppComboBox")));
         }
+    }
+
+    // The format button (same shape as the test toggle — a dropdown clipped
+    // off a narrow window) opens a menu of the Settings → Recorder choices;
+    // picking one writes the setting and the button's icon follows it. Locked
+    // during a take because the format is fixed when the take starts.
+    void formatButtonMenuDrivesTheRecordingFormatSetting()
+    {
+        QQuickView view;
+        QQuickItem *page = nullptr;
+        AudioRecorderStub *rec = nullptr;
+        QVERIFY(openRecorder(&view, &page, &rec));
+        QObject *settings = appSettings(&view);
+        QVERIFY(settings);
+        settings->setProperty("recordingFormat", QStringLiteral("flac16m"));
+        QQuickItem *button = find(&view, QStringLiteral("recordingFormatButton"));
+        QVERIFY2(button, "recordingFormatButton not found");
+        QQuickItem *test = find(&view, QStringLiteral("testModeToggleButton"));
+        QVERIFY(test);
+        QCOMPARE(button->size(), test->size());
+        QQuickItem *icon = find(&view, QStringLiteral("recordingFormatIcon"));
+        QVERIFY(icon);
+        QCOMPARE(icon->property("name").toString(), QStringLiteral("format-voice"));
+
+        auto *menu = view.rootObject()->findChild<QObject *>(QStringLiteral("recordingFormatMenu"));
+        QVERIFY(menu);
+        tap(&view, button);
+        QTRY_VERIFY(menu->property("opened").toBool());
+        // Popup contents live under the window's overlay, not the page.
+        QQuickItem *wavRow = nullptr;
+        QTRY_VERIFY((wavRow = findInVisualTree(view.contentItem(), QStringLiteral("recordingFormatOption_wav"))));
+        tap(&view, wavRow);
+        QCOMPARE(settings->property("recordingFormat").toString(), QStringLiteral("wav"));
+        QTRY_VERIFY(!menu->property("visible").toBool());
+        QCOMPARE(icon->property("name").toString(), QStringLiteral("format-wav"));
+
+        settings->setProperty("recordingFormat", QStringLiteral("flac"));
+        QCOMPARE(icon->property("name").toString(), QStringLiteral("format-flac"));
+
+        rec->setRecording(true);
+        QVERIFY(!button->isEnabled());
+        tap(&view, button);
+        QVERIFY(!menu->property("visible").toBool());
+        rec->setRecording(false);
+        QVERIFY(button->isEnabled());
+        settings->setProperty("recordingFormat", QStringLiteral("flac16m"));
+    }
+
+    // The controls row wraps instead of clipping: wide, it is one line that
+    // fills the width; narrow, every control still sits inside the page, on
+    // more than one line.
+    void controlsRowWrapsInsteadOfClipping()
+    {
+        QQuickView view;
+        QQuickItem *page = nullptr;
+        AudioRecorderStub *rec = nullptr;
+        QVERIFY(openRecorder(&view, &page, &rec));
+        const QStringList names = {QStringLiteral("recordToggleButton"), QStringLiteral("testModeToggleButton"),
+                                   QStringLiteral("recordingFormatButton"), QStringLiteral("recordingNameField"),
+                                   QStringLiteral("changeFolderButton")};
+        QList<QQuickItem *> items;
+        for (const QString &n : names) {
+            QQuickItem *item = find(&view, n);
+            QVERIFY2(item, qPrintable(n + QStringLiteral(" not found")));
+            items << item;
+        }
+        const auto top = [page](QQuickItem *i) { return i->mapToItem(page, QPointF()).y(); };
+        const auto right = [page](QQuickItem *i) { return i->mapToItem(page, QPointF(i->width(), 0)).x(); };
+
+        QQuickItem *flow = find(&view, QStringLiteral("recorderControlsFlow"));
+        QQuickItem *nameRow = find(&view, QStringLiteral("recorderNameRow"));
+        QVERIFY(flow && nameRow);
+        QTRY_COMPARE(top(items.last()), top(items.first()));
+        // One line uses the whole width: the folder button ends at the row's
+        // right edge, the name field having stretched to fill the gap.
+        QTRY_COMPARE(qRound(right(items.last())), qRound(right(flow)));
+        QVERIFY(items.at(3)->width() > 200);
+
+        view.rootObject()->setWidth(360);
+        QTRY_VERIFY(top(items.last()) > top(items.first()));
+        for (QQuickItem *item : items)
+            QVERIFY2(right(item) <= page->width(),
+                     qPrintable(item->objectName() + QStringLiteral(" clipped at x=%1 of %2")
+                                                     .arg(right(item)).arg(page->width())));
+        // Wrapped, the name row takes a full line of its own.
+        QCOMPARE(nameRow->width(), flow->width());
     }
 
     // WaveformBar's clamped-centring rule, called directly — assigning

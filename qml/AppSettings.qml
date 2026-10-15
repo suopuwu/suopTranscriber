@@ -267,6 +267,23 @@ Item {
     // controller, not here.
     property string recordingOutputFolder: ""
 
+    // What a take is recorded as — encoded live by AudioRecorder (see
+    // AudioRecorderIO::recordingExtension()): "flac16m" (16 kHz mono FLAC,
+    // ~70 MB/hour — exactly what every engine decodes to, so transcripts
+    // match), "flac" (lossless at capture rate, ~250 MB/hour) or "wav"
+    // (~690 MB/hour).
+    property string recordingFormat: "flac16m"
+    // recordingFormat's choices, shared by the Settings "Recorder" page and
+    // the recorder page's own dropdown. A function — every property here is
+    // a persisted setting.
+    function recordingFormatOptions() {
+        return [
+            { id: "flac16m", label: qsTr("FLAC voice (16 kHz mono)"), icon: "format-voice" },
+            { id: "flac", label: qsTr("FLAC (full quality)"), icon: "format-flac" },
+            { id: "wav", label: qsTr("WAV (uncompressed)"), icon: "format-wav" }
+        ]
+    }
+
     // Input gain multipliers (1.0 = unity) applied to the microphone and
     // system-audio capture streams before mixing, for the in-app recording
     // feature — independently adjustable since a user might want to boost a
@@ -406,6 +423,7 @@ Item {
         deleteOriginalsAfterCombine: false,
         autoCombineAfterGrab: false,
         recordingOutputFolder: "",
+        recordingFormat: "flac16m",
         recordingMicGain: 1.0,
         recordingSystemGain: 1.0,
         recordingWaveformStyle: "filled",
@@ -556,6 +574,7 @@ Item {
         function onDeleteOriginalsAfterCombineChanged() { appSettings.scheduleSave() }
         function onAutoCombineAfterGrabChanged() { appSettings.scheduleSave() }
         function onRecordingOutputFolderChanged() { appSettings.scheduleSave() }
+        function onRecordingFormatChanged() { appSettings.scheduleSave() }
         function onRecordingMicGainChanged() { appSettings.scheduleSave() }
         function onRecordingSystemGainChanged() { appSettings.scheduleSave() }
         function onRecordingWaveformStyleChanged() { appSettings.scheduleSave() }

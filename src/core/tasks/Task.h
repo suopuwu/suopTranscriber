@@ -257,16 +257,15 @@ public:
     // trash, never go stale this way).
     virtual bool undoStillApplicable() const { return true; }
 
-    // The undo-snackbar label when this task is undone as part of a BATCH of
-    // `count` sibling tasks (a multi-select move/trash enqueued via
-    // TranscriptionController::enqueueBatch() — batchId != 0). count==1 is the
-    // single-item case. Default: the singleton undoLabel(), ignoring count — a
-    // kind that supports multi-select batch undo overrides this to SUMMARIZE
-    // ("Moved 5 files") so N operations collapse into ONE snackbar. Only
-    // consulted for batch-enqueued tasks; irrelevant to kinds never batched.
-    virtual QString batchUndoLabel(int count) const
+    // The undo-snackbar label for a BATCH (TranscriptionController::
+    // enqueueBatch() — batchId != 0), called on one member with every Done,
+    // undoable member (this one included; size 1 is the single-item case).
+    // Default: the singleton undoLabel() — a kind that supports multi-select
+    // batch undo overrides this to SUMMARIZE ("Moved 5 files"), reading the
+    // members for any aggregate (CompressAudioTask sums bytes saved).
+    virtual QString batchUndoLabel(const QList<const Task *> &undoableMembers) const
     {
-        Q_UNUSED(count);
+        Q_UNUSED(undoableMembers);
         return undoLabel();
     }
 

@@ -1,6 +1,8 @@
 #include <QtTest>
 
+#include <QDir>
 #include <QFile>
+#include <QProcess>
 #include <QRegularExpression>
 #include <QString>
 #include <QStringList>
@@ -178,17 +180,79 @@ private slots:
         }
     }
 
+    // The describe string DEPENDENCIES.md's pin table quotes per submodule must
+    // be the commit actually checked out. Nothing else notices when a bump
+    // updates the pin but not the table — the doc then names a commit that was
+    // never built, which is worse than naming none (both whisper.cpp and
+    // sherpa-onnx had drifted this way before this check existed).
+    void submodulePinTable_matchesCheckedOutCommits()
+    {
+        const QString doc = readAll(QStringLiteral(SUOP_REPO_DIR "/DEPENDENCIES.md"));
+        QVERIFY2(!doc.isEmpty(), "DEPENDENCIES.md must exist");
+
+        QProcess git;
+        git.setWorkingDirectory(QStringLiteral(SUOP_REPO_DIR));
+        git.start(QStringLiteral("git"), {QStringLiteral("submodule"), QStringLiteral("status")});
+        if (!git.waitForStarted(5000) || !git.waitForFinished(30000))
+            QSKIP("git unavailable, cannot verify submodule pins");
+        const QString status = QString::fromUtf8(git.readAllStandardOutput());
+        QVERIFY2(!status.isEmpty(), "`git submodule status` produced no output");
+
+        // ` <sha> <path> (<describe>)` — the describe is what the table quotes.
+        static const QRegularExpression line(
+            QStringLiteral(R"(^.?[0-9a-f]+ (\S+) \(([^)]+)\))"),
+            QRegularExpression::MultilineOption);
+        int checked = 0;
+        for (auto it = line.globalMatch(status); it.hasNext();) {
+            const QRegularExpressionMatch m = it.next();
+            const QString path = m.captured(1);
+            const QString describe = m.captured(2);
+            if (!doc.contains(path))
+                continue; // a submodule the doc deliberately doesn't table
+            QVERIFY2(doc.contains(QStringLiteral("`%1`").arg(describe)),
+                     qPrintable(QStringLiteral(
+                         "DEPENDENCIES.md's pin table must quote `%1` for %2 — the checked-out "
+                         "commit. Update the table in the same change as the bump.")
+                                    .arg(describe, path)));
+            ++checked;
+        }
+        QCOMPARE(checked, 3);
+    }
+
     // The CMakeLists.txt patch-guard FATAL_ERROR must still point readers at
-    // DEPENDENCIES.md — it's the only in-code tripwire for the sherpa-onnx
-    // bump procedure, so it must name the runbook that covers it.
+    // DEPENDENCIES.md — it's the only in-code tripwire for the bump
+    // procedure, so it must name the runbook that covers it.
     void patchGuardError_pointsAtDependenciesDoc()
     {
         const QString cmake = readAll(QStringLiteral(SUOP_REPO_DIR "/CMakeLists.txt"));
         QVERIFY2(!cmake.isEmpty(), "CMakeLists.txt must exist");
         QVERIFY2(cmake.contains(QStringLiteral("re-derive the patch against the current pinned commit rather")),
-                 "the sherpa-onnx patch-guard FATAL_ERROR anchor text must still exist");
+                 "the patch-guard FATAL_ERROR anchor text must still exist");
         QVERIFY2(cmake.contains(QStringLiteral("DEPENDENCIES.md")),
-                 "the sherpa-onnx patch-guard FATAL_ERROR must point at DEPENDENCIES.md");
+                 "the patch-guard FATAL_ERROR must point at DEPENDENCIES.md");
+    }
+
+    // Every patches/*.patch must be wired to a suop_apply_vendored_patch()
+    // call and named in DEPENDENCIES.md. An orphaned patch file is the worst
+    // failure mode here: it reads as applied, it re-derives cleanly on a bump,
+    // and nothing it fixes is actually in the build.
+    void everyPatchFile_isAppliedAndDocumented()
+    {
+        const QString cmake = readAll(QStringLiteral(SUOP_REPO_DIR "/CMakeLists.txt"));
+        const QString doc = readAll(QStringLiteral(SUOP_REPO_DIR "/DEPENDENCIES.md"));
+        QVERIFY2(!cmake.isEmpty() && !doc.isEmpty(), "CMakeLists.txt and DEPENDENCIES.md must exist");
+
+        const QStringList patches =
+            QDir(QStringLiteral(SUOP_REPO_DIR "/patches")).entryList({QStringLiteral("*.patch")}, QDir::Files);
+        QVERIFY2(!patches.isEmpty(), "patches/ must contain at least one patch");
+        for (const QString &name : patches) {
+            QVERIFY2(cmake.contains(QStringLiteral("suop_apply_vendored_patch(third_party/")),
+                     "the shared patch applier must still be how patches reach the submodules");
+            QVERIFY2(cmake.contains(name),
+                     qPrintable(QStringLiteral("patches/%1 is never applied by CMakeLists.txt").arg(name)));
+            QVERIFY2(doc.contains(name),
+                     qPrintable(QStringLiteral("DEPENDENCIES.md must name patches/%1 in a bump procedure").arg(name)));
+        }
     }
 };
 

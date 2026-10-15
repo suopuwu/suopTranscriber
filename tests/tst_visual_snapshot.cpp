@@ -161,7 +161,8 @@ private slots:
                      "singleton AppSettings 1.0 qml/AppSettings.qml\n"
                      "singleton Theme 1.0 qml/Theme.qml\n"
                      "AppIcon 1.0 qml/AppIcon.qml\n"
-                     "AppIconButton 1.0 qml/AppIconButton.qml\n");
+                     "AppIconButton 1.0 qml/AppIconButton.qml\n"
+                     "CompressButton 1.0 qml/CompressButton.qml\n");
         qmldir.close();
         qmlRegisterSingletonType<IconTheme>(
             "SuopTranscriber", 1, 0, "IconTheme",

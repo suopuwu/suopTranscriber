@@ -529,6 +529,17 @@ public:
     // needed, same as DiarizeTask).
     Q_INVOKABLE void detectSilences(const QUrl &fileUrl, const QUrl &vaultUrl);
 
+    // The explicit "compress" action. `target` is "voice" (FLAC voice) or
+    // "lossless" (FLAC at the original rate); anything else is a no-op. Each
+    // file in fileUrls that isCompressibleAudio() for that target (anything
+    // else, the take being recorded, or one already being compressed is
+    // skipped) becomes a CompressAudioTask — all in ONE undo batch whose
+    // snackbar reports the space saved. Never reached from run-all.
+    Q_INVOKABLE void compressAudioFiles(const QVariantList &fileUrls, const QUrl &vaultUrl, const QString &target);
+    // CompressAudioTask::isCompressible() for a local path or file:// URL —
+    // the eligibility rule behind every compress button.
+    Q_INVOKABLE static bool isCompressibleAudio(const QString &pathOrUrl, const QString &target);
+
     // True if fileUrl currently has a Queued or Active entry. Forwards to
     // TaskQuery::isQueued().
     Q_INVOKABLE bool isQueued(const QUrl &fileUrl) const;
@@ -626,9 +637,12 @@ public:
     // "transcribe", "diarize", "relabel", "chapters". A step is absent once its
     // own output is on disk — sibling .md for transcribe, `speakerDetection:
     // true` for diarize, transcriptIsLabeled() for relabel, a chapter marker in
-    // the body for chapters. Purely a disk read: it says nothing about what's
-    // queued (runAllJobs()'s isQueued() gate covers that). Empty ⇒ everything
-    // has already run, and runAllJobs() is a no-op.
+    // the body for chapters. A transcribed file whose body has NO segment text
+    // (a fully-silent recording) reports nothing pending at all — the derived
+    // passes have nothing to work on and would only fail. Purely a disk read:
+    // it says nothing about what's queued (runAllJobs()'s isQueued() gate
+    // covers that). Empty ⇒ nothing left that could run, and runAllJobs() is
+    // a no-op.
     Q_INVOKABLE QStringList pendingJobKinds(const QUrl &fileUrl) const;
 
     Q_INVOKABLE void runAllJobs(const QUrl &fileUrl, const QUrl &vaultUrl, const QString &modelId,
@@ -1398,6 +1412,10 @@ signals:
     // player to newUrl on success, rolls back its optimistic filename field on
     // failure.
     void fileRenamed(const QUrl &oldUrl, const QUrl &newUrl, bool ok, const QString &error);
+    // A CompressAudioTask (or its undo) replaced oldUrl with newUrl — the same
+    // url for an in-place FLAC replace. The tree is already updated in place;
+    // QML repoints (or reloads) any player/panel on oldUrl.
+    void audioCompressed(const QUrl &oldUrl, const QUrl &newUrl);
     // Bumped whenever the pending-rename table changes (a rename enqueued, or its
     // task completing/failing). Views read pendingRenameStem() gated on this so
     // the read is reactive — see pendingRenameStem()'s doc comment.
@@ -1448,6 +1466,7 @@ signals:
     void usbGrabFinished(int jobId, int filesCopied, int filesSkipped, const QStringList &errors, bool cancelled);
 
 private:
+    bool isCompressQueued(const QUrl &fileUrl) const;
     // Task system: the Job struct, the DownloadTarget enum, and
     // jobKind() that used to live here are GONE. A queued unit of work is now
     // a polymorphic Task (src/core/tasks/Task.h) — one subclass per kind,

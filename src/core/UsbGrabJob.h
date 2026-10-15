@@ -29,6 +29,11 @@ class UsbGrabJobWorker;
 // too, since a non-existent source is a misconfigured rule, not an empty device.
 QString usbGrabRefusalReason(const QString &scanRoot, const QString &destinationVaultPath);
 
+// Non-empty (a user-facing reason) iff a rule's destinationFolder would copy
+// outside the vault: absolute, or a ".."/symlink escape. Rules load from disk
+// unvalidated, so every grab and preview re-checks here, not just the picker.
+QString usbGrabDestinationRefusal(const QString &destinationFolder, const QString &vaultLocalPath);
+
 // What one runUsbGrabScan() pass did (or, in dry-run mode, would have done).
 struct UsbGrabScanResult {
     int filesCopied = 0;

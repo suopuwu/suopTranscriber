@@ -1125,6 +1125,14 @@ bool VaultTreeModel::isPathInsideVault(const QString &candidatePath) const
     return pathIsInsideVault(candidatePath, vaultLocalPath());
 }
 
+QString VaultTreeModel::vaultRelativePath(const QString &localPathOrUrl) const
+{
+    const QString localPath = localPathOrUrl.startsWith(QStringLiteral("file:"))
+        ? QUrl(localPathOrUrl).toLocalFile()
+        : localPathOrUrl;
+    return vaultRelativePathOf(localPath, vaultLocalPath());
+}
+
 QVariantMap VaultTreeModel::readVaultSettings() const
 {
     QVariantMap result;

@@ -31,6 +31,9 @@ public slots:
     void play();
     void pause();
     void togglePlay();
+    // Re-opens the current source: the file behind an unchanged URL was
+    // replaced (FLAC → FLAC voice in place), which setSource() ignores.
+    void reload();
 
 signals:
     void sourceChanged();

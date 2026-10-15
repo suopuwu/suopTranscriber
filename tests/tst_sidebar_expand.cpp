@@ -217,6 +217,7 @@ private slots:
                       "CombineGroupOutline 1.0 qml/CombineGroupOutline.qml\n"
                       "AppIcon 1.0 qml/AppIcon.qml\n"
                       "AppIconButton 1.0 qml/AppIconButton.qml\n"
+                      "CompressButton 1.0 qml/CompressButton.qml\n"
                       "ConfirmPopup 1.0 qml/ConfirmPopup.qml\n"
                       "PlayGlyph 1.0 qml/PlayGlyph.qml\n"
                       "PauseGlyph 1.0 qml/PauseGlyph.qml\n"

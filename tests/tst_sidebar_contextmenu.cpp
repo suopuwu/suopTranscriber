@@ -245,6 +245,7 @@ private slots:
                      "HoverBorder 1.0 qml/HoverBorder.qml\n"
                      "AppIcon 1.0 qml/AppIcon.qml\n"
                      "AppIconButton 1.0 qml/AppIconButton.qml\n"
+                     "CompressButton 1.0 qml/CompressButton.qml\n"
                      "ConfirmPopup 1.0 qml/ConfirmPopup.qml\n"
                      "PlayGlyph 1.0 qml/PlayGlyph.qml\n"
                      "PauseGlyph 1.0 qml/PauseGlyph.qml\n"
@@ -357,6 +358,47 @@ private slots:
 
         QCOMPARE(sidebar()->property("ctxStatus").toInt(), 2);
         verifyMenuIsActuallyShown("transcribed row");
+    }
+
+    // User report: choosing a menu entry also opened whichever file's row sat
+    // under the menu — the click reached the tree after the menu closed.
+    void menuEntry_clickDoesNotReachTheRowBeneath_data()
+    {
+        QTest::addColumn<QString>("entry");
+        QTest::newRow("rename") << QStringLiteral("ctxRenameRow");
+        QTest::newRow("new folder") << QStringLiteral("ctxNewFolderRow");
+    }
+    void menuEntry_clickDoesNotReachTheRowBeneath()
+    {
+        QFETCH(QString, entry);
+        QTemporaryDir vault;
+        QVERIFY(vault.isValid());
+        // Enough rows that the menu, opened on the first, covers others.
+        for (const char *name : {"a.mp3", "b.mp3", "c.mp3", "d.mp3", "e.mp3", "f.mp3"})
+            QVERIFY(touch(vault.filePath(QString::fromLatin1(name))));
+
+        QVERIFY(openVault(vault.path()));
+        QTRY_VERIFY(tree()->property("rows").toInt() > 0);
+        expandEverything(tree());
+
+        const int row = rowForPath(tree(), vault.filePath(QStringLiteral("a.mp3")));
+        QVERIFY(row >= 0);
+        rightClickRowAt(row);
+        verifyMenuIsActuallyShown("menu for a.mp3");
+
+        auto *item = m_window->findChild<QQuickItem *>(entry);
+        QVERIFY(item && item->isVisible());
+        const QPoint at = item->mapToScene(QPointF(item->width() / 2, item->height() / 2)).toPoint();
+        QQuickItem *rowBeneath = tree()->childAt(tree()->mapFromScene(at).x(), tree()->mapFromScene(at).y());
+        QVERIFY2(rowBeneath, "the menu entry must sit over the tree for this to test anything");
+
+        QTest::mouseClick(m_window, Qt::LeftButton, Qt::NoModifier, at);
+        QTRY_VERIFY(!menu()->property("opened").toBool());
+        // Real event loop: the stray tap, if any, lands after close().
+        QEventLoop loop;
+        QTimer::singleShot(300, &loop, &QEventLoop::quit);
+        loop.exec();
+        QCOMPARE(m_window->property("openPath").toString(), QString());
     }
 };
 

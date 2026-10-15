@@ -1,4 +1,6 @@
 #include "AudioRecorder.h"
+#include "AudioExtensions.h"
+#include "FileRename.h"
 
 #include <QAudioDevice>
 #include <QAudioFormat>
@@ -94,29 +96,53 @@ QVariantList filterAppStreams(const QVariantList &systemSources)
     return result;
 }
 
+QString appNameKey(const QString &name)
+{
+    QString key = name.trimmed().toCaseFolded();
+    static const QRegularExpression suffix(QStringLiteral("[\\s._-]+(browser|bin|stable|exe)$"));
+    for (;;) {
+        const QRegularExpressionMatch match = suffix.match(key);
+        if (!match.hasMatch() || match.capturedStart() == 0)
+            break; // capturedStart 0 would strip the whole name.
+        key.truncate(match.capturedStart());
+    }
+    static const QRegularExpression separators(QStringLiteral("[\\s._-]+"));
+    key.remove(separators);
+    return key;
+}
+
 QVariantList buildAppCaptureRows(const QVariantList &appStreams, const QStringList &rememberedNames)
 {
-    QMap<QString, QStringList> idsByName; // QMap: sorted by key, which IS the row order.
+    struct Row {
+        QString name;
+        QStringList ids;
+    };
+    QMap<QString, Row> rowsByKey; // QMap: sorted by key, which IS the row order.
     for (const QString &name : rememberedNames) {
-        if (!name.isEmpty())
-            idsByName.insert(name, {});
+        const QString key = appNameKey(name);
+        if (!key.isEmpty() && !rowsByKey.contains(key))
+            rowsByKey.insert(key, { name, {} });
     }
     for (const QVariant &entry : appStreams) {
         const QVariantMap map = entry.toMap();
         const QString name = map.value(QStringLiteral("name")).toString();
         const QString id = map.value(QStringLiteral("id")).toString();
-        if (name.isEmpty() || id.isEmpty())
+        const QString key = appNameKey(name);
+        if (key.isEmpty() || id.isEmpty())
             continue;
-        idsByName[name].append(id);
+        Row &row = rowsByKey[key];
+        if (row.name.isEmpty())
+            row.name = name;
+        row.ids.append(id);
     }
 
     QVariantList rows;
-    for (auto it = idsByName.cbegin(); it != idsByName.cend(); ++it) {
-        QVariantMap row;
-        row[QStringLiteral("name")] = it.key();
-        row[QStringLiteral("ids")] = it.value();
-        row[QStringLiteral("active")] = !it.value().isEmpty();
-        rows.append(row);
+    for (const Row &row : std::as_const(rowsByKey)) {
+        QVariantMap out;
+        out[QStringLiteral("name")] = row.name;
+        out[QStringLiteral("ids")] = row.ids;
+        out[QStringLiteral("active")] = !row.ids.isEmpty();
+        rows.append(out);
     }
     return rows;
 }
@@ -284,10 +310,11 @@ void patchWavHeader(QFile &file, quint32 dataSize, quint32 sampleRate, quint16 c
 QString sanitizeRecordingName(const QString &requestedName)
 {
     QString name = requestedName.trimmed();
-    // A user who types "notes.wav" means the recording "notes", not
-    // "notes.wav.wav".
-    if (name.endsWith(QStringLiteral(".wav"), Qt::CaseInsensitive))
-        name.chop(4);
+    // A user who types "notes.wav" (or "notes.flac") means the recording
+    // "notes".
+    const qsizetype dot = name.lastIndexOf(QLatin1Char('.'));
+    if (dot > 0 && audioExtensions().contains(name.mid(dot + 1).toLower()))
+        name.truncate(dot);
     static const QRegularExpression invalid(QStringLiteral("[/\\\\:*?\"<>|\\x00-\\x1f]"));
     name.remove(invalid);
     // Leading/trailing dots go last, after the character strip: it is what
@@ -303,24 +330,51 @@ QString sanitizeRecordingName(const QString &requestedName)
 }
 
 QString buildOutputFilePath(const QUrl &vaultUrl, const QString &outputRelativeFolder,
-                            const QDateTime &timestamp, const QString &requestedName)
+                            const QDateTime &timestamp, const QString &requestedName, const QString &extension)
 {
     QString base = vaultUrl.toLocalFile();
-    if (!outputRelativeFolder.isEmpty())
+    if (QDir::isAbsolutePath(outputRelativeFolder))
+        base = outputRelativeFolder;
+    else if (!outputRelativeFolder.isEmpty())
         base += QLatin1Char('/') + outputRelativeFolder;
     const QString name = sanitizeRecordingName(requestedName);
-    return base + QLatin1Char('/')
-        + (name.isEmpty()
-               ? QStringLiteral("suopAudio_") + timestamp.toString(QStringLiteral("yyyyMMdd-HHmmss"))
-               : name)
-        + QStringLiteral(".wav");
+    return QDir::cleanPath(base + QLatin1Char('/')
+                           + (name.isEmpty()
+                                  ? QStringLiteral("suopAudio_")
+                                        + timestamp.toString(QStringLiteral("yyyyMMdd-HHmmss"))
+                                  : name)
+                           + QLatin1Char('.') + extension);
+}
+
+QString recordingExtension(const QString &format)
+{
+    return format == QStringLiteral("wav") ? QStringLiteral("wav") : QStringLiteral("flac");
+}
+
+QStringList liveEncoderArguments(const QString &format, const QString &outputPath, int sampleRate,
+                                 int channelCount)
+{
+    if (format == QStringLiteral("wav"))
+        return {};
+    QStringList args = {QStringLiteral("-hide_banner"), QStringLiteral("-nostdin"),
+                        QStringLiteral("-loglevel"),    QStringLiteral("error"),
+                        QStringLiteral("-f"),           QStringLiteral("s16le"),
+                        QStringLiteral("-ar"),          QString::number(sampleRate),
+                        QStringLiteral("-ac"),          QString::number(channelCount),
+                        QStringLiteral("-i"),           QStringLiteral("pipe:0")};
+    if (format != QStringLiteral("flac"))
+        args << QStringLiteral("-ar") << QStringLiteral("16000") << QStringLiteral("-ac") << QStringLiteral("1");
+    args << QStringLiteral("-c:a") << QStringLiteral("flac") << QStringLiteral("-flush_packets")
+         << QStringLiteral("1") << QStringLiteral("-f") << QStringLiteral("flac") << QStringLiteral("-n")
+         << outputPath;
+    return args;
 }
 
 QString buildTestOutputFilePath(const QString &tempRoot, const QDateTime &timestamp,
-                                 const QString &requestedName)
+                                 const QString &requestedName, const QString &extension)
 {
     return buildOutputFilePath(QUrl::fromLocalFile(tempRoot + QStringLiteral("/suopTranscriber-test")),
-                               QString(), timestamp, requestedName);
+                               QString(), timestamp, requestedName, extension);
 }
 
 QString uniquePathForRecording(const QString &desiredPath)
@@ -329,10 +383,17 @@ QString uniquePathForRecording(const QString &desiredPath)
     const QString dir = info.absolutePath();
     const QString baseName = info.completeBaseName();
     const QString suffix = info.suffix();
-    const auto taken = [&dir, &suffix](const QString &candidateBase) {
-        // The .md sibling counts: see uniquePathForRecording()'s declaration.
-        return QFileInfo::exists(dir + QLatin1Char('/') + candidateBase + QLatin1Char('.') + suffix)
-            || QFileInfo::exists(dir + QLatin1Char('/') + candidateBase + QStringLiteral(".md"));
+    const auto taken = [&dir](const QString &candidateBase) {
+        // The .md sibling and every audio extension count: see
+        // uniquePathForRecording()'s declaration.
+        const QString stem = dir + QLatin1Char('/') + candidateBase + QLatin1Char('.');
+        if (QFileInfo::exists(stem + QStringLiteral("md")))
+            return true;
+        for (const QString &ext : audioExtensions()) {
+            if (QFileInfo::exists(stem + ext))
+                return true;
+        }
+        return false;
     };
     if (!taken(baseName))
         return desiredPath;
@@ -348,7 +409,8 @@ int pruneTestRecordings(const QString &dir, int keepNewest)
     QDir directory(dir);
     if (!directory.exists())
         return 0;
-    QStringList names = directory.entryList({ QStringLiteral("suopAudio_*.wav") }, QDir::Files, QDir::Name);
+    QStringList names = directory.entryList({QStringLiteral("suopAudio_*.wav"), QStringLiteral("suopAudio_*.flac")},
+                                            QDir::Files, QDir::Name);
     int removed = 0;
     for (int i = 0; i < names.size() - std::max(0, keepNewest); ++i) {
         if (directory.remove(names.at(i)))
@@ -503,13 +565,14 @@ QStringList processAncestryNames(qint64 pid, int maxDepth)
 
 QString streamDisplayName(const QVariantMap &props, const QStringList &ancestryNames)
 {
+    // Only an all-lowercase name: "iTunes" or "VLC" are already deliberate.
     const auto titleCase = [](const QString &raw) {
-        return raw.isEmpty() ? raw : raw.left(1).toUpper() + raw.mid(1);
+        return raw.isEmpty() || raw != raw.toLower() ? raw : raw.left(1).toUpper() + raw.mid(1);
     };
 
     const QString appName = props.value(QStringLiteral("application.name")).toString().trimmed();
     if (!appName.isEmpty() && !isGenericProcessName(appName))
-        return appName;
+        return titleCase(appName);
 
     for (const QString &ancestor : ancestryNames) {
         if (!ancestor.isEmpty() && !isGenericProcessName(ancestor))
@@ -527,7 +590,7 @@ QString streamDisplayName(const QVariantMap &props, const QStringList &ancestryN
     // A real Chromium browser genuinely IS "Chromium" — falling all the way
     // through here means no ancestor or binary disagreed, so the generic name
     // is the honest one.
-    return appName;
+    return titleCase(appName);
 }
 
 }
@@ -554,9 +617,9 @@ public:
     }
 
 public slots:
-    void start(const QString &outputPath, bool useMic, const QString &micDeviceId, bool useSystemAudio,
-                double micGain, double systemGain, const QString &systemSourceId = QString(),
-                const QVariantList &appCaptureSources = {})
+    void start(const QString &outputPath, const QString &format, bool useMic, const QString &micDeviceId,
+               bool useSystemAudio, double micGain, double systemGain, const QString &systemSourceId = QString(),
+               const QVariantList &appCaptureSources = {})
     {
         if (m_running) {
             emit started(false, QStringLiteral("already recording"));
@@ -581,7 +644,32 @@ public slots:
         // page merely sits open, so gains can be set before arming a take.
         m_writing = !outputPath.isEmpty();
 
-        if (m_writing) {
+        m_outputPath = outputPath;
+        const QStringList encoderArgs =
+            AudioRecorderIO::liveEncoderArguments(format, outputPath, kSampleRate, kChannelCount);
+        if (m_writing && !encoderArgs.isEmpty()) {
+            QDir().mkpath(QFileInfo(outputPath).absolutePath());
+            // Deliberately NOT ProcessRunner::guardChildLifetime(): if this app
+            // dies, the encoder must outlive it — its stdin closing is what
+            // makes it finish the file properly.
+            m_encoder = std::make_unique<QProcess>();
+            m_encoder->setStandardOutputFile(QProcess::nullDevice());
+            m_encoder->start(QStringLiteral("ffmpeg"), encoderArgs);
+            if (!m_encoder->waitForStarted(3000)) {
+                m_encoder.reset();
+                emit started(false, QStringLiteral("could not start ffmpeg to record FLAC"));
+                return;
+            }
+            connect(m_encoder.get(), &QProcess::finished, this, [this] {
+                // finalizeAndStop() disconnects first, so this is a death mid-take.
+                const QString err = QString::fromUtf8(m_encoder->readAllStandardError()).trimmed();
+                emit recordingError(QStringLiteral("FLAC encoder stopped; the take was cut short")
+                                    + (err.isEmpty() ? QString() : QStringLiteral(": ") + err));
+                // Queued: finalizeAndStop() destroys the QProcess emitting this.
+                QMetaObject::invokeMethod(
+                    this, [this] { if (m_running) finalizeAndStop(); }, Qt::QueuedConnection);
+            });
+        } else if (m_writing) {
             const QFileInfo info(outputPath);
             QDir().mkpath(info.absolutePath());
             m_outputFile.setFileName(outputPath);
@@ -892,6 +980,10 @@ private:
         if (!source)
             return;
         if (source->process) {
+            // waitForFinished() emits the kill's finished()/errorOccurred()
+            // synchronously; left connected, they reach dropSource(), which
+            // frees `source` (and this very QProcess) under us.
+            source->process->disconnect(this);
             source->process->kill();
             source->process->waitForFinished(1000);
         }
@@ -918,7 +1010,13 @@ private:
             }
         }
         m_sources.clear();
-        if (m_writing) {
+        if (m_encoder) {
+            m_encoder->disconnect(this);
+            m_encoder->kill();
+            m_encoder->waitForFinished(1000);
+            m_encoder.reset();
+            QFile::remove(m_outputPath);
+        } else if (m_writing) {
             m_outputFile.close();
             m_outputFile.remove();
         }
@@ -995,15 +1093,6 @@ private:
     {
         const QStringList cmd = AudioRecorderIO::captureCommand(source.id);
         source.process = std::make_unique<QProcess>();
-        CaptureSource *sourcePtr = &source;
-        connect(source.process.get(), &QProcess::readyReadStandardOutput, this,
-                [sourcePtr] { sourcePtr->queue += sourcePtr->process->readAllStandardOutput(); });
-        connect(source.process.get(), &QProcess::errorOccurred, this,
-                [this, sourcePtr](QProcess::ProcessError) { onSourceProcessGone(sourcePtr, /*graceful=*/false); });
-        connect(source.process.get(), &QProcess::finished, this,
-                [this, sourcePtr](int, QProcess::ExitStatus status) {
-                    onSourceProcessGone(sourcePtr, status == QProcess::NormalExit);
-                });
         source.process->start(cmd.constFirst(), cmd.mid(1));
         if (!source.process->waitForStarted(3000)) {
             const QString error =
@@ -1016,17 +1105,25 @@ private:
             source.process.reset();
             return false;
         }
+        // Connected only once started, so a launch failure is reported once,
+        // inline above — never also via dropSource() for a source that is not
+        // in m_sources yet (and, mid-take, would end it when none others are).
+        CaptureSource *sourcePtr = &source;
+        connect(source.process.get(), &QProcess::readyReadStandardOutput, this,
+                [sourcePtr] { sourcePtr->queue += sourcePtr->process->readAllStandardOutput(); });
+        connect(source.process.get(), &QProcess::errorOccurred, this,
+                [this, sourcePtr](QProcess::ProcessError) { onSourceProcessGone(sourcePtr, /*graceful=*/false); });
+        connect(source.process.get(), &QProcess::finished, this,
+                [this, sourcePtr](int, QProcess::ExitStatus status) {
+                    onSourceProcessGone(sourcePtr, status == QProcess::NormalExit);
+                });
         return true;
     }
 
-    // A process source exited or errored, either mid-recording (drop it and
-    // keep going — see dropSource()) or synchronously out of
-    // startProcessSource()'s own start()/waitForStarted() call, which handles
-    // its own failure inline; m_running is only ever true once every source
-    // in this start() call has already succeeded, so that guard tells the two
-    // cases apart without extra state. Also fires (and no-ops via the same
-    // guard) while finalizeAndStop() kills every remaining process — that
-    // teardown is already what erases m_sources.
+    // A process source exited or errored mid-recording — drop it and keep
+    // going (see dropSource()). Also fires, and no-ops via the m_running
+    // guard, while finalizeAndStop()/abortStart() kill every remaining
+    // process — that teardown is already what erases m_sources.
     void onSourceProcessGone(CaptureSource *source, bool graceful)
     {
         if (!m_running)
@@ -1044,8 +1141,15 @@ private:
     // would train the user to ignore the banner.
     void dropSource(CaptureSource *source, bool graceful)
     {
-        if (source->process)
+        if (source->process) {
             source->queue += source->process->readAllStandardOutput();
+            // We are inside this process's own finished()/errorOccurred()
+            // emission, so it can't be deleted in place. Disconnecting also
+            // swallows the second signal of the errorOccurred+finished pair,
+            // which would otherwise re-enter here with a freed `source`.
+            source->process->disconnect(this);
+            source->process.release()->deleteLater();
+        }
         const QString name = source->id.isEmpty() ? QStringLiteral("system audio") : source->id;
         // A crash, or losing the LAST source (which ends the take), still
         // reports through the banner. This test runs BEFORE the erase below —
@@ -1127,7 +1231,10 @@ private:
         // Monitor mode mixes and measures exactly as a take does, but keeps
         // nothing — see start()'s empty-outputPath contract.
         if (m_writing) {
-            m_outputFile.write(mixed);
+            if (m_encoder)
+                m_encoder->write(mixed);
+            else
+                m_outputFile.write(mixed);
             m_bytesWritten += static_cast<quint32>(mixed.size());
         }
 
@@ -1142,7 +1249,7 @@ private:
         // patchWavHeader()'s flush is what pushes that payload out of QFile's
         // buffer, so stamping a size first and writing the bytes second would
         // leave a header describing audio that is not on disk yet.
-        if (m_writing
+        if (m_writing && !m_encoder
             && (!m_sinceLastCheckpoint.isValid()
                 || m_sinceLastCheckpoint.elapsed() >= kHeaderCheckpointIntervalMs)) {
             m_sinceLastCheckpoint.restart();
@@ -1210,7 +1317,35 @@ private:
             return;
         }
 
-        const QString path = m_outputFile.fileName();
+        const QString path = m_outputPath;
+        if (m_encoder) {
+            m_encoder->disconnect(this);
+            if (m_bytesWritten == 0) {
+                m_encoder->kill();
+                m_encoder->waitForFinished(1000);
+                m_encoder.reset();
+                QFile::remove(path);
+                emit stopped(QString());
+                return;
+            }
+            // EOF on stdin is what makes ffmpeg flush its last frames and
+            // write the stream length into the header. Already NotRunning =
+            // it died mid-take, which its finished() handler reported.
+            if (m_encoder->state() != QProcess::NotRunning) {
+                m_encoder->closeWriteChannel();
+                if (!m_encoder->waitForFinished(15000)) {
+                    m_encoder->kill();
+                    m_encoder->waitForFinished(1000);
+                    emit recordingError(QStringLiteral("FLAC encoder did not finish; the take may be incomplete"));
+                } else if (m_encoder->exitStatus() != QProcess::NormalExit || m_encoder->exitCode() != 0) {
+                    emit recordingError(QStringLiteral("FLAC encoder failed: %1")
+                                            .arg(QString::fromUtf8(m_encoder->readAllStandardError()).trimmed()));
+                }
+            }
+            m_encoder.reset();
+            emit stopped(path);
+            return;
+        }
         if (m_bytesWritten == 0) {
             // Captured nothing at all (stopped before the first mix tick, or a
             // source that died on open). Writing the 44-byte header alone
@@ -1239,6 +1374,10 @@ private:
     std::vector<std::unique_ptr<CaptureSource>> m_sources;
 
     QFile m_outputFile;
+    // The live FLAC encoder (see AudioRecorderIO::liveEncoderArguments());
+    // null for a WAV take, which writes m_outputFile directly.
+    std::unique_ptr<QProcess> m_encoder;
+    QString m_outputPath;
     // False in monitor mode — see start()'s empty-outputPath contract. Gates
     // every write, the header checkpoint, and the file's creation/removal.
     bool m_writing = false;
@@ -1404,13 +1543,23 @@ void AudioRecorder::applySources(const QVariantList &sources)
     emit sourcesChanged();
 }
 
+void AudioRecorder::setRecordingFormat(const QString &format)
+{
+    if (format == m_recordingFormat)
+        return;
+    m_recordingFormat = format;
+    emit recordingFormatChanged();
+}
+
 QString AudioRecorder::plannedRecordingFileName(const QUrl &vaultUrl, const QString &outputRelativeFolder,
                                                  const QString &requestedName, bool testMode) const
 {
+    const QString ext = AudioRecorderIO::recordingExtension(m_recordingFormat);
     const QString desired = testMode
-        ? AudioRecorderIO::buildTestOutputFilePath(QDir::tempPath(), QDateTime::currentDateTime(), requestedName)
+        ? AudioRecorderIO::buildTestOutputFilePath(QDir::tempPath(), QDateTime::currentDateTime(), requestedName,
+                                                   ext)
         : AudioRecorderIO::buildOutputFilePath(vaultUrl, outputRelativeFolder, QDateTime::currentDateTime(),
-                                                requestedName);
+                                                requestedName, ext);
     return QFileInfo(AudioRecorderIO::uniquePathForRecording(desired)).fileName();
 }
 
@@ -1429,6 +1578,7 @@ void AudioRecorder::startRecording(const QUrl &vaultUrl, const QString &outputRe
         emit lastErrorChanged();
         return;
     }
+    const QString ext = AudioRecorderIO::recordingExtension(m_recordingFormat);
     QString outputPath;
     if (testMode) {
         // Disposable by definition, and on tmpfs an unpruned pile of them is
@@ -1438,10 +1588,19 @@ void AudioRecorder::startRecording(const QUrl &vaultUrl, const QString &outputRe
         AudioRecorderIO::pruneTestRecordings(QDir::tempPath() + QStringLiteral("/suopTranscriber-test"),
                                              kKeepTestRecordings);
         outputPath = AudioRecorderIO::buildTestOutputFilePath(QDir::tempPath(), QDateTime::currentDateTime(),
-                                                              requestedName);
+                                                              requestedName, ext);
     } else {
         outputPath = AudioRecorderIO::buildOutputFilePath(vaultUrl, outputRelativeFolder,
-                                                          QDateTime::currentDateTime(), requestedName);
+                                                          QDateTime::currentDateTime(), requestedName, ext);
+        // The folder is checked, not the file: a name is sanitized and can't
+        // escape on its own. pathIsInsideVault() resolves symlinks on the
+        // existing part, so a symlinked folder pointing out is refused too.
+        if (!pathIsInsideVault(QFileInfo(outputPath).absolutePath(), vaultUrl.toLocalFile())) {
+            m_lastError = QStringLiteral("recording folder is outside the vault: %1")
+                              .arg(QFileInfo(outputPath).absolutePath());
+            emit lastErrorChanged();
+            return;
+        }
     }
     // Resolved here rather than in the builders so they stay pure joins, and
     // resolved on the GUI thread because it is two stat calls, not real work.
@@ -1477,7 +1636,7 @@ void AudioRecorder::startRecording(const QUrl &vaultUrl, const QString &outputRe
         QMetaObject::invokeMethod(m_worker, "stop", Qt::QueuedConnection);
     }
     QMetaObject::invokeMethod(m_worker, "start", Qt::QueuedConnection, Q_ARG(QString, outputPath),
-                               Q_ARG(bool, useMic), Q_ARG(QString, micDeviceId), Q_ARG(bool, useSystemAudio),
+                               Q_ARG(QString, m_recordingFormat), Q_ARG(bool, useMic), Q_ARG(QString, micDeviceId), Q_ARG(bool, useSystemAudio),
                                Q_ARG(double, micGain), Q_ARG(double, systemGain), Q_ARG(QString, systemSourceId),
                                Q_ARG(QVariantList, appCaptureSources));
 }
@@ -1496,7 +1655,7 @@ void AudioRecorder::startMonitoring(bool useMic, const QString &micDeviceId, boo
     emit monitoringChanged();
     // Empty outputPath == monitor mode; see AudioRecorderWorker::start().
     QMetaObject::invokeMethod(m_worker, "start", Qt::QueuedConnection, Q_ARG(QString, QString()),
-                               Q_ARG(bool, useMic), Q_ARG(QString, micDeviceId), Q_ARG(bool, useSystemAudio),
+                               Q_ARG(QString, QString()), Q_ARG(bool, useMic), Q_ARG(QString, micDeviceId), Q_ARG(bool, useSystemAudio),
                                Q_ARG(double, micGain), Q_ARG(double, systemGain), Q_ARG(QString, systemSourceId),
                                Q_ARG(QVariantList, appCaptureSources));
 }

@@ -72,6 +72,9 @@ const PhaseInfo *phaseInfoFor(const QString &phase)
         {QStringLiteral("grabbing"), JobListFormatter::tr("grabbing…"), QString()},
         {QStringLiteral("labeling"), JobListFormatter::tr("labeling…"), QString()},
         {QStringLiteral("benchmarking"), JobListFormatter::tr("benchmarking…"), QString()},
+        // CompressAudioTask is Background: label column only.
+        {QStringLiteral("encoding"), JobListFormatter::tr("compressing…"), QString()},
+        {QStringLiteral("verifying"), JobListFormatter::tr("verifying…"), QString()},
     };
     for (const auto &info : kPhases) {
         if (info.slug == phase)

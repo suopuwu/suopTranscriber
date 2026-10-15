@@ -74,11 +74,24 @@ MixTickPlan planMixTick(const QList<int> &queuedBytes, const QList<bool> &wasSta
 // two parsers over one pw-dump would be two things to keep in step.
 QVariantList filterAppStreams(const QVariantList &systemSources);
 
+// The identity two spellings of one application share — what rows, the
+// remembered list and the per-app settings maps are matched on. One app
+// reaches us under several names ("discord"/"Discord", "Brave-browser"/
+// "Brave", "firefox-bin"): application.name, a comm name and a binary name
+// each spell it their own way. Deterministic on purpose, not fuzzy: an edit-
+// distance match would merge genuinely different apps with short names.
+// Rules: trim, casefold, repeatedly drop a separator-led trailing "browser" /
+// "bin" / "stable" / "exe" (never the whole name), then drop every
+// whitespace, '.', '-' and '_'. Empty for an empty name.
+QString appNameKey(const QString &name);
+
 // The recorder's per-app capture rows: one entry per APPLICATION rather than
-// per live stream. {name, ids, active} — ids is every live filterAppStreams()
-// id whose display name is `name` (empty for a remembered app that is
-// currently silent), active is ids non-empty. Entries are the union of the
-// live streams and `rememberedNames`, sorted by name.
+// per live stream, grouped by appNameKey(). {name, ids, active} — ids is every
+// live filterAppStreams() id whose name has that key (empty for a remembered
+// app that is currently silent), active is ids non-empty. Entries are the
+// union of the live streams and `rememberedNames`, sorted by key. A row's
+// name is the FIRST remembered spelling of its key, else the first live one —
+// so the caller's saved spelling wins and its settings lookups keep hitting.
 //
 // Keyed on the display name because that is the only stable handle there is:
 // a "stream:<object.serial>" id dies with the connection and a new one is
@@ -203,7 +216,7 @@ void patchWavHeader(QFile &file, quint32 dataSize, quint32 sampleRate = 48000, q
                      quint16 bitsPerSample = 16);
 
 // A typed recording name reduced to something safe to join into a path:
-// trimmed, a user-typed ".wav" extension dropped, every filesystem-invalid
+// trimmed, a user-typed audio extension (".wav", ".opus", …) dropped, every filesystem-invalid
 // character (/\:*?"<>|) and control character removed, leading/trailing dots
 // stripped (so "." and ".." can never survive as a name that means a
 // directory), capped at 120 characters. Empty when nothing usable is left —
@@ -214,12 +227,31 @@ QString sanitizeRecordingName(const QString &requestedName);
 
 // "<vaultUrl>/[outputRelativeFolder/]<name>.wav" — see
 // AudioRecorder::startRecording()'s doc comment for the exact join rule
-// (outputRelativeFolder empty => straight under the vault root). <name> is
+// (outputRelativeFolder empty => straight under the vault root; an ABSOLUTE
+// outputRelativeFolder is used as-is, not nested under the vault — whether it
+// is allowed is startRecording()'s vault guard's call, not this join's). The
+// result is QDir::cleanPath()ed so the guard and the file created agree on
+// what any ".." means. <name> is
 // sanitizeRecordingName(requestedName), or "suopAudio_yyyyMMdd-HHmmss" when
 // that yields nothing. Still a pure join: collisions are resolved separately,
 // by uniquePathForRecording().
 QString buildOutputFilePath(const QUrl &vaultUrl, const QString &outputRelativeFolder,
-                            const QDateTime &timestamp, const QString &requestedName = QString());
+                            const QDateTime &timestamp, const QString &requestedName = QString(),
+                            const QString &extension = QStringLiteral("wav"));
+
+// Take formats (AppSettings.recordingFormat): "flac16m" — 16 kHz mono FLAC,
+// exactly what every engine decodes to — is the default and the fallback for
+// anything unrecognized; "flac" keeps the capture rate lossless; "wav" writes
+// the PCM directly. Returns "wav" or "flac".
+QString recordingExtension(const QString &format);
+
+// ffmpeg arguments that encode the mixed capture (s16le at sampleRate/
+// channelCount, on stdin) into outputPath AS it is recorded; empty for "wav",
+// which the worker writes itself. -flush_packets: a killed encoder still
+// leaves every encoded frame on disk — decodable, only the header's total
+// length missing. -n: never overwrite (the path is already unique).
+QStringList liveEncoderArguments(const QString &format, const QString &outputPath, int sampleRate,
+                                 int channelCount);
 
 // desiredPath itself if nothing is in the way, else the same path with "_N"
 // appended to the base name for the lowest N >= 2 that is free — so a series
@@ -229,8 +261,10 @@ QString buildOutputFilePath(const QUrl &vaultUrl, const QString &outputRelativeF
 // elsewhere, not numbering a sequence the user is creating, so the two
 // deliberately differ.)
 //
-// "In the way" means EITHER the .wav or a sibling .md of that base name
-// exists. The .md check is load-bearing, not caution: a sibling .md IS the
+// "In the way" means a sibling .md OR an audio file with ANY recognized
+// extension (AudioExtensions.h) of that base name exists — a take may be
+// compressed to <stem>.flac/.opus afterwards, which must never land on an
+// existing recording. The .md check is load-bearing, not caution: a sibling .md IS the
 // transcript of a recording in this vault, so writing a fresh take next to an
 // orphaned "notes.md" would silently adopt someone else's transcript as its
 // own. Reads the filesystem (like pruneTestRecordings above), so it is
@@ -247,9 +281,10 @@ QString uniquePathForRecording(const QString &desiredPath);
 // /tmp is tmpfs, so a test take never reaches a disk in the first place —
 // which is why there is no separate in-memory capture path to maintain.
 QString buildTestOutputFilePath(const QString &tempRoot, const QDateTime &timestamp,
-                                 const QString &requestedName = QString());
+                                 const QString &requestedName = QString(),
+                                 const QString &extension = QStringLiteral("wav"));
 
-// Deletes all but the `keepNewest` most recent suopAudio_*.wav files in `dir`,
+// Deletes all but the `keepNewest` most recent suopAudio_*.{wav,flac} files in `dir`,
 // newest by filename (the timestamp in the name sorts lexicographically —
 // mtime does not survive a copy, see the combine scanner's note on the same
 // trap). Returns how many it removed. Called before each test recording
@@ -312,6 +347,9 @@ QStringList processAncestryNames(qint64 pid, int maxDepth = 8);
 // Human-readable label for one application playback stream, from its pw-dump
 // props plus the process ancestry of its application.process.id (see
 // processAncestryNames()). Precedence:
+// An all-lowercase result gets its first letter capitalised (whatever tier it
+// came from, bar media.name, which is a title and not an app name) so one app
+// reads the same whichever tier named it.
 //   1. application.name, unless it is a generic Chromium/Electron shell name
 //   2. the nearest non-generic ancestry process name, title-cased — this is
 //      what turns "Chromium" into "Discord"
@@ -412,6 +450,10 @@ class AudioRecorder : public QObject {
     // flips back on the stop click while the header patch and flush are still
     // outstanding.
     Q_PROPERTY(QString activeRecordingPath READ activeRecordingPath NOTIFY activeRecordingPathChanged)
+    // What the next take is written as — see AudioRecorderIO::
+    // recordingExtension(). Bound to AppSettings.recordingFormat in Main.qml;
+    // read at startRecording(), so a change never touches a take in flight.
+    Q_PROPERTY(QString recordingFormat READ recordingFormat WRITE setRecordingFormat NOTIFY recordingFormatChanged)
 
 public:
     explicit AudioRecorder(QObject *parent = nullptr);
@@ -422,6 +464,8 @@ public:
     qint64 elapsedMs() const { return m_elapsedMs; }
     QString lastError() const { return m_lastError; }
     QString activeRecordingPath() const { return m_activeRecordingPath; }
+    QString recordingFormat() const { return m_recordingFormat; }
+    void setRecordingFormat(const QString &format);
 
     // Thin QML-facing wrapper over AudioRecorderIO::displayLevelFromRms() —
     // the recorder page maps each currentLevel sample through this ONCE, as
@@ -461,6 +505,11 @@ public:
     {
         return AudioRecorderIO::buildAppCaptureRows(appStreams, rememberedNames);
     }
+
+    // Thin QML-facing wrapper over AudioRecorderIO::appNameKey() — the page
+    // matches remembered names and settings-map keys on it, so a name variant
+    // inherits the saved arm/gain instead of becoming a second row.
+    Q_INVOKABLE QString appNameKey(const QString &name) const { return AudioRecorderIO::appNameKey(name); }
 
     // Thin QML-facing wrapper over AudioRecorderIO::pendingCaptureAdditions(),
     // matching the displayLevel()/appCaptureRows() precedent.
@@ -528,13 +577,18 @@ public:
     // prunes older test takes first — vaultUrl and outputRelativeFolder are
     // ignored. Everything else about the capture is identical, so a test
     // take is a faithful preview of what a real one would sound like.
+    // A real take whose destination resolves outside the vault (a stored
+    // outputRelativeFolder with "..", or an absolute path elsewhere) is
+    // refused like a second start: lastError set, nothing else touched.
+    // Checked here, not only in the folder picker, because the value comes
+    // from a hand-editable per-vault settings file.
     Q_INVOKABLE void startRecording(const QUrl &vaultUrl, const QString &outputRelativeFolder,
                                      const QString &requestedName, bool useMic,
                                      const QString &micDeviceId, bool useSystemAudio, double micGain,
                                      double systemGain, const QString &systemSourceId = QString(),
                                      const QVariantList &appCaptureSources = {}, bool testMode = false);
 
-    // Stops capture, patches the WAV header with the final size, and emits
+    // Stops capture, finalizes the file (WAV header / FLAC encoder), and emits
     // recordingFinished(filePath) once the file is fully finalized on disk.
     // No-op if not currently recording.
     Q_INVOKABLE void stopRecording();
@@ -593,9 +647,10 @@ signals:
     void activeCaptureSourcesChanged();
     void monitoringChanged();
     void activeRecordingPathChanged();
+    void recordingFormatChanged();
     // Emitted once stopRecording() (or an internal auto-stop triggered by a
     // fatal capture error — see lastError's doc comment) has fully
-    // finalized the WAV file on disk. filePath is EMPTY when the capture
+    // finalized the take on disk. filePath is EMPTY when the capture
     // recorded no audio at all: that file is deleted rather than left in the
     // vault as a zero-length recording, so there is nothing to point at.
     void recordingFinished(const QString &filePath);
@@ -618,6 +673,7 @@ private:
     QStringList m_activeCaptureSourceIds;
     QString m_lastError;
     QString m_activeRecordingPath;
+    QString m_recordingFormat = QStringLiteral("flac16m");
     QProcess *m_sourceProbe = nullptr; // non-null only while a pw-dump is in flight
     QVariantList m_systemSources;
     QVariantList m_appStreams;

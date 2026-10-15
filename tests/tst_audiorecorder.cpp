@@ -6,6 +6,9 @@
 #include <QDate>
 #include <QDateTime>
 #include <QFile>
+#include <QProcess>
+#include <QStandardPaths>
+#include <QSignalSpy>
 #include <QTemporaryDir>
 #include <QTime>
 #include <QUrl>
@@ -80,9 +83,14 @@ private slots:
     void testOutputPath_honoursTheRequestedName();
     void uniquePathForRecording_appendsTheLowestFreeNumber();
     void uniquePathForRecording_treatsAnOrphanedMdAsTaken();
+    void uniquePathForRecording_treatsAnySameStemAudioAsTaken();
     void pruneTestRecordings_keepsTheNewestNAndNothingElse();
     void pruneTestRecordings_missingDirectoryIsANoOp();
     void pruneTestRecordings_keepMoreThanPresentRemovesNothing();
+    void pruneTestRecordings_countsFlacTakesToo();
+    void recordingFormat_defaultsToFlacVoiceAndPicksTheExtension();
+    void liveEncoderArguments_encodeTheCapturePcmFromStdin_data();
+    void liveEncoderArguments_encodeTheCapturePcmFromStdin();
     void mixPcm16N_appliesIndependentGains();
     void mixPcm16N_clampsAtExtremes();
     void mixPcm16N_singleSourceScalesAndClips();
@@ -119,6 +127,14 @@ private slots:
     void buildAppCaptureRows_sortsByNameSoRowsDoNotMoveUnderTheCursor();
     void buildAppCaptureRows_skipsEntriesWithNoNameOrNoId();
     void buildAppCaptureRows_emptyInputsYieldNoRows();
+    void appNameKey_foldsSpellingVariantsOfOneApp();
+    void appNameKey_keepsDistinctAppsApart();
+    void buildAppCaptureRows_mergesNameVariantsIntoOneRow();
+    void buildAppCaptureRows_prefersTheRememberedSpelling();
+    void streamDisplayName_capitalisesAnAllLowercaseApplicationName();
+    void outputPath_absoluteFolderIsUsedAsIsAndCleaned();
+    void startRecording_refusesAFolderOutsideTheVault();
+    void startRecording_acceptsFoldersInsideTheVault();
     void captureCommand_mapsEachSourceIdToItsCapture();
     void isGenericProcessName_catchesTheChromiumShellNames();
     void streamDisplayName_prefersARealApplicationName();
@@ -133,6 +149,8 @@ private slots:
     void pendingCaptureAdditions_dropsEmptyIds();
     void pendingCaptureAdditions_emptyActiveListAddsEverything();
     void planMixTick_freshlyAddedStalledSourceDoesNotHaltTheMix();
+    void setSystemAudioEnabled_switchingSinkMidCaptureKeepsTheCaptureAlive();
+    void setSystemAudioEnabled_disablingLeavesTheOtherSourcesCapturing();
 };
 
 void TstAudioRecorder::wavHeader_structureAndSizes()
@@ -208,6 +226,8 @@ void TstAudioRecorder::outputPath_withAndWithoutSubfolder()
 void TstAudioRecorder::sanitizeRecordingName_stripsPathAndExtensionAndDots()
 {
     QCOMPARE(AudioRecorderIO::sanitizeRecordingName(QStringLiteral(" notes.wav ")), QStringLiteral("notes"));
+    QCOMPARE(AudioRecorderIO::sanitizeRecordingName(QStringLiteral("notes.opus")), QStringLiteral("notes"));
+    QCOMPARE(AudioRecorderIO::sanitizeRecordingName(QStringLiteral("v1.2 notes")), QStringLiteral("v1.2 notes"));
     QCOMPARE(AudioRecorderIO::sanitizeRecordingName(QStringLiteral("a/b:c")), QStringLiteral("abc"));
     QCOMPARE(AudioRecorderIO::sanitizeRecordingName(QStringLiteral("..")), QString());
     QCOMPARE(AudioRecorderIO::sanitizeRecordingName(QStringLiteral(".hidden")), QStringLiteral("hidden"));
@@ -289,6 +309,30 @@ void TstAudioRecorder::uniquePathForRecording_treatsAnOrphanedMdAsTaken()
 
     QCOMPARE(AudioRecorderIO::uniquePathForRecording(dir.filePath(QStringLiteral("notes.wav"))),
              dir.filePath(QStringLiteral("notes_2.wav")));
+}
+
+// A take is captured as WAV and may later be compressed to <stem>.flac/.opus
+// (CompressAudioTask), so an earlier take already compressed to
+// notes.opus must make "notes" taken — otherwise the new notes.wav could
+// never be compressed without colliding.
+void TstAudioRecorder::uniquePathForRecording_treatsAnySameStemAudioAsTaken()
+{
+    for (const QString &existing : {QStringLiteral("notes.opus"), QStringLiteral("notes.flac"),
+                                     QStringLiteral("notes.mp3")}) {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        QFile f(dir.filePath(existing));
+        QVERIFY(f.open(QIODevice::WriteOnly));
+        QCOMPARE(AudioRecorderIO::uniquePathForRecording(dir.filePath(QStringLiteral("notes.wav"))),
+                 dir.filePath(QStringLiteral("notes_2.wav")));
+    }
+    // A non-audio, non-.md sibling is not a recording and stays out of the way.
+    QTemporaryDir dir;
+    QVERIFY(dir.isValid());
+    QFile txt(dir.filePath(QStringLiteral("notes.txt")));
+    QVERIFY(txt.open(QIODevice::WriteOnly));
+    QCOMPARE(AudioRecorderIO::uniquePathForRecording(dir.filePath(QStringLiteral("notes.wav"))),
+             dir.filePath(QStringLiteral("notes.wav")));
 }
 
 void TstAudioRecorder::pruneTestRecordings_keepsTheNewestNAndNothingElse()
@@ -625,6 +669,93 @@ void TstAudioRecorder::decayPeak_negativeDecayCannotInflateThePeak()
     // A bad caller passing a negative decay must not make the meter climb
     // on its own.
     QCOMPARE(AudioRecorderIO::decayPeak(0.5, 0.0, -1.0), qreal(0.5));
+}
+
+void TstAudioRecorder::pruneTestRecordings_countsFlacTakesToo()
+{
+    QTemporaryDir dir;
+    QVERIFY(dir.isValid());
+    for (const QString &name : {QStringLiteral("suopAudio_20260101-000001.wav"),
+                                QStringLiteral("suopAudio_20260101-000002.flac"),
+                                QStringLiteral("suopAudio_20260101-000003.flac")}) {
+        QFile f(dir.filePath(name));
+        QVERIFY(f.open(QIODevice::WriteOnly));
+    }
+    QCOMPARE(AudioRecorderIO::pruneTestRecordings(dir.path(), 1), 2);
+    QCOMPARE(QDir(dir.path()).entryList(QDir::Files), QStringList{QStringLiteral("suopAudio_20260101-000003.flac")});
+}
+
+// Takes are FLAC voice unless the setting says otherwise; anything
+// unrecognized falls back to FLAC rather than the 10x-larger WAV.
+void TstAudioRecorder::recordingFormat_defaultsToFlacVoiceAndPicksTheExtension()
+{
+    QCOMPARE(AudioRecorderIO::recordingExtension(QStringLiteral("flac16m")), QStringLiteral("flac"));
+    QCOMPARE(AudioRecorderIO::recordingExtension(QStringLiteral("flac")), QStringLiteral("flac"));
+    QCOMPARE(AudioRecorderIO::recordingExtension(QStringLiteral("wav")), QStringLiteral("wav"));
+    QCOMPARE(AudioRecorderIO::recordingExtension(QStringLiteral("opus")), QStringLiteral("flac"));
+    QVERIFY(AudioRecorderIO::liveEncoderArguments(QStringLiteral("wav"), QStringLiteral("/x.wav"), 48000, 2).isEmpty());
+
+    QTemporaryDir vault;
+    QVERIFY(vault.isValid());
+    AudioRecorder recorder;
+    QCOMPARE(recorder.recordingFormat(), QStringLiteral("flac16m"));
+    const QUrl vaultUrl = QUrl::fromLocalFile(vault.path());
+    QCOMPARE(recorder.plannedRecordingFileName(vaultUrl, QString(), QStringLiteral("talk"), false),
+             QStringLiteral("talk.flac"));
+    recorder.setRecordingFormat(QStringLiteral("wav"));
+    QCOMPARE(recorder.plannedRecordingFileName(vaultUrl, QString(), QStringLiteral("talk"), false),
+             QStringLiteral("talk.wav"));
+}
+
+void TstAudioRecorder::liveEncoderArguments_encodeTheCapturePcmFromStdin_data()
+{
+    QTest::addColumn<QString>("format");
+    QTest::addColumn<QString>("rate");
+    QTest::addColumn<QString>("channels");
+    QTest::newRow("flac16m") << QStringLiteral("flac16m") << QStringLiteral("16000") << QStringLiteral("1");
+    QTest::newRow("flac") << QStringLiteral("flac") << QStringLiteral("48000") << QStringLiteral("2");
+}
+
+// The exact arguments the recorder spawns, fed the capture shape (s16le
+// 48 kHz stereo) on stdin: closing stdin must leave a complete FLAC.
+void TstAudioRecorder::liveEncoderArguments_encodeTheCapturePcmFromStdin()
+{
+    QFETCH(QString, format);
+    QFETCH(QString, rate);
+    QFETCH(QString, channels);
+    if (QStandardPaths::findExecutable(QStringLiteral("ffmpeg")).isEmpty()
+        || QStandardPaths::findExecutable(QStringLiteral("ffprobe")).isEmpty())
+        QSKIP("ffmpeg/ffprobe not available");
+    QTemporaryDir dir;
+    QVERIFY(dir.isValid());
+    const QString out = dir.filePath(QStringLiteral("take.flac"));
+    const QStringList args = AudioRecorderIO::liveEncoderArguments(format, out, 48000, 2);
+    QVERIFY(args.contains(QStringLiteral("-flush_packets")));
+    QVERIFY(args.contains(QStringLiteral("-n")));
+
+    QProcess encoder;
+    encoder.start(QStringLiteral("ffmpeg"), args);
+    QVERIFY(encoder.waitForStarted());
+    QByteArray pcm(48000 * 2 * 2, Qt::Uninitialized); // 1 s
+    auto *samples = reinterpret_cast<qint16 *>(pcm.data());
+    for (int i = 0; i < 48000; ++i)
+        samples[2 * i] = samples[2 * i + 1] = static_cast<qint16>(8000 * std::sin(i * 2 * M_PI * 440 / 48000));
+    encoder.write(pcm);
+    encoder.closeWriteChannel();
+    QVERIFY(encoder.waitForFinished(15000));
+    QCOMPARE(encoder.exitCode(), 0);
+
+    QProcess probe;
+    probe.start(QStringLiteral("ffprobe"),
+                {QStringLiteral("-v"), QStringLiteral("error"), QStringLiteral("-show_entries"),
+                 QStringLiteral("stream=codec_name,sample_rate,channels:format=duration"), QStringLiteral("-of"),
+                 QStringLiteral("default=nw=1"), out});
+    QVERIFY(probe.waitForFinished(10000));
+    const QString info = QString::fromUtf8(probe.readAllStandardOutput());
+    QVERIFY2(info.contains(QStringLiteral("codec_name=flac")), qPrintable(info));
+    QVERIFY2(info.contains(QStringLiteral("sample_rate=") + rate), qPrintable(info));
+    QVERIFY2(info.contains(QStringLiteral("channels=") + channels), qPrintable(info));
+    QVERIFY2(info.contains(QStringLiteral("duration=1.0")), qPrintable(info));
 }
 
 void TstAudioRecorder::startStopRecording_stateFlipsSynchronouslyOnTheCall()
@@ -987,6 +1118,149 @@ void TstAudioRecorder::buildAppCaptureRows_emptyInputsYieldNoRows()
     QVERIFY(AudioRecorderIO::buildAppCaptureRows({}, {}).isEmpty());
 }
 
+void TstAudioRecorder::appNameKey_foldsSpellingVariantsOfOneApp()
+{
+    using AudioRecorderIO::appNameKey;
+    // Each group is one application as PipeWire/procfs actually spell it.
+    QCOMPARE(appNameKey(QStringLiteral("discord")), appNameKey(QStringLiteral("Discord")));
+    QCOMPARE(appNameKey(QStringLiteral(" Discord ")), QStringLiteral("discord"));
+    QCOMPARE(appNameKey(QStringLiteral("Brave-browser")), appNameKey(QStringLiteral("Brave")));
+    QCOMPARE(appNameKey(QStringLiteral("Brave Browser")), QStringLiteral("brave"));
+    QCOMPARE(appNameKey(QStringLiteral("firefox-bin")), QStringLiteral("firefox"));
+    QCOMPARE(appNameKey(QStringLiteral("Discord.exe")), QStringLiteral("discord"));
+    // Suffixes strip repeatedly, then separators collapse.
+    QCOMPARE(appNameKey(QStringLiteral("google-chrome-stable")), appNameKey(QStringLiteral("Google Chrome")));
+    QCOMPARE(appNameKey(QStringLiteral("OBS_Studio")), appNameKey(QStringLiteral("obs studio")));
+    QVERIFY(appNameKey(QString()).isEmpty());
+    QVERIFY(appNameKey(QStringLiteral("   ")).isEmpty());
+}
+
+void TstAudioRecorder::appNameKey_keepsDistinctAppsApart()
+{
+    using AudioRecorderIO::appNameKey;
+    // Deterministic rules, not a similarity score: near-misses stay apart.
+    QVERIFY(appNameKey(QStringLiteral("Discord")) != appNameKey(QStringLiteral("Discover")));
+    QVERIFY(appNameKey(QStringLiteral("mpv")) != appNameKey(QStringLiteral("vlc")));
+    // A suffix is only stripped after a separator, and never down to nothing.
+    QCOMPARE(appNameKey(QStringLiteral("Robin")), QStringLiteral("robin"));
+    QCOMPARE(appNameKey(QStringLiteral("exe")), QStringLiteral("exe"));
+    QCOMPARE(appNameKey(QStringLiteral("-browser")), QStringLiteral("browser"));
+}
+
+void TstAudioRecorder::buildAppCaptureRows_mergesNameVariantsIntoOneRow()
+{
+    // The duplicate-row bug: two spellings of one app were two permanent rows.
+    const QVariantList streams = { appStream(QStringLiteral("stream:1"), QStringLiteral("discord")),
+                                    appStream(QStringLiteral("stream:2"), QStringLiteral("Discord")),
+                                    appStream(QStringLiteral("stream:3"), QStringLiteral("Brave-browser")) };
+    const QVariantList rows =
+        AudioRecorderIO::buildAppCaptureRows(streams, { QStringLiteral("Brave") });
+    QCOMPARE(rows.size(), 2);
+    const QVariantMap brave = rows[0].toMap();
+    QCOMPARE(brave.value(QStringLiteral("name")).toString(), QStringLiteral("Brave"));
+    QCOMPARE(brave.value(QStringLiteral("ids")).toStringList(), QStringList{ QStringLiteral("stream:3") });
+    const QVariantMap discord = rows[1].toMap();
+    // No remembered spelling: the first live one names the row.
+    QCOMPARE(discord.value(QStringLiteral("name")).toString(), QStringLiteral("discord"));
+    QCOMPARE(discord.value(QStringLiteral("ids")).toStringList(),
+             (QStringList{ QStringLiteral("stream:1"), QStringLiteral("stream:2") }));
+}
+
+void TstAudioRecorder::buildAppCaptureRows_prefersTheRememberedSpelling()
+{
+    // The row name is what the page looks settings up by, so the saved
+    // spelling must win over whatever the live stream happens to call itself —
+    // and the FIRST remembered spelling wins over a later variant.
+    const QVariantList streams = { appStream(QStringLiteral("stream:1"), QStringLiteral("discord")) };
+    const QVariantList rows = AudioRecorderIO::buildAppCaptureRows(
+        streams, { QStringLiteral("Discord"), QStringLiteral("DISCORD") });
+    QCOMPARE(rows.size(), 1);
+    QCOMPARE(rows[0].toMap().value(QStringLiteral("name")).toString(), QStringLiteral("Discord"));
+    QCOMPARE(rows[0].toMap().value(QStringLiteral("active")).toBool(), true);
+}
+
+void TstAudioRecorder::streamDisplayName_capitalisesAnAllLowercaseApplicationName()
+{
+    // Same casing whichever tier named the app: an ancestor was already
+    // title-cased, so a lowercase application.name must be too.
+    QVariantMap props;
+    props[QStringLiteral("application.name")] = QStringLiteral("discord");
+    QCOMPARE(AudioRecorderIO::streamDisplayName(props, {}), QStringLiteral("Discord"));
+    // A deliberately cased name is left alone.
+    props[QStringLiteral("application.name")] = QStringLiteral("iTunes");
+    QCOMPARE(AudioRecorderIO::streamDisplayName(props, {}), QStringLiteral("iTunes"));
+    // media.name is a title, not an app name — never recased.
+    QVariantMap mediaOnly;
+    mediaOnly[QStringLiteral("media.name")] = QStringLiteral("playback");
+    QCOMPARE(AudioRecorderIO::streamDisplayName(mediaOnly, {}), QStringLiteral("playback"));
+}
+
+void TstAudioRecorder::outputPath_absoluteFolderIsUsedAsIsAndCleaned()
+{
+    const QUrl vaultUrl = QUrl::fromLocalFile(QStringLiteral("/tmp/myvault"));
+    const QDateTime ts(QDate(2026, 7, 13), QTime(14, 5, 9));
+    // Not nested as "/tmp/myvault//tmp/myvault/rec" — the guard judges it.
+    QCOMPARE(AudioRecorderIO::buildOutputFilePath(vaultUrl, QStringLiteral("/tmp/myvault/rec"), ts,
+                                                  QStringLiteral("a")),
+             QStringLiteral("/tmp/myvault/rec/a.wav"));
+    QCOMPARE(AudioRecorderIO::buildOutputFilePath(vaultUrl, QStringLiteral("../elsewhere"), ts,
+                                                  QStringLiteral("a")),
+             QStringLiteral("/tmp/elsewhere/a.wav"));
+}
+
+void TstAudioRecorder::startRecording_refusesAFolderOutsideTheVault()
+{
+    QTemporaryDir root;
+    QVERIFY(root.isValid());
+    const QString vault = root.filePath(QStringLiteral("vault"));
+    QVERIFY(QDir().mkpath(vault));
+    QVERIFY(QDir().mkpath(root.filePath(QStringLiteral("outside"))));
+    QVERIFY(QFile::link(root.filePath(QStringLiteral("outside")), vault + QStringLiteral("/escape")));
+
+    // A hand-edited per-vault settings file can hold any of these.
+    const QStringList escapes = { QStringLiteral(".."), QStringLiteral("../outside"),
+                                  QStringLiteral("sub/../../outside"), root.filePath(QStringLiteral("outside")),
+                                  QStringLiteral("escape") };
+    for (const QString &folder : escapes) {
+        AudioRecorder recorder;
+        QSignalSpy recordingSpy(&recorder, &AudioRecorder::recordingChanged);
+        QSignalSpy errorSpy(&recorder, &AudioRecorder::lastErrorChanged);
+        recorder.startRecording(QUrl::fromLocalFile(vault), folder, QStringLiteral("take"), /*useMic=*/true,
+                                QString(), /*useSystemAudio=*/false, 1.0, 1.0);
+        QVERIFY2(!recorder.isRecording(), qPrintable(folder));
+        QCOMPARE(recordingSpy.count(), 0);
+        QCOMPARE(errorSpy.count(), 1);
+        QVERIFY2(recorder.lastError().contains(QStringLiteral("outside the vault")), qPrintable(folder));
+        QVERIFY(recorder.activeRecordingPath().isEmpty());
+    }
+    QVERIFY(QDir(root.filePath(QStringLiteral("outside"))).isEmpty());
+    QVERIFY(!QFileInfo::exists(root.filePath(QStringLiteral("take.flac"))));
+}
+
+void TstAudioRecorder::startRecording_acceptsFoldersInsideTheVault()
+{
+    QTemporaryDir vault;
+    QVERIFY(vault.isValid());
+    // Relative (existing or not), a ".." that stays inside, and an absolute
+    // path that is inside the vault all pass the guard.
+    const QList<QPair<QString, QString>> cases = {
+        { QStringLiteral("recordings"), vault.filePath(QStringLiteral("recordings/take.flac")) },
+        { QStringLiteral("a/../b"), vault.filePath(QStringLiteral("b/take.flac")) },
+        { vault.filePath(QStringLiteral("abs")), vault.filePath(QStringLiteral("abs/take.flac")) },
+    };
+    for (const auto &c : cases) {
+        AudioRecorder recorder;
+        // No source at all: the guard passes, the worker then rejects it —
+        // which proves the guard let it through without any audio hardware.
+        recorder.startRecording(QUrl::fromLocalFile(vault.path()), c.first, QStringLiteral("take"),
+                                /*useMic=*/false, QString(), /*useSystemAudio=*/false, 1.0, 1.0);
+        QVERIFY2(recorder.isRecording(), qPrintable(c.first));
+        QCOMPARE(recorder.activeRecordingPath(), c.second);
+        QTRY_VERIFY(!recorder.isRecording());
+        QCOMPARE(recorder.lastError(), QStringLiteral("no audio source selected"));
+    }
+}
+
 void TstAudioRecorder::captureCommand_mapsEachSourceIdToItsCapture()
 {
     // Empty and unrecognized ids both fall back to the default-sink monitor.
@@ -1216,6 +1490,93 @@ void TstAudioRecorder::planMixTick_freshlyAddedStalledSourceDoesNotHaltTheMix()
         AudioRecorderIO::planMixTick({ 4800, 4800, 0 }, { false, false, false }, 24000, 4);
     QCOMPARE(withoutFix.stalled, QList<bool>({ false, false, false }));
     QCOMPARE(withoutFix.bytes, 0);
+}
+
+namespace {
+
+// Puts stand-in `parec` / `pw-record` scripts first on PATH for the scope's
+// lifetime, so the worker runs REAL child processes (kill, finished,
+// errorOccurred all genuinely fire) without touching the audio server. Each
+// trickles silence at roughly the real 192 KB/s rather than `cat /dev/zero`,
+// which would grow the worker's queues without bound.
+class FakeCaptureTools {
+public:
+    FakeCaptureTools()
+        : m_oldPath(qgetenv("PATH"))
+    {
+        for (const char *tool : { "parec", "pw-record" }) {
+            QFile script(m_dir.filePath(QString::fromLatin1(tool)));
+            script.open(QIODevice::WriteOnly);
+            script.write("#!/bin/sh\nwhile :; do head -c 9600 /dev/zero; sleep 0.05; done\n");
+            script.close();
+            script.setPermissions(script.permissions() | QFileDevice::ExeOwner);
+        }
+        qputenv("PATH", m_dir.path().toLocal8Bit() + ':' + m_oldPath);
+    }
+    ~FakeCaptureTools() { qputenv("PATH", m_oldPath); }
+    bool isValid() const { return m_dir.isValid(); }
+
+private:
+    QTemporaryDir m_dir;
+    QByteArray m_oldPath;
+};
+
+// The capture is still being mixed — not merely "was alive once".
+bool keepsTicking(AudioRecorder &recorder)
+{
+    QSignalSpy ticks(&recorder, &AudioRecorder::levelUpdated);
+    return ticks.wait(2000) && ticks.wait(2000);
+}
+
+}
+
+// Re-tapping a different sink kills the old parec. That kill's finished()/
+// errorOccurred() used to reach dropSource() mid-eraseSource(): the source
+// (and the QProcess still inside its own waitForFinished) was freed under the
+// caller — the crash on toggling system audio — and, as the last source, it
+// also finalized the whole capture, so the new tap ran with no mixer.
+void TstAudioRecorder::setSystemAudioEnabled_switchingSinkMidCaptureKeepsTheCaptureAlive()
+{
+    FakeCaptureTools tools;
+    QVERIFY(tools.isValid());
+    AudioRecorder recorder;
+    recorder.startMonitoring(/*useMic=*/false, QString(), /*useSystemAudio=*/true, 1.0, 1.0,
+                             QStringLiteral("monitor:a"), {});
+    QTRY_COMPARE(recorder.activeCaptureSourceIds(), QStringList{ QStringLiteral("monitor:a") });
+    QVERIFY(keepsTicking(recorder));
+
+    for (const QString &sink : { QStringLiteral("monitor:b"), QStringLiteral("monitor:a"), QStringLiteral("monitor:b") }) {
+        recorder.setSystemAudioEnabled(true, sink, 1.0);
+        QTRY_COMPARE(recorder.activeCaptureSourceIds(), QStringList{ sink });
+        QVERIFY2(keepsTicking(recorder), "switching sinks must not end the capture");
+    }
+    recorder.stopMonitoring();
+}
+
+// The same kill path, with another source left: system audio goes, the app
+// stream carries on, and arming system audio again re-taps it.
+void TstAudioRecorder::setSystemAudioEnabled_disablingLeavesTheOtherSourcesCapturing()
+{
+    FakeCaptureTools tools;
+    QVERIFY(tools.isValid());
+    AudioRecorder recorder;
+    const QVariantList apps{ QVariantMap{ { QStringLiteral("id"), QStringLiteral("stream:42") },
+                                          { QStringLiteral("gain"), 1.0 } } };
+    recorder.startMonitoring(/*useMic=*/false, QString(), /*useSystemAudio=*/true, 1.0, 1.0,
+                             QStringLiteral("monitor:a"), apps);
+    QTRY_COMPARE(recorder.activeCaptureSourceIds().size(), 2);
+
+    for (int round = 0; round < 3; ++round) {
+        recorder.setSystemAudioEnabled(false, QString(), 1.0);
+        QTRY_COMPARE(recorder.activeCaptureSourceIds(), QStringList{ QStringLiteral("stream:42") });
+        QVERIFY2(keepsTicking(recorder), "disarming system audio must not end the capture");
+
+        recorder.setSystemAudioEnabled(true, QStringLiteral("monitor:a"), 1.0);
+        QTRY_COMPARE(recorder.activeCaptureSourceIds().size(), 2);
+        QVERIFY(keepsTicking(recorder));
+    }
+    QVERIFY2(recorder.lastError().isEmpty(), qPrintable(recorder.lastError()));
+    recorder.stopMonitoring();
 }
 
 QTEST_GUILESS_MAIN(TstAudioRecorder)

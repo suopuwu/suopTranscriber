@@ -137,16 +137,16 @@ Item {
         }).join("<br>")
     }
 
-    // Resolves a FolderDialog's selectedFolder into a vault-relative
-    // string suitable for a rule's destinationFolder field ("" = vault
-    // root), or null if the chosen folder is outside the vault — same
-    // shape as recordingFolderDialog's onAccepted below.
-    function relativeToVault(localPath) {
-        if (!usbGrabberPage.vaultTreeModel || !usbGrabberPage.vaultTreeModel.isPathInsideVault(localPath))
+    // A FolderDialog's selectedFolder url -> a rule's destinationFolder
+    // ("" = vault root), or null if it's outside the vault. The url goes to
+    // C++ undecoded so a spaced path (%20) resolves correctly.
+    function relativeToVault(folderUrl) {
+        if (!usbGrabberPage.vaultTreeModel)
             return null
-        const prefix = usbGrabberPage.vaultLocalPath + "/"
-        return localPath === usbGrabberPage.vaultLocalPath ? ""
-            : (localPath.startsWith(prefix) ? localPath.slice(prefix.length) : localPath)
+        const relative = usbGrabberPage.vaultTreeModel.vaultRelativePath(folderUrl.toString())
+        if (relative === "")
+            return null
+        return relative === "." ? "" : relative
     }
 
     // Shared by every per-field commit below: re-reads the device's
@@ -819,8 +819,7 @@ Item {
         property string targetSerial: ""
         property string targetLabel: ""
         onAccepted: {
-            const localPath = usbDestinationFolderDialog.selectedFolder.toString().replace("file://", "")
-            const relative = usbGrabberPage.relativeToVault(localPath)
+            const relative = usbGrabberPage.relativeToVault(usbDestinationFolderDialog.selectedFolder)
             if (relative === null) {
                 usbGrabberPage.destinationFolderError =
                     qsTr("That folder is outside the vault — pick a location inside it.")

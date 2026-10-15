@@ -1,7 +1,8 @@
-// Living spec + runtime verification for BottomBar.qml's bottom-left path:
-// each segment is its OWN click target. Drives a REAL QQuickView (offscreen,
-// sandboxed config — see main() below) loading the actual BottomBar.qml, and
-// clicks the segments it actually renders.
+// Living spec + runtime verification for BottomBar.qml's bottom-left path
+// (each segment is its OWN click target) and the row's slack distribution
+// (path left, everything else right-aligned). Drives a REAL QQuickView
+// (offscreen, sandboxed config — see main() below) loading the actual
+// BottomBar.qml, and clicks the segments it actually renders.
 //
 // Same harness shape as tst_sidebar_expand.cpp / tst_sidebar_dragmove.cpp
 // (read their top-of-file comments first). Two things are specific to this one:
@@ -109,6 +110,13 @@ private:
         return segments;
     }
 
+    static QQuickItem *itemNamed(QQuickItem *root, const QString &name)
+    {
+        QList<QQuickItem *> found;
+        collectByObjectName(root, name, found);
+        return found.isEmpty() ? nullptr : found.first();
+    }
+
     static QStringList textsOf(const QList<QQuickItem *> &segments)
     {
         QStringList texts;
@@ -124,7 +132,8 @@ private:
     }
 
     // Builds the view + returns the located BottomBar, or nullptr.
-    QQuickItem *openBar(QQuickView *view, const QString &vaultLocalPath, const QString &currentFilePath)
+    QQuickItem *openBar(QQuickView *view, const QString &vaultLocalPath, const QString &currentFilePath,
+                         bool shrinkPath = true)
     {
         view->engine()->addImportPath(m_moduleDir.path());
         view->engine()->addImageProvider(QString::fromLatin1(IconImageProvider::kProviderId),
@@ -146,6 +155,7 @@ private:
             return nullptr;
         root->setProperty("vaultLocal", vaultLocalPath);
         root->setProperty("filePath", currentFilePath);
+        root->setProperty("shrinkPath", shrinkPath);
         view->show();
         if (!QTest::qWaitForWindowExposed(view))
             return nullptr;
@@ -172,6 +182,7 @@ private slots:
                       "HoverUnderlineLabel 1.0 qml/HoverUnderlineLabel.qml\n"
                       "AppIcon 1.0 qml/AppIcon.qml\n"
                       "AppIconButton 1.0 qml/AppIconButton.qml\n"
+                      "CompressButton 1.0 qml/CompressButton.qml\n"
                       "ConfirmPopup 1.0 qml/ConfirmPopup.qml\n"
                       "PlayGlyph 1.0 qml/PlayGlyph.qml\n"
                       "PauseGlyph 1.0 qml/PauseGlyph.qml\n"
@@ -200,6 +211,8 @@ private slots:
             "    height: 40\n"
             "    property string vaultLocal: \"\"\n"
             "    property string filePath: \"\"\n"
+            "    property bool shrinkPath: true\n"
+            "    Binding { target: AppSettings; property: \"bottomBarPathShrinkToContent\"; value: root.shrinkPath }\n"
             "    BottomBar {\n"
             "        id: bar\n"
             "        objectName: \"bottomBar\"\n"
@@ -387,6 +400,57 @@ private slots:
                                                 "%3 — the path has a gap in it")
                                     .arg(i).arg(thisLeft).arg(prevRight)));
         }
+    }
+
+    // Everything to the RIGHT of the path is one right-aligned status cluster,
+    // and the "x/x tasks" counter is its last member — it must sit flush
+    // against the bar's right margin, never immediately after the path. The
+    // regression this guards: with bottomBarPathShrinkToContent on (the
+    // default) the path yields its slack to the task label, but the task label
+    // is HIDDEN when there's no job, an invisible Layout child claims no
+    // fillWidth, and the whole cluster then packs left. Asserted as geometry,
+    // because the misplacement is the thing a user sees however the layout is
+    // expressed.
+    void tasksCounter_sitsAtTheRightEdge_withNoJobShown()
+    {
+        QQuickView view;
+        QQuickItem *bar = openBar(&view, QStringLiteral("/vault"),
+                                   QStringLiteral("/vault/sub/talk.mp3"));
+        QVERIFY2(bar, "could not load BottomBar.qml / locate it");
+        QQuickItem *tasks = itemNamed(bar, QStringLiteral("bottomBarTasksCount"));
+        QVERIFY2(tasks, "the x/x tasks counter must carry objectName \"bottomBarTasksCount\"");
+        QVERIFY(tasks->isVisible());
+        // The row's own right margin (BottomBar.qml's anchors.rightMargin).
+        const qreal margin = 8.0;
+        // QTRY: an item laid out this tick may not have settled its x yet.
+        QTRY_VERIFY2(qAbs(bar->width() - margin
+                          - tasks->mapToItem(bar, QPointF(tasks->width(), 0)).x()) < 1.5,
+                     qPrintable(QStringLiteral("the tasks counter ends at %1 but the bar's "
+                                                "right margin is at %2 — the right-hand "
+                                                "cluster is not right-aligned")
+                                    .arg(tasks->mapToItem(bar, QPointF(tasks->width(), 0)).x())
+                                    .arg(bar->width() - margin)));
+    }
+
+    // Non-regression companion: the shrink-off mode is correct today (the
+    // greedy path absorbs the slack) and the new spacer must not disturb it.
+    void tasksCounter_sitsAtTheRightEdge_withNoJobShown_pathGreedyMode()
+    {
+        QQuickView view;
+        QQuickItem *bar = openBar(&view, QStringLiteral("/vault"),
+                                   QStringLiteral("/vault/sub/talk.mp3"), /*shrinkPath=*/false);
+        QVERIFY2(bar, "could not load BottomBar.qml / locate it");
+        QQuickItem *tasks = itemNamed(bar, QStringLiteral("bottomBarTasksCount"));
+        QVERIFY2(tasks, "the x/x tasks counter must carry objectName \"bottomBarTasksCount\"");
+        QVERIFY(tasks->isVisible());
+        const qreal margin = 8.0;
+        QTRY_VERIFY2(qAbs(bar->width() - margin
+                          - tasks->mapToItem(bar, QPointF(tasks->width(), 0)).x()) < 1.5,
+                     qPrintable(QStringLiteral("the tasks counter ends at %1 but the bar's "
+                                                "right margin is at %2 — the right-hand "
+                                                "cluster is not right-aligned")
+                                    .arg(tasks->mapToItem(bar, QPointF(tasks->width(), 0)).x())
+                                    .arg(bar->width() - margin)));
     }
 };
 

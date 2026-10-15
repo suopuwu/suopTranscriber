@@ -439,6 +439,11 @@ public:
     // the vault root itself must exist.
     Q_INVOKABLE bool isPathInsideVault(const QString &candidatePath) const;
 
+    // Canonical vault-relative path of a local path or file:// URL string (QML
+    // may pass a FolderDialog's selectedFolder url directly — decoded here, so
+    // "%20" never leaks into a path). "." = the vault root; "" = outside.
+    Q_INVOKABLE QString vaultRelativePath(const QString &localPathOrUrl) const;
+
     // Bug fix: "label always delayed by one file in the file explorer".
     // rebuild() only ever runs from QFileSystemWatcher::directoryChanged,
     // which fires on a directory's file add/remove/rename but NEVER on an

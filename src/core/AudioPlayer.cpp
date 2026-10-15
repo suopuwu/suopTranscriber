@@ -1,6 +1,7 @@
 #include "AudioPlayer.h"
 
 #include <QAudioDevice>
+#include <QSignalBlocker>
 
 AudioPlayer::AudioPlayer(QObject *parent)
     : QObject(parent)
@@ -28,6 +29,19 @@ void AudioPlayer::setSource(const QUrl &url)
 {
     if (url == m_player.source())
         return;
+    m_player.setSource(url);
+}
+
+void AudioPlayer::reload()
+{
+    const QUrl url = m_player.source();
+    if (url.isEmpty())
+        return;
+    m_player.stop();
+    // QML must never see the transient empty source — MainPanel treats a
+    // source change as "a different file is open".
+    const QSignalBlocker blocker(this);
+    m_player.setSource(QUrl());
     m_player.setSource(url);
 }
 

@@ -20,41 +20,6 @@
 
 namespace {
 
-// Runs ffprobe on `path` with the given extra arguments and returns trimmed
-// stdout, or nullopt on any failure (missing binary, non-zero exit, timeout).
-// The one ffprobe spawn site in this file — probeDurationSeconds() and
-// probeAudioFormat() below both go through it, so tst_styleguide's
-// everyProcessSpawnGuardsChildLifetime() only has one call to verify instead
-// of two drifting copies.
-std::optional<QString> runFfprobe(const QString &path, const QStringList &args)
-{
-    QProcess probe;
-    ProcessRunner::guardChildLifetime(probe);
-    QStringList fullArgs = args;
-    fullArgs << path;
-    probe.start(QStringLiteral("ffprobe"), fullArgs);
-    if (!probe.waitForFinished(10'000) || probe.exitStatus() != QProcess::NormalExit || probe.exitCode() != 0)
-        return std::nullopt;
-    return QString::fromUtf8(probe.readAllStandardOutput()).trimmed();
-}
-
-// Reads a media file's duration in seconds via ffprobe. nullopt on any
-// failure (missing binary, unparseable output) — validateCombinedOutput()
-// treats "couldn't check" as a validation failure rather than silently
-// skipping the check, since ffprobe ships in the same package as `ffmpeg`,
-// which this app already hard-requires for decode/playback.
-std::optional<double> probeDurationSeconds(const QString &path)
-{
-    const std::optional<QString> out =
-        runFfprobe(path, {QStringLiteral("-v"), QStringLiteral("error"), QStringLiteral("-show_entries"),
-                           QStringLiteral("format=duration"), QStringLiteral("-of"), QStringLiteral("csv=p=0")});
-    if (!out)
-        return std::nullopt;
-    bool ok = false;
-    const double seconds = out->toDouble(&ok);
-    return (ok && seconds >= 0.0) ? std::make_optional(seconds) : std::nullopt;
-}
-
 // The stream properties that decide whether `-c copy` can validly
 // concatenate two sources together (see ensureSourcesAreFormatCompatible's
 // doc comment for what goes wrong when they differ).
@@ -72,10 +37,11 @@ struct AudioStreamFormat {
 std::optional<AudioStreamFormat> probeAudioFormat(const QString &path)
 {
     const std::optional<QString> out =
-        runFfprobe(path, {QStringLiteral("-v"), QStringLiteral("error"), QStringLiteral("-select_streams"),
-                           QStringLiteral("a:0"), QStringLiteral("-show_entries"),
-                           QStringLiteral("stream=codec_name,sample_rate,channels,sample_fmt"), QStringLiteral("-of"),
-                           QStringLiteral("default=nw=1")});
+        AudioDecoder::runFfprobe(path, {QStringLiteral("-v"), QStringLiteral("error"),
+                                        QStringLiteral("-select_streams"), QStringLiteral("a:0"),
+                                        QStringLiteral("-show_entries"),
+                                        QStringLiteral("stream=codec_name,sample_rate,channels,sample_fmt"),
+                                        QStringLiteral("-of"), QStringLiteral("default=nw=1")});
     if (!out)
         return std::nullopt;
 
@@ -251,13 +217,13 @@ constexpr double kValidationStrideSec = 60.0;
 // were actually compatible for a byte-level copy.
 QString validateCombinedOutput(const QString &outputPath, const QStringList &sourcePaths)
 {
-    const std::optional<double> outputDuration = probeDurationSeconds(outputPath);
+    const std::optional<double> outputDuration = AudioDecoder::probeDurationSeconds(outputPath);
     if (!outputDuration)
         return QStringLiteral("could not read merged output's duration (ffprobe)");
 
     double summedSourceDuration = 0.0;
     for (const QString &source : sourcePaths) {
-        const std::optional<double> d = probeDurationSeconds(source);
+        const std::optional<double> d = AudioDecoder::probeDurationSeconds(source);
         if (!d)
             return QStringLiteral("could not read source duration (ffprobe): %1").arg(source);
         summedSourceDuration += *d;

@@ -4,7 +4,11 @@ CLAUDE.md
 .taskQueue/
 
 # --- CMake / C++ build ---
+# build-<Type>/ is the Makefile's scheme (one tree per CMAKE_BUILD_TYPE, see
+# Makefile); plain build/ is the older single-tree layout and any IDE still
+# defaulting to it.
 build/
+build-*/
 cmake-build-*/
 Testing/
 CMakeUserPresets.json

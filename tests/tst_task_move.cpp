@@ -125,8 +125,8 @@ private slots:
         MoveTask task(QUrl::fromLocalFile("/vault/a.wav"), QUrl::fromLocalFile("/vault/sub"),
                       QUrl::fromLocalFile("/vault"));
         // A batch of one keeps the specific single-file label; N>1 summarizes.
-        QCOMPARE(task.batchUndoLabel(1), task.undoLabel());
-        QCOMPARE(task.batchUndoLabel(3), QStringLiteral("Moved 3 files"));
+        QCOMPARE(task.batchUndoLabel({&task}), task.undoLabel());
+        QCOMPARE(task.batchUndoLabel({&task, &task, &task}), QStringLiteral("Moved 3 files"));
     }
 
     void moveTask_collision_throwsTaskError_andReportsFailure()

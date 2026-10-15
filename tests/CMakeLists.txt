@@ -17,7 +17,7 @@ set(SUOP_TASK_SOURCES
     tasks/DiarizeTask.cpp tasks/DetectSilenceTask.cpp tasks/RenameSpeakerTask.cpp tasks/MergeSpeakersTask.cpp tasks/CombineTask.cpp
     tasks/UncombineTask.cpp
     tasks/ImportTask.cpp tasks/UsbGrabTask.cpp tasks/BenchmarkTask.cpp tasks/DiarizationSweepTask.cpp
-    tasks/RenameFileTask.cpp tasks/MoveTask.cpp tasks/ModelIoTask.cpp
+    tasks/RenameFileTask.cpp tasks/MoveTask.cpp tasks/ModelIoTask.cpp tasks/CompressAudioTask.cpp tasks/RevertCompressionTask.cpp
     tasks/TrashTask.cpp tasks/DeleteTask.cpp tasks/RestoreTask.cpp
     tasks/FolderRenameTask.cpp tasks/FolderMoveTask.cpp FileRename.cpp VaultFileOps.cpp
     TranscribePipeline.cpp
@@ -190,6 +190,9 @@ suop_add_test(tst_bottombar_taskopen LINK_QUICK LINK_SVG ICON_ASSETS SOURCES Ico
 # See its top-of-file comment.
 suop_add_test(tst_mainpanel_chapterselection LINK_QUICK LINK_SVG ICON_ASSETS LINK_GUI SOURCES IconTheme.cpp Clipboard.cpp TranscriptDisplayBuilder.cpp UndoStack.cpp)
 suop_add_test(tst_mainpanel_guttertimestamp LINK_QUICK LINK_SVG ICON_ASSETS LINK_GUI SOURCES IconTheme.cpp Clipboard.cpp TranscriptDisplayBuilder.cpp UndoStack.cpp)
+# Gutter speaker filter follows a rename/merge; a filter on a vanished speaker
+# dims nothing (the whole-transcript-goes-dark bug).
+suop_add_test(tst_mainpanel_speakerfilter LINK_QUICK LINK_SVG ICON_ASSETS LINK_GUI SOURCES IconTheme.cpp Clipboard.cpp TranscriptDisplayBuilder.cpp UndoStack.cpp)
 suop_add_test(tst_scratch_headingrepro LINK_QUICK LINK_SVG ICON_ASSETS LINK_GUI SOURCES IconTheme.cpp Clipboard.cpp TranscriptDisplayBuilder.cpp UndoStack.cpp)
 # Loads the real BenchmarkPage.qml inside a modal Popup -> ScrollView (its
 # SettingsPopup nesting) and proves the benchmark file follows the left panel's
@@ -409,6 +412,13 @@ suop_add_test(tst_task_silence LINK_WHISPER LINK_LLAMA LINK_SHERPA_ONNX
             LabelingEngine.cpp DiarizationEngine.cpp EngineManifest.cpp GpuProbe.cpp SubprocessEngine.cpp
             EngineRegistry.cpp ParakeetEngine.cpp UsbGrabJob.cpp UsbRuleStore.cpp VaultTreeModel.cpp
             ${SUOP_TASK_SOURCES})
+# CompressAudioTask: real ffmpeg encode/verify (QSKIP without it); same
+# full dependency set as the other task tests (TaskContext -> EngineCache).
+suop_add_test(tst_task_compress LINK_WHISPER LINK_LLAMA LINK_SHERPA_ONNX
+    SOURCES TranscriptionController.cpp WhisperCppEngine.cpp VadChunker.cpp ModelManager.cpp AudioDecoder.cpp
+            LabelingEngine.cpp DiarizationEngine.cpp EngineManifest.cpp GpuProbe.cpp SubprocessEngine.cpp
+            EngineRegistry.cpp ParakeetEngine.cpp UsbGrabJob.cpp UsbRuleStore.cpp VaultTreeModel.cpp
+            ${SUOP_TASK_SOURCES})
 suop_add_test(tst_task_transcribe LINK_WHISPER LINK_LLAMA LINK_SHERPA_ONNX
     SOURCES TranscriptionController.cpp WhisperCppEngine.cpp VadChunker.cpp ModelManager.cpp AudioDecoder.cpp
             LabelingEngine.cpp DiarizationEngine.cpp EngineManifest.cpp GpuProbe.cpp SubprocessEngine.cpp
@@ -425,7 +435,7 @@ suop_add_test(tst_vadchunking LINK_WHISPER SOURCES VadChunker.cpp)
 suop_add_test(tst_transcribe_pipeline LINK_WHISPER
     SOURCES TranscribePipeline.cpp VadChunker.cpp ModelManager.cpp WhisperCppEngine.cpp)
 suop_add_test(tst_audiodecoder SOURCES AudioDecoder.cpp)
-suop_add_test(tst_audiorecorder LINK_MULTIMEDIA SOURCES AudioRecorder.cpp)
+suop_add_test(tst_audiorecorder LINK_MULTIMEDIA SOURCES AudioRecorder.cpp FileRename.cpp)
 suop_add_test(tst_labelingengine LINK_LLAMA SOURCES LabelingEngine.cpp)
 suop_add_test(tst_diarizationengine LINK_SHERPA_ONNX SOURCES DiarizationEngine.cpp AudioDecoder.cpp)
 suop_add_test(tst_future_spec)
@@ -464,7 +474,7 @@ suop_add_test(tst_modelpicker LINK_QUICK)
 # re-stated), hence LINK_MULTIMEDIA; and IconTheme + icon assets because the
 # page uses AppIcon.
 suop_add_test(tst_recorderpage_sources LINK_QUICK LINK_MULTIMEDIA LINK_SVG ICON_ASSETS
-    SOURCES AudioRecorder.cpp IconTheme.cpp)
+    SOURCES AudioRecorder.cpp FileRename.cpp IconTheme.cpp)
 # TitleBar.qml's own harness: loads the real TitleBar (frameless-mode custom
 # titlebar), so like the sidebar harnesses below it needs IconTheme (its
 # singleton + image provider) and the icon-pack resources for AppIcon.
